@@ -57,6 +57,9 @@ pub trait Quantization:
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Self::Metadata;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
     fn field(&self) -> Field;
+    fn extra_fields(&self) -> Vec<Field> {
+        vec![]
+    }
 }
 
 pub enum QuantizationType {

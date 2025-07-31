@@ -247,7 +247,7 @@ mod test {
         ] {
             let mut key = Arc::new(Float32Array::from(query)) as Arc<dyn Array>;
             if metric == MetricType::Cosine {
-                key = normalize_arrow(&key).unwrap();
+                key = normalize_arrow(&key).unwrap().0;
             };
             let q = Query {
                 column: "test".to_string(),

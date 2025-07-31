@@ -41,13 +41,13 @@ pub mod v3;
 use super::pb;
 use crate::metrics::MetricsCollector;
 use crate::{prefilter::PreFilter, Index};
-pub use residual::RESIDUAL_COLUMN;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const DIST_COL: &str = "_distance";
 pub const DISTANCE_TYPE_KEY: &str = "distance_type";
 pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
+pub const CENTROID_DIST_COLUMN: &str = "__centroid_dist";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const LOSS_METADATA_KEY: &str = "_loss";
@@ -61,6 +61,10 @@ pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::n
 
 pub static PART_ID_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true)
+});
+
+pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(CENTROID_DIST_COLUMN, arrow_schema::DataType::Float32, true)
 });
 
 /// Query parameters for the vector indices

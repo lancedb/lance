@@ -485,7 +485,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?;
+                        let key = normalize_arrow(&query.key)?.0;
                         query.key = key;
                     };
 
@@ -768,7 +768,7 @@ impl ANNIvfSubIndexExec {
                         let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                         let mut query = query.clone();
                         if index.metric_type() == DistanceType::Cosine {
-                            let key = normalize_arrow(&query.key)?;
+                            let key = normalize_arrow(&query.key)?.0;
                             query.key = key;
                         };
 
@@ -827,7 +827,7 @@ impl ANNIvfSubIndexExec {
                     let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?;
+                        let key = normalize_arrow(&query.key)?.0;
                         query.key = key;
                     };
 

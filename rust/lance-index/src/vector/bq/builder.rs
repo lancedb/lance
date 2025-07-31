@@ -11,6 +11,7 @@ use bitvec::prelude::{BitVec, Lsb0};
 use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
+use ndarray::Axis;
 use num_traits::AsPrimitive;
 use rand_distr::Distribution;
 use snafu::location;
@@ -18,8 +19,10 @@ use snafu::location;
 use crate::vector::bq::storage::{
     RabbitQuantizationMetadata, RabbitQuantizationStorage, RABBIT_CODE_COLUMN, RABBIT_METADATA_KEY,
 };
+use crate::vector::bq::transform::NORM_DIST_COLUMN;
 use crate::vector::bq::RQBuildParams;
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
+use crate::vector::CENTROID_DIST_COLUMN;
 
 /// Build parameters for RabbitQuantizer.
 ///
@@ -62,6 +65,39 @@ impl RabbitQuantizer {
 
     pub fn dim(&self) -> usize {
         self.metadata.inv_p.nrows()
+    }
+
+    pub fn norm_dists<T: ArrowPrimitiveType>(
+        &self,
+        vectors: &FixedSizeListArray,
+    ) -> Result<Vec<f32>>
+    where
+        T::Native: AsPrimitive<f32>,
+    {
+        if vectors.value_length() as usize != self.dim() {
+            return Err(Error::invalid_input(
+                format!(
+                    "Vector dimension mismatch: {} != {}",
+                    vectors.value_length(),
+                    self.dim()
+                ),
+                location!(),
+            ));
+        }
+
+        // convert the vector to a dxN matrix
+        let vec_matrix = ndarray::ArrayView2::from_shape(
+            (vectors.len(), self.dim()),
+            vectors.values().as_primitive::<Float32Type>().values(),
+        )
+        .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+        let vec_matrix = vec_matrix.t();
+
+        let transformed_vectors = self.metadata.inv_p.dot(&vec_matrix);
+        let sqrt_dim = (self.dim() as f32).sqrt();
+        let norm_dists = transformed_vectors.mapv(|v| v.abs()).sum_axis(Axis(0)) / sqrt_dim;
+        debug_assert_eq!(norm_dists.len(), vectors.len());
+        Ok(norm_dists.to_vec())
     }
 
     fn transform<T: ArrowPrimitiveType>(&self, vectors: &FixedSizeListArray) -> Result<ArrayRef>
@@ -184,6 +220,13 @@ impl Quantization for RabbitQuantizer {
             true,
         )
     }
+
+    fn extra_fields(&self) -> Vec<Field> {
+        vec![
+            Field::new(CENTROID_DIST_COLUMN, DataType::Float32, true),
+            Field::new(NORM_DIST_COLUMN, DataType::Float32, true),
+        ]
+    }
 }
 
 impl TryFrom<Quantizer> for RabbitQuantizer {
@@ -235,6 +278,10 @@ fn gram_schmidt(a: ndarray::Array2<f32>) -> ndarray::Array2<f32> {
 }
 
 fn random_orthogonal(n: usize) -> ndarray::Array2<f32> {
-    let a = random_normal_matrix_f32(n);
-    gram_schmidt(a)
+    if cfg!(debug_assertions) {
+        ndarray::Array2::eye(n)
+    } else {
+        let a = random_normal_matrix_f32(n);
+        gram_schmidt(a)
+    }
 }

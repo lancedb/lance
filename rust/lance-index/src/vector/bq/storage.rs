@@ -15,6 +15,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_arrow;
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
@@ -23,9 +24,11 @@ use snafu::location;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
+use crate::vector::bq::transform::NORM_DIST_COLUMN;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::sq::scale_to_u8;
 use crate::vector::storage::{DistCalculator, VectorStore};
+use crate::vector::CENTROID_DIST_COLUMN;
 
 pub const RABBIT_METADATA_KEY: &str = "lance:rabbit";
 pub const RABBIT_CODE_COLUMN: &str = "_rabbit_codes";
@@ -111,6 +114,8 @@ pub struct RabbitQuantizationStorage {
     // helper fields
     row_ids: UInt64Array,
     codes: FixedSizeListArray,
+    centroid_dists: Float32Array,
+    norm_dists: Float32Array,
 }
 
 impl DeepSizeOf for RabbitQuantizationStorage {
@@ -130,49 +135,86 @@ pub struct RabbitDistCalculator<'a> {
     // we split the query codes into d/4 chunks, each chunk is with 4 elements,
     // then dist_table[i][j] is the distance between the i-th query code and the code j
     dist_table: Vec<u32>,
+    centroid_dists: &'a [f32],
+    norm_dists: &'a [f32],
+    query_scalar_sum: f32,
+    min_v_in_query: f32,
+    scalar_delta: f32,
+    sqrt_d: f32,
+    query_norm: f32,
 }
 
 impl<'a> RabbitDistCalculator<'a> {
     // norm_qr = (q-c)/|q-c|
-    pub fn new(norm_qr: &dyn Array, codes: &'a [u8]) -> Self {
-        let query_codes = match norm_qr.data_type() {
-            DataType::Float16 => {
-                let norm_qr = norm_qr.as_primitive::<Float16Type>().values();
-                let (min, max) = norm_qr
-                    .iter()
-                    .copied()
-                    .minmax()
-                    .into_option()
-                    .expect("failed to get min and max of query vector");
-                let bounds = min.as_()..max.as_();
-                scale_to_u8::<Float16Type>(norm_qr, &bounds)
-            }
-            DataType::Float32 => {
-                let norm_qr = norm_qr.as_primitive::<Float32Type>().values();
-                let (min, max) = norm_qr
-                    .iter()
-                    .copied()
-                    .minmax()
-                    .into_option()
-                    .expect("failed to get min and max of query vector");
-                let bounds = min.as_()..max.as_();
-                scale_to_u8::<Float32Type>(norm_qr, &bounds)
-            }
-            DataType::Float64 => {
-                let norm_qr = norm_qr.as_primitive::<Float64Type>().values();
-                let (min, max) = norm_qr
-                    .iter()
-                    .copied()
-                    .minmax()
-                    .into_option()
-                    .expect("failed to get min and max of query vector");
-                let bounds = min..max;
-                scale_to_u8::<Float64Type>(norm_qr, &bounds)
-            }
-            _ => {
-                unimplemented!("unsupported data type for RabbitQ: {}", norm_qr.data_type());
-            }
-        };
+    pub fn new(
+        residual_q: &dyn Array,
+        codes: &'a [u8],
+        centroid_dists: &'a [f32],
+        norm_dists: &'a [f32],
+        inv_p: ndarray::ArrayView2<'a, f32>,
+    ) -> Self {
+        let (norm_qr, norm) = normalize_arrow(residual_q).unwrap();
+        let norm_qr = norm_qr.as_primitive::<Float32Type>().values();
+        let norm_qr = ndarray::ArrayView2::from_shape((norm_qr.len(), 1), norm_qr).unwrap();
+        let quantized_q = inv_p.dot(&norm_qr).into_raw_vec_and_offset().0;
+        let (min, max) = quantized_q
+            .iter()
+            .copied()
+            .minmax()
+            .into_option()
+            .expect("failed to get min and max of query vector");
+        let bounds = min.as_()..max.as_();
+        let query_codes = scale_to_u8::<Float32Type>(&quantized_q, &bounds);
+
+        // let (query_codes, min, max) = match norm_qr.data_type() {
+        // DataType::Float16 => {
+        //     let norm_qr = norm_qr.as_primitive::<Float16Type>().values();
+        //     let (min, max) = norm_qr
+        //         .iter()
+        //         .copied()
+        //         .minmax()
+        //         .into_option()
+        //         .expect("failed to get min and max of query vector");
+        //     let bounds = min.as_()..max.as_();
+        //     (
+        //         scale_to_u8::<Float16Type>(norm_qr, &bounds),
+        //         min.as_(),
+        //         max.as_(),
+        //     )
+        // }
+        // DataType::Float32 => {
+        //     let norm_qr = norm_qr.as_primitive::<Float32Type>().values();
+        //     let (min, max) = norm_qr
+        //         .iter()
+        //         .copied()
+        //         .minmax()
+        //         .into_option()
+        //         .expect("failed to get min and max of query vector");
+        //     let bounds = min.as_()..max.as_();
+        //     (scale_to_u8::<Float32Type>(norm_qr, &bounds), min, max)
+        // }
+        // DataType::Float64 => {
+        //     let norm_qr = norm_qr.as_primitive::<Float64Type>().values();
+        //     let (min, max) = norm_qr
+        //         .iter()
+        //         .copied()
+        //         .minmax()
+        //         .into_option()
+        //         .expect("failed to get min and max of query vector");
+        //     let bounds = min..max;
+        //     (
+        //         scale_to_u8::<Float64Type>(norm_qr, &bounds),
+        //         min.as_(),
+        //         max.as_(),
+        //     )
+        // }
+        // _ => {
+        //     unimplemented!("unsupported data type for RabbitQ: {}", norm_qr.data_type());
+        // }
+        // };
+        let delta = (max - min) / 255.0;
+        let sqrt_d = (norm_qr.len() as f32).sqrt();
+        let query_scalar_sum = query_codes.iter().map(|&v| v as u32).sum::<u32>() as f32;
 
         let dist_table = Self::build_dist_table(query_codes);
         Self {
@@ -180,6 +222,13 @@ impl<'a> RabbitDistCalculator<'a> {
             num_bits: 1,
             codes,
             dist_table,
+            centroid_dists,
+            min_v_in_query: min,
+            scalar_delta: delta,
+            sqrt_d,
+            query_scalar_sum,
+            norm_dists,
+            query_norm: norm,
         }
     }
 
@@ -208,14 +257,29 @@ impl DistCalculator for RabbitDistCalculator<'_> {
         let id = id as usize;
         let code_len = self.dim * (self.num_bits as usize) / 8;
         let code = &self.codes[id * code_len..(id + 1) * code_len];
-        for code_byte in code.iter() {
-            // code is a bit vector, we need to extract the bits
+        for (i, code_byte) in code.iter().enumerate() {
+            // code is a bit vector, we iterate over 8 bits at a time,
+            // every 4 bits is a sub-vector, we need to extract the bits
+            let dist_table = &self.dist_table[2 * i * 16..(2 * i + 1) * 16];
+            let next_dist_table = &self.dist_table[(2 * i + 1) * 16..(2 * i + 2) * 16];
             let current_code = (code_byte & 0x0F) as usize;
             let next_code = (code_byte >> 4) as usize;
-            dist += self.dist_table[current_code];
-            dist += self.dist_table[next_code];
+            dist += dist_table[current_code];
+            dist += next_dist_table[next_code];
         }
-        dist as f32
+
+        let vec_bitcount = code.iter().map(|byte| byte.count_ones()).sum::<u32>() as f32;
+        let dist = dist as f32;
+
+        // distance between quantized vector and query vector
+        let dist_vq_q = (2.0 * self.scalar_delta * dist + 2.0 * self.min_v_in_query * vec_bitcount
+            - self.scalar_delta * self.query_scalar_sum
+            - self.dim as f32 * self.min_v_in_query)
+            / self.sqrt_d;
+
+        let dist_v_q = dist_vq_q / self.norm_dists[id];
+        let dist_c = self.centroid_dists[id];
+        dist_c.powi(2) + self.query_norm.powi(2) - 2.0 * dist_c * self.query_norm * dist_v_q
     }
 
     fn distance_all(&self, _: usize) -> Vec<f32> {
@@ -264,9 +328,15 @@ impl VectorStore for RabbitQuantizationStorage {
         self.distance_type
     }
 
-    fn dist_calculator(&self, norm_qr: Arc<dyn Array>) -> Self::DistanceCalculator<'_> {
+    fn dist_calculator(&self, residual_q: Arc<dyn Array>) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
-        RabbitDistCalculator::new(norm_qr.as_ref(), codes)
+        RabbitDistCalculator::new(
+            residual_q.as_ref(),
+            codes,
+            self.centroid_dists.values(),
+            self.norm_dists.values(),
+            self.metadata.inv_p.view(),
+        )
     }
 
     // TODO: implement this
@@ -288,12 +358,20 @@ impl QuantizerStorage for RabbitQuantizationStorage {
     ) -> Result<Self> {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABBIT_CODE_COLUMN].as_fixed_size_list().clone();
+        let centroid_dists = batch[CENTROID_DIST_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
+        let norm_dists = batch[NORM_DIST_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
         Ok(Self {
             metadata: metadata.clone(),
             batch,
             distance_type,
             row_ids,
             codes,
+            centroid_dists,
+            norm_dists,
         })
     }
 

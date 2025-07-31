@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::AsArray;
-use arrow_array::RecordBatch;
+use arrow::datatypes::Float32Type;
+use arrow_array::{Float32Array, RecordBatch};
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use snafu::location;
@@ -15,6 +16,12 @@ use crate::vector::bq::builder::RabbitQuantizer;
 use crate::vector::bq::storage::RABBIT_CODE_COLUMN;
 use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
+
+// the inner product of quantized vector and the normalized residual vector.
+pub const NORM_DIST_COLUMN: &str = "__norm_dist";
+pub static NORM_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(NORM_DIST_COLUMN, arrow_schema::DataType::Float32, true)
+});
 
 pub struct RQTransformer {
     rq: RabbitQuantizer,
@@ -60,8 +67,11 @@ impl Transformer for RQTransformer {
             location: location!(),
         })?;
         let rq_code = self.rq.quantize(&data)?;
+        let norm_dists = self.rq.norm_dists::<Float32Type>(&data)?;
+        let norm_dists = Float32Array::from(norm_dists);
         debug_assert_eq!(rq_code.len(), batch.num_rows());
         let batch = batch.try_with_column(self.rq.field(), Arc::new(rq_code))?;
+        let batch = batch.try_with_column(NORM_DIST_FIELD.clone(), Arc::new(norm_dists))?;
         let batch = batch.drop_column(&self.vector_column)?;
         Ok(batch)
     }

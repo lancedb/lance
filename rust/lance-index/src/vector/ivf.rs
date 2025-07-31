@@ -272,11 +272,10 @@ impl IvfTransformer {
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
-        let partition_transform = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
-            distance_type,
-            vector_column,
-        ));
+        let partition_transform = Arc::new(
+            PartitionTransformer::new(centroids.clone(), distance_type, vector_column)
+                .with_distance(true),
+        );
         transforms.push(partition_transform);
 
         if let Some(range) = range {
@@ -286,7 +285,8 @@ impl IvfTransformer {
             )));
         }
 
-        // RQ requires to convert the vector `v` to `(v-c)/||v-c||`
+        // RQ requires to convert the vector `v` to `(v-c)/||v-c||`,
+        // so we do normalize again after the residual transform.
         transforms.push(Arc::new(ResidualTransform::new(
             centroids.clone(),
             PART_ID_COLUMN,
