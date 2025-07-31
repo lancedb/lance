@@ -20,7 +20,7 @@ use futures::{future::Either, FutureExt, StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
 use lance_core::utils::backoff::SlotBackoff;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::Fragment;
@@ -248,7 +248,7 @@ struct UpdateData {
     removed_fragment_ids: Vec<u64>,
     old_fragments: Vec<Fragment>,
     new_fragments: Vec<Fragment>,
-    affected_rows: RowIdTreeMap,
+    affected_rows: RowAddrTreeMap,
     num_updated_rows: u64,
 }
 
@@ -412,7 +412,7 @@ impl UpdateJob {
             .into_inner()
             .unwrap();
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
-        let affected_rows = RowIdTreeMap::from(removed_row_ids);
+        let affected_rows = RowAddrTreeMap::from(removed_row_ids);
 
         let num_updated_rows = new_fragments
             .iter()

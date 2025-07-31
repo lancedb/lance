@@ -29,7 +29,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::RowIdMask;
+use lance_core::utils::mask::RowAddrMask;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Projection, Error, Result};
 use lance_datafusion::planner::Planner;
@@ -83,7 +83,7 @@ impl EvaluatedIndex {
                 location: location!(),
             });
         }
-        let row_id_mask = RowIdMask::from_arrow(batch.column(0).as_binary())?;
+        let row_id_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
         let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
         let index_result = IndexExprResult::from_parts(row_id_mask, match_type)?;
 

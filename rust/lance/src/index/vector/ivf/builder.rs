@@ -27,7 +27,7 @@ use object_store::path::Path;
 use snafu::location;
 use tracing::instrument;
 
-use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
+use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ADDR, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
     ivf::shuffler::shuffle_dataset,
@@ -129,8 +129,8 @@ async fn load_precomputed_partitions(
                 .values()
                 .iter()
                 .zip(partitions.values().iter())
-                .for_each(|(row_id, partition)| {
-                    let addr = RowAddress::from(*row_id);
+                .for_each(|(row_addr, partition)| {
+                    let addr = RowAddress::from(*row_addr);
                     lookup[addr.fragment_id() as usize][addr.row_offset() as usize] =
                         *partition as i32;
                 });
@@ -146,17 +146,17 @@ fn add_precomputed_partitions(
     partition_map: &[Vec<i32>],
     part_id_field: &ArrowField,
 ) -> Result<RecordBatch> {
-    let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+    let row_addrs = batch.column_by_name(ROW_ADDR).ok_or(Error::Index {
         message: "column does not exist".to_string(),
         location: location!(),
     })?;
     let part_ids = UInt32Array::from_iter_values(
-        row_ids
+        row_addrs
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
-            .filter_map(|row_id| {
-                let addr = RowAddress::from(*row_id);
+            .filter_map(|row_addr| {
+                let addr = RowAddress::from(*row_addr);
                 let part_id =
                     partition_map[addr.fragment_id() as usize][addr.row_offset() as usize];
                 if part_id < 0 {

@@ -2060,14 +2060,14 @@ mod tests {
             index: &IVFIndex,
             prefilter: Arc<dyn PreFilter>,
             ids_to_test: &[u64],
-            row_id_map: F,
+            row_addr_map: F,
         ) {
             const ROWS_TO_TEST: u32 = 500;
             let num_vectors = ids_to_test.len() as u32 / self.dim;
             let num_tests = ROWS_TO_TEST.min(num_vectors);
-            let row_ids_to_test = sample_without_replacement(ids_to_test, num_tests);
-            for row_id in row_ids_to_test {
-                let row = self.get_vector(row_id as u32);
+            let row_addrs_to_test = sample_without_replacement(ids_to_test, num_tests);
+            for row_addr in row_addrs_to_test {
+                let row = self.get_vector(row_addr as u32);
                 let query = Query {
                     column: Self::COLUMN.to_string(),
                     key: Arc::new(row),
@@ -2095,12 +2095,12 @@ mod tests {
 
                 let found_ids = search_result.column(1);
                 let found_ids = found_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
-                let expected_id = row_id_map(row_id);
+                let expected_id = row_addr_map(row_addr);
 
                 match expected_id {
                     // Original id was deleted, results can be anything, just make sure they don't
                     // include the original id
-                    None => assert!(!found_ids.iter().any(|f_id| f_id.unwrap() == row_id)),
+                    None => assert!(!found_ids.iter().any(|f_id| f_id.unwrap() == row_addr)),
                     // Original id remains or was remapped, make sure expected id in results
                     Some(expected_id) => {
                         assert!(found_ids.iter().any(|f_id| f_id.unwrap() == expected_id))
@@ -2287,21 +2287,21 @@ mod tests {
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
 
         let is_not_remapped = Some;
-        let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
+        let is_remapped = |row_addr| Some(row_addr + BIG_OFFSET);
         let is_removed = |_| None;
         let max_id = test_data.get_vectors().len() as u64 / test_data.dim as u64;
-        let row_ids = Vec::from_iter(0..max_id);
+        let row_addrs = Vec::from_iter(0..max_id);
 
         // Sanity check to make sure the index we built is behaving correctly.  Any
         // input row, when used as a query, should be found in the results list with
         // the same id
         test_data
-            .check_index(ivf_index, prefilter.clone(), &row_ids, is_not_remapped)
+            .check_index(ivf_index, prefilter.clone(), &row_addrs, is_not_remapped)
             .await;
 
         // When remapping we change the id of 1/3 of the rows, we remove another 1/3,
         // and we keep 1/3 as they are
-        let partitioned_row_ids = partition_ids(row_ids, 3);
+        let partitioned_row_ids = partition_ids(row_addrs, 3);
         let row_ids_to_modify = &partitioned_row_ids[0];
         let row_ids_to_remove = &partitioned_row_ids[1];
         let row_ids_to_remain = &partitioned_row_ids[2];

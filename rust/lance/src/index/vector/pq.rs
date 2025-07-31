@@ -355,11 +355,11 @@ impl VectorIndex for PQIndex {
                 let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
                 let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
                     .enumerate()
-                    .filter_map(|(vec_idx, old_row_id)| {
-                        let new_row_id = frag_reuse_index_ref.remap_row_id(*old_row_id);
-                        new_row_id.map(|new_row_id| {
+                    .filter_map(|(vec_idx, old_row_addr)| {
+                        let new_row_addr = frag_reuse_index_ref.remap_row_addr(*old_row_addr);
+                        new_row_addr.map(|new_row_addr| {
                             (
-                                new_row_id,
+                                new_row_addr,
                                 Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
                             )
                         })
@@ -629,7 +629,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::index::vector::ivf::build_ivf_model;
-    use lance_core::utils::mask::RowIdMask;
+    use lance_core::utils::mask::RowAddrMask;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_testing::datagen::generate_random_array_with_range;
 
@@ -775,8 +775,8 @@ mod tests {
             self.row_ids.is_empty()
         }
 
-        fn mask(&self) -> Arc<RowIdMask> {
-            RowIdMask::all_rows().into()
+        fn mask(&self) -> Arc<RowAddrMask> {
+            RowAddrMask::all_rows().into()
         }
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {

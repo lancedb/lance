@@ -247,8 +247,8 @@ impl ProductQuantizationStorage {
             let mut new_codes = Vec::with_capacity(row_ids.len() * num_sub_vectors);
 
             let row_ids_values = row_ids.values();
-            for (i, row_id) in row_ids_values.iter().enumerate() {
-                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_id(*row_id) {
+            for (i, row_addr) in row_ids_values.iter().enumerate() {
+                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_addr(*row_addr) {
                     new_row_ids.push(mapped_value);
                     new_codes.extend(get_pq_code(
                         transposed_codes,

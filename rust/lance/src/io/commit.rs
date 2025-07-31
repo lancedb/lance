@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
@@ -688,7 +688,7 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    affected_rows: Option<&RowIdTreeMap>,
+    affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();

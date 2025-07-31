@@ -14,7 +14,7 @@ use datafusion_expr::{
 };
 
 use futures::join;
-use lance_core::{utils::mask::RowIdMask, Error, Result};
+use lance_core::{utils::mask::RowAddrMask, Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use snafu::location;
 use tracing::instrument;
@@ -676,19 +676,19 @@ impl std::fmt::Display for ScalarIndexExpr {
 
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
-    Exact(RowIdMask),
+    Exact(RowAddrMask),
     // The answer is at most the rows in the allow list minus the rows in the block list
     // Some of the rows in the allow list may not be in the result and will need to be filtered
     // by a recheck.  Every row in the block list is definitely not in the result.
-    AtMost(RowIdMask),
+    AtMost(RowAddrMask),
     // The answer is at least the rows in the allow list minus the rows in the block list
     // Some of the rows in the block list might be in the result.  Every row in the allow list is
     // definitely in the result.
-    AtLeast(RowIdMask),
+    AtLeast(RowAddrMask),
 }
 
 impl IndexExprResult {
-    pub fn row_id_mask(&self) -> &RowIdMask {
+    pub fn row_id_mask(&self) -> &RowAddrMask {
         match self {
             Self::Exact(mask) => mask,
             Self::AtMost(mask) => mask,
@@ -704,7 +704,7 @@ impl IndexExprResult {
         }
     }
 
-    pub fn from_parts(mask: RowIdMask, discriminant: u32) -> Result<Self> {
+    pub fn from_parts(mask: RowAddrMask, discriminant: u32) -> Result<Self> {
         match discriminant {
             0 => Ok(Self::Exact(mask)),
             1 => Ok(Self::AtMost(mask)),
@@ -818,16 +818,16 @@ impl ScalarIndexExpr {
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
                 match search_result {
                     SearchResult::Exact(matching_row_ids) => {
-                        Ok(IndexExprResult::Exact(RowIdMask {
+                        Ok(IndexExprResult::Exact(RowAddrMask {
                             block_list: None,
                             allow_list: Some(matching_row_ids),
                         }))
                     }
-                    SearchResult::AtMost(row_ids) => Ok(IndexExprResult::AtMost(RowIdMask {
+                    SearchResult::AtMost(row_ids) => Ok(IndexExprResult::AtMost(RowAddrMask {
                         block_list: None,
                         allow_list: Some(row_ids),
                     })),
-                    SearchResult::AtLeast(row_ids) => Ok(IndexExprResult::AtLeast(RowIdMask {
+                    SearchResult::AtLeast(row_ids) => Ok(IndexExprResult::AtLeast(RowAddrMask {
                         block_list: None,
                         allow_list: Some(row_ids),
                     })),

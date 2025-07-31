@@ -38,7 +38,7 @@ use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::utils::{
-    mask::RowIdMask,
+    mask::RowAddrMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
@@ -513,7 +513,7 @@ impl InvertedPartition {
         tokens: &[String],
         params: &FtsSearchParams,
         operator: Operator,
-        mask: Arc<RowIdMask>,
+        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<(u64, u32, u32)>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
@@ -1830,7 +1830,7 @@ impl DocSet {
                 .iter()
                 .filter_map(|id| {
                     if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
+                        frag_reuse_index_ref.remap_row_addr(*id)
                     } else {
                         Some(*id)
                     }
@@ -1844,7 +1844,7 @@ impl DocSet {
                     .iter()
                     .filter_map(|id| {
                         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
+                            frag_reuse_index_ref.remap_row_addr(*id)
                         } else {
                             Some(*id)
                         }
