@@ -859,7 +859,7 @@ public class Dataset implements Closeable {
    * @return MergeInsertBuilder 实例
    */
   public MergeInsertBuilder mergeInsert(List<String> onColumns) {
-    return new MergeInsertBuilder(this, onColumns);
+    return new MergeInsertBuilder(getNativeHandle(), onColumns, getAllocator());
   }
 
   /**
@@ -869,8 +869,45 @@ public class Dataset implements Closeable {
    * @return MergeInsertBuilder 实例
    */
   public MergeInsertBuilder mergeInsert(String onColumn) {
-    return new MergeInsertBuilder(this, Arrays.asList(onColumn));
+    return new MergeInsertBuilder(getNativeHandle(), Arrays.asList(onColumn), getAllocator());
   }
+
+  /**
+   * 执行 merge insert 操作（使用 BlockingDataset）
+   *
+   * @param sourceDatasetUri 源数据集URI
+   * @param whenMatchedConfig 匹配时的配置 ("update_all", "do_nothing", 或条件表达式)
+   * @param whenNotMatchedConfig 未匹配时的配置 ("insert_all", "do_nothing")
+   * @param whenNotMatchedBySourceConfig 源中未匹配时的配置 ("delete", "do_nothing", 或条件表达式)
+   * @param batchSize 可选的批处理大小
+   * @param timeoutMillis 可选的超时时间（毫秒）
+   */
+  public void mergeInsert(
+      String sourceDatasetUri,
+      String whenMatchedConfig,
+      String whenNotMatchedConfig,
+      String whenNotMatchedBySourceConfig,
+      Optional<Integer> batchSize,
+      Optional<Long> timeoutMillis) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMergeInsert(
+          sourceDatasetUri,
+          whenMatchedConfig,
+          whenNotMatchedConfig,
+          whenNotMatchedBySourceConfig,
+          batchSize,
+          timeoutMillis);
+    }
+  }
+
+  private native void nativeMergeInsert(
+      String sourceDatasetUri,
+      String whenMatchedConfig,
+      String whenNotMatchedConfig,
+      String whenNotMatchedBySourceConfig,
+      Optional<Integer> batchSize,
+      Optional<Long> timeoutMillis);
 
   BufferAllocator getAllocator() {
     return allocator;

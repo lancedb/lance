@@ -13,156 +13,176 @@
  */
 package com.lancedb.lance;
 
-import org.apache.arrow.c.ArrowArrayStream;
-import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.c.Data;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.time.Duration;
+import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 
+/**
+ * Builder for merge insert operations.
+ * This class collects all configuration options and executes the operation in a single call to Rust.
+ */
 public class MergeInsertBuilder implements AutoCloseable {
-  private long nativeBuilderHandle;
-  private Dataset dataset;
-  private List<String> onColumns;
-  private BufferAllocator allocator;
-
-  // 私有构造函数，通过 Dataset.mergeInsert() 创建
-  MergeInsertBuilder(Dataset dataset, List<String> onColumns) {
-    this.dataset = dataset;
-    this.onColumns = onColumns;
-    this.allocator = dataset.getAllocator();
-    this.nativeBuilderHandle =
-        createNativeBuilder(dataset.getNativeHandle(), onColumns.toArray(new String[0]));
-  }
-
-  /**
-   * 配置匹配行的更新行为
-   *
-   * @param condition 可选的 SQL 条件表达式
-   * @return this builder
-   */
-  public MergeInsertBuilder whenMatchedUpdateAll(String condition) {
-    whenMatchedUpdateAllNative(nativeBuilderHandle, condition);
-    return this;
-  }
-
-  /**
-   * 配置未匹配行的插入行为
-   *
-   * @return this builder
-   */
-  public MergeInsertBuilder whenNotMatchedInsertAll() {
-    whenNotMatchedInsertAllNative(nativeBuilderHandle);
-    return this;
-  }
-
-  /**
-   * 配置源表中未匹配行的删除行为
-   *
-   * @param expr 可选的删除条件表达式
-   * @return this builder
-   */
-  public MergeInsertBuilder whenNotMatchedBySourceDelete(String expr) {
-    whenNotMatchedBySourceDeleteNative(nativeBuilderHandle, expr);
-    return this;
-  }
-
-  /**
-   * 设置冲突重试次数
-   *
-   * @param maxRetries 最大重试次数，默认 10
-   * @return this builder
-   */
-  public MergeInsertBuilder conflictRetries(int maxRetries) {
-    conflictRetriesNative(nativeBuilderHandle, maxRetries);
-    return this;
-  }
-
-  /**
-   * 设置重试超时时间
-   *
-   * @param timeout 超时时间，默认 30 秒
-   * @return this builder
-   */
-  public MergeInsertBuilder retryTimeout(Duration timeout) {
-    retryTimeoutNative(nativeBuilderHandle, timeout.toMillis());
-    return this;
-  }
-
-  /**
-   * 执行 merge insert 操作
-   *
-   * @param stream Arrow 数据流
-   * @return 合并统计信息
-   */
-  public MergeInsertResult execute(ArrowArrayStream stream) {
-    return executeNative(nativeBuilderHandle, stream.memoryAddress());
-  }
-
-  /**
-   * 执行 merge insert 操作（VectorSchemaRoot 版本）
-   *
-   * @param root Arrow 数据
-   * @return 合并统计信息
-   */
-  public MergeInsertResult execute(VectorSchemaRoot root) {
-    try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
-      // 将 VectorSchemaRoot 转换为 ArrowArrayStream
-      convertToStream(root, stream);
-      return execute(stream);
+    private final long datasetHandle;
+    private final List<String> onColumns;
+    private final BufferAllocator allocator;
+    
+    // Configuration options
+    private String whenMatchedConfig = "do_nothing";
+    private String whenNotMatchedConfig = "do_nothing";
+    private String whenNotMatchedBySourceConfig = "do_nothing";
+    private int maxRetries = 0;
+    private long timeoutMillis = 0;
+    
+    // Native method declarations
+    private static native Object executeWithConfigNative(
+        long datasetHandle,
+        String[] onColumns,
+        String whenMatchedConfig,
+        String whenNotMatchedConfig,
+        String whenNotMatchedBySourceConfig,
+        int maxRetries,
+        long timeoutMillis,
+        long streamAddress
+    );
+    
+    static {
+        System.loadLibrary("lance_jni");
     }
-  }
-
-  // VectorSchemaRoot 到 ArrowArrayStream 转换
-  private void convertToStream(VectorSchemaRoot root, ArrowArrayStream stream) {
-    try {
-      // 将 VectorSchemaRoot 写入字节流
-      ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, outputStream)) {
-        writer.start();
-        writer.writeBatch();
-        writer.end();
-      }
-
-      // 从字节流创建 ArrowReader
-      ByteArrayInputStream inputStream = new ByteArrayInputStream(outputStream.toByteArray());
-      try (ArrowReader reader = new ArrowStreamReader(inputStream, allocator)) {
-        // 使用 Data.exportArrayStream 将 ArrowReader 转换为 ArrowArrayStream
-        Data.exportArrayStream(allocator, reader, stream);
-      }
-    } catch (Exception e) {
-      throw new RuntimeException("Failed to convert VectorSchemaRoot to ArrowArrayStream", e);
+    
+    /**
+     * Creates a new MergeInsertBuilder.
+     * 
+     * @param datasetHandle Native handle to the dataset
+     * @param onColumns Columns to match on
+     * @param allocator Buffer allocator for Arrow operations
+     */
+    MergeInsertBuilder(long datasetHandle, List<String> onColumns, BufferAllocator allocator) {
+        this.datasetHandle = datasetHandle;
+        this.onColumns = onColumns;
+        this.allocator = allocator;
     }
-  }
-
-  @Override
-  public void close() {
-    if (nativeBuilderHandle != 0) {
-      closeNative(nativeBuilderHandle);
-      nativeBuilderHandle = 0;
+    
+    /**
+     * Configure what to do when records match.
+     * 
+     * @param config Configuration string: "update_all", "do_nothing", or a condition expression
+     * @return this builder
+     */
+    public MergeInsertBuilder whenMatched(String config) {
+        this.whenMatchedConfig = config;
+        return this;
     }
-  }
-
-  // Native 方法声明
-  private static native long createNativeBuilder(long datasetHandle, String[] onColumns);
-
-  private static native void whenMatchedUpdateAllNative(long builderHandle, String condition);
-
-  private static native void whenNotMatchedInsertAllNative(long builderHandle);
-
-  private static native void whenNotMatchedBySourceDeleteNative(long builderHandle, String expr);
-
-  private static native void conflictRetriesNative(long builderHandle, int maxRetries);
-
-  private static native void retryTimeoutNative(long builderHandle, long timeoutMillis);
-
-  private static native MergeInsertResult executeNative(long builderHandle, long streamAddress);
-
-  private static native void closeNative(long builderHandle);
+    
+    /**
+     * Configure what to do when records don't match.
+     * 
+     * @param config Configuration string: "insert_all", "do_nothing"
+     * @return this builder
+     */
+    public MergeInsertBuilder whenNotMatched(String config) {
+        this.whenNotMatchedConfig = config;
+        return this;
+    }
+    
+    /**
+     * Configure what to do when source records don't match.
+     * 
+     * @param config Configuration string: "delete", "do_nothing", or a condition expression
+     * @return this builder
+     */
+    public MergeInsertBuilder whenNotMatchedBySource(String config) {
+        this.whenNotMatchedBySourceConfig = config;
+        return this;
+    }
+    
+    /**
+     * Set the maximum number of retries for conflicts.
+     * 
+     * @param maxRetries Maximum number of retries
+     * @return this builder
+     */
+    public MergeInsertBuilder conflictRetries(int maxRetries) {
+        this.maxRetries = maxRetries;
+        return this;
+    }
+    
+    /**
+     * Set the retry timeout in milliseconds.
+     * 
+     * @param timeoutMillis Timeout in milliseconds
+     * @return this builder
+     */
+    public MergeInsertBuilder retryTimeout(long timeoutMillis) {
+        this.timeoutMillis = timeoutMillis;
+        return this;
+    }
+    
+    /**
+     * Execute the merge insert operation with the current configuration.
+     * 
+     * @param root VectorSchemaRoot containing the data to merge
+     * @return MergeInsertResult with operation statistics
+     * @throws RuntimeException if the operation fails
+     */
+    public MergeInsertResult execute(VectorSchemaRoot root) {
+        try {
+            // Convert VectorSchemaRoot to ArrowArrayStream
+            long streamAddress = convertToStream(root);
+            
+            // Execute with all configuration
+            Object result = executeWithConfigNative(
+                datasetHandle,
+                onColumns.toArray(new String[0]),
+                whenMatchedConfig,
+                whenNotMatchedConfig,
+                whenNotMatchedBySourceConfig,
+                maxRetries,
+                timeoutMillis,
+                streamAddress
+            );
+            
+            return (MergeInsertResult) result;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to execute merge insert", e);
+        }
+    }
+    
+    /**
+     * Convert VectorSchemaRoot to ArrowArrayStream for native execution.
+     */
+    private long convertToStream(VectorSchemaRoot root) throws IOException {
+        // Write VectorSchemaRoot to ByteArrayOutputStream using ArrowStreamWriter
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, baos)) {
+            writer.start();
+            writer.writeBatch();
+            writer.end();
+        }
+        
+        // Read from ByteArrayInputStream using ArrowStreamReader
+        ByteArrayInputStream bais = new ByteArrayInputStream(baos.toByteArray());
+        ArrowStreamReader reader = new ArrowStreamReader(bais, allocator);
+        
+        // Export ArrowReader to ArrowArrayStream and get the memory address
+        try (org.apache.arrow.c.ArrowArrayStream stream = org.apache.arrow.c.ArrowArrayStream.allocateNew(allocator)) {
+            Data.exportArrayStream(allocator, reader, stream);
+            return stream.memoryAddress();
+        }
+    }
+    
+    @Override
+    public void close() {
+        // No cleanup needed for the new design
+    }
 }

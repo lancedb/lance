@@ -38,6 +38,7 @@ use lance::dataset::{
     ColumnAlteration, Dataset, NewColumnTransform, ProjectionRequest, ReadParams, Version,
     WriteParams,
 };
+use lance::dataset::write::merge_insert::{WhenMatched, WhenNotMatched, WhenNotMatchedBySource};
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
@@ -49,6 +50,7 @@ use std::collections::HashMap;
 use std::iter::empty;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -233,6 +235,26 @@ impl BlockingDataset {
 
     pub fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
         RT.block_on(self.inner.delete_config_keys(delete_keys))?;
+        Ok(())
+    }
+
+    pub fn merge_insert(
+        &mut self,
+        source_dataset_uri: &str,
+        when_matched: WhenMatched,
+        when_not_matched: WhenNotMatched,
+        when_not_matched_by_source: WhenNotMatchedBySource,
+        batch_size: Option<usize>,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        RT.block_on(self.inner.merge_insert(
+            source_dataset_uri,
+            when_matched,
+            when_not_matched,
+            when_not_matched_by_source,
+            batch_size,
+            timeout,
+        ))?;
         Ok(())
     }
 
@@ -1560,8 +1582,128 @@ fn inner_get_version_by_tag(
     java_dataset: JObject,
     jtag_name: JString,
 ) -> Result<u64> {
-    let tag = { jtag_name.extract(env)? };
-    let dataset_guard =
-        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.get_version(tag.as_str())
+    let dataset = get_dataset_from_java_object(env, java_dataset)?;
+    let tag_name = env.get_string(&jtag_name)?.into();
+    dataset.get_version(&tag_name)
+}
+
+/// Execute merge insert operation using BlockingDataset
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeMergeInsert(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    source_dataset_uri: JString,
+    when_matched_config: JString,
+    when_not_matched_config: JString,
+    when_not_matched_by_source_config: JString,
+    batch_size_obj: JObject, // Optional<Integer>
+    timeout_millis_obj: JObject, // Optional<Long>
+) {
+    if let Err(e) = inner_merge_insert(
+        &mut env,
+        java_dataset,
+        source_dataset_uri,
+        when_matched_config,
+        when_not_matched_config,
+        when_not_matched_by_source_config,
+        batch_size_obj,
+        timeout_millis_obj,
+    ) {
+        env.throw_new("java/lang/RuntimeException", &e.to_string()).unwrap();
+    }
+}
+
+fn inner_merge_insert(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    source_dataset_uri: JString,
+    when_matched_config: JString,
+    when_not_matched_config: JString,
+    when_not_matched_by_source_config: JString,
+    batch_size_obj: JObject,
+    timeout_millis_obj: JObject,
+) -> Result<()> {
+    let mut dataset = get_dataset_from_java_object(env, java_dataset)?;
+    let source_uri: String = env.get_string(&source_dataset_uri)?.into();
+    
+    // Parse when_matched configuration
+    let when_matched = if when_matched_config.is_null() {
+        WhenMatched::DoNothing
+    } else {
+        let config_str: String = env.get_string(&when_matched_config)?.into();
+        match config_str.as_str() {
+            "update_all" => WhenMatched::UpdateAll,
+            "do_nothing" => WhenMatched::DoNothing,
+            _ => {
+                // Try to parse as condition expression
+                WhenMatched::update_if(&dataset.inner, &config_str)
+                    .map_err(|e| Error::io_error(e.to_string()))?
+            }
+        }
+    };
+    
+    // Parse when_not_matched configuration
+    let when_not_matched = if when_not_matched_config.is_null() {
+        WhenNotMatched::DoNothing
+    } else {
+        let config_str: String = env.get_string(&when_not_matched_config)?.into();
+        match config_str.as_str() {
+            "insert_all" => WhenNotMatched::InsertAll,
+            "do_nothing" => WhenNotMatched::DoNothing,
+            _ => {
+                return Err(Error::io_error("Invalid when_not_matched config".to_string()));
+            }
+        }
+    };
+    
+    // Parse when_not_matched_by_source configuration
+    let when_not_matched_by_source = if when_not_matched_by_source_config.is_null() {
+        WhenNotMatchedBySource::DoNothing
+    } else {
+        let config_str: String = env.get_string(&when_not_matched_by_source_config)?.into();
+        match config_str.as_str() {
+            "delete" => WhenNotMatchedBySource::Delete,
+            "do_nothing" => WhenNotMatchedBySource::DoNothing,
+            _ => {
+                // Try to parse as condition expression
+                WhenNotMatchedBySource::delete_if(&dataset.inner, &config_str)
+                    .map_err(|e| Error::io_error(e.to_string()))?
+            }
+        }
+    };
+    
+    // Parse batch_size
+    let batch_size = if batch_size_obj.is_null() {
+        None
+    } else {
+        let batch_size_value = env.call_method(&batch_size_obj, "get", "()Ljava/lang/Object;", &[])?;
+        if batch_size_value.l()?.is_null() {
+            None
+        } else {
+            let batch_size_int = env.call_method(&batch_size_value.l()?, "intValue", "()I", &[])?;
+            Some(batch_size_int.i()? as usize)
+        }
+    };
+    
+    // Parse timeout
+    let timeout = if timeout_millis_obj.is_null() {
+        None
+    } else {
+        let timeout_value = env.call_method(&timeout_millis_obj, "get", "()Ljava/lang/Object;", &[])?;
+        if timeout_value.l()?.is_null() {
+            None
+        } else {
+            let timeout_long = env.call_method(&timeout_value.l()?, "longValue", "()J", &[])?;
+            Some(Duration::from_millis(timeout_long.j()? as u64))
+        }
+    };
+    
+    // Execute merge insert
+    dataset.merge_insert(
+        &source_uri,
+        when_matched,
+        when_not_matched,
+        when_not_matched_by_source,
+        batch_size,
+        timeout,
+    )
 }

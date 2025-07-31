@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use jni::objects::{JClass, JObject, JObjectArray, JString};
-use jni::sys::{jint, jlong, jobject};
+use jni::sys::{jboolean, jint, jlong, jobject};
 use jni::JNIEnv;
 use std::time::Duration;
 
@@ -218,13 +218,114 @@ pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_retryTimeoutNat
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_executeNative(
-    mut env: JNIEnv,
+pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_closeNative(
+    _env: JNIEnv,
     _class: JClass,
     builder_handle: jlong,
+) {
+    if builder_handle != 0 {
+        unsafe {
+            let _ = Box::from_raw(builder_handle as *mut LanceMergeInsertBuilder);
+        }
+    }
+}
+
+/// 执行merge insert操作的JNI方法，接收完整的配置
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_executeWithConfigNative(
+    mut env: JNIEnv,
+    _class: JClass,
+    dataset_handle: jlong,
+    on_columns: JObjectArray,
+    when_matched_config: JString,
+    when_not_matched_config: JString,
+    when_not_matched_by_source_config: JString,
+    max_retries: jint,
+    timeout_millis: jlong,
     stream_address: jlong,
 ) -> jobject {
-    let builder = unsafe { Box::from_raw(builder_handle as *mut LanceMergeInsertBuilder) };
+    let dataset = unsafe { &*(dataset_handle as *const LanceDataset) };
+
+    // 解析on_columns
+    let len = env.get_array_length(&on_columns).unwrap() as usize;
+    let mut columns = Vec::with_capacity(len);
+    for i in 0..len {
+        let jstr = env.get_object_array_element(&on_columns, i as i32).unwrap();
+        let jstr = JString::from(jstr);
+        let rust_str: String = env.get_string(&jstr).unwrap().into();
+        columns.push(rust_str);
+    }
+
+    // 创建构建器
+    let mut builder = match LanceMergeInsertBuilder::try_new(Arc::new(dataset.clone()), columns) {
+        Ok(builder) => builder,
+        Err(e) => {
+            env.throw_new("java/lang/RuntimeException", &e.to_string()).unwrap();
+            return std::ptr::null_mut();
+        }
+    };
+
+    // 配置when_matched
+    if !when_matched_config.is_null() {
+        let config_str: String = env.get_string(&when_matched_config).unwrap().into();
+        let when_matched = match config_str.as_str() {
+            "update_all" => WhenMatched::UpdateAll,
+            "do_nothing" => WhenMatched::DoNothing,
+            _ => {
+                // 尝试解析条件表达式
+                match WhenMatched::update_if(&builder.dataset, &config_str) {
+                    Ok(matched) => matched,
+                    Err(e) => {
+                        env.throw_new("java/lang/RuntimeException", &e.to_string()).unwrap();
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+        };
+        builder.when_matched(when_matched);
+    }
+
+    // 配置when_not_matched
+    if !when_not_matched_config.is_null() {
+        let config_str: String = env.get_string(&when_not_matched_config).unwrap().into();
+        let when_not_matched = match config_str.as_str() {
+            "insert_all" => WhenNotMatched::InsertAll,
+            "do_nothing" => WhenNotMatched::DoNothing,
+            _ => {
+                env.throw_new("java/lang/RuntimeException", "Invalid when_not_matched config").unwrap();
+                return std::ptr::null_mut();
+            }
+        };
+        builder.when_not_matched(when_not_matched);
+    }
+
+    // 配置when_not_matched_by_source
+    if !when_not_matched_by_source_config.is_null() {
+        let config_str: String = env.get_string(&when_not_matched_by_source_config).unwrap().into();
+        let when_not_matched_by_source = match config_str.as_str() {
+            "delete" => WhenNotMatchedBySource::Delete,
+            "do_nothing" => WhenNotMatchedBySource::DoNothing,
+            _ => {
+                // 尝试解析条件表达式
+                match WhenNotMatchedBySource::delete_if(&builder.dataset, &config_str) {
+                    Ok(not_matched) => not_matched,
+                    Err(e) => {
+                        env.throw_new("java/lang/RuntimeException", &e.to_string()).unwrap();
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+        };
+        builder.when_not_matched_by_source(when_not_matched_by_source);
+    }
+
+    // 配置重试参数
+    if max_retries > 0 {
+        builder.conflict_retries(max_retries as u32);
+    }
+    if timeout_millis > 0 {
+        builder.retry_timeout(Duration::from_millis(timeout_millis as u64));
+    }
 
     // 从内存地址创建 ArrowArrayStream
     let stream_reader = unsafe {
@@ -254,19 +355,6 @@ pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_executeNative(
         Err(e) => {
             env.throw_new("java/lang/RuntimeException", &e.to_string()).unwrap();
             std::ptr::null_mut()
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_MergeInsertBuilder_closeNative(
-    _env: JNIEnv,
-    _class: JClass,
-    builder_handle: jlong,
-) {
-    if builder_handle != 0 {
-        unsafe {
-            let _ = Box::from_raw(builder_handle as *mut LanceMergeInsertBuilder);
         }
     }
 }
