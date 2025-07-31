@@ -296,7 +296,7 @@ pub async fn parse_substrait(
         )
         .await?;
 
-    if expr_container.exprs.len() == 0 {
+    if expr_container.exprs.is_empty() {
         return Err(Error::invalid_input(
             "Substrait expression did not contain any expressions",
             location!(),
