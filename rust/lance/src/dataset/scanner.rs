@@ -175,6 +175,7 @@ impl ColumnOrdering {
 ///
 /// This parameter only affects scans.  Vector search and full text search
 /// always use late materialization.
+#[derive(Clone)]
 pub enum MaterializationStyle {
     /// Heuristic-based materialization style
     ///
@@ -216,7 +217,7 @@ struct PlannedFilteredScan {
 }
 
 /// Filter for filtering rows
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LanceFilter {
     /// The filter is an SQL string
     Sql(String),
@@ -298,6 +299,7 @@ impl LanceFilter {
 ///   .buffered(16)
 ///   .sum()
 /// ```
+#[derive(Clone)]
 pub struct Scanner {
     dataset: Arc<Dataset>,
 
@@ -6981,221 +6983,80 @@ mod test {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_fts_limit_offset() -> Result<()> {
-        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
-        test_ds.make_fts_index().await?;
-        let dataset = &test_ds.dataset;
+    async fn limit_offset_equivalency_test(scanner: &Scanner) {
+        async fn test_one(
+            scanner: &Scanner,
+            full_result: &RecordBatch,
+            limit: Option<i64>,
+            offset: Option<i64>,
+        ) {
+            let result = scanner
+                .clone()
+                .limit(limit, offset)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
 
-        // Create FTS query for testing
-        let fts_query = FullTextSearchQuery::new("s".to_string());
+            let resolved_offset = offset.unwrap_or(0).min(full_result.num_rows() as i64);
+            let resolved_length = limit
+                .unwrap_or(i64::MAX)
+                .min(full_result.num_rows() as i64 - resolved_offset);
 
-        // Get baseline results (all results)
-        let all_results = dataset
-            .scan()
-            .full_text_search(fts_query.clone())?
-            .project(&["i"])?
-            .try_into_batch()
-            .await?;
+            let expected = full_result.slice(resolved_offset as usize, resolved_length as usize);
+            assert_eq!(
+                &expected, &result,
+                "Limit: {:?}, Offset: {:?}",
+                limit, offset
+            );
+        }
 
-        let total_rows = all_results.num_rows();
-        assert!(
-            total_rows >= 3,
-            "Need at least 3 rows for testing, got {}",
-            total_rows
-        );
+        let full_results = scanner.try_into_batch().await.unwrap();
 
-        // Test limit only
-        let limit_results = dataset
-            .scan()
-            .full_text_search(fts_query.clone())?
-            .project(&["i"])?
-            .limit(Some(2), None)?
-            .try_into_batch()
-            .await?;
-        assert_eq!(limit_results.num_rows(), 2, "Limit=2 should return 2 rows");
+        test_one(scanner, &full_results, Some(1), None).await;
+        test_one(scanner, &full_results, Some(1), Some(1)).await;
+        test_one(scanner, &full_results, Some(1), Some(2)).await;
+        test_one(scanner, &full_results, Some(1), Some(10)).await;
 
-        // Test offset only
-        let offset_results = dataset
-            .scan()
-            .full_text_search(fts_query.clone())?
-            .project(&["i"])?
-            .limit(None, Some(1))?
-            .try_into_batch()
-            .await?;
-        assert_eq!(
-            offset_results.num_rows(),
-            total_rows - 1,
-            "Offset=1 should return {} rows, got {}",
-            total_rows - 1,
-            offset_results.num_rows()
-        );
+        test_one(scanner, &full_results, Some(3), None).await;
+        test_one(scanner, &full_results, Some(3), Some(2)).await;
+        test_one(scanner, &full_results, Some(3), Some(4)).await;
 
-        // Test limit + offset - THIS WILL FAIL with current implementation
-        let limit_offset_results = dataset
-            .scan()
-            .full_text_search(fts_query.clone())?
-            .project(&["i"])?
-            .limit(Some(2), Some(1))?
-            .try_into_batch()
-            .await?;
-        assert_eq!(
-            limit_offset_results.num_rows(),
-            2,
-            "Limit=2, Offset=1 should return 2 rows, got {}",
-            limit_offset_results.num_rows()
-        );
-
-        // For FTS, we can't verify exact order since results are sorted by relevance score
-        // Just verify that we got different results than the first 2 (indicating offset worked)
-        let first_two_ids = all_results.column_by_name("i").unwrap().slice(0, 2);
-        let actual_ids = limit_offset_results.column_by_name("i").unwrap();
-
-        // The results should be different from the first 2 results (due to offset)
-        // This is a basic sanity check that offset is working
-        assert_ne!(
-            actual_ids.as_ref(),
-            first_two_ids.as_ref(),
-            "Results with offset should be different from first 2 results"
-        );
-
-        Ok(())
+        test_one(scanner, &full_results, None, Some(3)).await;
+        test_one(scanner, &full_results, None, Some(10)).await;
     }
 
     #[tokio::test]
-    async fn test_vector_search_limit_offset() -> Result<()> {
-        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
-        test_ds.make_vector_index().await?;
-        let dataset = &test_ds.dataset;
-
-        let query_vector = Float32Array::from(vec![0.0; 32]);
-
-        // Get baseline results (k=10)
-        let all_results = dataset
-            .scan()
-            .nearest("vec", &query_vector, 10)?
-            .project(&["i"])?
-            .try_into_batch()
-            .await?;
-
-        let total_rows = all_results.num_rows();
-        assert!(
-            total_rows >= 5,
-            "Need at least 5 rows for testing, got {}",
-            total_rows
-        );
-
-        // Test limit only
-        let limit_results = dataset
-            .scan()
-            .nearest("vec", &query_vector, 10)?
-            .project(&["i"])?
-            .limit(Some(3), None)?
-            .try_into_batch()
-            .await?;
-        assert_eq!(limit_results.num_rows(), 3, "Limit=3 should return 3 rows");
-
-        // Test offset only - we expect total_rows - offset rows
-        let offset_results = dataset
-            .scan()
-            .nearest("vec", &query_vector, 10)?
-            .project(&["i"])?
-            .limit(None, Some(2))?
-            .try_into_batch()
-            .await?;
-
-        // Since we fetch k=10 results and apply offset=2, we should get 8 results
-        assert_eq!(
-            offset_results.num_rows(),
-            total_rows - 2,
-            "Offset=2 should return {} rows, got {}",
-            total_rows - 2,
-            offset_results.num_rows()
-        );
-
-        // Test limit + offset - THIS WILL FAIL with current implementation
-        let limit_offset_results = dataset
-            .scan()
-            .nearest("vec", &query_vector, 10)?
-            .project(&["i"])?
-            .limit(Some(3), Some(2))?
-            .try_into_batch()
-            .await?;
-        assert_eq!(
-            limit_offset_results.num_rows(),
-            3,
-            "Limit=3, Offset=2 should return 3 rows, got {}",
-            limit_offset_results.num_rows()
-        );
-
-        // Verify order is preserved - should be rows 2-4 after skipping first 2
-        let expected_ids = all_results.column_by_name("i").unwrap().slice(2, 3);
-        let actual_ids = limit_offset_results.column_by_name("i").unwrap();
-        assert_eq!(
-            actual_ids.as_ref(),
-            expected_ids.as_ref(),
-            "Results should match expected slice of original results"
-        );
-
-        Ok(())
+    async fn test_scan_limit_offset() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let scanner = test_ds.dataset.scan();
+        limit_offset_equivalency_test(&scanner).await;
     }
 
     #[tokio::test]
-    async fn test_edge_cases_limit_offset() -> Result<()> {
-        let mut test_ds =
-            TestVectorDataset::new_with_dimension(LanceFileVersion::Stable, false, 32).await?;
-        test_ds.make_vector_index().await?;
-        let dataset = &test_ds.dataset;
-
+    async fn test_ivf_pq_limit_offset() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
         let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 10).unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
 
-        // Test offset > k (should return empty results)
-        let results = dataset
-            .scan()
-            .nearest("vec", &query_vector, 2)? // k=2
-            .limit(Some(1), Some(5))? // offset=5 > k=2
-            .try_into_batch()
-            .await?;
-        assert_eq!(
-            results.num_rows(),
-            0,
-            "Offset > k should return 0 results, got {}",
-            results.num_rows()
-        );
-
-        // Test offset = k (boundary case)
-        let results = dataset
-            .scan()
-            .nearest("vec", &query_vector, 3)? // k=3
-            .limit(Some(1), Some(3))? // offset = k
-            .try_into_batch()
-            .await?;
-        assert_eq!(
-            results.num_rows(),
-            0,
-            "Offset = k should return 0 results, got {}",
-            results.num_rows()
-        );
-
-        // Test large offset with FTS
-        let mut test_ds_fts = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
-        test_ds_fts.make_fts_index().await?;
-        let dataset_fts = &test_ds_fts.dataset;
-
-        let fts_query = FullTextSearchQuery::new("s".to_string());
-        let results = dataset_fts
-            .scan()
-            .full_text_search(fts_query)?
-            .limit(Some(1), Some(1000))? // Very large offset
-            .try_into_batch()
-            .await?;
-        assert_eq!(
-            results.num_rows(),
-            0,
-            "Very large offset should return 0 results, got {}",
-            results.num_rows()
-        );
-
-        Ok(())
+    #[tokio::test]
+    async fn test_fts_limit_offset() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new("1".into()))
+            .unwrap();
+        limit_offset_equivalency_test(&scanner).await;
     }
 }
