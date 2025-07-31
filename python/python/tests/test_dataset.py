@@ -678,7 +678,6 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     dataset = dataset.checkout_version(full_ds_version)
     dataset.restore()
     dataset.delete("a > 2 AND a < 7")
-    print(dataset.to_table(offset=3, limit=1))
     filt_table = table.slice(7, 1)
 
     assert dataset.to_table(offset=3, limit=1) == filt_table

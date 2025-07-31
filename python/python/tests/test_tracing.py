@@ -92,12 +92,10 @@ assert events[1].target == "lance::dataset_events"
 assert events[1].args["event"] == "writing"
 assert events[1].args["uri"] == "memory://test"
 assert events[1].args["mode"] == "Create"
-assert events[1].args["timestamp"] is not None
 
 assert events[2].target == "lance::file_audit"
 assert events[2].args["mode"] == "create"
 assert events[2].args["type"] == "data"
-assert events[2].args["timestamp"] is not None
 
 assert events[3].target == "lance::dataset_events"
 assert events[3].args["event"] == "loading"
@@ -114,6 +112,10 @@ assert events[5].args["read_version"] == "0"
 assert events[5].args["committed_version"] == "1"
 assert events[5].args["detached"] == "false"
 assert events[5].args["operation"] == "Overwrite"
+
+for e in events:
+    assert e.args["timestamp"] is not None
+    assert e.args["client_version"] == lance.__version__
 """
     )
     subprocess.run(

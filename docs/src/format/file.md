@@ -86,7 +86,7 @@ benchmarking upcoming features.
 The following values are supported:
 
 | Version        | Minimal Lance Version | Maximum Lance Version | Description                                                                                                                                  |
-|----------------|-----------------------|-----------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| -------------- | --------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | 0.1            | Any                   | Any                   | This is the initial Lance format.                                                                                                            |
 | 2.0            | 0.16.0                | Any                   | Rework of the Lance file format that removed row groups and introduced null support for lists, fixed size lists, and primitives              |
 | 2.1 (unstable) | None                  | Any                   | Enhances integer and string compression, adds support for nulls in struct fields, and improves random access performance with nested fields. |
@@ -113,7 +113,7 @@ are not yet supported (since there is no dictionary field encoding)
 ### Encodings Available
 
 | Encoding Name   | Encoding Type  | What it does                                                                                                                                | Supported Versions | When it is applied                                                                      |
-|-----------------|----------------|---------------------------------------------------------------------------------------------------------------------------------------------|--------------------|-----------------------------------------------------------------------------------------|
+| --------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | --------------------------------------------------------------------------------------- |
 | Basic struct    | Field encoding | Encodes non-nullable struct data                                                                                                            | >= 2.0             | Default encoding for structs                                                            |
 | List            | Field encoding | Encodes lists (nullable or non-nullable)                                                                                                    | >= 2.0             | Default encoding for lists                                                              |
 | Basic Primitive | Field encoding | Encodes primitive data types using separate validity array                                                                                  | >= 2.0             | Default encoding for primitive data types                                               |
@@ -123,60 +123,3 @@ are not yet supported (since there is no dictionary field encoding)
 | Packed struct   | Array encoding | Encodes a struct with fixed-width fields in a row-major format making random access more efficient                                          | >= 2.0             | Only used on struct types if the field metadata attribute `"packed"` is set to `"true"` |
 | Fsst            | Array encoding | Compresses binary data by identifying common substrings (of 8 bytes or less) and encoding them as symbols                                   | >= 2.1             | Used on string pages that are not dictionary encoded                                    |
 | Bitpacking      | Array encoding | Encodes a single vector of fixed-width values using bitpacking which is useful for integral types that do not span the full range of values | >= 2.1             | Used on integral types                                                                  |
-
-
-## Statistics
-
-Statistics are stored within Lance files.
-The statistics can be used to determine which pages can be skipped within a query.
-The null count, lower bound (min), and upper bound (max) are stored.
-
-Statistics themselves are stored in Lance's columnar format,
-which allows for selectively reading only relevant stats columns.
-
-### Statistic Values
-
-Three types of statistics are stored per column: null count, min value, max value.
-The min and max values are stored as their native data types in arrays.
-
-There are special behaviors for different data types to account for nulls:
-
-1. For integer-based data types (including signed and unsigned integers, dates, and timestamps),
-   if the min and max are unknown (all values are null),
-   then the minimum/maximum representable values should be used instead.
-2. For float data types, if the min and max are unknown,
-   then use `-Inf` and `+Inf`, respectively.
-   (`-Inf` and `+Inf` may also be used for min and max if those values are present in the arrays.)
-   `NaN` values should be ignored for the purpose of min and max statistics.
-   If the max value is zero (negative or positive), the max value should be recorded as `+0.0`.
-   Likewise, if the min value is zero (positive or negative), it should be recorded as `-0.0`.
-3. For binary data types, if the min or max are unknown or unrepresentable, then use null value.
-   Binary data type bounds can also be truncated. For example,
-   an array containing just the value `"abcd"` could have a truncated min of `"abc"` and max of `"abd"`.
-   If there is no truncated value greater than the maximum value, then instead use null for the maximum.
-
-!!! warning
-The `min` and `max` values are not guaranteed to be within the array; they are simply upper and lower bounds. Two common cases where they are not contained in the array is if the min or max original value was deleted and when binary data is truncated. Therefore, statistic should not be used to compute queries such as `SELECT max(col) FROM table`.
-
-### Page-level Statistics Format
-
-Page-level statistics are stored as arrays within the Lance file. Each array contains one page long and is `num_pages` long. The page offsets are stored in an array just like the data page table. The offset to the statistics page table is stored in the metadata.
-
-The schema for the statistics is:
-
-```
-<field_id_1>: struct
-    null_count: i64
-    min_value: <field_1_data_type>
-    max_value: <field_1_data_type>
-...
-<field_id_N>: struct
-    null_count: i64
-    min_value: <field_N_data_type>
-    max_value: <field_N_data_type>
-```
-
-Any number of fields may be missing, as statistics for some fields or of some kind may be skipped. In addition, readers should expect there may be extra fields that are not in this schema. These should be ignored. Future changes to the format may add additional fields, but these changes will be backwards compatible.
-
-However, writers should not write extra fields that aren't described in this document. Until they are defined in the specification, there is no guarantee that readers will be able to safely interpret new forms of statistics.
-

@@ -263,10 +263,12 @@ impl LanceFilter {
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
-                use futures::FutureExt;
+                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
 
+                let ctx = get_session_context(&LanceExecutionOptions::default());
+                let state = ctx.state();
                 let schema = Arc::new(ArrowSchema::from(dataset_schema));
-                let expr = parse_substrait(expr, schema.clone())
+                let expr = parse_substrait(expr, schema.clone(), &ctx.state())
                     .now_or_never()
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
@@ -475,6 +477,15 @@ impl Scanner {
 
     fn is_fragment_scan(&self) -> bool {
         self.fragments.is_some()
+    }
+
+    /// Empty Projection
+    ///
+    /// The row_address will be scanned.
+    pub fn empty_project(&mut self) -> Result<&mut Self> {
+        self.with_row_address();
+        self.projection_plan.final_projection_is_empty = true;
+        self.project(&[ROW_ADDR])
     }
 
     /// Projection.
@@ -1565,10 +1576,11 @@ impl Scanner {
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
         // Stage 7: final projection
-        plan = Arc::new(DFProjectionExec::try_new(
-            self.output_expr(plan.schema().as_ref())?,
-            plan,
-        )?);
+        let output_expr = match self.projection_plan.final_projection_is_empty {
+            true => vec![],
+            false => self.output_expr(plan.schema().as_ref())?,
+        };
+        plan = Arc::new(DFProjectionExec::try_new(output_expr, plan)?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
