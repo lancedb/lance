@@ -263,10 +263,12 @@ impl LanceFilter {
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
-                use futures::FutureExt;
+                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
 
+                let ctx = get_session_context(&LanceExecutionOptions::default());
+                let state = ctx.state();
                 let schema = Arc::new(ArrowSchema::from(dataset_schema));
-                let expr = parse_substrait(expr, schema.clone())
+                let expr = parse_substrait(expr, schema.clone(), &ctx.state())
                     .now_or_never()
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
