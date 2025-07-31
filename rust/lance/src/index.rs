@@ -409,6 +409,7 @@ impl DatasetIndexExt for Dataset {
                 | IndexType::BTree
                 | IndexType::Inverted
                 | IndexType::NGram
+                | IndexType::ZoneMap
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
@@ -1450,11 +1451,15 @@ impl DatasetIndexInternalExt for Dataset {
                     let index_type = detect_scalar_index_type(self, index, &field.name).await?;
                     match index_type {
                         ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
-                            Box::new(SargableQueryParser::new(index.name.clone()))
+                            Box::new(SargableQueryParser::new(index.name.clone(), false))
+                                as Box<dyn ScalarQueryParser>
+                        }
+                        ScalarIndexType::ZoneMap => {
+                            Box::new(SargableQueryParser::new(index.name.clone(), true))
                                 as Box<dyn ScalarQueryParser>
                         }
                         ScalarIndexType::NGram => {
-                            Box::new(TextQueryParser::new(index.name.clone()))
+                            Box::new(TextQueryParser::new(index.name.clone(), true))
                                 as Box<dyn ScalarQueryParser>
                         }
                         ScalarIndexType::Inverted => {
@@ -1464,7 +1469,7 @@ impl DatasetIndexInternalExt for Dataset {
                         _ => continue,
                     }
                 }
-                _ => Box::new(SargableQueryParser::new(index.name.clone()))
+                _ => Box::new(SargableQueryParser::new(index.name.clone(), false))
                     as Box<dyn ScalarQueryParser>,
             };
 
