@@ -757,6 +757,7 @@ impl EncodedBatchWriteExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::v2::reader::{describe_encoding, FileReader, FileReaderOptions};
@@ -764,7 +765,7 @@ mod tests {
     use crate::v2::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
-    use arrow_array::{RecordBatch, UInt64Array};
+    use arrow_array::{Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
@@ -1164,6 +1165,210 @@ mod tests {
             product_id_encoding.contains("RLE") || product_id_encoding.contains("Rle"),
             "product_id column should use RLE encoding due to '*_id' pattern match, but got: {}",
             product_id_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_compression() {
+        // Test that field metadata compression settings are respected
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            lance_core::datatypes::COMPRESSION_META_KEY.to_string(),
+            "zstd".to_string(),
+        );
+        metadata.insert(
+            lance_core::datatypes::COMPRESSION_LEVEL_META_KEY.to_string(),
+            "6".to_string(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("text", DataType::Utf8, false).with_metadata(metadata.clone()),
+            ArrowField::new("data", DataType::Int32, false).with_metadata(HashMap::from([(
+                lance_core::datatypes::COMPRESSION_META_KEY.to_string(),
+                "none".to_string(),
+            )])),
+        ]));
+
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create test data
+        let id_array = Int32Array::from_iter_values(0..1000);
+        let text_array = StringArray::from_iter_values(
+            (0..1000).map(|i| format!("test string {} repeated text", i)),
+        );
+        let data_array = Int32Array::from_iter_values((0..1000).map(|i| i * 2));
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(id_array),
+                Arc::new(text_array),
+                Arc::new(data_array),
+            ],
+        )
+        .unwrap();
+
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().join("field_metadata_test.lance");
+        let object_store = ObjectStore::local();
+
+        // Create encoding strategy that will read from field metadata
+        let params = CompressionParams::new();
+        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
+            LanceFileVersion::V2_1,
+            params,
+        )
+        .unwrap();
+
+        let options = FileWriterOptions {
+            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let mut writer = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back metadata
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(
+                &Path::from(path.to_str().unwrap()),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+
+        // The text column (index 1) should use zstd compression based on metadata
+        let text_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        // For string columns, we expect Binary encoding with zstd compression
+        assert!(
+            text_encoding.contains("zstd"),
+            "text column should use zstd compression from field metadata, but got: {}",
+            text_encoding
+        );
+
+        // The data column (index 2) should use no compression based on metadata
+        let data_encoding = describe_encoding(&column_metadatas[2].pages[0]);
+        // For Int32 columns with "none" compression, we expect Flat encoding without compression
+        assert!(
+            data_encoding.contains("Flat") && data_encoding.contains("compression: None"),
+            "data column should use no compression from field metadata, but got: {}",
+            data_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_rle_threshold() {
+        // Test that RLE threshold from field metadata is respected
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            lance_core::datatypes::RLE_THRESHOLD_META_KEY.to_string(),
+            "0.9".to_string(),
+        );
+        // Also set compression to ensure RLE is used
+        metadata.insert(
+            lance_core::datatypes::COMPRESSION_META_KEY.to_string(),
+            "lz4".to_string(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "status",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(metadata)]));
+
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create data with very high repetition (3 runs for 10000 values = 0.0003 ratio)
+        let status_array = Int32Array::from_iter_values(
+            std::iter::repeat_n(200, 8000)
+                .chain(std::iter::repeat_n(404, 1500))
+                .chain(std::iter::repeat_n(500, 500)),
+        );
+
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(status_array)]).unwrap();
+
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().join("rle_threshold_test.lance");
+        let object_store = ObjectStore::local();
+
+        // Create encoding strategy that will read from field metadata
+        let params = CompressionParams::new();
+        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
+            LanceFileVersion::V2_1,
+            params,
+        )
+        .unwrap();
+
+        let options = FileWriterOptions {
+            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let mut writer = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back and check encoding
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(
+                &Path::from(path.to_str().unwrap()),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        let status_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        assert!(
+            status_encoding.contains("RLE") || status_encoding.contains("Rle"),
+            "status column should use RLE encoding due to metadata threshold, but got: {}",
+            status_encoding
         );
     }
 }
