@@ -64,6 +64,13 @@ impl WriteDestination<'_> {
             WriteDestination::Uri(_) => None,
         }
     }
+
+    pub fn uri(&self) -> String {
+        match self {
+            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
+            WriteDestination::Uri(uri) => uri.to_string(),
+        }
+    }
 }
 
 impl From<Arc<Dataset>> for WriteDestination<'_> {
@@ -201,6 +208,12 @@ pub struct WriteParams {
     /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
     /// Both parameters must be set to invoke autocleaning.
     pub auto_cleanup: Option<AutoCleanupParams>,
+
+    /// If true, skip auto cleanup during commits. This should be set to true
+    /// for high frequency writes to improve performance. This is also useful
+    /// if the writer does not have delete permissions and the clean up would
+    /// just try and log a failure anyway. Default is false.
+    pub skip_auto_cleanup: bool,
 }
 
 impl Default for WriteParams {
@@ -220,6 +233,7 @@ impl Default for WriteParams {
             enable_v2_manifest_paths: false,
             session: None,
             auto_cleanup: Some(AutoCleanupParams::default()),
+            skip_auto_cleanup: false,
         }
     }
 }

@@ -364,9 +364,11 @@ impl DisplayAs for FullSchemaMergeInsertExec {
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
                 let on_keys = self.params.on.join(", ");
                 let when_matched = match &self.params.when_matched {
-                    crate::dataset::WhenMatched::DoNothing => "DoNothing",
-                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll",
-                    crate::dataset::WhenMatched::UpdateIf(_) => "UpdateIf",
+                    crate::dataset::WhenMatched::DoNothing => "DoNothing".to_string(),
+                    crate::dataset::WhenMatched::UpdateAll => "UpdateAll".to_string(),
+                    crate::dataset::WhenMatched::UpdateIf(condition) => {
+                        format!("UpdateIf({})", condition)
+                    }
                 };
                 let when_not_matched = if self.params.insert_not_matched {
                     "InsertAll"
@@ -479,6 +481,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
+        let mem_wal_to_flush = self.params.mem_wal_to_flush.clone();
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
@@ -510,6 +513,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
+                mem_wal_to_flush,
             };
 
             // Step 5: Create and store the transaction

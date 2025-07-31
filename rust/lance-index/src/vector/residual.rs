@@ -5,6 +5,7 @@ use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::{iter, ops::MulAssign};
 
+use crate::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
 use arrow_array::ArrowNumericType;
 use arrow_array::{
     cast::AsArray,
@@ -15,7 +16,6 @@ use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
 use snafu::location;

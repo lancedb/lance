@@ -3,8 +3,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
-use super::super::utils::make_rowid_capture_stream;
+use super::super::utils::make_rowaddr_capture_stream;
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
@@ -15,15 +16,17 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use futures::StreamExt;
+use futures::{future::Either, FutureExt, StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
+use lance_core::utils::backoff::SlotBackoff;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
+use std::future::Future;
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{io::exec::Planner, Dataset};
@@ -53,6 +56,10 @@ pub struct UpdateBuilder {
     condition: Option<Expr>,
     /// The updates to apply to matching rows.
     updates: HashMap<String, Expr>,
+    /// Number of times to retry on commit conflicts.
+    conflict_retries: u32,
+    /// Total timeout for retries.
+    retry_timeout: Duration,
 }
 
 impl UpdateBuilder {
@@ -61,6 +68,8 @@ impl UpdateBuilder {
             dataset,
             condition: None,
             updates: HashMap::new(),
+            conflict_retries: 10,
+            retry_timeout: Duration::from_secs(30),
         }
     }
 
@@ -168,6 +177,22 @@ impl UpdateBuilder {
         Ok(self)
     }
 
+    /// Set the number of times to retry on commit conflicts.
+    ///
+    /// Default is 10.
+    pub fn conflict_retries(mut self, retries: u32) -> Self {
+        self.conflict_retries = retries;
+        self
+    }
+
+    /// Set the total timeout for all retries.
+    ///
+    /// Default is 30 seconds.
+    pub fn retry_timeout(mut self, timeout: Duration) -> Self {
+        self.retry_timeout = timeout;
+        self
+    }
+
     // TODO: set write params
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
@@ -204,6 +229,8 @@ impl UpdateBuilder {
             dataset: self.dataset,
             condition: self.condition,
             updates,
+            conflict_retries: self.conflict_retries,
+            retry_timeout: self.retry_timeout,
         })
     }
 }
@@ -216,17 +243,110 @@ pub struct UpdateResult {
     pub rows_updated: u64,
 }
 
+#[derive(Debug)]
+struct UpdateData {
+    removed_fragment_ids: Vec<u64>,
+    old_fragments: Vec<Fragment>,
+    new_fragments: Vec<Fragment>,
+    affected_rows: RowIdTreeMap,
+    num_updated_rows: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
+    conflict_retries: u32,
+    retry_timeout: Duration,
 }
 
 impl UpdateJob {
     pub async fn execute(self) -> Result<UpdateResult> {
+        let start = Instant::now();
+        let mut dataset_ref = self.dataset.clone();
+        let max_retries = self.conflict_retries;
+        let mut backoff = SlotBackoff::default();
+
+        fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
+            Error::TooMuchWriteContention {
+                message: format!(
+                    "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
+                    attempts,
+                    retry_timeout.as_secs_f32()
+                ),
+                location: location!(),
+            }
+        }
+
+        fn maybe_timeout<T>(
+            backoff: &SlotBackoff,
+            start: Instant,
+            retry_timeout: Duration,
+            future: impl Future<Output = T>,
+        ) -> impl Future<Output = Result<T>> {
+            let attempt = backoff.attempt();
+            if attempt == 0 {
+                // No timeout on first attempt
+                Either::Left(future.map(|res| Ok(res)))
+            } else {
+                let remaining = retry_timeout.saturating_sub(start.elapsed());
+                Either::Right(
+                    tokio::time::timeout(remaining, future)
+                        .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
+                )
+            }
+        }
+
+        while backoff.attempt() <= max_retries {
+            let mut job_with_updated_dataset = self.clone();
+            job_with_updated_dataset.dataset = dataset_ref.clone();
+            let execute_fut = job_with_updated_dataset.execute_impl();
+            let execute_fut = maybe_timeout(&backoff, start, self.retry_timeout, execute_fut);
+            let update_data = execute_fut.await??;
+
+            let commit_future = self.commit_impl(dataset_ref.clone(), update_data);
+            let commit_future = maybe_timeout(&backoff, start, self.retry_timeout, commit_future);
+            match commit_future.await? {
+                Ok(result) => return Ok(result),
+                Err(Error::RetryableCommitConflict { .. }) => {
+                    // Check whether we have exhausted our retries *before*
+                    // we sleep.
+                    if backoff.attempt() >= max_retries {
+                        break;
+                    }
+                    if start.elapsed() > self.retry_timeout {
+                        return Err(timeout_error(self.retry_timeout, backoff.attempt() + 1));
+                    }
+                    if backoff.attempt() == 0 {
+                        // We add 10% buffer here, to allow concurrent writes to complete.
+                        // We pass the first attempt's time to the backoff so it's used
+                        // as the unit for backoff time slots.
+                        // See SlotBackoff implementation for more details on how this works.
+                        backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                    }
+
+                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
+                    let sleep_fut = maybe_timeout(&backoff, start, self.retry_timeout, sleep_fut);
+                    sleep_fut.await?;
+
+                    let mut ds = dataset_ref.as_ref().clone();
+                    ds.checkout_latest().await?;
+                    dataset_ref = Arc::new(ds);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+        }
+        Err(Error::TooMuchWriteContention {
+            message: format!("Attempted {} retries.", max_retries),
+            location: location!(),
+        })
+    }
+
+    async fn execute_impl(self) -> Result<UpdateData> {
         let mut scanner = self.dataset.scan();
-        scanner.with_row_id();
+        scanner.with_row_address();
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -234,10 +354,10 @@ impl UpdateJob {
 
         let stream = scanner.try_into_stream().await?.into();
 
-        // We keep track of seen row ids so we can delete them from the existing
+        // We keep track of seen row addresses so we can delete them from the existing
         // fragments.
         let removed_row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-        let stream = make_rowid_capture_stream(removed_row_ids.clone(), stream)?;
+        let stream = make_rowaddr_capture_stream(removed_row_ids.clone(), stream)?;
 
         let schema = stream.schema();
 
@@ -298,18 +418,45 @@ impl UpdateJob {
             .iter()
             .map(|f| f.physical_rows.unwrap() as u64)
             .sum::<u64>();
+
+        Ok(UpdateData {
+            removed_fragment_ids,
+            old_fragments,
+            new_fragments,
+            affected_rows,
+            num_updated_rows,
+        })
+    }
+
+    async fn commit_impl(
+        &self,
+        dataset: Arc<Dataset>,
+        update_data: UpdateData,
+    ) -> Result<UpdateResult> {
         // Commit updated and new fragments
-        let new_dataset = self
-            .commit(
-                removed_fragment_ids,
-                old_fragments,
-                new_fragments,
-                affected_rows,
-            )
+        let operation = Operation::Update {
+            removed_fragment_ids: update_data.removed_fragment_ids,
+            updated_fragments: update_data.old_fragments,
+            new_fragments: update_data.new_fragments,
+            // This job only deletes rows, it does not modify any field values.
+            fields_modified: vec![],
+            mem_wal_to_flush: None,
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            operation,
+            /*blobs_op=*/ None,
+            None,
+        );
+
+        let new_dataset = CommitBuilder::new(dataset)
+            .with_affected_rows(update_data.affected_rows)
+            .execute(transaction)
             .await?;
+
         Ok(UpdateResult {
-            new_dataset,
-            rows_updated: num_updated_rows,
+            new_dataset: Arc::new(new_dataset),
+            rows_updated: update_data.num_updated_rows,
         })
     }
 
@@ -371,34 +518,6 @@ impl UpdateJob {
         }
 
         Ok((updated_fragments, removed_fragments))
-    }
-
-    async fn commit(
-        &self,
-        removed_fragment_ids: Vec<u64>,
-        updated_fragments: Vec<Fragment>,
-        new_fragments: Vec<Fragment>,
-        affected_rows: RowIdTreeMap,
-    ) -> Result<Arc<Dataset>> {
-        let operation = Operation::Update {
-            removed_fragment_ids,
-            updated_fragments,
-            new_fragments,
-            // This job only deletes rows, it does not modify any field values.
-            fields_modified: vec![],
-        };
-        let transaction = Transaction::new(
-            self.dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
-
-        CommitBuilder::new(self.dataset.clone())
-            .with_affected_rows(affected_rows)
-            .execute(transaction)
-            .await
-            .map(Arc::new)
     }
 }
 
@@ -703,5 +822,96 @@ mod tests {
         assert_eq!(ids, vec![0, 1, 2],);
         let values = data["value"].as_primitive::<UInt32Type>().values();
         assert!(values.iter().all(|&value| value == 1));
+    }
+
+    #[tokio::test]
+    async fn test_update_same_row_concurrency() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let concurrency = 3;
+        // Create dataset with just one row that all workers will update
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(10),
+                wait_get_per_call: Duration::from_millis(10),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
+        let mut handles = Vec::new();
+        for _i in 0..concurrency {
+            let session_ref = session.clone();
+            let barrier_ref = barrier.clone();
+            let throttled_ref = throttled.clone();
+            let handle = tokio::task::spawn(async move {
+                let dataset = DatasetBuilder::from_uri("memory://")
+                    .with_read_params(ReadParams {
+                        store_options: Some(ObjectStoreParams {
+                            object_store_wrapper: Some(throttled_ref.clone()),
+                            ..Default::default()
+                        }),
+                        session: Some(session_ref.clone()),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
+
+                let job = UpdateBuilder::new(Arc::new(dataset))
+                    .update_where("id = 0")
+                    .unwrap()
+                    .set("value", "99")
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                barrier_ref.wait().await;
+
+                job.execute().await.unwrap();
+            });
+            handles.push(handle);
+        }
+
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+
+        let data = dataset.scan().try_into_batch().await.unwrap();
+
+        // With retry-based conflict resolution, all concurrent updates should succeed
+        // Even though they all target the same row, they should not fail with commit conflicts
+        // The final result should be exactly one row (not duplicated) because the retries
+        // should work from the latest dataset state, preventing duplicate row creation
+        let ids = data["id"].as_primitive::<UInt32Type>().values();
+        assert_eq!(ids, &[0]);
+
+        let values = data["value"].as_primitive::<UInt32Type>().values();
+        assert_eq!(values, &[99]);
     }
 }

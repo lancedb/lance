@@ -19,6 +19,7 @@ import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.LanceSchema;
 import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -73,7 +74,7 @@ public class Dataset implements Closeable {
    * @param path dataset uri
    * @param schema dataset schema
    * @param params write params
-   * @return Datase
+   * @return Dataset
    */
   public static Dataset create(
       BufferAllocator allocator, String path, Schema schema, WriteParams params) {
@@ -104,7 +105,7 @@ public class Dataset implements Closeable {
    * @param stream arrow stream
    * @param path dataset uri
    * @param params write parameters
-   * @return Datase
+   * @return Dataset
    */
   public static Dataset create(
       BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
@@ -147,7 +148,7 @@ public class Dataset implements Closeable {
    * Open a dataset from the specified path.
    *
    * @param path file path
-   * @return Datase
+   * @return Dataset
    */
   public static Dataset open(String path) {
     return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build());
@@ -158,7 +159,7 @@ public class Dataset implements Closeable {
    *
    * @param path file path
    * @param options the open options
-   * @return Datase
+   * @return Dataset
    */
   public static Dataset open(String path, ReadOptions options) {
     return open(new RootAllocator(Long.MAX_VALUE), true, path, options);
@@ -169,7 +170,7 @@ public class Dataset implements Closeable {
    *
    * @param path file path
    * @param allocator Arrow buffer allocator
-   * @return Datase
+   * @return Dataset
    */
   public static Dataset open(String path, BufferAllocator allocator) {
     return open(allocator, path, new ReadOptions.Builder().build());
@@ -181,7 +182,7 @@ public class Dataset implements Closeable {
    * @param allocator Arrow buffer allocator
    * @param path file path
    * @param options the open options
-   * @return Datase
+   * @return Dataset
    */
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
     return open(allocator, false, path, options);
@@ -192,7 +193,7 @@ public class Dataset implements Closeable {
    *
    * @param path file path
    * @param options the open options
-   * @return Datase
+   * @return Dataset
    */
   private static Dataset open(
       BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
@@ -216,8 +217,8 @@ public class Dataset implements Closeable {
       String path,
       Optional<Integer> version,
       Optional<Integer> blockSize,
-      int indexCacheSize,
-      int metadataCacheSizeBytes,
+      long indexCacheSize,
+      long metadataCacheSizeBytes,
       Map<String, String> storageOptions);
 
   /**
@@ -265,6 +266,16 @@ public class Dataset implements Closeable {
       Optional<Long> readVersion,
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
+
+  /**
+   * Create a new transaction builder at current version for the dataset. The dataset itself will
+   * not refresh after the transaction committed.
+   *
+   * @return A new instance of {@link Transaction.Builder} linked to the opened dataset.
+   */
+  public Transaction.Builder newTransactionBuilder() {
+    return new Transaction.Builder(this).readVersion(version());
+  }
 
   /**
    * Drop a Dataset.
@@ -440,7 +451,7 @@ public class Dataset implements Closeable {
   /**
    * Gets the URI of the dataset.
    *
-   * @return the URI of the datase
+   * @return the URI of the dataset
    */
   public String uri() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -452,9 +463,9 @@ public class Dataset implements Closeable {
   private native String nativeUri();
 
   /**
-   * Get the currently checked out version id of the datase
+   * Get the currently checked out version id of the dataset
    *
-   * @return the version id of the datase
+   * @return the version id of the dataset
    */
   public long version() {
     return getVersion().getId();
@@ -463,7 +474,7 @@ public class Dataset implements Closeable {
   /**
    * Gets the currently checked out version of the dataset.
    *
-   * @return the version of the datase
+   * @return the version of the dataset
    */
   public Version getVersion() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -477,7 +488,7 @@ public class Dataset implements Closeable {
   /**
    * Get the version history of the dataset.
    *
-   * @return the version history of the datase
+   * @return the version history of the dataset
    */
   public List<Version> listVersions() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -510,10 +521,10 @@ public class Dataset implements Closeable {
 
   /**
    * Checks out a specific version of the dataset. If the version is already checked out, it returns
-   * a new Java Dataset object pointing to the same underlying Rust Dataset objec
+   * a new Java Dataset object pointing to the same underlying Rust Dataset object
    *
-   * @param version the version to check ou
-   * @return a new Dataset instance with the specified version checked ou
+   * @param version the version to check out
+   * @return a new Dataset instance with the specified version checked out
    */
   public Dataset checkoutVersion(long version) {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
@@ -526,11 +537,11 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckoutVersion(long version);
 
   /**
-   * Checks out a specific tag of the dataset. If the underlying version is already checked out, i
-   * returns a new Java Dataset object pointing to the same underlying Rust Dataset objec
+   * Checks out a specific tag of the dataset. If the underlying version is already checked out, it
+   * returns a new Java Dataset object pointing to the same underlying Rust Dataset object
    *
-   * @param tag the tag to check ou
-   * @return a new Dataset instance with the specified tag checked ou
+   * @param tag the tag to check out
+   * @return a new Dataset instance with the specified tag checked out
    */
   public Dataset checkoutTag(String tag) {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
@@ -615,7 +626,7 @@ public class Dataset implements Closeable {
   /**
    * Calculate the size of the dataset.
    *
-   * @return the size of the datase
+   * @return the size of the dataset
    */
   public long calculateDataSize() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -627,7 +638,7 @@ public class Dataset implements Closeable {
   /**
    * Calculate the statistics of the dataset.
    *
-   * @return the statistics of the datase
+   * @return the statistics of the dataset
    */
   private native DataStatistics nativeGetDataStatistics();
 
@@ -667,6 +678,20 @@ public class Dataset implements Closeable {
   }
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
+
+  /**
+   * Get the {@link com.lancedb.lance.schema.LanceSchema} of the dataset with field ids.
+   *
+   * @return the LanceSchema
+   */
+  public LanceSchema getLanceSchema() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLanceSchema();
+    }
+  }
+
+  private native LanceSchema nativeGetLanceSchema();
 
   /** @return all the created indexes names */
   public List<String> listIndexes() {
@@ -785,6 +810,38 @@ public class Dataset implements Closeable {
     return new Tags();
   }
 
+  /**
+   * Replace the schema metadata of the dataset.
+   *
+   * @param metadata the new table metadata
+   */
+  public void replaceSchemaMetadata(Map<String, String> metadata) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeReplaceSchemaMetadata(metadata);
+    }
+  }
+
+  private native void nativeReplaceSchemaMetadata(Map<String, String> metadata);
+
+  /**
+   * Replace target field metadata of the dataset. This method won't affect fields not in the map
+   *
+   * @param fieldMetadataMap field id to metadata map
+   */
+  public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      for (Integer fieldId : fieldMetadataMap.keySet()) {
+        Preconditions.checkArgument(fieldId >= 0, "Field id must be greater than 0");
+      }
+      nativeReplaceFieldMetadata(fieldMetadataMap);
+    }
+  }
+
+  private native void nativeReplaceFieldMetadata(
+      Map<Integer, Map<String, String>> fieldMetadataMap);
+
   /** Tag operations of the dataset. */
   public class Tags {
 
@@ -850,6 +907,19 @@ public class Dataset implements Closeable {
         return nativeGetVersionByTag(tag);
       }
     }
+  }
+
+  /**
+   * Execute SQL query on the dataset. The underlying SQL engine is DataFusion. Please refer to the
+   * DataFusion documentation for supported SQL syntax.
+   *
+   * @param sql SELECT statement to execute. The default FROM table name is `dataset`, for example:
+   *     SELECT * FROM `dataset` LIMIT 10. If FROM table name is a custom value, the {@link
+   *     SqlQuery#tableName(String)} should be invoked to set the custom table name.
+   * @return a SqlQuery instance.
+   */
+  public SqlQuery sql(String sql) {
+    return new SqlQuery(this, sql);
   }
 
   /**

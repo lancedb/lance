@@ -74,6 +74,9 @@ from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
+from .trace import TraceEvent as TraceEvent
+from .trace import capture_trace_events as capture_trace_events
+from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
 def infer_tfrecord_schema(
@@ -177,6 +180,8 @@ class _Dataset:
         commit_handler: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         manifest: Optional[bytes] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
     @property

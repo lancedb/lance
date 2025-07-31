@@ -16,7 +16,6 @@ use arrow_array::{
     OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow::FixedSizeListArrayExt;
 use num_traits::{bounds::Bounded, Float, Num};
 
 use crate::{Error, Result};
@@ -153,7 +152,20 @@ where
             .chunks(dim)
             .flat_map(normalize),
     );
-    FixedSizeListArray::try_new_from_values(norm_arr, fsl.value_length())
+
+    // Extract the field from the data type
+    let field = match fsl.data_type() {
+        DataType::FixedSizeList(field, _) => field.clone(),
+        _ => unreachable!("FixedSizeListArray must have FixedSizeList data type"),
+    };
+
+    // Use try_new to preserve the null buffer from the original array
+    FixedSizeListArray::try_new(
+        field,
+        fsl.value_length(),
+        Arc::new(norm_arr),
+        fsl.nulls().cloned(),
+    )
 }
 
 /// L2 normalize a [FixedSizeListArray] (of vectors).
@@ -230,6 +242,8 @@ mod tests {
     use arrow_array::{
         Float32Array, Int16Array, Int8Array, LargeStringArray, StringArray, UInt32Array, UInt8Array,
     };
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::Field;
 
     #[test]
     fn test_argmax() {
@@ -334,5 +348,78 @@ mod tests {
             .enumerate()
             .for_each(|(idx, &x)| assert_relative_eq!(x, (idx + 1) as f32 / 55.0_f32.sqrt()));
         assert_relative_eq!(1.0, normalized.iter().map(|&x| x.powi(2)).sum::<f32>());
+    }
+
+    #[test]
+    fn test_normalize_fsl_with_nulls() {
+        // Create test data with nulls
+        let values = Float32Array::from_iter_values(vec![
+            3.0, 4.0, // First vector: [3, 4] -> will be normalized to [0.6, 0.8]
+            0.0, 0.0, // Second vector: null (values don't matter)
+            5.0, 12.0, // Third vector: [5, 12] -> will be normalized to [5/13, 12/13]
+        ]);
+
+        // Create null buffer where second vector is null
+        let null_buffer = NullBuffer::from(vec![true, false, true]);
+
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl =
+            FixedSizeListArray::try_new(field, 2, Arc::new(values), Some(null_buffer.clone()))
+                .unwrap();
+
+        // Normalize the array
+        let normalized = normalize_fsl(&fsl).unwrap();
+
+        // Verify nulls are preserved
+        assert_eq!(normalized.nulls(), Some(&null_buffer));
+
+        // Verify non-null vectors are normalized correctly
+        let normalized_values = normalized.values().as_primitive::<Float32Type>();
+
+        // First vector [3, 4] -> [0.6, 0.8]
+        assert_relative_eq!(normalized_values.value(0), 0.6);
+        assert_relative_eq!(normalized_values.value(1), 0.8);
+
+        // Third vector [5, 12] -> [5/13, 12/13]
+        assert_relative_eq!(normalized_values.value(4), 5.0 / 13.0);
+        assert_relative_eq!(normalized_values.value(5), 12.0 / 13.0);
+    }
+
+    #[test]
+    fn test_normalize_fsl_edge_cases() {
+        // Test case 1: All nulls
+        let values = Float32Array::from_iter_values(vec![0.0; 6]);
+        let null_buffer = NullBuffer::from(vec![false, false, false]);
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl = FixedSizeListArray::try_new(
+            field.clone(),
+            2,
+            Arc::new(values),
+            Some(null_buffer.clone()),
+        )
+        .unwrap();
+
+        let normalized = normalize_fsl(&fsl).unwrap();
+        assert_eq!(normalized.nulls(), Some(&null_buffer));
+
+        // Test case 2: Empty array
+        let empty_values = Float32Array::from(vec![] as Vec<f32>);
+        let empty_fsl =
+            FixedSizeListArray::try_new(field.clone(), 2, Arc::new(empty_values), None).unwrap();
+
+        let normalized_empty = normalize_fsl(&empty_fsl).unwrap();
+        assert_eq!(normalized_empty.len(), 0);
+
+        // Test case 3: No nulls
+        let values = Float32Array::from_iter_values(vec![1.0, 0.0, 0.0, 1.0]);
+        let fsl_no_nulls = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
+
+        let normalized_no_nulls = normalize_fsl(&fsl_no_nulls).unwrap();
+        assert_eq!(normalized_no_nulls.nulls(), None);
+        let values = normalized_no_nulls.values().as_primitive::<Float32Type>();
+        assert_relative_eq!(values.value(0), 1.0);
+        assert_relative_eq!(values.value(1), 0.0);
+        assert_relative_eq!(values.value(2), 0.0);
+        assert_relative_eq!(values.value(3), 1.0);
     }
 }

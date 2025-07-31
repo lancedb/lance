@@ -14,8 +14,11 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::schema::convert_to_java_field;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
-use crate::utils::{extract_storage_options, extract_write_params, get_index_params, to_rust_map};
+use crate::utils::{
+    extract_storage_options, extract_write_params, get_index_params, to_java_map, to_rust_map,
+};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -33,10 +36,10 @@ use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::TagContents;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
-    ColumnAlteration, Dataset, NewColumnTransform, ProjectionRequest, ReadParams, Version,
-    WriteParams,
+    ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
+    Version, WriteParams,
 };
 use lance::dataset::write::merge_insert::{WhenMatched, WhenNotMatched, WhenNotMatchedBySource};
 use lance::io::{ObjectStore, ObjectStoreParams};
@@ -90,12 +93,12 @@ impl BlockingDataset {
         uri: &str,
         version: Option<i32>,
         block_size: Option<i32>,
-        index_cache_size: i32,
-        metadata_cache_size_bytes: i32,
+        index_cache_size_bytes: i64,
+        metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
     ) -> Result<Self> {
         let params = ReadParams {
-            index_cache_size: index_cache_size as usize,
+            index_cache_size_bytes: index_cache_size_bytes as usize,
             metadata_cache_size_bytes: metadata_cache_size_bytes as usize,
             store_options: Some(ObjectStoreParams {
                 block_size: block_size.map(|size| size as usize),
@@ -255,6 +258,35 @@ impl BlockingDataset {
             batch_size,
             timeout,
         ))?;
+        Ok(())
+    }
+
+    pub fn commit_transaction(
+        &mut self,
+        transaction: Transaction,
+        write_params: HashMap<String, String>,
+    ) -> Result<Self> {
+        let new_dataset = RT.block_on(
+            CommitBuilder::new(Arc::new(self.clone().inner))
+                .with_store_params(ObjectStoreParams {
+                    storage_options: Some(write_params),
+                    ..Default::default()
+                })
+                .execute(transaction),
+        )?;
+        Ok(BlockingDataset { inner: new_dataset })
+    }
+
+    pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        RT.block_on(self.inner.replace_schema_metadata(metadata))?;
+        Ok(())
+    }
+
+    pub fn replace_field_metadata(
+        &mut self,
+        metadata_map: HashMap<u32, HashMap<String, String>>,
+    ) -> Result<()> {
+        RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
         Ok(())
     }
 
@@ -639,8 +671,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     path: JString,
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
-    index_cache_size: jint,
-    metadata_cache_size_bytes: jint,
+    index_cache_size_bytes: jlong,
+    metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -650,7 +682,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             path,
             version_obj,
             block_size_obj,
-            index_cache_size,
+            index_cache_size_bytes,
             metadata_cache_size_bytes,
             storage_options_obj
         )
@@ -662,8 +694,8 @@ fn inner_open_native<'local>(
     path: JString,
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
-    index_cache_size: jint,
-    metadata_cache_size_bytes: jint,
+    index_cache_size_bytes: jlong,
+    metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
@@ -675,7 +707,7 @@ fn inner_open_native<'local>(
         &path_str,
         version,
         block_size,
-        index_cache_size,
+        index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
     )?;
@@ -730,6 +762,41 @@ fn inner_get_fragment<'local>(
         None => JObject::default(),
     };
     Ok(obj)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetLanceSchema<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_lance_schema(&mut env, java_dataset))
+}
+
+fn inner_get_lance_schema<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let schema = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset.inner.schema().clone()
+    };
+    let jfield_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for lance_field in schema.fields.iter() {
+        let java_field = convert_to_java_field(env, lance_field)?;
+        env.call_method(
+            &jfield_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&java_field)],
+        )?;
+    }
+    let metadata = to_java_map(env, &schema.metadata)?;
+    Ok(env.new_object(
+        "com/lancedb/lance/schema/LanceSchema",
+        "(Ljava/util/List;Ljava/util/Map;)V",
+        &[JValue::Object(&jfield_list), JValue::Object(&metadata)],
+    )?)
 }
 
 #[no_mangle]
@@ -1624,7 +1691,7 @@ fn inner_merge_insert(
 ) -> Result<()> {
     let mut dataset = get_dataset_from_java_object(env, java_dataset)?;
     let source_uri: String = env.get_string(&source_dataset_uri)?.into();
-    
+
     // Parse when_matched configuration
     let when_matched = if when_matched_config.is_null() {
         WhenMatched::DoNothing
@@ -1640,7 +1707,7 @@ fn inner_merge_insert(
             }
         }
     };
-    
+
     // Parse when_not_matched configuration
     let when_not_matched = if when_not_matched_config.is_null() {
         WhenNotMatched::DoNothing
@@ -1654,7 +1721,7 @@ fn inner_merge_insert(
             }
         }
     };
-    
+
     // Parse when_not_matched_by_source configuration
     let when_not_matched_by_source = if when_not_matched_by_source_config.is_null() {
         WhenNotMatchedBySource::DoNothing
@@ -1670,7 +1737,7 @@ fn inner_merge_insert(
             }
         }
     };
-    
+
     // Parse batch_size
     let batch_size = if batch_size_obj.is_null() {
         None
@@ -1683,7 +1750,7 @@ fn inner_merge_insert(
             Some(batch_size_int.i()? as usize)
         }
     };
-    
+
     // Parse timeout
     let timeout = if timeout_millis_obj.is_null() {
         None
@@ -1696,7 +1763,7 @@ fn inner_merge_insert(
             Some(Duration::from_millis(timeout_long.j()? as u64))
         }
     };
-    
+
     // Execute merge insert
     dataset.merge_insert(
         &source_uri,
@@ -1706,4 +1773,62 @@ fn inner_merge_insert(
         batch_size,
         timeout,
     )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceSchemaMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jschema_metadata: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata)
+    )
+}
+
+fn inner_replace_schema_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jschema_metadata: JObject,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &jschema_metadata)?;
+    let schema_metadata = to_rust_map(env, &jmap)?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_schema_metadata(schema_metadata)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jfield_metadata_map: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map)
+    )
+}
+
+fn inner_replace_field_metadata(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jfield_metadata_map: JObject,
+) -> Result<()> {
+    let jmap = JMap::from_env(env, &jfield_metadata_map)?;
+    let mut field_metadata_map = HashMap::new();
+    let mut iter = jmap.iter(env)?;
+    env.with_local_frame(16, |env| {
+        while let Some((key, value)) = iter.next(env)? {
+            let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
+            let inner_map = JMap::from_env(env, &value)?;
+            let value_map = to_rust_map(env, &inner_map)?;
+            field_metadata_map.insert(field_id, value_map);
+        }
+        Ok::<(), Error>(())
+    })?;
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.replace_field_metadata(field_metadata_map)
 }

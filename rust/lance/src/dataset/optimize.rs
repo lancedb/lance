@@ -92,6 +92,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -102,8 +103,9 @@ use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
 use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
-use super::utils::make_rowid_capture_stream;
+use super::utils::make_rowaddr_capture_stream;
 use super::{write_fragments_internal, WriteMode, WriteParams};
+use tracing::info;
 
 pub mod remapping;
 
@@ -217,6 +219,7 @@ pub async fn compact_files(
     mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     options.validate();
 
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
@@ -687,9 +690,9 @@ async fn rewrite_files(
         .scan_in_order(true);
     let (row_ids, reader) = if needs_remapping {
         let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-        scanner.with_row_id();
+        scanner.with_row_address();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let data_no_row_ids = make_rowid_capture_stream(row_ids.clone(), data)?;
+        let data_no_row_ids = make_rowaddr_capture_stream(row_ids.clone(), data)?;
         (Some(row_ids), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
@@ -989,7 +992,7 @@ mod tests {
     use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
-    use lance_index::IndexType;
+    use lance_index::{Index, IndexType};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -1955,9 +1958,18 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                .await
+                .unwrap();
+        let stats = frag_reuse_index.statistics().unwrap();
+        assert_eq!(
+            serde_json::to_string(&stats).unwrap(),
+            dataset
+                .index_statistics(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+        );
 
         // Verify the index has one version with the correct dataset version
         let compaction_version = &frag_reuse_index.details.versions[0];
@@ -2061,9 +2073,10 @@ mod tests {
                 load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
                     .await
                     .unwrap();
-            let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-                .await
-                .unwrap();
+            let frag_reuse_index =
+                open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                    .await
+                    .unwrap();
 
             // Verify the index has one version with the correct dataset version
             assert_eq!(
@@ -2154,9 +2167,10 @@ mod tests {
         let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
             .await
             .unwrap();
-        let frag_reuse_index = open_frag_reuse_index(frag_reuse_details.as_ref())
-            .await
-            .unwrap();
+        let frag_reuse_index =
+            open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
+                .await
+                .unwrap();
 
         assert_eq!(frag_reuse_index.details.versions.len(), plan.tasks().len());
 
@@ -2481,7 +2495,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Concurrently commit a FRI cleanup operation.
+        // Concurrently commit a frag_reuse_index cleanup operation.
         // Because there is no index, it should remove the first version.
         // but after rebase it should contain the new compaction versions.
         cleanup_frag_reuse_index(&mut dataset_clone).await.unwrap();
@@ -2561,7 +2575,7 @@ mod tests {
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 1);
 
-        // First commit the FRI cleanup
+        // First commit the frag_reuse_index cleanup
         // Because there is no index, it should remove the first version.
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
 
@@ -2783,13 +2797,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected bitmap index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[category = 1]@category_idx"),
+            "Expected index query in plan: {}",
             plan
         );
     }
@@ -2882,13 +2891,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected btree index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[id >= 2000 && id < 3000]@id_idx"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
@@ -3151,13 +3155,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected inverted index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[contains(doc, Utf8"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }
@@ -3254,13 +3253,8 @@ mod tests {
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("MaterializeIndex"),
-            "Expected label list index scan in plan: {}",
-            plan
-        );
-        assert!(
-            !plan.contains("LanceScan"),
-            "Expected no fragment scan in plan: {}",
+            plan.contains("ScalarIndexQuery: query=[array_has_any(labels, List([1]))]@labels_idx"),
+            "Expected scalar index query in plan: {}",
             plan
         );
     }

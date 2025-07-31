@@ -111,7 +111,7 @@ enum UploadState {
 
 /// Methods for state transitions.
 impl UploadState {
-    fn started_to_completing(&mut self, path: Arc<Path>, buffer: Vec<u8>) {
+    fn started_to_putting_single(&mut self, path: Arc<Path>, buffer: Vec<u8>) {
         // To get owned self, we temporarily swap with Done.
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
@@ -457,7 +457,7 @@ impl AsyncWrite for ObjectWriter {
                     // If we didn't start a multipart upload, we can just do a single put.
                     let part = std::mem::take(&mut mut_self.buffer);
                     let path = mut_self.path.clone();
-                    self.state.started_to_completing(path, part);
+                    self.state.started_to_putting_single(path, part);
                 }
                 UploadState::InProgress {
                     upload,

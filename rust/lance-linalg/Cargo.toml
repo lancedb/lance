@@ -11,6 +11,7 @@ categories = { workspace = true }
 
 [dependencies]
 arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 bitvec = { workspace = true }
@@ -67,14 +68,6 @@ harness = false
 
 [[bench]]
 name = "norm_l2"
-harness = false
-
-[[bench]]
-name = "kmeans"
-harness = false
-
-[[bench]]
-name = "compute_partition"
 harness = false
 
 [lints]

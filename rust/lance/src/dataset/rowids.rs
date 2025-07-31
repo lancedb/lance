@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::Dataset;
+use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use snafu::location;
@@ -18,26 +19,34 @@ pub async fn load_row_id_sequence(
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
     // Virtual path to prevent collisions in the cache.
-    let path = dataset.base.child(fragment.id.to_string()).child("row_ids");
     match &fragment.row_id_meta {
         None => Err(Error::Internal {
             message: "Missing row id meta".into(),
             location: location!(),
         }),
         Some(RowIdMeta::Inline(data)) => {
+            let data = data.clone();
+            let key = RowIdSequenceKey {
+                fragment_id: fragment.id,
+            };
             dataset
                 .metadata_cache
-                .get_or_insert(path.to_string(), |_path| async { read_row_ids(data) })
+                .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
                 .await
         }
         Some(RowIdMeta::External(file_slice)) => {
+            let file_slice = file_slice.clone();
+            let dataset_clone = dataset.clone();
+            let key = RowIdSequenceKey {
+                fragment_id: fragment.id,
+            };
             dataset
                 .metadata_cache
-                .get_or_insert(path.to_string(), |_path| async {
-                    let path = dataset.base.child(file_slice.path.as_str());
+                .get_or_insert_with_key(key, || async move {
+                    let path = dataset_clone.base.child(file_slice.path.as_str());
                     let range = file_slice.offset as usize
                         ..(file_slice.offset as usize + file_slice.size as usize);
-                    let data = dataset
+                    let data = dataset_clone
                         .object_store
                         .open(&path)
                         .await?
@@ -69,12 +78,12 @@ pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
     if dataset.manifest.uses_move_stable_row_ids() {
-        let cache_key = format!("row_id_index/{}", dataset.manifest.version);
+        let key = RowIdIndexKey {
+            version: dataset.manifest.version,
+        };
         let index = dataset
             .metadata_cache
-            .get_or_insert(cache_key, |_path| async {
-                load_row_id_index(dataset).await
-            })
+            .get_or_insert_with_key(key, || load_row_id_index(dataset))
             .await?;
         Ok(Some(index))
     } else {
@@ -100,11 +109,19 @@ mod test {
 
     use super::*;
 
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
+    use lance_core::datatypes::Schema;
     use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
+    use lance_datagen::Dimension;
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+    use std::collections::HashMap;
+    use std::collections::HashSet;
 
     fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -421,5 +438,130 @@ mod test {
         assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
     }
 
-    // TODO: query / scan / take after deletion, compaction, then deletion
+    #[tokio::test]
+    async fn test_stable_row_id_after_multiple_deletion_and_compaction() {
+        fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {
+            row_ids
+                .values()
+                .iter()
+                .zip(i_array.values().iter())
+                .map(|(&row_id, &i)| (row_id, i))
+                .collect()
+        }
+
+        async fn scan_rowid_map(dataset: &Dataset) -> HashMap<u64, i32> {
+            let mut scan = dataset.scan();
+            scan.with_row_id();
+            scan.scan_in_order(true);
+            let result = scan.try_into_batch().await.unwrap();
+            let i = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let row_ids = result[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            build_rowid_to_i_map(row_ids, i)
+        }
+
+        async fn compact(dataset: &mut Dataset, target_rows: usize) {
+            let options = CompactionOptions {
+                target_rows_per_fragment: target_rows,
+                ..Default::default()
+            };
+            let _ = compact_files(dataset, options, None).await.unwrap();
+        }
+
+        async fn delete(dataset: &mut Dataset, expr: &str) {
+            dataset.delete(expr).await.unwrap();
+        }
+
+        let mut dataset = lance_datagen::gen()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col(
+                "category",
+                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_move_stable_row_ids: true,
+                    enable_v2_manifest_paths: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // first delete and compact
+        delete(&mut dataset, "i = 2 or i = 3 or i = 5").await;
+        let map_before = scan_rowid_map(&dataset).await;
+        compact(&mut dataset, 20).await;
+        let map_after = scan_rowid_map(&dataset).await;
+
+        // verify row id
+        assert_eq!(
+            map_before.keys().collect::<HashSet<_>>(),
+            map_after.keys().collect::<HashSet<_>>()
+        );
+        for row_id in map_before.keys() {
+            assert_eq!(map_before[row_id], map_after[row_id]);
+        }
+
+        // second delete
+        delete(&mut dataset, "i = 9").await;
+        let mut scan = dataset.scan();
+        let result = scan
+            .filter("i >= 0")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let id_set = ids.values().iter().cloned().collect::<HashSet<_>>();
+        let expected: Vec<i32> = (0..60)
+            .filter(|&i| i != 2 && i != 3 && i != 5 && i != 9)
+            .collect();
+        assert_eq!(id_set, expected.iter().cloned().collect());
+
+        // get the row_id where i == 15
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        scan.scan_in_order(true);
+        let result = scan
+            .filter("i == 15")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_id_vec = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+
+        // third delete and compact
+        delete(&mut dataset, "i = 15 or i = 25").await;
+        let map_before = scan_rowid_map(&dataset).await;
+        compact(&mut dataset, 30).await;
+        let map_after = scan_rowid_map(&dataset).await;
+
+        assert_eq!(
+            map_before.keys().collect::<HashSet<_>>(),
+            map_after.keys().collect::<HashSet<_>>()
+        );
+        for row_id in map_before.keys() {
+            assert_eq!(map_before[row_id], map_after[row_id]);
+        }
+
+        // verify the rowid represent i == 15 has been deleted
+        let result = dataset
+            .take_rows(&row_id_vec, Schema::try_from(dataset.schema()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
 }

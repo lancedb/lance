@@ -25,6 +25,8 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
+use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
+use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
 ///
@@ -151,6 +153,11 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
+        self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
+        self
+    }
+
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
@@ -230,9 +237,12 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
-        let metadata_cache = match &dest {
-            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
-            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.with_key_prefix(uri)),
+        let (metadata_cache, index_cache) = match &dest {
+            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
+            WriteDestination::Uri(uri) => (
+                Arc::new(session.metadata_cache.for_dataset(uri)),
+                Arc::new(session.index_cache.for_dataset(uri)),
+            ),
         };
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
@@ -323,6 +333,16 @@ impl<'a> CommitBuilder<'a> {
             .await?
         };
 
+        info!(
+            target: TRACE_DATASET_EVENTS,
+            event=DATASET_COMMITTED_EVENT,
+            uri=dest.uri(),
+            read_version=transaction.read_version,
+            committed_version=manifest.version,
+            detached=self.detached,
+            operation=&transaction.operation.name()
+        );
+
         let tags = Tags::new(
             object_store.clone(),
             commit_handler.clone(),
@@ -345,7 +365,9 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                index_cache,
                 metadata_cache,
+                file_reader_options: None,
             }),
         }
     }
@@ -731,6 +753,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
+                mem_wal_to_flush: None,
             },
             read_version: 1,
             blobs_op: None,

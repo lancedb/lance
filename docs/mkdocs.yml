@@ -27,6 +27,7 @@ theme:
     - navigation.tabs
     - navigation.sections
     - navigation.instant
+    - navigation.indexes
     - navigation.tracking
     - navigation.top
     - search.highlight
@@ -69,10 +70,12 @@ extra:
       link: https://twitter.com/lancedb
 
 nav:
-  - Introduction: index.md
   - Getting Started:
-    - Install: start/install.md
-    - Quickstart: start/quickstart.md
+    - Lance Documentation: index.md
+    - Quickstart:
+      - Getting Started with Lance: quickstart/index.md
+      - Versioning: quickstart/versioning.md
+      - Vector Search: quickstart/vector-search.md
   - User Guide:
     - Read and Write: guide/read_and_write.md
     - Data Evolution: guide/data_evolution.md
@@ -83,22 +86,15 @@ nav:
     - Performance Guide: guide/performance.md
     - Tokenizer: guide/tokenizer.md
     - Extension Arrays: guide/arrays.md
-  - Format:
-    - Format: format/format.md
-  - Catalog Integrations: https://lancedb.github.io/lance-namespace
-  - Compute Integrations:
-    - Apache DataFusion: integrations/datafusion.md
-    - Apache Spark: https://lancedb.github.io/lance-spark
-    - DuckDB: integrations/duckdb.md
-    - Huggingface: integrations/huggingface.md
-    - PostgreSQL: https://github.com/lancedb/pglance
-    - PyTorch: integrations/pytorch.md
-    - Ray: integrations/ray.md
-    - Tensorflow: integrations/tensorflow.md
-    - Trino: https://github.com/lancedb/lance-trino
-  - Community:
-    - Contributing: community/contributing.md
-    - Lancelot: community/lancelot.md
+  - Format Specification:
+    - Overview: format/index.md
+    - Table Format: format/table.md
+    - File Format: format/file.md
+  - SDK Docs:
+    - Overview: sdk_docs.md
+    - Python: https://lancedb.github.io/lance-python-doc
+    - Rust: https://docs.rs/lance/latest/lance
+    - Java: https://www.javadoc.io/doc/com.lancedb/lance-core/latest/index.html
   - Examples:
     - Python:
       - LLM Dataset Creation: examples/python/llm_dataset_creation.md
@@ -110,8 +106,17 @@ nav:
       - Write/Read Dataset: examples/rust/write_read_dataset.md
       - HNSW Vector Index: examples/rust/hnsw.md
       - LLM Dataset Creation: examples/rust/llm_dataset_creation.md
-  - SDK Docs:
-      - Overview: sdk_docs.md
-      - Python: https://lancedb.github.io/lance-python-doc
-      - Rust: https://docs.rs/lance/latest/lance
-      - Java: https://www.javadoc.io/doc/com.lancedb/lance-core/latest/index.html
+  - Compute Integrations:
+    - Apache DataFusion: integrations/datafusion.md
+    - Apache Spark: https://lancedb.github.io/lance-spark
+    - DuckDB: integrations/duckdb.md
+    - Huggingface: integrations/huggingface.md
+    - PostgreSQL: https://github.com/lancedb/pglance
+    - PyTorch: integrations/pytorch.md
+    - Ray: integrations/ray.md
+    - Tensorflow: integrations/tensorflow.md
+    - Trino: https://github.com/lancedb/lance-trino
+  - Catalog Integrations: https://lancedb.github.io/lance-namespace
+  - Community Guidelines:
+      - Contribution Guidelines: community/index.md
+      - Lancelot Program: community/lancelot.md

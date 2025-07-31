@@ -53,13 +53,11 @@ def download_lindera(lm: str):
     dirname = os.path.join(LANGUAGE_MODEL_HOME, "lindera", lm)
     src_dirname = os.path.join(dirname, "src")
     if lm == "ipadic":
-        url = "https://lindera.s3.ap-northeast-1.amazonaws.com/mecab-ipadic-2.7.0-20070801.tar.gz"
+        url = "https://Lindera.dev/mecab-ipadic-2.7.0-20070801.tar.gz"
     elif lm == "ko-dic":
-        url = "https://lindera.s3.ap-northeast-1.amazonaws.com/mecab-ko-dic-2.1.1-20180720.tar.gz"
+        url = "https://Lindera.dev/mecab-ko-dic-2.1.1-20180720.tar.gz"
     elif lm == "unidic":
-        url = (
-            "https://lindera.s3.ap-northeast-1.amazonaws.com/unidic-mecab-2.1.2.tar.gz"
-        )
+        url = "https://Lindera.dev/unidic-mecab-2.1.2.tar.gz"
     else:
         raise Exception(f"language model {lm} is not supported")
     os.makedirs(src_dirname, exist_ok=True)

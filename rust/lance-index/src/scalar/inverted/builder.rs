@@ -218,7 +218,9 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         for part in self.partitions.iter() {
-            let part = InvertedPartition::load(src_store.clone(), *part, None).await?;
+            let part =
+                InvertedPartition::load(src_store.clone(), *part, None, LanceCache::no_cache())
+                    .await?;
             let mut builder = part.into_builder().await?;
             builder.remap(mapping).await?;
             builder.write(dest_store).await?;
@@ -240,16 +242,27 @@ impl InvertedIndexBuilder {
     }
 
     async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        let partitions =
-            futures::future::try_join_all(
-                self.partitions
-                    .iter()
-                    .map(|part| InvertedPartition::load(self.src_store.clone(), *part, None))
-                    .chain(self.new_partitions.iter().map(|part| {
-                        InvertedPartition::load(self.local_store.clone(), *part, None)
-                    })),
-            )
-            .await?;
+        let partitions = futures::future::try_join_all(
+            self.partitions
+                .iter()
+                .map(|part| {
+                    InvertedPartition::load(
+                        self.src_store.clone(),
+                        *part,
+                        None,
+                        LanceCache::no_cache(),
+                    )
+                })
+                .chain(self.new_partitions.iter().map(|part| {
+                    InvertedPartition::load(
+                        self.local_store.clone(),
+                        *part,
+                        None,
+                        LanceCache::no_cache(),
+                    )
+                })),
+        )
+        .await?;
         let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
         let partitions = merger.merge().await?;
         self.write_metadata(dest_store, &partitions).await?;
@@ -298,19 +311,19 @@ impl InnerBuilder {
         // - if the a row is removed, we need to shift the doc ids of the following rows
         // - if a row is updated (assigned a new row id), we don't need to do anything with the posting lists
         let mut token_id = 0;
-        let mut empty_posting_lists = Vec::new();
+        let mut removed_token_ids = Vec::new();
         self.posting_lists.retain_mut(|posting_list| {
             posting_list.remap(&removed);
             let keep = !posting_list.is_empty();
             if !keep {
-                empty_posting_lists.push(token_id as u32);
+                removed_token_ids.push(token_id as u32);
             }
             token_id += 1;
             keep
         });
 
         // for the tokens, remap the token ids if any posting list is empty
-        self.tokens.remap(&empty_posting_lists);
+        self.tokens.remap(&removed_token_ids);
 
         Ok(())
     }

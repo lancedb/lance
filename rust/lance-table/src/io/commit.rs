@@ -1062,12 +1062,16 @@ impl Debug for ConditionalPutCommitHandler {
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,
+    pub skip_auto_cleanup: bool,
     // TODO: add isolation_level
 }
 
 impl Default for CommitConfig {
     fn default() -> Self {
-        Self { num_retries: 20 }
+        Self {
+            num_retries: 20,
+            skip_auto_cleanup: false,
+        }
     }
 }
 

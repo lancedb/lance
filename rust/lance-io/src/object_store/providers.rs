@@ -21,6 +21,8 @@ pub mod azure;
 pub mod gcp;
 pub mod local;
 pub mod memory;
+#[cfg(feature = "oss")]
+pub mod oss;
 
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
@@ -237,6 +239,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("az".into(), Arc::new(azure::AzureBlobStoreProvider));
         #[cfg(feature = "gcp")]
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
+        #[cfg(feature = "oss")]
+        providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
