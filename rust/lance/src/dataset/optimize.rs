@@ -759,7 +759,7 @@ async fn rewrite_files(
             row_ids.serialize_into(&mut changed_row_addrs)?;
             (None, Some(changed_row_addrs))
         } else {
-            let row_id_map = remapping::transpose_row_ids(row_ids, &fragments, &new_fragments);
+            let row_id_map = remapping::transpose_row_addrs(row_ids, &fragments, &new_fragments);
             (Some(row_id_map), None)
         }
     } else {
@@ -971,7 +971,9 @@ mod tests {
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
-    use crate::dataset::optimize::remapping::{transpose_row_ids, transpose_row_ids_from_digest};
+    use crate::dataset::optimize::remapping::{
+        transpose_row_addrs, transpose_row_addrs_from_digest,
+    };
     use crate::dataset::WriteDestination;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
@@ -1887,7 +1889,7 @@ mod tests {
             let changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor).unwrap();
 
             // Use transpose_row_ids to convert changed_row_addrs to row_id_map
-            let transposed_map = transpose_row_ids(
+            let transposed_map = transpose_row_addrs(
                 changed_row_addrs,
                 &deferred_result.original_fragments,
                 &deferred_result.new_fragments,
@@ -1990,7 +1992,7 @@ mod tests {
             compacted_all_old_frag_digests.extend(group.old_frags.clone());
             compacted_all_new_frag_digests.extend(group.new_frags.clone());
 
-            let group_transposed_map = transpose_row_ids_from_digest(
+            let group_transposed_map = transpose_row_addrs_from_digest(
                 changed_row_addrs,
                 &group.old_frags,
                 &group.new_frags,
