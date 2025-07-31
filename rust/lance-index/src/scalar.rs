@@ -219,10 +219,6 @@ pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     fn to_expr(&self, col: String) -> Expr;
     /// Compare this query to another query
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool;
-    /// If true, the query results are inexact and will need rechecked
-    fn needs_recheck(&self) -> bool {
-        false
-    }
 }
 
 impl PartialEq for dyn AnyQuery {
@@ -555,10 +551,6 @@ impl AnyQuery for TextQuery {
             Some(o) => self == o,
             None => false,
         }
-    }
-
-    fn needs_recheck(&self) -> bool {
-        true
     }
 }
 

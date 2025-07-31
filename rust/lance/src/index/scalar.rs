@@ -449,7 +449,8 @@ pub async fn open_scalar_index(
             Ok(ngram_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::ZoneMap => {
-            let zone_map_index = ZoneMapIndex::load(index_store, fri).await?;
+            let zone_map_index =
+                ZoneMapIndex::load(index_store, frag_reuse_index, index_cache).await?;
             Ok(zone_map_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::BTree => {

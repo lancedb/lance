@@ -1353,32 +1353,38 @@ impl DatasetIndexInternalExt for Dataset {
                 ),
                 location: location!(),
             })?;
+            let index_type =
+                detect_scalar_index_type(self, index, &field.name, self.session.as_ref()).await?;
 
             let query_parser = match field.data_type() {
                 DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))
                     as Box<dyn ScalarQueryParser>,
-                DataType::Utf8 | DataType::LargeUtf8 => {
-                    let index_type = detect_scalar_index_type(self, index, &field.name).await?;
-                    match index_type {
-                        ScalarIndexType::BTree
-                        | ScalarIndexType::Bitmap
-                        | ScalarIndexType::ZoneMap => {
-                            Box::new(SargableQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        ScalarIndexType::NGram => {
-                            Box::new(TextQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        ScalarIndexType::Inverted => {
-                            Box::new(FtsQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        _ => continue,
+                DataType::Utf8 | DataType::LargeUtf8 => match index_type {
+                    ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
+                        Box::new(SargableQueryParser::new(index.name.clone(), false))
+                            as Box<dyn ScalarQueryParser>
                     }
+                    ScalarIndexType::ZoneMap => {
+                        Box::new(SargableQueryParser::new(index.name.clone(), true))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                    ScalarIndexType::NGram => {
+                        Box::new(TextQueryParser::new(index.name.clone(), true))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                    ScalarIndexType::Inverted => Box::new(FtsQueryParser::new(index.name.clone()))
+                        as Box<dyn ScalarQueryParser>,
+                    _ => continue,
+                },
+                _ => {
+                    // inexact index filter
+                    let needs_recheck = match index_type {
+                        ScalarIndexType::ZoneMap => true,
+                        _ => false,
+                    };
+                    Box::new(SargableQueryParser::new(index.name.clone(), needs_recheck))
+                        as Box<dyn ScalarQueryParser>
                 }
-                _ => Box::new(SargableQueryParser::new(index.name.clone()))
-                    as Box<dyn ScalarQueryParser>,
             };
 
             indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
