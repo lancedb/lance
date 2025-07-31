@@ -75,7 +75,7 @@ impl IndexRemapperOptions for IgnoreRemap {
 }
 
 /// Iterator that yields row_addrs that are in the given fragments but not in
-/// the given row_ids iterator.
+/// the given row_addrs iterator.
 struct MissingAddrs<'a, I: Iterator<Item = u64>> {
     row_addrs: I,
     expected_row_addr: u64,
@@ -399,7 +399,7 @@ mod tests {
         ];
 
         // Written as pairs of (fragment_id, offset)
-        let row_ids = vec![
+        let row_addrs = vec![
             (0, 1),
             (0, 3),
             (0, 4),
@@ -409,10 +409,10 @@ mod tests {
             (1, 1),
             (1, 2),
         ];
-        let row_ids = row_ids
+        let row_addrs = row_addrs
             .into_iter()
             .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into());
-        let result = MissingAddrs::new(row_ids, &fragments).collect::<Vec<_>>();
+        let result = MissingAddrs::new(row_addrs, &fragments).collect::<Vec<_>>();
 
         let expected = vec![(0, 0), (0, 2), (3, 1)];
         let expected = expected
