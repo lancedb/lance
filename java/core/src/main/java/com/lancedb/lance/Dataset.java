@@ -919,6 +919,28 @@ public class Dataset implements Closeable {
 
   private native void nativeUpdateFieldMetadata(Map<Integer, Map<String, String>> fieldUpdates, boolean replace);
 
+  /**
+   * Update metadata for multiple fields using field paths.
+   *
+   * This method supports both incremental updates (default) and full replacement.
+   * It can handle nested fields using dot notation (e.g., "struct_field.sub_field").
+   *
+   * @param fieldUpdates field metadata updates where keys are field paths and values are metadata maps.
+   *                     For each field's metadata map:
+   *                     - String values: Set the metadata key to this value
+   *                     - null values: Remove the metadata key (ignored in replace mode)
+   * @param replace if true, completely replace all metadata for the specified fields.
+   *                If false, incrementally update only the specified keys for each field.
+   */
+  public void updateFieldMetadataByPath(Map<String, Map<String, String>> fieldUpdates, boolean replace) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeUpdateFieldMetadataByPath(fieldUpdates, replace);
+    }
+  }
+
+  private native void nativeUpdateFieldMetadataByPath(Map<String, Map<String, String>> fieldUpdates, boolean replace);
+
   /** Tag operations of the dataset. */
   public class Tags {
 

@@ -1793,6 +1793,58 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateFieldMetadata(
     )
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateFieldMetadataByPath(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    field_updates_map: JObject,
+    replace: jboolean,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_update_field_metadata_by_path(&mut env, java_dataset, field_updates_map, replace)
+    )
+}
+
+fn inner_update_field_metadata_by_path(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    field_updates_map: JObject,
+    replace: jboolean,
+) -> Result<()> {
+    use lance_core::datatypes::FieldRef;
+
+    let jmap = JMap::from_env(env, &field_updates_map)?;
+    // First collect field paths as owned strings
+    let mut field_path_updates: Vec<(String, HashMap<String, Option<String>>)> = Vec::new();
+    let mut iter = jmap.iter(env)?;
+    env.with_local_frame(16, |env| {
+        while let Some((key, value)) = iter.next(env)? {
+            let field_path = env.get_string(&key.into())?;
+            let field_path_str = field_path
+                .to_str()
+                .map_err(|e| Error::JNI {
+                    message: format!("Failed to convert field path to string: {}", e),
+                })?
+                .to_string();
+            let inner_map = JMap::from_env(env, &value)?;
+            let field_metadata = to_rust_optional_map(env, &inner_map)?;
+            field_path_updates.push((field_path_str, field_metadata));
+        }
+        Ok::<(), Error>(())
+    })?;
+
+    // Then convert to FieldRef
+    let field_updates: HashMap<FieldRef, HashMap<String, Option<String>>> = field_path_updates
+        .iter()
+        .map(|(path, metadata)| (FieldRef::ByPath(path.as_str()), metadata.clone()))
+        .collect();
+
+    let mut dataset_guard =
+        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
+    dataset_guard.update_field_metadata_by_ref(field_updates, replace != 0)
+}
+
 fn inner_update_field_metadata(
     env: &mut JNIEnv,
     java_dataset: JObject,

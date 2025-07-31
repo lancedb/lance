@@ -1924,6 +1924,47 @@ impl Dataset {
         .await
     }
 
+    /// Update field metadata using field references (ID or path).
+    ///
+    /// Pass `None` for a value to remove that key from the field's metadata.
+    /// Pass `replace=true` to replace the entire metadata map for each field.
+    ///
+    /// # Arguments
+    /// * `field_updates` - Map from field references to metadata updates
+    /// * `replace` - If true, replace the entire metadata map for each field
+    pub async fn update_field_metadata_by_ref(
+        &mut self,
+        field_updates: HashMap<
+            lance_core::datatypes::FieldRef<'_>,
+            HashMap<String, Option<String>>,
+        >,
+        replace: bool,
+    ) -> Result<()> {
+        let schema = self.schema();
+        let field_metadata_updates = field_updates
+            .into_iter()
+            .map(|(field_ref, values)| {
+                let field_id = field_ref.into_id(&schema)?;
+                let update_map = UpdateMap {
+                    update_entries: values
+                        .into_iter()
+                        .map(|(k, v)| UpdateMapEntry { key: k, value: v })
+                        .collect(),
+                    replace,
+                };
+                Ok((field_id as u32, update_map))
+            })
+            .collect::<Result<HashMap<u32, UpdateMap>>>()?;
+
+        self.update_op(Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates,
+        })
+        .await
+    }
+
     /// Update field metadata.
     ///
     /// Pass `None` for a value to remove that key from the field's metadata.
@@ -1933,26 +1974,16 @@ impl Dataset {
         field_updates: HashMap<u32, HashMap<String, Option<String>>>,
         replace: bool,
     ) -> Result<()> {
-        let field_metadata_updates = field_updates
+        use lance_core::datatypes::FieldRef;
+
+        // Convert u32 field IDs to FieldRef::ById
+        let field_ref_updates = field_updates
             .into_iter()
-            .map(|(field_id, values)| {
-                let update_map = UpdateMap {
-                    update_entries: values
-                        .into_iter()
-                        .map(|(k, v)| UpdateMapEntry { key: k, value: v })
-                        .collect(),
-                    replace,
-                };
-                (field_id, update_map)
-            })
+            .map(|(field_id, values)| (FieldRef::ById(field_id as i32), values))
             .collect();
-        self.update_op(Operation::UpdateConfig {
-            config_updates: None,
-            table_metadata_updates: None,
-            schema_metadata_updates: None,
-            field_metadata_updates,
-        })
-        .await
+
+        self.update_field_metadata_by_ref(field_ref_updates, replace)
+            .await
     }
 
     /// Update schema metadata
@@ -4061,6 +4092,96 @@ mod tests {
 
         let field = dataset.manifest.schema.field_by_id(0).unwrap();
         assert_eq!(field.metadata.get("field_key").unwrap(), "field_value");
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_by_path() {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::collections::HashMap;
+
+        // Create a schema with nested fields
+        let inner_field = ArrowField::new("inner", DataType::Int32, false);
+        let struct_field =
+            ArrowField::new("outer", DataType::Struct(vec![inner_field].into()), false);
+        let simple_field = ArrowField::new("simple", DataType::Int32, false);
+
+        let schema = Arc::new(ArrowSchema::new(vec![struct_field, simple_field]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create some test data
+        use arrow_array::{Int32Array, RecordBatch, StructArray};
+        let inner_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let inner_field = Arc::new(ArrowField::new("inner", DataType::Int32, false));
+        let struct_array = Arc::new(StructArray::from(vec![(
+            inner_field,
+            inner_array.clone() as _,
+        )]));
+        let simple_array = Arc::new(Int32Array::from(vec![4, 5, 6]));
+
+        let data = RecordBatch::try_new(schema.clone(), vec![struct_array as _, simple_array as _])
+            .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test updating nested field metadata using field paths
+        use lance_core::datatypes::FieldRef;
+        let mut field_updates = HashMap::new();
+        let mut nested_metadata = HashMap::new();
+        nested_metadata.insert(
+            "description".to_string(),
+            Some("nested field description".to_string()),
+        );
+        nested_metadata.insert("type".to_string(), Some("inner_field".to_string()));
+        field_updates.insert(FieldRef::ByPath("outer.inner"), nested_metadata);
+
+        let mut simple_metadata = HashMap::new();
+        simple_metadata.insert(
+            "description".to_string(),
+            Some("simple field description".to_string()),
+        );
+        field_updates.insert(FieldRef::ByPath("simple"), simple_metadata);
+
+        dataset
+            .update_field_metadata_by_ref(field_updates, false)
+            .await
+            .unwrap();
+
+        // Verify the metadata was set correctly
+        let schema = dataset.schema();
+
+        // Find the nested field by path
+        let nested_field = schema.field("outer.inner").unwrap();
+        assert_eq!(
+            nested_field.metadata.get("description").unwrap(),
+            "nested field description"
+        );
+        assert_eq!(nested_field.metadata.get("type").unwrap(), "inner_field");
+
+        // Find the simple field by path
+        let simple_field = schema.field("simple").unwrap();
+        assert_eq!(
+            simple_field.metadata.get("description").unwrap(),
+            "simple field description"
+        );
+
+        // Test error handling for non-existent field path
+        let mut invalid_updates = HashMap::new();
+        let mut invalid_metadata = HashMap::new();
+        invalid_metadata.insert("key".to_string(), Some("value".to_string()));
+        invalid_updates.insert(FieldRef::ByPath("nonexistent.field"), invalid_metadata);
+
+        let result = dataset
+            .update_field_metadata_by_ref(invalid_updates, false)
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Field 'nonexistent.field' not found"));
     }
 
     #[tokio::test]

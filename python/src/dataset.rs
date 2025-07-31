@@ -1971,6 +1971,31 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature = (field_updates, *, replace = false))]
+    fn update_field_metadata_by_path(
+        &mut self,
+        field_updates: HashMap<String, HashMap<String, Option<String>>>,
+        replace: bool,
+    ) -> PyResult<()> {
+        use lance_core::datatypes::FieldRef;
+
+        let mut new_self = self.ds.as_ref().clone();
+
+        // Convert String paths to FieldRef::ByPath
+        let field_ref_updates = field_updates
+            .iter()
+            .map(|(path, values)| (FieldRef::ByPath(path.as_str()), values.clone()))
+            .collect();
+
+        RT.block_on(
+            None,
+            new_self.update_field_metadata_by_ref(field_ref_updates, replace),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     #[pyo3(signature = (index_name))]
     fn get_ivf_model(
         &self,

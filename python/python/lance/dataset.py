@@ -981,23 +981,8 @@ class LanceDataset(pa.dataset.Dataset):
         ...     "user_id": {"description": "User ID"}
         ... }, replace=True)
         """
-        # Convert field paths to field IDs
-        field_id_updates = {}
-        for field_path, metadata in field_updates.items():
-            field = self.schema.field(field_path)
-            if field is None:
-                raise ValueError(f"Field '{field_path}' not found in schema")
-            # Get field ID from the Lance schema (not PyArrow)
-            lance_field = None
-            for f in self._ds.lance_schema.fields():
-                if f.name() == field_path:
-                    lance_field = f
-                    break
-            if lance_field is None:
-                raise ValueError(f"Field '{field_path}' not found in Lance schema")
-            field_id_updates[lance_field.id()] = metadata
-
-        self._ds.update_field_metadata(field_id_updates, replace=replace)
+        # Use the new path-based Rust function directly
+        self._ds.update_field_metadata_by_path(field_updates, replace=replace)
 
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
