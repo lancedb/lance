@@ -799,7 +799,7 @@ class LanceDataset(pa.dataset.Dataset):
             DeprecationWarning,
             stacklevel=2,
         )
-        self._ds.replace_schema_metadata(new_metadata)
+        self.update_schema_metadata(new_metadata, replace=True)
 
     def replace_field_metadata(self, field_name: str, new_metadata: Dict[str, str]):
         """
@@ -822,26 +822,14 @@ class LanceDataset(pa.dataset.Dataset):
             DeprecationWarning,
             stacklevel=2,
         )
-        self._ds.replace_field_metadata(field_name, new_metadata)
+        self.update_field_metadata({field_name: new_metadata}, replace=True)
 
     # Unified metadata APIs
 
-    def get_table_metadata(self) -> Dict[str, str]:
-        """
-        Get the table metadata of the dataset.
-
-        Returns
-        -------
-        Dict[str, str]
-            The table metadata as a dictionary of key-value pairs.
-        """
-        return self._ds.get_table_metadata()
-
+    @property
     def metadata(self) -> Dict[str, str]:
         """
         Get the table metadata of the dataset.
-
-        This is an alias for `get_table_metadata()`.
 
         Returns
         -------

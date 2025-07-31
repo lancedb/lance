@@ -720,19 +720,12 @@ public class Dataset implements Closeable {
    * Update the config of the dataset. This operation will only overwrite and NOT delete the
    * existing config.
    *
-   * @deprecated Use {@link #updateConfig(Map, boolean)} instead for more flexible metadata updates.
-   *             This method will be removed in a future version.
    * @param tableConfig the config to update
    */
-  @Deprecated
   public void updateConfig(Map<String, String> tableConfig) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeUpdateConfig(tableConfig);
-    }
+    updateConfig(tableConfig, false);
   }
 
-  private native void nativeUpdateConfig(Map<String, String> config);
 
   /**
    * Delete the config keys of the dataset.
@@ -809,13 +802,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void replaceSchemaMetadata(Map<String, String> metadata) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeReplaceSchemaMetadata(metadata);
-    }
+    updateSchemaMetadata(metadata, true);
   }
 
-  private native void nativeReplaceSchemaMetadata(Map<String, String> metadata);
 
   /**
    * Replace target field metadata of the dataset. This method won't affect fields not in the map
@@ -826,17 +815,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      for (Integer fieldId : fieldMetadataMap.keySet()) {
-        Preconditions.checkArgument(fieldId >= 0, "Field id must be greater than 0");
-      }
-      nativeReplaceFieldMetadata(fieldMetadataMap);
-    }
+    updateFieldMetadata(fieldMetadataMap, true);
   }
 
-  private native void nativeReplaceFieldMetadata(
-      Map<Integer, Map<String, String>> fieldMetadataMap);
 
   // Unified metadata APIs
 

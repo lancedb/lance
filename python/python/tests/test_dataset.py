@@ -3739,20 +3739,20 @@ def test_table_metadata_updates(tmp_path: Path):
 
     # Test incremental updates
     ds.update_metadata({"key1": "value1", "key2": "value2"})
-    metadata = ds.metadata()
+    metadata = ds.metadata
     assert metadata["key1"] == "value1"
     assert metadata["key2"] == "value2"
 
     # Test updating existing key
     ds.update_metadata({"key1": "updated_value1", "key3": "value3"})
-    metadata = ds.metadata()
+    metadata = ds.metadata
     assert metadata["key1"] == "updated_value1"
     assert metadata["key2"] == "value2"  # Should remain
     assert metadata["key3"] == "value3"
 
     # Test deletion with None values
     ds.update_metadata({"key2": None, "key4": "value4"})
-    metadata = ds.metadata()
+    metadata = ds.metadata
     assert metadata["key1"] == "updated_value1"
     assert "key2" not in metadata  # Should be deleted
     assert metadata["key3"] == "value3"
@@ -3760,7 +3760,7 @@ def test_table_metadata_updates(tmp_path: Path):
 
     # Test full replacement
     ds.update_metadata({"new_key": "new_value"}, replace=True)
-    metadata = ds.metadata()
+    metadata = ds.metadata
     assert metadata == {"new_key": "new_value"}  # All previous keys gone
 
 

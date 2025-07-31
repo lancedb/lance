@@ -861,7 +861,7 @@ public class DatasetTest {
       Map<String, String> replaceMetadata = new HashMap<>();
       replaceMetadata.put("key1", "value1");
       replaceMetadata.put("key2", "value2");
-      dataset.updateSchemaMetadata(replaceMetadata, true);
+      dataset.replaceSchemaMetadata(replaceMetadata);
       assertEquals(2, dataset.version());
       Map<String, String> currentMetadata = dataset.getSchema().getCustomMetadata();
       for (String configKey : currentMetadata.keySet()) {
