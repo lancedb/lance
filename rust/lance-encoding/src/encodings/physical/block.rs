@@ -85,6 +85,7 @@ impl FromStr for CompressionScheme {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "none" => Ok(Self::None),
+            "fsst" => Ok(Self::Fsst),
             "zstd" => Ok(Self::Zstd),
             "lz4" => Ok(Self::Lz4),
             _ => Err(Error::invalid_input(

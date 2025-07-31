@@ -201,7 +201,7 @@ impl DefaultCompressionStrategy {
 
         // 3. Apply general compression if configured
         if let Some(compression_scheme) = &params.compression {
-            if compression_scheme != "none" {
+            if compression_scheme != "none" && compression_scheme != "fsst" {
                 let scheme: CompressionScheme = compression_scheme.parse()?;
                 let config = CompressionConfig::new(scheme, params.compression_level);
                 base_encoder = Box::new(GeneralMiniBlockCompressor::new(base_encoder, config));
@@ -236,7 +236,12 @@ impl DefaultCompressionStrategy {
             return Ok(Box::new(BinaryMiniBlockEncoder::default()));
         }
 
-        // 2. Choose base encoder (FSST or Binary)
+        // 2. Check for explicit "fsst" compression
+        if params.compression.as_deref() == Some("fsst") {
+            return Ok(Box::new(FsstMiniBlockEncoder::default()));
+        }
+
+        // 3. Choose base encoder (FSST or Binary) based on data characteristics
         let mut base_encoder: Box<dyn MiniBlockCompressor> = if max_len
             >= FSST_LEAST_INPUT_MAX_LENGTH
             && data_size >= FSST_LEAST_INPUT_SIZE as u64
@@ -246,9 +251,9 @@ impl DefaultCompressionStrategy {
             Box::new(BinaryMiniBlockEncoder::default())
         };
 
-        // 3. Apply general compression if configured
+        // 4. Apply general compression if configured
         if let Some(compression_scheme) = &params.compression {
-            if compression_scheme != "none" {
+            if compression_scheme != "none" && compression_scheme != "fsst" {
                 let scheme: CompressionScheme = compression_scheme.parse()?;
                 let config = CompressionConfig::new(scheme, params.compression_level);
                 base_encoder = Box::new(GeneralMiniBlockCompressor::new(base_encoder, config));
@@ -315,9 +320,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
     fn create_per_value(
         &self,
-        _field: &Field,
+        field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
+        let field_params = Self::parse_field_metadata(field);
+
         match data {
             DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
             DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
@@ -338,8 +345,10 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
                     let variable_compression = Box::new(VariableEncoder::default());
 
-                    if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                        && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                    // Use FSST if explicitly requested or if data characteristics warrant it
+                    if field_params.compression.as_deref() == Some("fsst")
+                        || (max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                            && data_size >= FSST_LEAST_INPUT_SIZE as u64)
                     {
                         Ok(Box::new(FsstPerValueEncoder::new(variable_compression)))
                     } else {
