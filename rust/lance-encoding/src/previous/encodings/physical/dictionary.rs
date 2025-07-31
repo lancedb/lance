@@ -23,11 +23,11 @@ use crate::data::{
     VariableWidthBlock,
 };
 use crate::format::ProtobufUtils;
-use crate::v2::decoder::LogicalPageDecoder;
-use crate::v2::encodings::logical::primitive::PrimitiveFieldDecoder;
+use crate::previous::decoder::LogicalPageDecoder;
+use crate::previous::encodings::logical::primitive::PrimitiveFieldDecoder;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
-    v2::encoder::{ArrayEncoder, EncodedArray},
+    previous::encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 

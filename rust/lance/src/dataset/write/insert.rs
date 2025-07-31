@@ -186,7 +186,12 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
 
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, path=context.base_path.to_string(), mode=?context.params.mode);
+        info!(
+            target: TRACE_DATASET_EVENTS,
+            event=DATASET_WRITING_EVENT,
+            uri=context.dest.uri(),
+            mode=?context.params.mode
+        );
 
         self.validate_write(&mut context, &schema)?;
 
@@ -412,6 +417,7 @@ impl<'a> InsertBuilder<'a> {
                 let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
+                    session: params.session.clone(),
                     ..Default::default()
                 });
 
@@ -462,4 +468,31 @@ struct WriteContext<'a> {
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: LanceFileVersion,
+}
+
+#[cfg(test)]
+mod test {
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::session::Session;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pass_session() {
+        let session = Arc::new(Session::new(0, 0, Default::default()));
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![],
+                Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)])),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(Arc::as_ptr(&dataset.session()), Arc::as_ptr(&session));
+    }
 }

@@ -25,7 +25,7 @@ use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
 use crate::format::ProtobufUtils;
-use crate::v2::encoder::{ArrayEncoder, EncodedArray};
+use crate::previous::encoder::{ArrayEncoder, EncodedArray};
 use arrow::array::{ArrayRef, AsArray};
 use bytemuck::cast_slice;
 

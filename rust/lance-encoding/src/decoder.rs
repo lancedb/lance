@@ -241,14 +241,14 @@ use crate::encodings::logical::list::StructuralListScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
-use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
-use crate::v2::decoder::LogicalPageDecoder;
-use crate::v2::encodings::logical::list::OffsetPageInfo;
-use crate::v2::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
-use crate::v2::encodings::logical::{
+use crate::previous::decoder::LogicalPageDecoder;
+use crate::previous::encodings::logical::list::OffsetPageInfo;
+use crate::previous::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
+use crate::previous::encodings::logical::{
     binary::BinaryFieldScheduler, blob::BlobFieldScheduler, list::ListFieldScheduler,
     primitive::PrimitiveFieldScheduler,
 };
+use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
 
@@ -345,11 +345,11 @@ impl ColumnInfo {
 
 enum RootScheduler {
     Structural(Box<dyn StructuralFieldScheduler>),
-    Legacy(Arc<dyn crate::v2::decoder::FieldScheduler>),
+    Legacy(Arc<dyn crate::previous::decoder::FieldScheduler>),
 }
 
 impl RootScheduler {
-    fn as_legacy(&self) -> &Arc<dyn crate::v2::decoder::FieldScheduler> {
+    fn as_legacy(&self) -> &Arc<dyn crate::previous::decoder::FieldScheduler> {
         match self {
             Self::Structural(_) => panic!("Expected a legacy scheduler"),
             Self::Legacy(s) => s,
@@ -546,7 +546,7 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column: &ColumnInfo,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn crate::v2::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         Self::ensure_values_encoded(column, &field.name)?;
         // Primitive fields map to a single column
         let column_buffers = ColumnBuffers {
@@ -589,7 +589,7 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         offsets_column: &ColumnInfo,
-    ) -> Result<Box<dyn crate::v2::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         Self::ensure_values_encoded(offsets_column, &list_field.name)?;
         let offsets_column_buffers = ColumnBuffers {
             file_buffers: buffers,
@@ -634,7 +634,7 @@ impl CoreFieldDecoderStrategy {
             Arc::from(inner_infos.into_boxed_slice()),
             offsets_column_buffers,
             self.validate_data,
-        )) as Arc<dyn crate::v2::decoder::FieldScheduler>;
+        )) as Arc<dyn crate::previous::decoder::FieldScheduler>;
         let items_field = match list_field.data_type() {
             DataType::List(inner) => inner,
             DataType::LargeList(inner) => inner,
@@ -742,7 +742,7 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
-    ) -> Result<Box<dyn crate::v2::decoder::FieldScheduler>> {
+    ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
@@ -1003,7 +1003,7 @@ impl DecodeBatchScheduler {
 
     #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
     pub fn from_scheduler(
-        root_scheduler: Arc<dyn crate::v2::decoder::FieldScheduler>,
+        root_scheduler: Arc<dyn crate::previous::decoder::FieldScheduler>,
         root_fields: Fields,
         cache: Arc<LanceCache>,
     ) -> Self {
@@ -1307,7 +1307,7 @@ impl BatchDecodeStream {
         }
     }
 
-    fn accept_decoder(&mut self, decoder: crate::v2::decoder::DecoderReady) -> Result<()> {
+    fn accept_decoder(&mut self, decoder: crate::previous::decoder::DecoderReady) -> Result<()> {
         if decoder.path.is_empty() {
             // The root decoder we can ignore
             Ok(())
@@ -1419,7 +1419,7 @@ impl BatchDecodeStream {
 // we can have a single implementation of the batch decode iterator
 enum RootDecoderMessage {
     LoadedPage(LoadedPage),
-    LegacyPage(crate::v2::decoder::DecoderReady),
+    LegacyPage(crate::previous::decoder::DecoderReady),
 }
 trait RootDecoderType {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
@@ -2281,14 +2281,14 @@ impl SchedulerContext {
     #[deprecated(since = "0.29.1", note = "This is for legacy 2.0 paths")]
     pub fn locate_decoder(
         &mut self,
-        decoder: Box<dyn crate::v2::decoder::LogicalPageDecoder>,
-    ) -> crate::v2::decoder::DecoderReady {
+        decoder: Box<dyn crate::previous::decoder::LogicalPageDecoder>,
+    ) -> crate::previous::decoder::DecoderReady {
         trace!(
             "Scheduling decoder of type {:?} for {:?}",
             decoder.data_type(),
             self.path,
         );
-        crate::v2::decoder::DecoderReady {
+        crate::previous::decoder::DecoderReady {
             decoder,
             path: self.current_path(),
         }
@@ -2416,7 +2416,7 @@ pub enum MessageType {
     // decoder itself.  The messages were not sent in priority order and the decoder
     // had to wait for I/O, figuring out the correct priority.  This was a lot of
     // complexity.
-    DecoderReady(crate::v2::decoder::DecoderReady),
+    DecoderReady(crate::previous::decoder::DecoderReady),
     // Starting in 2.1 we use a simpler scheme where the scheduling happens in priority
     // order and the message is an unloaded decoder.  These can be awaited, in order, and
     // the decoder does not have to worry about waiting for I/O.
@@ -2424,7 +2424,7 @@ pub enum MessageType {
 }
 
 impl MessageType {
-    pub fn into_legacy(self) -> crate::v2::decoder::DecoderReady {
+    pub fn into_legacy(self) -> crate::previous::decoder::DecoderReady {
         match self {
             Self::DecoderReady(decoder) => decoder,
             Self::UnloadedPage(_) => {

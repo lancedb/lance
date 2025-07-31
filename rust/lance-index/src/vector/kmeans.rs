@@ -204,7 +204,25 @@ pub trait KMeansAlgo<T: Num> {
         dimension: usize,
         distance_type: DistanceType,
         index: Option<&SimpleIndex>,
-    ) -> (Vec<Option<u32>>, f64);
+    ) -> (Vec<Option<u32>>, f64) {
+        let (membership, dists) =
+            Self::compute_membership_and_dist(centroids, data, dimension, distance_type, index);
+        (
+            membership,
+            dists
+                .into_iter()
+                .map(|d| d.unwrap_or_default() as f64)
+                .sum(),
+        )
+    }
+
+    fn compute_membership_and_dist(
+        centroids: &[T],
+        data: &[T],
+        dimension: usize,
+        distance_type: DistanceType,
+        index: Option<&SimpleIndex>,
+    ) -> (Vec<Option<u32>>, Vec<Option<f32>>);
 
     /// Construct a new KMeans model.
     fn to_kmeans(
@@ -229,13 +247,13 @@ where
     T::Native: Float + Dot + L2 + MulAssign + DivAssign + AddAssign + FromPrimitive + Sync,
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
-    fn compute_membership_and_loss(
+    fn compute_membership_and_dist(
         centroids: &[T::Native],
         data: &[T::Native],
         dimension: usize,
         distance_type: DistanceType,
         index: Option<&SimpleIndex>,
-    ) -> (Vec<Option<u32>>, f64) {
+    ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -265,16 +283,7 @@ where
             },
         };
 
-        (
-            cluster_and_dists
-                .iter()
-                .map(|cd| cd.map(|(c, _)| c))
-                .collect::<Vec<_>>(),
-            cluster_and_dists
-                .iter()
-                .map(|cd| cd.map(|(_, d)| d as f64).unwrap_or_default())
-                .sum(),
-        )
+        cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
     fn to_kmeans(
@@ -356,13 +365,13 @@ where
 struct KModeAlgo {}
 
 impl KMeansAlgo<u8> for KModeAlgo {
-    fn compute_membership_and_loss(
+    fn compute_membership_and_dist(
         centroids: &[u8],
         data: &[u8],
         dimension: usize,
         distance_type: DistanceType,
         _: Option<&SimpleIndex>,
-    ) -> (Vec<Option<u32>>, f64) {
+    ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
         assert_eq!(distance_type, DistanceType::Hamming);
         let cluster_and_dists = data
             .par_chunks(dimension)
@@ -376,16 +385,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                 )
             })
             .collect::<Vec<_>>();
-        (
-            cluster_and_dists
-                .iter()
-                .map(|cd| cd.map(|(c, _)| c))
-                .collect::<Vec<_>>(),
-            cluster_and_dists
-                .iter()
-                .map(|cd| cd.map(|(_, d)| d as f64).unwrap_or_default())
-                .sum(),
-        )
+        cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
     fn to_kmeans(
@@ -756,18 +756,19 @@ pub fn kmeans_find_partitions_binary(
 }
 
 /// Compute partitions from Arrow FixedSizeListArray.
+#[allow(clippy::type_complexity)]
 pub fn compute_partitions_arrow_array(
     centroids: &FixedSizeListArray,
     vectors: &FixedSizeListArray,
     distance_type: DistanceType,
-) -> arrow::error::Result<(Vec<Option<u32>>, f64)> {
+) -> arrow::error::Result<(Vec<Option<u32>>, Vec<Option<f32>>)> {
     if centroids.value_length() != vectors.value_length() {
         return Err(ArrowError::InvalidArgumentError(
             "Centroids and vectors have different dimensions".to_string(),
         ));
     }
     match (centroids.value_type(), vectors.value_type()) {
-        (DataType::Float16, DataType::Float16) => Ok(compute_partitions::<
+        (DataType::Float16, DataType::Float16) => Ok(compute_partitions_with_dists::<
             Float16Type,
             KMeansAlgoFloat<Float16Type>,
         >(
@@ -776,7 +777,7 @@ pub fn compute_partitions_arrow_array(
             centroids.value_length(),
             distance_type,
         )),
-        (DataType::Float32, DataType::Float32) => Ok(compute_partitions::<
+        (DataType::Float32, DataType::Float32) => Ok(compute_partitions_with_dists::<
             Float32Type,
             KMeansAlgoFloat<Float32Type>,
         >(
@@ -785,7 +786,7 @@ pub fn compute_partitions_arrow_array(
             centroids.value_length(),
             distance_type,
         )),
-        (DataType::Float32, DataType::Int8) => Ok(compute_partitions::<
+        (DataType::Float32, DataType::Int8) => Ok(compute_partitions_with_dists::<
             Float32Type,
             KMeansAlgoFloat<Float32Type>,
         >(
@@ -794,7 +795,7 @@ pub fn compute_partitions_arrow_array(
             centroids.value_length(),
             distance_type,
         )),
-        (DataType::Float64, DataType::Float64) => Ok(compute_partitions::<
+        (DataType::Float64, DataType::Float64) => Ok(compute_partitions_with_dists::<
             Float64Type,
             KMeansAlgoFloat<Float64Type>,
         >(
@@ -803,12 +804,14 @@ pub fn compute_partitions_arrow_array(
             centroids.value_length(),
             distance_type,
         )),
-        (DataType::UInt8, DataType::UInt8) => Ok(compute_partitions::<UInt8Type, KModeAlgo>(
-            centroids.values().as_primitive(),
-            vectors.values().as_primitive(),
-            centroids.value_length(),
-            distance_type,
-        )),
+        (DataType::UInt8, DataType::UInt8) => {
+            Ok(compute_partitions_with_dists::<UInt8Type, KModeAlgo>(
+                centroids.values().as_primitive(),
+                vectors.values().as_primitive(),
+                centroids.value_length(),
+                distance_type,
+            ))
+        }
         _ => Err(ArrowError::InvalidArgumentError(
             "Centroids and vectors have incompatible types".to_string(),
         )),
@@ -829,6 +832,25 @@ where
 {
     let dimension = dimension.as_();
     K::compute_membership_and_loss(
+        centroids.values(),
+        vectors.values(),
+        dimension,
+        distance_type,
+        None,
+    )
+}
+
+pub fn compute_partitions_with_dists<T: ArrowNumericType, K: KMeansAlgo<T::Native>>(
+    centroids: &PrimitiveArray<T>,
+    vectors: &PrimitiveArray<T>,
+    dimension: impl AsPrimitive<usize>,
+    distance_type: DistanceType,
+) -> (Vec<Option<u32>>, Vec<Option<f32>>)
+where
+    T::Native: Num,
+{
+    let dimension = dimension.as_();
+    K::compute_membership_and_dist(
         centroids.values(),
         vectors.values(),
         dimension,

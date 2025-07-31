@@ -102,24 +102,23 @@ impl Transformer for PartitionTransformer {
                 location: location!(),
             })?;
 
-        let (part_ids, loss) = match &self.index {
-            Some(index) => {
-                let parts_and_dists = fsl.iter().map(|vec| vec.map(|v| index.search(v).unwrap()));
-
-                let mut part_ids = Vec::with_capacity(fsl.len());
-                let mut loss = 0.0;
-                parts_and_dists.for_each(|pair| {
-                    if let Some((part_id, dist)) = pair {
-                        part_ids.push(Some(part_id));
-                        loss += dist as f64;
-                    } else {
-                        part_ids.push(None);
+        let (part_ids, dists) = match &self.index {
+            Some(index) => fsl
+                .iter()
+                .map(|vec| match vec {
+                    Some(v) => {
+                        let (id, dist) = index.search(v).unwrap();
+                        (Some(id), Some(dist))
                     }
-                });
-                (part_ids, loss)
-            }
+                    None => (None, None),
+                })
+                .unzip(),
             None => compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?,
         };
+        let loss = dists
+            .iter()
+            .map(|d| d.unwrap_or_default() as f64)
+            .sum::<f64>();
         let part_ids = UInt32Array::from(part_ids);
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
         Ok(batch
