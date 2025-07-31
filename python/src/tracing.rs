@@ -364,17 +364,20 @@ pub fn initialize_tracing(level: log::Level) {
 
 #[pyfunction]
 #[pyo3(signature=(callback))]
-pub fn capture_trace_events(callback: PyObject) {
+pub fn capture_trace_events(callback: PyObject, py: Python<'_>) {
     SUBSCRIBER
         .write()
         .unwrap()
         .as_mut()
         .unwrap()
-        .set_callback(callback);
+        .set_callback(callback.clone_ref(py));
 }
 
 #[pyfunction]
 #[pyo3(signature=())]
-pub fn shutdown_tracing() {
-    SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
+pub fn shutdown_tracing(py: Python<'_>) {
+    // Release Python GIL to avoid deadlock between current thread with the receiver thread.
+    py.allow_threads(|| {
+        SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
+    });
 }
