@@ -2839,7 +2839,8 @@ impl Scanner {
             }]),
             knn_plan,
         )
-        .with_fetch(Some(self.calculate_effective_k(q.k)));
+        .with_fetch(Some(self.calculate_effective_k(q.k)))
+        .with_preserve_partitioning(true);
 
         let logical_not_null = col(DIST_COL).is_not_null();
         let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
@@ -6990,25 +6991,28 @@ mod test {
             limit: Option<i64>,
             offset: Option<i64>,
         ) {
-            let result = scanner
-                .clone()
-                .limit(limit, offset)
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap();
+            let mut new_scanner = scanner.clone();
+            new_scanner.limit(limit, offset).unwrap();
+            let result = new_scanner.try_into_batch().await.unwrap();
+
+            dbg!(&full_result);
 
             let resolved_offset = offset.unwrap_or(0).min(full_result.num_rows() as i64);
             let resolved_length = limit
                 .unwrap_or(i64::MAX)
                 .min(full_result.num_rows() as i64 - resolved_offset);
+            dbg!((resolved_offset, resolved_length));
 
             let expected = full_result.slice(resolved_offset as usize, resolved_length as usize);
-            assert_eq!(
-                &expected, &result,
-                "Limit: {:?}, Offset: {:?}",
-                limit, offset
-            );
+
+            if expected != result {
+                let plan = new_scanner.analyze_plan().await.unwrap();
+                assert_eq!(
+                    &expected, &result,
+                    "Limit: {:?}, Offset: {:?}, Plan: \n{}",
+                    limit, offset, plan
+                );
+            }
         }
 
         let full_results = scanner.try_into_batch().await.unwrap();
@@ -7036,14 +7040,34 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_knn_limit_offset() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .project(&["i"])
+            .unwrap();
+        // Nearest has a default limit of 10, so we need the base scanner to have a high limit.
+        scanner.limit(Some(500), None).unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
     async fn test_ivf_pq_limit_offset() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
         test_ds.make_vector_index().await.unwrap();
+        test_ds.append_new_data().await.unwrap();
         let query_vector = Float32Array::from(vec![0.0; 32]);
         let mut scanner = test_ds.dataset.scan();
         scanner.nearest("vec", &query_vector, 10).unwrap();
+        // Nearest has a default limit of 10, so we need the base scanner to have a high limit.
+        scanner.limit(Some(500), None).unwrap();
         limit_offset_equivalency_test(&scanner).await;
     }
 
@@ -7053,9 +7077,10 @@ mod test {
             .await
             .unwrap();
         test_ds.make_fts_index().await.unwrap();
+        test_ds.append_new_data().await.unwrap();
         let mut scanner = test_ds.dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new("1".into()))
+            .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
     }
