@@ -16,13 +16,10 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
-/// Default threshold for RLE compression selection.
-/// RLE is chosen when the run count is less than this fraction of total values.
-const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
-
 use crate::{
     buffer::LanceBuffer,
     compression_config::{CompressionFieldParams, CompressionParams},
+    constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY},
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
         logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
@@ -50,14 +47,14 @@ use crate::{
     format::{pb, ProtobufUtils},
     statistics::{GetStat, Stat},
 };
-
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
-use lance_core::{
-    datatypes::{Field, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY},
-    Error, Result,
-};
+use lance_core::{datatypes::Field, Error, Result};
 use snafu::location;
+
+/// Default threshold for RLE compression selection.
+/// RLE is chosen when the run count is less than this fraction of total values.
+const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
 
 /// Trait for compression algorithms that compress an entire block of data into one opaque
 /// and self-described chunk.
@@ -131,11 +128,32 @@ impl DefaultCompressionStrategy {
         Self { params }
     }
 
+    /// Parse compression parameters from field metadata
+    fn parse_field_metadata(field: &Field) -> CompressionFieldParams {
+        let mut params = CompressionFieldParams::default();
+
+        // Parse compression method
+        if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
+            params.compression = Some(compression.clone());
+        }
+
+        // Parse compression level
+        if let Some(level) = field.metadata.get(COMPRESSION_LEVEL_META_KEY) {
+            params.compression_level = level.parse().ok();
+        }
+
+        // Parse RLE threshold
+        if let Some(threshold) = field.metadata.get(RLE_THRESHOLD_META_KEY) {
+            params.rle_threshold = threshold.parse().ok();
+        }
+
+        params
+    }
+
     /// Build compressor based on parameters for fixed-width data
     fn build_fixed_width_compressor(
         &self,
         params: &CompressionFieldParams,
-        field: &Field,
         data: &FixedWidthDataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         let bits_per_value = data.bits_per_value;
@@ -156,25 +174,11 @@ impl DefaultCompressionStrategy {
             return Ok(Box::new(ValueEncoder::default()));
         }
 
-        // 2. Check metadata override (legacy support)
-        if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
-            if compression.as_str() == "none" {
-                return Ok(Box::new(ValueEncoder::default()));
-            }
-        }
-
-        // 3. Determine base encoder
+        // 2. Determine base encoder
         let mut base_encoder: Box<dyn MiniBlockCompressor> = {
             // Check if RLE should be used
             let rle_threshold = params
                 .rle_threshold
-                .or_else(|| {
-                    // Check field metadata for legacy threshold
-                    field
-                        .metadata
-                        .get(RLE_THRESHOLD_META_KEY)
-                        .and_then(|v| v.parse().ok())
-                })
                 .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
             let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
@@ -191,9 +195,9 @@ impl DefaultCompressionStrategy {
             }
         };
 
-        // 4. Apply general compression if configured
+        // 3. Apply general compression if configured
         if let Some(compression_scheme) = &params.compression {
-            if compression_scheme != "none" {
+            if compression_scheme != "none" && compression_scheme != "fsst" {
                 let scheme: CompressionScheme = compression_scheme.parse()?;
                 let config = CompressionConfig::new(scheme, params.compression_level);
                 base_encoder = Box::new(GeneralMiniBlockCompressor::new(base_encoder, config));
@@ -228,7 +232,12 @@ impl DefaultCompressionStrategy {
             return Ok(Box::new(BinaryMiniBlockEncoder::default()));
         }
 
-        // 2. Choose base encoder (FSST or Binary)
+        // 2. Check for explicit "fsst" compression
+        if params.compression.as_deref() == Some("fsst") {
+            return Ok(Box::new(FsstMiniBlockEncoder::default()));
+        }
+
+        // 3. Choose base encoder (FSST or Binary) based on data characteristics
         let mut base_encoder: Box<dyn MiniBlockCompressor> = if max_len
             >= FSST_LEAST_INPUT_MAX_LENGTH
             && data_size >= FSST_LEAST_INPUT_SIZE as u64
@@ -238,9 +247,9 @@ impl DefaultCompressionStrategy {
             Box::new(BinaryMiniBlockEncoder::default())
         };
 
-        // 3. Apply general compression if configured
+        // 4. Apply general compression if configured
         if let Some(compression_scheme) = &params.compression {
-            if compression_scheme != "none" {
+            if compression_scheme != "none" && compression_scheme != "fsst" {
                 let scheme: CompressionScheme = compression_scheme.parse()?;
                 let config = CompressionConfig::new(scheme, params.compression_level);
                 base_encoder = Box::new(GeneralMiniBlockCompressor::new(base_encoder, config));
@@ -257,13 +266,17 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        let field_params = self
+        let mut field_params = self
             .params
             .get_field_params(&field.name, &field.data_type());
 
+        // Override with field metadata if present (highest priority)
+        let metadata_params = Self::parse_field_metadata(field);
+        field_params.merge(&metadata_params);
+
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
-                self.build_fixed_width_compressor(&field_params, field, fixed_width_data)
+                self.build_fixed_width_compressor(&field_params, fixed_width_data)
             }
             DataBlock::VariableWidth(variable_width_data) => {
                 self.build_variable_width_compressor(&field_params, variable_width_data)
@@ -303,9 +316,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
     fn create_per_value(
         &self,
-        _field: &Field,
+        field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
+        let field_params = Self::parse_field_metadata(field);
+
         match data {
             DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
             DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
@@ -326,8 +341,10 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
                     let variable_compression = Box::new(VariableEncoder::default());
 
-                    if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                        && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                    // Use FSST if explicitly requested or if data characteristics warrant it
+                    if field_params.compression.as_deref() == Some("fsst")
+                        || (max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                            && data_size >= FSST_LEAST_INPUT_SIZE as u64)
                     {
                         Ok(Box::new(FsstPerValueEncoder::new(variable_compression)))
                     } else {
@@ -780,5 +797,101 @@ mod tests {
         // Should use default strategy's decision
         let debug_str = format!("{:?}", compressor);
         assert!(debug_str.contains("ValueEncoder") || debug_str.contains("InlineBitpacking"));
+    }
+
+    #[test]
+    fn test_field_metadata_compression() {
+        let params = CompressionParams::new();
+        let strategy = DefaultCompressionStrategy::with_params(params);
+
+        // Test field with compression metadata
+        let mut metadata = HashMap::new();
+        metadata.insert(COMPRESSION_META_KEY.to_string(), "zstd".to_string());
+        metadata.insert(COMPRESSION_LEVEL_META_KEY.to_string(), "6".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        let data = create_fixed_width_block(32, 1000);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+
+        // Should use zstd with level 6
+        let debug_str = format!("{:?}", compressor);
+        assert!(debug_str.contains("GeneralMiniBlockCompressor"));
+    }
+
+    #[test]
+    fn test_field_metadata_rle_threshold() {
+        let params = CompressionParams::new();
+        let strategy = DefaultCompressionStrategy::with_params(params);
+
+        // Test field with RLE threshold metadata
+        let mut metadata = HashMap::new();
+        metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "0.8".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        // Create data with 0.7 run ratio (700 runs for 1000 values)
+        let data = create_fixed_width_block_with_stats(32, 1000, 700);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+
+        // Should use RLE because 0.7 < 0.8
+        assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
+    }
+
+    #[test]
+    fn test_field_metadata_override_params() {
+        // Set up params with one configuration
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "test_column".to_string(),
+            CompressionFieldParams {
+                rle_threshold: Some(0.3),
+                compression: Some("lz4".to_string()),
+                compression_level: None,
+            },
+        );
+
+        let strategy = DefaultCompressionStrategy::with_params(params);
+
+        // Field metadata should override params
+        let mut metadata = HashMap::new();
+        metadata.insert(COMPRESSION_META_KEY.to_string(), "none".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        let data = create_fixed_width_block(32, 1000);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+
+        // Should use none compression (from metadata) instead of lz4 (from params)
+        assert!(format!("{:?}", compressor).contains("ValueEncoder"));
+    }
+
+    #[test]
+    fn test_field_metadata_mixed_configuration() {
+        // Configure type-level params
+        let mut params = CompressionParams::new();
+        params.types.insert(
+            "Int32".to_string(),
+            CompressionFieldParams {
+                rle_threshold: Some(0.5),
+                compression: Some("lz4".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let strategy = DefaultCompressionStrategy::with_params(params);
+
+        // Field metadata provides partial override
+        let mut metadata = HashMap::new();
+        metadata.insert(COMPRESSION_LEVEL_META_KEY.to_string(), "3".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        let data = create_fixed_width_block(32, 1000);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+
+        // Should use lz4 (from type params) with level 3 (from metadata)
+        let debug_str = format!("{:?}", compressor);
+        assert!(debug_str.contains("GeneralMiniBlockCompressor"));
     }
 }

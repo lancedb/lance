@@ -227,6 +227,9 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::constants::{
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    };
     use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
@@ -235,9 +238,6 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
-    use lance_core::datatypes::{
-        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
-    };
     use rstest::rstest;
 
     use crate::{

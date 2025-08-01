@@ -473,7 +473,7 @@ pub mod tests {
     };
     use arrow_schema::{DataType, Field};
 
-    use lance_core::datatypes::{
+    use crate::constants::{
         COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
@@ -505,8 +505,6 @@ pub mod tests {
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
-
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -556,7 +554,7 @@ pub mod tests {
     async fn test_large_binary_fsst_with_dict(
         #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
     ) {
-        use lance_core::datatypes::DICT_DIVISOR_META_KEY;
+        use crate::constants::DICT_DIVISOR_META_KEY;
 
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -615,8 +613,6 @@ pub mod tests {
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
-
         let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
         let string_array = arrow_cast::cast(&string_array, &data_type).unwrap();
 

@@ -461,12 +461,6 @@ mod test {
     async fn test_miniblock_bitpack() {
         let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
 
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "lance-encoding:compression".to_string(),
-            "bitpacking".to_string(),
-        );
-
         let arrays = vec![
             Arc::new(Int8Array::from(vec![100; 1024])) as Arc<dyn Array>,
             Arc::new(Int8Array::from(vec![1; 1024])) as Arc<dyn Array>,
@@ -474,7 +468,7 @@ mod test {
             Arc::new(Int8Array::from(vec![-1; 1024])) as Arc<dyn Array>,
             Arc::new(Int8Array::from(vec![5; 1])) as Arc<dyn Array>,
         ];
-        check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+        check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
 
         for data_type in [DataType::Int16, DataType::Int32, DataType::Int64] {
             let int64_arrays = vec![
@@ -493,12 +487,7 @@ mod test {
                 arrays.push(arrow_cast::cast(&int64_array, &data_type).unwrap());
             }
 
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                "lance-encoding:compression".to_string(),
-                "bitpacking".to_string(),
-            );
-            check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+            check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
         }
     }
 }
