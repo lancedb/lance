@@ -1,7 +1,7 @@
 /*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * You may obtain a copy of the License a
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -51,7 +51,7 @@ public class LockManager {
   /**
    * Acquires a read lock on the LockManager.
    *
-   * @return the acquired ReadLock object
+   * @return the acquired ReadLock objec
    */
   public ReadLock acquireReadLock() {
     return new ReadLock();
@@ -60,7 +60,7 @@ public class LockManager {
   /**
    * Acquires a write lock on the LockManager.
    *
-   * @return the acquired WriteLock object
+   * @return the acquired WriteLock objec
    */
   public WriteLock acquireWriteLock() {
     return new WriteLock();

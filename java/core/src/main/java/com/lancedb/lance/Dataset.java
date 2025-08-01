@@ -39,6 +39,7 @@ import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -204,7 +205,7 @@ public class Dataset implements Closeable {
             path,
             options.getVersion(),
             options.getBlockSize(),
-            options.getIndexCacheSizeBytes(),
+            options.getIndexCacheSize(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions());
     dataset.allocator = allocator;
@@ -279,7 +280,7 @@ public class Dataset implements Closeable {
   /**
    * Drop a Dataset.
    *
-   * @param path The file path of the dataset
+   * @param path The file path of the datase
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
@@ -386,7 +387,7 @@ public class Dataset implements Closeable {
   /**
    * Create a new Dataset Scanner.
    *
-   * @param batchSize the scan options with batch size, columns filter, and substrait
+   * @param batchSize the scan options with batch size, columns filter, and substrai
    * @return a dataset scanner
    */
   public LanceScanner newScan(long batchSize) {
@@ -662,7 +663,7 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
-   * Gets the arrow schema of the dataset.
+   * Gets the schema of the dataset.
    *
    * @return the arrow schema
    */
@@ -777,6 +778,18 @@ public class Dataset implements Closeable {
   public boolean closed() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       return nativeDatasetHandle == 0;
+    }
+  }
+
+  /**
+   * Get the native handle of the dataset.
+   *
+   * @return the native handle
+   */
+  public long getNativeHandle() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDatasetHandle;
     }
   }
 
@@ -907,6 +920,67 @@ public class Dataset implements Closeable {
    */
   public SqlQuery sql(String sql) {
     return new SqlQuery(this, sql);
+  }
+
+  /**
+   * 创建 merge insert 操作构建器
+   *
+   * @param onColumns 用于匹配的列名列表
+   * @return MergeInsertBuilder 实例
+   */
+  public MergeInsertBuilder mergeInsert(List<String> onColumns) {
+    return new MergeInsertBuilder(getNativeHandle(), onColumns, getAllocator());
+  }
+
+  /**
+   * 创建 merge insert 操作构建器（单列版本）
+   *
+   * @param onColumn 用于匹配的列名
+   * @return MergeInsertBuilder 实例
+   */
+  public MergeInsertBuilder mergeInsert(String onColumn) {
+    return new MergeInsertBuilder(getNativeHandle(), Arrays.asList(onColumn), getAllocator());
+  }
+
+  /**
+   * 执行 merge insert 操作（使用 BlockingDataset）
+   *
+   * @param sourceDatasetUri 源数据集URI
+   * @param whenMatchedConfig 匹配时的配置 ("update_all", "do_nothing", 或条件表达式)
+   * @param whenNotMatchedConfig 未匹配时的配置 ("insert_all", "do_nothing")
+   * @param whenNotMatchedBySourceConfig 源中未匹配时的配置 ("delete", "do_nothing", 或条件表达式)
+   * @param batchSize 可选的批处理大小
+   * @param timeoutMillis 可选的超时时间（毫秒）
+   */
+  public void mergeInsert(
+      String sourceDatasetUri,
+      String whenMatchedConfig,
+      String whenNotMatchedConfig,
+      String whenNotMatchedBySourceConfig,
+      Optional<Integer> batchSize,
+      Optional<Long> timeoutMillis) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMergeInsert(
+          sourceDatasetUri,
+          whenMatchedConfig,
+          whenNotMatchedConfig,
+          whenNotMatchedBySourceConfig,
+          batchSize,
+          timeoutMillis);
+    }
+  }
+
+  private native void nativeMergeInsert(
+      String sourceDatasetUri,
+      String whenMatchedConfig,
+      String whenNotMatchedConfig,
+      String whenNotMatchedBySourceConfig,
+      Optional<Integer> batchSize,
+      Optional<Long> timeoutMillis);
+
+  BufferAllocator getAllocator() {
+    return allocator;
   }
 
   private native void nativeCreateTag(String tag, long version);
