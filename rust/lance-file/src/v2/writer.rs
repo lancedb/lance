@@ -1173,11 +1173,11 @@ mod tests {
         // Test that field metadata compression settings are respected
         let mut metadata = HashMap::new();
         metadata.insert(
-            lance_core::datatypes::COMPRESSION_META_KEY.to_string(),
+            lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
             "zstd".to_string(),
         );
         metadata.insert(
-            lance_core::datatypes::COMPRESSION_LEVEL_META_KEY.to_string(),
+            lance_encoding::constants::COMPRESSION_LEVEL_META_KEY.to_string(),
             "6".to_string(),
         );
 
@@ -1185,7 +1185,7 @@ mod tests {
             ArrowField::new("id", DataType::Int32, false),
             ArrowField::new("text", DataType::Utf8, false).with_metadata(metadata.clone()),
             ArrowField::new("data", DataType::Int32, false).with_metadata(HashMap::from([(
-                lance_core::datatypes::COMPRESSION_META_KEY.to_string(),
+                lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
                 "none".to_string(),
             )])),
         ]));
@@ -1285,12 +1285,12 @@ mod tests {
         // Test that RLE threshold from field metadata is respected
         let mut metadata = HashMap::new();
         metadata.insert(
-            lance_core::datatypes::RLE_THRESHOLD_META_KEY.to_string(),
+            lance_encoding::constants::RLE_THRESHOLD_META_KEY.to_string(),
             "0.9".to_string(),
         );
         // Also set compression to ensure RLE is used
         metadata.insert(
-            lance_core::datatypes::COMPRESSION_META_KEY.to_string(),
+            lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
             "lz4".to_string(),
         );
 

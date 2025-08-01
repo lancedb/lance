@@ -16,13 +16,10 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
-/// Default threshold for RLE compression selection.
-/// RLE is chosen when the run count is less than this fraction of total values.
-const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
-
 use crate::{
     buffer::LanceBuffer,
     compression_config::{CompressionFieldParams, CompressionParams},
+    constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY},
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
         logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
@@ -50,14 +47,14 @@ use crate::{
     format::{pb, ProtobufUtils},
     statistics::{GetStat, Stat},
 };
-
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
-use lance_core::{
-    datatypes::{Field, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY},
-    Error, Result,
-};
+use lance_core::{datatypes::Field, Error, Result};
 use snafu::location;
+
+/// Default threshold for RLE compression selection.
+/// RLE is chosen when the run count is less than this fraction of total values.
+const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
 
 /// Trait for compression algorithms that compress an entire block of data into one opaque
 /// and self-described chunk.
