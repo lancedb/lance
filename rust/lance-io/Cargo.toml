@@ -66,9 +66,9 @@ harness = false
 default = ["aws", "azure", "gcp"]
 gcs-test = []
 gcp = ["object_store/gcp"]
-aws = ["object_store/aws", "aws-config", "aws-credential-types"]
+aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types"]
 azure = ["object_store/azure"]
-oss = ["opendal/services-oss", "object_store_opendal"]
+oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 
 [lints]
 workspace = true

@@ -76,8 +76,8 @@ rstest.workspace = true
 
 [features]
 protoc = ["dep:protobuf-src"]
-tokenizer-lindera = ["lindera", "lindera-tantivy"]
-tokenizer-jieba = ["jieba-rs"]
+tokenizer-lindera = ["dep:lindera", "dep:lindera-tantivy"]
+tokenizer-jieba = ["dep:jieba-rs"]
 
 [build-dependencies]
 prost-build.workspace = true

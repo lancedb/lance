@@ -110,9 +110,9 @@ aws-sdk-s3 = { workspace = true }
 default = ["aws", "azure", "gcp", "oss"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
-cli = ["clap", "lzma-sys/static"]
-tensorflow = ["tfrecord", "prost_old"]
-dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
+cli = ["dep:clap", "lzma-sys/static"]
+tensorflow = ["dep:tfrecord", "dep:prost_old"]
+dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
 protoc = [
