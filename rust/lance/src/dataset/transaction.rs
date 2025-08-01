@@ -93,6 +93,7 @@ pub struct Transaction {
     /// If this is `None`, then the blobs dataset was not modified
     pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1018,16 +1019,70 @@ impl Operation {
     }
 }
 
-impl Transaction {
-    pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
-        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
+/// Add TransactionBuilder for flexibly setting option without using `mut`
+pub struct TransactionBuilder {
+    read_version: u64,
+    // uuid is optional for builder since it can autogenerate
+    uuid: Option<String>,
+    operation: Operation,
+    blobs_op: Option<Operation>,
+    tag: Option<String>,
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
+}
+
+impl TransactionBuilder {
+    pub fn new(read_version: u64, operation: Operation) -> Self {
         Self {
             read_version,
-            uuid,
+            uuid: None,
             operation,
             blobs_op: None,
             tag: None,
+            transaction_properties: None,
         }
+    }
+
+    pub fn uuid(mut self, uuid: String) -> Self {
+        self.uuid = Some(uuid);
+        self
+    }
+
+    pub fn blobs_op(mut self, blobs_op: Option<Operation>) -> Self {
+        self.blobs_op = blobs_op;
+        self
+    }
+
+    pub fn tag(mut self, tag: Option<String>) -> Self {
+        self.tag = tag;
+        self
+    }
+
+    pub fn transaction_properties(
+        mut self,
+        transaction_properties: Option<Arc<HashMap<String, String>>>,
+    ) -> Self {
+        self.transaction_properties = transaction_properties;
+        self
+    }
+
+    pub fn build(self) -> Transaction {
+        let uuid = self
+            .uuid
+            .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string());
+        Transaction {
+            read_version: self.read_version,
+            uuid,
+            operation: self.operation,
+            blobs_op: self.blobs_op,
+            tag: self.tag,
+            transaction_properties: self.transaction_properties,
+        }
+    }
+}
+
+impl Transaction {
+    pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
+        TransactionBuilder::new(read_version, operation).build()
     }
 
     pub fn with_blobs_op(self, blobs_op: Option<Operation>) -> Self {
@@ -1040,14 +1095,10 @@ impl Transaction {
         blobs_op: Option<Operation>,
         tag: Option<String>,
     ) -> Self {
-        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
-        Self {
-            read_version,
-            uuid,
-            operation,
-            blobs_op,
-            tag,
-        }
+        TransactionBuilder::new(read_version, operation)
+            .blobs_op(blobs_op)
+            .tag(tag)
+            .build()
     }
 
     fn fragments_with_ids<'a, T>(
@@ -2038,6 +2089,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(message.tag.clone())
             },
+            transaction_properties: if message.transaction_properties.is_empty() {
+                None
+            } else {
+                Some(Arc::new(message.transaction_properties))
+            },
         })
     }
 }
@@ -2263,12 +2319,18 @@ impl From<&Transaction> for pb::Transaction {
             _ => panic!("Invalid blob operation: {:?}", value),
         });
 
+        let transaction_properties = value
+            .transaction_properties
+            .as_ref()
+            .map(|arc| arc.as_ref().clone())
+            .unwrap_or_default();
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
+            transaction_properties,
         }
     }
 }

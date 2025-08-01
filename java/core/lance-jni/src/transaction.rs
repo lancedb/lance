@@ -6,7 +6,7 @@ use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
-use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::datatypes::Schema as LanceSchema;
 
 #[no_mangle]
@@ -69,13 +69,10 @@ fn convert_to_rust_transaction(env: &mut JNIEnv, java_tx: JObject) -> Result<Tra
         Some(convert_to_rust_operation(env, blobs_op)?)
     };
 
-    Ok(Transaction {
-        read_version: read_ver as u64,
-        uuid,
-        operation: op,
-        blobs_op,
-        tag: None,
-    })
+    Ok(TransactionBuilder::new(read_ver as u64, op)
+        .uuid(uuid)
+        .blobs_op(blobs_op)
+        .build())
 }
 
 fn convert_to_rust_operation(env: &mut JNIEnv, java_operation: JObject) -> Result<Operation> {
