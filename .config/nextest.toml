@@ -1,0 +1,13 @@
+[profile.default]
+# Run tests in parallel using all available cores
+test-threads = "num-cpus"
+# Retry failed tests once
+retries = { backoff = "exponential", count = 1, delay = "1s" }
+
+[profile.ci]
+# More aggressive retries for CI
+retries = { backoff = "exponential", count = 2, delay = "1s" }
+# Detect slow tests
+slow-timeout = { period = "120s", terminate-after = 2 }
+# Fail fast on first failure
+fail-fast = false
