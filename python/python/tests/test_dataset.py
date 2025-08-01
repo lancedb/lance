@@ -2152,6 +2152,63 @@ def test_merge_insert_empty_index():
     empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
 
 
+def test_merge_insert_explain_analyze_plan():
+    """Test that explain_plan and analyze_plan work on merge insert operations."""
+    # Create a simple test dataset
+    data = pa.table(
+        [pa.array([1, 2, 3, 4]), pa.array(["a", "b", "c", "d"])], names=["id", "value"]
+    )
+
+    dataset = lance.write_dataset(data, "memory://test-merge-explain")
+
+    # Create merge insert builder
+    builder = (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+
+    # Test explain_plan with default schema (None)
+    plan = builder.explain_plan()  # Uses dataset schema by default
+    assert isinstance(plan, str)
+    assert len(plan) > 0
+    assert "MergeInsert" in plan
+
+    # Test with explicit schema (must match dataset schema exactly)
+    source_schema = pa.schema(
+        [pa.field("id", pa.int64()), pa.field("value", pa.string())]
+    )
+    plan_explicit = builder.explain_plan(source_schema, verbose=False)
+    assert isinstance(plan_explicit, str)
+    assert len(plan_explicit) > 0
+    assert "MergeInsert" in plan_explicit
+
+    # Test verbose mode with default schema
+    plan_verbose = builder.explain_plan(verbose=True)
+    assert isinstance(plan_verbose, str)
+    assert len(plan_verbose) > 0
+    assert "MergeInsert" in plan_verbose
+
+    # Create test source data for analyze_plan (must match dataset schema exactly)
+    source_data = pa.table(
+        [
+            pa.array([1, 5]),  # 1 matches existing, 5 is new
+            pa.array(["updated_a", "e"]),
+        ],
+        names=["id", "value"],
+    )
+
+    # Test analyze_plan
+    analysis = builder.analyze_plan(source_data)
+    assert isinstance(analysis, str)
+    assert len(analysis) > 0
+    assert "MergeInsert" in analysis
+    assert "metrics" in analysis
+    # Check for new write metrics
+    assert "bytes_written" in analysis
+    assert "num_files_written" in analysis
+
+
 def test_add_null_columns(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)

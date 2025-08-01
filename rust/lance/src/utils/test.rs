@@ -6,6 +6,8 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 
+use snafu::location;
+
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
@@ -769,6 +771,52 @@ fn trim_whitespace(s: &str) -> String {
     result
 }
 
+/// Asserts that the actual string matches the expected pattern.
+/// The pattern can contain "..." to match any content between specified pieces.
+/// The first piece must match from the start, middle pieces can appear anywhere,
+/// and the last piece must match at the end.
+pub fn assert_string_matches(actual: &str, expected_pattern: &str) -> lance_core::Result<()> {
+    let actual_cleaned = trim_whitespace(actual);
+    let expected = trim_whitespace(expected_pattern);
+
+    let to_match = expected.split("...").collect::<Vec<_>>();
+    let num_pieces = to_match.len();
+    let mut remainder = actual_cleaned.as_str().trim_end_matches('\n');
+
+    for (i, piece) in to_match.into_iter().enumerate() {
+        let res = match i {
+            0 => remainder.starts_with(piece),
+            _ if i == num_pieces - 1 => remainder.ends_with(piece),
+            _ => remainder.contains(piece),
+        };
+        if !res {
+            return Err(lance_core::Error::InvalidInput {
+                source: format!(
+                    "Expected string to match:\nExpected: {}\nActual: {}",
+                    expected_pattern, actual
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+        let idx = remainder.find(piece).unwrap();
+        remainder = &remainder[idx + piece.len()..];
+    }
+
+    if !remainder.is_empty() {
+        return Err(lance_core::Error::InvalidInput {
+            source: format!(
+                "Expected string to match:\nExpected: {}\nActual: {}",
+                expected_pattern, actual
+            )
+            .into(),
+            location: location!(),
+        });
+    }
+
+    Ok(())
+}
+
 pub async fn assert_plan_node_equals(
     plan_node: Arc<dyn ExecutionPlan>,
     raw_expected: &str,
@@ -777,32 +825,9 @@ pub async fn assert_plan_node_equals(
         "{}",
         datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
     );
-    let plan_desc = trim_whitespace(&raw_plan_desc);
 
-    let expected = trim_whitespace(raw_expected);
-
-    let to_match = expected.split("...").collect::<Vec<_>>();
-    let num_pieces = to_match.len();
-    let mut remainder = plan_desc.as_str().trim_end_matches('\n');
-    for (i, piece) in to_match.into_iter().enumerate() {
-        let res = match i {
-            0 => remainder.starts_with(piece),
-            _ if i == num_pieces - 1 => remainder.ends_with(piece),
-            _ => remainder.contains(piece),
-        };
-        if !res {
-            break;
-        }
-        let idx = remainder.find(piece).unwrap();
-        remainder = &remainder[idx + piece.len()..];
-    }
-    if !remainder.is_empty() {
-        panic!(
-            "Expected plan to match:\nExpected: {}\nActual: {}",
-            raw_expected, raw_plan_desc
-        )
-    }
-    Ok(())
+    // Use the extracted string matching logic
+    assert_string_matches(&raw_plan_desc, raw_expected)
 }
 
 #[cfg(test)]
