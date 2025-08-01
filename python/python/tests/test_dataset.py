@@ -3797,10 +3797,10 @@ def test_get_properties_with_no_properties(tmp_path):
 
     # Test retrieving properties - should return None
     transaction = dataset.read_transaction(1)
-    assert transaction.transaction_properties is None
+    assert transaction.transaction_properties == {}
 
 
-def test_get_transactions_properties(tmp_path):
+def test_commit_message_and_get_properties(tmp_path):
     """Test accessing commit messages via get_transactions."""
     table = pa.table({"a": [1]})
 
@@ -3821,7 +3821,7 @@ def test_get_transactions_properties(tmp_path):
     # The latest transaction has no message,
     # so the key should be missing or properties is None
     assert (
-        transactions[0].transaction_properties is None
+        transactions[0].transaction_properties == {}
         or LANCE_COMMIT_MESSAGE_KEY not in transactions[0].transaction_properties
     )
     # The first transaction should still have the message
@@ -3835,4 +3835,4 @@ def test_get_transactions_properties(tmp_path):
     transactions = dataset.get_transactions()
     assert len(transactions) == 3
     # The latest transaction from delete should have no properties.
-    assert transactions[0].transaction_properties is None
+    assert transactions[0].transaction_properties == {}

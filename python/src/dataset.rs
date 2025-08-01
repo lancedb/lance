@@ -1952,14 +1952,14 @@ impl Dataset {
         Ok(transaction.map(PyLance))
     }
 
-    #[pyo3(signature = (max_transactions=10))]
+    #[pyo3(signature = (recent_transactions=10))]
     fn get_transactions(
         &mut self,
-        max_transactions: usize,
+        recent_transactions: usize,
     ) -> PyResult<Vec<Option<PyLance<Transaction>>>> {
         let new_self = self.ds.as_ref().clone();
         let transactions = RT
-            .block_on(None, new_self.get_transactions(max_transactions))?
+            .block_on(None, new_self.get_transactions(recent_transactions))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         Ok(transactions.into_iter().map(|t| t.map(PyLance)).collect())

@@ -718,12 +718,12 @@ impl Dataset {
     /// List transactions for the dataset, up to a maximum number.
     ///
     /// This method iterates through dataset versions, starting from the current version,
-    /// and collects the transaction for each version. It stops when either `max_transactions`
+    /// and collects the transaction for each version. It stops when either `recent_transactions`
     /// is reached or there are no more versions.
     ///
     /// # Arguments
     ///
-    /// * `max_transactions` - Maximum number of transactions to return
+    /// * `recent_transactions` - Maximum number of transactions to return
     ///
     /// # Returns
     ///
@@ -731,7 +731,7 @@ impl Dataset {
     /// and may be None if no transaction file exists for that version.
     pub async fn get_transactions(
         &self,
-        max_transactions: usize,
+        recent_transactions: usize,
     ) -> Result<Vec<Option<Transaction>>> {
         let mut transactions = vec![];
         let mut dataset = self.clone();
@@ -740,7 +740,7 @@ impl Dataset {
             let transaction = dataset.read_transaction().await?;
             transactions.push(transaction);
 
-            if transactions.len() >= max_transactions {
+            if transactions.len() >= recent_transactions {
                 break;
             } else {
                 match dataset

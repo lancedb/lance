@@ -374,10 +374,9 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             .getattr("blobs_op")?
             .extract::<Option<PyLance<Operation>>>()?
             .map(|op| op.0);
-        let transaction_properties: Option<Arc<HashMap<String, String>>> = ob
-            .getattr("transaction_properties")
-            .ok()
-            .and_then(|props| props.extract::<HashMap<String, String>>().ok())
+        let transaction_properties = ob
+            .getattr("transaction_properties")?
+            .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
         Ok(Self(Transaction {
@@ -418,12 +417,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         let py_transaction = cls.call1((read_version, operation, uuid, blobs_op))?;
 
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
-            if py_transaction.hasattr("transaction_properties")? {
-                let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
-                py_transaction.setattr("transaction_properties", py_dict)?;
-            }
+            let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
+            py_transaction.setattr("transaction_properties", py_dict)?;
         }
-
         // Unwrap due to infallible
         Ok(py_transaction.into_pyobject(py).unwrap())
     }

@@ -2819,8 +2819,8 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.read_transaction(version)
 
-    def get_transactions(self, max_transactions=10) -> Optional[List[Transaction]]:
-        return self._ds.get_transactions(max_transactions)
+    def get_transactions(self, recent_transactions=10) -> Optional[List[Transaction]]:
+        return self._ds.get_transactions(recent_transactions)
 
     def sql(self, sql: str) -> "SqlQueryBuilder":
         """Execute SQL query on the dataset.
@@ -3041,7 +3041,9 @@ class Transaction:
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     blobs_op: Optional[LanceOperation.BaseOperation] = None
-    transaction_properties: Optional[Dict[str, str]] = None
+    transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 class Tag(TypedDict):
