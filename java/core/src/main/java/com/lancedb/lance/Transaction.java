@@ -52,7 +52,8 @@ public class Transaction {
     this.operation = operation;
     this.blobOp = blobOp;
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
-    this.transactionProperties = transactionProperties != null ? transactionProperties : new HashMap<>();
+    this.transactionProperties =
+        transactionProperties != null ? transactionProperties : new HashMap<>();
   }
 
   public Dataset dataset() {
