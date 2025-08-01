@@ -157,7 +157,6 @@ impl DefaultCompressionStrategy {
     fn build_fixed_width_compressor(
         &self,
         params: &CompressionFieldParams,
-        _field: &Field,
         data: &FixedWidthDataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         let bits_per_value = data.bits_per_value;
@@ -280,7 +279,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
-                self.build_fixed_width_compressor(&field_params, field, fixed_width_data)
+                self.build_fixed_width_compressor(&field_params, fixed_width_data)
             }
             DataBlock::VariableWidth(variable_width_data) => {
                 self.build_variable_width_compressor(&field_params, variable_width_data)
