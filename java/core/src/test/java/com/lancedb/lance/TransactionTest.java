@@ -58,7 +58,7 @@ public class TransactionTest {
           dataset
               .newTransactionBuilder()
               .project(new Schema(fieldList))
-              .properties(Collections.singletonMap("op", "project"))
+              .transactionProperties(Collections.singletonMap("op", "project"))
               .build();
       assertEquals(1, txn.readVersion());
       assertEquals(1, dataset.version());
