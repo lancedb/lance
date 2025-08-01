@@ -1259,9 +1259,9 @@ impl FileFragment {
         Ok(())
     }
 
-    /// Open a session for take.
+    /// Open a [`FragmentSession`], which manages a short-lived session of [`FileFragment`].
     ///
-    /// A [`FragmentSession`] maintains states for better performance in continuous take requests.
+    /// This API works well for users making repeated requests over the same projected schema.
     pub async fn open_session(
         &self,
         projection: &Schema,
@@ -2365,7 +2365,7 @@ impl FragmentReader {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use arrow_arith::numeric::mul;
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
@@ -2386,10 +2386,7 @@ pub mod tests {
         utils::test::{StatsHolder, TestDatasetGenerator},
     };
 
-    pub(crate) async fn create_dataset(
-        test_uri: &str,
-        data_storage_version: LanceFileVersion,
-    ) -> Dataset {
+    async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new("s", DataType::Utf8, true),

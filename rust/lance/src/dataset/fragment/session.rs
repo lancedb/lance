@@ -10,9 +10,10 @@ use lance_core::Result;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-/// A session of [`FileFragment`]
+/// A [`FragmentSession`] manages a short-lived session of [`FileFragment`], allowing us to maintain
+/// internal states instead of creating new ones each time.
 ///
-/// A [`FragmentSession`] maintains states for better performance in continuous take requests.
+/// This API works well for users making repeated requests over the same projected schema.
 pub struct FragmentSession {
     reader: FragmentReader,
     sorted_deleted_ids: Option<Vec<u32>>,
@@ -31,14 +32,11 @@ impl FragmentSession {
             )
             .await?;
 
-        let deletion_vector = fragment.get_deletion_vector().await?;
-        let sorted_deleted_ids = if let Some(dv) = deletion_vector {
-            let mut sorted_deleted_ids = dv.as_ref().clone().into_iter().collect::<Vec<_>>();
-            sorted_deleted_ids.sort();
-            Some(sorted_deleted_ids)
-        } else {
-            None
-        };
+        let sorted_deleted_ids = fragment.get_deletion_vector().await?.map(|dv| {
+            let mut ids = dv.as_ref().clone().into_iter().collect::<Vec<_>>();
+            ids.sort();
+            ids
+        });
 
         Ok(Self {
             reader,
@@ -71,11 +69,14 @@ impl FragmentSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::dataset::fragment::tests::create_dataset;
-    use arrow_array::{Int32Array, UInt64Array};
+    use crate::dataset::WriteParams;
+    use crate::Dataset;
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ADDR;
     use lance_encoding::version::LanceFileVersion;
     use rstest::rstest;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[rstest]
@@ -200,5 +201,40 @@ mod tests {
             batch.column_by_name(ROW_ADDR).unwrap().as_ref(),
             &UInt64Array::from(vec![(3 << 32) + 1, (3 << 32) + 5, (3 << 32) + 8])
         );
+    }
+
+    async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..10)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        Dataset::open(test_uri).await.unwrap()
     }
 }
