@@ -54,7 +54,12 @@ public class TransactionTest {
       assertEquals(testDataset.getSchema(), dataset.getSchema());
       List<Field> fieldList = new ArrayList<>(testDataset.getSchema().getFields());
       Collections.reverse(fieldList);
-      Transaction txn = dataset.newTransactionBuilder().project(new Schema(fieldList)).build();
+      Transaction txn =
+          dataset
+              .newTransactionBuilder()
+              .project(new Schema(fieldList))
+              .properties(Collections.singletonMap("op", "project"))
+              .build();
       assertEquals(1, txn.readVersion());
       assertEquals(1, dataset.version());
       assertEquals(1, txn.dataset().version());
