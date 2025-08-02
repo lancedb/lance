@@ -32,7 +32,7 @@ use lance_index::scalar::expression::{
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{ScalarIndex, ScalarIndexType};
-use lance_index::vector::bq::builder::RabbitQuantizer;
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
@@ -1281,8 +1281,8 @@ impl DatasetIndexInternalExt for Dataset {
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
-                    "IVF_RABBIT" => {
-                        let ivf = IVFIndex::<FlatIndex, RabbitQuantizer>::try_new(
+                    "IVF_RABIT" => {
+                        let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),

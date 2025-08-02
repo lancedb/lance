@@ -480,7 +480,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
-        (SubIndexType::Flat, QuantizationType::Rabbit) => {
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),

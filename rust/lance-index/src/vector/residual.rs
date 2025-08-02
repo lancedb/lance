@@ -12,7 +12,7 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type, UInt32Type},
     Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
@@ -22,6 +22,8 @@ use snafu::location;
 use tracing::instrument;
 
 use super::{transform::Transformer, PQ_CODE_COLUMN};
+
+pub const RESIDUAL_COLUMN: &str = "__residual";
 
 /// Compute the residual vector of a Vector Matrix to their centroids.
 ///
@@ -37,6 +39,10 @@ pub struct ResidualTransform {
 
     /// Vector Column
     vec_col: String,
+
+    /// Replace the original vector with the residual vector if false,
+    /// otherwise, keep the original vector and add the residual vector as a new column.
+    keep_original: bool,
 }
 
 impl std::fmt::Debug for ResidualTransform {
@@ -51,6 +57,14 @@ impl ResidualTransform {
             centroids,
             part_col: part_col.to_owned(),
             vec_col: column.to_owned(),
+            keep_original: false,
+        }
+    }
+
+    pub fn keep_original(self, keep_original: bool) -> Self {
+        Self {
+            keep_original,
+            ..self
         }
     }
 }
@@ -191,8 +205,10 @@ impl Transformer for ResidualTransform {
         let residual_arr =
             compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
-        // Replace original column with residual column.
-        let batch = if residual_arr.data_type() != original.data_type() {
+        let batch = if self.keep_original {
+            let field = Field::new(RESIDUAL_COLUMN, original.data_type().clone(), true);
+            batch.try_with_column(field, Arc::new(residual_arr))?
+        } else if residual_arr.data_type() != original.data_type() {
             batch.replace_column_schema_by_name(
                 &self.vec_col,
                 residual_arr.data_type().clone(),

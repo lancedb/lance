@@ -24,7 +24,7 @@ use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
-use crate::vector::bq::builder::RabbitQuantizer;
+use crate::vector::bq::builder::RabitQuantizer;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
 pub trait Quantization:
@@ -66,7 +66,7 @@ pub enum QuantizationType {
     Flat,
     Product,
     Scalar,
-    Rabbit,
+    Rabit,
 }
 
 impl FromStr for QuantizationType {
@@ -77,7 +77,7 @@ impl FromStr for QuantizationType {
             "FLAT" => Ok(Self::Flat),
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
-            "RABBIT" => Ok(Self::Rabbit),
+            "RABIT" => Ok(Self::Rabit),
             _ => Err(Error::Index {
                 message: format!("Unknown quantization type: {}", s),
                 location: location!(),
@@ -92,7 +92,7 @@ impl std::fmt::Display for QuantizationType {
             Self::Flat => write!(f, "FLAT"),
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
-            Self::Rabbit => write!(f, "RABBIT"),
+            Self::Rabit => write!(f, "RABIT"),
         }
     }
 }
@@ -121,7 +121,7 @@ pub enum Quantizer {
     FlatBin(FlatBinQuantizer),
     Product(ProductQuantizer),
     Scalar(ScalarQuantizer),
-    Rabbit(RabbitQuantizer),
+    Rabit(RabitQuantizer),
 }
 
 impl Quantizer {
@@ -131,7 +131,7 @@ impl Quantizer {
             Self::FlatBin(fq) => fq.code_dim(),
             Self::Product(pq) => pq.code_dim(),
             Self::Scalar(sq) => sq.code_dim(),
-            Self::Rabbit(rq) => rq.code_dim(),
+            Self::Rabit(rq) => rq.code_dim(),
         }
     }
 
@@ -141,7 +141,7 @@ impl Quantizer {
             Self::FlatBin(fq) => fq.column(),
             Self::Product(pq) => pq.column(),
             Self::Scalar(sq) => sq.column(),
-            Self::Rabbit(rq) => rq.column(),
+            Self::Rabit(rq) => rq.column(),
         }
     }
 
@@ -151,7 +151,7 @@ impl Quantizer {
             Self::FlatBin(_) => FlatBinQuantizer::metadata_key(),
             Self::Product(_) => ProductQuantizer::metadata_key(),
             Self::Scalar(_) => ScalarQuantizer::metadata_key(),
-            Self::Rabbit(_) => RabbitQuantizer::metadata_key(),
+            Self::Rabit(_) => RabitQuantizer::metadata_key(),
         }
     }
 
@@ -161,7 +161,7 @@ impl Quantizer {
             Self::FlatBin(_) => QuantizationType::Flat,
             Self::Product(_) => QuantizationType::Product,
             Self::Scalar(_) => QuantizationType::Scalar,
-            Self::Rabbit(_) => QuantizationType::Rabbit,
+            Self::Rabit(_) => QuantizationType::Rabit,
         }
     }
 
@@ -171,7 +171,7 @@ impl Quantizer {
             Self::FlatBin(fq) => serde_json::to_value(fq.metadata(args))?,
             Self::Product(pq) => serde_json::to_value(pq.metadata(args))?,
             Self::Scalar(sq) => serde_json::to_value(sq.metadata(args))?,
-            Self::Rabbit(rq) => serde_json::to_value(rq.metadata(args))?,
+            Self::Rabit(rq) => serde_json::to_value(rq.metadata(args))?,
         };
         Ok(metadata)
     }

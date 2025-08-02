@@ -840,6 +840,8 @@ where
     )
 }
 
+/// compute the partition id and the distance to the centroid for each vector,
+/// NOTE the distance is squared distance for L2
 pub fn compute_partitions_with_dists<T: ArrowNumericType, K: KMeansAlgo<T::Native>>(
     centroids: &PrimitiveArray<T>,
     vectors: &PrimitiveArray<T>,

@@ -359,7 +359,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
-            (SubIndexType::Flat, QuantizationType::Rabbit) => IndexType::IvfRq,
+            (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat) => IndexType::IvfHnswFlat,
@@ -1384,6 +1384,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case(1, DistanceType::L2, 0.85)]
     #[case(4, DistanceType::L2, 0.85)]
     #[tokio::test]
     async fn test_build_ivf_rq(

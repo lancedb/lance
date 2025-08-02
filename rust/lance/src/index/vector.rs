@@ -21,7 +21,7 @@ use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::vector::bq::builder::RabbitQuantizer;
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -444,7 +444,7 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        IvfIndexBuilder::<FlatIndex, RabbitQuantizer>::new(
+        IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
             dataset.clone(),
             column.to_owned(),
             dataset.indices_dir().child(uuid),

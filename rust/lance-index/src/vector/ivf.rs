@@ -13,7 +13,7 @@ use lance_core::Result;
 use lance_linalg::distance::{DistanceType, MetricType};
 use tracing::instrument;
 
-use crate::vector::bq::builder::RabbitQuantizer;
+use crate::vector::bq::builder::RabitQuantizer;
 use crate::vector::bq::transform::RQTransformer;
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array};
@@ -80,7 +80,7 @@ pub fn new_ivf_transformer_with_quantizer(
             sq,
             range,
         )),
-        Quantizer::Rabbit(rq) => Ok(IvfTransformer::with_rq(
+        Quantizer::Rabit(rq) => Ok(IvfTransformer::with_rq(
             centroids,
             metric_type,
             vector_column,
@@ -256,7 +256,7 @@ impl IvfTransformer {
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
         vector_column: &str,
-        rq: RabbitQuantizer,
+        rq: RabitQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
@@ -285,14 +285,10 @@ impl IvfTransformer {
             )));
         }
 
-        // RQ requires to convert the vector `v` to `(v-c)/||v-c||`,
-        // so we do normalize again after the residual transform.
-        transforms.push(Arc::new(ResidualTransform::new(
-            centroids.clone(),
-            PART_ID_COLUMN,
-            vector_column,
-        )));
-        transforms.push(Arc::new(NormalizeTransformer::new(vector_column)));
+        transforms.push(Arc::new(
+            ResidualTransform::new(centroids.clone(), PART_ID_COLUMN, vector_column)
+                .keep_original(true),
+        ));
 
         transforms.push(Arc::new(RQTransformer::new(rq, vector_column)));
 

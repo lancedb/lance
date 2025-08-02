@@ -15,7 +15,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
-use lance_linalg::kernels::normalize_arrow;
+use lance_linalg::kernels::{self, normalize_arrow};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
@@ -24,31 +24,31 @@ use snafu::location;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
-use crate::vector::bq::transform::NORM_DIST_COLUMN;
+use crate::vector::bq::transform::{CODE_BITCOUNT_COLUMN, IP_RQ_RES_COLUMN};
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::sq::scale_to_u8;
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::CENTROID_DIST_COLUMN;
 
-pub const RABBIT_METADATA_KEY: &str = "lance:rabbit";
-pub const RABBIT_CODE_COLUMN: &str = "_rabbit_codes";
+pub const RABIT_METADATA_KEY: &str = "lance:rabit";
+pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RabbitQuantizationMetadata {
+pub struct RabitQuantizationMetadata {
     #[serde(skip)]
     pub inv_p: ndarray::ArcArray2<f32>,
     pub inv_p_position: u32,
     pub num_bits: u8,
 }
 
-impl DeepSizeOf for RabbitQuantizationMetadata {
+impl DeepSizeOf for RabitQuantizationMetadata {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         self.inv_p.len() * std::mem::size_of::<f32>()
     }
 }
 
 #[async_trait]
-impl QuantizerMetadata for RabbitQuantizationMetadata {
+impl QuantizerMetadata for RabitQuantizationMetadata {
     fn buffer_index(&self) -> Option<u32> {
         Some(self.inv_p_position)
     }
@@ -90,11 +90,11 @@ impl QuantizerMetadata for RabbitQuantizationMetadata {
             reader
                 .schema()
                 .metadata
-                .get(RABBIT_METADATA_KEY)
+                .get(RABIT_METADATA_KEY)
                 .ok_or(Error::Index {
                     message: format!(
-                        "Reading Rabbit metadata: metadata key {} not found",
-                        RABBIT_METADATA_KEY
+                        "Reading Rabit metadata: metadata key {} not found",
+                        RABIT_METADATA_KEY
                     ),
                     location: location!(),
                 })?;
@@ -106,25 +106,26 @@ impl QuantizerMetadata for RabbitQuantizationMetadata {
 }
 
 #[derive(Debug, Clone)]
-pub struct RabbitQuantizationStorage {
-    metadata: RabbitQuantizationMetadata,
+pub struct RabitQuantizationStorage {
+    metadata: RabitQuantizationMetadata,
     batch: RecordBatch,
     distance_type: DistanceType,
 
     // helper fields
     row_ids: UInt64Array,
-    codes: FixedSizeListArray,
     centroid_dists: Float32Array,
+    codes: FixedSizeListArray,
+    code_bitcounts: Float32Array,
     norm_dists: Float32Array,
 }
 
-impl DeepSizeOf for RabbitQuantizationStorage {
+impl DeepSizeOf for RabitQuantizationStorage {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.metadata.deep_size_of_children(context) + self.batch.get_array_memory_size()
     }
 }
 
-pub struct RabbitDistCalculator<'a> {
+pub struct RabitDistCalculator<'a> {
     dim: usize,
     // num_bits is the number of bits per dimension,
     // it's always 1 for now
@@ -136,35 +137,45 @@ pub struct RabbitDistCalculator<'a> {
     // then dist_table[i][j] is the distance between the i-th query code and the code j
     dist_table: Vec<u32>,
     centroid_dists: &'a [f32],
-    norm_dists: &'a [f32],
-    query_scalar_sum: f32,
-    min_v_in_query: f32,
-    scalar_delta: f32,
-    sqrt_d: f32,
-    query_norm: f32,
+    code_bitcounts: &'a [f32],
+    ip_rq_res: &'a [f32],
+    ip_rq_centroid: &'a [f32],
+
+    // factors for all computing distances to all vectors
+    // |v-c|^2  + 2 * |v-c|^2 * ip_rq_res[i] /
+    add_factor: f32,
+    scale_factor: f32,
+
+    // factors for query vector
+    // -(2^B - 1)/2 * sum(q')
+    kbit_x_sq_sum: f32,
+    // |(q-c)| ^ 2
+    qr_norm_square: f32,
 }
 
-impl<'a> RabbitDistCalculator<'a> {
-    // norm_qr = (q-c)/|q-c|
+impl<'a> RabitDistCalculator<'a> {
     pub fn new(
-        residual_q: &dyn Array,
+        q: &dyn Array,
+        centroid: &dyn Array,
         codes: &'a [u8],
         centroid_dists: &'a [f32],
-        norm_dists: &'a [f32],
+        code_bitcounts: &'a [f32],
+        ip_rq_res: &'a [f32],
+        ip_rq_centroid: &'a [f32],
         inv_p: ndarray::ArrayView2<'a, f32>,
     ) -> Self {
-        let (norm_qr, norm) = normalize_arrow(residual_q).unwrap();
-        let norm_qr = norm_qr.as_primitive::<Float32Type>().values();
-        let norm_qr = ndarray::ArrayView2::from_shape((norm_qr.len(), 1), norm_qr).unwrap();
-        let quantized_q = inv_p.dot(&norm_qr).into_raw_vec_and_offset().0;
-        let (min, max) = quantized_q
+        let qr = arrow_arith::numeric::sub(&q, &centroid).unwrap();
+        let l2_norm_square = qr.iter().map(|&v| v * v).sum::<f32>();
+        let qr = ndarray::ArrayView2::from_shape((qr.len(), 1), qr).unwrap();
+        let rotated_q = inv_p.dot(&qr);
+        let (min, max) = rotated_q
             .iter()
             .copied()
             .minmax()
             .into_option()
             .expect("failed to get min and max of query vector");
         let bounds = min.as_()..max.as_();
-        let query_codes = scale_to_u8::<Float32Type>(&quantized_q, &bounds);
+        let query_codes = scale_to_u8::<Float32Type>(&rotated_q, &bounds);
 
         // let (query_codes, min, max) = match norm_qr.data_type() {
         // DataType::Float16 => {
@@ -209,7 +220,7 @@ impl<'a> RabbitDistCalculator<'a> {
         //     )
         // }
         // _ => {
-        //     unimplemented!("unsupported data type for RabbitQ: {}", norm_qr.data_type());
+        //     unimplemented!("unsupported data type for RabitQ: {}", norm_qr.data_type());
         // }
         // };
         let delta = (max - min) / 255.0;
@@ -224,9 +235,10 @@ impl<'a> RabbitDistCalculator<'a> {
             dist_table,
             centroid_dists,
             min_v_in_query: min,
-            scalar_delta: delta,
+            delta,
             sqrt_d,
             query_scalar_sum,
+            code_bitcounts,
             norm_dists,
             query_norm: norm,
         }
@@ -239,8 +251,8 @@ impl<'a> RabbitDistCalculator<'a> {
             .flat_map(|sub_vec| {
                 (0..16).map(|j| {
                     let mut dist = 0;
-                    for (b, v) in sub_vec.iter().enumerate() {
-                        dist += (*v * ((j >> b) & 0x1)) as u32;
+                    for (b, &v) in sub_vec.iter().enumerate() {
+                        dist += (v * ((j >> b) & 0x1)) as u32;
                     }
                     dist
                 })
@@ -251,7 +263,7 @@ impl<'a> RabbitDistCalculator<'a> {
 }
 
 // TODO: optimize this with SIMD
-impl DistCalculator for RabbitDistCalculator<'_> {
+impl DistCalculator for RabitDistCalculator<'_> {
     fn distance(&self, id: u32) -> f32 {
         let mut dist = 0;
         let id = id as usize;
@@ -268,12 +280,12 @@ impl DistCalculator for RabbitDistCalculator<'_> {
             dist += next_dist_table[next_code];
         }
 
-        let vec_bitcount = code.iter().map(|byte| byte.count_ones()).sum::<u32>() as f32;
+        let vec_bitcount = self.code_bitcounts[id];
         let dist = dist as f32;
 
         // distance between quantized vector and query vector
-        let dist_vq_q = (2.0 * self.scalar_delta * dist + 2.0 * self.min_v_in_query * vec_bitcount
-            - self.scalar_delta * self.query_scalar_sum
+        let dist_vq_q = (2.0 * self.delta * dist + 2.0 * self.min_v_in_query * vec_bitcount
+            - self.delta * self.query_scalar_sum
             - self.dim as f32 * self.min_v_in_query)
             / self.sqrt_d;
 
@@ -284,8 +296,8 @@ impl DistCalculator for RabbitDistCalculator<'_> {
 
     fn distance_all(&self, _: usize) -> Vec<f32> {
         let code_len = self.dim * (self.num_bits as usize) / 8;
-        let len = self.codes.len() / code_len;
-        let mut dists = vec![0.0; len];
+        let n = self.codes.len() / code_len;
+        let mut dists = vec![0.0; n];
         for (i, dist) in dists.iter_mut().enumerate() {
             *dist = self.distance(i as u32);
         }
@@ -293,8 +305,8 @@ impl DistCalculator for RabbitDistCalculator<'_> {
     }
 }
 
-impl VectorStore for RabbitQuantizationStorage {
-    type DistanceCalculator<'a> = RabbitDistCalculator<'a>;
+impl VectorStore for RabitQuantizationStorage {
+    type DistanceCalculator<'a> = RabitDistCalculator<'a>;
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -309,7 +321,7 @@ impl VectorStore for RabbitQuantizationStorage {
     }
 
     fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
-        unimplemented!("RabbitQ does not support append_batch")
+        unimplemented!("RabitQ does not support append_batch")
     }
 
     fn len(&self) -> usize {
@@ -328,27 +340,29 @@ impl VectorStore for RabbitQuantizationStorage {
         self.distance_type
     }
 
-    fn dist_calculator(&self, residual_q: Arc<dyn Array>) -> Self::DistanceCalculator<'_> {
+    // qr = (q-c)
+    fn dist_calculator(&self, qr: Arc<dyn Array>) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
-        RabbitDistCalculator::new(
-            residual_q.as_ref(),
+        RabitDistCalculator::new(
+            qr.as_ref(),
             codes,
             self.centroid_dists.values(),
+            self.code_bitcounts.values(),
             self.norm_dists.values(),
             self.metadata.inv_p.view(),
         )
     }
 
     // TODO: implement this
-    // This method is required for HNSW, we can't support HNSW_RABBIT before this is implemented
+    // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
     fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
-        unimplemented!("RabbitQ does not support dist_calculator_from_id")
+        unimplemented!("RabitQ does not support dist_calculator_from_id")
     }
 }
 
 #[async_trait]
-impl QuantizerStorage for RabbitQuantizationStorage {
-    type Metadata = RabbitQuantizationMetadata;
+impl QuantizerStorage for RabitQuantizationStorage {
+    type Metadata = RabitQuantizationMetadata;
 
     fn try_from_batch(
         batch: RecordBatch,
@@ -357,11 +371,14 @@ impl QuantizerStorage for RabbitQuantizationStorage {
         _fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-        let codes = batch[RABBIT_CODE_COLUMN].as_fixed_size_list().clone();
+        let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
         let centroid_dists = batch[CENTROID_DIST_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
-        let norm_dists = batch[NORM_DIST_COLUMN]
+        let code_bitcounts = batch[CODE_BITCOUNT_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
+        let norm_dists = batch[IP_RQ_RES_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
         Ok(Self {
@@ -371,6 +388,7 @@ impl QuantizerStorage for RabbitQuantizationStorage {
             row_ids,
             codes,
             centroid_dists,
+            code_bitcounts,
             norm_dists,
         })
     }

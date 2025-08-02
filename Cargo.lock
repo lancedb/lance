@@ -4379,6 +4379,7 @@ version = "0.32.1"
 dependencies = [
  "approx",
  "arrow",
+ "arrow-arith",
  "arrow-array",
  "arrow-ord",
  "arrow-schema",
