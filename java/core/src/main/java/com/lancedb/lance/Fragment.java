@@ -62,7 +62,7 @@ public class Fragment {
     return LanceScanner.create(
         dataset,
         new ScanOptions.Builder().fragmentIds(Arrays.asList(fragment.getId())).build(),
-        dataset.allocator);
+        dataset.allocator());
   }
 
   /**
@@ -78,7 +78,7 @@ public class Fragment {
             .fragmentIds(Arrays.asList(fragment.getId()))
             .batchSize(batchSize)
             .build(),
-        dataset.allocator);
+        dataset.allocator());
   }
 
   /**
@@ -92,7 +92,7 @@ public class Fragment {
     return LanceScanner.create(
         dataset,
         new ScanOptions.Builder(options).fragmentIds(Arrays.asList(fragment.getId())).build(),
-        dataset.allocator);
+        dataset.allocator());
   }
 
   private native int countRowsNative(Dataset dataset, long fragmentId);

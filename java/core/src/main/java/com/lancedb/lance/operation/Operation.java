@@ -23,6 +23,6 @@ public interface Operation {
    */
   String name();
 
-  /** Release the underlying JNI resource including arrow c schema */
-  void release();
+  /** Release the underlying JNI resource like arrow c schema */
+  default void release() {}
 }

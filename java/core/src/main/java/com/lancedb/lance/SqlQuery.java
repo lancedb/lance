@@ -50,10 +50,10 @@ public class SqlQuery {
   }
 
   public ArrowReader intoBatchRecords() throws IOException {
-    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator)) {
+    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
       intoBatchRecords(
           dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, s.memoryAddress());
-      return Data.importArrayStream(dataset.allocator, s);
+      return Data.importArrayStream(dataset.allocator(), s);
     }
   }
 
