@@ -1107,7 +1107,6 @@ mod tests {
 
         StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
             .unwrap()
-            .assert_num_columns(false)
             .build(vec![batch])
             .unwrap()
     }

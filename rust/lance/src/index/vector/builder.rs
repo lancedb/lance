@@ -785,9 +785,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
 
-        let storage_schema: Schema =
-            (&arrow_schema::Schema::new(vec![ROW_ID_FIELD.clone(), quantizer.field()]))
-                .try_into()?;
+        let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
+        fields.extend(quantizer.extra_fields());
+        let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
         let mut storage_writer = FileWriter::try_new(
             self.store.create(&storage_path).await?,
             storage_schema.clone(),

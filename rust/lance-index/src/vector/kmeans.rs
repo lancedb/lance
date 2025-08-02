@@ -140,13 +140,13 @@ fn split_clusters<T: Float + MulAssign>(
     dim: usize,
 ) {
     let eps = T::from(1.0 / 1024.0).unwrap();
-    let mut rng = SmallRng::from_entropy();
+    let mut rng = SmallRng::from_rng(&mut rand::rng());
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
             let mut j = 0;
             loop {
                 let p = (cnts[j] as f32 - 1.0) / (n - cnts.len()) as f32;
-                if rng.gen::<f32>() < p {
+                if rng.random::<f32>() < p {
                     break;
                 }
                 j += 1;
@@ -540,7 +540,7 @@ impl KMeans {
         let mut best_stddev = f32::MAX;
 
         // TODO: use seed for Rng.
-        let rng = SmallRng::from_entropy();
+        let rng = SmallRng::from_rng(&mut rand::rng());
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
@@ -840,6 +840,8 @@ where
     )
 }
 
+/// compute the partition id and the distance to the centroid for each vector,
+/// NOTE the distance is squared distance for L2
 pub fn compute_partitions_with_dists<T: ArrowNumericType, K: KMeansAlgo<T::Native>>(
     centroids: &PrimitiveArray<T>,
     vectors: &PrimitiveArray<T>,

@@ -2759,7 +2759,7 @@ name = "fsst"
 version = "0.32.1"
 dependencies = [
  "arrow-array",
- "rand 0.8.5",
+ "rand 0.9.1",
 ]
 
 [[package]]
@@ -3685,7 +3685,7 @@ dependencies = [
  "prost 0.12.6",
  "prost 0.13.5",
  "prost-types 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "roaring",
  "serde",
  "serde_json",
@@ -3713,7 +3713,7 @@ dependencies = [
  "getrandom 0.2.16",
  "half",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.1",
 ]
 
 [[package]]
@@ -3740,7 +3740,7 @@ dependencies = [
  "object_store",
  "pin-project",
  "prost 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "roaring",
  "serde_json",
  "snafu",
@@ -3791,7 +3791,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rand_xoshiro",
  "random_word",
 ]
@@ -3826,7 +3826,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "seq-macro",
  "snafu",
  "tokio",
@@ -3908,11 +3908,13 @@ dependencies = [
  "lindera",
  "lindera-tantivy",
  "log",
+ "ndarray",
  "num-traits",
  "object_store",
  "prost 0.13.5",
  "prost-build 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
+ "rand_distr 0.5.1",
  "rayon",
  "roaring",
  "serde",
@@ -3956,7 +3958,7 @@ dependencies = [
  "path_abs",
  "pin-project",
  "prost 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "serde",
  "shellexpand",
  "snafu",
@@ -3982,7 +3984,7 @@ dependencies = [
  "lance-core",
  "log",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rayon",
  "tokio",
  "tracing",
@@ -4014,7 +4016,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rangemap",
  "roaring",
  "serde",
@@ -4439,6 +4441,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrixmultiply"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06de3016e9fae57a36fd14dba131fccf49f74b40b7fbdb472f96e361ec71a08"
+dependencies = [
+ "autocfg",
+ "num_cpus",
+ "once_cell",
+ "rawpointer",
+ "thread-tree",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4555,6 +4570,21 @@ name = "murmurhash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
+
+[[package]]
+name = "ndarray"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
+dependencies = [
+ "matrixmultiply",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "portable-atomic",
+ "portable-atomic-util",
+ "rawpointer",
+]
 
 [[package]]
 name = "noisy_float"
@@ -5602,12 +5632,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_xoshiro"
-version = "0.6.0"
+name = "rand_distr"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
+checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
 dependencies = [
- "rand_core 0.6.4",
+ "num-traits",
+ "rand 0.9.1",
+]
+
+[[package]]
+name = "rand_xoshiro"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+dependencies = [
+ "rand_core 0.9.3",
 ]
 
 [[package]]
@@ -5629,6 +5669,12 @@ name = "rangemap"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60fcc7d6849342eff22c4350c8b9a989ee8ceabc4b481253e8946b9fe83d684"
+
+[[package]]
+name = "rawpointer"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
 
 [[package]]
 name = "rayon"
@@ -6655,7 +6701,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bcdebb267671311d1e8891fd9d1301803fdb8ad21ba22e0a30d0cab49ba59c1"
 dependencies = [
  "murmurhash32",
- "rand_distr",
+ "rand_distr 0.4.3",
  "tantivy-common",
 ]
 
@@ -6771,6 +6817,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.104",
+]
+
+[[package]]
+name = "thread-tree"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffbd370cb847953a25954d9f63e14824a36113f8c72eecf6eccef5dc4b45d630"
+dependencies = [
+ "crossbeam-channel",
 ]
 
 [[package]]

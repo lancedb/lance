@@ -110,8 +110,6 @@ pub struct StorageBuilder<Q: Quantization> {
     distance_type: DistanceType,
     quantizer: Q,
 
-    // this is for testing purpose
-    assert_num_columns: bool,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
@@ -126,15 +124,8 @@ impl<Q: Quantization> StorageBuilder<Q> {
             vector_column,
             distance_type,
             quantizer,
-            assert_num_columns: true,
             frag_reuse_index,
         })
-    }
-
-    // this is for testing purpose
-    pub fn assert_num_columns(mut self, assert_num_columns: bool) -> Self {
-        self.assert_num_columns = assert_num_columns;
-        self
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
@@ -154,9 +145,6 @@ impl<Q: Quantization> StorageBuilder<Q> {
             )?;
         }
 
-        if self.assert_num_columns {
-            debug_assert_eq!(batch.num_columns(), 2, "{}", batch.schema());
-        }
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 

@@ -260,7 +260,8 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         if n >= self.len() {
             return Ok(self.clone());
         }
-        let mut rng = SmallRng::from_entropy();
+        let mut rng = rand::rng();
+        let mut rng = SmallRng::from_rng(&mut rng);
         let chosen = (0..self.len() as u32).choose_multiple(&mut rng, n);
         take(self, &UInt32Array::from(chosen), None).map(|arr| arr.as_fixed_size_list().clone())
     }
