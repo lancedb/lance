@@ -219,7 +219,7 @@ impl RowIdMask {
         }
     }
 
-    /// Iterate over the row ids that are selected by the mask
+    /// Iterate over the row addrs that are selected by the mask
     ///
     /// This is only possible if there is an allow list and neither the
     /// allow list nor the block list contain any "full fragment" blocks.
@@ -227,10 +227,10 @@ impl RowIdMask {
     /// TODO: We could probably still iterate efficiently even if the block
     /// list contains "full fragment" blocks but that would require some
     /// extra logic.
-    pub fn iter_ids(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
-        if let Some(mut allow_iter) = self.allow_list.as_ref().and_then(|list| list.row_ids()) {
+    pub fn iter_addrs(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
+        if let Some(mut allow_iter) = self.allow_list.as_ref().and_then(|list| list.row_addrs()) {
             if let Some(block_list) = &self.block_list {
-                if let Some(block_iter) = block_list.row_ids() {
+                if let Some(block_iter) = block_list.row_addrs() {
                     let mut block_iter = block_iter.peekable();
                     Some(Box::new(iter::from_fn(move || {
                         for allow_id in allow_iter.by_ref() {
@@ -402,11 +402,11 @@ impl RowIdTreeMap {
             .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
     }
 
-    /// An iterator of row ids
+    /// An iterator of row addrs
     ///
     /// If there are any "full fragment" items then this can't be calculated and None
     /// is returned
-    pub fn row_ids(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
+    pub fn row_addrs(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
         let inner_iters = self
             .inner
             .iter()
@@ -652,14 +652,14 @@ impl RowIdTreeMap {
         }
     }
 
-    /// Convert the set into an iterator of row ids
+    /// Convert the set into an iterator of row addrs
     ///
     /// # Safety
     ///
     /// This is unsafe because if any of the inner RowIdSelection elements
     /// is not a Partial then the iterator will panic because we don't know
     /// the size of the bitmap.
-    pub unsafe fn into_id_iter(self) -> impl Iterator<Item = u64> {
+    pub unsafe fn into_addr_iter(self) -> impl Iterator<Item = u64> {
         self.inner
             .into_iter()
             .flat_map(|(fragment, selection)| match selection {
@@ -1135,14 +1135,14 @@ mod tests {
     #[test]
     fn test_iter_ids() {
         let mut mask = RowIdMask::default();
-        assert!(mask.iter_ids().is_none());
+        assert!(mask.iter_addrs().is_none());
 
         // Test with just an allow list
         let mut allow_list = RowIdTreeMap::default();
         allow_list.extend([1, 5, 10].iter().copied());
         mask.allow_list = Some(allow_list);
 
-        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
+        let ids: Vec<_> = mask.iter_addrs().unwrap().collect();
         assert_eq!(
             ids,
             vec![
@@ -1157,7 +1157,7 @@ mod tests {
         block_list.extend([5].iter().copied());
         mask.block_list = Some(block_list);
 
-        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
+        let ids: Vec<_> = mask.iter_addrs().unwrap().collect();
         assert_eq!(
             ids,
             vec![
@@ -1170,13 +1170,13 @@ mod tests {
         let mut block_list = RowIdTreeMap::default();
         block_list.insert_fragment(0);
         mask.block_list = Some(block_list);
-        assert!(mask.iter_ids().is_none());
+        assert!(mask.iter_addrs().is_none());
 
         // Test with full fragment in allow list
         mask.block_list = None;
         let mut allow_list = RowIdTreeMap::default();
         allow_list.insert_fragment(0);
         mask.allow_list = Some(allow_list);
-        assert!(mask.iter_ids().is_none());
+        assert!(mask.iter_addrs().is_none());
     }
 }

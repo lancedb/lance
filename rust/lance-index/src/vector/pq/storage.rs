@@ -248,7 +248,7 @@ impl ProductQuantizationStorage {
 
             let row_ids_values = row_ids.values();
             for (i, row_id) in row_ids_values.iter().enumerate() {
-                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_id(*row_id) {
+                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_addr(*row_id) {
                     new_row_ids.push(mapped_value);
                     new_codes.extend(get_pq_code(
                         transposed_codes,
