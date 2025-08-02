@@ -8,6 +8,7 @@ use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::datatypes::Schema as LanceSchema;
+use std::sync::Arc;
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Transaction_commitNative<'local>(
@@ -69,9 +70,15 @@ fn convert_to_rust_transaction(env: &mut JNIEnv, java_tx: JObject) -> Result<Tra
         Some(convert_to_rust_operation(env, blobs_op)?)
     };
 
+    let transaction_properties = env
+        .call_method(&java_tx, "transactionProperties", "()Ljava/util/Map;", &[])?
+        .l()?;
+    let transaction_properties = JMap::from_env(env, &transaction_properties)?;
+    let transaction_properties = to_rust_map(env, &transaction_properties)?;
     Ok(TransactionBuilder::new(read_ver as u64, op)
         .uuid(uuid)
         .blobs_op(blobs_op)
+        .transaction_properties(Some(Arc::new(transaction_properties)))
         .build())
 }
 
