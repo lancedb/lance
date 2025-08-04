@@ -26,6 +26,7 @@ class DeletionFile:
     id: int
     num_deleted_rows: int
     file_type: Literal["array", "bitmap"]
+    path_base: Optional[str]
 
     def __init__(
         self,
@@ -33,6 +34,7 @@ class DeletionFile:
         id: int,
         file_type: Literal["array", "bitmap"],
         num_deleted_rows: int,
+        path_base: Optional[str] = None,
     ): ...
     def asdict(self) -> dict:
         """Get a dictionary representation of the deletion file."""
