@@ -1173,102 +1173,7 @@ pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
 ) -> IndexedExpression {
-    // First, try to optimize the expression by converting OR chains to IN lists
-    let optimized_expr = optimize_or_chains(expr);
-    visit_node(&optimized_expr, index_info).unwrap_or(IndexedExpression::refine_only(optimized_expr))
-}
-
-/// Optimize OR chains by converting them to IN lists when possible
-/// This helps prevent stack overflow by reducing the depth of the expression tree
-fn optimize_or_chains(expr: Expr) -> Expr {
-    match expr {
-        Expr::BinaryExpr(binary_expr) => {
-            if binary_expr.op == Operator::Or {
-                // Try to convert OR chain to IN list
-                if let Some(in_list_expr) = try_convert_or_to_in_list(&binary_expr) {
-                    return in_list_expr;
-                }
-                // If conversion fails, recursively optimize left and right
-                let left = optimize_or_chains(*binary_expr.left);
-                let right = optimize_or_chains(*binary_expr.right);
-                Expr::BinaryExpr(BinaryExpr {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    op: binary_expr.op,
-                })
-            } else {
-                // For non-OR operators, recursively optimize children
-                let left = optimize_or_chains(*binary_expr.left);
-                let right = optimize_or_chains(*binary_expr.right);
-                Expr::BinaryExpr(BinaryExpr {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    op: binary_expr.op,
-                })
-            }
-        }
-        // For other expression types, return as-is
-        _ => expr,
-    }
-}
-
-/// Try to convert an OR chain to an IN list
-/// This works when all conditions are equality comparisons on the same column
-fn try_convert_or_to_in_list(binary_expr: &BinaryExpr) -> Option<Expr> {
-    // Collect all equality conditions on the same column
-    let mut conditions = Vec::new();
-    let mut column_name = None;
-    
-    // Use iterative traversal to avoid stack overflow
-    let mut stack = vec![Expr::BinaryExpr(binary_expr.clone())];
-    
-    while let Some(expr) = stack.pop() {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { op: Operator::Or, left, right }) => {
-                stack.push(*left);
-                stack.push(*right);
-            }
-            Expr::BinaryExpr(BinaryExpr { op: Operator::Eq, left, right }) => {
-                // Check if this is a column = value comparison
-                if let (Expr::Column(col), Expr::Literal(val, _)) = (*left, *right) {
-                    if let Some(ref col_name) = column_name {
-                        if col.name == *col_name {
-                            conditions.push(Expr::Literal(val.clone(), None));
-                        } else {
-                            // Different columns, can't convert
-                            return None;
-                        }
-                    } else {
-                        column_name = Some(col.name.clone());
-                        conditions.push(Expr::Literal(val.clone(), None));
-                    }
-                } else {
-                    // Not a simple equality, can't convert
-                    return None;
-                }
-            }
-            _ => {
-                // Not an OR or equality, can't convert
-                return None;
-            }
-        }
-    }
-    
-    // If we found conditions and they're all on the same column, create IN list
-    if let Some(col_name) = column_name {
-        if conditions.len() > 1 {
-            let column_expr = Expr::Column(datafusion_common::Column::from_name(col_name));
-            Some(Expr::InList(InList {
-                expr: Box::new(column_expr),
-                list: conditions,
-                negated: false,
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    visit_node(&expr, index_info).unwrap_or(IndexedExpression::refine_only(expr))
 }
 
 fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
@@ -1286,7 +1191,7 @@ fn visit_node_with_depth_limit(
     
     if depth > MAX_DEPTH {
         // If we exceed max depth, throw an error instead of silently failing
-        panic!("Expression tree too deep (depth: {}). This may indicate a stack overflow risk. Consider simplifying the expression or using IN lists instead of long OR chains.", depth);
+        panic!("Expression tree too deep (depth: {}). This may indicate a stack overflow risk. Consider simplifying the expression or breaking it into smaller parts.", depth);
     }
     
     match expr {
@@ -1966,30 +1871,31 @@ mod tests {
     }
 
     #[test]
-    fn test_or_to_in_list_conversion() {
+    fn test_recursion_depth_limit() {
         // Create a mock index info provider
         let index_info = MockIndexInfoProvider::new(vec![
             ("id", ColInfo::new(DataType::Int32, Box::new(SargableQueryParser::new("btree".to_string()))))
         ]);
 
-        // Test that a simple OR chain gets converted to an IN list
-        let filter_str = "id = 1 OR id = 2 OR id = 3 OR id = 4 OR id = 5";
+        // Create a deeply nested expression that should trigger the depth limit
+        let mut deep_expr = "id = 1".to_string();
+        for _ in 0..2000 { // Much deeper than MAX_DEPTH of 1000
+            deep_expr = format!("({}) OR id = 1", deep_expr);
+        }
         
-        let result = apply_scalar_indices(
-            datafusion_expr::parse_sql(&format!("SELECT * FROM t WHERE {}", filter_str))
-                .unwrap()
-                .as_ref()
-                .as_any()
-                .downcast_ref::<datafusion_expr::LogicalPlan>()
-                .unwrap()
-                .expressions()
-                .first()
-                .unwrap()
-                .clone(),
-            &index_info,
-        );
+        // This should panic with a clear error message about depth limit
+        let result = std::panic::catch_unwind(|| {
+            apply_scalar_indices(
+                datafusion_expr::parse_sql(&format!("SELECT * FROM t WHERE {}", deep_expr))
+                    .unwrap()
+                    .selection
+                    .unwrap()
+                    .clone(),
+                &index_info,
+            );
+        });
         
-        // The result should be optimized to use an IN list
-        assert!(result.scalar_query.is_some());
+        // Should panic with depth limit error
+        assert!(result.is_err());
     }
 }
