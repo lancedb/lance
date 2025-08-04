@@ -41,9 +41,69 @@ impl Dialect for LanceDialect {
     }
 }
 
+/// Optimize OR chains to IN lists to prevent stack overflow during parsing
+/// This converts patterns like "column = val1 OR column = val2 OR ..." to "column IN (val1, val2, ...)"
+pub(crate) fn optimize_or_chains(filter: &str) -> String {
+    // Simple optimization for common patterns
+    // This is a basic implementation - in practice, you might want a more robust parser
+    
+    // Look for patterns like "column = value OR column = value OR ..."
+    let mut optimized = filter.to_string();
+    
+    // Split by OR to find potential chains
+    let parts: Vec<&str> = filter.split(" OR ").collect();
+    if parts.len() < 3 {
+        // Need at least 3 parts to make optimization worthwhile
+        return optimized;
+    }
+    
+    // Try to find a column name and values
+    let mut column_name = None;
+    let mut values = Vec::new();
+    let mut can_optimize = true;
+    
+    for part in &parts {
+        let part = part.trim();
+        // Look for patterns like "column = value"
+        if let Some(equal_pos) = part.find(" = ") {
+            let col = part[..equal_pos].trim();
+            let val = part[equal_pos + 3..].trim();
+            
+            if let Some(ref expected_col) = column_name {
+                if col == *expected_col {
+                    values.push(val.to_string());
+                } else {
+                    // Different columns, can't optimize
+                    can_optimize = false;
+                    break;
+                }
+            } else {
+                column_name = Some(col.to_string());
+                values.push(val.to_string());
+            }
+        } else {
+            // Not a simple equality, can't optimize
+            can_optimize = false;
+            break;
+        }
+    }
+    
+    if can_optimize && values.len() > 1 {
+        // Convert to IN list
+        let in_list = format!("{} IN ({})", column_name.unwrap(), values.join(", "));
+        println!("Optimized OR chain: {} -> {}", filter, in_list);
+        return in_list;
+    }
+    
+    optimized
+}
+
 /// Parse sql filter to Expression.
 pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
-    let sql = format!("SELECT 1 FROM t WHERE {filter}");
+    // Optimize OR chains before parsing to prevent stack overflow
+    let optimized_filter = optimize_or_chains(filter);
+    
+    let sql = format!("SELECT 1 FROM t WHERE {optimized_filter}");
     let statement = parse_statement(&sql)?;
 
     let selection = if let Statement::Query(query) = &statement {

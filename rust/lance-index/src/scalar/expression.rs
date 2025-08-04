@@ -1019,7 +1019,7 @@ fn visit_is_null(
 }
 
 fn visit_not(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
-    let node = visit_node(expr, index_info)?;
+    let node = visit_node_with_depth_limit(expr, index_info, 0)?;
     node.maybe_not()
 }
 
@@ -1111,8 +1111,8 @@ fn visit_and(
         return Some(range_expr);
     }
 
-    let left = visit_node(&expr.left, index_info);
-    let right = visit_node(&expr.right, index_info);
+    let left = visit_node_with_depth_limit(&expr.left, index_info, 0);
+    let right = visit_node_with_depth_limit(&expr.right, index_info, 0);
     match (left, right) {
         (Some(left), Some(right)) => Some(left.and(right)),
         (Some(left), None) => Some(left.refine((*expr.right).clone())),
@@ -1125,8 +1125,8 @@ fn visit_or(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
 ) -> Option<IndexedExpression> {
-    let left = visit_node(&expr.left, index_info);
-    let right = visit_node(&expr.right, index_info);
+    let left = visit_node_with_depth_limit(&expr.left, index_info, 0);
+    let right = visit_node_with_depth_limit(&expr.right, index_info, 0);
     match (left, right) {
         (Some(left), Some(right)) => left.maybe_or(right),
         // If one side can use an index and the other side cannot then
@@ -1167,7 +1167,123 @@ fn visit_scalar_fn(
     query_parser.visit_scalar_function(col, data_type, &scalar_fn.func, &scalar_fn.args)
 }
 
-fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
+/// Attempt to split a filter expression into a search of scalar indexes and an
+///   optional post-search refinement query
+pub fn apply_scalar_indices(
+    expr: Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> IndexedExpression {
+    // First, try to optimize the expression by converting OR chains to IN lists
+    let optimized_expr = optimize_or_chains(expr);
+    visit_node_with_depth_limit(&optimized_expr, index_info, 0).unwrap_or(IndexedExpression::refine_only(optimized_expr))
+}
+
+/// Optimize OR chains by converting them to IN lists when possible
+/// This helps prevent stack overflow by reducing the depth of the expression tree
+fn optimize_or_chains(expr: Expr) -> Expr {
+    match expr {
+        Expr::BinaryExpr(binary_expr) => {
+            if binary_expr.op == Operator::Or {
+                // Try to convert OR chain to IN list
+                if let Some(in_list_expr) = try_convert_or_to_in_list(&binary_expr) {
+                    return in_list_expr;
+                }
+                // If conversion fails, recursively optimize left and right
+                let left = optimize_or_chains(*binary_expr.left);
+                let right = optimize_or_chains(*binary_expr.right);
+                Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    op: binary_expr.op,
+                })
+            } else {
+                // For non-OR operators, recursively optimize children
+                let left = optimize_or_chains(*binary_expr.left);
+                let right = optimize_or_chains(*binary_expr.right);
+                Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    op: binary_expr.op,
+                })
+            }
+        }
+        // For other expression types, return as-is
+        _ => expr,
+    }
+}
+
+/// Try to convert an OR chain to an IN list
+/// This works when all conditions are equality comparisons on the same column
+fn try_convert_or_to_in_list(binary_expr: &BinaryExpr) -> Option<Expr> {
+    // Collect all equality conditions on the same column
+    let mut conditions = Vec::new();
+    let mut column_name = None;
+    
+    // Use iterative traversal to avoid stack overflow
+    let mut stack = vec![Expr::BinaryExpr(binary_expr.clone())];
+    
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { op: Operator::Or, left, right }) => {
+                stack.push(*left);
+                stack.push(*right);
+            }
+            Expr::BinaryExpr(BinaryExpr { op: Operator::Eq, left, right }) => {
+                // Check if this is a column = value comparison
+                if let (Expr::Column(col), Expr::Literal(val, _)) = (*left, *right) {
+                    if let Some(ref col_name) = column_name {
+                        if col.name == *col_name {
+                            conditions.push(Expr::Literal(val.clone(), None));
+                        } else {
+                            // Different columns, can't convert
+                            return None;
+                        }
+                    } else {
+                        column_name = Some(col.name.clone());
+                        conditions.push(Expr::Literal(val.clone(), None));
+                    }
+                } else {
+                    // Not a simple equality, can't convert
+                    return None;
+                }
+            }
+            _ => {
+                // Not an OR or equality, can't convert
+                return None;
+            }
+        }
+    }
+    
+    // If we found conditions and they're all on the same column, create IN list
+    if let Some(col_name) = column_name {
+        if conditions.len() > 1 {
+            let column_expr = Expr::Column(datafusion_common::Column::from_name(col_name));
+            Some(Expr::InList(InList {
+                expr: Box::new(column_expr),
+                list: conditions,
+                negated: false,
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Version of visit_node with depth limit to prevent stack overflow
+fn visit_node_with_depth_limit(
+    expr: &Expr, 
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Option<IndexedExpression> {
+    const MAX_DEPTH: usize = 1000;
+    
+    if depth > MAX_DEPTH {
+        // If we exceed max depth, fall back to refine-only
+        return None;
+    }
+    
     match expr {
         Expr::Between(between) => visit_between(between, index_info),
         Expr::Column(_) => visit_column(expr, index_info),
@@ -1177,9 +1293,69 @@ fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<
         Expr::IsNull(expr) => visit_is_null(expr.as_ref(), index_info, false),
         Expr::IsNotNull(expr) => visit_is_null(expr.as_ref(), index_info, true),
         Expr::Not(expr) => visit_not(expr.as_ref(), index_info),
-        Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info),
+        Expr::BinaryExpr(binary_expr) => visit_binary_expr_with_depth_limit(binary_expr, index_info, depth),
         Expr::ScalarFunction(scalar_fn) => visit_scalar_fn(scalar_fn, index_info),
         _ => None,
+    }
+}
+
+/// Version of visit_binary_expr with depth limit
+fn visit_binary_expr_with_depth_limit(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Option<IndexedExpression> {
+    match &expr.op {
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
+            visit_comparison(expr, index_info)
+        }
+        // visit_comparison will maybe create an Eq query which we negate
+        Operator::NotEq => visit_comparison(expr, index_info).and_then(|node| node.maybe_not()),
+        Operator::And => visit_and_with_depth_limit(expr, index_info, depth),
+        Operator::Or => visit_or_with_depth_limit(expr, index_info, depth),
+        _ => None,
+    }
+}
+
+/// Version of visit_and with depth limit
+fn visit_and_with_depth_limit(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Option<IndexedExpression> {
+    let left = visit_node_with_depth_limit(&expr.left, index_info, depth + 1);
+    let right = visit_node_with_depth_limit(&expr.right, index_info, depth + 1);
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.and(right)),
+        // If one side can use an index and the other side cannot then
+        // we must abandon the entire thing.  For example, consider the
+        // query "color == 'blue' and size > 10" where color is indexed but
+        // size is not.  It's entirely possible that size > 10 matches every
+        // row in our database.  There is nothing we can do except a full scan
+        (Some(_), None) => None,
+        (None, Some(_)) => None,
+        (None, None) => None,
+    }
+}
+
+/// Version of visit_or with depth limit
+fn visit_or_with_depth_limit(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Option<IndexedExpression> {
+    let left = visit_node_with_depth_limit(&expr.left, index_info, depth + 1);
+    let right = visit_node_with_depth_limit(&expr.right, index_info, depth + 1);
+    match (left, right) {
+        (Some(left), Some(right)) => left.maybe_or(right),
+        // If one side can use an index and the other side cannot then
+        // we must abandon the entire thing.  For example, consider the
+        // query "color == 'blue' or size > 10" where color is indexed but
+        // size is not.  It's entirely possible that size > 10 matches every
+        // row in our database.  There is nothing we can do except a full scan
+        (Some(_), None) => None,
+        (None, Some(_)) => None,
+        (None, None) => None,
     }
 }
 
@@ -1188,15 +1364,6 @@ pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
     /// as well as a query parser that can parse queries for that column
     fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
-}
-
-/// Attempt to split a filter expression into a search of scalar indexes and an
-///   optional post-search refinement query
-pub fn apply_scalar_indices(
-    expr: Expr,
-    index_info: &dyn IndexInformationProvider,
-) -> IndexedExpression {
-    visit_node(&expr, index_info).unwrap_or(IndexedExpression::refine_only(expr))
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1733,5 +1900,68 @@ mod tests {
 
         // Non-normalized arithmetic (can use expression simplification)
         check_no_index(&index_info, "aisle + 3 < 10")
+    }
+
+    #[test]
+    fn test_stack_overflow_prevention() {
+        // Create a mock index info provider
+        let index_info = MockIndexInfoProvider::new(vec![
+            ("id", ColInfo::new(DataType::Int32, Box::new(SargableQueryParser::new("btree".to_string()))))
+        ]);
+
+        // Test that a long OR chain doesn't cause stack overflow
+        // This would have caused stack overflow before our fix
+        let mut or_conditions = Vec::new();
+        for i in 0..1000 {
+            or_conditions.push(format!("id = {}", i));
+        }
+        let filter_str = or_conditions.join(" OR ");
+        
+        // This should not panic or cause stack overflow
+        let result = apply_scalar_indices(
+            datafusion_expr::parse_sql(&format!("SELECT * FROM t WHERE {}", filter_str))
+                .unwrap()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<datafusion_expr::LogicalPlan>()
+                .unwrap()
+                .expressions()
+                .first()
+                .unwrap()
+                .clone(),
+            &index_info,
+        );
+        
+        // The result should be a refine-only expression since we can't use the index
+        // for such a complex OR chain, but it shouldn't crash
+        assert!(result.refine_expr.is_some());
+    }
+
+    #[test]
+    fn test_or_to_in_list_conversion() {
+        // Create a mock index info provider
+        let index_info = MockIndexInfoProvider::new(vec![
+            ("id", ColInfo::new(DataType::Int32, Box::new(SargableQueryParser::new("btree".to_string()))))
+        ]);
+
+        // Test that a simple OR chain gets converted to an IN list
+        let filter_str = "id = 1 OR id = 2 OR id = 3 OR id = 4 OR id = 5";
+        
+        let result = apply_scalar_indices(
+            datafusion_expr::parse_sql(&format!("SELECT * FROM t WHERE {}", filter_str))
+                .unwrap()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<datafusion_expr::LogicalPlan>()
+                .unwrap()
+                .expressions()
+                .first()
+                .unwrap()
+                .clone(),
+            &index_info,
+        );
+        
+        // The result should be optimized to use an IN list
+        assert!(result.scalar_query.is_some());
     }
 }
