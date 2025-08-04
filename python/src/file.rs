@@ -291,33 +291,36 @@ impl LanceFileWriter {
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(
-            path,
-            schema,
-            data_cache_bytes,
-            version,
-            storage_options,
-            keep_original_array,
-            max_page_bytes,
-        ))
+        RT.block_on(
+            None,
+            Self::open(
+                path,
+                schema,
+                data_cache_bytes,
+                version,
+                storage_options,
+                keep_original_array,
+                max_page_bytes,
+            ),
+        )?
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
-        RT.runtime
-            .block_on(self.inner_lock()?.write_batch(&batch.0))
+        RT.block_on(None, self.inner_lock()?.write_batch(&batch.0))?
             .infer_error()
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        RT.runtime
-            .block_on(self.inner_lock()?.finish())
+        RT.block_on(None, self.inner_lock()?.finish())?
             .infer_error()
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
-        RT.runtime
-            .block_on(self.inner_lock()?.add_global_buffer(Bytes::from(bytes)))
-            .infer_error()
+        RT.block_on(
+            None,
+            self.inner_lock()?.add_global_buffer(Bytes::from(bytes)),
+        )?
+        .infer_error()
     }
 
     pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
@@ -449,7 +452,7 @@ impl Iterator for LanceReaderAdapter {
     type Item = std::result::Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = RT.runtime.block_on(self.0.next());
+        let batch = RT.block_on(None, self.0.next()).ok()?;
         batch.map(|b| b.map_err(|e| e.into()))
     }
 }
@@ -470,15 +473,16 @@ impl LanceFileReader {
         // read_stream is a synchronous method but it launches tasks and needs to be
         // run in the context of a tokio runtime
         let inner = self.inner.clone();
-        let _guard = RT.runtime.enter();
-        let stream = inner
-            .read_stream(
-                params,
-                batch_size,
-                batch_readahead,
-                FilterExpression::no_filter(),
-            )
-            .infer_error()?;
+        let stream = RT.block_on(None, async move {
+            inner
+                .read_stream(
+                    params,
+                    batch_size,
+                    batch_readahead,
+                    FilterExpression::no_filter(),
+                )
+                .infer_error()
+        })??;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
     }
 }
@@ -492,8 +496,7 @@ impl LanceFileReader {
         storage_options: Option<HashMap<String, String>>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        RT.runtime
-            .block_on(Self::open(path, storage_options, columns))
+        RT.block_on(None, Self::open(path, storage_options, columns))?
     }
 
     pub fn read_all(
