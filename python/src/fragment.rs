@@ -433,7 +433,13 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
-    fn new(read_version: u64, id: u64, file_type: &str, num_deleted_rows: usize, path_base: Option<String>) -> PyResult<Self> {
+    fn new(
+        read_version: u64,
+        id: u64,
+        file_type: &str,
+        num_deleted_rows: usize,
+        path_base: Option<String>,
+    ) -> PyResult<Self> {
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
             "bitmap" => DeletionFileType::Bitmap,
