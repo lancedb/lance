@@ -26,6 +26,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
       - name: Run Jumbo String/Binary Tests
         run: |
           echo "Running jumbo tests for Lance 2.1..."
