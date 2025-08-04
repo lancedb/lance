@@ -79,7 +79,12 @@ fn convert_to_rust_transaction(
     };
 
     let transaction_properties = env
-        .call_method(&java_transaction, "transactionProperties", "()Ljava/util/Map;", &[])?
+        .call_method(
+            &java_transaction,
+            "transactionProperties",
+            "()Ljava/util/Map;",
+            &[],
+        )?
         .l()?;
     let transaction_properties = JMap::from_env(env, &transaction_properties)?;
     let transaction_properties = to_rust_map(env, &transaction_properties)?;
