@@ -905,7 +905,7 @@ impl FileFragment {
             if !schema_per_file.fields.is_empty() {
                 let path = self
                     .dataset
-                    .data_file_dir(&data_file)?
+                    .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = FileReader::try_new_with_fragment_id(
@@ -933,7 +933,7 @@ impl FileFragment {
         } else {
             let path = self
                 .dataset
-                .data_file_dir(&data_file)?
+                .data_file_dir(data_file)?
                 .child(data_file.path.as_str());
             let (store_scheduler, reader_priority) =
                 if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
@@ -1132,7 +1132,7 @@ impl FileFragment {
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_file_dir(&data_file)?
+                            .data_file_dir(data_file)?
                             .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is not in increasing order in fragment {:#?}",
@@ -1145,7 +1145,7 @@ impl FileFragment {
                 if !seen_fields.insert(field_id) {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_file_dir(&data_file)?
+                            .data_file_dir(data_file)?
                             .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is duplicated in fragment {:#?}",
@@ -1174,7 +1174,7 @@ impl FileFragment {
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
-            let data_file_dir = self.dataset.data_file_dir(&data_file)?;
+            let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
                 .open_reader(data_file, None, &FragReadConfig::default())
                 .await?
@@ -1199,7 +1199,7 @@ impl FileFragment {
             if length != expected_length {
                 let path = self
                     .dataset
-                    .data_file_dir(&data_file)?
+                    .data_file_dir(data_file)?
                     .child(data_file.path.as_str());
                 return Err(Error::corrupt_file(
                     path,

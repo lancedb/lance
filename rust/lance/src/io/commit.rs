@@ -128,7 +128,7 @@ async fn do_commit_new_dataset(
             )
             .await?;
         let source_manifest = Dataset::load_manifest(
-            &object_store,
+            object_store,
             &source_manifest_location,
             base_path.to_string().as_str(),
             &Session::default(),
