@@ -870,6 +870,11 @@ impl Scanner {
         Ok(self)
     }
 
+    #[cfg(test)]
+    fn nearest_mut(&mut self) -> Option<&mut Query> {
+        self.nearest.as_mut()
+    }
+
     /// Set the distance thresholds for the nearest neighbor search.
     pub fn distance_range(
         &mut self,
@@ -2848,7 +2853,7 @@ impl Scanner {
             ]),
             knn_plan,
         )
-        .with_fetch(Some(self.calculate_effective_k(q.k)));
+        .with_fetch(Some(q.k));
 
         let logical_not_null = col(DIST_COL).is_not_null();
         let not_nulls = Arc::new(LanceFilterExec::try_new(logical_not_null, Arc::new(sort))?);
@@ -2911,9 +2916,7 @@ impl Scanner {
                 LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
                 inner_fanout_search,
             )
-            .with_fetch(Some(
-                self.calculate_effective_k(q.k) * q.refine_factor.unwrap_or(1) as usize,
-            )),
+            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
     }
 
@@ -2975,9 +2978,7 @@ impl Scanner {
                     LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
                     ann_node,
                 )
-                .with_fetch(Some(
-                    self.calculate_effective_k(q.k) * over_fetch_factor as usize,
-                )),
+                .with_fetch(Some(q.k * over_fetch_factor as usize)),
             );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
@@ -3003,9 +3004,7 @@ impl Scanner {
                 LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
                 ann_node,
             )
-            .with_fetch(Some(
-                self.calculate_effective_k(q.k) * q.refine_factor.unwrap_or(1) as usize,
-            )),
+            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         );
 
         Ok(ann_node)
@@ -3095,16 +3094,6 @@ impl Scanner {
         } else {
             // No new columns needed
             Ok(input)
-        }
-    }
-
-    /// Calculate effective k for vector search considering limit and offset
-    fn calculate_effective_k(&self, original_k: usize) -> usize {
-        match (self.limit, self.offset) {
-            (Some(limit), Some(offset)) => std::cmp::max(original_k, (limit + offset) as usize),
-            (Some(limit), None) => std::cmp::max(original_k, limit as usize),
-            (None, Some(offset)) => original_k + offset as usize,
-            (None, None) => original_k,
         }
     }
 
@@ -7034,6 +7023,9 @@ mod test {
         ) {
             let mut new_scanner = scanner.clone();
             new_scanner.limit(limit, offset).unwrap();
+            if let Some(nearest) = new_scanner.nearest_mut() {
+                nearest.k = offset.unwrap_or(0).saturating_add(limit.unwrap_or(10_000)) as usize;
+            }
             let result = new_scanner.try_into_batch().await.unwrap();
 
             let resolved_offset = offset.unwrap_or(0).min(full_result.num_rows() as i64);
@@ -7053,7 +7045,11 @@ mod test {
             }
         }
 
-        let full_results = scanner.try_into_batch().await.unwrap();
+        let mut scanner_full = scanner.clone();
+        if let Some(nearest) = scanner_full.nearest_mut() {
+            nearest.k = 500;
+        }
+        let full_results = scanner_full.try_into_batch().await.unwrap();
 
         test_one(scanner, &full_results, Some(1), None).await;
         test_one(scanner, &full_results, Some(1), Some(1)).await;
@@ -7085,12 +7081,10 @@ mod test {
         let query_vector = Float32Array::from(vec![0.0; 32]);
         let mut scanner = test_ds.dataset.scan();
         scanner
-            .nearest("vec", &query_vector, 500)
+            .nearest("vec", &query_vector, 5)
             .unwrap()
             .project(&["i"])
             .unwrap();
-        // Nearest has a default limit of 10, so we need the base scanner to have a high limit.
-        scanner.limit(Some(500), None).unwrap();
         limit_offset_equivalency_test(&scanner).await;
     }
 
@@ -7104,8 +7098,6 @@ mod test {
         let query_vector = Float32Array::from(vec![0.0; 32]);
         let mut scanner = test_ds.dataset.scan();
         scanner.nearest("vec", &query_vector, 500).unwrap();
-        // Nearest has a default limit of 10, so we need the base scanner to have a high limit.
-        scanner.limit(Some(500), None).unwrap();
         limit_offset_equivalency_test(&scanner).await;
     }
 
