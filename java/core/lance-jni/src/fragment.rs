@@ -224,7 +224,8 @@ fn create_fragment<'a>(
 }
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
-const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/String;)V";
+const DATA_FILE_CONSTRUCTOR_SIG: &str =
+    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/String;)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;Ljava/lang/String;)V";
@@ -498,7 +499,10 @@ fn get_path_base(env: &mut JNIEnv, obj: &JObject) -> Result<Option<String>> {
     let path_base = if path_base.is_null() {
         None
     } else {
-        Some(env.get_string(&unsafe { JString::from_raw(path_base.into_raw()) })?.into())
+        Some(
+            env.get_string(&unsafe { JString::from_raw(path_base.into_raw()) })?
+                .into(),
+        )
     };
     Ok(path_base)
 }
