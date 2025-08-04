@@ -374,6 +374,50 @@ fn escape_column_name(name: &str) -> String {
         .join(".")
 }
 
+/// Check if an expression is a simple rowid equality filter (_rowid = literal)
+fn extract_rowid_from_filter(expr: &Expr) -> Option<u64> {
+    if let Expr::BinaryExpr(binary) = expr {
+        match binary.op {
+            datafusion_expr::Operator::Eq => {
+                // Check for _rowid = literal
+                if let (Expr::Column(col), Expr::Literal(lit, _)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                {
+                    if col.name == ROW_ID {
+                        if let ScalarValue::UInt64(Some(val)) = lit {
+                            return Some(*val);
+                        }
+                        // Try to convert from Int64
+                        if let ScalarValue::Int64(Some(val)) = lit {
+                            if *val >= 0 {
+                                return Some(*val as u64);
+                            }
+                        }
+                    }
+                }
+                // Check for literal = _rowid (commutative)
+                if let (Expr::Literal(lit, _), Expr::Column(col)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                {
+                    if col.name == ROW_ID {
+                        if let ScalarValue::UInt64(Some(val)) = lit {
+                            return Some(*val);
+                        }
+                        // Try to convert from Int64
+                        if let ScalarValue::Int64(Some(val)) = lit {
+                            if *val >= 0 {
+                                return Some(*val as u64);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         // By default, we only scan the local schema
@@ -1426,6 +1470,52 @@ impl Scanner {
         } else {
             FilterPlan::default()
         };
+
+        // Check if the filter is a simple _rowid = literal filter
+        let rowid_take = if let Some(ref full_expr) = filter_plan.full_expr {
+            extract_rowid_from_filter(full_expr)
+        } else {
+            None
+        };
+
+        // If we have a simple _rowid filter, convert to a take operation
+        if let Some(row_id) = rowid_take {
+            use arrow_array::{RecordBatch, UInt64Array};
+            use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+            // Create a simple plan that outputs the row ID
+            let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                ROW_ID,
+                DataType::UInt64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![row_ids]).unwrap();
+
+            // Create a simple execution plan that outputs this batch
+            use lance_datafusion::exec::OneShotExec;
+            let row_id_plan = Arc::new(OneShotExec::from_batch(batch));
+
+            // Create take exec
+            let projection = self
+                .dataset
+                .empty_projection()
+                .union_schema(&self.projection_plan.physical_schema);
+
+            if let Some(take_exec) =
+                TakeExec::try_new(self.dataset.clone(), row_id_plan, projection)?
+            {
+                let mut plan: Arc<dyn ExecutionPlan> = Arc::new(take_exec);
+
+                // Apply post processing (limit, projection, etc.)
+                if let Some(limit) = self.limit {
+                    use datafusion::physical_plan::limit::GlobalLimitExec;
+                    plan = Arc::new(GlobalLimitExec::new(plan, 0, Some(limit as usize)));
+                }
+
+                return Ok(plan);
+            }
+        }
 
         let scan_range = if filter_plan.has_any_filter() {
             // If there is a filter we can't pushdown limit / offset
@@ -6392,5 +6482,77 @@ mod test {
             .unwrap();
 
         assert_eq!(tracker.new_iops(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rowid_filter_to_take() -> Result<()> {
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        // Create test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])),
+                Arc::new(Int32Array::from(vec![
+                    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                ])),
+            ],
+        )?;
+
+        // Create dataset
+        use arrow_array::RecordBatchIterator;
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let dataset = Dataset::write(reader, "memory://test", None).await?;
+
+        // Test rowid filter
+        let plan_str = dataset
+            .scan()
+            .filter("_rowid = 5")?
+            .with_row_id()
+            .explain_plan(true)
+            .await?;
+
+        println!("Execution plan for _rowid = 5:\n{}", plan_str);
+
+        // Check if Take operation is in the plan
+        assert!(
+            plan_str.contains("Take:") || plan_str.contains("TakeExec"),
+            "Filter '_rowid = 5' should be converted to Take operation. Got plan:\n{}",
+            plan_str
+        );
+
+        // Also test that the results are correct
+        let results = dataset
+            .scan()
+            .filter("_rowid = 5")?
+            .with_row_id()
+            .try_into_batch()
+            .await?;
+
+        assert_eq!(results.num_rows(), 1, "Should find exactly one row");
+
+        // Row 5 should have id=5 and value=15
+        let id_arr = results
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let value_arr = results
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_arr.value(0), 5);
+        assert_eq!(value_arr.value(0), 15);
+
+        Ok(())
     }
 }

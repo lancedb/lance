@@ -154,9 +154,15 @@ impl ExecutionPlan for OneShotExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        // OneShotExec has no children, so this should only be called with an empty vector
+        if !children.is_empty() {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "OneShotExec does not support children".to_string(),
+            ));
+        }
+        Ok(self)
     }
 
     fn execute(

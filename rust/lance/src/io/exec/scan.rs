@@ -26,7 +26,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
@@ -561,7 +561,7 @@ impl core::fmt::Debug for LanceStream {
 impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
         let mut schema: ArrowSchema = self.projection.as_ref().into();
-        if self.config.with_row_id {
+        if self.config.with_row_id && schema.column_with_name(ROW_ID).is_none() {
             schema = schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
         if self.config.with_row_address {
@@ -662,7 +662,7 @@ impl LanceScanExec {
     ) -> Self {
         let mut output_schema: ArrowSchema = projection.as_ref().into();
 
-        if config.with_row_id {
+        if config.with_row_id && output_schema.column_with_name(ROW_ID).is_none() {
             output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
         if config.with_row_address {

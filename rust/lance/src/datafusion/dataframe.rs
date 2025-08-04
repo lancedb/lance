@@ -18,9 +18,40 @@ use datafusion::{
     physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream},
 };
 use lance_arrow::SchemaExt;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 
 use crate::Dataset;
+
+/// Check if an expression references the _rowid column
+fn expr_references_rowid(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(col) => col.name == ROW_ID,
+        Expr::BinaryExpr(binary) => {
+            expr_references_rowid(&binary.left) || expr_references_rowid(&binary.right)
+        }
+        Expr::Not(inner) | Expr::IsNotNull(inner) | Expr::IsNull(inner) => {
+            expr_references_rowid(inner)
+        }
+        Expr::InList(in_list) => {
+            expr_references_rowid(&in_list.expr)
+                || in_list.list.iter().any(|e| expr_references_rowid(e))
+        }
+        Expr::Case(case) => {
+            case.expr
+                .as_ref()
+                .map_or(false, |e| expr_references_rowid(e))
+                || case
+                    .when_then_expr
+                    .iter()
+                    .any(|(when, then)| expr_references_rowid(when) || expr_references_rowid(then))
+                || case
+                    .else_expr
+                    .as_ref()
+                    .map_or(false, |e| expr_references_rowid(e))
+        }
+        _ => false,
+    }
+}
 
 #[derive(Debug)]
 pub struct LanceTableProvider {
@@ -29,6 +60,8 @@ pub struct LanceTableProvider {
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
     ordered: bool,
+    /// Track if row_id was explicitly requested vs auto-included for SQL compatibility
+    explicit_row_id: bool,
 }
 
 impl LanceTableProvider {
@@ -43,22 +76,30 @@ impl LanceTableProvider {
         ordered: bool,
     ) -> Self {
         let mut full_schema = Schema::from(dataset.schema());
-        let mut row_id_idx = None;
+        let row_id_idx;
         let mut row_addr_idx = None;
-        if with_row_id {
+
+        // Always include _rowid in the schema to support SQL queries
+        // This ensures SQL queries can reference _rowid without schema errors
+        if full_schema.column_with_name(ROW_ID).is_none() {
             full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
             row_id_idx = Some(full_schema.fields.len() - 1);
+        } else {
+            row_id_idx = full_schema.fields.iter().position(|f| f.name() == ROW_ID);
         }
+
         if with_row_addr {
             full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
             row_addr_idx = Some(full_schema.fields.len() - 1);
         }
+
         Self {
             dataset,
             full_schema: Arc::new(full_schema),
             row_id_idx,
             row_addr_idx,
             ordered,
+            explicit_row_id: with_row_id,
         }
     }
 }
@@ -85,11 +126,16 @@ impl TableProvider for LanceTableProvider {
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
+
+        // Check if _rowid is needed either in projection or filters
+        let mut needs_row_id = self.explicit_row_id;
+
+        // Check if _rowid is in the projection
         if let Some(projection) = projection {
             let mut columns = Vec::with_capacity(projection.len());
             for field_idx in projection {
                 if Some(*field_idx) == self.row_id_idx {
-                    scan.with_row_id();
+                    needs_row_id = true;
                 } else if Some(*field_idx) == self.row_addr_idx {
                     scan.with_row_address();
                 } else {
@@ -100,6 +146,20 @@ impl TableProvider for LanceTableProvider {
                 scan.project(&columns)?;
             }
         }
+
+        // Check if _rowid is referenced in filters
+        for filter in filters {
+            if expr_references_rowid(filter) {
+                needs_row_id = true;
+                break;
+            }
+        }
+
+        // Enable row_id if needed
+        if needs_row_id {
+            scan.with_row_id();
+        }
+
         let combined_filter = match filters.len() {
             0 => None,
             1 => Some(filters[0].clone()),

@@ -1817,10 +1817,13 @@ impl FragmentReader {
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
-        self.output_schema = self
-            .output_schema
-            .try_with_column(ROW_ID_FIELD.clone())
-            .expect("Table already has a column named _rowid");
+        // Only add _rowid if it's not already in the schema
+        if self.output_schema.column_with_name(ROW_ID).is_none() {
+            self.output_schema = self
+                .output_schema
+                .try_with_column(ROW_ID_FIELD.clone())
+                .expect("Failed to add _rowid column");
+        }
         self
     }
 
@@ -2012,7 +2015,7 @@ impl FragmentReader {
 
         let output_schema = {
             let mut output_schema = ArrowSchema::from(projection);
-            if self.with_row_id {
+            if self.with_row_id && output_schema.column_with_name(ROW_ID).is_none() {
                 output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone())?;
             }
             if self.with_row_addr {
