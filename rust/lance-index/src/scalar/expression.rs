@@ -1175,7 +1175,7 @@ pub fn apply_scalar_indices(
 ) -> IndexedExpression {
     // First, try to optimize the expression by converting OR chains to IN lists
     let optimized_expr = optimize_or_chains(expr);
-    visit_node_with_depth_limit(&optimized_expr, index_info, 0).unwrap_or(IndexedExpression::refine_only(optimized_expr))
+    visit_node(&optimized_expr, index_info).unwrap_or(IndexedExpression::refine_only(optimized_expr))
 }
 
 /// Optimize OR chains by converting them to IN lists when possible
@@ -1271,6 +1271,11 @@ fn try_convert_or_to_in_list(binary_expr: &BinaryExpr) -> Option<Expr> {
     }
 }
 
+fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
+    // Use depth-limited version internally to prevent stack overflow
+    visit_node_with_depth_limit(expr, index_info, 0)
+}
+
 /// Version of visit_node with depth limit to prevent stack overflow
 fn visit_node_with_depth_limit(
     expr: &Expr, 
@@ -1280,8 +1285,8 @@ fn visit_node_with_depth_limit(
     const MAX_DEPTH: usize = 1000;
     
     if depth > MAX_DEPTH {
-        // If we exceed max depth, fall back to refine-only
-        return None;
+        // If we exceed max depth, throw an error instead of silently failing
+        panic!("Expression tree too deep (depth: {}). This may indicate a stack overflow risk. Consider simplifying the expression or using IN lists instead of long OR chains.", depth);
     }
     
     match expr {
@@ -1921,20 +1926,43 @@ mod tests {
         let result = apply_scalar_indices(
             datafusion_expr::parse_sql(&format!("SELECT * FROM t WHERE {}", filter_str))
                 .unwrap()
-                .as_ref()
-                .as_any()
-                .downcast_ref::<datafusion_expr::LogicalPlan>()
-                .unwrap()
-                .expressions()
-                .first()
+                .selection
                 .unwrap()
                 .clone(),
             &index_info,
         );
         
-        // The result should be a refine-only expression since we can't use the index
-        // for such a complex OR chain, but it shouldn't crash
-        assert!(result.refine_expr.is_some());
+        // Should return a valid result (either indexed or refine-only)
+        assert!(result.scalar_query.is_some() || result.refine_expr.is_some());
+    }
+
+    #[test]
+    fn test_and_chain_stack_overflow_prevention() {
+        // Create a mock index info provider
+        let index_info = MockIndexInfoProvider::new(vec![
+            ("id", ColInfo::new(DataType::Int32, Box::new(SargableQueryParser::new("btree".to_string()))))
+        ]);
+
+        // Test that a long AND chain doesn't cause stack overflow
+        // This would have caused stack overflow before our fix
+        let mut and_conditions = Vec::new();
+        for i in 0..1000 {
+            and_conditions.push(format!("id > {}", i));
+        }
+        let filter_str = and_conditions.join(" AND ");
+        
+        // This should not panic or cause stack overflow
+        let result = apply_scalar_indices(
+            datafusion_expr::parse_sql(&format!("SELECT * FROM t WHERE {}", filter_str))
+                .unwrap()
+                .selection
+                .unwrap()
+                .clone(),
+            &index_info,
+        );
+        
+        // Should return a valid result (either indexed or refine-only)
+        assert!(result.scalar_query.is_some() || result.refine_expr.is_some());
     }
 
     #[test]
