@@ -2674,7 +2674,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let mut test_dir = tempdir().unwrap();
+        let test_dir = tempdir().unwrap();
         let clone_path = test_dir.path().join("clone");
         let cloned_dir = clone_path.to_str().unwrap();
 
