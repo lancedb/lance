@@ -32,7 +32,10 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run Jumbo String/Binary Tests
         run: |
-          echo "Running jumbo tests for Lance 2.1..."
+          echo "Running jumbo tests for Lance 2.0 and 2.1..."
+          echo "System memory info:"
+          free -h
           cd rust
-          # Run only the jumbo tests in release mode for better performance
-          cargo test --release --package lance-encoding -- --ignored jumbo
+          # Run only the jumbo tests in release mode with limited parallelism
+          # to avoid OOM issues (these tests use >5GiB memory each)
+          cargo test --release --package lance-encoding -- --ignored jumbo --test-threads=1
