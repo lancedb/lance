@@ -23,8 +23,7 @@ use object_store::path::Path;
 use snafu::location;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::Operation;
-use crate::dataset::transaction::Transaction;
+use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::write_fragments_internal;
 use crate::dataset::ReadParams;
 use crate::Dataset;
@@ -273,16 +272,19 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
-        Ok(Transaction::new(
+        let transaction = TransactionBuilder::new(
             context
                 .dest
                 .dataset()
                 .map(|ds| ds.manifest.version)
                 .unwrap_or(0),
             operation,
-            blobs_op,
-            None,
-        ))
+        )
+        .blobs_op(blobs_op)
+        .transaction_properties(context.params.transaction_properties.clone())
+        .build();
+
+        Ok(transaction)
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
@@ -417,6 +419,7 @@ impl<'a> InsertBuilder<'a> {
                 let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
+                    session: params.session.clone(),
                     ..Default::default()
                 });
 
@@ -467,4 +470,31 @@ struct WriteContext<'a> {
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: LanceFileVersion,
+}
+
+#[cfg(test)]
+mod test {
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::session::Session;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pass_session() {
+        let session = Arc::new(Session::new(0, 0, Default::default()));
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![],
+                Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)])),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(Arc::as_ptr(&dataset.session()), Arc::as_ptr(&session));
+    }
 }

@@ -51,7 +51,7 @@ lance-datagen = { version = "=0.32.1", path = "./rust/lance-datagen" }
 lance-encoding = { version = "=0.32.1", path = "./rust/lance-encoding" }
 lance-file = { version = "=0.32.1", path = "./rust/lance-file" }
 lance-index = { version = "=0.32.1", path = "./rust/lance-index" }
-lance-io = { version = "=0.32.1", path = "./rust/lance-io" }
+lance-io = { version = "=0.32.1", path = "./rust/lance-io", default-features = false }
 lance-linalg = { version = "=0.32.1", path = "./rust/lance-linalg" }
 lance-table = { version = "=0.32.1", path = "./rust/lance-table" }
 lance-test-macros = { version = "=0.32.1", path = "./rust/lance-test-macros" }

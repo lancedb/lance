@@ -12,6 +12,10 @@ use std::{
     vec,
 };
 
+use crate::constants::{
+    DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+    STRUCTURAL_ENCODING_MINIBLOCK,
+};
 use arrow::array::AsArray;
 use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
@@ -21,10 +25,6 @@ use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{CacheKey, Context, DeepSizeOf},
-    datatypes::{
-        DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-        STRUCTURAL_ENCODING_MINIBLOCK,
-    },
     error::Error,
     utils::{bit::pad_bytes, hash::U8SliceKey},
 };

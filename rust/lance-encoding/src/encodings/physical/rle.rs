@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_compression_strategy_selection() {
-        let strategy = DefaultCompressionStrategy;
+        let strategy = DefaultCompressionStrategy::new();
         let field = Field::new_arrow("test", arrow_schema::DataType::Int32, false).unwrap();
 
         // High repetition - should select RLE

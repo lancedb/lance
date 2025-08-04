@@ -58,6 +58,7 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod schema;
+mod sql;
 pub mod traits;
 mod transaction;
 pub mod utils;

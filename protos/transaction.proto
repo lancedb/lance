@@ -28,6 +28,10 @@ message Transaction {
   // Optional version tag.
   string tag = 3;
 
+  // Optional properties for the transaction
+  // __lance_commit_message is a reserved key
+  map<string, string> transaction_properties = 4;
+
   // Add new rows to the dataset.
   message Append {
     // The new fragments to append.
