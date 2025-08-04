@@ -43,10 +43,9 @@ use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR, ROW_ID};
-use lance_datafusion::exec::{
-    analyze_plan, execute_plan, LanceExecutionOptions, StrictBatchSizeExec,
-};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, ROW_OFFSET};
+use lance_datafusion::exec::{analyze_plan, execute_plan, LanceExecutionOptions};
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::expression::PlannerIndexExt;
@@ -402,6 +401,65 @@ fn escape_column_name(name: &str) -> String {
         .map(|s| format!("`{}`", s))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Represents a user-requested take operation
+pub enum TakeOperation {
+    /// Take rows by row id
+    RowIds(Vec<u64>),
+    /// Take rows by row address
+    RowAddrs(Vec<u64>),
+    /// Take rows by row offset
+    ///
+    /// The row offset is the offset of the row in the dataset.  This can
+    /// be converted to row addresses using the fragment sizes.
+    RowOffsets(Vec<u64>),
+}
+
+/// Certain filters can be satisfied by a take operator
+///
+/// For example:
+///  - `_rowid = 10`
+///  - `_rowid IN (10, 20, 30)`
+///  - `_rowaddr = 10`
+///  - `_rowaddr IN (10, 20, 30)`
+///  - `_rowoffset = 10`
+///  - `_rowoffset IN (10, 20, 30)`
+///
+/// The _rowid / _rowaddr / _rowoffset determine if we are taking by row id, address, or offset.
+fn extract_take(expr: &Expr) -> Option<TakeOperation> {
+    if let Expr::BinaryExpr(binary) = expr {
+        match binary.op {
+            datafusion_expr::Operator::Eq => {
+                // Check for _rowid = literal
+                if let (Expr::Column(col), Expr::Literal(lit, _)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                {
+                    if col.name == ROW_ID {
+                        if let Some(ScalarValue::UInt64(Some(val))) =
+                            safe_coerce_scalar(lit, &DataType::UInt64)
+                        {
+                            return Some(TakeOperation::RowIds(vec![val]));
+                        }
+                    } else if col.name == ROW_ADDR {
+                        if let Some(ScalarValue::UInt64(Some(val))) =
+                            safe_coerce_scalar(lit, &DataType::UInt64)
+                        {
+                            return Some(TakeOperation::RowAddrs(vec![val]));
+                        }
+                    } else if col.name == ROW_OFFSET {
+                        if let Some(ScalarValue::UInt64(Some(val))) =
+                            safe_coerce_scalar(lit, &DataType::UInt64)
+                        {
+                            return Some(TakeOperation::RowOffsets(vec![val]));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 impl Scanner {
@@ -7203,5 +7261,77 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_rowid_filter_to_take() -> Result<()> {
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        // Create test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])),
+                Arc::new(Int32Array::from(vec![
+                    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                ])),
+            ],
+        )?;
+
+        // Create dataset
+        use arrow_array::RecordBatchIterator;
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        let dataset = Dataset::write(reader, "memory://test", None).await?;
+
+        // Test rowid filter
+        let plan_str = dataset
+            .scan()
+            .filter("_rowid = 5")?
+            .with_row_id()
+            .explain_plan(true)
+            .await?;
+
+        println!("Execution plan for _rowid = 5:\n{}", plan_str);
+
+        // Check if Take operation is in the plan
+        assert!(
+            plan_str.contains("Take:") || plan_str.contains("TakeExec"),
+            "Filter '_rowid = 5' should be converted to Take operation. Got plan:\n{}",
+            plan_str
+        );
+
+        // Also test that the results are correct
+        let results = dataset
+            .scan()
+            .filter("_rowid = 5")?
+            .with_row_id()
+            .try_into_batch()
+            .await?;
+
+        assert_eq!(results.num_rows(), 1, "Should find exactly one row");
+
+        // Row 5 should have id=5 and value=15
+        let id_arr = results
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let value_arr = results
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_arr.value(0), 5);
+        assert_eq!(value_arr.value(0), 15);
+
+        Ok(())
     }
 }
