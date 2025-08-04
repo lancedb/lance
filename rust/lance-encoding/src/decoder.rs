@@ -50,7 +50,7 @@
 //!
 //! Typically, a "logical encoding" will have both a logical decoder and a field scheduler.
 //! Meanwhile, a "physical encoding" will have a physical decoder but no corresponding field
-//! scheduler.git add --all
+//! scheduler.
 //!
 //!
 //! # General notes
