@@ -2,7 +2,7 @@ name: Nightly Run Jobs
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Runs every day at midnight UTC
+    - cron: "0 0 * * *" # Runs every day at midnight UTC
   workflow_dispatch:
 
 jobs:
@@ -16,3 +16,17 @@ jobs:
           workflow: file_verification.yml
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  jumbo-tests:
+    # jumbo tests need more resources
+    runs-on: ubuntu-2404-4x-x64
+    if: github.repository == 'lancedb/lance'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Jumbo String/Binary Tests
+        run: |
+          echo "Running jumbo tests for Lance 2.1..."
+          cd rust
+          # Run only the jumbo tests in release mode for better performance
+          cargo test --release --package lance-encoding -- --ignored jumbo
