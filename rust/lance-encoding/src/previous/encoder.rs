@@ -39,10 +39,12 @@ use crate::{
     version::LanceFileVersion,
 };
 
-use lance_core::datatypes::{
-    Field, BLOB_DESC_FIELD, BLOB_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
-    PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY,
+use crate::constants::{
+    COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY,
+    PACKED_STRUCT_META_KEY,
 };
+
+use lance_core::datatypes::{Field, BLOB_DESC_FIELD, BLOB_META_KEY};
 use lance_core::{Error, Result};
 
 /// An encoded array
@@ -616,6 +618,7 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
 
 #[cfg(test)]
 pub mod tests {
+    use crate::constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
     use crate::previous::encoder::{
         check_dict_encoding, check_fixed_size_encoding, ArrayEncodingStrategy,
         CoreArrayEncodingStrategy,
@@ -623,7 +626,6 @@ pub mod tests {
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, StringArray};
     use arrow_schema::Field;
-    use lance_core::datatypes::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
     use std::collections::HashMap;
     use std::sync::Arc;
 
