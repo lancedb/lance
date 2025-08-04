@@ -24,12 +24,15 @@ public class DeletionFile implements Serializable {
   private final long readVersion;
   private final Long numDeletedRows;
   private final DeletionFileType fileType;
+  private final String pathBase;
 
-  public DeletionFile(long id, long readVersion, Long numDeletedRows, DeletionFileType fileType) {
+  public DeletionFile(
+      long id, long readVersion, Long numDeletedRows, DeletionFileType fileType, String pathBase) {
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
     this.fileType = fileType;
+    this.pathBase = pathBase;
   }
 
   public long getId() {
@@ -48,6 +51,10 @@ public class DeletionFile implements Serializable {
     return fileType;
   }
 
+  public String getPathBase() {
+    return pathBase;
+  }
+
   @Override
   public String toString() {
     return new ToStringBuilder(this)
@@ -55,6 +62,7 @@ public class DeletionFile implements Serializable {
         .append("readVersion", readVersion)
         .append("numDeletedRows", numDeletedRows)
         .append("fileType", fileType)
+        .append("pathBase", pathBase)
         .toString();
   }
 }
