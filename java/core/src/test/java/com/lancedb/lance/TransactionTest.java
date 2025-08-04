@@ -67,7 +67,6 @@ public class TransactionTest {
               .build();
       assertEquals(1, txn.readVersion());
       assertEquals(1, dataset.version());
-      assertEquals(1, dataset.version());
       try (Dataset committedDataset = txn.commit()) {
         assertEquals(1, txn.readVersion());
         assertEquals(1, dataset.version());

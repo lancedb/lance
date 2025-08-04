@@ -6,8 +6,9 @@ use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
-use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::datatypes::Schema as LanceSchema;
+use std::sync::Arc;
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCommitTransaction<'local>(
@@ -77,13 +78,16 @@ fn convert_to_rust_transaction(
         Some(convert_to_rust_operation(env, blobs_op, java_dataset)?)
     };
 
-    Ok(Transaction {
-        read_version: read_ver as u64,
-        uuid,
-        operation: op,
-        blobs_op,
-        tag: None,
-    })
+    let transaction_properties = env
+        .call_method(&java_tx, "transactionProperties", "()Ljava/util/Map;", &[])?
+        .l()?;
+    let transaction_properties = JMap::from_env(env, &transaction_properties)?;
+    let transaction_properties = to_rust_map(env, &transaction_properties)?;
+    Ok(TransactionBuilder::new(read_ver as u64, op)
+        .uuid(uuid)
+        .blobs_op(blobs_op)
+        .transaction_properties(Some(Arc::new(transaction_properties)))
+        .build())
 }
 
 fn convert_to_rust_operation(
