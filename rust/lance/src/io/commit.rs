@@ -116,7 +116,6 @@ async fn do_commit_new_dataset(
     let (mut manifest, indices) = if let Operation::Clone {
         ref source_path,
         ref ref_name,
-        is_strong_ref,
         ref_version,
         ..
     } = transaction.operation
@@ -135,7 +134,7 @@ async fn do_commit_new_dataset(
             &Session::default(),
         )
         .await?;
-        let new_manifest = source_manifest.shallow_clone(source_path, ref_name, is_strong_ref);
+        let new_manifest = source_manifest.shallow_clone(source_path, ref_name, transaction_file);
         (new_manifest, Vec::new())
     } else {
         let (manifest, indices) = transaction.build_manifest(
@@ -1451,7 +1450,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version=*/ None,
-            None,
+            HashMap::new(),
         );
 
         fix_schema(&mut manifest).unwrap();

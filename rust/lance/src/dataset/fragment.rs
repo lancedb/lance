@@ -905,7 +905,7 @@ impl FileFragment {
             if !schema_per_file.fields.is_empty() {
                 let path = self
                     .dataset
-                    .data_file_dir(&self.metadata)
+                    .data_file_dir(&data_file)?
                     .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = FileReader::try_new_with_fragment_id(
@@ -933,7 +933,7 @@ impl FileFragment {
         } else {
             let path = self
                 .dataset
-                .data_file_dir(&self.metadata)
+                .data_file_dir(&data_file)?
                 .child(data_file.path.as_str());
             let (store_scheduler, reader_priority) =
                 if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
@@ -1132,7 +1132,7 @@ impl FileFragment {
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_file_dir(&self.metadata)
+                            .data_file_dir(&data_file)?
                             .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is not in increasing order in fragment {:#?}",
@@ -1145,7 +1145,7 @@ impl FileFragment {
                 if !seen_fields.insert(field_id) {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_file_dir(&self.metadata)
+                            .data_file_dir(&data_file)?
                             .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is duplicated in fragment {:#?}",
@@ -1162,7 +1162,7 @@ impl FileFragment {
         {
             return Err(Error::corrupt_file(
                 self.dataset
-                    .data_file_dir(&self.metadata)
+                    .data_file_dir(&self.metadata.files[0])?
                     .child(self.metadata.files[0].path.as_str()),
                 "Fragment contains a mix of v1 and v2 data files".to_string(),
                 location!(),
@@ -1170,18 +1170,16 @@ impl FileFragment {
         }
 
         for data_file in &self.metadata.files {
-            data_file.validate(&self.dataset.data_file_dir(&self.metadata))?;
+            data_file.validate(&self.dataset.data_file_dir(&self.metadata.files[0])?)?;
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
+            let data_file_dir = self.dataset.data_file_dir(&data_file)?;
             let reader = self
                 .open_reader(data_file, None, &FragReadConfig::default())
                 .await?
                 .ok_or_else(|| {
-                    Error::corrupt_file(
-                        self.dataset
-                            .data_file_dir(&self.metadata)
-                            .child(data_file.path.as_str()),
+                    Error::corrupt_file(data_file_dir.child(data_file.path.as_str()),
                         "did not have any fields in common with the dataset schema",
                         location!(),
                     )
@@ -1200,7 +1198,7 @@ impl FileFragment {
             if length != expected_length {
                 let path = self
                     .dataset
-                    .data_file_dir(&self.metadata)
+                    .data_file_dir(&data_file)?
                     .child(data_file.path.as_str());
                 return Err(Error::corrupt_file(
                     path,
@@ -1216,7 +1214,7 @@ impl FileFragment {
             if physical_rows != *expected_length {
                 return Err(Error::corrupt_file(
                     self.dataset
-                        .data_file_dir(&self.metadata)
+                        .data_file_dir(&self.metadata.files[0])?
                         .child(self.metadata.files[0].path.as_str()),
                     format!(
                         "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",

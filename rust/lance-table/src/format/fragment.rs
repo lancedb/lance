@@ -41,9 +41,27 @@ pub struct DataFile {
 
     /// The size of the file in bytes, if known.
     pub file_size_bytes: CachedFileSize,
+
+    /// The base path of the datafile, when the datafile is a reference to another dataset.
+    pub path_base: Option<String>,
 }
 
 impl DataFile {
+    pub fn refer(
+        datafile: &DataFile,
+        path_base: String,
+    ) -> Self {
+        Self {
+            path: datafile.path.clone(),
+            fields: datafile.fields.clone(),
+            column_indices: datafile.column_indices.clone(),
+            file_major_version: datafile.file_major_version,
+            file_minor_version: datafile.file_minor_version,
+            file_size_bytes: datafile.file_size_bytes.clone(),
+            path_base: Some(path_base),
+        }
+    }
+
     pub fn new(
         path: impl Into<String>,
         fields: Vec<i32>,
@@ -59,6 +77,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
+            path_base: None,
         }
     }
 
@@ -75,6 +94,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
+            path_base: None,
         }
     }
 
@@ -143,6 +163,7 @@ impl From<&DataFile> for pb::DataFile {
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
+            path_base: df.path_base.clone(),
         }
     }
 }
@@ -158,6 +179,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
+            path_base: proto.path_base,
         })
     }
 }
@@ -186,6 +208,7 @@ pub struct DeletionFile {
     pub file_type: DeletionFileType,
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
+    pub path_base: Option<String>,
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -212,6 +235,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             id: value.id,
             file_type,
             num_deleted_rows,
+            path_base: value.path_base,
         })
     }
 }
@@ -453,6 +477,7 @@ impl From<&Fragment> for pb::DataFragment {
                 id: f.id,
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
+                path_base: f.path_base.clone(),
             }
         });
 
@@ -523,6 +548,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            path_base: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -545,6 +571,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            path_base: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();

@@ -233,7 +233,6 @@ pub enum Operation {
 
     Clone {
         is_shallow: bool,
-        is_strong_ref: bool,
         ref_name: String,
         ref_version: u64,
         source_path: String,
@@ -276,21 +275,18 @@ impl PartialEq for Operation {
             (
                 Self::Clone {
                     is_shallow: a_is_shallow,
-                    is_strong_ref: a_is_strong_ref,
                     ref_name: a_ref_name,
                     ref_version: a_ref_version,
                     source_path: a_source_path,
                 },
                 Self::Clone {
                     is_shallow: b_is_shallow,
-                    is_strong_ref: b_is_strong_ref,
                     ref_name: b_ref_name,
                     ref_version: b_ref_version,
                     source_path: b_source_path,
                 },
             ) => {
                 a_is_shallow == b_is_shallow
-                    && a_is_strong_ref == b_is_strong_ref
                     && a_ref_name == b_ref_name
                     && a_ref_version == b_ref_version
                     && a_source_path == b_source_path
@@ -1292,7 +1288,10 @@ impl Transaction {
                 location: location!(),
             });
         }
-        let reference = current_manifest.and_then(|m| m.reference.clone());
+        let ref_base_paths = match current_manifest {
+            Some(m) => m.ref_base_paths.clone(),
+            None => HashMap::new(),
+        };
 
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -1679,7 +1678,7 @@ impl Transaction {
                 Arc::new(final_fragments),
                 data_storage_format,
                 new_blob_version,
-                reference,
+                ref_base_paths,
             )
         };
 
@@ -1973,13 +1972,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             }
             Some(pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow,
-                is_strong_ref,
                 ref_name,
                 ref_version,
                 source_path,
             })) => Operation::Clone {
                 is_shallow,
-                is_strong_ref,
                 ref_name,
                 ref_version,
                 source_path,
@@ -2287,13 +2284,11 @@ impl From<&Transaction> for pb::Transaction {
             }
             Operation::Clone {
                 is_shallow,
-                is_strong_ref,
                 ref_name,
                 ref_version,
                 source_path,
             } => pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow: *is_shallow,
-                is_strong_ref: *is_strong_ref,
                 ref_name: ref_name.clone(),
                 ref_version: *ref_version,
                 source_path: source_path.clone(),

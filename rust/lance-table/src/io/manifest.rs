@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{ops::Range, sync::Arc};
-
+use std::collections::HashMap;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
@@ -227,7 +227,7 @@ impl ManifestProvider for ManifestDescribing {
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
             /*blob_dataset_version= */ None,
-            None,
+            HashMap::new(),
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
@@ -279,7 +279,7 @@ mod test {
             Arc::new(vec![]),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            None,
+            HashMap::new(),
         );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await

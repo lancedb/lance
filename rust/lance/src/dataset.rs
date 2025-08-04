@@ -133,7 +133,7 @@ pub struct Dataset {
     /// `bucket` is swlloed in the inner [ObjectStore].
     uri: String,
     pub(crate) base: Path,
-    pub(crate) manifest: Arc<Manifest>,
+    pub manifest: Arc<Manifest>,
     // Path for the manifest that is loaded. Used to get additional information,
     // such as the index metadata.
     pub(crate) manifest_location: ManifestLocation,
@@ -435,7 +435,7 @@ impl Dataset {
         self.checkout_by_version_number(version).await
     }
 
-    async fn load_manifest(
+    pub(crate) async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
         uri: &str,
@@ -1136,23 +1136,29 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub(crate) fn data_file_dir(&self, fragment: &Fragment) -> Path {
-        let reference = &self.manifest.as_ref().reference;
-        match reference {
-            Some(ref_value) if ref_value.max_fragment_id > fragment.id as u32 => {
-                Path::from(ref_value.root_path.clone()).child(DATA_DIR)
+    pub(crate) fn data_file_dir(&self, datafile: &DataFile) -> Result<Path> {
+        match datafile.path_base.as_ref() {
+            Some(ref_path) => {
+                let &base_path = &self.manifest.ref_base_paths.get(ref_path);
+                if let Some(actual_base_path) = base_path {
+                    return Ok(Path::from(actual_base_path.as_str()).child(DATA_DIR))
+                }
+                Err(Error::invalid_input(format!("base_paths is not found in ref_base_paths for ref_name {}", ref_path), location!()))
             }
-            _ => self.base.child(DATA_DIR),
+            _ => Ok(self.base.child(DATA_DIR)),
         }
     }
 
-    pub(crate) fn deletion_file_root_dir(&self, deletion: &DeletionFile) -> Path {
-        let reference = &self.manifest.as_ref().reference;
-        match reference {
-            Some(ref_value) if deletion.read_version < ref_value.version => {
-                Path::from(ref_value.root_path.clone())
+    pub(crate) fn deletion_file_root_dir(&self, deletion_file: &DeletionFile) -> Result<Path> {
+        match deletion_file.path_base.as_ref() {
+            Some(ref_path) => {
+                let &base_path = &self.manifest.ref_base_paths.get(ref_path);
+                if let Some(actual_base_path) = base_path {
+                    return Ok(Path::from(actual_base_path.as_str()))
+                }
+                Err(Error::invalid_input(format!("base_paths is not found in ref_base_paths for ref_name {}", ref_path), location!()))
             }
-            _ => self.base.clone(),
+            _ => Ok(self.base.clone()),
         }
     }
 
@@ -1576,7 +1582,6 @@ impl Dataset {
         let version = self.tags.get_version(ref_name).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
-            is_strong_ref: true,
             ref_name: ref_name.to_string(),
             ref_version: version,
             source_path: self.base.to_string(),
@@ -2686,7 +2691,7 @@ mod tests {
             .unwrap();
         dataset.tags.create("tag", 1).await.unwrap();
         let cloned_dataset = dataset
-            .shallow_clone(cloned_dir, "tag", Some(ObjectStoreParams::default()))
+            .shallow_clone(cloned_dir, "tag", ObjectStoreParams::default())
             .await
             .unwrap();
 
@@ -6550,6 +6555,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
+            path_base: None,
         };
 
         let dataset = Dataset::commit(
@@ -6604,6 +6610,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
+            path_base: None,
         };
 
         let dataset = Dataset::commit(
@@ -6702,6 +6709,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
+            path_base: None,
         };
 
         let new_data_file = DataFile {

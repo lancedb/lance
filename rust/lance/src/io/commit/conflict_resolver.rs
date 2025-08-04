@@ -1653,7 +1653,8 @@ mod tests {
             read_deletion_file(
                 fragment.id,
                 deletion_file,
-                &dataset.deletion_file_root_dir(deletion_file),
+                // Reference deletion file should never enter this apply_deletion. So base path is fine.
+                &dataset.base,
                 dataset.object_store(),
             )
             .await

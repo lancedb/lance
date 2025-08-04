@@ -157,10 +157,9 @@ message Transaction {
   // An operation that clones a dataset.
   message Clone {
     bool is_shallow = 1;
-    bool is_strong_ref = 2;
-    string ref_name = 3;
-    uint64 ref_version = 4;
-    string source_path = 5;
+    string ref_name = 2;
+    uint64 ref_version = 3;
+    string source_path = 4;
   }
 
   // An operation that updates rows but does not add or remove rows.

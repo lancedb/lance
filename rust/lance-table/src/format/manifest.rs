@@ -94,7 +94,7 @@ pub struct Manifest {
     pub blob_dataset_version: Option<u64>,
 
     /* reference to a source dataset*/
-    pub reference: Option<Reference>,
+    pub ref_base_paths: HashMap<String, String>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -123,7 +123,7 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
         blob_dataset_version: Option<u64>,
-        reference: Option<Reference>,
+        ref_base_paths: HashMap<String, String>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let local_schema = schema.retain_storage_class(StorageClass::Default);
@@ -147,7 +147,7 @@ impl Manifest {
             data_storage_format,
             config: HashMap::new(),
             blob_dataset_version,
-            reference,
+            ref_base_paths,
         }
     }
 
@@ -181,17 +181,32 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             blob_dataset_version,
-            reference: previous.reference.clone(),
+            ref_base_paths: previous.ref_base_paths.clone(),
         }
     }
 
-    pub fn shallow_clone(&self, root_path: &str, ref_name: &str, is_strong_ref: bool) -> Self {
+    pub fn shallow_clone(&self, root_path: &str, ref_name: &str, transaction_file: String) -> Self {
+        let cloned_fragments = self.fragments.as_ref().iter().map(|fragment| {
+            let mut cloned_fragment = fragment.clone();
+            cloned_fragment.files = cloned_fragment.files.into_iter().map(|mut file| {
+                file.path_base = Some(ref_name.to_string());
+                file
+            }).collect();
+
+            if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
+                deletion.path_base = Some(ref_name.to_string());
+                cloned_fragment.deletion_file = Some(deletion);
+            }
+
+            cloned_fragment
+        }).collect::<Vec<_>>();
+
         Self {
             schema: self.schema.clone(),
             local_schema: self.local_schema.clone(),
             version: self.version,
             writer_version: self.writer_version.clone(),
-            fragments: Arc::new(self.fragments.as_ref().clone()),
+            fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
             index_section: None,
             timestamp_nanos: self.timestamp_nanos,
@@ -199,19 +214,17 @@ impl Manifest {
             tag: None,
             writer_feature_flags: self.writer_feature_flags,
             max_fragment_id: self.max_fragment_id,
-            transaction_file: self.transaction_file.clone(),
+            transaction_file: Some(transaction_file),
             fragment_offsets: self.fragment_offsets.clone(),
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
             blob_dataset_version: self.blob_dataset_version,
-            reference: Some(Reference {
-                root_path: root_path.to_string(),
-                is_strong_ref,
-                ref_name: ref_name.to_string(),
-                version: self.version,
-                max_fragment_id: self.max_fragment_id.unwrap_or(0),
-            }),
+            ref_base_paths: {
+                let mut refs = self.ref_base_paths.clone();
+                refs.insert(ref_name.to_string(), root_path.to_string());
+                refs
+            },
         }
     }
 
@@ -614,13 +627,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.blob_dataset_version)
             },
-            reference: p.reference.as_ref().map(|reference| Reference {
-                root_path: reference.root_path.clone(),
-                is_strong_ref: reference.is_strong_ref,
-                ref_name: reference.ref_name.clone(),
-                version: reference.version,
-                max_fragment_id: reference.max_fragment_id,
-            }),
+            ref_base_paths: p.ref_base_paths,
         })
     }
 }
@@ -665,13 +672,7 @@ impl From<&Manifest> for pb::Manifest {
             }),
             config: m.config.clone(),
             blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
-            reference: m.reference.as_ref().map(|reference| pb::Reference {
-                root_path: reference.root_path.clone(),
-                is_strong_ref: reference.is_strong_ref,
-                ref_name: reference.ref_name.clone(),
-                version: reference.version,
-                max_fragment_id: reference.max_fragment_id,
-            }),
+            ref_base_paths: m.ref_base_paths.clone(),
         }
     }
 }
@@ -792,7 +793,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ None,
+            /*ref_main_location= */ HashMap::new(),
         );
 
         let actual = manifest.fragments_by_offset_range(0..10);
@@ -860,7 +861,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ None,
+            /*ref_main_location= */ HashMap::new(),
         );
 
         assert_eq!(manifest.max_field_id(), 43);
@@ -884,7 +885,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ None,
+            /*ref_main_location= */ HashMap::new(),
         );
 
         let mut config = manifest.config.clone();
