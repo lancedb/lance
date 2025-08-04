@@ -32,6 +32,7 @@ public class Transaction {
   private final long readVersion;
   private final String uuid;
   private final Map<String, String> writeParams;
+  private final Map<String, String> transactionProperties;
   // Mainly for JNI usage
   private final Dataset dataset;
   private final Operation operation;
@@ -43,13 +44,16 @@ public class Transaction {
       String uuid,
       Operation operation,
       Operation blobOp,
-      Map<String, String> writeParams) {
+      Map<String, String> writeParams,
+      Map<String, String> transactionProperties) {
     this.dataset = dataset;
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
     this.blobOp = blobOp;
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
+    this.transactionProperties =
+        transactionProperties != null ? transactionProperties : new HashMap<>();
   }
 
   public Dataset dataset() {
@@ -76,6 +80,10 @@ public class Transaction {
     return writeParams;
   }
 
+  public Map<String, String> transactionProperties() {
+    return transactionProperties;
+  }
+
   public Dataset commit() {
     try {
       Dataset committed = commitNative();
@@ -98,6 +106,7 @@ public class Transaction {
     private Operation operation;
     private Operation blobOp;
     private Map<String, String> writeParams;
+    private Map<String, String> transactionProperties;
 
     public Builder(Dataset dataset) {
       this.dataset = dataset;
@@ -106,6 +115,11 @@ public class Transaction {
 
     public Builder readVersion(long readVersion) {
       this.readVersion = readVersion;
+      return this;
+    }
+
+    public Builder transactionProperties(Map<String, String> properties) {
+      this.transactionProperties = properties;
       return this;
     }
 
@@ -126,7 +140,8 @@ public class Transaction {
 
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-      return new Transaction(dataset, readVersion, uuid, operation, blobOp, writeParams);
+      return new Transaction(
+          dataset, readVersion, uuid, operation, blobOp, writeParams, transactionProperties);
     }
   }
 }
