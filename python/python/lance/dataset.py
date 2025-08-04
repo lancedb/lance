@@ -234,22 +234,44 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         --------
         >>> import lance
         >>> import pyarrow as pa
-        >>> dataset = lance.dataset("/tmp/my_dataset")
+        >>> data = pa.table([
+        ...     pa.array([1, 2, 3]),
+        ...     pa.array(['alice', 'bob', 'charlie']),
+        ...     pa.array([100.0, 200.0, 300.0])
+        ... ], names=['id', 'name', 'score'])
+        >>> dataset = lance.write_dataset(data, "memory://test_dataset")
 
         >>> # Using default dataset schema
-        >>> builder = dataset.merge_insert("id").when_matched_update_all()\
-        ...     .when_not_matched_insert_all()
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
         >>> plan = builder.explain_plan()  # Uses dataset schema
-        >>> print(plan)
+        >>> print(plan) # doctest: +ELLIPSIS
+        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
+          CoalescePartitionsExec
+            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
+              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+                CoalesceBatchesExec: target_batch_size=...
+                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                    LanceRead: uri=test_dataset/data, projection=[id], ...
+                    RepartitionExec: ...
+                      StreamingTableExec: partition_sizes=1, ...
+        <BLANKLINE>
 
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([
         ...     pa.field("id", pa.int64()),
         ...     pa.field("name", pa.string()),
-        ...     pa.field("value", pa.float64())
+        ...     pa.field("score", pa.float64())
         ... ])
         >>> plan = builder.explain_plan(source_schema, verbose=True)
-        >>> print(plan)
+        >>> print(plan) # doctest: +ELLIPSIS
+        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
+          CoalescePartitionsExec
+            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
+              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+                CoalesceBatchesExec: target_batch_size=...
+                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                    ...
         """
         if schema is None:
             return super(MergeInsertBuilder, self).explain_plan(verbose=verbose)
@@ -289,16 +311,44 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         --------
         >>> import lance
         >>> import pyarrow as pa
-        >>> dataset = lance.dataset("/tmp/my_dataset")
+        >>> data = pa.table([
+        ...     pa.array([1, 2, 3]),
+        ...     pa.array(['alice', 'bob', 'charlie']),
+        ...     pa.array([100.0, 200.0, 300.0])
+        ... ], names=['id', 'name', 'score'])
+        >>> dataset = lance.write_dataset(data, "memory://analyze_dataset")
         >>> new_data = pa.table([
         ...     pa.array([1, 4]),
-        ...     pa.array(["updated_a", "d"]),
-        ...     pa.array([10.0, 20.0])
-        ... ], names=["id", "name", "value"])
-        >>> builder = dataset.merge_insert("id").when_matched_update_all()\
-        ...     .when_not_matched_insert_all()
+        ...     pa.array(["updated_alice", "david"]),
+        ...     pa.array([150.0, 400.0])
+        ... ], names=["id", "name", "score"])
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
         >>> analysis = builder.analyze_plan(new_data)
-        >>> print(analysis)
+        >>> print(analysis) # doctest: +ELLIPSIS
+            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...]
+              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...]
+                ProjectionExec: expr=[_rowaddr@1 as _rowaddr, ...], metrics=[...]
+                  ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...], ...
+                    CoalesceBatchesExec: ..., metrics=[...]
+                      HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                        LanceRead: ..., metrics=[..., bytes_read=..., ...]
+                        RepartitionExec: ...
+                          StreamingTableExec: ..., metrics=[]
+
+        Key metrics in MergeInsert operations:
+        - bytes_written: total bytes written to storage
+        - num_files_written: number of new data files created
+        - num_inserted_rows: rows added that didn't match existing data
+        - num_updated_rows: existing rows that were updated
+        - num_deleted_rows: rows removed (when using delete conditions)
+
+        Key metrics in LanceRead operations:
+        - bytes_read: bytes read from storage
+        - fragments_scanned: number of data fragments accessed
+        - rows_scanned: total rows examined during the scan
+        - iops: number of I/O operations performed
+        - requests: number of storage requests made
         """
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
