@@ -202,6 +202,10 @@ impl BlockingDataset {
         Ok(rows)
     }
 
+    pub fn get_max_field_id(&self) -> Result<i32> {
+        Ok(self.inner.manifest().max_field_id())
+    }
+
     pub fn calculate_data_stats(&self) -> Result<DataStatistics> {
         let stats = RT.block_on(Arc::new(self.clone().inner).calculate_data_stats())?;
         Ok(stats)
@@ -538,6 +542,20 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitOverwrite<'local>(
             storage_options_obj
         )
     )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetMaxFieldId(
+    mut env: JNIEnv,
+    _obj: JObject,
+) -> jint {
+    ok_or_throw_with_return!(env, inner_get_max_field_id(&mut env, _obj), -1) as jint
+}
+
+pub fn inner_get_max_field_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<i32> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.get_max_field_id()
 }
 
 pub fn inner_commit_overwrite<'local>(
