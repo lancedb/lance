@@ -3874,6 +3874,7 @@ name = "lance-index"
 version = "0.32.1"
 dependencies = [
  "arrow",
+ "arrow-arith",
  "arrow-array",
  "arrow-ord",
  "arrow-schema",

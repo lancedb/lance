@@ -24,7 +24,7 @@ use snafu::location;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
-use crate::vector::bq::transform::{CODE_BITCOUNT_COLUMN, IP_RQ_RES_COLUMN};
+use crate::vector::bq::transform::{CODE_BITCOUNT_COLUMN, IP_RQ_CENTROID_COLUMN, IP_RQ_RES_COLUMN};
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::sq::scale_to_u8;
 use crate::vector::storage::{DistCalculator, VectorStore};
@@ -116,7 +116,8 @@ pub struct RabitQuantizationStorage {
     centroid_dists: Float32Array,
     codes: FixedSizeListArray,
     code_bitcounts: Float32Array,
-    norm_dists: Float32Array,
+    ip_rq_res: Float32Array,
+    ip_rq_centroid: Float32Array,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -142,21 +143,30 @@ pub struct RabitDistCalculator<'a> {
     ip_rq_centroid: &'a [f32],
 
     // factors for all computing distances to all vectors
-    // |v-c|^2  + 2 * |v-c|^2 * ip_rq_res[i] /
-    add_factor: f32,
-    scale_factor: f32,
+    // |v-c|^2  + 2 * |v-c|^2 * ip_rq_centroid[i] / ip_rq_res[i]
+    // add_factor: f32,
+    // -2 * |v-c| / ip_rq_res[i] * |v-c| = -2 * |v-c|^2 / ip_rq_res[i]
+    // scale_factor: f32,
 
     // factors for query vector
-    // -(2^B - 1)/2 * sum(q')
-    kbit_x_sq_sum: f32,
+    // -(2^B - 1)/2 * sum(q') where B is the number of bits per dimension for RQ (not SQ)
+    // it's 0 for 1 bit RQ
+    // kbit_x_sq_sum: f32,
     // |(q-c)| ^ 2
-    qr_norm_square: f32,
+    // qr_norm_square: f32,
+    qc_norm_square: f32,
+
+    sq_min: f32,
+    sq_delta: f32,
+    sq_scale: f32,
+    sq_sum: f32,
+    sqrt_d: f32,
 }
 
 impl<'a> RabitDistCalculator<'a> {
     pub fn new(
-        q: &dyn Array,
-        centroid: &dyn Array,
+        qr: &dyn Array,
+        // centroid: &dyn Array,
         codes: &'a [u8],
         centroid_dists: &'a [f32],
         code_bitcounts: &'a [f32],
@@ -164,83 +174,39 @@ impl<'a> RabitDistCalculator<'a> {
         ip_rq_centroid: &'a [f32],
         inv_p: ndarray::ArrayView2<'a, f32>,
     ) -> Self {
-        let qr = arrow_arith::numeric::sub(&q, &centroid).unwrap();
-        let l2_norm_square = qr.iter().map(|&v| v * v).sum::<f32>();
+        // let qr = arrow_arith::numeric::sub(&q, &centroid).unwrap();
+
+        let qr = qr.as_primitive::<Float32Type>().values();
+        let q_norm_square = qr.iter().map(|&v| v * v).sum::<f32>();
         let qr = ndarray::ArrayView2::from_shape((qr.len(), 1), qr).unwrap();
-        let rotated_q = inv_p.dot(&qr);
-        let (min, max) = rotated_q
+        let rotated_qr = inv_p.dot(&qr);
+        let rotated_qr = rotated_qr.as_slice().unwrap();
+        let (min, max) = rotated_qr
             .iter()
             .copied()
             .minmax()
             .into_option()
             .expect("failed to get min and max of query vector");
         let bounds = min.as_()..max.as_();
-        let query_codes = scale_to_u8::<Float32Type>(&rotated_q, &bounds);
-
-        // let (query_codes, min, max) = match norm_qr.data_type() {
-        // DataType::Float16 => {
-        //     let norm_qr = norm_qr.as_primitive::<Float16Type>().values();
-        //     let (min, max) = norm_qr
-        //         .iter()
-        //         .copied()
-        //         .minmax()
-        //         .into_option()
-        //         .expect("failed to get min and max of query vector");
-        //     let bounds = min.as_()..max.as_();
-        //     (
-        //         scale_to_u8::<Float16Type>(norm_qr, &bounds),
-        //         min.as_(),
-        //         max.as_(),
-        //     )
-        // }
-        // DataType::Float32 => {
-        //     let norm_qr = norm_qr.as_primitive::<Float32Type>().values();
-        //     let (min, max) = norm_qr
-        //         .iter()
-        //         .copied()
-        //         .minmax()
-        //         .into_option()
-        //         .expect("failed to get min and max of query vector");
-        //     let bounds = min.as_()..max.as_();
-        //     (scale_to_u8::<Float32Type>(norm_qr, &bounds), min, max)
-        // }
-        // DataType::Float64 => {
-        //     let norm_qr = norm_qr.as_primitive::<Float64Type>().values();
-        //     let (min, max) = norm_qr
-        //         .iter()
-        //         .copied()
-        //         .minmax()
-        //         .into_option()
-        //         .expect("failed to get min and max of query vector");
-        //     let bounds = min..max;
-        //     (
-        //         scale_to_u8::<Float64Type>(norm_qr, &bounds),
-        //         min.as_(),
-        //         max.as_(),
-        //     )
-        // }
-        // _ => {
-        //     unimplemented!("unsupported data type for RabitQ: {}", norm_qr.data_type());
-        // }
-        // };
-        let delta = (max - min) / 255.0;
-        let sqrt_d = (norm_qr.len() as f32).sqrt();
-        let query_scalar_sum = query_codes.iter().map(|&v| v as u32).sum::<u32>() as f32;
+        let query_codes = scale_to_u8::<Float32Type>(&rotated_qr, &bounds);
+        let sq_sum = query_codes.iter().map(|&v| v as u32).sum::<u32>() as f32;
 
         let dist_table = Self::build_dist_table(query_codes);
         Self {
-            dim: norm_qr.len(),
+            dim: qr.len(),
             num_bits: 1,
             codes,
             dist_table,
             centroid_dists,
-            min_v_in_query: min,
-            delta,
-            sqrt_d,
-            query_scalar_sum,
             code_bitcounts,
-            norm_dists,
-            query_norm: norm,
+            ip_rq_res,
+            ip_rq_centroid,
+            qc_norm_square: q_norm_square,
+            sq_min: min,
+            sq_delta: (max - min),
+            sq_scale: (max - min) / 255.0,
+            sq_sum,
+            sqrt_d: (qr.len() as f32).sqrt(),
         }
     }
 
@@ -284,14 +250,14 @@ impl DistCalculator for RabitDistCalculator<'_> {
         let dist = dist as f32;
 
         // distance between quantized vector and query vector
-        let dist_vq_q = (2.0 * self.delta * dist + 2.0 * self.min_v_in_query * vec_bitcount
-            - self.delta * self.query_scalar_sum
-            - self.dim as f32 * self.min_v_in_query)
+        let dist_vq_qr = (2.0 * self.sq_scale * dist + 2.0 * self.sq_min * vec_bitcount
+            - self.sq_scale * self.sq_sum
+            - self.dim as f32 * self.sq_min)
             / self.sqrt_d;
 
-        let dist_v_q = dist_vq_q / self.norm_dists[id];
-        let dist_c = self.centroid_dists[id];
-        dist_c.powi(2) + self.query_norm.powi(2) - 2.0 * dist_c * self.query_norm * dist_v_q
+        let dist_v_q = dist_vq_qr / self.ip_rq_res[id];
+        let vr_norm_square = self.centroid_dists[id];
+        vr_norm_square + self.qc_norm_square - 2.0 * vr_norm_square * dist_v_q
     }
 
     fn distance_all(&self, _: usize) -> Vec<f32> {
@@ -348,7 +314,8 @@ impl VectorStore for RabitQuantizationStorage {
             codes,
             self.centroid_dists.values(),
             self.code_bitcounts.values(),
-            self.norm_dists.values(),
+            self.ip_rq_res.values(),
+            self.ip_rq_centroid.values(),
             self.metadata.inv_p.view(),
         )
     }
@@ -378,7 +345,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let code_bitcounts = batch[CODE_BITCOUNT_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
-        let norm_dists = batch[IP_RQ_RES_COLUMN]
+        let ip_rq_res = batch[IP_RQ_RES_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
+        let ip_rq_centroid = batch[IP_RQ_CENTROID_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
         Ok(Self {
@@ -389,7 +359,8 @@ impl QuantizerStorage for RabitQuantizationStorage {
             codes,
             centroid_dists,
             code_bitcounts,
-            norm_dists,
+            ip_rq_res,
+            ip_rq_centroid,
         })
     }
 
