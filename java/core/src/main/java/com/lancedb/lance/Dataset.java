@@ -726,6 +726,20 @@ public class Dataset implements Closeable {
 
   private native LanceSchema nativeGetLanceSchema();
 
+  /**
+   * Get the {@link com.lancedb.lance.Transaction} of the dataset at the current version.
+   *
+   * @return the Transaction
+   */
+  public Optional<Transaction> readTransaction() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeReadTransaction());
+    }
+  }
+
+  private native Transaction nativeReadTransaction();
+
   /** @return all the created indexes names */
   public List<String> listIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

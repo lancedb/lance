@@ -16,6 +16,8 @@ package com.lancedb.lance.fragment;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
+import java.util.Arrays;
+import java.util.Objects;
 
 public class DataFile implements Serializable {
   private static final long serialVersionUID = -2827710928026343591L;
@@ -63,6 +65,19 @@ public class DataFile implements Serializable {
 
   public Long getFileSizeBytes() {
     return fileSizeBytes;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    DataFile that = (DataFile) o;
+    return fileMajorVersion == that.fileMajorVersion
+        && fileMinorVersion == that.fileMinorVersion
+        && Objects.equals(path, that.path)
+        && Arrays.equals(fields, that.fields)
+        && Arrays.equals(columnIndices, that.columnIndices)
+        && Objects.equals(fileSizeBytes, that.fileSizeBytes);
   }
 
   @Override
