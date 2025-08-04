@@ -49,7 +49,6 @@ use object_store::path::Path;
 use prost::Message;
 
 use super::ObjectStore;
-use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
