@@ -51,10 +51,8 @@ use std::{
 };
 
 use super::ManifestWriteConfig;
-use crate::dataset::builder::DatasetBuilder;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
-use crate::Dataset;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
@@ -76,7 +74,6 @@ use lance_table::{
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
-use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
 /// A change to a dataset that can be retried

@@ -1597,11 +1597,10 @@ impl Dataset {
             ref_name: ref_name.to_string(),
             ref_version: version,
             source_path: self.base.to_string(),
-            // source_path: self.uri.clone(),
         };
         let transaction = Transaction::new(version, clone_op, None, None);
 
-        let mut builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params)
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
