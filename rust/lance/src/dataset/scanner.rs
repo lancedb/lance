@@ -482,12 +482,11 @@ impl Scanner {
         self.fragments.is_some()
     }
 
-    /// Empty Projection
+    /// Empty Projection (useful for count queries)
     ///
-    /// The row_address will be scanned.
+    /// The row_address will be scanned (no I/O required) but not included in the output
     pub fn empty_project(&mut self) -> Result<&mut Self> {
-        self.with_row_address();
-        self.project(&[ROW_ADDR])
+        self.project(&[] as &[&str])
     }
 
     /// Projection.
@@ -499,8 +498,8 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
             .collect();
 
-        let with_row_id = self.projection_plan.physical_projection.with_row_id;
-        let with_row_addr = self.projection_plan.physical_projection.with_row_addr;
+        let with_row_id = self.projection_plan.desires_row_id;
+        let with_row_addr = self.projection_plan.desires_row_addr;
 
         for (col, _) in &transformed_columns {
             if *col == ROW_ID && !with_row_id {
@@ -1132,14 +1131,15 @@ impl Scanner {
             output_expr.push((score_expr, SCORE_COL.to_string()));
         }
 
-        if self.projection_plan.physical_projection.with_row_id
-            && output_expr.iter().all(|(_, name)| name != ROW_ID)
+        // TODO: These output_expr.iter().all() checks seem redundant.  We should never have ROW_ID
+        // or ROW_ADDR in the output exprs.
+        if self.projection_plan.desires_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID)
         {
             let row_id_expr = expressions::col(ROW_ID, current_schema)?;
             output_expr.push((row_id_expr, ROW_ID.to_string()));
         }
 
-        if self.projection_plan.physical_projection.with_row_addr
+        if self.projection_plan.desires_row_addr
             && output_expr.iter().all(|(_, name)| name != ROW_ADDR)
         {
             let row_addr_expr = expressions::col(ROW_ADDR, current_schema)?;
@@ -1356,21 +1356,7 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
-        // Note: it's _ok_ (though maybe dubious) if the projection is empty and there is a vector search
-        // or FTS because we might be projecting just the _distance / _score columns
-        if !self.projection_plan.has_output_cols()
-            && self.nearest.is_none()
-            && self.full_text_query.is_none()
-        {
-            return Err(Error::InvalidInput {
-                source:
-                    "no columns were selected and with_row_id is false, there is nothing to scan"
-                        .into(),
-                location: location!(),
-            });
-        }
-
-        if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
+        if self.include_deleted_rows && !self.projection_plan.desires_row_id {
             return Err(Error::InvalidInput {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
                 location: location!(),
@@ -1494,6 +1480,7 @@ impl Scanner {
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
+
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
@@ -1504,15 +1491,20 @@ impl Scanner {
             (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
             (None, None) => {
-                if self.projection_plan.physical_projection.is_empty() {
+                if self.projection_plan.has_output_cols()
+                    && self.projection_plan.physical_projection.is_empty()
+                {
+                    // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
+                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
+                    //
+                    // It's also possible we get here from `SELECT does_not_exist`
+
                     // Note: even though we are just going to return an error we still want to calculate the
                     // output_expr here.  This lets us distinguish between a user doing something like:
                     //
                     // SELECT 1 FROM t (not supported error)
                     // SELECT non_existent_column FROM t (column not found error)
                     let output_expr = self.output_expr(&ArrowSchema::empty())?;
-                    // This means the user is doing something like `SELECT 1`.  We don't support this and
-                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
                     return Err(Error::NotSupported {
                         source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
                         location: location!(),
@@ -1797,7 +1789,7 @@ impl Scanner {
         filter_plan: &mut FilterPlan,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
-        let projection = if filter_plan.has_refine() {
+        let mut projection = if filter_plan.has_refine() {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
@@ -1808,6 +1800,12 @@ impl Scanner {
             // columns that the user asked for.
             self.projection_plan.physical_projection.clone()
         };
+
+        if projection.is_empty() {
+            // If the user is not requesting any columns then we will scan the row address which
+            // is cheap
+            projection.with_row_addr = true;
+        }
 
         let scan_range = if filter_plan.is_empty() {
             log::trace!("pushing scan_range into filtered_read");
@@ -7057,14 +7055,14 @@ mod test {
 
         // Test explicit projection
         let mut scanner = dataset.scan();
-        scanner.projection_plan.physical_projection.with_row_id = with_row_id;
-        scanner.projection_plan.physical_projection.with_row_addr = with_row_address;
 
         let mut projection = vec!["data_item_id".to_string()];
         if with_row_id {
+            scanner.with_row_id();
             projection.push(ROW_ID.to_string());
         }
         if with_row_address {
+            scanner.with_row_address();
             projection.push(ROW_ADDR.to_string());
         }
 
@@ -7084,8 +7082,12 @@ mod test {
 
         // Test implicit inclusion
         let mut scanner = dataset.scan();
-        scanner.projection_plan.physical_projection.with_row_id = with_row_id;
-        scanner.projection_plan.physical_projection.with_row_addr = with_row_address;
+        if with_row_id {
+            scanner.with_row_id();
+        }
+        if with_row_address {
+            scanner.with_row_address();
+        }
         scanner.project(&["data_item_id"]).unwrap();
         let stream = scanner.try_into_stream().await.unwrap();
         let batch = stream.try_collect::<Vec<_>>().await.unwrap().pop().unwrap();
@@ -7094,8 +7096,6 @@ mod test {
 
         // Test error case
         let mut scanner = dataset.scan();
-        scanner.projection_plan.physical_projection.with_row_id = false;
-        scanner.projection_plan.physical_projection.with_row_addr = false;
         let result = if with_row_id {
             scanner.project(&[ROW_ID])
         } else {

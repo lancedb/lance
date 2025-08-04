@@ -30,6 +30,25 @@ pub struct ProjectionPlan {
     /// The physical schema that must be loaded from the dataset
     pub physical_projection: Projection,
 
+    /// True if the user wants the row id in the final output
+    ///
+    /// Note: this is related, but slightly different, to physical_projection.with_row_id
+    /// which only tracks if the row id is needed.
+    ///
+    /// desires_row_id implies with_row_id is true
+    /// However, it is possible to have desires_row_id=false and with_row_id=true (e.g. when
+    /// the row id is needed to perform a late materialization take)
+    pub desires_row_id: bool,
+    /// True if the user wants the row address in the final output
+    ///
+    /// Note: this is related, but slightly different, to physical_projection.with_row_addr
+    /// which only tracks if the row address is needed.
+    ///
+    /// desires_row_addr implies with_row_addr is true
+    /// However, it is possible to have deisres_row_addr=false and with_row_addr=true (e.g. during
+    /// a count query)
+    pub desires_row_addr: bool,
+
     /// If present, expressions that represent the output columns.  These expressions
     /// run on the output of the physical projection.
     ///
@@ -47,6 +66,8 @@ impl ProjectionPlan {
             base,
             physical_projection,
             requested_output_expr: None,
+            desires_row_addr: false,
+            desires_row_id: false,
         }
     }
 
@@ -122,6 +143,9 @@ impl ProjectionPlan {
         self.physical_projection = physical_projection;
     }
 
+    /// Convert the projection to a list of physical expressions
+    ///
+    /// This is used to apply the final projection (including dynamic expressions) to the data.
     pub fn to_physical_exprs(
         &self,
         current_schema: &ArrowSchema,
@@ -156,12 +180,16 @@ impl ProjectionPlan {
         }
     }
 
+    /// Include the row id in the output
     pub fn include_row_id(&mut self) {
         self.physical_projection.with_row_id = true;
+        self.desires_row_id = true;
     }
 
+    /// Include the row address in the output
     pub fn include_row_addr(&mut self) {
         self.physical_projection.with_row_addr = true;
+        self.desires_row_addr = true;
     }
 
     /// Check if the projection has any output columns
@@ -169,10 +197,15 @@ impl ProjectionPlan {
     /// This doesn't mean there is a physical projection.  For example, we may someday support
     /// something like `SELECT 1 AS foo` which would have an output column (foo) but no physical projection
     pub fn has_output_cols(&self) -> bool {
-        self.requested_output_expr
-            .as_ref()
-            .map(|exprs| !exprs.is_empty())
-            .unwrap_or(!self.physical_projection.is_empty())
+        if self.desires_row_id || self.desires_row_addr {
+            return true;
+        }
+        if let Some(exprs) = &self.requested_output_expr {
+            if !exprs.is_empty() {
+                return true;
+            }
+        }
+        self.physical_projection.has_non_meta_cols()
     }
 
     pub fn output_schema(&self) -> Result<ArrowSchema> {

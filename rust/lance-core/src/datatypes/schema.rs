@@ -1150,6 +1150,11 @@ impl Projection {
         self.field_ids.is_empty() && (self.with_row_addr || self.with_row_id)
     }
 
+    /// True if the projection has at least one non-metadata column
+    pub fn has_non_meta_cols(&self) -> bool {
+        !self.field_ids.is_empty()
+    }
+
     /// Convert the projection to a schema that does not include metadata columns
     pub fn to_bare_schema(&self) -> Schema {
         self.base.schema().apply_projection(self)

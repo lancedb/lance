@@ -2737,9 +2737,11 @@ def test_scan_no_columns(tmp_path: Path):
     for batch in batches:
         assert batch.schema == expected_schema
 
-    # if with_row_id is not True then columns=[] is an error
-    with pytest.raises(ValueError, match="no columns were selected"):
-        dataset.scanner(columns=[]).to_table()
+    # Can specify nothing at all to get empty batches (with correct counts)
+    batches = list(dataset.scanner(columns=[], batch_size=10).to_batches())
+    assert len(batches) == 10
+    for batch in batches:
+        assert batch.num_rows == 10
 
     # also test with deleted data to make sure deleted ids not included
     dataset.delete("a = 5")
