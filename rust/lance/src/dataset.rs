@@ -1141,9 +1141,15 @@ impl Dataset {
             Some(ref_path) => {
                 let &base_path = &self.manifest.ref_base_paths.get(ref_path);
                 if let Some(actual_base_path) = base_path {
-                    return Ok(Path::from(actual_base_path.as_str()).child(DATA_DIR))
+                    return Ok(Path::from(actual_base_path.as_str()).child(DATA_DIR));
                 }
-                Err(Error::invalid_input(format!("base_paths is not found in ref_base_paths for ref_name {}", ref_path), location!()))
+                Err(Error::invalid_input(
+                    format!(
+                        "base_paths is not found in ref_base_paths for ref_name {}",
+                        ref_path
+                    ),
+                    location!(),
+                ))
             }
             _ => Ok(self.base.child(DATA_DIR)),
         }
@@ -1154,9 +1160,15 @@ impl Dataset {
             Some(ref_path) => {
                 let &base_path = &self.manifest.ref_base_paths.get(ref_path);
                 if let Some(actual_base_path) = base_path {
-                    return Ok(Path::from(actual_base_path.as_str()))
+                    return Ok(Path::from(actual_base_path.as_str()));
                 }
-                Err(Error::invalid_input(format!("base_paths is not found in ref_base_paths for ref_name {}", ref_path), location!()))
+                Err(Error::invalid_input(
+                    format!(
+                        "base_paths is not found in ref_base_paths for ref_name {}",
+                        ref_path
+                    ),
+                    location!(),
+                ))
             }
             _ => Ok(self.base.clone()),
         }

@@ -60,9 +60,7 @@ impl BlobFile {
         let frag_id = RowAddress::from(row_addr).fragment_id();
         let frag = dataset.get_fragment(frag_id as usize).unwrap();
         let data_file = frag.data_file_for_field(field_id).unwrap();
-        let data_file = dataset
-            .data_dir()
-            .child(data_file.path.as_str());
+        let data_file = dataset.data_dir().child(data_file.path.as_str());
         Self {
             dataset,
             data_file,

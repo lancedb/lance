@@ -47,10 +47,7 @@ pub struct DataFile {
 }
 
 impl DataFile {
-    pub fn refer(
-        datafile: &DataFile,
-        path_base: String,
-    ) -> Self {
+    pub fn refer(datafile: &DataFile, path_base: String) -> Self {
         Self {
             path: datafile.path.clone(),
             fields: datafile.fields.clone(),

@@ -1179,7 +1179,8 @@ impl FileFragment {
                 .open_reader(data_file, None, &FragReadConfig::default())
                 .await?
                 .ok_or_else(|| {
-                    Error::corrupt_file(data_file_dir.child(data_file.path.as_str()),
+                    Error::corrupt_file(
+                        data_file_dir.child(data_file.path.as_str()),
                         "did not have any fields in common with the dataset schema",
                         location!(),
                     )

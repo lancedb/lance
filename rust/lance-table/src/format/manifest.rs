@@ -186,20 +186,29 @@ impl Manifest {
     }
 
     pub fn shallow_clone(&self, root_path: &str, ref_name: &str, transaction_file: String) -> Self {
-        let cloned_fragments = self.fragments.as_ref().iter().map(|fragment| {
-            let mut cloned_fragment = fragment.clone();
-            cloned_fragment.files = cloned_fragment.files.into_iter().map(|mut file| {
-                file.path_base = Some(ref_name.to_string());
-                file
-            }).collect();
+        let cloned_fragments = self
+            .fragments
+            .as_ref()
+            .iter()
+            .map(|fragment| {
+                let mut cloned_fragment = fragment.clone();
+                cloned_fragment.files = cloned_fragment
+                    .files
+                    .into_iter()
+                    .map(|mut file| {
+                        file.path_base = Some(ref_name.to_string());
+                        file
+                    })
+                    .collect();
 
-            if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
-                deletion.path_base = Some(ref_name.to_string());
-                cloned_fragment.deletion_file = Some(deletion);
-            }
+                if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
+                    deletion.path_base = Some(ref_name.to_string());
+                    cloned_fragment.deletion_file = Some(deletion);
+                }
 
-            cloned_fragment
-        }).collect::<Vec<_>>();
+                cloned_fragment
+            })
+            .collect::<Vec<_>>();
 
         Self {
             schema: self.schema.clone(),
