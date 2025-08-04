@@ -27,6 +27,7 @@ use crate::{
         default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
         EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
     },
+    format::pb::{self, array_encoding::ArrayEncoding as ArrayEncodingEnum},
     repdef::RepDefBuilder,
     version::LanceFileVersion,
     EncodingsIo,
@@ -350,6 +351,7 @@ pub struct TestCases {
     page_sizes: Vec<u64>,
     file_version: LanceFileVersion,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
+    expected_encoding: Option<Vec<String>>,
 }
 
 impl Default for TestCases {
@@ -363,6 +365,7 @@ impl Default for TestCases {
             page_sizes: vec![4096, 1024 * 1024],
             file_version: LanceFileVersion::default(),
             verify_encoding: None,
+            expected_encoding: None,
         }
     }
 }
@@ -417,6 +420,159 @@ impl TestCases {
             verify_encoding(encoding);
         }
     }
+
+    pub fn with_expected_encoding(mut self, encoding: &str) -> Self {
+        self.expected_encoding = Some(vec![encoding.to_string()]);
+        self
+    }
+
+    pub fn with_expected_encoding_chain(mut self, encodings: Vec<&str>) -> Self {
+        self.expected_encoding = Some(encodings.iter().map(|s| s.to_string()).collect());
+        self
+    }
+}
+
+/// Extract encoding types from array encoding (helper for nested encodings)
+fn extract_array_encoding_chain(encoding: &pb::ArrayEncoding) -> Vec<String> {
+    let mut chain = Vec::new();
+
+    if let Some(ref array_encoding) = encoding.array_encoding {
+        match array_encoding {
+            ArrayEncodingEnum::Flat(_) => chain.push("flat".to_string()),
+            ArrayEncodingEnum::Binary(_) => chain.push("binary".to_string()),
+            ArrayEncodingEnum::FixedSizeBinary(_) => chain.push("fixed_size_binary".to_string()),
+            ArrayEncodingEnum::Fsst(_) => chain.push("fsst".to_string()),
+            ArrayEncodingEnum::Dictionary(_) => chain.push("dictionary".to_string()),
+            ArrayEncodingEnum::Constant(_) => chain.push("constant".to_string()),
+            ArrayEncodingEnum::Variable(_) => chain.push("variable".to_string()),
+            ArrayEncodingEnum::Bitpacked(_) => chain.push("bitpacked".to_string()),
+            ArrayEncodingEnum::InlineBitpacking(_) => chain.push("inline_bitpacking".to_string()),
+            ArrayEncodingEnum::OutOfLineBitpacking(_) => {
+                chain.push("out_of_line_bitpacking".to_string())
+            }
+            ArrayEncodingEnum::BitpackedForNonNeg(_) => chain.push("bitpacked_non_neg".to_string()),
+            ArrayEncodingEnum::Block(block) => {
+                chain.push("block".to_string());
+                // The block scheme (e.g., "lz4", "zstd") is stored in block.scheme
+                if !block.scheme.is_empty() {
+                    chain.push(block.scheme.clone());
+                }
+            }
+            ArrayEncodingEnum::Rle(_) => chain.push("rle".to_string()),
+            ArrayEncodingEnum::PackedStruct(_) => chain.push("packed_struct".to_string()),
+            ArrayEncodingEnum::PackedStructFixedWidthMiniBlock(_) => {
+                chain.push("packed_struct_fixed_width".to_string())
+            }
+            ArrayEncodingEnum::Nullable(nullable) => {
+                chain.push("nullable".to_string());
+                if let Some(ref nullability) = nullable.nullability {
+                    match nullability {
+                        pb::nullable::Nullability::NoNulls(no_nulls) => {
+                            if let Some(ref values) = no_nulls.values {
+                                chain.extend(extract_array_encoding_chain(values));
+                            }
+                        }
+                        pb::nullable::Nullability::SomeNulls(some_nulls) => {
+                            if let Some(ref values) = some_nulls.values {
+                                chain.extend(extract_array_encoding_chain(values));
+                            }
+                        }
+                        pb::nullable::Nullability::AllNulls(_) => {
+                            chain.push("all_nulls".to_string());
+                        }
+                    }
+                }
+            }
+            ArrayEncodingEnum::FixedSizeList(fsl) => {
+                chain.push("fixed_size_list".to_string());
+                // items is a repeated field in FixedSizeList
+                if let Some(items) = &fsl.items {
+                    chain.extend(extract_array_encoding_chain(items));
+                }
+            }
+            ArrayEncodingEnum::List(_) => {
+                chain.push("list".to_string());
+                // List doesn't have an items field in the simple message
+            }
+            ArrayEncodingEnum::Struct(_) => {
+                chain.push("struct".to_string());
+                // SimpleStruct doesn't have fields array
+            }
+            ArrayEncodingEnum::GeneralMiniBlock(general) => {
+                chain.push("general_miniblock".to_string());
+                // Check the inner encoding
+                if let Some(ref inner) = general.inner {
+                    let inner_chain = extract_array_encoding_chain(inner);
+                    chain.extend(inner_chain);
+                }
+            }
+            ArrayEncodingEnum::ByteStreamSplit(_) => {
+                chain.push("byte_stream_split".to_string());
+            }
+        }
+    }
+
+    chain
+}
+
+/// Verify that a single page contains the expected encoding
+fn verify_page_encoding(
+    page: &EncodedPage,
+    expected_chain: &[String],
+    col_idx: usize,
+) -> Result<()> {
+    use crate::decoder::PageEncoding;
+    use lance_core::Error;
+    use snafu::location;
+
+    let mut actual_chain = Vec::new();
+
+    match &page.description {
+        PageEncoding::Structural(layout) => {
+            // Extract encodings from the page layout
+            use crate::format::pb::page_layout::Layout;
+            if let Some(ref layout_type) = layout.layout {
+                match layout_type {
+                    Layout::MiniBlockLayout(mini_block) => {
+                        // Check value compression
+                        if let Some(ref value_comp) = mini_block.value_compression {
+                            let chain = extract_array_encoding_chain(value_comp);
+                            actual_chain.extend(chain);
+                        }
+                    }
+                    Layout::FullZipLayout(full_zip) => {
+                        // Check value compression in full zip layout
+                        if let Some(ref value_comp) = full_zip.value_compression {
+                            let chain = extract_array_encoding_chain(value_comp);
+                            actual_chain.extend(chain);
+                        }
+                    }
+                    Layout::AllNullLayout(_) => {
+                        // No value encoding for all null
+                    }
+                }
+            }
+        }
+        PageEncoding::Legacy(encoding) => {
+            let chain = extract_array_encoding_chain(encoding);
+            actual_chain.extend(chain);
+        }
+    }
+
+    // Check that all expected encodings appear in the actual chain
+    for expected in expected_chain {
+        if !actual_chain.iter().any(|actual| actual.contains(expected)) {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Column {} expected encoding chain {:?} but got {:?}",
+                    col_idx, expected_chain, actual_chain
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Given specific data and test cases we check round trip encoding and decoding
@@ -542,6 +698,15 @@ async fn check_round_trip_encoding_inner(
         }
         for encode_task in encode_tasks {
             let encoded_page = encode_task.await.unwrap();
+
+            // For V2.1, verify encoding in the page if expected
+            if test_cases.file_version >= LanceFileVersion::V2_1 {
+                if let Some(ref expected) = test_cases.expected_encoding {
+                    verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                        .unwrap();
+                }
+            }
+
             writer.write_page(encoded_page);
         }
         row_number += arr.len() as u64;
@@ -553,7 +718,17 @@ async fn check_round_trip_encoding_inner(
         writer.write_lance_buffer(buffer);
     }
     for task in encode_tasks {
-        writer.write_page(task.await.unwrap());
+        let encoded_page = task.await.unwrap();
+
+        // For V2.1, verify encoding in the page if expected
+        if test_cases.file_version >= LanceFileVersion::V2_1 {
+            if let Some(ref expected) = test_cases.expected_encoding {
+                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                    .unwrap();
+            }
+        }
+
+        writer.write_page(encoded_page);
     }
 
     let mut external_buffers = writer.new_external_buffers();
@@ -564,7 +739,9 @@ async fn check_round_trip_encoding_inner(
     }
     let mut column_infos = Vec::new();
     for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
-        for page in encoded_column.final_pages {
+        // Keep track of pages for encoding verification
+        let pages = encoded_column.final_pages;
+        for page in pages {
             writer.write_page(page);
         }
 

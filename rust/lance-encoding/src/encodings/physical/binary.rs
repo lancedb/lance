@@ -785,4 +785,34 @@ pub mod tests {
         let string_array = Arc::new(StringArray::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_binary_encoding_verification() {
+        use lance_datagen::{ByteCount, RowCount};
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("variable")
+            .with_file_version(LanceFileVersion::V2_1);
+
+        // Test both automatic selection and explicit configuration
+        // 1. Test automatic binary encoding selection (small strings that won't trigger FSST)
+        let arr_small = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(10), false))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr_small], &test_cases, HashMap::new()).await;
+
+        // 2. Test explicit "none" compression to force binary encoding
+        let metadata_explicit =
+            HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
+        let arr_large = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(50), false))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr_large], &test_cases, metadata_explicit).await;
+    }
 }
