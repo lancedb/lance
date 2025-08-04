@@ -119,7 +119,7 @@ public class Transaction {
     }
 
     public Builder transactionProperties(Map<String, String> properties) {
-      this.writeParams = properties;
+      this.transactionProperties = properties;
       return this;
     }
 
