@@ -85,7 +85,7 @@ class LanceFileReader:
             path, storage_options=storage_options, columns=columns
         )
 
-    def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
+    def read_all(self, *, batch_size: int = 1024, batch_readahead=16, columns: Optional[List[str]] = None) -> ReaderResults:
         """
         Reads the entire file
 
@@ -97,11 +97,14 @@ class LanceFileReader:
 
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
+        columns: list of str, default None
+            List of column names to be fetched.
+            All columns are fetched if None or unspecified.
         """
-        return ReaderResults(self._reader.read_all(batch_size, batch_readahead))
+        return ReaderResults(self._reader.read_all(batch_size, batch_readahead, columns))
 
     def read_range(
-        self, start: int, num_rows: int, *, batch_size: int = 1024, batch_readahead=16
+        self, start: int, num_rows: int, *, batch_size: int = 1024, batch_readahead=16, columns: Optional[List[str]] = None
     ) -> ReaderResults:
         """
         Read a range of rows from the file
@@ -118,13 +121,16 @@ class LanceFileReader:
 
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
+        columns: list of str, default None
+            List of column names to be fetched.
+            All columns are fetched if None or unspecified.
         """
         return ReaderResults(
-            self._reader.read_range(start, num_rows, batch_size, batch_readahead)
+            self._reader.read_range(start, num_rows, batch_size, batch_readahead, columns)
         )
 
     def take_rows(
-        self, indices, *, batch_size: int = 1024, batch_readahead=16
+        self, indices, *, batch_size: int = 1024, batch_readahead=16, columns: Optional[List[str]] = None
     ) -> ReaderResults:
         """
         Read a specific set of rows from the file
@@ -139,6 +145,9 @@ class LanceFileReader:
 
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
+        columns: list of str, default None
+            List of column names to be fetched.
+            All columns are fetched if None or unspecified.
         """
         for i in range(len(indices) - 1):
             if indices[i] > indices[i + 1]:
@@ -148,7 +157,7 @@ class LanceFileReader:
                 )
 
         return ReaderResults(
-            self._reader.take_rows(indices, batch_size, batch_readahead)
+            self._reader.take_rows(indices, batch_size, batch_readahead, columns)
         )
 
     def metadata(self) -> LanceFileMetadata:

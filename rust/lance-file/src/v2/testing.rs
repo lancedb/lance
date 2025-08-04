@@ -108,7 +108,7 @@ pub async fn read_lance_file(
     assert_eq!(schema.metadata.get("foo").unwrap(), "bar");
 
     let batch_stream = file_reader
-        .read_stream(ReadBatchParams::RangeFull, 1024, 16, filter)
+        .read_stream(ReadBatchParams::RangeFull, 1024, 16, filter, None)
         .unwrap();
 
     batch_stream.try_collect().await.unwrap()
