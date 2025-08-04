@@ -6,7 +6,7 @@ use crate::Dataset;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::prelude::SessionContext;
+use lance_datafusion::exec::{new_session_context, LanceExecutionOptions};
 use std::sync::Arc;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
@@ -63,11 +63,11 @@ impl SqlQueryBuilder {
     }
 
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
-        let ctx = SessionContext::new();
+        let ctx = new_session_context(&LanceExecutionOptions::default());
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
         ctx.register_table(
-            self.table_name,
+            self.table_name.clone(),
             Arc::new(LanceTableProvider::new(
                 self.dataset.clone(),
                 row_id,
@@ -75,6 +75,7 @@ impl SqlQueryBuilder {
             )),
         )?;
         let df = ctx.sql(&self.sql).await?;
+
         Ok(SqlQuery::new(df))
     }
 }
@@ -112,10 +113,14 @@ impl SqlQuery {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{assert_string_matches, DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::Dataset;
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+    use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use lance_datagen::{array, gen_batch};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -280,5 +285,52 @@ mod tests {
   "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., bytes_read=..., fragments_scanned=..., iops=..., ranges_scanned=..., requests=..., rows_scanned=..., task_wait_time=...]\n",
 ]], row_count: 1 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sql_contains_tokens() {
+        let text_col = Arc::new(StringArray::from(vec![
+            "a cat",
+            "lovely cat",
+            "white cat",
+            "catch up",
+            "fish",
+        ]));
+
+        // Prepare dataset
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        // Test without fts index
+        let results = dataset
+            .sql("select * from foo where contains_tokens(text, 'cat')")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        pretty_assertions::assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(results.num_columns(), 1);
+
+        pretty_assertions::assert_eq!(
+            results
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["a cat", "lovely cat", "white cat", "catch up"])
+        );
     }
 }
