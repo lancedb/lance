@@ -1,4 +1,6 @@
 name: Nightly Run Jobs
+permissions:
+  contents: read
 
 on:
   schedule:
