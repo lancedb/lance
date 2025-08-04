@@ -1,6 +1,4 @@
 name: Nightly Run Jobs
-permissions:
-  contents: read
 
 on:
   schedule:
@@ -24,6 +22,8 @@ jobs:
     runs-on: ubuntu-2404-4x-x64
     if: github.repository == 'lancedb/lance'
     timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
