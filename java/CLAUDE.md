@@ -3,7 +3,8 @@ Java code: `core/src`
 Rust JNI bindings: `core/lance-jni`
 
 ## Commands
-format: `mvn spotless:apply && cargo fmt --all`
+Use `./mvnw` instead of `mvn` to ensure the correct version of Maven is used.
+format: `./mvnw spotless:apply && cargo fmt --all`
 lint rust: `cargo clippy --tests`
-compile: `mvn compile`
-test: `mvn test`
+compile: `./mvnw compile`
+test: `./mvnw test`
