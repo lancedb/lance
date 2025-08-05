@@ -490,7 +490,7 @@ fn get_path_base_index(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
         .call_method(obj, "getPathBaseIndex", "()Ljava/util/Optional;", &[])?
         .l()?;
 
-    if !env
+    if env
         .call_method(&path_base_index, "isPresent", "()Z", &[])?
         .z()?
     {
