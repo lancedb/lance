@@ -233,9 +233,9 @@ impl FragReuseIndex {
 
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
         let mut mapped_value = Some(row_id);
-        for row_addr_map in self.row_id_maps.iter() {
+        for row_id_map in self.row_id_maps.iter() {
             if mapped_value.is_some() {
-                mapped_value = row_addr_map
+                mapped_value = row_id_map
                     .get(&mapped_value.unwrap())
                     .copied()
                     .unwrap_or(mapped_value);
