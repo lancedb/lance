@@ -5,7 +5,7 @@
 
 use std::cmp::min;
 use std::collections::HashMap;
-use std::{any::Any, cell::Cell, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -396,10 +396,10 @@ pub mod tests {
 
             // Create a stream that adds proper _rowaddr values
             // For MockTrainingSource, we'll treat each batch as a separate fragment
-            let fragment_id = Cell::new(0u32);
+            let mut fragment_id = 0;
             let data_with_rowaddr = self.data.map_ok(move |batch| {
                 let num_rows = batch.num_rows();
-                let current_fragment_id = fragment_id.get();
+                let current_fragment_id = fragment_id;
 
                 // Calculate _rowaddr as (fragment_id << 32) | local_offset
                 let rowaddrs = UInt64Array::from_iter_values((0..num_rows).map(|local_offset| {
@@ -412,7 +412,7 @@ pub mod tests {
                 new_columns.push(Arc::new(rowaddrs));
 
                 // Increment fragment_id for the next batch
-                fragment_id.set(current_fragment_id + 1);
+                fragment_id += 1;
 
                 RecordBatch::try_new(schema_for_stream.clone(), new_columns).unwrap()
             });
