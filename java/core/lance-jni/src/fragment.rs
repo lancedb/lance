@@ -225,10 +225,10 @@ fn create_fragment<'a>(
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
-    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/String;)V";
+    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;Ljava/lang/String;)V";
+    "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFile;Lcom/lancedb/lance/fragment/RowIdMeta;)V";
