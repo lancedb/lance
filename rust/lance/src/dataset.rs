@@ -1605,7 +1605,7 @@ impl Dataset {
             is_shallow: true,
             ref_name: ref_name.to_string(),
             ref_version: version,
-            ref_path: self.base.to_string(),
+            ref_path: self.base.to_string_lossy().into_owned(),
             ref_path_index: next_ref_path_index as u32,
         };
         let transaction = Transaction::new(version, clone_op, None, None);
