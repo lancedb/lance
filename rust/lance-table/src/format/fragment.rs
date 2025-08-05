@@ -161,7 +161,7 @@ impl From<&DataFile> for pb::DataFile {
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
-            path_base_index: df.path_base_index.clone(),
+            path_base_index: df.path_base_index,
         }
     }
 }
@@ -489,7 +489,7 @@ impl From<&Fragment> for pb::DataFragment {
                 id: f.id,
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
-                path_base_index: f.path_base_index.clone(),
+                path_base_index: f.path_base_index,
             }
         });
 

@@ -1450,7 +1450,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version=*/ None,
-            HashMap::new(),
+            Vec::new(),
         );
 
         fix_schema(&mut manifest).unwrap();
