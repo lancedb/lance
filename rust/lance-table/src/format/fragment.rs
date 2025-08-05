@@ -599,9 +599,8 @@ mod tests {
                      "file_size_bytes": null, "path_base_index": null }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
-                                  "num_deleted_rows": 10},
-                "physical_rows": None::<usize>,
-                "path_base_index": null}),
+                                  "num_deleted_rows": 10, "path_base_index": null},
+                "physical_rows": None::<usize>}),
         );
 
         let frag2 = Fragment::from_json(&json).unwrap();
