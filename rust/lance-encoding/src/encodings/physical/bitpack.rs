@@ -490,4 +490,25 @@ mod test {
             check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
         }
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_encoding_verification() {
+        use arrow_array::Int32Array;
+
+        // Test bitpacking encoding verification with varied small values that should trigger bitpacking
+        let test_cases = TestCases::default()
+            .with_expected_encoding("inline_bitpacking")
+            .with_file_version(LanceFileVersion::V2_1);
+
+        // Generate data with varied small values to avoid RLE
+        // Mix different values but keep them small to trigger bitpacking
+        let mut values = Vec::new();
+        for i in 0..2048 {
+            values.push(i % 16); // Values 0-15, varied enough to avoid RLE
+        }
+
+        let arrays = vec![Arc::new(Int32Array::from(values)) as Arc<dyn Array>];
+
+        check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
+    }
 }
