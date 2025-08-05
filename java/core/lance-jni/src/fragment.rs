@@ -491,7 +491,7 @@ fn get_path_base_index(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
         .l()?;
 
     if env
-        .call_method(&path_base_index, "isEmpty", "()Z", &[])?
+        .call_method(&path_base_index, "isPresent", "()Z", &[])?
         .z()?
     {
         return Ok(None);

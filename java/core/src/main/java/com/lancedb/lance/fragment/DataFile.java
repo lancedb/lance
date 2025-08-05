@@ -69,7 +69,7 @@ public class DataFile implements Serializable {
     return fileSizeBytes;
   }
 
-  public Optional<Integer> getPathBase() {
+  public Optional<Integer> getPathBaseIndex() {
     return Optional.ofNullable(pathBaseIndex);
   }
 
