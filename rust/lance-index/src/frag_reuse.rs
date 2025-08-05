@@ -208,32 +208,32 @@ impl FragReuseIndexDetails {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragReuseIndex {
     pub uuid: Uuid,
-    pub row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
+    pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
     pub details: FragReuseIndexDetails,
 }
 
 impl DeepSizeOf for FragReuseIndex {
     fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-        self.row_addr_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+        self.row_id_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
     }
 }
 
 impl FragReuseIndex {
     pub fn new(
         uuid: Uuid,
-        row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
+        row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
         Self {
             uuid,
-            row_addr_maps,
+            row_id_maps,
             details,
         }
     }
 
-    pub fn remap_row_addr(&self, row_addr: u64) -> Option<u64> {
-        let mut mapped_value = Some(row_addr);
-        for row_addr_map in self.row_addr_maps.iter() {
+    pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+        let mut mapped_value = Some(row_id);
+        for row_addr_map in self.row_id_maps.iter() {
             if mapped_value.is_some() {
                 mapped_value = row_addr_map
                     .get(&mapped_value.unwrap())
@@ -248,12 +248,12 @@ impl FragReuseIndex {
     pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
         RowIdTreeMap::from_iter(row_ids.row_addrs().unwrap().filter_map(|addr| {
             let addr_as_u64 = u64::from(addr);
-            self.remap_row_addr(addr_as_u64)
+            self.remap_row_id(addr_as_u64)
         }))
     }
 
     pub fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
-        RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_addr(addr)))
+        RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
     /// Remap a record batch that contains a row_id column at index [`row_id_idx`]
@@ -274,7 +274,7 @@ impl FragReuseIndex {
             .iter()
             .enumerate()
             .filter_map(|(idx, old_id)| {
-                self.remap_row_addr(*old_id)
+                self.remap_row_id(*old_id)
                     .map(|new_id| (idx as u64, new_id))
             })
             .unzip();
@@ -306,7 +306,7 @@ impl FragReuseIndex {
                 if primitive_array.is_null(i) {
                     None
                 } else {
-                    self.remap_row_addr(primitive_array.value(i))
+                    self.remap_row_id(primitive_array.value(i))
                 }
             })
             .collect()
