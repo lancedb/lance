@@ -41,13 +41,11 @@ impl RowIdIndex {
 
         // If users stable row ids, check for overlapping ranges and if found,
         // return a NotImplementedError.
-        if !uses_stable_row_ids {
-            if pieces.windows(2).any(|w| w[0].0.end() >= w[1].0.start()) {
-                return Err(Error::NotSupported {
-                    source: "Overlapping ranges are not yet supported".into(),
-                    location: location!(),
-                });
-            }
+        if !uses_stable_row_ids && pieces.windows(2).any(|w| w[0].0.end() >= w[1].0.start()) {
+            return Err(Error::NotSupported {
+                source: "Overlapping ranges are not yet supported".into(),
+                location: location!(),
+            });
         }
 
         Ok(Self(RangeInclusiveMap::from_iter(pieces)))
