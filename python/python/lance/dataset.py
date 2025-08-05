@@ -4372,7 +4372,9 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: Optional[str] = None,
+    data_storage_version: Optional[
+        Literal["stable", "2.0", "2.1", "next", "legacy", "0.1"]
+    ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
