@@ -583,7 +583,8 @@ mod tests {
     };
     use datafusion_common::DataFusionError;
     use datafusion_common::ScalarValue;
-    use futures::{stream, TryStreamExt};
+    use datafusion_sql::sqlparser::keywords::ZONE;
+    use futures::{stream, StreamExt, TryStreamExt};
     use itertools::Itertools;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datafusion::datagen::DatafusionDatagenExt;
@@ -605,7 +606,8 @@ mod tests {
         ScalarIndex, SearchResult, TextQuery,
     };
 
-    #[test_log::test(tokio::test)]
+    use crate::scalar::btree::TrainingSource;
+
     async fn test_empty_zonemap_index() {
         let tmpdir = Arc::new(tempdir().unwrap());
         let test_store = Arc::new(LanceIndexStore::new(
@@ -789,6 +791,8 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
+        // Create data that will produce the expected zonemap zones
+        // The original test expected 3 zones with specific min/max values
         let data =
             arrow_array::Int64Array::from_iter_values(0..=(ZONEMAP_DEFAULT_SIZE * 2 + 42) as i64);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
@@ -844,6 +848,223 @@ mod tests {
         assert_eq!(index.zonemap_offset, 43);
 
         // TODO: Test search functionality
+    }
+
+    #[tokio::test]
+    async fn test_multiple_fragments_zonemap() {
+        // Test zonemap with multiple fragments to verify fragment_id functionality
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Int64, false),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+
+        // Create multiple fragments with data that will produce expected zones
+        // Fragment 0: values 0-8191 (first zone)
+        let fragment0_data =
+            arrow_array::Int64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as i64);
+        let fragment0_row_ids =
+            UInt64Array::from_iter_values((0..ZONEMAP_DEFAULT_SIZE as u64).map(|i| i as u64));
+        let fragment0_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(fragment0_data), Arc::new(fragment0_row_ids)],
+        )
+        .unwrap();
+
+        // Fragment 1: values 8192-16383 (second zone)
+        let fragment1_data = arrow_array::Int64Array::from_iter_values(
+            (ZONEMAP_DEFAULT_SIZE as i64)..((ZONEMAP_DEFAULT_SIZE * 2) as i64),
+        );
+        let fragment1_row_ids =
+            UInt64Array::from_iter_values((0..ZONEMAP_DEFAULT_SIZE as u64).map(|i| i as u64));
+        let fragment1_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],
+        )
+        .unwrap();
+
+        // Fragment 2: values 16384-16426 (third zone)
+        let fragment2_data = arrow_array::Int64Array::from_iter_values(
+            ((ZONEMAP_DEFAULT_SIZE * 2) as i64)..((ZONEMAP_DEFAULT_SIZE * 2 + 43) as i64),
+        );
+        let fragment2_row_ids = UInt64Array::from_iter_values((0..43).map(|i| i as u64));
+        let fragment2_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(fragment2_data), Arc::new(fragment2_row_ids)],
+        )
+        .unwrap();
+
+        // Create a stream with multiple batches (fragments)
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![
+                Ok(fragment0_batch.clone()),
+                Ok(fragment1_batch.clone()),
+                Ok(fragment2_batch.clone()),
+            ]),
+        ));
+
+        let data_source = Box::new(MockTrainingSource::from(data_stream));
+        train_zonemap_index(
+            data_source,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderOptions::default()),
+        )
+        .await
+        .unwrap();
+
+        // Read the index file back and check its contents
+        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load ZoneMapIndex");
+        assert_eq!(index.zones.len(), 3);
+        assert_eq!(
+            index.zones,
+            vec![
+                ZoneMapStatistics {
+                    min: ScalarValue::Int64(Some(0)),
+                    max: ScalarValue::Int64(Some(8191)),
+                    null_count: 0
+                },
+                ZoneMapStatistics {
+                    min: ScalarValue::Int64(Some(8192)),
+                    max: ScalarValue::Int64(Some(16383)),
+                    null_count: 0
+                },
+                ZoneMapStatistics {
+                    min: ScalarValue::Int64(Some(16384)),
+                    max: ScalarValue::Int64(Some(16426)),
+                    null_count: 0
+                }
+            ]
+        );
+        assert_eq!(index.data_type, DataType::Int64);
+        assert_eq!(index.zonemap_size, ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(index.zonemap_offset, 43);
+
+        // Verify _rowaddr column values are properly assigned
+        let verify_data_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::iter(vec![
+                    Ok(fragment0_batch.clone()),
+                    Ok(fragment1_batch.clone()),
+                    Ok(fragment2_batch.clone()),
+                ]),
+            ));
+        let verify_data_source = Box::new(MockTrainingSource::from(verify_data_stream));
+        let aligned_stream = verify_data_source.scan_aligned_chunks(4096).await.unwrap();
+        let batches: Vec<RecordBatch> = aligned_stream.try_collect().await.unwrap();
+
+        assert_eq!(batches.len(), 3);
+
+        // Check fragment 0 _rowaddr values (should start from 0)
+        let fragment0_rowaddr_col = batches[0].column_by_name("_rowaddr").unwrap();
+        let fragment0_rowaddrs = fragment0_rowaddr_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(fragment0_rowaddrs.values().len(), ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(fragment0_rowaddrs.values()[0], 0);
+        assert_eq!(
+            fragment0_rowaddrs.values()[fragment0_rowaddrs.values().len() - 1],
+            8191
+        );
+
+        // Check fragment 1 _rowaddr values (should start from fragment_id=1)
+        let fragment1_rowaddr_col = batches[1].column_by_name("_rowaddr").unwrap();
+        let fragment1_rowaddrs = fragment1_rowaddr_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(fragment1_rowaddrs.values().len(), ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(fragment1_rowaddrs.values()[0], 1u64 << 32); // fragment_id=1, local_offset=0
+        assert_eq!(
+            fragment1_rowaddrs.values()[fragment1_rowaddrs.values().len() - 1],
+            8191 | 1u64 << 32
+        );
+
+        // Check fragment 2 _rowaddr values (should start from fragment_id=2)
+        let fragment2_rowaddr_col = batches[2].column_by_name("_rowaddr").unwrap();
+        let fragment2_rowaddrs = fragment2_rowaddr_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(fragment2_rowaddrs.values().len(), 43);
+        assert_eq!(fragment2_rowaddrs.values()[0], 2u64 << 32); // fragment_id=2, local_offset=0
+        assert_eq!(
+            fragment2_rowaddrs.values()[fragment2_rowaddrs.values().len() - 1],
+            (2u64 << 32) | 42
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_id_assignment() {
+        // Test that fragment IDs are properly assigned in _rowaddr values
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Int32, false),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+
+        // Create multiple fragments
+        let fragment0_data = arrow_array::Int32Array::from_iter_values(0..5);
+        let fragment0_row_ids = UInt64Array::from_iter_values((0..5).map(|i| i as u64));
+        let fragment0_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(fragment0_data), Arc::new(fragment0_row_ids)],
+        )
+        .unwrap();
+
+        let fragment1_data = arrow_array::Int32Array::from_iter_values(5..10);
+        let fragment1_row_ids = UInt64Array::from_iter_values((0..5).map(|i| i as u64));
+        let fragment1_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],
+        )
+        .unwrap();
+
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(fragment0_batch), Ok(fragment1_batch)]),
+        ));
+
+        let data_source = Box::new(MockTrainingSource::from(data_stream));
+
+        // Use scan_aligned_chunks to get the data with _rowaddr
+        let aligned_stream = data_source.scan_aligned_chunks(100).await.unwrap();
+        let batches: Vec<RecordBatch> = aligned_stream.try_collect().await.unwrap();
+
+        assert_eq!(batches.len(), 2);
+
+        // Check fragment 0 _rowaddr values
+        let fragment0_rowaddr_col = batches[0].column_by_name("_rowaddr").unwrap();
+        let fragment0_rowaddrs = fragment0_rowaddr_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // Fragment 0 should have _rowaddr values: 0, 1, 2, 3, 4
+        assert_eq!(fragment0_rowaddrs.values(), &[0, 1, 2, 3, 4]);
+
+        // Check fragment 1 _rowaddr values
+        let fragment1_rowaddr_col = batches[1].column_by_name("_rowaddr").unwrap();
+        let fragment1_rowaddrs = fragment1_rowaddr_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // Fragment 1 should have _rowaddr values: (1 << 32) | 0, (1 << 32) | 1, etc.
+        // which is: 4294967296, 4294967297, 4294967298, 4294967299, 4294967300
+        assert_eq!(
+            fragment1_rowaddrs.values(),
+            &[4294967296, 4294967297, 4294967298, 4294967299, 4294967300]
+        );
     }
     // Create another test following test_page_cache in  btree.rs
 }
