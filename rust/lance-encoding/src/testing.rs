@@ -421,97 +421,93 @@ impl TestCases {
         }
     }
 
-    pub fn with_expected_encoding(mut self, encoding: &str) -> Self {
-        self.expected_encoding = Some(vec![encoding.to_string()]);
+    pub fn with_expected_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.expected_encoding = Some(vec![encoding.into()]);
         self
     }
 
-    pub fn with_expected_encoding_chain(mut self, encodings: Vec<&str>) -> Self {
-        self.expected_encoding = Some(encodings.iter().map(|s| s.to_string()).collect());
+    pub fn with_expected_encoding_chain<I: IntoIterator<Item = T>, T: Into<String>>(
+        mut self,
+        encodings: I,
+    ) -> Self {
+        self.expected_encoding = Some(encodings.into_iter().map(Into::into).collect());
         self
     }
 }
 
-/// Extract encoding types from array encoding (helper for nested encodings)
-fn extract_array_encoding_chain(encoding: &pb::ArrayEncoding) -> Vec<String> {
-    let mut chain = Vec::new();
+/// Maps encoding enum variant to its string tag
+/// Uses exhaustive match to ensure compile-time checking when variants are added/removed
+fn tag(e: &ArrayEncodingEnum) -> &'static str {
+    use ArrayEncodingEnum::*;
 
-    if let Some(ref array_encoding) = encoding.array_encoding {
-        match array_encoding {
-            ArrayEncodingEnum::Flat(_) => chain.push("flat".to_string()),
-            ArrayEncodingEnum::Binary(_) => chain.push("binary".to_string()),
-            ArrayEncodingEnum::FixedSizeBinary(_) => chain.push("fixed_size_binary".to_string()),
-            ArrayEncodingEnum::Fsst(_) => chain.push("fsst".to_string()),
-            ArrayEncodingEnum::Dictionary(_) => chain.push("dictionary".to_string()),
-            ArrayEncodingEnum::Constant(_) => chain.push("constant".to_string()),
-            ArrayEncodingEnum::Variable(_) => chain.push("variable".to_string()),
-            ArrayEncodingEnum::Bitpacked(_) => chain.push("bitpacked".to_string()),
-            ArrayEncodingEnum::InlineBitpacking(_) => chain.push("inline_bitpacking".to_string()),
-            ArrayEncodingEnum::OutOfLineBitpacking(_) => {
-                chain.push("out_of_line_bitpacking".to_string())
+    match e {
+        Flat(_) => "flat",
+        Binary(_) => "binary",
+        FixedSizeBinary(_) => "fixed_size_binary",
+        Fsst(_) => "fsst",
+        Dictionary(_) => "dictionary",
+        Constant(_) => "constant",
+        Variable(_) => "variable",
+        Bitpacked(_) => "bitpacked",
+        InlineBitpacking(_) => "inline_bitpacking",
+        OutOfLineBitpacking(_) => "out_of_line_bitpacking",
+        BitpackedForNonNeg(_) => "bitpacked_non_neg",
+        Block(_) => "block", // scheme handled separately
+        Rle(_) => "rle",
+        PackedStruct(_) => "packed_struct",
+        PackedStructFixedWidthMiniBlock(_) => "packed_struct_fixed_width",
+        Nullable(_) => "nullable",             // has recursion
+        FixedSizeList(_) => "fixed_size_list", // has recursion
+        List(_) => "list",
+        Struct(_) => "struct",
+        GeneralMiniBlock(_) => "general_miniblock", // has recursion
+        ByteStreamSplit(_) => "byte_stream_split",
+    }
+}
+
+/// Returns the child encoding if this variant contains nested ArrayEncoding
+fn child(e: &ArrayEncodingEnum) -> Option<&pb::ArrayEncoding> {
+    use ArrayEncodingEnum::*;
+
+    match e {
+        Nullable(n) => {
+            use pb::nullable::Nullability::*;
+            match &n.nullability {
+                Some(NoNulls(v)) => v.values.as_ref().map(|b| b.as_ref()),
+                Some(SomeNulls(v)) => v.values.as_ref().map(|b| b.as_ref()),
+                _ => None, // AllNulls or None have no child
             }
-            ArrayEncodingEnum::BitpackedForNonNeg(_) => chain.push("bitpacked_non_neg".to_string()),
-            ArrayEncodingEnum::Block(block) => {
-                chain.push("block".to_string());
-                // The block scheme (e.g., "lz4", "zstd") is stored in block.scheme
-                if !block.scheme.is_empty() {
-                    chain.push(block.scheme.clone());
+        }
+        FixedSizeList(f) => f.items.as_ref().map(|b| b.as_ref()),
+        GeneralMiniBlock(g) => g.inner.as_ref().map(|b| b.as_ref()),
+        _ => None,
+    }
+}
+
+/// Extract encoding types from array encoding (helper for nested encodings)
+/// Returns the encoding chain including compression schemes for Block variants
+pub fn extract_array_encoding_chain(enc: &pb::ArrayEncoding) -> Vec<String> {
+    let mut chain = Vec::with_capacity(8);
+    let mut stack = vec![enc];
+
+    while let Some(cur) = stack.pop() {
+        if let Some(inner) = &cur.array_encoding {
+            // 1. Add current layer's tag
+            chain.push(tag(inner).to_string());
+
+            // 2. Special handling for Block: append compression scheme
+            if let ArrayEncodingEnum::Block(b) = inner {
+                if !b.scheme.is_empty() {
+                    chain.push(b.scheme.clone());
                 }
             }
-            ArrayEncodingEnum::Rle(_) => chain.push("rle".to_string()),
-            ArrayEncodingEnum::PackedStruct(_) => chain.push("packed_struct".to_string()),
-            ArrayEncodingEnum::PackedStructFixedWidthMiniBlock(_) => {
-                chain.push("packed_struct_fixed_width".to_string())
-            }
-            ArrayEncodingEnum::Nullable(nullable) => {
-                chain.push("nullable".to_string());
-                if let Some(ref nullability) = nullable.nullability {
-                    match nullability {
-                        pb::nullable::Nullability::NoNulls(no_nulls) => {
-                            if let Some(ref values) = no_nulls.values {
-                                chain.extend(extract_array_encoding_chain(values));
-                            }
-                        }
-                        pb::nullable::Nullability::SomeNulls(some_nulls) => {
-                            if let Some(ref values) = some_nulls.values {
-                                chain.extend(extract_array_encoding_chain(values));
-                            }
-                        }
-                        pb::nullable::Nullability::AllNulls(_) => {
-                            chain.push("all_nulls".to_string());
-                        }
-                    }
-                }
-            }
-            ArrayEncodingEnum::FixedSizeList(fsl) => {
-                chain.push("fixed_size_list".to_string());
-                // items is a repeated field in FixedSizeList
-                if let Some(items) = &fsl.items {
-                    chain.extend(extract_array_encoding_chain(items));
-                }
-            }
-            ArrayEncodingEnum::List(_) => {
-                chain.push("list".to_string());
-                // List doesn't have an items field in the simple message
-            }
-            ArrayEncodingEnum::Struct(_) => {
-                chain.push("struct".to_string());
-                // SimpleStruct doesn't have fields array
-            }
-            ArrayEncodingEnum::GeneralMiniBlock(general) => {
-                chain.push("general_miniblock".to_string());
-                // Check the inner encoding
-                if let Some(ref inner) = general.inner {
-                    let inner_chain = extract_array_encoding_chain(inner);
-                    chain.extend(inner_chain);
-                }
-            }
-            ArrayEncodingEnum::ByteStreamSplit(_) => {
-                chain.push("byte_stream_split".to_string());
+
+            // 3. Process child encoding if exists
+            if let Some(next) = child(inner) {
+                stack.push(next);
             }
         }
     }
-
     chain
 }
 
