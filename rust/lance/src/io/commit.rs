@@ -113,9 +113,9 @@ async fn do_commit_new_dataset(
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) = if let Operation::Clone {
-        ref source_path,
-        ref ref_name,
+        ref_path: ref source_path,
         ref_version,
+        ref_path_index,
         ..
     } = transaction.operation
     {
@@ -133,7 +133,8 @@ async fn do_commit_new_dataset(
             &Session::default(),
         )
         .await?;
-        let new_manifest = source_manifest.shallow_clone(source_path, ref_name, transaction_file);
+        let new_manifest =
+            source_manifest.shallow_clone(source_path, ref_path_index, transaction_file);
         (new_manifest, Vec::new())
     } else {
         let (manifest, indices) = transaction.build_manifest(

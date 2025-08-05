@@ -1136,41 +1136,49 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub(crate) fn data_file_dir(&self, datafile: &DataFile) -> Result<Path> {
-        match datafile.path_base.as_ref() {
-            Some(ref_path) => {
-                let &base_path = &self.manifest.ref_base_paths.get(ref_path);
-                if let Some(actual_base_path) = base_path {
-                    return Ok(Path::from(actual_base_path.as_str()).child(DATA_DIR));
-                }
-                Err(Error::invalid_input(
-                    format!(
-                        "base_paths is not found in ref_base_paths for ref_name {}",
-                        ref_path
-                    ),
-                    location!(),
-                ))
+    pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
+        match data_file.path_base_index.as_ref() {
+            Some(path_index) => {
+                let reference_paths = &self.manifest.reference_paths;
+                reference_paths
+                    .get(*path_index as usize)
+                    .map(|base_path| Path::from(base_path.as_str()).child(DATA_DIR))
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "base_paths index {} out of bounds (max {}) for data_file {}",
+                                path_index,
+                                reference_paths.len(),
+                                data_file.path,
+                            ),
+                            location!(),
+                        )
+                    })
             }
             _ => Ok(self.base.child(DATA_DIR)),
         }
     }
 
     pub(crate) fn deletion_file_root_dir(&self, deletion_file: &DeletionFile) -> Result<Path> {
-        match deletion_file.path_base.as_ref() {
-            Some(ref_path) => {
-                let &base_path = &self.manifest.ref_base_paths.get(ref_path);
-                if let Some(actual_base_path) = base_path {
-                    return Ok(Path::from(actual_base_path.as_str()));
-                }
-                Err(Error::invalid_input(
-                    format!(
-                        "base_paths is not found in ref_base_paths for ref_name {}",
-                        ref_path
-                    ),
-                    location!(),
-                ))
+        match deletion_file.path_base_index.as_ref() {
+            Some(path_index) => {
+                let reference_paths = &self.manifest.reference_paths;
+                reference_paths
+                    .get(*path_index as usize)
+                    .map(|base_path| Path::from(base_path.as_str()))
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "base_paths index {} out of bounds (max {}) for deletion_file {}",
+                                path_index,
+                                reference_paths.len(),
+                                deletion_file,
+                            ),
+                            location!(),
+                        )
+                    })
             }
-            _ => Ok(self.base.clone()),
+            _ => Ok(self.base.as_ref().into()),
         }
     }
 
@@ -1592,11 +1600,13 @@ impl Dataset {
     ) -> Result<Self> {
         // self.tags.create(ref_name, self.version().version).await?;
         let version = self.tags.get_version(ref_name).await?;
+        let next_ref_path_index = self.manifest.reference_paths.len();
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: ref_name.to_string(),
             ref_version: version,
-            source_path: self.base.to_string(),
+            ref_path: self.base.to_string(),
+            ref_path_index: next_ref_path_index as u32,
         };
         let transaction = Transaction::new(version, clone_op, None, None);
 
@@ -6566,7 +6576,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
-            path_base: None,
+            path_base_index: None,
         };
 
         let dataset = Dataset::commit(
@@ -6621,7 +6631,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
-            path_base: None,
+            path_base_index: None,
         };
 
         let dataset = Dataset::commit(
@@ -6720,7 +6730,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
-            path_base: None,
+            path_base_index: None,
         };
 
         let new_data_file = DataFile {

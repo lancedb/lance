@@ -232,7 +232,8 @@ pub enum Operation {
         is_shallow: bool,
         ref_name: String,
         ref_version: u64,
-        source_path: String,
+        ref_path: String,
+        ref_path_index: u32,
     },
 }
 
@@ -274,19 +275,22 @@ impl PartialEq for Operation {
                     is_shallow: a_is_shallow,
                     ref_name: a_ref_name,
                     ref_version: a_ref_version,
-                    source_path: a_source_path,
+                    ref_path: a_source_path,
+                    ref_path_index: a_ref_path_index,
                 },
                 Self::Clone {
                     is_shallow: b_is_shallow,
                     ref_name: b_ref_name,
                     ref_version: b_ref_version,
-                    source_path: b_source_path,
+                    ref_path: b_source_path,
+                    ref_path_index: b_ref_path_index,
                 },
             ) => {
                 a_is_shallow == b_is_shallow
                     && a_ref_name == b_ref_name
                     && a_ref_version == b_ref_version
                     && a_source_path == b_source_path
+                    && a_ref_path_index == b_ref_path_index
             }
             (
                 Self::Delete {
@@ -1285,9 +1289,9 @@ impl Transaction {
                 location: location!(),
             });
         }
-        let ref_base_paths = match current_manifest {
-            Some(m) => m.ref_base_paths.clone(),
-            None => HashMap::new(),
+        let reference_paths = match current_manifest {
+            Some(m) => m.reference_paths.clone(),
+            None => Vec::new(),
         };
 
         // Get the schema and the final fragment list
@@ -1675,7 +1679,7 @@ impl Transaction {
                 Arc::new(final_fragments),
                 data_storage_format,
                 new_blob_version,
-                ref_base_paths,
+                reference_paths,
             )
         };
 
@@ -1971,12 +1975,14 @@ impl TryFrom<pb::Transaction> for Transaction {
                 is_shallow,
                 ref_name,
                 ref_version,
-                source_path,
+                ref_path,
+                ref_path_index,
             })) => Operation::Clone {
                 is_shallow,
                 ref_name,
                 ref_version,
-                source_path,
+                ref_path,
+                ref_path_index,
             },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
@@ -2283,12 +2289,14 @@ impl From<&Transaction> for pb::Transaction {
                 is_shallow,
                 ref_name,
                 ref_version,
-                source_path,
+                ref_path,
+                ref_path_index,
             } => pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow: *is_shallow,
                 ref_name: ref_name.clone(),
                 ref_version: *ref_version,
-                source_path: source_path.clone(),
+                ref_path: ref_path.clone(),
+                ref_path_index: *ref_path_index,
             }),
             Operation::Delete {
                 updated_fragments,

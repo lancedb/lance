@@ -93,8 +93,8 @@ pub struct Manifest {
     /// Blob dataset version
     pub blob_dataset_version: Option<u64>,
 
-    /* reference to a source dataset*/
-    pub ref_base_paths: HashMap<String, String>,
+    /* reference to source datasets*/
+    pub reference_paths: Vec<String>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -123,7 +123,7 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
         blob_dataset_version: Option<u64>,
-        ref_base_paths: HashMap<String, String>,
+        reference_paths: Vec<String>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let local_schema = schema.retain_storage_class(StorageClass::Default);
@@ -147,7 +147,7 @@ impl Manifest {
             data_storage_format,
             config: HashMap::new(),
             blob_dataset_version,
-            ref_base_paths,
+            reference_paths,
         }
     }
 
@@ -181,11 +181,16 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             blob_dataset_version,
-            ref_base_paths: previous.ref_base_paths.clone(),
+            reference_paths: previous.reference_paths.clone(),
         }
     }
 
-    pub fn shallow_clone(&self, root_path: &str, ref_name: &str, transaction_file: String) -> Self {
+    pub fn shallow_clone(
+        &self,
+        root_path: &str,
+        path_base_index: u32,
+        transaction_file: String,
+    ) -> Self {
         let cloned_fragments = self
             .fragments
             .as_ref()
@@ -196,13 +201,13 @@ impl Manifest {
                     .files
                     .into_iter()
                     .map(|mut file| {
-                        file.path_base = Some(ref_name.to_string());
+                        file.path_base_index = Some(path_base_index);
                         file
                     })
                     .collect();
 
                 if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
-                    deletion.path_base = Some(ref_name.to_string());
+                    deletion.path_base_index = Some(path_base_index);
                     cloned_fragment.deletion_file = Some(deletion);
                 }
 
@@ -229,9 +234,9 @@ impl Manifest {
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
             blob_dataset_version: self.blob_dataset_version,
-            ref_base_paths: {
-                let mut refs = self.ref_base_paths.clone();
-                refs.insert(ref_name.to_string(), root_path.to_string());
+            reference_paths: {
+                let mut refs = self.reference_paths.clone();
+                refs.push(root_path.to_string());
                 refs
             },
         }
@@ -636,7 +641,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.blob_dataset_version)
             },
-            ref_base_paths: p.ref_base_paths,
+            reference_paths: p.reference_paths,
         })
     }
 }
@@ -681,7 +686,7 @@ impl From<&Manifest> for pb::Manifest {
             }),
             config: m.config.clone(),
             blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
-            ref_base_paths: m.ref_base_paths.clone(),
+            reference_paths: m.reference_paths.clone(),
         }
     }
 }
@@ -802,7 +807,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            /*ref_main_location= */ Vec::new(),
         );
 
         let actual = manifest.fragments_by_offset_range(0..10);
@@ -870,7 +875,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            /*ref_main_location= */ Vec::new(),
         );
 
         assert_eq!(manifest.max_field_id(), 43);
@@ -894,7 +899,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            /*ref_main_location= */ Vec::new(),
         );
 
         let mut config = manifest.config.clone();

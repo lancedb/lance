@@ -438,7 +438,7 @@ impl PyDeletionFile {
         id: u64,
         file_type: &str,
         num_deleted_rows: usize,
-        path_base: Option<String>,
+        path_base_index: Option<u32>,
     ) -> PyResult<Self> {
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
@@ -455,7 +455,7 @@ impl PyDeletionFile {
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
-            path_base,
+            path_base_index,
         }))
     }
 
@@ -507,8 +507,8 @@ impl PyDeletionFile {
     }
 
     #[getter]
-    fn path_base(&self) -> &Option<String> {
-        &self.0.path_base
+    fn path_base_index(&self) -> &Option<u32> {
+        &self.0.path_base_index
     }
 
     #[pyo3(signature = (fragment_id, base_uri=None))]
@@ -681,7 +681,7 @@ impl FromPyObject<'_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
-            path_base: ob.getattr("path_base")?.extract()?,
+            path_base_index: ob.getattr("path_base")?.extract()?,
         }))
     }
 }
@@ -705,7 +705,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_major_version,
             self.0.file_minor_version,
             file_size_bytes,
-            self.0.path_base.clone(),
+            self.0.path_base_index.clone(),
         ))
     }
 }

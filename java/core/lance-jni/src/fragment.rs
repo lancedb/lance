@@ -16,7 +16,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
-use jni::objects::{JIntArray, JValueGen};
+use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -244,9 +244,23 @@ impl IntoJava for &DataFile {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
         };
-        let path_base = match &self.path_base {
-            Some(path_base_str) => env.new_string(path_base_str)?.into(),
-            None => JObject::null(),
+        let path_base_index = match self.path_base_index {
+            Some(base_index) => {
+                let base_index_obj = env.new_object(
+                    "java/lang/Integer", "(I)V", &[JValue::Int(base_index as jint)])?;
+
+                env.call_static_method(
+                    "java/util/Optional",
+                    "of",
+                    "(Ljava/lang/Object;)Ljava/util/Optional;",
+                    &[JValue::from(&base_index_obj)],
+                )?
+                .l()?
+            }
+            None => {
+                env.call_static_method(
+                    "java/util/Optional", "empty", "()Ljava/util/Optional;", &[])?.l()?
+            }
         };
         Ok(env.new_object(
             DATA_FILE_CLASS,
@@ -258,7 +272,7 @@ impl IntoJava for &DataFile {
                 JValueGen::Int(self.file_major_version as i32),
                 JValueGen::Int(self.file_minor_version as i32),
                 JValueGen::Object(&file_size_bytes),
-                JValueGen::Object(&path_base),
+                JValueGen::Object(&path_base_index),
             ],
         )?)
     }
@@ -289,9 +303,23 @@ impl IntoJava for &DeletionFile {
             None => JObject::null(),
         };
         let file_type = self.file_type.into_java(env)?;
-        let path_base = match &self.path_base {
-            Some(path_base_str) => env.new_string(path_base_str)?.into(),
-            None => JObject::null(),
+        let path_base_index = match self.path_base_index {
+            Some(base_index) => {
+                let base_index_obj = env.new_object(
+                    "java/lang/Integer", "(I)V", &[JValue::Int(base_index as jint)])?;
+
+                env.call_static_method(
+                    "java/util/Optional",
+                    "of",
+                    "(Ljava/lang/Object;)Ljava/util/Optional;",
+                    &[JValue::from(&base_index_obj)],
+                )?
+                    .l()?
+            }
+            None => {
+                env.call_static_method(
+                    "java/util/Optional", "empty", "()Ljava/util/Optional;", &[])?.l()?
+            }
         };
         Ok(env.new_object(
             DELETE_FILE_CLASS,
@@ -301,7 +329,7 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
-                JValueGen::Object(&path_base),
+                JValueGen::Object(&path_base_index),
             ],
         )?)
     }
@@ -434,7 +462,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             id,
             num_deleted_rows,
             file_type,
-            path_base,
+            path_base_index,
         })
     }
 }
@@ -478,7 +506,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             .extract_object(env)?;
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
-        let path_base = get_path_base(env, self)?;
+        let path_base_index = get_path_base(env, self)?;
         Ok(DataFile {
             path,
             fields,
@@ -486,23 +514,21 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
-            path_base,
+            path_base_index,
         })
     }
 }
 
-fn get_path_base(env: &mut JNIEnv, obj: &JObject) -> Result<Option<String>> {
-    let path_base = env
-        .call_method(obj, "getPathBase", "()Ljava/lang/String;", &[])?
+fn get_path_base(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
+    let path_base_index = env
+        .call_method(obj, "getPathBaseIndex", "()Ljava/util/Optional;", &[])?
         .l()?;
 
-    let path_base = if path_base.is_null() {
-        None
-    } else {
-        Some(
-            env.get_string(&unsafe { JString::from_raw(path_base.into_raw()) })?
-                .into(),
-        )
-    };
-    Ok(path_base)
+    if env.call_method(&path_base_index, "isEmpty", "()Z", &[])?.z()? {
+        return Ok(None);
+    }
+    let inner_value = env.call_method(&path_base_index, "get", "()Ljava/lang/Object;", &[])?
+        .l()?;
+    let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
+    Ok(Some(int_value as u32))
 }

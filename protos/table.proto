@@ -153,7 +153,7 @@ message Manifest {
   // If this value is 0 then there are no blob fields.
   uint64 blob_dataset_version = 17;
 
-  map<string, string> ref_base_paths = 18;
+  repeated string reference_paths = 18;
 } // Manifest
 
 // Auxiliary Data attached to a version.
@@ -322,7 +322,7 @@ message DataFile {
   // When this is zero, it should be interpreted as "unknown".
   uint64 file_size_bytes = 6;
   // The base path of the data file. Used when the file is imported or referred from another dataset
-  optional string path_base = 7;
+  optional uint32 path_base_index = 7;
 } // DataFile
 
 // Deletion File
@@ -353,7 +353,7 @@ message DeletionFile {
   // The number of rows that are marked as deleted.
   uint64 num_deleted_rows = 4;
   // The base path of the deletion file. Used when the file is imported or referred from another dataset
-  optional string path_base = 5;
+  optional uint32 path_base_index = 5;
 } // DeletionFile
 
 message ExternalFile {
