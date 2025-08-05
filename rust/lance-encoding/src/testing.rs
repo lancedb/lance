@@ -553,9 +553,8 @@ fn verify_page_encoding(
                 }
             }
         }
-        PageEncoding::Legacy(encoding) => {
-            let chain = extract_array_encoding_chain(encoding);
-            actual_chain.extend(chain);
+        PageEncoding::Legacy(_) => {
+            // We don't need to care about legacy.
         }
     }
 
@@ -740,8 +739,7 @@ async fn check_round_trip_encoding_inner(
     let mut column_infos = Vec::new();
     for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
         // Keep track of pages for encoding verification
-        let pages = encoded_column.final_pages;
-        for page in pages {
+        for page in encoded_column.final_pages {
             writer.write_page(page);
         }
 
