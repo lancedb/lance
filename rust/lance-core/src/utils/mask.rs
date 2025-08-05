@@ -1142,9 +1142,9 @@ mod tests {
         allow_list.extend([1, 5, 10].iter().copied());
         mask.allow_list = Some(allow_list);
 
-        let ids: Vec<_> = mask.iter_addrs().unwrap().collect();
+        let addrs: Vec<_> = mask.iter_addrs().unwrap().collect();
         assert_eq!(
-            ids,
+            addrs,
             vec![
                 RowAddress::new_from_parts(0, 1),
                 RowAddress::new_from_parts(0, 5),
@@ -1157,9 +1157,9 @@ mod tests {
         block_list.extend([5].iter().copied());
         mask.block_list = Some(block_list);
 
-        let ids: Vec<_> = mask.iter_addrs().unwrap().collect();
+        let addrs: Vec<_> = mask.iter_addrs().unwrap().collect();
         assert_eq!(
-            ids,
+            addrs,
             vec![
                 RowAddress::new_from_parts(0, 1),
                 RowAddress::new_from_parts(0, 10)
