@@ -13,7 +13,8 @@ use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{Future, Stream, StreamExt, TryStreamExt};
+use futures::future::BoxFuture;
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
@@ -24,6 +25,18 @@ use snafu::location;
 
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
+
+pub type TakeFunction = Box<
+    dyn Fn(FileFragment, Vec<u32>, Arc<Schema>, bool) -> BoxFuture<'static, Result<RecordBatch>>
+        + Send
+        + Sync,
+>;
+
+pub type TakeRangeFunction = Box<
+    dyn Fn(FileFragment, Range<usize>, Arc<Schema>) -> BoxFuture<'static, Result<RecordBatch>>
+        + Send
+        + Sync,
+>;
 
 /// Convert a list of row offsets to a list of row addresses
 ///
@@ -126,9 +139,11 @@ pub async fn take(
 }
 
 /// Take rows by the internal ROW ids.
-async fn do_take_rows(
+pub async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
+    do_take: TakeFunction,
+    do_take_range: TakeRangeFunction,
 ) -> Result<RecordBatch> {
     let row_addrs = builder.get_row_addrs().await?.clone();
 
@@ -140,23 +155,6 @@ async fn do_take_rows(
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);
-
-    // This method is mostly to annotate the send bound to avoid the
-    // higher-order lifetime error.
-    // manually implemented async for Send bound
-    #[allow(clippy::manual_async_fn)]
-    fn do_take(
-        fragment: FileFragment,
-        row_offsets: Vec<u32>,
-        projection: Arc<Schema>,
-        with_row_addresses: bool,
-    ) -> impl Future<Output = Result<RecordBatch>> + Send {
-        async move {
-            fragment
-                .take_rows(&row_offsets, projection.as_ref(), with_row_addresses)
-                .await
-        }
-    }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
 
@@ -175,10 +173,7 @@ async fn do_take_rows(
             )
         })?;
 
-        let reader = fragment
-            .open(&physical_schema, FragReadConfig::default())
-            .await?;
-        reader.legacy_read_range_as_batch(range).await
+        do_take_range(fragment, range, physical_schema).await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate
 
@@ -343,7 +338,27 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
 
     let projection = builder.projection.clone();
 
-    do_take_rows(builder, projection).await
+    let do_take: TakeFunction =
+        Box::new(|fragment, row_offsets, projection, with_row_addresses| {
+            async move {
+                fragment
+                    .take_rows(&row_offsets, projection.as_ref(), with_row_addresses)
+                    .await
+            }
+            .boxed()
+        });
+
+    let do_take_range: TakeRangeFunction = Box::new(|fragment, range, projection| {
+        async move {
+            let reader = fragment
+                .open(&projection, FragReadConfig::default())
+                .await?;
+            reader.legacy_read_range_as_batch(range).await
+        }
+        .boxed()
+    });
+
+    do_take_rows(builder, projection, do_take, do_take_range).await
 }
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -421,12 +436,12 @@ impl TakeBuilder {
     pub fn try_new_from_ids(
         dataset: Arc<Dataset>,
         row_ids: Vec<u64>,
-        projection: ProjectionRequest,
+        projection: Arc<ProjectionPlan>,
     ) -> Result<Self> {
         Ok(Self {
             row_ids: Some(row_ids),
             row_addrs: None,
-            projection: Arc::new(projection.into_projection_plan(dataset.clone())?),
+            projection,
             dataset,
             with_row_address: false,
         })

@@ -57,6 +57,7 @@ use tracing::{info, instrument};
 mod blob;
 pub mod builder;
 pub mod cleanup;
+mod dataset_reader;
 mod delta;
 pub mod fragment;
 mod hash_joiner;
@@ -82,6 +83,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::dataset_reader::DatasetReader;
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -1055,6 +1057,16 @@ impl Dataset {
         Ok(cnts.iter().sum())
     }
 
+    /// Open a [`DatasetReader`], which manages a short-lived reader of [`Dataset`].
+    ///
+    /// This API works well for users making repeated requests over the same projection.
+    pub async fn open_reader(
+        &self,
+        projection: impl Into<ProjectionRequest>,
+    ) -> Result<DatasetReader> {
+        DatasetReader::new(self, projection).await
+    }
+
     /// Take rows by indices.
     #[instrument(skip_all, fields(num_rows=row_indices.len()))]
     pub async fn take(
@@ -1115,7 +1127,8 @@ impl Dataset {
         row_ids: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<TakeBuilder> {
-        TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
+        let projection = Arc::new(projection.into().into_projection_plan(self.clone())?);
+        TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection)
     }
 
     /// Take [BlobFile] by row ids (row address).
