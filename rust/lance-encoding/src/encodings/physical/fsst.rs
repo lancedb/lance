@@ -379,30 +379,26 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(32), false))
-            .into_batch_rows(RowCount::from(1_000_000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_encoding_of_data(
-            vec![arr],
-            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
-            HashMap::new(),
-        )
-        .await;
+        let test_cases = TestCases::default()
+            .with_expected_encoding("fsst")
+            .with_file_version(LanceFileVersion::V2_1);
 
+        // Generate data suitable for FSST (large strings, total size > 32KB)
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(64), false))
-            .into_batch_rows(RowCount::from(1_000_000))
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(100), false))
+            .into_batch_rows(RowCount::from(5000))
             .unwrap()
             .column(0)
             .clone();
-        check_round_trip_encoding_of_data(
-            vec![arr],
-            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
-            HashMap::new(),
-        )
-        .await;
+
+        // Test both explicit metadata and automatic selection
+        // 1. Test with explicit FSST metadata
+        let metadata_explicit =
+            HashMap::from([("lance-encoding:compression".to_string(), "fsst".to_string())]);
+        check_round_trip_encoding_of_data(vec![arr.clone()], &test_cases, metadata_explicit).await;
+
+        // 2. Test automatic FSST selection based on data characteristics
+        // FSST should be chosen automatically: max_len >= 5 and total_size >= 32KB
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
 }

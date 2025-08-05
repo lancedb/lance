@@ -1091,4 +1091,28 @@ pub(crate) mod tests {
 
         assert_eq!(decompressed.as_ref(), sample_array.as_ref());
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_value_encoding_verification() {
+        use std::collections::HashMap;
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("flat")
+            .with_file_version(LanceFileVersion::V2_1);
+
+        // Test both explicit configuration and automatic fallback scenarios
+        // 1. Test explicit "none" compression to force flat encoding
+        let metadata_explicit =
+            HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
+        let arr_explicit =
+            Arc::new(Int32Array::from((0..1000).collect::<Vec<i32>>())) as Arc<dyn Array>;
+        check_round_trip_encoding_of_data(vec![arr_explicit], &test_cases, metadata_explicit).await;
+
+        // 2. Test automatic fallback to flat encoding when bitpacking conditions aren't met
+        // Use unique values to avoid RLE encoding
+        let arr_fallback = Arc::new(Int32Array::from(
+            (0..100).map(|i| i * 73 + 19).collect::<Vec<i32>>(),
+        )) as Arc<dyn Array>;
+        check_round_trip_encoding_of_data(vec![arr_fallback], &test_cases, HashMap::new()).await;
+    }
 }
