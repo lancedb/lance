@@ -464,12 +464,6 @@ impl TakeBuilder {
                     .collect::<Vec<_>>();
                 addresses
             } else {
-                if self.dataset.manifest().uses_move_stable_row_ids() {
-                    return Err(Error::NotSupported {
-                        source: "Cannot convert row IDs to row addresses without a row ID index when move-stable row IDs are enabled".into(),
-                        location: location!(),
-                    });
-                }
                 row_ids.clone()
             };
             self.row_addrs = Some(addrs);
