@@ -503,7 +503,10 @@ fn get_path_base_index(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
     Ok(Some(int_value as u32))
 }
 
-fn convert_to_java_integer<'local>(env: &mut JNIEnv<'local>, value: Option<u32>) -> Result<JObject<'local>> {
+fn convert_to_java_integer<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<u32>,
+) -> Result<JObject<'local>> {
     match value {
         Some(base_index) => Ok(env.new_object(
             "java/lang/Integer",
