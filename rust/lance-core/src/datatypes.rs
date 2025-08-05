@@ -24,14 +24,9 @@ pub use field::{
 };
 pub use schema::{OnMissing, Projectable, Projection, Schema};
 
-pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
-pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
+// NOTE: BLOB_META_KEY is used in lance-core's field.rs, so it must stay here
+// to avoid circular dependency with lance-encoding
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
-pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
-pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
-pub const STRUCTURAL_ENCODING_META_KEY: &str = "lance-encoding:structural-encoding";
-pub const STRUCTURAL_ENCODING_MINIBLOCK: &str = "miniblock";
-pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![

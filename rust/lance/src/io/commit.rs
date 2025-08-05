@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
-use lance_core::cache::LanceCache;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_file::version::LanceFileVersion;
@@ -44,7 +43,7 @@ use snafu::location;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_index::DatasetIndexExt;
+use lance_index::{is_system_index, DatasetIndexExt};
 use log;
 use object_store::path::Path;
 use prost::Message;
@@ -58,6 +57,8 @@ use crate::dataset::{
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
+use crate::session::caches::DSMetadataCache;
+use crate::session::index_caches::IndexMetadataKey;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -79,28 +80,6 @@ pub(crate) async fn read_transaction_file(
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
     transaction.try_into()
-}
-
-pub(crate) fn transaction_file_cache_key(version: u64) -> String {
-    format!("txn/{version}")
-}
-
-pub(crate) fn manifest_cache_key(location: &ManifestLocation) -> String {
-    if let Some(e_tag) = &location.e_tag {
-        format!("manifest/{}/{}", location.version, e_tag)
-    } else {
-        format!("manifest/{}", location.version)
-    }
-}
-
-pub(crate) fn deletion_file_cache_key(fragment_id: u64, deletion_file: &DeletionFile) -> String {
-    format!(
-        "deletion/{}/{}/{}/{}",
-        fragment_id,
-        deletion_file.read_version,
-        deletion_file.id,
-        deletion_file.file_type.suffix()
-    )
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -128,7 +107,7 @@ async fn do_commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
-    metadata_cache: &LanceCache,
+    metadata_cache: &DSMetadataCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -156,14 +135,20 @@ async fn do_commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            metadata_cache.insert(
-                &transaction_file_cache_key(manifest.version),
-                Arc::new(transaction.clone()),
-            );
-            metadata_cache.insert(
-                &manifest_cache_key(&manifest_location),
-                Arc::new(manifest.clone()),
-            );
+            let tx_key = crate::session::caches::TransactionKey {
+                version: manifest.version,
+            };
+            metadata_cache
+                .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                .await;
+
+            let manifest_key = crate::session::caches::ManifestKey {
+                version: manifest_location.version,
+                e_tag: manifest_location.e_tag.as_deref(),
+            };
+            metadata_cache
+                .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+                .await;
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
@@ -181,7 +166,7 @@ pub(crate) async fn commit_new_dataset(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-    metadata_cache: &LanceCache,
+    metadata_cache: &crate::session::caches::DSMetadataCache,
 ) -> Result<(Manifest, ManifestLocation)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
@@ -501,6 +486,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
     for index in indices {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
+                && !is_system_index(index)
         {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
@@ -850,27 +836,42 @@ pub(crate) async fn commit_transaction(
         match result {
             Ok(manifest_location) => {
                 // Cache both the transaction file and manifest
-                let cache_key = transaction_file_cache_key(target_version);
+                let tx_key = crate::session::caches::TransactionKey {
+                    version: target_version,
+                };
                 dataset
                     .metadata_cache
-                    .insert(&cache_key, Arc::new(transaction.clone()));
-                dataset.metadata_cache.insert(
-                    &manifest_cache_key(&manifest_location),
-                    Arc::new(manifest.clone()),
-                );
+                    .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                    .await;
+
+                let manifest_key = crate::session::caches::ManifestKey {
+                    version: manifest_location.version,
+                    e_tag: manifest_location.e_tag.as_deref(),
+                };
+                dataset
+                    .metadata_cache
+                    .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+                    .await;
                 if !indices.is_empty() {
-                    dataset.session().index_cache.insert_metadata(
-                        dataset.base.as_ref(),
-                        target_version,
-                        Arc::new(indices),
-                    );
+                    let key = IndexMetadataKey {
+                        version: target_version,
+                    };
+                    dataset
+                        .index_cache
+                        .insert_with_key(&key, Arc::new(indices))
+                        .await;
                 }
 
-                match auto_cleanup_hook(&dataset, &manifest).await {
-                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
-                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
-                    _ => {}
-                };
+                if !commit_config.skip_auto_cleanup {
+                    // Note: We're using the old dataset here (before the new manifest is committed).
+                    // This means cleanup runs based on the previous version's state, which may affect
+                    // which versions are available for cleanup.
+                    match auto_cleanup_hook(&dataset, &manifest).await {
+                        Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+                        Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                        _ => {}
+                    };
+                }
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {

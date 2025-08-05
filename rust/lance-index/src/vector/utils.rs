@@ -5,16 +5,106 @@ use arrow::{
     array::AsArray,
     datatypes::{Float16Type, Float32Type, Float64Type},
 };
-use arrow_array::{Array, BooleanArray, FixedSizeListArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
+use lance_linalg::distance::DistanceType;
 use prost::bytes;
 use snafu::location;
+use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
+use crate::vector::flat::storage::FlatFloatStorage;
+use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
+use crate::vector::hnsw::HNSW;
+use crate::vector::v3::subindex::IvfSubIndex;
+
+enum SimpleIndexStatus {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(|| {
+    if let Ok(v) = std::env::var("LANCE_USE_HNSW_SPEEDUP_INDEXING") {
+        if v == "enabled" {
+            SimpleIndexStatus::Enabled
+        } else if v == "disabled" {
+            SimpleIndexStatus::Disabled
+        } else {
+            SimpleIndexStatus::Auto
+        }
+    } else {
+        SimpleIndexStatus::Auto
+    }
+});
+
+#[derive(Debug)]
+pub struct SimpleIndex {
+    store: FlatFloatStorage,
+    index: HNSW,
+}
+
+impl SimpleIndex {
+    pub fn try_new(store: FlatFloatStorage) -> Result<Self> {
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().ef_construction(15).num_edges(12),
+        )?;
+        Ok(Self { store, index: hnsw })
+    }
+
+    // train HNSW over the centroids to speed up finding the nearest clusters,
+    // only train if all conditions are met:
+    //  - the centroids are float32s or uint8s
+    //  - `num_centroids * dimension >= 1_000_000`
+    //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
+    //      so set the threshold to 1_000_000.
+    pub fn may_train_index(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> Result<Option<Self>> {
+        match *USE_HNSW_SPEEDUP_INDEXING {
+            SimpleIndexStatus::Auto => {
+                if centroids.len() < 1_000_000 {
+                    return Ok(None);
+                }
+            }
+            SimpleIndexStatus::Disabled => return Ok(None),
+            _ => {}
+        }
+
+        match centroids.data_type() {
+            DataType::Float32 => {
+                let fsl =
+                    FixedSizeListArray::try_new_from_values(centroids.clone(), dimension as i32)?;
+                let store = FlatFloatStorage::new(fsl, distance_type);
+                Self::try_new(store).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
+        let res = self.index.search_basic(
+            query,
+            1,
+            &HnswQueryParams {
+                ef: 15,
+                lower_bound: None,
+                upper_bound: None,
+            },
+            None,
+            &self.store,
+        )?;
+        Ok((res[0].id, res[0].dist.0))
+    }
+}
 
 #[inline]
 #[allow(dead_code)]

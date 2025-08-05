@@ -74,6 +74,9 @@ from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
+from .trace import TraceEvent as TraceEvent
+from .trace import capture_trace_events as capture_trace_events
+from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
 def infer_tfrecord_schema(
@@ -96,6 +99,7 @@ class LanceFileWriter:
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
         keep_original_array: Optional[bool],
+        max_page_bytes: Optional[int],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
     def finish(self) -> int: ...
@@ -176,6 +180,8 @@ class _Dataset:
         commit_handler: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         manifest: Optional[bytes] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
     @property
@@ -325,6 +331,10 @@ class _Dataset:
         batch_size: Optional[int] = None,
     ): ...
     def add_columns_with_schema(self, schema: pa.Schema): ...
+    def read_transaction(self, version: int) -> Optional[Transaction]: ...
+    def get_transactions(
+        self, recent_transactions=10
+    ) -> Optional[List[Transaction]]: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...

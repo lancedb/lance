@@ -94,8 +94,14 @@ type InnerIterator = std::iter::Zip<std::vec::IntoIter<u32>, std::vec::IntoIter<
 
 impl CompressedPostingListIterator {
     pub fn new(length: usize, blocks: LargeBinaryArray, positions: Option<ListArray>) -> Self {
-        debug_assert!(length > 0);
-        debug_assert_eq!(blocks.len(), length.div_ceil(BLOCK_SIZE));
+        debug_assert!(length > 0, "length: {}", length);
+        debug_assert_eq!(
+            length.div_ceil(BLOCK_SIZE),
+            blocks.len(),
+            "length: {}, num_blocks: {}",
+            length,
+            blocks.len(),
+        );
 
         Self {
             remainder: length % BLOCK_SIZE,

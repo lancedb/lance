@@ -14,6 +14,8 @@ rust-version.workspace = true
 [dependencies]
 
 object_store = { workspace = true }
+opendal = { workspace = true, optional = true }
+object_store_opendal = { workspace = true, optional = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
@@ -64,8 +66,9 @@ harness = false
 default = ["aws", "azure", "gcp"]
 gcs-test = []
 gcp = ["object_store/gcp"]
-aws = ["object_store/aws", "aws-config", "aws-credential-types"]
+aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types"]
 azure = ["object_store/azure"]
+oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 
 [lints]
 workspace = true

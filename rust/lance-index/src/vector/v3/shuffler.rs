@@ -11,7 +11,7 @@ use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::Schema;
 use future::try_join_all;
 use futures::prelude::*;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::{
     cache::LanceCache,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
@@ -112,11 +112,26 @@ impl Shuffler for IvfShuffler {
             return Ok(Box::new(SinglePartitionReader::new(data)));
         }
 
-        let mut writers: Vec<FileWriter> = vec![];
-        let mut partition_sizes = vec![0; self.num_partitions];
-        let mut first_pass = true;
-
         let num_partitions = self.num_partitions;
+        let mut partition_sizes = vec![0; num_partitions];
+        let schema = data.schema().without_column(PART_ID_COLUMN);
+        let mut writers = stream::iter(0..num_partitions)
+            .map(|partition_id| {
+                let part_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
+                let object_store = self.object_store.clone();
+                let schema = schema.clone();
+                async move {
+                    let writer = object_store.create(&part_path).await?;
+                    FileWriter::try_new(
+                        writer,
+                        lance_core::datatypes::Schema::try_from(&schema)?,
+                        Default::default(),
+                    )
+                }
+            })
+            .buffered(self.object_store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
         let mut parallel_sort_stream = data
             .map(|batch| {
                 spawn_cpu(move || {
@@ -136,8 +151,7 @@ impl Shuffler for IvfShuffler {
                     let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
                     let batch = batch.drop_column(PART_ID_COLUMN)?;
 
-                    let mut partition_buffers =
-                        (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>();
+                    let mut partition_buffers = vec![Vec::new(); num_partitions];
 
                     let mut start = 0;
                     while start < batch.num_rows() {
@@ -159,9 +173,7 @@ impl Shuffler for IvfShuffler {
 
         // part_id:           |       0        |       1        |       3        |
         // partition_buffers: |[batch,batch,..]|[batch,batch,..]|[batch,batch,..]|
-        let mut partition_buffers = (0..self.num_partitions)
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
+        let mut partition_buffers = vec![Vec::new(); num_partitions];
 
         let mut counter = 0;
         let mut total_loss = 0.0;
@@ -175,35 +187,6 @@ impl Shuffler for IvfShuffler {
             }
 
             counter += 1;
-
-            if first_pass {
-                let schema = partition_buffers
-                    .iter()
-                    .flatten()
-                    .find(|_| true)
-                    .map(|batch| batch.schema())
-                    .expect("there should be at least one batch");
-                writers = stream::iter(0..self.num_partitions)
-                    .map(|partition_id| {
-                        let part_path =
-                            self.output_dir.child(format!("ivf_{}.lance", partition_id));
-                        let object_store = self.object_store.clone();
-                        let schema = schema.clone();
-                        async move {
-                            let writer = object_store.create(&part_path).await?;
-                            FileWriter::try_new(
-                                writer,
-                                lance_core::datatypes::Schema::try_from(schema.as_ref())?,
-                                Default::default(),
-                            )
-                        }
-                    })
-                    .buffered(self.object_store.io_parallelism())
-                    .try_collect::<Vec<_>>()
-                    .await?;
-
-                first_pass = false;
-            }
 
             // do flush
             if counter % self.buffer_size == 0 {

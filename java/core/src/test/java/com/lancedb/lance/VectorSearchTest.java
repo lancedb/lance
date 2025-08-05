@@ -13,9 +13,6 @@
  */
 package com.lancedb.lance;
 
-import org.junit.jupiter.api.io.TempDir;
-
-import java.nio.file.Path;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -30,7 +27,6 @@ import static org.junit.jupiter.api.Assertions.*;
 //
 // An IVF-PQ index with 2 partitions is trained on this data
 public class VectorSearchTest {
-  @TempDir Path tempDir;
 
   // TODO: fix in https://github.com/lancedb/lance/issues/2956
 

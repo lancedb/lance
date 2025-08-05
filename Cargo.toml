@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "java/core/lance-jni",
     "rust/examples",
     "rust/lance",
     "rust/lance-arrow",
@@ -16,12 +15,12 @@ members = [
     "rust/lance-testing",
     "rust/lance-encoding/src/compression_algo/fsst",
 ]
-exclude = ["python"]
+exclude = ["python", "java/core/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
 [workspace.package]
-version = "0.31.1"
+version = "0.32.1"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -44,20 +43,19 @@ categories = [
 rust-version = "1.82.0"
 
 [workspace.dependencies]
-lance = { version = "=0.31.1", path = "./rust/lance" }
-lance-arrow = { version = "=0.31.1", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.31.1", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.31.1", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.31.1", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.31.1", path = "./rust/lance-encoding" }
-lance-file = { version = "=0.31.1", path = "./rust/lance-file" }
-lance-index = { version = "=0.31.1", path = "./rust/lance-index" }
-lance-io = { version = "=0.31.1", path = "./rust/lance-io" }
-lance-jni = { version = "=0.31.1", path = "./java/core/lance-jni" }
-lance-linalg = { version = "=0.31.1", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.31.1", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.31.1", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.31.1", path = "./rust/lance-testing" }
+lance = { version = "=0.32.1", path = "./rust/lance" }
+lance-arrow = { version = "=0.32.1", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.32.1", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.32.1", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.32.1", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.32.1", path = "./rust/lance-encoding" }
+lance-file = { version = "=0.32.1", path = "./rust/lance-file" }
+lance-index = { version = "=0.32.1", path = "./rust/lance-index" }
+lance-io = { version = "=0.32.1", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=0.32.1", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.32.1", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.32.1", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.32.1", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "55.1", optional = false, features = ["prettyprint"] }
@@ -118,7 +116,7 @@ deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=0.31.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
+fsst = { version = "=0.32.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
@@ -131,6 +129,8 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 object_store = { version = "0.12.2" }
+opendal = { version = "0.54" }
+object_store_opendal = { version = "0.54" }
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
@@ -148,9 +148,9 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.8"
-tantivy = { version = "0.22.0", features = ["stopwords"] }
-lindera = { version = "0.40.2" }
-lindera-tantivy = { version = "0.40.2" }
+tantivy = { version = "0.24.1", features = ["stopwords"] }
+lindera = { version = "0.44.0" }
+lindera-tantivy = { version = "0.44.0" }
 tempfile = "3"
 test-log = { version = "0.2.15" }
 tokio = { version = "1.23", features = [
@@ -194,3 +194,4 @@ print_stderr = "deny"
 multiple-crate-versions = "allow"
 # We use Vec<Range<u64>> in a lot of places and it is very common to use a single range in the vec.
 single_range_in_vec_init = "allow"
+large_futures = "deny"

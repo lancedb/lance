@@ -45,7 +45,6 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScannerTest {
-  @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
   @BeforeAll
@@ -60,7 +59,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScanner() throws IOException {
+  void testDatasetScanner(@TempDir Path tempDir) throws IOException {
     String datasetPath = tempDir.resolve("dataset_scanner").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -76,7 +75,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerFilter() throws Exception {
+  void testDatasetScannerFilter(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_filter").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -93,7 +92,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerColumns() throws Exception {
+  void testDatasetScannerColumns(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_columns").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -130,7 +129,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerSchema() throws Exception {
+  void testDatasetScannerSchema(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_schema").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -153,7 +152,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerCountRows() throws Exception {
+  void testDatasetScannerCountRows(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_count").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -175,7 +174,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testFragmentScanner() throws Exception {
+  void testFragmentScanner(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -193,7 +192,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testFragmentScannerFilter() throws Exception {
+  void testFragmentScannerFilter(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner_filter").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -211,7 +210,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testFragmentScannerColumns() throws Exception {
+  void testFragmentScannerColumns(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner_columns").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -249,7 +248,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testScanFragment() throws Exception {
+  void testScanFragment(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner_single_fragment").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -271,7 +270,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testScanFragments() throws Exception {
+  void testScanFragments(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("fragments_scanner").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -312,7 +311,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerLimit() throws Exception {
+  void testDatasetScannerLimit(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_limit").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -329,7 +328,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerOffset() throws Exception {
+  void testDatasetScannerOffset(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_offset").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -347,7 +346,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerWithRowId() throws Exception {
+  void testDatasetScannerWithRowId(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_with_row_id").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -373,7 +372,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerBatchReadahead() throws Exception {
+  void testDatasetScannerBatchReadahead(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_batch_readahead").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -405,7 +404,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerSortBy() throws Exception {
+  void testDatasetScannerSortBy(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testDatasetScannerSortBy").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
@@ -478,7 +477,7 @@ public class ScannerTest {
   }
 
   @Test
-  void testDatasetScannerCombinedParams() throws Exception {
+  void testDatasetScannerCombinedParams(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_combined_params").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
-use crate::io::{commit::deletion_file_cache_key, deletion::read_dataset_deletion_file};
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     dataset::transaction::{Operation, Transaction},
     Dataset,
@@ -13,6 +13,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::mem_wal::MemWal;
 use lance_table::format::Index;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
@@ -48,7 +49,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
-            | Operation::Restore { .. } => Ok(Self {
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => Ok(Self {
                 transaction,
                 affected_rows,
                 initial_fragments: HashMap::new(),
@@ -183,9 +185,8 @@ impl<'a> TransactionRebase<'a> {
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
         let op = &self.transaction.operation;
         match op {
-            Operation::Delete { .. } | Operation::Update { .. } => {
-                self.check_delete_update_txn(other_transaction, other_version)
-            }
+            Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
+            Operation::Update { .. } => self.check_update_txn(other_transaction, other_version),
             Operation::CreateIndex { .. } => {
                 self.check_create_index_txn(other_transaction, other_version)
             }
@@ -198,7 +199,7 @@ impl<'a> TransactionRebase<'a> {
                 self.check_data_replacement_txn(other_transaction, other_version)
             }
             Operation::Merge { .. } => self.check_merge_txn(other_transaction, other_version),
-            Operation::Restore { .. } => self.check_restore_txn(other_transaction),
+            Operation::Restore { .. } => self.check_restore_txn(other_transaction, other_version),
             Operation::ReserveFragments { .. } => {
                 self.check_reserve_fragments_txn(other_transaction, other_version)
             }
@@ -206,106 +207,255 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateConfig { .. } => {
                 self.check_update_config_txn(other_transaction, other_version)
             }
+            Operation::UpdateMemWalState { .. } => {
+                self.check_update_mem_wal_state_txn(other_transaction, other_version)
+            }
         }
     }
 
-    fn check_delete_update_txn(
+    fn check_delete_txn(
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        match &other_transaction.operation {
-            Operation::CreateIndex { .. }
-            | Operation::ReserveFragments { .. }
-            | Operation::Project { .. }
-            | Operation::Append { .. }
-            | Operation::UpdateConfig { .. } => Ok(()),
-            Operation::Rewrite { groups, .. } => {
-                if groups
-                    .iter()
-                    .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
-                    .any(|id| self.modified_fragment_ids.contains(&id))
-                {
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
-                } else {
-                    Ok(())
-                }
-            }
-            Operation::DataReplacement { replacements, .. } => {
-                if replacements
-                    .iter()
-                    .map(|r| r.0)
-                    .any(|id| self.modified_fragment_ids.contains(&id))
-                {
-                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
-                } else {
-                    Ok(())
-                }
-            }
-            Operation::Update {
-                updated_fragments,
-                removed_fragment_ids,
-                ..
-            }
-            | Operation::Delete {
-                updated_fragments,
-                deleted_fragment_ids: removed_fragment_ids,
-                ..
-            } => {
-                if !updated_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(removed_fragment_ids.iter().copied())
-                    .any(|id| self.modified_fragment_ids.contains(&id))
-                {
-                    return Ok(());
-                }
-
-                if self.affected_rows.is_none() {
-                    // We don't have any affected rows, so we can't
-                    // do the rebase anyways.
-                    return Err(self.retryable_conflict_err(
-                        other_transaction,
-                        other_version,
-                        location!(),
-                    ));
-                }
-                for updated in updated_fragments {
-                    if let Some((fragment, needs_rewrite)) =
-                        self.initial_fragments.get_mut(&updated.id)
+        if let Operation::Delete { .. } = &self.transaction.operation {
+            match &other_transaction.operation {
+                Operation::CreateIndex { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::Append { .. }
+                | Operation::UpdateConfig { .. } => Ok(()),
+                Operation::Rewrite { groups, .. } => {
+                    if groups
+                        .iter()
+                        .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
+                        .any(|id| self.modified_fragment_ids.contains(&id))
                     {
-                        // If data files, not just deletion files, are modified,
-                        // then we can't rebase.
-                        if fragment.files != updated.files {
-                            return Err(self.retryable_conflict_err(
-                                other_transaction,
-                                other_version,
-                                location!(),
-                            ));
-                        }
-
-                        // Mark any modified fragments as needing a rewrite.
-                        *needs_rewrite |= updated.deletion_file != fragment.deletion_file;
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else {
+                        Ok(())
                     }
                 }
+                Operation::DataReplacement { replacements, .. } => {
+                    if replacements
+                        .iter()
+                        .map(|r| r.0)
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::Update {
+                    updated_fragments,
+                    removed_fragment_ids,
+                    ..
+                }
+                | Operation::Delete {
+                    updated_fragments,
+                    deleted_fragment_ids: removed_fragment_ids,
+                    ..
+                } => {
+                    if !updated_fragments
+                        .iter()
+                        .map(|f| f.id)
+                        .chain(removed_fragment_ids.iter().copied())
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        return Ok(());
+                    }
 
-                for removed_fragment_id in removed_fragment_ids {
-                    if self.initial_fragments.contains_key(removed_fragment_id) {
+                    if self.affected_rows.is_none() {
+                        // We don't have any affected rows, so we can't
+                        // do the rebase anyways.
                         return Err(self.retryable_conflict_err(
                             other_transaction,
                             other_version,
                             location!(),
                         ));
                     }
+                    for updated in updated_fragments {
+                        if let Some((fragment, needs_rewrite)) =
+                            self.initial_fragments.get_mut(&updated.id)
+                        {
+                            // If data files, not just deletion files, are modified,
+                            // then we can't rebase.
+                            if fragment.files != updated.files {
+                                return Err(self.retryable_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+
+                            // Mark any modified fragments as needing a rewrite.
+                            *needs_rewrite |= updated.deletion_file != fragment.deletion_file;
+                        }
+                    }
+
+                    for removed_fragment_id in removed_fragment_ids {
+                        if self.initial_fragments.contains_key(removed_fragment_id) {
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ));
+                        }
+                    }
+                    Ok(())
                 }
-                Ok(())
+                Operation::Merge { .. } => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                }
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
+                    other_transaction,
+                    other_version,
+                    location!(),
+                )),
             }
-            Operation::Merge { .. } => {
-                Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+        } else {
+            Err(wrong_operation_err(&self.transaction.operation))
+        }
+    }
+
+    fn check_update_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        if let Operation::Update {
+            mem_wal_to_flush, ..
+        } = &self.transaction.operation
+        {
+            match &other_transaction.operation {
+                Operation::CreateIndex { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::Append { .. }
+                | Operation::UpdateConfig { .. } => Ok(()),
+                Operation::Rewrite { groups, .. } => {
+                    if groups
+                        .iter()
+                        .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::DataReplacement { replacements, .. } => {
+                    if replacements
+                        .iter()
+                        .map(|r| r.0)
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::Update {
+                    updated_fragments,
+                    removed_fragment_ids,
+                    ..
+                }
+                | Operation::Delete {
+                    updated_fragments,
+                    deleted_fragment_ids: removed_fragment_ids,
+                    ..
+                } => {
+                    if !updated_fragments
+                        .iter()
+                        .map(|f| f.id)
+                        .chain(removed_fragment_ids.iter().copied())
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        return Ok(());
+                    }
+
+                    if self.affected_rows.is_none() {
+                        // We don't have any affected rows, so we can't
+                        // do the rebase anyways.
+                        return Err(self.retryable_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ));
+                    }
+                    for updated in updated_fragments {
+                        if let Some((fragment, needs_rewrite)) =
+                            self.initial_fragments.get_mut(&updated.id)
+                        {
+                            // If data files, not just deletion files, are modified,
+                            // then we can't rebase.
+                            if fragment.files != updated.files {
+                                return Err(self.retryable_conflict_err(
+                                    other_transaction,
+                                    other_version,
+                                    location!(),
+                                ));
+                            }
+
+                            // Mark any modified fragments as needing a rewrite.
+                            *needs_rewrite |= updated.deletion_file != fragment.deletion_file;
+                        }
+                    }
+
+                    for removed_fragment_id in removed_fragment_ids {
+                        if self.initial_fragments.contains_key(removed_fragment_id) {
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ));
+                        }
+                    }
+                    Ok(())
+                }
+                Operation::Merge { .. } => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+                }
+                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
+                    self.incompatible_conflict_err(other_transaction, other_version, location!())
+                ),
+                Operation::UpdateMemWalState { added, updated, .. } => {
+                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
+                        added,
+                        mem_wal_to_flush.as_slice(),
+                        other_transaction,
+                        other_version,
+                    )?;
+                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
+                        updated,
+                        mem_wal_to_flush.as_slice(),
+                        other_transaction,
+                        other_version,
+                    )?;
+                    Ok(())
+                }
             }
-            Operation::Overwrite { .. } | Operation::Restore { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
-            }
+        } else {
+            Err(wrong_operation_err(&self.transaction.operation))
         }
     }
 
@@ -359,9 +509,9 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_index,
                     ..
                 } => {
-                    // if FRI is available, index remapping is deferred and
+                    // if frag_reuse_index is available, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
-                    // The only case that needs rebasing is when the FRI cleanup
+                    // The only case that needs rebasing is when the frag_reuse_index cleanup
                     // triggers a CreateIndex, and it needs to add the new reuse
                     // version created by the rewrite
                     if let Some(committed_fri) = frag_reuse_index {
@@ -370,7 +520,7 @@ impl<'a> TransactionRebase<'a> {
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         {
                             // this should not happen today since we don't support committing
-                            // a mixture of fri and other indices.
+                            // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self.incompatible_conflict_err(
                                     other_transaction,
@@ -419,9 +569,13 @@ impl<'a> TransactionRebase<'a> {
                     // TODO(rmeng): check that the new indices isn't on the column being replaced
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
-                    self.incompatible_conflict_err(other_transaction, other_version, location!())
-                ),
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::UpdateMemWalState { .. } => Err(self.incompatible_conflict_err(
+                    other_transaction,
+                    other_version,
+                    location!(),
+                )),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -445,7 +599,8 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Append { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
-                | Operation::UpdateConfig { .. } => Ok(()),
+                | Operation::UpdateConfig { .. }
+                | Operation::UpdateMemWalState { .. } => Ok(()),
                 Operation::Delete {
                     updated_fragments,
                     deleted_fragment_ids,
@@ -487,9 +642,9 @@ impl<'a> TransactionRebase<'a> {
                             location!(),
                         ))
                     } else if committed_fri.is_some() && frag_reuse_index.is_some() {
-                        // Do not commit concurrent rewrites that could produce conflicting FRIs.
+                        // Do not commit concurrent rewrites that could produce conflicting frag_reuse_indexes.
                         // The other rewrite must retry.
-                        // TODO: could potentially rebase to combine both FRIs,
+                        // TODO: could potentially rebase to combine both frag_reuse_indexes,
                         //   but today it is already rare to run concurrent rewrites.
                         Err(self.retryable_conflict_err(
                             other_transaction,
@@ -515,12 +670,12 @@ impl<'a> TransactionRebase<'a> {
                             .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
                         &frag_reuse_index,
                     ) {
-                        // If the rewrite produces a FRI, but FRI was cleaned up
-                        // in the other transaction, the FRI produced by the rewrite should
+                        // If the rewrite produces a frag_reuse_index, but frag_reuse_index was cleaned up
+                        // in the other transaction, the frag_reuse_index produced by the rewrite should
                         // be cleaned up in the same way as a part of the rebase.
                         (Some(committed_fri), Some(_)) => {
                             // this should not happen today since we don't support committing
-                            // a mixture of FRI and other indices.
+                            // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self.incompatible_conflict_err(
                                     other_transaction,
@@ -536,10 +691,10 @@ impl<'a> TransactionRebase<'a> {
                         // If rewrite defers index remap,
                         // then it does not conflict with index creation
                         (None, Some(_)) => Ok(()),
-                        // Rewrite with remapping and FRI creation can commit without conflict
+                        // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), None) => {
                             // this should not happen today since we don't support committing
-                            // a mixture of FRI and other indices.
+                            // a mixture of frag_reuse_index and other indices.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 Err(self.incompatible_conflict_err(
                                     other_transaction,
@@ -612,6 +767,9 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
             }
+            Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+            }
             Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::CreateIndex { .. }
@@ -633,7 +791,9 @@ impl<'a> TransactionRebase<'a> {
         match &other_transaction.operation {
             // Append is not compatible with any operation that completely
             // overwrites the schema.
-            Operation::Overwrite { .. } | Operation::Restore { .. } => {
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
             Operation::Append { .. }
@@ -674,7 +834,9 @@ impl<'a> TransactionRebase<'a> {
                 // TODO(rmeng): check cell conflicts
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
-            Operation::Overwrite { .. } | Operation::Restore { .. } => {
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
         }
@@ -698,13 +860,20 @@ impl<'a> TransactionRebase<'a> {
             | Operation::DataReplacement { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
             }
-            Operation::Overwrite { .. } | Operation::Restore { .. } | Operation::Project { .. } => {
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::Project { .. }
+            | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
         }
     }
 
-    fn check_restore_txn(&mut self, other_transaction: &Transaction) -> Result<()> {
+    fn check_restore_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
         match &other_transaction.operation {
             Operation::Append { .. }
             | Operation::Delete { .. }
@@ -718,6 +887,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
+            Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
+            }
         }
     }
 
@@ -739,7 +911,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
-            | Operation::UpdateConfig { .. } => Ok(()),
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateMemWalState { .. } => Ok(()),
         }
     }
 
@@ -762,7 +935,9 @@ impl<'a> TransactionRebase<'a> {
                 // Need to recompute the schema
                 Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
             }
-            Operation::Overwrite { .. } | Operation::Restore { .. } => {
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
         }
@@ -827,11 +1002,149 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Update { .. }
-                | Operation::Project { .. } => Ok(()),
+                | Operation::Project { .. }
+                | Operation::UpdateMemWalState { .. } => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
         }
+    }
+
+    fn check_update_mem_wal_state_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        if let Operation::UpdateMemWalState {
+            added,
+            updated,
+            removed: _,
+            ..
+        } = &self.transaction.operation
+        {
+            match &other_transaction.operation {
+                Operation::UpdateMemWalState {
+                    added: committed_added,
+                    updated: committed_updated,
+                    removed: _,
+                } => {
+                    // 1. if the current or last committed job is trimming flushed MemWALs,
+                    // it is compatible with any other UpdateMemWalState commits
+                    if (committed_added.is_empty() && committed_updated.is_empty())
+                        || (added.is_empty() && updated.is_empty())
+                    {
+                        return Ok(());
+                    }
+
+                    // 2. MemWALs of different regions can be changed at the same time
+                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
+                        committed_added,
+                        added,
+                        other_transaction,
+                        other_version,
+                    )?;
+                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
+                        committed_added,
+                        updated,
+                        other_transaction,
+                        other_version,
+                    )?;
+                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
+                        committed_updated,
+                        added,
+                        other_transaction,
+                        other_version,
+                    )?;
+                    self.check_update_mem_wal_state_not_modify_same_mem_wal(
+                        committed_updated,
+                        updated,
+                        other_transaction,
+                        other_version,
+                    )?;
+                    Ok(())
+                }
+                Operation::Update {
+                    mem_wal_to_flush, ..
+                } => {
+                    if mem_wal_to_flush.is_some() {
+                        // TODO: This check could be more detailed, there is an assumption that
+                        //  once a MemWAL is sealed, there is no other operation that could change
+                        //  the state back to open, and at that point it can always be flushed.
+                        Ok(())
+                    } else {
+                        Err(self.incompatible_conflict_err(
+                            other_transaction,
+                            other_version,
+                            location!(),
+                        ))
+                    }
+                }
+                Operation::UpdateConfig { .. }
+                | Operation::Rewrite { .. }
+                | Operation::CreateIndex { .. }
+                | Operation::ReserveFragments { .. } => Ok(()),
+                Operation::Append { .. }
+                | Operation::Overwrite { .. }
+                | Operation::Delete { .. }
+                | Operation::DataReplacement { .. }
+                | Operation::Merge { .. }
+                | Operation::Restore { .. }
+                | Operation::Project { .. } => Err(self.incompatible_conflict_err(
+                    other_transaction,
+                    other_version,
+                    location!(),
+                )),
+            }
+        } else {
+            Err(wrong_operation_err(&self.transaction.operation))
+        }
+    }
+
+    fn check_update_mem_wal_state_not_modify_same_mem_wal(
+        &self,
+        committed: &[MemWal],
+        to_commit: &[MemWal],
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        if !committed.is_empty() {
+            if to_commit.is_empty() {
+                return Ok(());
+            }
+
+            if committed.len() > 1 {
+                return Err(Error::Internal {
+                    message: format!(
+                        "Committing multiple MemWALs is not supported, but found committed: {:?}",
+                        committed
+                    ),
+                    location: location!(),
+                });
+            }
+
+            if to_commit.len() > 1 {
+                return Err(Error::NotSupported {
+                    source: format!(
+                        "Committing multiple MemWALs is not supported, but found attempt to commit: {:?}",
+                        to_commit
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+
+            let committed_mem_wal = committed.first().unwrap();
+            let to_commit_mem_wal = to_commit.first().unwrap();
+            if committed_mem_wal.id == to_commit_mem_wal.id {
+                return Err(self.incompatible_conflict_err(
+                    other_transaction,
+                    other_version,
+                    location!(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Writes
@@ -849,7 +1162,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
-            | Operation::UpdateConfig { .. } => Ok(self.transaction),
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateMemWalState { .. } => Ok(self.transaction),
         }
     }
 
@@ -967,9 +1281,15 @@ impl<'a> TransactionRebase<'a> {
                     .await?;
 
                     // Make sure this is available in the cache for future conflict resolution.
-                    let key =
-                        deletion_file_cache_key(*fragment_id, new_deletion_file.as_ref().unwrap());
-                    dataset.metadata_cache.insert(&key, Arc::new(dv));
+                    let deletion_file = new_deletion_file.as_ref().unwrap();
+                    let key = crate::session::caches::DeletionFileKey {
+                        fragment_id: *fragment_id,
+                        deletion_file,
+                    };
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&key, Arc::new(dv))
+                        .await;
 
                     // TODO: also cleanup the old deletion file.
                     new_deletion_files.insert(*fragment_id, new_deletion_file);
@@ -1046,7 +1366,7 @@ impl<'a> TransactionRebase<'a> {
                 max_versions.push(max_version);
             }
 
-            // there should be only 1 FRI in new indices
+            // there should be only 1 frag_reuse_index in new indices
             let new_fri = &new_indices[0];
             let mut new_fri_details = Arc::try_unwrap(
                 load_frag_reuse_index_details(dataset, new_fri)
@@ -1058,7 +1378,7 @@ impl<'a> TransactionRebase<'a> {
 
             let new_frag_bitmap = new_fri_details.new_frag_bitmap();
 
-            let new_fri_meta = build_frag_reuse_index_metadata(
+            let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
                 dataset,
                 Some(new_fri),
                 new_fri_details,
@@ -1067,7 +1387,7 @@ impl<'a> TransactionRebase<'a> {
             .await?;
 
             new_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
-            new_indices.push(new_fri_meta);
+            new_indices.push(new_frag_reuse_index_meta);
             Ok(self.transaction)
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1113,7 +1433,7 @@ impl<'a> TransactionRebase<'a> {
                     // If committed_fri is empty, that means everything is cleaned up.
                     // then only the last item in committed_fri should be retained, which is [3].
                     // Note that this is under the assumption that the sequence of
-                    // conflicting_frag_reuse_indices all come from FRI cleanup rebase.
+                    // conflicting_frag_reuse_indices all come from frag_reuse_index cleanup rebase.
                     match committed_min_dataset_version {
                         Some(committed_min_dataset_version) => {
                             if committed_min_dataset_version > min_dataset_version {
@@ -1136,7 +1456,7 @@ impl<'a> TransactionRebase<'a> {
                     .retain(|v| v.dataset_version >= min_dataset_version);
                 let new_frag_bitmap = new_fri_details.new_frag_bitmap();
 
-                let new_fri_meta = build_frag_reuse_index_metadata(
+                let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
                     dataset,
                     Some(new_fri),
                     new_fri_details,
@@ -1144,7 +1464,7 @@ impl<'a> TransactionRebase<'a> {
                 )
                 .await?;
 
-                *frag_reuse_index = Some(new_fri_meta);
+                *frag_reuse_index = Some(new_frag_reuse_index_meta);
                 Ok(self.transaction)
             } else {
                 Ok(self.transaction)
@@ -1207,6 +1527,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::transaction::RewriteGroup;
+    use crate::session::caches::DeletionFileKey;
     use crate::{
         dataset::{CommitBuilder, InsertBuilder, WriteParams},
         io,
@@ -1252,6 +1573,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_to_flush: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1260,6 +1582,7 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_to_flush: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1271,6 +1594,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_to_flush: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1332,11 +1656,15 @@ mod tests {
         .await
         .unwrap();
 
-        let cache_key =
-            deletion_file_cache_key(fragment.id, fragment.deletion_file.as_ref().unwrap());
+        let deletion_file = fragment.deletion_file.as_ref().unwrap();
+        let key = DeletionFileKey {
+            fragment_id: fragment.id,
+            deletion_file,
+        };
         dataset
             .metadata_cache
-            .insert(&cache_key, Arc::new(current_deletions));
+            .insert_with_key(&key, Arc::new(current_deletions))
+            .await;
 
         fragment.clone()
     }
@@ -1364,6 +1692,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
+                mem_wal_to_flush: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1375,6 +1704,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
+                mem_wal_to_flush: None,
             },
         ];
         let transactions =
@@ -1493,6 +1823,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
+                    mem_wal_to_flush: None,
                 },
             ),
             (
@@ -1502,6 +1833,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
+                    mem_wal_to_flush: None,
                 },
             ),
             (
@@ -1655,6 +1987,7 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
+                mem_wal_to_flush: None,
             },
             Operation::UpdateConfig {
                 upsert_values: Some(HashMap::from_iter(vec![(
@@ -1846,6 +2179,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
+                    mem_wal_to_flush: None,
                 },
                 [
                     Compatible,    // append
@@ -2089,7 +2423,8 @@ mod tests {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
-            | Operation::Restore { .. } => Box::new(std::iter::empty()),
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,

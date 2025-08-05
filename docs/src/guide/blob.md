@@ -25,6 +25,37 @@ schema = pa.schema(
 )
 ```
 
+To write blob data to a Lance dataset, create a PyArrow table with the blob schema and use `lance.write_dataset`:
+
+```python
+import lance
+
+# First, download a sample video file for testing
+# wget https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4
+import urllib.request
+urllib.request.urlretrieve(
+    "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-mp4-file.mp4",
+    "sample_video.mp4"
+)
+
+# Then read the video file content
+with open("sample_video.mp4", 'rb') as f:
+    video_data = f.read()
+
+# Create table with blob data
+table = pa.table({
+    "id": [1],
+    "video": [video_data],
+}, schema=schema)
+
+# Write to Lance dataset
+ds = lance.write_dataset(
+    table,
+    "./youtube.lance",
+    schema=schema
+)
+```
+
 To fetch blobs from a Lance dataset, you can use `lance.dataset.LanceDataset.take_blobs`.
 
 For example, it's easy to use `BlobFile` to extract frames from a video file without
@@ -36,7 +67,8 @@ import lance
 
 ds = lance.dataset("./youtube.lance")
 start_time, end_time = 500, 1000
-blobs = ds.take_blobs([5], "video")
+# Get blob data from the first row (id=0)
+blobs = ds.take_blobs("video", ids=[0])
 with av.open(blobs[0]) as container:
     stream = container.streams.video[0]
     stream.codec_context.skip_frame = "NONKEY"

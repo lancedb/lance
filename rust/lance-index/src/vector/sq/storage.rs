@@ -180,14 +180,14 @@ impl ScalarQuantizationStorage {
         distance_type: DistanceType,
         bounds: Range<f64>,
         batches: impl IntoIterator<Item = RecordBatch>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
         let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
         offsets.push(0);
         for mut batch in batches.into_iter() {
-            if let Some(fri_ref) = fri.as_ref() {
-                batch = fri_ref.remap_row_ids_record_batch(batch, 0)?
+            if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                batch = frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
             }
             offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
             let chunk = SQStorageChunk::new(batch)?;
@@ -220,7 +220,7 @@ impl ScalarQuantizationStorage {
     pub async fn load(
         object_store: &ObjectStore,
         path: &Path,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let reader = FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
@@ -243,7 +243,14 @@ impl ScalarQuantizationStorage {
         let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
         let metadata = ScalarQuantizationMetadata::load(&reader).await?;
 
-        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata, fri).await
+        Self::load_partition(
+            &reader,
+            0..reader.len(),
+            distance_type,
+            &metadata,
+            frag_reuse_index,
+        )
+        .await
     }
 
     fn optimize(self) -> Result<Self> {
@@ -270,7 +277,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -280,7 +287,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
             distance_type,
             metadata.bounds.clone(),
             [batch],
-            fri,
+            frag_reuse_index,
         )
     }
 
@@ -301,7 +308,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema).await?;
@@ -311,7 +318,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
             distance_type,
             metadata.bounds.clone(),
             [batch],
-            fri,
+            frag_reuse_index,
         )
     }
 }

@@ -52,10 +52,10 @@ impl QuantizerStorage for FlatFloatStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let batch = if let Some(fri_ref) = fri.as_ref() {
-            fri_ref.remap_row_ids_record_batch(batch, 0)?
+        let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+            frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
         } else {
             batch
         };
@@ -105,7 +105,7 @@ impl QuantizerStorage for FlatFloatStorage {
 }
 
 impl FlatFloatStorage {
-    // deprecated, use `try_from_batch` instead
+    // used for only testing
     pub fn new(vectors: FixedSizeListArray, distance_type: DistanceType) -> Self {
         let row_ids = Arc::new(UInt64Array::from_iter_values(0..vectors.len() as u64));
         let vectors = Arc::new(vectors);
@@ -210,10 +210,10 @@ impl QuantizerStorage for FlatBinStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let batch = if let Some(fri_ref) = fri.as_ref() {
-            fri_ref.remap_row_ids_record_batch(batch, 0)?
+        let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+            frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
         } else {
             batch
         };
@@ -263,6 +263,28 @@ impl QuantizerStorage for FlatBinStorage {
 }
 
 impl FlatBinStorage {
+    // used for only testing
+    pub fn new(vectors: FixedSizeListArray, distance_type: DistanceType) -> Self {
+        let row_ids = Arc::new(UInt64Array::from_iter_values(0..vectors.len() as u64));
+        let vectors = Arc::new(vectors);
+
+        let batch = RecordBatch::try_from_iter_with_nullable(vec![
+            (ROW_ID, row_ids.clone() as ArrayRef, true),
+            (FLAT_COLUMN, vectors.clone() as ArrayRef, true),
+        ])
+        .unwrap();
+
+        Self {
+            metadata: FlatMetadata {
+                dim: vectors.value_length() as usize,
+            },
+            batch,
+            distance_type,
+            row_ids,
+            vectors,
+        }
+    }
+
     pub fn vector(&self, id: u32) -> ArrayRef {
         self.vectors.value(id as usize)
     }

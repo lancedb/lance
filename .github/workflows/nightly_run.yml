@@ -2,12 +2,13 @@ name: Nightly Run Jobs
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Runs every day at midnight UTC
+    - cron: "0 0 * * *" # Runs every day at midnight UTC
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-24.04
+    if: github.repository == 'lancedb/lance'
     steps:
       - name: Nightly Run File Verification Workflow
         uses: benc-uk/workflow-dispatch@v1
@@ -15,3 +16,26 @@ jobs:
           workflow: file_verification.yml
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  jumbo-tests:
+    # jumbo tests need more resources
+    runs-on: warp-ubuntu-latest-x64-8x
+    if: github.repository == 'lancedb/lance'
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Run Jumbo String/Binary Tests
+        run: |
+          echo "Running jumbo tests for Lance 2.0 and 2.1..."
+          echo "System memory info:"
+          free -h
+          cd rust
+          # Run only the jumbo tests in release mode with limited parallelism
+          # to avoid OOM issues (these tests use >5GiB memory each)
+          cargo test --release --package lance-encoding -- --ignored jumbo --test-threads=1

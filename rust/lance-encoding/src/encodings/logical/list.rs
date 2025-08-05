@@ -227,6 +227,9 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::constants::{
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    };
     use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
@@ -235,9 +238,6 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
-    use lance_core::datatypes::{
-        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
-    };
     use rstest::rstest;
 
     use crate::{
@@ -761,9 +761,12 @@ mod tests {
             .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
     #[ignore] // This test is quite slow in debug mode
-    async fn test_jumbo_list() {
+    async fn test_jumbo_list(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         // This is an overflow test.  We have a list of lists where each list
         // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
         // offsets range
@@ -778,7 +781,9 @@ mod tests {
         let arrs = vec![list_arr; 5000];
 
         // We can't validate because our validation relies on concatenating all input arrays
-        let test_cases = TestCases::default().without_validation();
+        let test_cases = TestCases::default()
+            .without_validation()
+            .with_file_version(version);
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 }

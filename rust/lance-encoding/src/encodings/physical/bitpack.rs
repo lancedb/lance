@@ -486,6 +486,7 @@ mod test {
             for int64_array in int64_arrays {
                 arrays.push(arrow_cast::cast(&int64_array, &data_type).unwrap());
             }
+
             check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
         }
     }

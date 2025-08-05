@@ -282,7 +282,7 @@ pub(crate) async fn build_vector_index(
     name: &str,
     uuid: &str,
     params: &VectorIndexParams,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -326,7 +326,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
-                    fri,
+                    frag_reuse_index,
                 )?
                 .build()
                 .await?;
@@ -341,7 +341,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(()),
                     (),
-                    fri,
+                    frag_reuse_index,
                 )?
                 .build()
                 .await?;
@@ -385,7 +385,7 @@ pub(crate) async fn build_vector_index(
                     Some(ivf_params.clone()),
                     Some(pq_params.clone()),
                     (),
-                    fri,
+                    frag_reuse_index,
                 )?
                 .build()
                 .await?;
@@ -408,7 +408,7 @@ pub(crate) async fn build_vector_index(
             Some(ivf_params.clone()),
             Some(sq_params.clone()),
             (),
-            fri,
+            frag_reuse_index,
         )?
         .build()
         .await?;
@@ -434,7 +434,7 @@ pub(crate) async fn build_vector_index(
                         Some(ivf_params.clone()),
                         Some(pq_params.clone()),
                         hnsw_params.clone(),
-                        fri,
+                        frag_reuse_index,
                     )?
                     .build()
                     .await?;
@@ -449,7 +449,7 @@ pub(crate) async fn build_vector_index(
                         Some(ivf_params.clone()),
                         Some(sq_params.clone()),
                         hnsw_params.clone(),
-                        fri,
+                        frag_reuse_index,
                     )?
                     .build()
                     .await?;
@@ -472,7 +472,7 @@ pub(crate) async fn build_vector_index(
                 Some(ivf_params.clone()),
                 Some(()),
                 hnsw_params.clone(),
-                fri,
+                frag_reuse_index,
             )?
             .build()
             .await?;
@@ -538,11 +538,13 @@ pub(crate) async fn open_vector_index(
     uuid: &str,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
+
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -564,12 +566,14 @@ pub(crate) async fn open_vector_index(
                 }
                 let ivf = IvfModel::try_from(ivf_pb.to_owned())?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
-                    dataset.session.clone(),
                     uuid,
                     ivf,
                     reader.clone(),
                     last_stage.unwrap(),
                     metric_type,
+                    dataset
+                        .index_cache
+                        .for_index(uuid, frag_reuse_uuid.as_ref()),
                 )?));
             }
             Some(Stage::Pq(pq_proto)) => {
@@ -580,7 +584,11 @@ pub(crate) async fn open_vector_index(
                     });
                 };
                 let pq = ProductQuantizer::from_proto(pq_proto, metric_type)?;
-                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type, fri.clone())));
+                last_stage = Some(Arc::new(PQIndex::new(
+                    pq,
+                    metric_type,
+                    frag_reuse_index.clone(),
+                )));
             }
             Some(Stage::Diskann(_)) => {
                 return Err(Error::Index {
@@ -608,7 +616,7 @@ pub(crate) async fn open_vector_index_v2(
     column: &str,
     uuid: &str,
     reader: FileReader,
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
         .schema()
@@ -620,6 +628,8 @@ pub(crate) async fn open_vector_index_v2(
         })?;
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
+
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
@@ -641,12 +651,14 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                dataset.session.clone(),
                 uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
+                dataset
+                    .index_cache
+                    .for_index(uuid, frag_reuse_uuid.as_ref()),
             )?)
         }
 
@@ -672,12 +684,14 @@ pub(crate) async fn open_vector_index_v2(
             let ivf = IvfModel::try_from(pb_ivf)?;
 
             Arc::new(IVFIndex::try_new(
-                dataset.session.clone(),
                 uuid,
                 ivf,
                 reader.object_reader.clone(),
                 Arc::new(hnsw),
                 distance_type,
+                dataset
+                    .index_cache
+                    .for_index(uuid, frag_reuse_uuid.as_ref()),
             )?)
         }
 

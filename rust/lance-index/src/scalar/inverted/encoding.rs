@@ -148,6 +148,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
         compress_remainder(&positions[length - remainder..], &mut builder)?;
         builder.append_value("");
     }
+
     Ok(builder.finish())
 }
 
@@ -190,8 +191,8 @@ pub fn decompress_positions(compressed: &arrow::array::LargeBinaryArray) -> Vec<
 
     let remainder = num_positions as usize % BLOCK_SIZE;
     if remainder > 0 {
-        let compressed = compressed.value(num_blocks + 1);
-        decompress_remainder(compressed, remainder, &mut positions);
+        let compressed_block = compressed.value(num_blocks + 1);
+        decompress_remainder(compressed_block, remainder, &mut positions);
     }
 
     positions
@@ -212,8 +213,8 @@ pub fn decompress_positions_list(compressed: &ListArray) -> Result<ListArray> {
     Ok(builder.finish())
 }
 
-pub fn read_num_positions(posting_list: &arrow::array::LargeBinaryArray) -> u32 {
-    u32::from_le_bytes(posting_list.values().as_ref()[..4].try_into().unwrap())
+pub fn read_num_positions(compressed: &arrow::array::LargeBinaryArray) -> u32 {
+    u32::from_le_bytes(compressed.value(0).try_into().unwrap())
 }
 
 #[instrument(level = "info", name = "decompress_posting_block", skip_all)]

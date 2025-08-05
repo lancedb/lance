@@ -11,6 +11,9 @@ use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::ROW_ADDR;
+use lance_core::ROW_ID;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -20,12 +23,12 @@ use object_store::path::Path;
 use snafu::location;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::Operation;
-use crate::dataset::transaction::Transaction;
+use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::write_fragments_internal;
 use crate::dataset::ReadParams;
 use crate::Dataset;
 use crate::{Error, Result};
+use tracing::info;
 
 use super::commit::CommitBuilder;
 use super::resolve_commit_handler;
@@ -123,7 +126,8 @@ impl<'a> InsertBuilder<'a> {
             .with_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
-            .with_object_store(context.object_store.clone());
+            .with_object_store(context.object_store.clone())
+            .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
 
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());
@@ -180,6 +184,13 @@ impl<'a> InsertBuilder<'a> {
         schema: Schema,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
+
+        info!(
+            target: TRACE_DATASET_EVENTS,
+            event=DATASET_WRITING_EVENT,
+            uri=context.dest.uri(),
+            mode=?context.params.mode
+        );
 
         self.validate_write(&mut context, &schema)?;
 
@@ -261,16 +272,19 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
-        Ok(Transaction::new(
+        let transaction = TransactionBuilder::new(
             context
                 .dest
                 .dataset()
                 .map(|ds| ds.manifest.version)
                 .unwrap_or(0),
             operation,
-            blobs_op,
-            None,
-        ))
+        )
+        .blobs_op(blobs_op)
+        .transaction_properties(context.params.transaction_properties.clone())
+        .build();
+
+        Ok(transaction)
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
@@ -325,6 +339,20 @@ impl<'a> InsertBuilder<'a> {
                 }
 
                 data_schema.check_compatible(&m.schema, &schema_cmp_opts)?;
+            }
+        }
+
+        // Make sure we aren't using any reserved column names
+        for field in data_schema.fields.iter() {
+            if field.name == ROW_ID || field.name == ROW_ADDR {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "The column {} is a reserved name and cannot be used in a Lance dataset",
+                        field.name
+                    )
+                    .into(),
+                    location: location!(),
+                });
             }
         }
 
@@ -391,6 +419,7 @@ impl<'a> InsertBuilder<'a> {
                 let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
+                    session: params.session.clone(),
                     ..Default::default()
                 });
 
@@ -441,4 +470,31 @@ struct WriteContext<'a> {
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: LanceFileVersion,
+}
+
+#[cfg(test)]
+mod test {
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::session::Session;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pass_session() {
+        let session = Arc::new(Session::new(0, 0, Default::default()));
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![],
+                Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)])),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(Arc::as_ptr(&dataset.session()), Arc::as_ptr(&session));
+    }
 }

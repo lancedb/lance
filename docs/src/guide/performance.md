@@ -47,7 +47,7 @@ debugging query performance.
 Lance is designed to be thread-safe and performant. Lance APIs can be called concurrently unless
 explicitly stated otherwise. Users may create multiple tables and share tables between threads.
 Operations may run in parallel on the same table, but some operations may lead to conflicts. For
-details see [conflict resolution](../format/format.md#conflict-resolution).
+details see [conflict resolution](../format/index.md#conflict-resolution).
 
 Most Lance operations will use multiple threads to perform work in parallel. There are two thread
 pools in lance: the IO thread pool and the compute thread pool. The IO thread pool is used for

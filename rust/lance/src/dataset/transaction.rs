@@ -51,11 +51,13 @@ use std::{
 };
 
 use super::ManifestWriteConfig;
+use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::is_system_index;
+use lance_index::mem_wal::MemWal;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use lance_table::{
@@ -91,6 +93,7 @@ pub struct Transaction {
     /// If this is `None`, then the blobs dataset was not modified
     pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -204,6 +207,8 @@ pub enum Operation {
         new_fragments: Vec<Fragment>,
         /// The fields that have been modified
         fields_modified: Vec<u32>,
+        /// The MemWAL (pre-image) that should be marked as flushed after this transaction
+        mem_wal_to_flush: Option<MemWal>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -215,6 +220,12 @@ pub enum Operation {
         delete_keys: Option<Vec<String>>,
         schema_metadata: Option<HashMap<String, String>>,
         field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
+    },
+    /// Update the state of MemWALs.
+    UpdateMemWalState {
+        added: Vec<MemWal>,
+        updated: Vec<MemWal>,
+        removed: Vec<MemWal>,
     },
 }
 
@@ -233,6 +244,7 @@ impl std::fmt::Display for Operation {
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
+            Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
         }
     }
 }
@@ -328,18 +340,21 @@ impl PartialEq for Operation {
                     updated_fragments: a_updated,
                     new_fragments: a_new,
                     fields_modified: a_fields,
+                    mem_wal_to_flush: a_mem_wal_to_flush,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
                     updated_fragments: b_updated,
                     new_fragments: b_new,
                     fields_modified: b_fields,
+                    mem_wal_to_flush: b_mem_wal_to_flush,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
+                    && a_mem_wal_to_flush == b_mem_wal_to_flush
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -409,6 +424,9 @@ impl PartialEq for Operation {
             (Self::Append { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Append { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Delete { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -441,6 +459,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Delete { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -477,6 +498,9 @@ impl PartialEq for Operation {
             (Self::Overwrite { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Overwrite { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::CreateIndex { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -509,6 +533,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::CreateIndex { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -545,6 +572,9 @@ impl PartialEq for Operation {
             (Self::Rewrite { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Rewrite { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Merge { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -577,6 +607,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Merge { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -613,6 +646,9 @@ impl PartialEq for Operation {
             (Self::Restore { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Restore { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::ReserveFragments { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -645,6 +681,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::ReserveFragments { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -681,6 +720,9 @@ impl PartialEq for Operation {
             (Self::Update { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Update { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Project { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -713,6 +755,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Project { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -749,6 +794,9 @@ impl PartialEq for Operation {
             (Self::UpdateConfig { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateConfig { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::DataReplacement { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -782,6 +830,62 @@ impl PartialEq for Operation {
             }
             (Self::DataReplacement { .. }, Self::UpdateConfig { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+
+            (Self::UpdateMemWalState { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (
+                Self::UpdateMemWalState {
+                    added: a_added,
+                    updated: a_updated,
+                    removed: a_removed,
+                },
+                Self::UpdateMemWalState {
+                    added: b_added,
+                    updated: b_updated,
+                    removed: b_removed,
+                },
+            ) => {
+                compare_vec(a_added, b_added)
+                    && compare_vec(a_updated, b_updated)
+                    && compare_vec(a_removed, b_removed)
             }
         }
     }
@@ -910,20 +1014,75 @@ impl Operation {
             Self::Project { .. } => "Project",
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
+            Self::UpdateMemWalState { .. } => "UpdateMemWalState",
+        }
+    }
+}
+
+/// Add TransactionBuilder for flexibly setting option without using `mut`
+pub struct TransactionBuilder {
+    read_version: u64,
+    // uuid is optional for builder since it can autogenerate
+    uuid: Option<String>,
+    operation: Operation,
+    blobs_op: Option<Operation>,
+    tag: Option<String>,
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
+}
+
+impl TransactionBuilder {
+    pub fn new(read_version: u64, operation: Operation) -> Self {
+        Self {
+            read_version,
+            uuid: None,
+            operation,
+            blobs_op: None,
+            tag: None,
+            transaction_properties: None,
+        }
+    }
+
+    pub fn uuid(mut self, uuid: String) -> Self {
+        self.uuid = Some(uuid);
+        self
+    }
+
+    pub fn blobs_op(mut self, blobs_op: Option<Operation>) -> Self {
+        self.blobs_op = blobs_op;
+        self
+    }
+
+    pub fn tag(mut self, tag: Option<String>) -> Self {
+        self.tag = tag;
+        self
+    }
+
+    pub fn transaction_properties(
+        mut self,
+        transaction_properties: Option<Arc<HashMap<String, String>>>,
+    ) -> Self {
+        self.transaction_properties = transaction_properties;
+        self
+    }
+
+    pub fn build(self) -> Transaction {
+        let uuid = self
+            .uuid
+            .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string());
+        Transaction {
+            read_version: self.read_version,
+            uuid,
+            operation: self.operation,
+            blobs_op: self.blobs_op,
+            tag: self.tag,
+            transaction_properties: self.transaction_properties,
         }
     }
 }
 
 impl Transaction {
     pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
-        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
-        Self {
-            read_version,
-            uuid,
-            operation,
-            blobs_op: None,
-            tag: None,
-        }
+        TransactionBuilder::new(read_version, operation).build()
     }
 
     pub fn with_blobs_op(self, blobs_op: Option<Operation>) -> Self {
@@ -936,14 +1095,10 @@ impl Transaction {
         blobs_op: Option<Operation>,
         tag: Option<String>,
     ) -> Self {
-        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
-        Self {
-            read_version,
-            uuid,
-            operation,
-            blobs_op,
-            tag,
-        }
+        TransactionBuilder::new(read_version, operation)
+            .blobs_op(blobs_op)
+            .tag(tag)
+            .build()
     }
 
     fn fragments_with_ids<'a, T>(
@@ -1116,6 +1271,7 @@ impl Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                mem_wal_to_flush,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
                     if removed_fragment_ids.contains(&f.id) {
@@ -1142,7 +1298,21 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
+
+                if let Some(mem_wal_to_flush) = mem_wal_to_flush {
+                    update_mem_wal_index_in_indices_list(
+                        self.read_version,
+                        current_manifest.map_or(1, |m| m.version + 1),
+                        &mut final_indices,
+                        vec![],
+                        vec![MemWal {
+                            state: lance_index::mem_wal::State::Flushed,
+                            ..mem_wal_to_flush.clone()
+                        }],
+                        vec![mem_wal_to_flush.clone()],
+                    )?;
+                }
             }
             Operation::Overwrite { ref fragments, .. } => {
                 let mut new_fragments =
@@ -1341,6 +1511,20 @@ impl Transaction {
 
                 final_fragments.extend(unmodified_fragments);
             }
+            Operation::UpdateMemWalState {
+                added,
+                updated,
+                removed,
+            } => {
+                update_mem_wal_index_in_indices_list(
+                    self.read_version,
+                    current_manifest.map_or(1, |m| m.version + 1),
+                    &mut final_indices,
+                    added.clone(),
+                    updated.clone(),
+                    removed.clone(),
+                )?;
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -1416,11 +1600,11 @@ impl Transaction {
                     manifest.update_config(upsert_values.clone());
                 }
                 if let Some(schema_metadata) = schema_metadata {
-                    manifest.update_schema_metadata(schema_metadata.clone());
+                    manifest.replace_schema_metadata(schema_metadata.clone());
                 }
                 if let Some(field_metadata) = field_metadata {
                     for (field_id, metadata) in field_metadata {
-                        manifest.update_field_metadata(*field_id as i32, metadata.clone());
+                        manifest.replace_field_metadata(*field_id as i32, metadata.clone())?;
                     }
                 }
             }
@@ -1479,7 +1663,7 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
-                || existing_index.name == FRAG_REUSE_INDEX_NAME
+                || is_system_index(existing_index)
         });
 
         let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
@@ -1492,7 +1676,7 @@ impl Transaction {
                 .as_ref()
                 .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
                 .unwrap_or(true)
-                || existing_index.name == FRAG_REUSE_INDEX_NAME
+                || is_system_index(existing_index)
         });
     }
 
@@ -1771,6 +1955,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                mem_wal_to_flush,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -1782,6 +1967,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
+                mem_wal_to_flush: mem_wal_to_flush.map(|m| MemWal::try_from(m).unwrap()),
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -1831,6 +2017,26 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(DataReplacementGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
+            },
+            Some(pb::transaction::Operation::UpdateMemWalState(
+                pb::transaction::UpdateMemWalState {
+                    added,
+                    updated,
+                    removed,
+                },
+            )) => Operation::UpdateMemWalState {
+                added: added
+                    .into_iter()
+                    .map(|m| MemWal::try_from(m).unwrap())
+                    .collect(),
+                updated: updated
+                    .into_iter()
+                    .map(|m| MemWal::try_from(m).unwrap())
+                    .collect(),
+                removed: removed
+                    .into_iter()
+                    .map(|m| MemWal::try_from(m).unwrap())
+                    .collect(),
             },
             None => {
                 return Err(Error::Internal {
@@ -1882,6 +2088,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                 None
             } else {
                 Some(message.tag.clone())
+            },
+            transaction_properties: if message.transaction_properties.is_empty() {
+                None
+            } else {
+                Some(Arc::new(message.transaction_properties))
             },
         })
     }
@@ -2011,6 +2222,7 @@ impl From<&Transaction> for pb::Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                mem_wal_to_flush,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -2019,6 +2231,9 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 fields_modified: fields_modified.clone(),
+                mem_wal_to_flush: mem_wal_to_flush
+                    .as_ref()
+                    .map(pb::mem_wal_index_details::MemWal::from),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
@@ -2059,6 +2274,26 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
+            Operation::UpdateMemWalState {
+                added,
+                updated,
+                removed,
+            } => {
+                pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
+                    added: added
+                        .iter()
+                        .map(pb::mem_wal_index_details::MemWal::from)
+                        .collect::<Vec<_>>(),
+                    updated: updated
+                        .iter()
+                        .map(pb::mem_wal_index_details::MemWal::from)
+                        .collect::<Vec<_>>(),
+                    removed: removed
+                        .iter()
+                        .map(pb::mem_wal_index_details::MemWal::from)
+                        .collect::<Vec<_>>(),
+                })
+            }
         };
 
         let blob_operation = value.blobs_op.as_ref().map(|op| match op {
@@ -2084,12 +2319,18 @@ impl From<&Transaction> for pb::Transaction {
             _ => panic!("Invalid blob operation: {:?}", value),
         });
 
+        let transaction_properties = value
+            .transaction_properties
+            .as_ref()
+            .map(|arc| arc.as_ref().clone())
+            .unwrap_or_default();
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
+            transaction_properties,
         }
     }
 }

@@ -19,7 +19,7 @@ use std::ops::Range;
 mod bitmap;
 mod encoded_array;
 mod index;
-mod segment;
+pub mod segment;
 mod serde;
 
 use deepsize::DeepSizeOf;
@@ -35,6 +35,7 @@ pub use serde::{read_row_ids, write_row_ids};
 use snafu::location;
 
 use segment::U64Segment;
+use tracing::instrument;
 
 use crate::utils::LanceIteratorExtension;
 
@@ -181,7 +182,7 @@ impl RowIdSequence {
             offset = cutoff;
         }
 
-        self.0.retain(|segment| segment.len() != 0);
+        self.0.retain(|segment| !segment.is_empty());
 
         Ok(())
     }
@@ -299,6 +300,44 @@ impl RowIdSequence {
         None
     }
 
+    /// Get row ids from the sequence based on the provided _sorted_ offsets
+    ///
+    /// Any out of bounds offsets will be ignored
+    ///
+    /// # Panics
+    ///
+    /// If the input selection is not sorted, this function will panic
+    pub fn select<'a>(
+        &'a self,
+        selection: impl Iterator<Item = usize> + 'a,
+    ) -> impl Iterator<Item = u64> + 'a {
+        let mut seg_iter = self.0.iter();
+        let mut cur_seg = seg_iter.next();
+        let mut rows_passed = 0;
+        let mut cur_seg_len = cur_seg.map(|seg| seg.len()).unwrap_or(0);
+        let mut last_index = 0;
+        selection.filter_map(move |index| {
+            if index < last_index {
+                panic!("Selection is not sorted");
+            }
+            last_index = index;
+
+            cur_seg?;
+
+            while (index - rows_passed) >= cur_seg_len {
+                rows_passed += cur_seg_len;
+                cur_seg = seg_iter.next();
+                if let Some(cur_seg) = cur_seg {
+                    cur_seg_len = cur_seg.len();
+                } else {
+                    return None;
+                }
+            }
+
+            Some(cur_seg.unwrap().get(index - rows_passed).unwrap())
+        })
+    }
+
     /// Given a mask of row ids, calculate the offset ranges of the row ids that are present
     /// in the sequence.
     ///
@@ -313,6 +352,7 @@ impl RowIdSequence {
     ///
     /// This function is useful when determining which row offsets to read from a fragment given
     /// a mask.
+    #[instrument(level = "debug", skip_all)]
     pub fn mask_to_offset_ranges(&self, mask: &RowIdMask) -> Vec<Range<u64>> {
         let mut offset = 0;
         let mut ranges = Vec::new();
@@ -991,6 +1031,30 @@ mod test {
         sequence.mask(0..sequence.len() as u32).unwrap();
         let expected = RowIdSequence(vec![]);
         assert_eq!(sequence, expected);
+    }
+
+    #[test]
+    fn test_selection() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::Range(10..15),
+            U64Segment::Range(20..25),
+        ]);
+        let selection = sequence.select(vec![2, 4, 13, 14, 57].into_iter());
+        assert_eq!(selection.collect::<Vec<_>>(), vec![2, 4, 23, 24]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_selection_unsorted() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::Range(10..15),
+            U64Segment::Range(20..25),
+        ]);
+        let _ = sequence
+            .select(vec![2, 4, 3].into_iter())
+            .collect::<Vec<_>>();
     }
 
     #[test]

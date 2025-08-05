@@ -3,6 +3,8 @@
 
 use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
+use crate::decoder::DecoderConfig;
+
 use arrow::array::make_comparator;
 use arrow_array::{Array, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
@@ -174,6 +176,7 @@ async fn test_decode(
         io,
         cache,
         &FilterExpression::no_filter(),
+        &DecoderConfig::default(),
     )
     .await
     .unwrap();
@@ -264,6 +267,30 @@ pub async fn check_round_trip_encoding_random(field: Field, version: LanceFileVe
         field: field.clone(),
     };
     check_round_trip_encoding_generated(field, Box::new(array_generator_provider), version).await;
+}
+
+pub struct FnArrayGeneratorProvider<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> {
+    provider_fn: F,
+}
+
+impl<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> FnArrayGeneratorProvider<F> {
+    pub fn new(provider_fn: F) -> Self {
+        Self { provider_fn }
+    }
+}
+
+impl<F: Fn() -> Box<dyn ArrayGenerator> + Clone + 'static> ArrayGeneratorProvider
+    for FnArrayGeneratorProvider<F>
+{
+    fn provide(&self) -> Box<dyn ArrayGenerator> {
+        (self.provider_fn)()
+    }
+
+    fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
+        Box::new(Self {
+            provider_fn: self.provider_fn.clone(),
+        })
+    }
 }
 
 pub async fn check_round_trip_encoding_generated(
