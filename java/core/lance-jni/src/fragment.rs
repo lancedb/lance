@@ -244,24 +244,7 @@ impl IntoJava for &DataFile {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
         };
-        let path_base_index = match self.path_base_index {
-            Some(base_index) => {
-                let base_index_obj = env.new_object(
-                    "java/lang/Integer", "(I)V", &[JValue::Int(base_index as jint)])?;
-
-                env.call_static_method(
-                    "java/util/Optional",
-                    "of",
-                    "(Ljava/lang/Object;)Ljava/util/Optional;",
-                    &[JValue::from(&base_index_obj)],
-                )?
-                .l()?
-            }
-            None => {
-                env.call_static_method(
-                    "java/util/Optional", "empty", "()Ljava/util/Optional;", &[])?.l()?
-            }
-        };
+        let path_base_index = convert_to_java_integer(env, self.path_base_index)?;
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -303,24 +286,7 @@ impl IntoJava for &DeletionFile {
             None => JObject::null(),
         };
         let file_type = self.file_type.into_java(env)?;
-        let path_base_index = match self.path_base_index {
-            Some(base_index) => {
-                let base_index_obj = env.new_object(
-                    "java/lang/Integer", "(I)V", &[JValue::Int(base_index as jint)])?;
-
-                env.call_static_method(
-                    "java/util/Optional",
-                    "of",
-                    "(Ljava/lang/Object;)Ljava/util/Optional;",
-                    &[JValue::from(&base_index_obj)],
-                )?
-                    .l()?
-            }
-            None => {
-                env.call_static_method(
-                    "java/util/Optional", "empty", "()Ljava/util/Optional;", &[])?.l()?
-            }
-        };
+        let path_base_index = convert_to_java_integer(env, self.path_base_index)?;
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -456,7 +422,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             )?
             .l()?
             .extract_object(env)?;
-        let path_base = get_path_base(env, self)?;
+        let path_base_index = get_path_base_index(env, self)?;
         Ok(DeletionFile {
             read_version,
             id,
@@ -506,7 +472,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             .extract_object(env)?;
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
-        let path_base_index = get_path_base(env, self)?;
+        let path_base_index = get_path_base_index(env, self)?;
         Ok(DataFile {
             path,
             fields,
@@ -519,16 +485,31 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
     }
 }
 
-fn get_path_base(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
+fn get_path_base_index(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
     let path_base_index = env
         .call_method(obj, "getPathBaseIndex", "()Ljava/util/Optional;", &[])?
         .l()?;
 
-    if env.call_method(&path_base_index, "isEmpty", "()Z", &[])?.z()? {
+    if env
+        .call_method(&path_base_index, "isEmpty", "()Z", &[])?
+        .z()?
+    {
         return Ok(None);
     }
-    let inner_value = env.call_method(&path_base_index, "get", "()Ljava/lang/Object;", &[])?
+    let inner_value = env
+        .call_method(&path_base_index, "get", "()Ljava/lang/Object;", &[])?
         .l()?;
     let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
     Ok(Some(int_value as u32))
+}
+
+fn convert_to_java_integer<'local>(env: &mut JNIEnv<'local>, value: Option<u32>) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Integer",
+            "(I)V",
+            &[JValue::Int(base_index as jint)],
+        )?),
+        None => Ok(JObject::null()),
+    }
 }

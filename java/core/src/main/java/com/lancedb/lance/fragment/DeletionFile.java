@@ -16,6 +16,7 @@ package com.lancedb.lance.fragment;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
+import java.util.Optional;
 
 public class DeletionFile implements Serializable {
   private static final long serialVersionUID = 3786348766842875859L;
@@ -24,15 +25,19 @@ public class DeletionFile implements Serializable {
   private final long readVersion;
   private final Long numDeletedRows;
   private final DeletionFileType fileType;
-  private final String pathBase;
+  private final Integer pathBaseIndex;
 
   public DeletionFile(
-      long id, long readVersion, Long numDeletedRows, DeletionFileType fileType, String pathBase) {
+      long id,
+      long readVersion,
+      Long numDeletedRows,
+      DeletionFileType fileType,
+      Integer pathBaseIndex) {
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
     this.fileType = fileType;
-    this.pathBase = pathBase;
+    this.pathBaseIndex = pathBaseIndex;
   }
 
   public long getId() {
@@ -51,8 +56,8 @@ public class DeletionFile implements Serializable {
     return fileType;
   }
 
-  public String getPathBase() {
-    return pathBase;
+  public Optional<Integer> getPathBaseIndex() {
+    return Optional.ofNullable(pathBaseIndex);
   }
 
   @Override
@@ -62,7 +67,7 @@ public class DeletionFile implements Serializable {
         .append("readVersion", readVersion)
         .append("numDeletedRows", numDeletedRows)
         .append("fileType", fileType)
-        .append("pathBase", pathBase)
+        .append("pathBaseIndex", pathBaseIndex)
         .toString();
   }
 }

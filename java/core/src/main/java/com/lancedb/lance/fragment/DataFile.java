@@ -16,6 +16,7 @@ package com.lancedb.lance.fragment;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
+import java.util.Optional;
 
 public class DataFile implements Serializable {
   private static final long serialVersionUID = -2827710928026343591L;
@@ -25,7 +26,7 @@ public class DataFile implements Serializable {
   private final int fileMajorVersion;
   private final int fileMinorVersion;
   private final Long fileSizeBytes;
-  private final String pathBase;
+  private final Integer pathBaseIndex;
 
   public DataFile(
       String path,
@@ -34,14 +35,14 @@ public class DataFile implements Serializable {
       int fileMajorVersion,
       int fileMinorVersion,
       Long fileSizeBytes,
-      String pathBase) {
+      Integer pathBaseIndex) {
     this.path = path;
     this.fields = fields;
     this.columnIndices = columnIndices;
     this.fileMajorVersion = fileMajorVersion;
     this.fileMinorVersion = fileMinorVersion;
     this.fileSizeBytes = fileSizeBytes;
-    this.pathBase = pathBase;
+    this.pathBaseIndex = pathBaseIndex;
   }
 
   public String getPath() {
@@ -68,8 +69,8 @@ public class DataFile implements Serializable {
     return fileSizeBytes;
   }
 
-  public String getPathBase() {
-    return pathBase;
+  public Optional<Integer> getPathBase() {
+    return Optional.ofNullable(pathBaseIndex);
   }
 
   @Override
@@ -81,7 +82,7 @@ public class DataFile implements Serializable {
         .append("fileMajorVersion", fileMajorVersion)
         .append("fileMinorVersion", fileMinorVersion)
         .append("fileSizeBytes", fileSizeBytes)
-        .append("pathBase", pathBase)
+        .append("pathBaseIndex", pathBaseIndex)
         .toString();
   }
 }
