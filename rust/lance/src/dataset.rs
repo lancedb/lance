@@ -7007,9 +7007,11 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Create;
-        write_params.data_storage_version = Some(LanceFileVersion::V2_1);
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
 
         let batches = vec![batch.clone()];
         let batch_reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
