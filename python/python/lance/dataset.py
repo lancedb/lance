@@ -324,7 +324,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = self._storage_options
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
-        ds._read_params = getattr(self, "_read_params", None)
+        ds._read_params = self._read_params.copy() if self._read_params else None
         return ds
 
     def __len__(self):
