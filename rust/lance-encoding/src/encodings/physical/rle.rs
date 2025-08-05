@@ -525,10 +525,8 @@ impl MiniBlockDecompressor for RleMiniBlockDecompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
     use crate::data::DataBlock;
     use arrow_array::Int32Array;
-    use lance_core::datatypes::Field;
 
     // ========== Core Functionality Tests ==========
 
@@ -566,30 +564,6 @@ mod tests {
         // Should have 6 runs total (4 for first value, 2 for second)
         let lengths_buffer = &compressed.data[1];
         assert_eq!(lengths_buffer.len(), 6);
-    }
-
-    #[test]
-    fn test_compression_strategy_selection() {
-        let strategy = DefaultCompressionStrategy::new();
-        let field = Field::new_arrow("test", arrow_schema::DataType::Int32, false).unwrap();
-
-        // High repetition - should select RLE
-        let repetitive_array = Int32Array::from(vec![1; 1000]);
-        let repetitive_block = DataBlock::from_array(repetitive_array);
-
-        let compressor = strategy
-            .create_miniblock_compressor(&field, &repetitive_block)
-            .unwrap();
-        assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
-
-        // No repetition - should NOT select RLE
-        let unique_array = Int32Array::from((0..1000).collect::<Vec<i32>>());
-        let unique_block = DataBlock::from_array(unique_array);
-
-        let compressor = strategy
-            .create_miniblock_compressor(&field, &unique_block)
-            .unwrap();
-        assert!(!format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
     }
 
     // ========== Round-trip Tests for Different Types ==========

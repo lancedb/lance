@@ -58,12 +58,16 @@ use std::fmt::Debug;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::MiniBlockDecompressor;
+use crate::compression_config::BssMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
 use crate::format::pb;
 use crate::format::ProtobufUtils;
+use crate::statistics::{GetStat, Stat};
+use arrow::array::AsArray;
+use arrow::datatypes::UInt64Type;
 use lance_core::Result;
 use snafu::location;
 
@@ -255,6 +259,55 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
             block_info: BlockInfo::new(),
         }))
     }
+}
+
+/// Determine if BSS should be used based on mode and data characteristics
+pub fn should_use_bss(data: &FixedWidthDataBlock, mode: BssMode) -> bool {
+    // Only support byte-aligned data
+    let bytes_per_value = data.bits_per_value / 8;
+    if data.bits_per_value % 8 != 0 || bytes_per_value < 2 {
+        return false;
+    }
+
+    let sensitivity = mode.to_sensitivity();
+
+    // Fast paths
+    if sensitivity <= 0.0 {
+        return false;
+    }
+    if sensitivity >= 1.0 {
+        return true;
+    }
+
+    // Auto mode: check byte position entropy
+    evaluate_entropy_for_bss(data, sensitivity)
+}
+
+/// Evaluate if BSS should be used based on byte position entropy
+fn evaluate_entropy_for_bss(data: &FixedWidthDataBlock, sensitivity: f32) -> bool {
+    // Get the precomputed entropy statistics
+    let Some(entropy_stat) = data.get_stat(Stat::BytePositionEntropy) else {
+        return false; // No entropy data available
+    };
+
+    let entropies = entropy_stat.as_primitive::<UInt64Type>();
+    if entropies.is_empty() {
+        return false;
+    }
+
+    // Calculate average entropy across all byte positions
+    let sum: u64 = entropies.values().iter().sum();
+    let avg_entropy = sum as f64 / entropies.len() as f64 / 1000.0; // Scale back from integer
+
+    // Entropy threshold based on sensitivity
+    // sensitivity = 0.5 (default auto) -> threshold = 4.0 bits
+    // sensitivity = 0.0 (off) -> threshold = 0.0 (never use)
+    // sensitivity = 1.0 (on) -> threshold = 8.0 (always use)
+    let entropy_threshold = sensitivity as f64 * 8.0;
+
+    // Use BSS if average entropy is below threshold
+    // Lower entropy means more repetitive byte patterns
+    avg_entropy < entropy_threshold
 }
 
 #[cfg(test)]
