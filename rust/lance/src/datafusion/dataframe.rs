@@ -124,7 +124,7 @@ impl TableProvider for LanceTableProvider {
         scan.limit(limit.map(|l| l as i64), None)?;
         scan.scan_in_order(self.ordered);
 
-        dbg!(scan.create_plan().await).map_err(DataFusionError::from)
+        scan.create_plan().await.map_err(DataFusionError::from)
     }
 
     // Since we are using datafusion itself to apply the filters it should

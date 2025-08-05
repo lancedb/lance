@@ -95,16 +95,6 @@ impl SqlQuery {
     pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {
         use futures::TryStreamExt;
 
-        let plan = self.dataframe.clone().into_optimized_plan().unwrap();
-        println!("{:#?}", plan);
-
-        let plan = self.dataframe.clone().create_physical_plan().await.unwrap();
-        println!(
-            "{}",
-            datafusion_physical_plan::display::DisplayableExecutionPlan::new(plan.as_ref())
-                .indent(true)
-        );
-
         Ok(self
             .dataframe
             .execute_stream()
