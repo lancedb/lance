@@ -28,3 +28,7 @@ pub static ROW_ID_FIELD: LazyLock<ArrowField> =
 /// as a selection vector.
 pub static ROW_ADDR_FIELD: LazyLock<ArrowField> =
     LazyLock::new(|| ArrowField::new(ROW_ADDR, DataType::UInt64, true));
+/// Row offset field. This is nullable merely for compatibility with the other
+/// fields.
+pub static ROW_OFFSET_FIELD: LazyLock<ArrowField> =
+    LazyLock::new(|| ArrowField::new(ROW_OFFSET, DataType::UInt64, true));

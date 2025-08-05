@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Float32Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -34,6 +34,7 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
@@ -42,9 +43,12 @@ use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, ROW_OFFSET};
-use lance_datafusion::exec::{analyze_plan, execute_plan, LanceExecutionOptions};
+use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
+use lance_datafusion::exec::{
+    analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
+};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
@@ -65,6 +69,7 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
+use crate::dataset::row_offsets_to_row_addresses;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
@@ -404,6 +409,7 @@ fn escape_column_name(name: &str) -> String {
 }
 
 /// Represents a user-requested take operation
+#[derive(Debug, Clone)]
 pub enum TakeOperation {
     /// Take rows by row id
     RowIds(Vec<u64>),
@@ -416,50 +422,101 @@ pub enum TakeOperation {
     RowOffsets(Vec<u64>),
 }
 
-/// Certain filters can be satisfied by a take operator
-///
-/// For example:
-///  - `_rowid = 10`
-///  - `_rowid IN (10, 20, 30)`
-///  - `_rowaddr = 10`
-///  - `_rowaddr IN (10, 20, 30)`
-///  - `_rowoffset = 10`
-///  - `_rowoffset IN (10, 20, 30)`
-///
-/// The _rowid / _rowaddr / _rowoffset determine if we are taking by row id, address, or offset.
-fn extract_take(expr: &Expr) -> Option<TakeOperation> {
-    if let Expr::BinaryExpr(binary) = expr {
-        match binary.op {
-            datafusion_expr::Operator::Eq => {
-                // Check for _rowid = literal
-                if let (Expr::Column(col), Expr::Literal(lit, _)) =
-                    (binary.left.as_ref(), binary.right.as_ref())
+impl TakeOperation {
+    fn extract_u64_list(list: &[Expr]) -> Option<Vec<u64>> {
+        let mut u64s = Vec::with_capacity(list.len());
+        for expr in list {
+            if let Expr::Literal(lit, _) = expr {
+                if let Some(ScalarValue::UInt64(Some(val))) =
+                    safe_coerce_scalar(lit, &DataType::UInt64)
                 {
-                    if col.name == ROW_ID {
+                    u64s.push(val);
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(u64s)
+    }
+
+    fn merge(self, other: TakeOperation) -> Option<TakeOperation> {
+        match (self, other) {
+            (TakeOperation::RowIds(mut left), TakeOperation::RowIds(right)) => {
+                left.extend(right);
+                Some(TakeOperation::RowIds(left))
+            }
+            (TakeOperation::RowAddrs(mut left), TakeOperation::RowAddrs(right)) => {
+                left.extend(right);
+                Some(TakeOperation::RowAddrs(left))
+            }
+            (TakeOperation::RowOffsets(mut left), TakeOperation::RowOffsets(right)) => {
+                left.extend(right);
+                Some(TakeOperation::RowOffsets(left))
+            }
+            _ => None,
+        }
+    }
+
+    /// Attempts to create a take operation from an expression.  This will succeed if the expression
+    /// has one of the following forms:
+    ///  - `_rowid = 10`
+    ///  - `_rowid = 10 OR _rowid = 20 OR _rowid = 30`
+    ///  - `_rowid IN (10, 20, 30)`
+    ///  - `_rowaddr = 10`
+    ///  - `_rowaddr = 10 OR _rowaddr = 20 OR _rowaddr = 30`
+    ///  - `_rowaddr IN (10, 20, 30)`
+    ///  - `_rowoffset = 10`
+    ///  - `_rowoffset = 10 OR _rowoffset = 20 OR _rowoffset = 30`
+    ///  - `_rowoffset IN (10, 20, 30)`
+    ///
+    /// The _rowid / _rowaddr / _rowoffset determine if we are taking by row id, address, or offset.
+    fn try_from_expr(expr: &Expr) -> Option<TakeOperation> {
+        if let Expr::BinaryExpr(binary) = expr {
+            match binary.op {
+                datafusion_expr::Operator::Eq => {
+                    // Check for _rowid = literal
+                    if let (Expr::Column(col), Expr::Literal(lit, _)) =
+                        (binary.left.as_ref(), binary.right.as_ref())
+                    {
                         if let Some(ScalarValue::UInt64(Some(val))) =
                             safe_coerce_scalar(lit, &DataType::UInt64)
                         {
-                            return Some(TakeOperation::RowIds(vec![val]));
-                        }
-                    } else if col.name == ROW_ADDR {
-                        if let Some(ScalarValue::UInt64(Some(val))) =
-                            safe_coerce_scalar(lit, &DataType::UInt64)
-                        {
-                            return Some(TakeOperation::RowAddrs(vec![val]));
-                        }
-                    } else if col.name == ROW_OFFSET {
-                        if let Some(ScalarValue::UInt64(Some(val))) =
-                            safe_coerce_scalar(lit, &DataType::UInt64)
-                        {
-                            return Some(TakeOperation::RowOffsets(vec![val]));
+                            if col.name == ROW_ID {
+                                return Some(TakeOperation::RowIds(vec![val]));
+                            } else if col.name == ROW_ADDR {
+                                return Some(TakeOperation::RowAddrs(vec![val]));
+                            } else if col.name == ROW_OFFSET {
+                                return Some(TakeOperation::RowOffsets(vec![val]));
+                            }
                         }
                     }
                 }
+                datafusion_expr::Operator::Or => {
+                    let left_take = Self::try_from_expr(&binary.left);
+                    let right_take = Self::try_from_expr(&binary.right);
+                    if let (Some(left), Some(right)) = (left_take, right_take) {
+                        return left.merge(right);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+        } else if let Expr::InList(in_expr) = expr {
+            if let Expr::Column(col) = in_expr.expr.as_ref() {
+                if let Some(u64s) = Self::extract_u64_list(&in_expr.list) {
+                    if col.name == ROW_ID {
+                        return Some(TakeOperation::RowIds(u64s));
+                    } else if col.name == ROW_ADDR {
+                        return Some(TakeOperation::RowAddrs(u64s));
+                    } else if col.name == ROW_OFFSET {
+                        return Some(TakeOperation::RowOffsets(u64s));
+                    }
+                }
+            }
         }
+        None
     }
-    None
 }
 
 impl Scanner {
@@ -1142,7 +1199,7 @@ impl Scanner {
     }
 
     fn add_extra_columns(&self, schema: Schema) -> Result<Schema> {
-        let mut extra_columns = vec![];
+        let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
 
         if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
@@ -1152,11 +1209,7 @@ impl Scanner {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
         }
 
-        if extra_columns.is_empty() {
-            Ok(schema)
-        } else {
-            schema.merge(&ArrowSchema::new(extra_columns))
-        }
+        schema.merge(&ArrowSchema::new(extra_columns))
     }
 
     /// The full schema available to filters
@@ -1168,6 +1221,7 @@ impl Scanner {
             .with_row_id()
             .with_row_addr()
             .to_schema();
+
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
@@ -1569,14 +1623,25 @@ impl Scanner {
                     });
                 }
 
-                let planned_read = self.filtered_read_source(&mut filter_plan).await?;
-                if planned_read.limit_pushed_down {
-                    use_limit_node = false;
-                }
-                if planned_read.filter_pushed_down {
+                let take_op = filter_plan
+                    .full_expr
+                    .as_ref()
+                    .and_then(TakeOperation::try_from_expr)
+                    .map(|x| dbg!(x));
+                if let Some(take_op) = take_op {
+                    // Reset the filter plan because we are going to apply it in the take
                     filter_plan = FilterPlan::default();
+                    self.take_source(take_op).await?
+                } else {
+                    let planned_read = self.filtered_read_source(&mut filter_plan).await?;
+                    if planned_read.limit_pushed_down {
+                        use_limit_node = false;
+                    }
+                    if planned_read.filter_pushed_down {
+                        filter_plan = FilterPlan::default();
+                    }
+                    planned_read.plan
                 }
-                planned_read.plan
             }
             _ => {
                 return Err(Error::InvalidInput {
@@ -1839,6 +1904,47 @@ impl Scanner {
                 limit_pushed_down,
                 plan,
             })
+        }
+    }
+
+    fn u64s_as_take_input(u64s: Vec<u64>, col_name: &str) -> Result<Arc<dyn ExecutionPlan>> {
+        let arr = UInt64Array::from(u64s);
+        let field = ArrowField::new(col_name, DataType::UInt64, false);
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)])?;
+        let stream = futures::stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        Ok(Arc::new(OneShotExec::new(stream)))
+    }
+
+    async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
+        // We generally assume that late materialization does not make sense for take operations
+        // so we can just use the physical projection
+        let projection = self.projection_plan.physical_projection.clone();
+
+        let input = match take_op {
+            TakeOperation::RowIds(ids) => Self::u64s_as_take_input(ids, ROW_ID),
+            TakeOperation::RowAddrs(addrs) => Self::u64s_as_take_input(addrs, ROW_ADDR),
+            TakeOperation::RowOffsets(offsets) => {
+                let addrs = row_offsets_to_row_addresses(self.dataset.as_ref(), &offsets).await?;
+                if addrs.iter().any(|addr| *addr == RowAddress::TOMBSTONE_ROW) {
+                    return Err(Error::InvalidInput {
+                        source: "One or more row offsets went past the end of the dataset".into(),
+                        location: location!(),
+                    });
+                }
+                Self::u64s_as_take_input(addrs, ROW_ADDR)
+            }
+        }?;
+
+        let input_clone = input.clone();
+        if let Some(take) = TakeExec::try_new(self.dataset.clone(), input, projection)? {
+            Ok(Arc::new(take))
+        } else {
+            // This is pretty much a nonsense path but could happen if the user does
+            //
+            // SELECT _rowid FROM table WHERE _rowid = 10
+            Ok(input_clone)
         }
     }
 
@@ -7264,74 +7370,124 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_rowid_filter_to_take() -> Result<()> {
-        use arrow_array::{Int32Array, RecordBatch};
-        use arrow_schema::{DataType, Field, Schema};
-
-        // Create test data
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Int32, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])),
-                Arc::new(Int32Array::from(vec![
-                    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                ])),
-            ],
-        )?;
-
-        // Create dataset
-        use arrow_array::RecordBatchIterator;
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
-        let dataset = Dataset::write(reader, "memory://test", None).await?;
-
-        // Test rowid filter
-        let plan_str = dataset
-            .scan()
-            .filter("_rowid = 5")?
-            .with_row_id()
-            .explain_plan(true)
-            .await?;
-
-        println!("Execution plan for _rowid = 5:\n{}", plan_str);
-
-        // Check if Take operation is in the plan
-        assert!(
-            plan_str.contains("Take:") || plan_str.contains("TakeExec"),
-            "Filter '_rowid = 5' should be converted to Take operation. Got plan:\n{}",
-            plan_str
-        );
-
-        // Also test that the results are correct
-        let results = dataset
-            .scan()
-            .filter("_rowid = 5")?
-            .with_row_id()
-            .try_into_batch()
-            .await?;
-
-        assert_eq!(results.num_rows(), 1, "Should find exactly one row");
-
-        // Row 5 should have id=5 and value=15
-        let id_arr = results
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
+    async fn test_filter_to_take() {
+        let mut ds = lance_datagen::gen()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
             .unwrap();
-        let value_arr = results
-            .column_by_name("value")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(id_arr.value(0), 5);
-        assert_eq!(value_arr.value(0), 15);
 
-        Ok(())
+        let row_ids = ds
+            .scan()
+            .project(&Vec::<&str>::default())
+            .unwrap()
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = row_ids[0].schema();
+        let row_ids = concat_batches(&schema, row_ids.iter()).unwrap();
+        let row_ids = row_ids.column(0).as_primitive::<UInt64Type>().clone();
+
+        let row_addrs = ds
+            .scan()
+            .project(&Vec::<&str>::default())
+            .unwrap()
+            .with_row_address()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = row_addrs[0].schema();
+        let row_addrs = concat_batches(&schema, row_addrs.iter()).unwrap();
+        let row_addrs = row_addrs.column(0).as_primitive::<UInt64Type>().clone();
+
+        ds.delete("idx >= 190 AND idx < 210").await.unwrap();
+
+        let ds_copy = ds.clone();
+        let check = async move |filt: &str, expected_idx: &[i32]| {
+            let mut scanner = ds_copy.scan();
+            scanner.filter(filt).unwrap();
+            let stream = scanner.try_into_stream().await.unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let idx = batches
+                .iter()
+                .map(|b| b.column_by_name("idx").unwrap().as_ref())
+                .collect::<Vec<_>>();
+            let idx = arrow::compute::concat(&idx).unwrap();
+
+            assert_eq!(idx.as_primitive::<Int32Type>().values(), expected_idx);
+        };
+
+        // Simple case, no deletions yet
+        check("_rowid = 50", &[50]).await;
+        check("_rowaddr = 50", &[50]).await;
+        check("_rowoffset = 50", &[50]).await;
+
+        check(
+            "_rowid = 50 OR _rowid = 51 OR _rowid = 52 OR _rowid = 49",
+            &[50, 51, 52, 49],
+        )
+        .await;
+        check(
+            "_rowaddr = 50 OR _rowaddr = 51 OR _rowaddr = 52 OR _rowaddr = 49",
+            &[50, 51, 52, 49],
+        )
+        .await;
+        check(
+            "_rowoffset = 50 OR _rowoffset = 51 OR _rowoffset = 52 OR _rowoffset = 49",
+            &[50, 51, 52, 49],
+        )
+        .await;
+
+        check("_rowid IN (52, 51, 50, 17)", &[52, 51, 50, 17]).await;
+        check("_rowaddr IN (52, 51, 50, 17)", &[52, 51, 50, 17]).await;
+        check("_rowoffset IN (52, 51, 50, 17)", &[52, 51, 50, 17]).await;
+
+        // Taking _rowid / _rowaddr of deleted row
+
+        // TODO: Would be nice to either get empty batches or an error when we try and take
+        // an id / addr that doesn't exist.  Today we get a bizarre error:
+        // check(&format!("_rowid = {}", row_ids.value(190)), &[]).await;
+        // check(&format!("_rowaddr = {}", row_addrs.value(190)), &[]).await;
+        check("_rowoffset = 190", &[210]).await;
+
+        // Grabbing after the deleted rows
+        check(&format!("_rowid = {}", row_ids.value(250)), &[250]).await;
+        check(&format!("_rowaddr = {}", row_addrs.value(250)), &[250]).await;
+        check("_rowoffset = 250", &[270]).await;
+
+        // Grabbing past the end
+        let res = ds
+            .scan()
+            .filter("_rowoffset = 1000")
+            .unwrap()
+            .try_into_stream()
+            .await;
+        match res {
+            Ok(_) => panic!("Expected error"),
+            Err(e) => {
+                assert!(e
+                    .to_string()
+                    .contains("One or more row offsets went past the end of the dataset"))
+            }
+        }
+
+        // Dynamic projection
+        let mut scanner = ds.scan();
+        scanner.filter("_rowoffset = 77").unwrap();
+        scanner
+            .project_with_transform(&[("foo", "idx * 2")])
+            .unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "foo");
+        let val = batches[0].column(0).as_primitive::<Int32Type>().values()[0];
+        assert_eq!(val, 154);
     }
 }

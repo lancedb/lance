@@ -14,6 +14,7 @@ use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::ROW_ADDR;
 use lance_core::ROW_ID;
+use lance_core::ROW_OFFSET;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -344,7 +345,7 @@ impl<'a> InsertBuilder<'a> {
 
         // Make sure we aren't using any reserved column names
         for field in data_schema.fields.iter() {
-            if field.name == ROW_ID || field.name == ROW_ADDR {
+            if field.name == ROW_ID || field.name == ROW_ADDR || field.name == ROW_OFFSET {
                 return Err(Error::InvalidInput {
                     source: format!(
                         "The column {} is a reserved name and cannot be used in a Lance dataset",
