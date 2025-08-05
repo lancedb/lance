@@ -705,7 +705,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_major_version,
             self.0.file_minor_version,
             file_size_bytes,
-            self.0.path_base_index.clone(),
+            self.0.path_base_index,
         ))
     }
 }
