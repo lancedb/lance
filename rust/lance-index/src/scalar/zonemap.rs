@@ -552,7 +552,7 @@ pub async fn train_zonemap_index(
     options: Option<ZoneMapIndexBuilderOptions>,
 ) -> Result<()> {
     // TODO: Implement actual training logic
-    let batches_source = data_source.scan_unordered_chunks(4096).await?;
+    let batches_source = data_source.scan_aligned_chunks(4096).await?;
     let value_type = batches_source.schema().field(0).data_type().clone();
 
     let mut builder = ZoneMapIndexBuilder::try_new(

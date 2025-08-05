@@ -5,11 +5,12 @@
 
 use std::cmp::min;
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, cell::Cell, sync::Arc};
 
-use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
@@ -383,7 +384,43 @@ pub mod tests {
             self: Box<Self>,
             _chunk_size: u32,
         ) -> Result<SendableRecordBatchStream> {
-            Ok(self.data)
+            // Implement similar functionality to TrainingRequest's scan_aligned_chunks
+            // Add _rowaddr column to the data with proper fragment_id and local_offset
+
+            let schema = self.data.schema();
+            let mut new_fields = schema.fields().to_vec();
+            new_fields.push(Arc::new(Field::new("_rowaddr", DataType::UInt64, false)));
+
+            let new_schema = Arc::new(Schema::new(new_fields));
+            let schema_for_stream = new_schema.clone();
+
+            // Create a stream that adds proper _rowaddr values
+            // For MockTrainingSource, we'll treat each batch as a separate fragment
+            let fragment_id = Cell::new(0u32);
+            let data_with_rowaddr = self.data.map_ok(move |batch| {
+                let num_rows = batch.num_rows();
+                let current_fragment_id = fragment_id.get();
+
+                // Calculate _rowaddr as (fragment_id << 32) | local_offset
+                let rowaddrs = UInt64Array::from_iter_values((0..num_rows).map(|local_offset| {
+                    let fragment_id_u64 = current_fragment_id as u64;
+                    let local_offset_u64 = local_offset as u64;
+                    (fragment_id_u64 << 32) | local_offset_u64
+                }));
+
+                let mut new_columns = batch.columns().to_vec();
+                new_columns.push(Arc::new(rowaddrs));
+
+                // Increment fragment_id for the next batch
+                fragment_id.set(current_fragment_id + 1);
+
+                RecordBatch::try_new(schema_for_stream.clone(), new_columns).unwrap()
+            });
+
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                new_schema,
+                data_with_rowaddr,
+            )))
         }
     }
 
