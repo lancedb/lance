@@ -18,7 +18,7 @@ use arrow_array::{
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
@@ -783,7 +783,8 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
             )));
         }
     }
-    StructArray::try_new(fields.clone(), columns, None)
+    // Preserve the struct's validity when projecting
+    StructArray::try_new(fields.clone(), columns, struct_array.nulls().cloned())
 }
 
 fn lists_have_same_offsets_helper<T: OffsetSizeTrait>(left: &dyn Array, right: &dyn Array) -> bool {
@@ -1015,13 +1016,11 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
             }
         });
 
-    let zipped: Vec<(FieldRef, ArrayRef)> = fields
-        .iter()
-        .cloned()
-        .map(Arc::new)
-        .zip(columns.iter().cloned())
-        .collect::<Vec<_>>();
-    StructArray::from(zipped)
+    // Preserve validity from the left struct array (if any)
+    // This assumes that both structs have the same validity pattern if they're being merged
+    let validity = left_struct_array.nulls().cloned();
+
+    StructArray::try_new(Fields::from(fields), columns, validity).unwrap()
 }
 
 fn merge_with_schema(
@@ -1087,12 +1086,11 @@ fn merge_with_schema(
         }
     }
 
-    let zipped: Vec<(FieldRef, ArrayRef)> = output_fields
-        .into_iter()
-        .map(Arc::new)
-        .zip(columns)
-        .collect::<Vec<_>>();
-    StructArray::from(zipped)
+    // Preserve validity from the left struct array (if any)
+    // This assumes that both structs have the same validity pattern if they're being merged
+    let validity = left_struct_array.nulls().cloned();
+
+    StructArray::try_new(Fields::from(output_fields), columns, validity).unwrap()
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
@@ -1200,7 +1198,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, new_null_array, Int32Array, ListArray, StringArray};
+    use arrow_array::{new_empty_array, new_null_array, ListArray, StringArray};
+    use arrow_array::{Float32Array, Int32Array, StructArray};
     use arrow_buffer::OffsetBuffer;
 
     #[test]
@@ -1544,5 +1543,35 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn test_project_preserves_struct_validity() {
+        // Test that projecting a struct array preserves its validity (fix for issue #4385)
+        let fields = Fields::from(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Float32, true),
+        ]);
+
+        // Create a struct array with validity
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let value_array = Float32Array::from(vec![Some(1.0), Some(2.0), Some(3.0)]);
+        let struct_array = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(id_array) as ArrayRef,
+                Arc::new(value_array) as ArrayRef,
+            ],
+            Some(vec![true, false, true].into()), // Second struct is null
+        );
+
+        // Project the struct array
+        let projected = project(&struct_array, &fields).unwrap();
+
+        // Verify the validity is preserved
+        assert_eq!(projected.null_count(), 1);
+        assert!(!projected.is_null(0));
+        assert!(projected.is_null(1));
+        assert!(!projected.is_null(2));
     }
 }

@@ -174,6 +174,7 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
         Ok(DataBlock::Struct(StructDataBlock {
             children: children_data_block,
             block_info: BlockInfo::default(),
+            validity: None,
         }))
     }
 }
