@@ -490,17 +490,18 @@ fn get_path_base_index(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
         .call_method(obj, "getPathBaseIndex", "()Ljava/util/Optional;", &[])?
         .l()?;
 
-    if env
+    if !env
         .call_method(&path_base_index, "isPresent", "()Z", &[])?
         .z()?
     {
-        return Ok(None);
+        let inner_value = env
+            .call_method(&path_base_index, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
+        Ok(Some(int_value as u32))
+    } else {
+        Ok(None)
     }
-    let inner_value = env
-        .call_method(&path_base_index, "get", "()Ljava/lang/Object;", &[])?
-        .l()?;
-    let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
-    Ok(Some(int_value as u32))
 }
 
 fn convert_to_java_integer<'local>(
