@@ -1574,4 +1574,54 @@ mod tests {
         assert!(projected.is_null(1));
         assert!(!projected.is_null(2));
     }
+
+    #[test]
+    fn test_merge_struct_with_different_validity() {
+        // Test case from Weston's review comment
+        // File 1 has height field with some nulls
+        let height_array = Int32Array::from(vec![Some(500), None, Some(600), None]);
+        let left_fields = Fields::from(vec![Field::new("height", DataType::Int32, true)]);
+        let left_struct = StructArray::new(
+            left_fields,
+            vec![Arc::new(height_array) as ArrayRef],
+            Some(vec![true, false, true, false].into()), // Rows 2 and 4 are null structs
+        );
+
+        // File 2 has width field with some nulls  
+        let width_array = Int32Array::from(vec![Some(300), Some(200), None, None]);
+        let right_fields = Fields::from(vec![Field::new("width", DataType::Int32, true)]);
+        let right_struct = StructArray::new(
+            right_fields,
+            vec![Arc::new(width_array) as ArrayRef],
+            Some(vec![true, true, false, false].into()), // Rows 3 and 4 are null structs
+        );
+
+        // Merge the two structs
+        let merged = merge(&left_struct, &right_struct);
+
+        // Expected: 
+        // Row 1: both non-null -> {width: 300, height: 500}
+        // Row 2: left null, right non-null -> {width: 200, height: null}
+        // Row 3: left non-null, right null -> {width: null, height: 600}
+        // Row 4: both null -> null struct
+        
+        assert_eq!(merged.null_count(), 1); // Only row 4 is null
+        assert!(!merged.is_null(0));
+        assert!(!merged.is_null(1));
+        assert!(!merged.is_null(2));
+        assert!(merged.is_null(3));
+
+        // Check field values
+        let height_col = merged.column_by_name("height").unwrap();
+        let height_values = height_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(height_values.value(0), 500);
+        assert!(height_values.is_null(1)); // height is null when left struct was null
+        assert_eq!(height_values.value(2), 600);
+
+        let width_col = merged.column_by_name("width").unwrap();
+        let width_values = width_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(width_values.value(0), 300);
+        assert_eq!(width_values.value(1), 200);
+        assert!(width_values.is_null(2)); // width is null when right struct was null
+    }
 }
