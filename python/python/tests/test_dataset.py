@@ -1235,7 +1235,9 @@ def test_strict_overwrite(tmp_path: Path):
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
     dataset_v1 = lance.LanceDataset.commit(base_dir, operation, max_retries=0)
-    lance.LanceDataset.commit(base_dir, operation, read_version=dataset_v1.version, max_retries=0)
+    lance.LanceDataset.commit(
+        base_dir, operation, read_version=dataset_v1.version, max_retries=0
+    )
     with pytest.raises(
         OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
     ):
