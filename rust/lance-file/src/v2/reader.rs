@@ -2144,6 +2144,56 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_empty_range() {
+        let fs = FsFixture::default();
+        create_some_file(&fs, LanceFileVersion::V2_0).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // All ranges empty, no data
+        let batches = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Range(0..0),
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 0);
+
+        // Some ranges empty
+        let batches = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Ranges(Arc::new([0..1, 2..2])),
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_global_buffers() {
         let fs = FsFixture::default();
 

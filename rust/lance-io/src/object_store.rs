@@ -236,6 +236,11 @@ impl Eq for ObjectStoreParams {}
 impl PartialEq for ObjectStoreParams {
     #[allow(deprecated)]
     fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "aws")]
+        if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
+            return false;
+        }
+
         // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
         self.block_size == other.block_size
             && self
@@ -247,8 +252,6 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.aws_credentials.as_ref().map(Arc::as_ptr)
-                == other.aws_credentials.as_ref().map(Arc::as_ptr)
             && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
                 == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
             && self.storage_options == other.storage_options
