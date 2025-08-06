@@ -974,7 +974,6 @@ fn merge_struct_validity(
                         return Some(left.clone());
                     }
 
-                    // Use SIMD-optimized bitwise OR operation
                     let left_buffer = left.inner();
                     let right_buffer = right.inner();
 
@@ -982,7 +981,6 @@ fn merge_struct_validity(
                     // This preserves the correct semantics: 1 = valid, 0 = null
                     let merged_buffer = left_buffer | right_buffer;
 
-                    // The result is already a BooleanBuffer with correct semantics
                     Some(arrow_buffer::NullBuffer::from(merged_buffer))
                 }
             }
@@ -1013,8 +1011,6 @@ fn adjust_child_validity(
             parent_validity.clone()
         }
         Some(child_nulls) => {
-            // Use SIMD-optimized bitwise AND operation
-            // Direct buffer operations without BooleanArray conversion
             let child_buffer = child_nulls.inner();
             let parent_buffer = parent_validity.inner();
 
@@ -1022,7 +1018,6 @@ fn adjust_child_validity(
             // This preserves the correct semantics: 1 = valid, 0 = null
             let merged_buffer = child_buffer & parent_buffer;
 
-            // The result is already a BooleanBuffer with correct semantics
             arrow_buffer::NullBuffer::from(merged_buffer)
         }
     };
