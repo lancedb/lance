@@ -1178,7 +1178,7 @@ impl Dataset {
                         )
                     })
             }
-            _ => Ok(self.base.as_ref().into()),
+            _ => Ok(self.base.clone()),
         }
     }
 
