@@ -2741,6 +2741,7 @@ def test_scan_no_columns(tmp_path: Path):
     batches = list(dataset.scanner(columns=[], batch_size=10).to_batches())
     assert len(batches) == 10
     for batch in batches:
+        assert batch.schema.names == []
         assert batch.num_rows == 10
 
     # also test with deleted data to make sure deleted ids not included
