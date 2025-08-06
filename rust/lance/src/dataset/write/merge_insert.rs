@@ -1588,6 +1588,11 @@ impl MergeInsertJob {
     /// This method takes actual source data, calls `create_plan()` to generate the plan,
     /// and executes it to collect performance metrics and analysis.
     ///
+    /// **Note:** This method executes the merge insert operation to collect metrics
+    /// but **does not commit the changes**. While data files may be written to storage
+    /// during execution, they will not be referenced by any dataset version and the
+    /// dataset remains unchanged. This is intended for performance analysis only.
+    ///
     /// # Arguments
     ///
     /// * `source` - The source data stream that would be used in the merge insert
@@ -3450,12 +3455,15 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_analyze_plan() {
         // Set up test data using lance_datagen
-        let dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .col("name", array::cycle_utf8_literals(&["a", "b", "c"]))
             .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
             .await
             .unwrap();
+
+        // Capture the original version before analyze_plan
+        let original_version = dataset.version().version;
 
         // Create merge insert job
         let merge_insert_job =
@@ -3496,6 +3504,15 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         // Should show execution metrics including new write metrics
         assert!(analysis.contains("bytes_written"));
         assert!(analysis.contains("num_files_written"));
+
+        // IMPORTANT: Verify that no new version was created
+        // analyze_plan should not commit the transaction
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            original_version,
+            "analyze_plan should not create a new dataset version"
+        );
 
         // Also validate the full string structure with pattern matching
         let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1]

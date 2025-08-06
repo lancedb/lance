@@ -292,6 +292,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         as a formatted string. This is useful for understanding the actual
         performance characteristics of the merge insert operation with your data.
 
+        .. warning::
+            This method executes the merge insert operation to collect metrics
+            but **does not commit the changes**. While data files may be written
+            to storage during execution, they will not be referenced by any dataset
+            version and the dataset remains unchanged. This is intended for
+            performance analysis only.
+
         Parameters
         ----------
         data_obj : ReaderLike
