@@ -1751,6 +1751,13 @@ impl RequestedRows {
             Self::Indices(indices) => indices.len() as u64,
         }
     }
+
+    pub fn trim_empty_ranges(mut self) -> Self {
+        if let Self::Ranges(ranges) = &mut self {
+            ranges.retain(|r| !r.is_empty());
+        }
+        self
+    }
 }
 
 /// Configuration for decoder behavior
@@ -1926,6 +1933,11 @@ pub fn schedule_and_decode(
     if requested_rows.num_rows() == 0 {
         return stream::empty().boxed();
     }
+
+    // If the user requested any ranges that are empty, ignore them.  They are pointless and
+    // trying to read them has caused bugs in the past.
+    let requested_rows = requested_rows.trim_empty_ranges();
+
     // For convenience we really want this method to be a snchronous method where all
     // errors happen on the stream.  There is some async initialization that must happen
     // when creating a scheduler.  We wrap that all up in the very first task.
