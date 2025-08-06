@@ -332,6 +332,7 @@ pub mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::ROW_ADDR;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -389,7 +390,7 @@ pub mod tests {
 
             let schema = self.data.schema();
             let mut new_fields = schema.fields().to_vec();
-            new_fields.push(Arc::new(Field::new("_rowaddr", DataType::UInt64, false)));
+            new_fields.push(Arc::new(Field::new(ROW_ADDR, DataType::UInt64, false)));
 
             let new_schema = Arc::new(Schema::new(new_fields));
             let schema_for_stream = new_schema.clone();
