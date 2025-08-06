@@ -12,6 +12,8 @@ use lance_table::{
     format::{Fragment, RowIdMeta},
     rowids::{read_row_ids, RowIdIndex, RowIdSequence},
 };
+use lance_table::rowids::FragmentRowIdIndex;
+use lance_core::utils::deletion::DeletionVector;
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -96,7 +98,29 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
         .try_collect::<Vec<_>>()
         .await?;
 
-    let index = RowIdIndex::new(&sequences)?;
+    let frag_indices: Vec<FragmentRowIdIndex> = futures::future::try_join_all(
+        sequences.into_iter().map(|(fragment_id, row_id_sequence)| {
+            let dataset = dataset.clone();
+            async move {
+                let deletion_vector = match dataset.get_fragment(fragment_id as usize) {
+                    Some(fragment) => match fragment.get_deletion_vector().await? {
+                        Some(deletion_vector) => deletion_vector,
+                        None => Arc::new(DeletionVector::default()),
+                    },
+                    None => Arc::new(DeletionVector::default()),
+                };
+
+                Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
+                    fragment_id,
+                    row_id_sequence,
+                    deletion_vector,
+                })
+            }
+        })
+    )
+        .await?;
+
+    let index = RowIdIndex::new(&frag_indices)?;
 
     Ok(index)
 }

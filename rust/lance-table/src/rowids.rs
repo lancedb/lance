@@ -25,6 +25,7 @@ mod serde;
 use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
+pub use index::FragmentRowIdIndex;
 use lance_core::{
     utils::mask::{RowIdMask, RowIdTreeMap},
     Error, Result,
