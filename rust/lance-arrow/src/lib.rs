@@ -931,9 +931,10 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
-// Helper function to merge validity buffers from two struct arrays
-// Returns None only if both arrays are null at the same position
-// Uses SIMD-optimized bitwise operations for performance
+/// Helper function to merge validity buffers from two struct arrays
+/// Returns None only if both arrays are null at the same position
+///
+/// Special handling for placeholder structs (all-null validity)
 fn merge_struct_validity(
     left_validity: Option<&arrow_buffer::NullBuffer>,
     right_validity: Option<&arrow_buffer::NullBuffer>,
@@ -941,25 +942,50 @@ fn merge_struct_validity(
     match (left_validity, right_validity) {
         // Fast paths: no computation needed
         (None, None) => None,
-        (Some(left), None) => Some(left.clone()),
-        (None, Some(right)) => Some(right.clone()),
-        (Some(left), Some(right)) => {
-            // Fast path: if both have no nulls, can return either one
-            if left.null_count() == 0 && right.null_count() == 0 {
-                return Some(left.clone());
+        (Some(left), None) => {
+            // Check if left is a placeholder (all null)
+            if left.null_count() == left.len() {
+                None
+            } else {
+                Some(left.clone())
             }
+        }
+        (None, Some(right)) => {
+            // Check if right is a placeholder (all null)
+            if right.null_count() == right.len() {
+                None
+            } else {
+                Some(right.clone())
+            }
+        }
+        (Some(left), Some(right)) => {
+            // Check for placeholders first
+            let left_is_placeholder = left.null_count() == left.len();
+            let right_is_placeholder = right.null_count() == right.len();
 
-            // Use SIMD-optimized bitwise OR operation
-            // Direct buffer operations without BooleanArray conversion
-            let left_buffer = left.inner();
-            let right_buffer = right.inner();
+            match (left_is_placeholder, right_is_placeholder) {
+                (true, true) => None,                 // Both are placeholders
+                (true, false) => Some(right.clone()), // Left is placeholder, use right
+                (false, true) => Some(left.clone()),  // Right is placeholder, use left
+                (false, false) => {
+                    // Neither is placeholder, perform normal merge
+                    // Fast path: if both have no nulls, can return either one
+                    if left.null_count() == 0 && right.null_count() == 0 {
+                        return Some(left.clone());
+                    }
 
-            // Perform bitwise OR directly on BooleanBuffers
-            // This preserves the correct semantics: 1 = valid, 0 = null
-            let merged_buffer = left_buffer | right_buffer;
+                    // Use SIMD-optimized bitwise OR operation
+                    let left_buffer = left.inner();
+                    let right_buffer = right.inner();
 
-            // The result is already a BooleanBuffer with correct semantics
-            Some(arrow_buffer::NullBuffer::from(merged_buffer))
+                    // Perform bitwise OR directly on BooleanBuffers
+                    // This preserves the correct semantics: 1 = valid, 0 = null
+                    let merged_buffer = left_buffer | right_buffer;
+
+                    // The result is already a BooleanBuffer with correct semantics
+                    Some(arrow_buffer::NullBuffer::from(merged_buffer))
+                }
+            }
         }
     }
 }
@@ -1107,7 +1133,8 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                 .any(|f| f.name() == field.name())
             {
                 fields.push(field.as_ref().clone());
-                // Adjust the column validity: if right struct was null, propagate to child
+                // This field doesn't exist on the left
+                // We use the right's column but need to adjust for struct validity
                 let adjusted_column = adjust_child_validity(column, right_validity);
                 columns.push(adjusted_column);
             }
