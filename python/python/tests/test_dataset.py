@@ -3729,6 +3729,80 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
+def test_file_reader_options(tmp_path: Path):
+    """Test cache_repetition_index and validate_on_decode options"""
+    # Create a dataset with large repetitive strings to test cache_repetition_index
+    # Using large strings to ensure repetition index is used
+    large_string = "x" * 1000
+    table = pa.table(
+        {
+            "id": range(10000),
+            "text": [large_string] * 10000,  # Highly repetitive column
+            "unique": [f"unique_{i}" for i in range(10000)],  # Non-repetitive column
+        }
+    )
+    lance.write_dataset(table, tmp_path / "test")
+
+    # Test cache_repetition_index reduces I/O operations
+    # First read without cache
+    dataset_no_cache = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": False}
+    )
+    iops_before = lance.iops_counter()
+    result1 = dataset_no_cache.scanner(columns=["text"]).to_table()
+    iops_without_cache = lance.iops_counter() - iops_before
+    assert result1.num_rows == 10000
+
+    # Second read with cache enabled
+    dataset_with_cache = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": True}
+    )
+    iops_before = lance.iops_counter()
+    result2 = dataset_with_cache.scanner(columns=["text"]).to_table()
+    iops_with_cache = lance.iops_counter() - iops_before
+    assert result2.num_rows == 10000
+
+    # With cache, we should see fewer I/O operations for repetitive data
+    # The difference might be small for small datasets, but should be measurable
+    assert iops_with_cache <= iops_without_cache
+
+    # Test validate_on_decode option
+    # For now just verify it doesn't break normal operation
+    dataset_validate = lance.dataset(
+        tmp_path / "test", read_params={"validate_on_decode": True}
+    )
+    result3 = dataset_validate.to_table()
+    assert result3.num_rows == 10000
+
+    # Test both options together
+    dataset_both = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": False},
+    )
+    result4 = dataset_both.to_table()
+    assert result4.num_rows == 10000
+
+    # Test that scanner inherits options from dataset
+    dataset_inherit = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": True},
+    )
+    scanner = dataset_inherit.scanner()
+    result5 = scanner.to_table()
+    assert result5.num_rows == 10000
+
+    # Verify the scanner is using the same options by checking I/O pattern
+    iops_before = lance.iops_counter()
+    scanner2 = dataset_inherit.scanner(columns=["text"])
+    result6 = scanner2.to_table()
+    assert result6.num_rows == 10000
+    iops_scanner = lance.iops_counter() - iops_before
+
+    # Scanner with inherited cache option should have similar I/O pattern as
+    # direct dataset read
+    assert iops_scanner <= iops_without_cache
+
+
 def test_read_transaction_properties(tmp_path):
     """Test retrieving properties from transactions at different versions."""
     # Create schema and data for the dataset

@@ -408,6 +408,7 @@ impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         // By default, we only scan the local schema
         let projection_plan = ProjectionPlan::new(dataset.clone());
+        let file_reader_options = dataset.file_reader_options.clone();
         Self {
             dataset,
             projection_plan,
@@ -431,7 +432,7 @@ impl Scanner {
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
-            file_reader_options: None,
+            file_reader_options,
         }
     }
 
