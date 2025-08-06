@@ -3795,9 +3795,11 @@ def test_file_reader_options(tmp_path: Path):
     iops_before = lance.iops_counter()
     scanner2 = dataset_inherit.scanner(columns=["text"])
     result6 = scanner2.to_table()
+    assert result6.num_rows == 10000
     iops_scanner = lance.iops_counter() - iops_before
 
-    # Scanner with inherited cache option should have similar I/O pattern as direct dataset read
+    # Scanner with inherited cache option should have similar I/O pattern as
+    # direct dataset read
     assert iops_scanner <= iops_without_cache
 
 
