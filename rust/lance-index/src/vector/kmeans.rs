@@ -659,7 +659,8 @@ pub fn kmeans_find_partitions_arrow_array(
     query: &dyn Array,
     nprobes: usize,
     distance_type: DistanceType,
-) -> arrow::error::Result<UInt32Array> {
+    with_dist: bool,
+) -> arrow::error::Result<(UInt32Array, Option<Float32Array>)> {
     if centroids.value_length() as usize != query.len() {
         return Err(ArrowError::InvalidArgumentError(format!(
             "Centroids and vectors have different dimensions: {} != {}",
@@ -674,25 +675,31 @@ pub fn kmeans_find_partitions_arrow_array(
             query.as_primitive::<Float16Type>().values(),
             nprobes,
             distance_type,
+            with_dist,
         )?),
         (DataType::Float32, DataType::Float32) => Ok(kmeans_find_partitions(
             centroids.values().as_primitive::<Float32Type>().values(),
             query.as_primitive::<Float32Type>().values(),
             nprobes,
             distance_type,
+            with_dist,
         )?),
         (DataType::Float64, DataType::Float64) => Ok(kmeans_find_partitions(
             centroids.values().as_primitive::<Float64Type>().values(),
             query.as_primitive::<Float64Type>().values(),
             nprobes,
             distance_type,
+            with_dist,
         )?),
-        (DataType::UInt8, DataType::UInt8) => kmeans_find_partitions_binary(
-            centroids.values().as_primitive::<UInt8Type>().values(),
-            query.as_primitive::<UInt8Type>().values(),
-            nprobes,
-            distance_type,
-        ),
+        (DataType::UInt8, DataType::UInt8) => Ok((
+            kmeans_find_partitions_binary(
+                centroids.values().as_primitive::<UInt8Type>().values(),
+                query.as_primitive::<UInt8Type>().values(),
+                nprobes,
+                distance_type,
+            )?,
+            None,
+        )),
         _ => Err(ArrowError::InvalidArgumentError(format!(
             "Centroids and vectors have different types: {} != {}",
             centroids.value_type(),
@@ -717,7 +724,8 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     query: &[T],
     nprobes: usize,
     distance_type: DistanceType,
-) -> arrow::error::Result<UInt32Array> {
+    with_dist: bool,
+) -> arrow::error::Result<(UInt32Array, Option<Float32Array>)> {
     let dists: Vec<f32> = match distance_type {
         DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
         DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
@@ -731,7 +739,15 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
 
     // TODO: use heap to just keep nprobes smallest values.
     let dists_arr = Float32Array::from(dists);
-    sort_to_indices(&dists_arr, None, Some(nprobes))
+    let indices = sort_to_indices(&dists_arr, None, Some(nprobes))?;
+    if with_dist {
+        let dists = arrow::compute::take(&dists_arr, &indices, None)?
+            .as_primitive::<Float32Type>()
+            .clone();
+        Ok((indices, Some(dists)))
+    } else {
+        Ok((indices, None))
+    }
 }
 
 pub fn kmeans_find_partitions_binary(
@@ -1053,7 +1069,7 @@ mod tests {
         const K: usize = 32;
         const NUM_VALUES: usize = 256 * K;
 
-        let mut rng = SmallRng::from_entropy();
+        let mut rng = SmallRng::from_rng(&mut rand::rng());
         let values =
             UInt8Array::from_iter_values((0..NUM_VALUES * DIM).map(|_| rng.gen_range(0..255)));
 

@@ -65,7 +65,7 @@ mod test {
         sync::{atomic::AtomicBool, Arc},
     };
 
-    use arrow_array::{RecordBatch, UInt32Array};
+    use arrow_array::{Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
@@ -140,7 +140,11 @@ mod test {
             unimplemented!()
         }
 
-        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        fn find_partitions(
+            &self,
+            _: &Query,
+            _: bool,
+        ) -> Result<(UInt32Array, Option<Float32Array>)> {
             unimplemented!()
         }
 

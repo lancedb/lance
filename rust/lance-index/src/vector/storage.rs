@@ -95,7 +95,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     ///
     /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
+    fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_>;
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 

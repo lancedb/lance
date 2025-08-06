@@ -5,16 +5,19 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt64Type, UInt8Type};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, PrimitiveArray, RecordBatch,
+    UInt64Array,
+};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
-use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kernels::{self, normalize_arrow};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
@@ -36,14 +39,17 @@ pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RabitQuantizationMetadata {
     #[serde(skip)]
-    pub inv_p: ndarray::ArcArray2<f32>,
+    pub inv_p: Option<FixedSizeListArray>,
     pub inv_p_position: u32,
     pub num_bits: u8,
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.inv_p.len() * std::mem::size_of::<f32>()
+        self.inv_p
+            .as_ref()
+            .map(|inv_p| inv_p.get_array_memory_size())
+            .unwrap_or(0)
     }
 }
 
@@ -60,29 +66,19 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
     fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
         debug_assert!(!bytes.is_empty());
         let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
-        let inv_p = FixedSizeListArray::try_from(&codebook_tensor)?;
-        let shape = (inv_p.len(), inv_p.len());
-        let inv_p = inv_p
-            .values()
-            .as_primitive::<Float32Type>()
-            .values()
-            .to_vec();
-        let inv_p = ndarray::ArcArray2::from_shape_vec(shape, inv_p).map_err(|e| Error::Index {
-            message: format!("failed to parse matrix: {}", e),
-            location: location!(),
-        })?;
-        self.inv_p = inv_p;
+        self.inv_p = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
         Ok(())
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        let inv_p_flatten = Float32Array::from_iter_values(self.inv_p.iter().copied());
-        let inv_p_fsl =
-            FixedSizeListArray::try_new_from_values(inv_p_flatten, self.inv_p.nrows() as i32)?;
-        let inv_p_tensor = pb::Tensor::try_from(&inv_p_fsl)?;
-        let mut bytes = BytesMut::new();
-        inv_p_tensor.encode(&mut bytes)?;
-        Ok(Some(bytes.freeze()))
+        if let Some(inv_p) = &self.inv_p {
+            let inv_p_tensor = pb::Tensor::try_from(inv_p)?;
+            let mut bytes = BytesMut::new();
+            inv_p_tensor.encode(&mut bytes)?;
+            Ok(Some(bytes.freeze()))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn load(reader: &FileReader) -> Result<Self> {
@@ -126,6 +122,46 @@ impl DeepSizeOf for RabitQuantizationStorage {
     }
 }
 
+impl RabitQuantizationStorage {
+    fn quantize_query_vector<T: ArrowFloatType>(
+        inv_p: &dyn Array,
+        qr: &dyn Array,
+    ) -> (Vec<u8>, f32, f32)
+    where
+        T::Native: num_traits::Float + AsPrimitive<f64> + AsPrimitive<f32>,
+    {
+        let d = qr.len();
+        // convert to matrix
+        let inv_p = inv_p
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice();
+        let inv_p = ndarray::ArrayView2::from_shape((d, d), inv_p).unwrap();
+        let qr = qr
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice();
+        let qr = ndarray::ArrayView2::from_shape((d, 1), qr).unwrap();
+
+        // rotate query vector
+        let rotated_qr = inv_p.dot(&qr);
+        let rotated_qr = rotated_qr.as_slice().unwrap();
+        let (min, max) = rotated_qr
+            .iter()
+            .copied()
+            .minmax()
+            .into_option()
+            .expect("failed to get min and max of query vector");
+        let bounds = min.as_()..max.as_();
+        let query_codes = scale_to_u8::<T>(&rotated_qr, &bounds);
+
+        let (min, max): (f32, f32) = (min.as_(), max.as_());
+        (query_codes, min, (max - min) / 255.0)
+    }
+}
+
 pub struct RabitDistCalculator<'a> {
     dim: usize,
     // num_bits is the number of bits per dimension,
@@ -152,12 +188,12 @@ pub struct RabitDistCalculator<'a> {
     // -(2^B - 1)/2 * sum(q') where B is the number of bits per dimension for RQ (not SQ)
     // it's 0 for 1 bit RQ
     // kbit_x_sq_sum: f32,
-    // |(q-c)| ^ 2
-    // qr_norm_square: f32,
-    qc_norm_square: f32,
+
+    // for L2, it's |q-c|^2
+    // for dot, it's -q*c
+    q_factor: f32,
 
     sq_min: f32,
-    sq_delta: f32,
     sq_scale: f32,
     sq_sum: f32,
     sqrt_d: f32,
@@ -165,35 +201,22 @@ pub struct RabitDistCalculator<'a> {
 
 impl<'a> RabitDistCalculator<'a> {
     pub fn new(
-        qr: &dyn Array,
-        // centroid: &dyn Array,
+        query_codes: Vec<u8>,
+        sq_min: f32,
+        sq_scale: f32,
+        q_factor: f32,
         codes: &'a [u8],
         centroid_dists: &'a [f32],
         code_bitcounts: &'a [f32],
         ip_rq_res: &'a [f32],
         ip_rq_centroid: &'a [f32],
-        inv_p: ndarray::ArrayView2<'a, f32>,
     ) -> Self {
-        // let qr = arrow_arith::numeric::sub(&q, &centroid).unwrap();
-
-        let qr = qr.as_primitive::<Float32Type>().values();
-        let q_norm_square = qr.iter().map(|&v| v * v).sum::<f32>();
-        let qr = ndarray::ArrayView2::from_shape((qr.len(), 1), qr).unwrap();
-        let rotated_qr = inv_p.dot(&qr);
-        let rotated_qr = rotated_qr.as_slice().unwrap();
-        let (min, max) = rotated_qr
-            .iter()
-            .copied()
-            .minmax()
-            .into_option()
-            .expect("failed to get min and max of query vector");
-        let bounds = min.as_()..max.as_();
-        let query_codes = scale_to_u8::<Float32Type>(&rotated_qr, &bounds);
+        let dim = query_codes.len();
         let sq_sum = query_codes.iter().map(|&v| v as u32).sum::<u32>() as f32;
 
         let dist_table = Self::build_dist_table(query_codes);
         Self {
-            dim: qr.len(),
+            dim,
             num_bits: 1,
             codes,
             dist_table,
@@ -201,12 +224,11 @@ impl<'a> RabitDistCalculator<'a> {
             code_bitcounts,
             ip_rq_res,
             ip_rq_centroid,
-            qc_norm_square: q_norm_square,
-            sq_min: min,
-            sq_delta: (max - min),
-            sq_scale: (max - min) / 255.0,
+            q_factor: q_factor,
+            sq_min,
+            sq_scale,
             sq_sum,
-            sqrt_d: (qr.len() as f32).sqrt(),
+            sqrt_d: (dim as f32).sqrt(),
         }
     }
 
@@ -257,7 +279,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
 
         let dist_v_q = dist_vq_qr / self.ip_rq_res[id];
         let vr_norm_square = self.centroid_dists[id];
-        vr_norm_square + self.qc_norm_square - 2.0 * vr_norm_square * dist_v_q
+        vr_norm_square + self.q_factor - 2.0 * vr_norm_square * dist_v_q
     }
 
     fn distance_all(&self, _: usize) -> Vec<f32> {
@@ -307,16 +329,39 @@ impl VectorStore for RabitQuantizationStorage {
     }
 
     // qr = (q-c)
-    fn dist_calculator(&self, qr: Arc<dyn Array>) -> Self::DistanceCalculator<'_> {
+    fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
+        let inv_p = self
+            .metadata
+            .inv_p
+            .as_ref()
+            .map(|inv_p| inv_p.values())
+            .expect("RabitQ metadata not loaded");
+
+        let (query_codes, sq_min, sq_scale) = match inv_p.data_type() {
+            DataType::Float16 => Self::quantize_query_vector::<Float16Type>(&inv_p, &qr),
+            DataType::Float32 => Self::quantize_query_vector::<Float32Type>(&inv_p, &qr),
+            DataType::Float64 => Self::quantize_query_vector::<Float64Type>(&inv_p, &qr),
+            dt => unimplemented!("RabitQ does not support data type: {}", dt),
+        };
+        let q_factor = match self.distance_type {
+            DistanceType::L2 => dist_q_c,
+            DistanceType::Dot => dist_q_c - 1.0,
+            _ => unimplemented!(
+                "RabitQ does not support distance type: {}",
+                self.distance_type
+            ),
+        };
         RabitDistCalculator::new(
-            qr.as_ref(),
+            query_codes,
+            sq_min,
+            sq_scale,
+            q_factor,
             codes,
             self.centroid_dists.values(),
             self.code_bitcounts.values(),
             self.ip_rq_res.values(),
             self.ip_rq_centroid.values(),
-            self.metadata.inv_p.view(),
         )
     }
 

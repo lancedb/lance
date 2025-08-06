@@ -12,11 +12,11 @@ use arrow_array::{
 use arrow_schema::{DataType, Field};
 use bitvec::prelude::{BitVec, Lsb0};
 use deepsize::DeepSizeOf;
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatType};
 use lance_core::{Error, Result};
 use ndarray::Axis;
-use num_traits::AsPrimitive;
-use rand_distr::Distribution;
+use num_traits::{AsPrimitive, FromPrimitive};
+use rand_distr::{Distribution, StandardNormal};
 use snafu::location;
 
 use crate::vector::bq::storage::{
@@ -53,13 +53,31 @@ pub struct RabitQuantizer {
 }
 
 impl RabitQuantizer {
-    pub fn new(num_bits: u8, dim: i32) -> Self {
+    pub fn new<T: ArrowFloatType>(num_bits: u8, dim: i32) -> Self {
         // we don't need to calculate the inverse of P,
         // because the inverse of an orthogonal matrix is still an orthogonal matrix,
         // we just generate the inverse of P here.
-        let inv_p = random_orthogonal(dim as usize);
+        let inv_p = random_orthogonal::<T>(dim as usize);
+        let (inv_p, _) = inv_p.into_raw_vec_and_offset();
+
+        let inv_p = match T::FLOAT_TYPE {
+            FloatType::Float16 => {
+                let inv_p = T::ArrayType::from(inv_p);
+                FixedSizeListArray::try_new_from_values(inv_p, dim).unwrap()
+            }
+            FloatType::Float32 => {
+                let inv_p = T::ArrayType::from(inv_p);
+                FixedSizeListArray::try_new_from_values(inv_p, dim).unwrap()
+            }
+            FloatType::Float64 => {
+                let inv_p = T::ArrayType::from(inv_p);
+                FixedSizeListArray::try_new_from_values(inv_p, dim).unwrap()
+            }
+            _ => unimplemented!("RabitQ does not support data type: {:?}", T::FLOAT_TYPE),
+        };
+
         let metadata = RabitQuantizationMetadata {
-            inv_p: inv_p.into(),
+            inv_p: Some(inv_p),
             inv_p_position: 0,
             num_bits,
         };
@@ -67,7 +85,11 @@ impl RabitQuantizer {
     }
 
     pub fn dim(&self) -> usize {
-        self.metadata.inv_p.nrows()
+        self.metadata
+            .inv_p
+            .as_ref()
+            .map(|inv_p| inv_p.len())
+            .unwrap_or(0)
     }
 
     // compute the dot product of v_q * v_r
@@ -313,9 +335,9 @@ impl From<RabitQuantizer> for Quantizer {
     }
 }
 
-fn random_normal_matrix_f32(n: usize) -> ndarray::Array2<f32> {
+fn random_normal_matrix(n: usize) -> ndarray::Array2<f32> {
     let mut rng = rand::rng();
-    let normal = rand_distr::Normal::new(0.0f32, 1.0f32).unwrap();
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
     ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
 }
 
@@ -341,14 +363,14 @@ fn gram_schmidt(a: ndarray::Array2<f32>) -> ndarray::Array2<f32> {
     q
 }
 
-fn random_orthogonal(n: usize) -> ndarray::Array2<f32> {
-    // let a = random_normal_matrix_f32(n);
-    // gram_schmidt(a)
-    ndarray::Array2::eye(n)
-    // if cfg!(debug_assertions) {
-    //     ndarray::Array2::eye(n)
-    // } else {``
-    //     let a = random_normal_matrix_f32(n);
-    //     gram_schmidt(a)
-    // }
+fn random_orthogonal<T: ArrowFloatType>(n: usize) -> ndarray::Array2<T::Native>
+where
+    T::Native: FromPrimitive,
+{
+    let a = random_normal_matrix(n);
+    let results = gram_schmidt(a);
+
+    // cast f32 matrix to T::Native matrix
+    let results = results.mapv(|v| T::Native::from_f32(v).unwrap());
+    results
 }
