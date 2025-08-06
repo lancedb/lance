@@ -1020,7 +1020,7 @@ fn adjust_child_validity(
             child.data_type().clone(),
             child.len(),
             Some(new_validity.into_inner().into_inner()),
-            0,
+            child.offset(),
             child.to_data().buffers().to_vec(),
             child.to_data().child_data().to_vec(),
         )
