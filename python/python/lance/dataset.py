@@ -2639,6 +2639,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
+        ds._read_params = None
         return ds
 
     @staticmethod
@@ -2728,7 +2729,9 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
+        ds._storage_options = storage_options
         ds._default_scan_options = None
+        ds._read_params = None
         return BulkCommitResult(
             dataset=ds,
             merged=merged,
@@ -4535,6 +4538,7 @@ def write_dataset(
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
+    ds._read_params = None
     return ds
 
 
