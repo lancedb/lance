@@ -273,10 +273,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                   HashJoinExec: mode=CollectLeft, join_type=Right, ...
                     ...
         """
-        if schema is None:
-            return super(MergeInsertBuilder, self).explain_plan(verbose=verbose)
-        else:
-            return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
+        return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
 
     def analyze_plan(
         self,
