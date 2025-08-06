@@ -681,7 +681,7 @@ impl FromPyObject<'_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
-            path_base_index: ob.getattr("path_base")?.extract()?,
+            path_base_index: ob.getattr("path_base_index")?.extract()?,
         }))
     }
 }
