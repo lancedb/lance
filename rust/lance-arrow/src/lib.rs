@@ -931,6 +931,20 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
+/// Helper function to normalize validity buffers
+/// Returns None for all-null validity (placeholder structs)
+fn normalize_validity(
+    validity: Option<&arrow_buffer::NullBuffer>,
+) -> Option<&arrow_buffer::NullBuffer> {
+    validity.and_then(|v| {
+        if v.null_count() == v.len() {
+            None
+        } else {
+            Some(v)
+        }
+    })
+}
+
 /// Helper function to merge validity buffers from two struct arrays
 /// Returns None only if both arrays are null at the same position
 ///
@@ -939,51 +953,29 @@ fn merge_struct_validity(
     left_validity: Option<&arrow_buffer::NullBuffer>,
     right_validity: Option<&arrow_buffer::NullBuffer>,
 ) -> Option<arrow_buffer::NullBuffer> {
-    match (left_validity, right_validity) {
+    // Normalize both validity buffers (convert all-null to None)
+    let left_normalized = normalize_validity(left_validity);
+    let right_normalized = normalize_validity(right_validity);
+
+    match (left_normalized, right_normalized) {
         // Fast paths: no computation needed
         (None, None) => None,
-        (Some(left), None) => {
-            // Check if left is a placeholder (all null)
-            if left.null_count() == left.len() {
-                None
-            } else {
-                Some(left.clone())
-            }
-        }
-        (None, Some(right)) => {
-            // Check if right is a placeholder (all null)
-            if right.null_count() == right.len() {
-                None
-            } else {
-                Some(right.clone())
-            }
-        }
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right.clone()),
         (Some(left), Some(right)) => {
-            // Check for placeholders first
-            let left_is_placeholder = left.null_count() == left.len();
-            let right_is_placeholder = right.null_count() == right.len();
-
-            match (left_is_placeholder, right_is_placeholder) {
-                (true, true) => None,                 // Both are placeholders
-                (true, false) => Some(right.clone()), // Left is placeholder, use right
-                (false, true) => Some(left.clone()),  // Right is placeholder, use left
-                (false, false) => {
-                    // Neither is placeholder, perform normal merge
-                    // Fast path: if both have no nulls, can return either one
-                    if left.null_count() == 0 && right.null_count() == 0 {
-                        return Some(left.clone());
-                    }
-
-                    let left_buffer = left.inner();
-                    let right_buffer = right.inner();
-
-                    // Perform bitwise OR directly on BooleanBuffers
-                    // This preserves the correct semantics: 1 = valid, 0 = null
-                    let merged_buffer = left_buffer | right_buffer;
-
-                    Some(arrow_buffer::NullBuffer::from(merged_buffer))
-                }
+            // Fast path: if both have no nulls, can return either one
+            if left.null_count() == 0 && right.null_count() == 0 {
+                return Some(left.clone());
             }
+
+            let left_buffer = left.inner();
+            let right_buffer = right.inner();
+
+            // Perform bitwise OR directly on BooleanBuffers
+            // This preserves the correct semantics: 1 = valid, 0 = null
+            let merged_buffer = left_buffer | right_buffer;
+
+            Some(arrow_buffer::NullBuffer::from(merged_buffer))
         }
     }
 }
