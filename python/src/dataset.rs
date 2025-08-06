@@ -418,7 +418,7 @@ impl Dataset {
             builder = builder.with_serialized_manifest(manifest).infer_error()?;
         }
 
-        let dataset = RT.runtime.block_on(builder.load());
+        let dataset = RT.block_on(Some(py), builder.load())?;
 
         match dataset {
             Ok(ds) => Ok(Self {
@@ -483,8 +483,7 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        RT.runtime
-            .block_on(self.ds.index_statistics(&index_name))
+        RT.block_on(None, self.ds.index_statistics(&index_name))?
             .map_err(|err| match err {
                 lance::Error::IndexNotFound { .. } => {
                     PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
@@ -924,8 +923,7 @@ impl Dataset {
 
     #[pyo3(signature=(filter=None))]
     fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
-        RT.runtime
-            .block_on(self.ds.count_rows(filter))
+        RT.block_on(None, self.ds.count_rows(filter))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -1196,9 +1194,7 @@ impl Dataset {
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
-        let versions = self_
-            .list_versions()
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let versions = self_.list_versions()?;
         Python::with_gil(|py| {
             let pyvers: Vec<PyObject> = versions
                 .iter()
@@ -1278,9 +1274,7 @@ impl Dataset {
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
-        let tags = self_
-            .list_tags_ordered(order.as_deref())
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let tags = self_.list_tags_ordered(order.as_deref())?;
 
         Python::with_gil(|py| {
             let pylist = PyList::empty(py);
@@ -1298,9 +1292,7 @@ impl Dataset {
     }
 
     fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let tags = self_
-            .list_tags()
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let tags = self_.list_tags()?;
 
         Python::with_gil(|py| {
             let pytags = PyDict::new(py);
@@ -2115,38 +2107,30 @@ impl Dataset {
         })
     }
 
-    fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
-        RT.runtime.block_on(self.ds.versions())
+    fn list_versions(&self) -> PyResult<Vec<Version>> {
+        RT.block_on(None, self.ds.versions())?.infer_error()
     }
 
-    fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
-        RT.runtime.block_on(self.ds.tags.list())
+    fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
+        RT.block_on(None, self.ds.tags.list())?.infer_error()
     }
 
-    fn list_tags_ordered(
-        &self,
-        order: Option<&str>,
-    ) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+    fn list_tags_ordered(&self, order: Option<&str>) -> PyResult<Vec<(String, TagContents)>> {
         let ordering = match order {
             Some("asc") => Some(std::cmp::Ordering::Less),
             Some("desc") => Some(std::cmp::Ordering::Greater),
             Some(invalid_order) => {
-                let error_msg = format!(
+                return Err(PyValueError::new_err(format!(
                     "Invalid sort order '{}'. Valid values are: asc, desc",
                     invalid_order
-                );
-                return Err(::lance::error::Error::InvalidInput {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        error_msg,
-                    )),
-                    location: location!(),
-                });
+                )));
             }
             None => None,
         };
-        RT.runtime
-            .block_on(async { self.ds.tags.list_tags_ordered(ordering).await })
+        RT.block_on(None, async {
+            self.ds.tags.list_tags_ordered(ordering).await
+        })?
+        .infer_error()
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
