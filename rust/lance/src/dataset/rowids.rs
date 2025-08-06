@@ -96,7 +96,7 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
         .try_collect::<Vec<_>>()
         .await?;
 
-    let index = RowIdIndex::new(&sequences, dataset.manifest.uses_move_stable_row_ids())?;
+    let index = RowIdIndex::new(&sequences)?;
 
     Ok(index)
 }
