@@ -14,10 +14,8 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.operation.Operation;
-import com.lancedb.lance.operation.Project;
 
 import org.apache.arrow.util.Preconditions;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -56,10 +54,6 @@ public class Transaction {
         transactionProperties != null ? transactionProperties : new HashMap<>();
   }
 
-  public Dataset dataset() {
-    return dataset;
-  }
-
   public long readVersion() {
     return readVersion;
   }
@@ -85,19 +79,18 @@ public class Transaction {
   }
 
   public Dataset commit() {
-    try {
-      Dataset committed = commitNative();
-      committed.allocator = dataset.allocator;
-      return committed;
-    } finally {
-      operation.release();
-      if (blobOp != null) {
-        blobOp.release();
-      }
+    if (dataset == null) {
+      throw new UnsupportedOperationException("Transaction doesn't support create new dataset yet");
     }
+    return dataset.commitTransaction(this);
   }
 
-  private native Dataset commitNative();
+  public void release() {
+    operation.release();
+    if (blobOp != null) {
+      blobOp.release();
+    }
+  }
 
   public static class Builder {
     private final String uuid;
@@ -128,14 +121,17 @@ public class Transaction {
       return this;
     }
 
-    public Builder project(Schema newSchema) {
+    public Builder operation(Operation operation) {
       validateState();
-      this.operation = new Project.Builder().schema(newSchema).allocator(dataset.allocator).build();
+      this.operation = operation;
       return this;
     }
 
     private void validateState() {
-      Preconditions.checkState(operation == null, "Operation " + operation + " already set");
+      if (operation != null) {
+        throw new IllegalStateException(
+            String.format("Operation %s has been set", operation.name()));
+      }
     }
 
     public Transaction build() {
