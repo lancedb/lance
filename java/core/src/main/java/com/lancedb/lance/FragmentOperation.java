@@ -23,7 +23,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-/** Fragment related operations. */
+@Deprecated
+/** Fragment related operations. Use {@link Transaction} instead */
 public abstract class FragmentOperation {
   protected static void validateFragments(List<FragmentMetadata> fragments) {
     if (fragments == null || fragments.isEmpty()) {
