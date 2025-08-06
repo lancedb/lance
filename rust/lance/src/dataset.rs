@@ -6961,4 +6961,93 @@ mod tests {
             "Version 3 should still exist"
         );
     }
+
+    #[tokio::test]
+    async fn test_nullable_struct_v2_1_issue_4385() {
+        // Test for issue #4385: nullable struct should preserve null values in v2.1 format
+        use arrow_array::cast::AsArray;
+        use arrow_schema::Fields;
+
+        // Create a struct field with nullable float field
+        let struct_fields = Fields::from(vec![ArrowField::new("x", DataType::Float32, true)]);
+
+        // Create outer struct with the nullable struct as a field (not root)
+        let outer_fields = Fields::from(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("data", DataType::Struct(struct_fields.clone()), true),
+        ]);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "record",
+            DataType::Struct(outer_fields.clone()),
+            false,
+        )]));
+
+        // Create data with null struct
+        let id_values = Int32Array::from(vec![1, 2, 3]);
+        let x_values = Float32Array::from(vec![Some(1.0), Some(2.0), Some(3.0)]);
+        let inner_struct_array = StructArray::new(
+            struct_fields,
+            vec![Arc::new(x_values) as ArrayRef],
+            Some(vec![true, false, true].into()), // Second struct is null
+        );
+
+        let outer_struct_array = StructArray::new(
+            outer_fields,
+            vec![
+                Arc::new(id_values) as ArrayRef,
+                Arc::new(inner_struct_array.clone()) as ArrayRef,
+            ],
+            None, // Outer struct is not nullable
+        );
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(outer_struct_array)]).unwrap();
+
+        // Write dataset with v2.1 format
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+
+        let batches = vec![batch.clone()];
+        let batch_reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        Dataset::write(batch_reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Read back the dataset
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let scanner = dataset.scan();
+        let result_batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(result_batches.len(), 1);
+        let result_batch = &result_batches[0];
+        let read_outer_struct = result_batch.column(0).as_struct();
+        let read_inner_struct = read_outer_struct.column(1).as_struct(); // "data" field
+
+        // The bug: null struct is not preserved
+        assert!(
+            read_inner_struct.is_null(1),
+            "Second struct should be null but it's not. Read value: {:?}",
+            read_inner_struct
+        );
+
+        // Verify the null count is preserved
+        assert_eq!(
+            inner_struct_array.null_count(),
+            read_inner_struct.null_count(),
+            "Null count should be preserved"
+        );
+    }
 }

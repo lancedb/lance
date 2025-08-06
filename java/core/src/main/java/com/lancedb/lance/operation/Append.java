@@ -13,46 +13,52 @@
  */
 package com.lancedb.lance.operation;
 
-import org.apache.arrow.vector.types.pojo.Schema;
+import com.lancedb.lance.FragmentMetadata;
 
-/**
- * Project to a new schema. This Operation only changes the schema, not the data. Note: 1. For
- * removing columns. The data will be removed after compaction. 2. Project will modify column
- * positions, not ids(a.k.a. field id)
- */
-public class Project extends SchemaOperation {
+import org.apache.arrow.util.Preconditions;
 
-  private Project(Schema schema) {
-    super(schema);
+import java.util.List;
+
+public class Append implements Operation {
+
+  private final List<FragmentMetadata> fragments;
+
+  private Append(List<FragmentMetadata> fragments) {
+    Preconditions.checkArgument(
+        fragments != null && !fragments.isEmpty(), "fragments cannot be null or empty");
+    this.fragments = fragments;
+  }
+
+  public List<FragmentMetadata> fragments() {
+    return fragments;
   }
 
   @Override
   public String name() {
-    return "Project";
+    return "Append";
   }
 
   @Override
   public String toString() {
-    return "Project{" + "schema=" + +'}';
+    return "Append{" + "fragments=" + fragments + '}';
   }
 
   public static Builder builder() {
     return new Builder();
   }
 
-  // Builder class for Project
   public static class Builder {
-    private Schema schema;
+    private List<FragmentMetadata> fragments;
 
     public Builder() {}
 
-    public Builder schema(Schema schema) {
-      this.schema = schema;
+    public Builder fragments(List<FragmentMetadata> fragments) {
+      this.fragments = fragments;
       return this;
     }
 
-    public Project build() {
-      return new Project(schema);
+    public Append build() {
+      return new Append(fragments);
     }
   }
 }
