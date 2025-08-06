@@ -340,6 +340,10 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                         RepartitionExec: ...
                           StreamingTableExec: ..., metrics=[]
 
+        The two key parts of the plan analysis are LanceRead and MergeInsert.
+        LanceRead scans join keys and columns in conditions. MergeInsert writes
+        data files to storage.
+
         Key metrics in MergeInsert operations:
         - bytes_written: total bytes written to storage
         - num_files_written: number of new data files created
