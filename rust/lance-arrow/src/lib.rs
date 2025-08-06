@@ -944,25 +944,21 @@ fn merge_struct_validity(
         (Some(left), None) => Some(left.clone()),
         (None, Some(right)) => Some(right.clone()),
         (Some(left), Some(right)) => {
-            // Fast path: if either has no nulls, return the other
-            if left.null_count() == 0 {
+            // Fast path: if both have no nulls, can return either one
+            if left.null_count() == 0 && right.null_count() == 0 {
                 return Some(left.clone());
-            }
-            if right.null_count() == 0 {
-                return Some(right.clone());
             }
 
             // Use SIMD-optimized bitwise OR operation
-            // Convert to BooleanArray for bitwise operations
-            use arrow_array::BooleanArray;
+            // Direct buffer operations without BooleanArray conversion
+            let left_buffer = left.inner();
+            let right_buffer = right.inner();
 
-            let left_array = BooleanArray::from(left.inner().clone());
-            let right_array = BooleanArray::from(right.inner().clone());
+            // Perform bitwise OR directly on BooleanBuffers
+            // This preserves the correct semantics: 1 = valid, 0 = null
+            let merged_buffer = left_buffer | right_buffer;
 
-            // Perform bitwise OR manually with SIMD-optimized buffer operations
-            let merged_buffer = left_array.values() | right_array.values();
-
-            // Convert back to NullBuffer
+            // The result is already a BooleanBuffer with correct semantics
             Some(arrow_buffer::NullBuffer::from(merged_buffer))
         }
     }
@@ -992,15 +988,15 @@ fn adjust_child_validity(
         }
         Some(child_nulls) => {
             // Use SIMD-optimized bitwise AND operation
-            use arrow_array::BooleanArray;
+            // Direct buffer operations without BooleanArray conversion
+            let child_buffer = child_nulls.inner();
+            let parent_buffer = parent_validity.inner();
 
-            let child_array = BooleanArray::from(child_nulls.inner().clone());
-            let parent_array = BooleanArray::from(parent_validity.inner().clone());
+            // Perform bitwise AND directly on BooleanBuffers
+            // This preserves the correct semantics: 1 = valid, 0 = null
+            let merged_buffer = child_buffer & parent_buffer;
 
-            // Perform bitwise AND manually with SIMD-optimized buffer operations
-            let merged_buffer = child_array.values() & parent_array.values();
-
-            // Convert back to NullBuffer
+            // The result is already a BooleanBuffer with correct semantics
             arrow_buffer::NullBuffer::from(merged_buffer)
         }
     };
