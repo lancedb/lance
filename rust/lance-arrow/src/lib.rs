@@ -933,68 +933,90 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
 
 // Helper function to merge validity buffers from two struct arrays
 // Returns None only if both arrays are null at the same position
+// Uses SIMD-optimized bitwise operations for performance
 fn merge_struct_validity(
     left_validity: Option<&arrow_buffer::NullBuffer>,
     right_validity: Option<&arrow_buffer::NullBuffer>,
 ) -> Option<arrow_buffer::NullBuffer> {
     match (left_validity, right_validity) {
+        // Fast paths: no computation needed
         (None, None) => None,
         (Some(left), None) => Some(left.clone()),
         (None, Some(right)) => Some(right.clone()),
         (Some(left), Some(right)) => {
-            // Create a new validity buffer where a position is null only if both are null
-            let len = left.len();
-            let mut builder = arrow_buffer::BooleanBufferBuilder::new(len);
-            for i in 0..len {
-                // Valid if at least one side is valid
-                builder.append(left.is_valid(i) || right.is_valid(i));
+            // Fast path: if either has no nulls, return the other
+            if left.null_count() == 0 {
+                return Some(left.clone());
             }
-            Some(arrow_buffer::NullBuffer::from(builder.finish()))
+            if right.null_count() == 0 {
+                return Some(right.clone());
+            }
+
+            // Use SIMD-optimized bitwise OR operation
+            // Convert to BooleanArray for bitwise operations
+            use arrow_array::BooleanArray;
+
+            let left_array = BooleanArray::from(left.inner().clone());
+            let right_array = BooleanArray::from(right.inner().clone());
+
+            // Perform bitwise OR manually with SIMD-optimized buffer operations
+            let merged_buffer = left_array.values() | right_array.values();
+
+            // Convert back to NullBuffer
+            Some(arrow_buffer::NullBuffer::from(merged_buffer))
         }
     }
 }
 
 // Helper function to adjust child array validity based on parent struct validity
 // When parent struct is null, propagates null to child array
+// Optimized with fast paths and SIMD operations
 fn adjust_child_validity(
     child: &ArrayRef,
     parent_validity: Option<&arrow_buffer::NullBuffer>,
 ) -> ArrayRef {
-    if let Some(parent_validity) = parent_validity {
-        // We need to propagate parent nulls to child
-        let child_validity = child.nulls();
-        let len = child.len();
-        let mut builder = arrow_buffer::BooleanBufferBuilder::new(len);
+    // Fast path: no parent validity means no adjustment needed
+    let parent_validity = match parent_validity {
+        None => return child.clone(),
+        Some(p) if p.null_count() == 0 => return child.clone(), // No nulls to propagate
+        Some(p) => p,
+    };
 
-        for i in 0..len {
-            let parent_valid = parent_validity.is_valid(i);
-            let child_valid = child_validity.is_none_or(|v| v.is_valid(i));
+    let child_validity = child.nulls();
 
-            // If parent is null at this position, make the child null.
-            // Otherwise preserve child validity.
-            if !parent_valid {
-                builder.append(false);
-            } else {
-                builder.append(child_valid);
-            }
+    // Compute the new validity: child_validity AND parent_validity
+    let new_validity = match child_validity {
+        None => {
+            // Fast path: child has no existing validity, just use parent's
+            parent_validity.clone()
         }
+        Some(child_nulls) => {
+            // Use SIMD-optimized bitwise AND operation
+            use arrow_array::BooleanArray;
 
-        let new_validity = arrow_buffer::NullBuffer::from(builder.finish());
-        // Use make_array to create a new array with updated validity
-        arrow_array::make_array(
-            arrow_data::ArrayData::try_new(
-                child.data_type().clone(),
-                child.len(),
-                Some(new_validity.into_inner().into_inner()),
-                0,
-                child.to_data().buffers().to_vec(),
-                child.to_data().child_data().to_vec(),
-            )
-            .unwrap(),
+            let child_array = BooleanArray::from(child_nulls.inner().clone());
+            let parent_array = BooleanArray::from(parent_validity.inner().clone());
+
+            // Perform bitwise AND manually with SIMD-optimized buffer operations
+            let merged_buffer = child_array.values() & parent_array.values();
+
+            // Convert back to NullBuffer
+            arrow_buffer::NullBuffer::from(merged_buffer)
+        }
+    };
+
+    // Create new array with adjusted validity
+    arrow_array::make_array(
+        arrow_data::ArrayData::try_new(
+            child.data_type().clone(),
+            child.len(),
+            Some(new_validity.into_inner().into_inner()),
+            0,
+            child.to_data().buffers().to_vec(),
+            child.to_data().child_data().to_vec(),
         )
-    } else {
-        child.clone()
-    }
+        .unwrap(),
+    )
 }
 
 fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
