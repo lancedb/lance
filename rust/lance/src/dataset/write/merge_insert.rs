@@ -231,6 +231,11 @@ struct MergeInsertParams {
     // If set, this MemWAL should be marked as flushed, and will be committed to replace the
     // MemWAL that is currently in the index with the same ID.
     mem_wal_to_flush: Option<MemWal>,
+    // If true, skip auto cleanup during commits. This should be set to true
+    // for high frequency writes to improve performance. This is also useful
+    // if the writer does not have delete permissions and the clean up would
+    // just try and log a failure anyway.
+    skip_auto_cleanup: bool,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -313,6 +318,7 @@ impl MergeInsertBuilder {
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
                 mem_wal_to_flush: None,
+                skip_auto_cleanup: false,
             },
         })
     }
@@ -365,6 +371,11 @@ impl MergeInsertBuilder {
     /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.params.retry_timeout = timeout;
+        self
+    }
+
+    pub fn skip_auto_cleanup(&mut self, skip: bool) -> &mut Self {
+        self.params.skip_auto_cleanup = skip;
         self
     }
 
@@ -1588,7 +1599,8 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         // Update stats with the current attempt count
         data.stats.num_attempts = self.attempt_count.load(Ordering::SeqCst);
 
-        let mut commit_builder = CommitBuilder::new(dataset);
+        let mut commit_builder =
+            CommitBuilder::new(dataset).with_skip_auto_cleanup(self.job.params.skip_auto_cleanup);
         if let Some(affected_rows) = data.affected_rows {
             commit_builder = commit_builder.with_affected_rows(affected_rows);
         }
@@ -1883,8 +1895,7 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::future::try_join_all;
-    use futures::{StreamExt, TryStreamExt};
+    use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
