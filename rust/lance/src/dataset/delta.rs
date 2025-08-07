@@ -17,7 +17,7 @@ pub struct DatasetDelta {
 
 impl DatasetDelta {
     /// Listing the transactions between two versions.
-    pub async fn diff_meta(&self) -> Result<Vec<Transaction>> {
+    pub async fn list_transactions(&self) -> Result<Vec<Transaction>> {
         let mut transactions = Vec::new();
         for version in (self.begin_version + 1)..=self.end_version {
             let current_ds = self.base_dataset.checkout_version(version).await?;
@@ -68,7 +68,7 @@ mod tests {
             end_version: ds.version().version,
             base_dataset: ds.clone(),
         };
-        let txs = delta_struct.diff_meta().await.unwrap();
+        let txs = delta_struct.list_transactions().await.unwrap();
         assert_eq!(txs.len(), 1);
         assert!(matches!(txs[0].operation, Operation::Delete { .. }));
     }
@@ -84,7 +84,7 @@ mod tests {
             end_version: ds.version().version,
             base_dataset: ds.clone(),
         };
-        let txs = delta_struct.diff_meta().await.unwrap();
+        let txs = delta_struct.list_transactions().await.unwrap();
         assert_eq!(txs.len(), 2);
     }
 }

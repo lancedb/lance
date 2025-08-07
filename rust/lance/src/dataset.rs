@@ -643,7 +643,7 @@ impl Dataset {
         Ok(())
     }
 
-    async fn build_delta_dataset(&self, compared_version: u64) -> Result<DatasetDelta> {
+    async fn build_dataset_delta(&self, compared_version: u64) -> Result<DatasetDelta> {
         let current_version = self.version().version;
 
         let (begin_version, end_version) = if current_version > compared_version {
@@ -662,8 +662,8 @@ impl Dataset {
     /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
     pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
         self.validate_compared_version(compared_version).await?;
-        let ds_delta = self.build_delta_dataset(compared_version).await?;
-        ds_delta.diff_meta().await
+        let ds_delta = self.build_dataset_delta(compared_version).await?;
+        ds_delta.list_transactions().await
     }
 
     // TODO: Cache this
