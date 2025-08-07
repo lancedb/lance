@@ -180,6 +180,8 @@ class _Dataset:
         commit_handler: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         manifest: Optional[bytes] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
     @property
@@ -329,6 +331,10 @@ class _Dataset:
         batch_size: Optional[int] = None,
     ): ...
     def add_columns_with_schema(self, schema: pa.Schema): ...
+    def read_transaction(self, version: int) -> Optional[Transaction]: ...
+    def get_transactions(
+        self, recent_transactions=10
+    ) -> Optional[List[Transaction]]: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...

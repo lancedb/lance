@@ -295,7 +295,7 @@ impl CredentialProvider for AwsCredentialAdapter {
         } else {
             let refreshed_creds = Arc::new(self.inner.provide_credentials().await.map_err(
                 |e| Error::Internal {
-                    message: format!("Failed to get AWS credentials: {}", e),
+                    message: format!("Failed to get AWS credentials: {:?}", e),
                     location: location!(),
                 },
             )?);

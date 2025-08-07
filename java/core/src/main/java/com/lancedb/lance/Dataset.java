@@ -19,6 +19,7 @@ import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.LanceSchema;
 import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -58,8 +59,8 @@ public class Dataset implements Closeable {
 
   private long nativeDatasetHandle;
 
-  BufferAllocator allocator;
-  boolean selfManagedAllocator = false;
+  private BufferAllocator allocator;
+  private boolean selfManagedAllocator = false;
 
   private final LockManager lockManager = new LockManager();
 
@@ -203,7 +204,7 @@ public class Dataset implements Closeable {
             path,
             options.getVersion(),
             options.getBlockSize(),
-            options.getIndexCacheSize(),
+            options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions());
     dataset.allocator = allocator;
@@ -215,12 +216,12 @@ public class Dataset implements Closeable {
       String path,
       Optional<Integer> version,
       Optional<Integer> blockSize,
-      int indexCacheSize,
-      int metadataCacheSizeBytes,
+      long indexCacheSize,
+      long metadataCacheSizeBytes,
       Map<String, String> storageOptions);
 
   /**
-   * Create a new version of dataset.
+   * Create a new version of dataset. Use {@link Transaction} instead
    *
    * @param allocator the buffer allocator
    * @param path The file path of the dataset to open.
@@ -229,6 +230,7 @@ public class Dataset implements Closeable {
    *     is not needed for overwrite or restore operations.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
+  @Deprecated
   public static Dataset commit(
       BufferAllocator allocator,
       String path,
@@ -237,6 +239,7 @@ public class Dataset implements Closeable {
     return commit(allocator, path, operation, readVersion, new HashMap<>());
   }
 
+  @Deprecated
   public static Dataset commit(
       BufferAllocator allocator,
       String path,
@@ -252,18 +255,60 @@ public class Dataset implements Closeable {
     return dataset;
   }
 
+  /** Use {@link Transaction} instead */
+  @Deprecated
   public static native Dataset commitAppend(
       String path,
       Optional<Long> readVersion,
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  /** Use {@link Transaction} instead */
+  @Deprecated
   public static native Dataset commitOverwrite(
       String path,
       long arrowSchemaMemoryAddress,
       Optional<Long> readVersion,
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
+
+  public BufferAllocator allocator() {
+    return allocator;
+  }
+
+  /**
+   * Create a new transaction builder at current version for the dataset. The dataset itself will
+   * not refresh after the transaction committed.
+   *
+   * @return A new instance of {@link Transaction.Builder} linked to the opened dataset.
+   */
+  public Transaction.Builder newTransactionBuilder() {
+    return new Transaction.Builder(this).readVersion(version());
+  }
+
+  /**
+   * Commit a single transaction and return a new Dataset with the new version. Original dataset
+   * version will not be refreshed.
+   *
+   * @param transaction The transaction to commit
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(Transaction transaction) {
+    Preconditions.checkNotNull(transaction);
+    try {
+      Dataset dataset = nativeCommitTransaction(transaction);
+      if (selfManagedAllocator) {
+        dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        dataset.allocator = allocator;
+      }
+      return dataset;
+    } finally {
+      transaction.release();
+    }
+  }
+
+  private native Dataset nativeCommitTransaction(Transaction transaction);
 
   /**
    * Drop a Dataset.
@@ -651,7 +696,7 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
-   * Gets the schema of the dataset.
+   * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
    */
@@ -666,6 +711,20 @@ public class Dataset implements Closeable {
   }
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
+
+  /**
+   * Get the {@link com.lancedb.lance.schema.LanceSchema} of the dataset with field ids.
+   *
+   * @return the LanceSchema
+   */
+  public LanceSchema getLanceSchema() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetLanceSchema();
+    }
+  }
+
+  private native LanceSchema nativeGetLanceSchema();
 
   /** @return all the created indexes names */
   public List<String> listIndexes() {
@@ -772,6 +831,38 @@ public class Dataset implements Closeable {
     return new Tags();
   }
 
+  /**
+   * Replace the schema metadata of the dataset.
+   *
+   * @param metadata the new table metadata
+   */
+  public void replaceSchemaMetadata(Map<String, String> metadata) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeReplaceSchemaMetadata(metadata);
+    }
+  }
+
+  private native void nativeReplaceSchemaMetadata(Map<String, String> metadata);
+
+  /**
+   * Replace target field metadata of the dataset. This method won't affect fields not in the map
+   *
+   * @param fieldMetadataMap field id to metadata map
+   */
+  public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      for (Integer fieldId : fieldMetadataMap.keySet()) {
+        Preconditions.checkArgument(fieldId >= 0, "Field id must be greater than 0");
+      }
+      nativeReplaceFieldMetadata(fieldMetadataMap);
+    }
+  }
+
+  private native void nativeReplaceFieldMetadata(
+      Map<Integer, Map<String, String>> fieldMetadataMap);
+
   /** Tag operations of the dataset. */
   public class Tags {
 
@@ -837,6 +928,19 @@ public class Dataset implements Closeable {
         return nativeGetVersionByTag(tag);
       }
     }
+  }
+
+  /**
+   * Execute SQL query on the dataset. The underlying SQL engine is DataFusion. Please refer to the
+   * DataFusion documentation for supported SQL syntax.
+   *
+   * @param sql SELECT statement to execute. The default FROM table name is `dataset`, for example:
+   *     SELECT * FROM `dataset` LIMIT 10. If FROM table name is a custom value, the {@link
+   *     SqlQuery#tableName(String)} should be invoked to set the custom table name.
+   * @return a SqlQuery instance.
+   */
+  public SqlQuery sql(String sql) {
+    return new SqlQuery(this, sql);
   }
 
   private native void nativeCreateTag(String tag, long version);

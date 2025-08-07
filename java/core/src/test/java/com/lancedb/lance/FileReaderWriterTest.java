@@ -44,8 +44,6 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 public class FileReaderWriterTest {
 
-  @TempDir private static Path tempDir;
-
   private VectorSchemaRoot createBatch(BufferAllocator allocator) throws IOException {
     Schema schema =
         new Schema(
@@ -77,7 +75,7 @@ public class FileReaderWriterTest {
   }
 
   @Test
-  void testBasicRead() throws Exception {
+  void testBasicRead(@TempDir Path tempDir) throws Exception {
     BufferAllocator allocator = new RootAllocator();
     String filePath = tempDir.resolve("basic_read.lance").toString();
     createSimpleFile(filePath);
@@ -128,7 +126,7 @@ public class FileReaderWriterTest {
   }
 
   @Test
-  void testReadWithProjection() throws Exception {
+  void testReadWithProjection(@TempDir Path tempDir) throws Exception {
     BufferAllocator allocator = new RootAllocator();
     String filePath = tempDir.resolve("basic_read.lance").toString();
     createSimpleFile(filePath);
@@ -200,13 +198,13 @@ public class FileReaderWriterTest {
   }
 
   @Test
-  void testBasicWrite() throws Exception {
+  void testBasicWrite(@TempDir Path tempDir) throws Exception {
     String filePath = tempDir.resolve("basic_write.lance").toString();
     createSimpleFile(filePath);
   }
 
   @Test
-  void testWriteNoData() throws Exception {
+  void testWriteNoData(@TempDir Path tempDir) throws Exception {
     String filePath = tempDir.resolve("no_data.lance").toString();
     BufferAllocator allocator = new RootAllocator();
 
@@ -221,7 +219,7 @@ public class FileReaderWriterTest {
   }
 
   @Test
-  void testWriteWithStorage() {
+  void testWriteWithStorage(@TempDir Path tempDir) {
     String filePath = "az://fail_bucket" + tempDir.resolve("test_write_with_storage");
     BufferAllocator allocator = new RootAllocator();
     Map<String, String> storageOptions = new HashMap<>();

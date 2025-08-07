@@ -20,6 +20,14 @@ format: format-python
 	cargo fmt
 .PHONY: format
 
+build:
+	uv run maturin develop
+.PHONY: build
+
+clean:
+	rm -rf ./target
+.PHONY: clean
+
 format-python:
 	uv run ruff format python
 	uv run ruff check --fix python

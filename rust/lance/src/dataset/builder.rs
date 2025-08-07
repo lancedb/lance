@@ -2,7 +2,16 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use super::refs::{Ref, Tags};
+use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use crate::{
+    error::{Error, Result},
+    session::Session,
+    Dataset,
+};
+use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
 };
@@ -13,21 +22,13 @@ use lance_table::{
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
 use snafu::location;
-use tracing::instrument;
+use tracing::{info, instrument};
 use url::Url;
-
-use super::refs::{Ref, Tags};
-use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use crate::{
-    error::{Error, Result},
-    session::Session,
-    Dataset,
-};
 /// builder for loading a [`Dataset`].
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
     /// Cache size for index cache. If it is zero, index cache is disabled.
-    index_cache_size: usize,
+    index_cache_size_bytes: usize,
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
     metadata_cache_size_bytes: usize,
@@ -38,12 +39,13 @@ pub struct DatasetBuilder {
     options: ObjectStoreParams,
     version: Option<Ref>,
     table_uri: String,
+    file_reader_options: Option<FileReaderOptions>,
 }
 
 impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
         Self {
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
+            index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
@@ -51,6 +53,7 @@ impl DatasetBuilder {
             session: None,
             version: None,
             manifest: None,
+            file_reader_options: None,
         }
     }
 }
@@ -59,8 +62,16 @@ impl DatasetBuilder {
 // https://github.com/delta-io/delta-rs/main/crates/deltalake-core/src/table/builder.rs
 impl DatasetBuilder {
     /// Set the cache size for indices. Set to zero, to disable the cache.
+    pub fn with_index_cache_size_bytes(mut self, cache_size: usize) -> Self {
+        self.index_cache_size_bytes = cache_size;
+        self
+    }
+
+    /// Set the cache size for indices. Set to zero, to disable the cache.
+    #[deprecated(since = "0.30.0", note = "Use `with_index_cache_size_bytes` instead")]
     pub fn with_index_cache_size(mut self, cache_size: usize) -> Self {
-        self.index_cache_size = cache_size;
+        let assumed_entry_size = 20 * 1024 * 1024; // 20 MiB per entry
+        self.index_cache_size_bytes = cache_size * assumed_entry_size;
         self
     }
 
@@ -175,7 +186,7 @@ impl DatasetBuilder {
     /// Set options based on [ReadParams].
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
-            .with_index_cache_size(read_params.index_cache_size)
+            .with_index_cache_size_bytes(read_params.index_cache_size_bytes)
             .with_metadata_cache_size_bytes(read_params.metadata_cache_size_bytes);
 
         if let Some(options) = read_params.store_options {
@@ -188,6 +199,10 @@ impl DatasetBuilder {
 
         if let Some(commit_handler) = read_params.commit_handler {
             self.commit_handler = Some(commit_handler);
+        }
+
+        if let Some(file_reader_options) = read_params.file_reader_options {
+            self.file_reader_options = Some(file_reader_options);
         }
 
         self
@@ -271,10 +286,11 @@ impl DatasetBuilder {
 
     #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=self.table_uri);
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
             None => Arc::new(Session::new(
-                self.index_cache_size,
+                self.index_cache_size_bytes,
                 self.metadata_cache_size_bytes,
                 Default::default(),
             )),
@@ -288,6 +304,7 @@ impl DatasetBuilder {
 
         let manifest = self.manifest.take();
 
+        let file_reader_options = self.file_reader_options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         if let Some(r) = cloned_ref {
@@ -333,7 +350,7 @@ impl DatasetBuilder {
             let manifest = Dataset::load_manifest(
                 &object_store,
                 &manifest_location,
-                &base_path,
+                &table_uri,
                 session.as_ref(),
             )
             .await?;
@@ -348,6 +365,7 @@ impl DatasetBuilder {
             location,
             session,
             commit_handler,
+            file_reader_options,
         )
     }
 }

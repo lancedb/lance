@@ -19,8 +19,8 @@ use lance_io::object_store::WrappingObjectStore;
 use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
+    GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -281,6 +281,17 @@ pub struct IoStats {
     pub write_bytes: u64,
     /// Number of disjoint periods where at least one IO is in-flight.
     pub num_hops: u64,
+    pub requests: Vec<IoRequestRecord>,
+}
+
+// These fields are "dead code" because we just use them right now to display
+// in test failure messages through Debug. (The lint ignores Debug impls.)
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct IoRequestRecord {
+    pub method: &'static str,
+    pub path: Path,
+    pub range: Option<Range<u64>>,
 }
 
 impl Display for IoStats {
@@ -327,10 +338,21 @@ impl IoTrackingStore {
         (Arc::new(StatsHolder(stats.clone())), stats)
     }
 
-    fn record_read(&self, num_bytes: u64) {
+    fn record_read(
+        &self,
+        method: &'static str,
+        path: Path,
+        num_bytes: u64,
+        range: Option<Range<u64>>,
+    ) {
         let mut stats = self.stats.lock().unwrap();
         stats.read_iops += 1;
         stats.read_bytes += num_bytes;
+        stats.requests.push(IoRequestRecord {
+            method,
+            path,
+            range,
+        });
     }
 
     fn record_write(&self, num_bytes: u64) {
@@ -393,26 +415,36 @@ impl ObjectStore for IoTrackingStore {
         let result = self.target.get(location).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes);
+            self.record_read("get", location.to_owned(), num_bytes, None);
         }
         result
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let _guard = self.hop_guard();
+        let range = match &options.range {
+            Some(GetRange::Bounded(range)) => Some(range.clone()),
+            _ => None, // TODO: fill in other options.
+        };
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
             let num_bytes = result.range.end - result.range.start;
-            self.record_read(num_bytes);
+
+            self.record_read("get_opts", location.to_owned(), num_bytes, range);
         }
         result
     }
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         let _guard = self.hop_guard();
-        let result = self.target.get_range(location, range).await;
+        let result = self.target.get_range(location, range.clone()).await;
         if let Ok(result) = &result {
-            self.record_read(result.len() as u64);
+            self.record_read(
+                "get_range",
+                location.to_owned(),
+                result.len() as u64,
+                Some(range),
+            );
         }
         result
     }
@@ -421,14 +453,19 @@ impl ObjectStore for IoTrackingStore {
         let _guard = self.hop_guard();
         let result = self.target.get_ranges(location, ranges).await;
         if let Ok(result) = &result {
-            self.record_read(result.iter().map(|b| b.len() as u64).sum());
+            self.record_read(
+                "get_ranges",
+                location.to_owned(),
+                result.iter().map(|b| b.len() as u64).sum(),
+                None,
+            );
         }
         result
     }
 
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
         let _guard = self.hop_guard();
-        self.record_read(0);
+        self.record_read("head", location.to_owned(), 0, None);
         self.target.head(location).await
     }
 
@@ -447,7 +484,7 @@ impl ObjectStore for IoTrackingStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let _guard = self.hop_guard();
-        self.record_read(0);
+        self.record_read("list", prefix.cloned().unwrap_or_default(), 0, None);
         self.target.list(prefix)
     }
 
@@ -456,13 +493,23 @@ impl ObjectStore for IoTrackingStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.record_read(0);
+        self.record_read(
+            "list_with_offset",
+            prefix.cloned().unwrap_or_default(),
+            0,
+            None,
+        );
         self.target.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         let _guard = self.hop_guard();
-        self.record_read(0);
+        self.record_read(
+            "list_with_delimiter",
+            prefix.cloned().unwrap_or_default(),
+            0,
+            None,
+        );
         self.target.list_with_delimiter(prefix).await
     }
 
@@ -570,7 +617,43 @@ pub trait DatagenExt {
         path: &str,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        let rows_per_fragment_val = rows_per_fragment.0;
+        self.into_dataset_with_params(
+            path,
+            frag_count,
+            rows_per_fragment,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment_val as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    async fn into_dataset_with_params(
+        self,
+        path: &str,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
     ) -> crate::Result<Dataset>;
+
+    async fn into_ram_dataset_with_params(
+        self,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+        write_params: Option<WriteParams>,
+    ) -> crate::Result<Dataset>
+    where
+        Self: Sized,
+    {
+        self.into_dataset_with_params("memory://", frag_count, rows_per_fragment, write_params)
+            .await
+    }
 
     async fn into_ram_dataset(
         self,
@@ -587,25 +670,18 @@ pub trait DatagenExt {
 
 #[async_trait::async_trait]
 impl DatagenExt for BatchGeneratorBuilder {
-    async fn into_dataset(
+    async fn into_dataset_with_params(
         self,
         path: &str,
         frag_count: FragmentCount,
         rows_per_fragment: FragmentRowCount,
-    ) -> crate::Result<Dataset> {
+        write_params: Option<WriteParams>,
+    ) -> lance_core::Result<Dataset> {
         let reader = self.into_reader_rows(
             RowCount::from(rows_per_fragment.0 as u64),
             BatchCount::from(frag_count.0),
         );
-        Dataset::write(
-            reader,
-            path,
-            Some(WriteParams {
-                max_rows_per_file: rows_per_fragment.0 as usize,
-                ..Default::default()
-            }),
-        )
-        .await
+        Dataset::write(reader, path, write_params).await
     }
 }
 
@@ -676,14 +752,34 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     Ok(test_dir)
 }
 
+/// Trims whitespace from the start and end of each line in the string.
+fn trim_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for line in s.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    if !result.is_empty() {
+        // Remove the last newline
+        result.pop();
+    }
+    result
+}
+
 pub async fn assert_plan_node_equals(
     plan_node: Arc<dyn ExecutionPlan>,
-    expected: &str,
+    raw_expected: &str,
 ) -> lance_core::Result<()> {
-    let plan_desc = format!(
+    let raw_plan_desc = format!(
         "{}",
         datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
     );
+    let plan_desc = trim_whitespace(&raw_plan_desc);
+
+    let expected = trim_whitespace(raw_expected);
 
     let to_match = expected.split("...").collect::<Vec<_>>();
     let num_pieces = to_match.len();
@@ -703,7 +799,7 @@ pub async fn assert_plan_node_equals(
     if !remainder.is_empty() {
         panic!(
             "Expected plan to match:\nExpected: {}\nActual: {}",
-            expected, plan_desc
+            raw_expected, raw_plan_desc
         )
     }
     Ok(())

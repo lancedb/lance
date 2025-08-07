@@ -58,6 +58,7 @@ use crate::dataset::{
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::DSMetadataCache;
+use crate::session::index_caches::IndexMetadataKey;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -137,13 +138,17 @@ async fn do_commit_new_dataset(
             let tx_key = crate::session::caches::TransactionKey {
                 version: manifest.version,
             };
-            metadata_cache.insert_with_key(&tx_key, Arc::new(transaction.clone()));
+            metadata_cache
+                .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                .await;
 
             let manifest_key = crate::session::caches::ManifestKey {
                 version: manifest_location.version,
                 e_tag: manifest_location.e_tag.as_deref(),
             };
-            metadata_cache.insert_with_key(&manifest_key, Arc::new(manifest.clone()));
+            metadata_cache
+                .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+                .await;
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
@@ -836,7 +841,8 @@ pub(crate) async fn commit_transaction(
                 };
                 dataset
                     .metadata_cache
-                    .insert_with_key(&tx_key, Arc::new(transaction.clone()));
+                    .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                    .await;
 
                 let manifest_key = crate::session::caches::ManifestKey {
                     version: manifest_location.version,
@@ -844,20 +850,28 @@ pub(crate) async fn commit_transaction(
                 };
                 dataset
                     .metadata_cache
-                    .insert_with_key(&manifest_key, Arc::new(manifest.clone()));
+                    .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+                    .await;
                 if !indices.is_empty() {
-                    dataset.session().index_cache.insert_metadata(
-                        dataset.base.as_ref(),
-                        target_version,
-                        Arc::new(indices),
-                    );
+                    let key = IndexMetadataKey {
+                        version: target_version,
+                    };
+                    dataset
+                        .index_cache
+                        .insert_with_key(&key, Arc::new(indices))
+                        .await;
                 }
 
-                match auto_cleanup_hook(&dataset, &manifest).await {
-                    Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
-                    Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
-                    _ => {}
-                };
+                if !commit_config.skip_auto_cleanup {
+                    // Note: We're using the old dataset here (before the new manifest is committed).
+                    // This means cleanup runs based on the previous version's state, which may affect
+                    // which versions are available for cleanup.
+                    match auto_cleanup_hook(&dataset, &manifest).await {
+                        Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+                        Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+                        _ => {}
+                    };
+                }
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {

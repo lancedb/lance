@@ -192,7 +192,7 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
-            } else if err_on_missing {
+            } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
@@ -318,6 +318,18 @@ impl Schema {
             .fields
             .iter()
             .filter_map(|f| f.project_by_ids(column_ids, include_all_children))
+            .collect();
+        Self {
+            fields: filtered_fields,
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    fn apply_projection(&self, projection: &Projection) -> Self {
+        let filtered_fields = self
+            .fields
+            .iter()
+            .filter_map(|f| f.apply_projection(projection))
             .collect();
         Self {
             fields: filtered_fields,
@@ -836,6 +848,51 @@ impl Projectable for Schema {
     }
 }
 
+/// Specifies how to handle blob columns when projecting
+#[derive(Debug, Clone, Default)]
+pub enum BlobHandling {
+    /// Read all blobs as binary
+    AllBinary,
+    #[default]
+    /// Read all blobs as descriptions and other binary columns as binary
+    BlobsDescriptions,
+    /// Read all binary columns as descriptions
+    AllDescriptions,
+    /// Read specific blobs as binary and the rest as descriptions
+    ///
+    /// Non-blob binary columns will be read as binary
+    ///
+    /// The set contains the field ids that should be read as binary
+    SomeBlobsBinary(HashSet<u32>),
+    /// Read specific columns as binary and all other binary columns as descriptions
+    ///
+    /// The set contains the field ids that should be read as binary
+    SomeBinary(HashSet<u32>),
+}
+
+impl BlobHandling {
+    fn should_unload(&self, field: &Field) -> bool {
+        if !field.data_type().is_binary_like() {
+            return false;
+        }
+        match self {
+            Self::AllBinary => false,
+            Self::BlobsDescriptions => field.is_blob(),
+            Self::AllDescriptions => true,
+            Self::SomeBlobsBinary(set) => field.is_blob() && !set.contains(&(field.id as u32)),
+            Self::SomeBinary(set) => !set.contains(&(field.id as u32)),
+        }
+    }
+
+    pub fn unload_if_needed(&self, field: Field) -> Field {
+        if self.should_unload(&field) {
+            field.into_unloaded()
+        } else {
+            field
+        }
+    }
+}
+
 /// A projection is a selection of fields in a schema
 ///
 /// In addition we record whether the row_id or row_addr are
@@ -846,14 +903,16 @@ pub struct Projection {
     pub field_ids: HashSet<i32>,
     pub with_row_id: bool,
     pub with_row_addr: bool,
+    pub blob_handling: BlobHandling,
 }
 
 impl Debug for Projection {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Projection")
-            .field("schema", &self.to_schema())
+            .field("field_ids", &self.field_ids)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_addr", &self.with_row_addr)
+            .field("blob_handling", &self.blob_handling)
             .finish()
     }
 }
@@ -866,6 +925,7 @@ impl Projection {
             field_ids: HashSet::new(),
             with_row_id: false,
             with_row_addr: false,
+            blob_handling: BlobHandling::default(),
         }
     }
 
@@ -884,7 +944,24 @@ impl Projection {
         self
     }
 
-    /// Add a column (and any of its parents) to the projection from a string reference
+    pub fn with_blob_handling(mut self, blob_handling: BlobHandling) -> Self {
+        self.blob_handling = blob_handling;
+        self
+    }
+
+    fn add_field_children(field_ids: &mut HashSet<i32>, field: &Field) {
+        for child in &field.children {
+            field_ids.insert(child.id);
+            Self::add_field_children(field_ids, child);
+        }
+    }
+
+    /// Add a column to the projection from a string reference
+    ///
+    /// The string reference can be a dotted field path (x.y.z) to reference inner struct fields
+    ///
+    /// Parent fields will automatically be added.  If the specified field has any children then
+    /// those will be added to.  Siblings, aunts, etc. are not automatically added
     pub fn union_column(mut self, column: impl AsRef<str>, on_missing: OnMissing) -> Result<Self> {
         let column = column.as_ref();
         if column == ROW_ID {
@@ -897,6 +974,9 @@ impl Projection {
 
         if let Some(fields) = self.base.schema().resolve(column) {
             self.field_ids.extend(fields.iter().map(|f| f.id));
+            if let Some(last_field) = fields.last() {
+                Self::add_field_children(&mut self.field_ids, last_field);
+            }
         } else if matches!(on_missing, OnMissing::Error) {
             return Err(Error::InvalidInput {
                 source: format!("Column {} does not exist", column).into(),
@@ -1063,10 +1143,37 @@ impl Projection {
         self.field_ids.is_empty() && !self.with_row_addr && !self.with_row_id
     }
 
+    /// True if the projection is only the row_id or row_addr columns
+    ///
+    /// Note: this will return false for a completely empty projection
+    pub fn is_metadata_only(&self) -> bool {
+        self.field_ids.is_empty() && (self.with_row_addr || self.with_row_id)
+    }
+
+    /// True if the projection has at least one non-metadata column
+    pub fn has_non_meta_cols(&self) -> bool {
+        !self.field_ids.is_empty()
+    }
+
+    /// Convert the projection to a schema that does not include metadata columns
+    pub fn to_bare_schema(&self) -> Schema {
+        self.base.schema().apply_projection(self)
+    }
+
     /// Convert the projection to a schema
+    ///
+    /// Includes the _rowid and _rowaddr columns if requested
     pub fn to_schema(&self) -> Schema {
-        let field_ids = self.field_ids.iter().copied().collect::<Vec<_>>();
-        self.base.schema().project_by_ids(&field_ids, false)
+        let mut schema = self.to_bare_schema();
+        let mut extra_fields = Vec::new();
+        if self.with_row_id {
+            extra_fields.push(ROW_ID_FIELD.clone());
+        }
+        if self.with_row_addr {
+            extra_fields.push(ROW_ADDR_FIELD.clone());
+        }
+        schema.extend(&extra_fields).unwrap();
+        schema
     }
 
     /// Convert the projection to a schema
@@ -1080,16 +1187,8 @@ impl Projection {
     }
 
     /// Convert the projection into an Arrow schema
-    pub fn to_arrow_schema(&self) -> Result<arrow_schema::Schema> {
-        let mut arrow_schema: arrow_schema::Schema = (&self.to_schema()).into();
-        // Should we be adding row_id / row_addr on to_schema?
-        if self.with_row_id {
-            arrow_schema = arrow_schema.try_with_column(ROW_ID_FIELD.clone())?;
-        }
-        if self.with_row_addr {
-            arrow_schema = arrow_schema.try_with_column(ROW_ADDR_FIELD.clone())?;
-        }
-        Ok(arrow_schema)
+    pub fn to_arrow_schema(&self) -> arrow_schema::Schema {
+        (&self.to_schema()).into()
     }
 }
 

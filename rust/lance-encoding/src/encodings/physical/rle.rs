@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_compression_strategy_selection() {
-        let strategy = DefaultCompressionStrategy;
+        let strategy = DefaultCompressionStrategy::new();
         let field = Field::new_arrow("test", arrow_schema::DataType::Int32, false).unwrap();
 
         // High repetition - should select RLE
@@ -790,53 +790,68 @@ mod tests {
     }
 
     #[test]
-    fn test_exact_1024_values_bug() {
+    fn test_1024_boundary_conditions() {
+        // Comprehensive test for various boundary conditions at 1024 values
+        // This consolidates multiple bug tests that were previously separate
         let encoder = RleMiniBlockEncoder::new();
+        let decompressor = RleMiniBlockDecompressor::new(32);
 
-        // Try different patterns that might trigger the bug
-        let test_patterns = [
-            // Pattern 1: runs of 2
-            {
+        let test_cases = [
+            ("runs_of_2", {
                 let mut data = Vec::new();
                 for i in 0..512 {
                     data.push(i);
                     data.push(i);
                 }
                 data
-            },
-            // Pattern 2: single run that ends at exactly 1024
-            vec![42i32; 1024],
-            // Pattern 3: alternating values
-            {
+            }),
+            ("single_run_1024", vec![42i32; 1024]),
+            ("alternating_values", {
                 let mut data = Vec::new();
                 for i in 0..1024 {
                     data.push(i % 2);
                 }
                 data
-            },
-            // Pattern 4: runs that end right at boundary
-            {
+            }),
+            ("run_boundary_255s", {
                 let mut data = Vec::new();
-                // 255 + 255 + 255 + 255 + 4 = 1024
                 data.extend(vec![1i32; 255]);
                 data.extend(vec![2i32; 255]);
                 data.extend(vec![3i32; 255]);
                 data.extend(vec![4i32; 255]);
                 data.extend(vec![5i32; 4]);
                 data
-            },
-            // Pattern 5: unique values ending exactly at 1024
-            { (0..1024).collect::<Vec<_>>() },
+            }),
+            ("unique_values_1024", (0..1024).collect::<Vec<_>>()),
+            ("unique_plus_duplicate", {
+                // 1023 unique values followed by one duplicate (regression test)
+                let mut data = Vec::new();
+                for i in 0..1023 {
+                    data.push(i);
+                }
+                data.push(1022i32); // Last value same as second-to-last
+                data
+            }),
+            ("bug_4092_pattern", {
+                // Test exact scenario that produces 4092 bytes instead of 4096
+                let mut data = Vec::new();
+                for i in 0..1022 {
+                    data.push(i);
+                }
+                data.push(999999i32);
+                data.push(999999i32);
+                data
+            }),
         ];
 
-        for (idx, data) in test_patterns.iter().enumerate() {
-            assert_eq!(data.len(), 1024);
+        for (test_name, data) in test_cases.iter() {
+            assert_eq!(data.len(), 1024, "Test case {} has wrong length", test_name);
 
+            // Compress the data
             let array = Int32Array::from(data.clone());
             let (compressed, _) = encoder.compress(DataBlock::from_array(array)).unwrap();
 
             // Decompress and verify
-            let decompressor = RleMiniBlockDecompressor::new(32);
             match decompressor.decompress(compressed.data, compressed.num_values) {
                 Ok(decompressed) => match decompressed {
                     DataBlock::FixedWidth(ref block) => {
@@ -844,102 +859,26 @@ mod tests {
                         assert_eq!(
                             values.len(),
                             1024,
-                            "Pattern {} failed: got {} values",
-                            idx,
+                            "Test case {} got {} values, expected 1024",
+                            test_name,
                             values.len()
                         );
-                        assert_eq!(values, &data[..], "Pattern {} data mismatch", idx);
+                        assert_eq!(
+                            block.data.len(),
+                            4096,
+                            "Test case {} got {} bytes, expected 4096",
+                            test_name,
+                            block.data.len()
+                        );
+                        assert_eq!(values, &data[..], "Test case {} data mismatch", test_name);
                     }
-                    _ => panic!("Expected FixedWidth block"),
+                    _ => panic!("Test case {} expected FixedWidth block", test_name),
                 },
                 Err(e) => {
-                    panic!("Pattern {} failed with error: {}", idx, e);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_unique_values_at_boundary() {
-        let encoder = RleMiniBlockEncoder::new();
-
-        // This specific pattern should trigger the bug:
-        // 1023 unique values followed by one that's the same
-        let mut data = Vec::new();
-        for i in 0..1023 {
-            data.push(i);
-        }
-        data.push(1022i32); // Last value is the same as second-to-last
-        assert_eq!(data.len(), 1024);
-
-        let array = Int32Array::from(data.clone());
-        let (compressed, _) = encoder.compress(DataBlock::from_array(array)).unwrap();
-
-        // Decompress and verify
-        let decompressor = RleMiniBlockDecompressor::new(32);
-        match decompressor.decompress(compressed.data, compressed.num_values) {
-            Ok(decompressed) => match decompressed {
-                DataBlock::FixedWidth(ref block) => {
-                    let values: &[i32] = bytemuck::cast_slice(block.data.as_ref());
-                    assert_eq!(
-                        values.len(),
-                        1024,
-                        "Got {} values, expected 1024",
-                        values.len()
-                    );
-                    assert_eq!(values, &data[..]);
-                }
-                _ => panic!("Expected FixedWidth block"),
-            },
-            Err(e) => {
-                panic!("Decompression failed: {}", e);
-            }
-        }
-    }
-
-    #[test]
-    fn test_bug_4092_bytes() {
-        // Test the exact scenario that produces 4092 bytes instead of 4096
-        let encoder = RleMiniBlockEncoder::new();
-
-        // Create pattern: 1022 unique values, then one value repeated 3 times
-        let mut data = Vec::new();
-        for i in 0..1022 {
-            data.push(i);
-        }
-        data.push(999999i32);
-        data.push(999999i32);
-        assert_eq!(data.len(), 1024);
-
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert_eq!(bytes.len(), 4096);
-
-        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 32,
-            data: LanceBuffer::Owned(bytes),
-            num_values: 1024,
-            block_info: BlockInfo::default(),
-        });
-
-        let (compressed, _) = encoder.compress(block).unwrap();
-
-        // Try to decode and see what happens
-        let decompressor = RleMiniBlockDecompressor::new(32);
-        match decompressor.decompress(compressed.data, compressed.num_values) {
-            Ok(decompressed) => match decompressed {
-                DataBlock::FixedWidth(ref block) => {
-                    assert_eq!(
-                        block.data.len(),
-                        4096,
-                        "Expected 4096 bytes but got {}",
-                        block.data.len()
-                    );
-                }
-                _ => panic!("Expected FixedWidth block"),
-            },
-            Err(e) => {
-                if e.to_string().contains("4092") {
-                    panic!("Found the bug! {}", e);
+                    if e.to_string().contains("4092") {
+                        panic!("Test case {} found bug 4092: {}", test_name, e);
+                    }
+                    panic!("Test case {} failed with error: {}", test_name, e);
                 }
             }
         }
@@ -1014,6 +953,81 @@ mod tests {
                     panic!("Unexpected error: {}", e);
                 }
             }
+        }
+    }
+
+    // ========== Encoding Verification Tests ==========
+
+    #[test_log::test(tokio::test)]
+    async fn test_rle_encoding_verification() {
+        use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+        use crate::version::LanceFileVersion;
+        use arrow_array::{Array, Int32Array};
+        use lance_datagen::{ArrayGenerator, RowCount};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("rle")
+            .with_file_version(LanceFileVersion::V2_1);
+
+        // Test both explicit metadata and automatic selection
+        // 1. Test with explicit RLE threshold metadata
+        let metadata_explicit = HashMap::from([(
+            "lance-encoding:rle-threshold".to_string(),
+            "0.8".to_string(),
+        )]);
+        let mut generator = RleDataGenerator::new(vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
+        let data_explicit = generator.generate_default(RowCount::from(10000)).unwrap();
+        check_round_trip_encoding_of_data(vec![data_explicit], &test_cases, metadata_explicit)
+            .await;
+
+        // 2. Test automatic RLE selection based on data characteristics
+        // 80% repetition should trigger RLE (> default 50% threshold)
+        let mut values = vec![42i32; 8000]; // 80% repetition
+        values.extend([1i32, 2i32, 3i32, 4i32, 5i32].repeat(400)); // 20% variety
+        let arr = Arc::new(Int32Array::from(values)) as Arc<dyn Array>;
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    /// Generator that produces repetitive patterns suitable for RLE
+    #[derive(Debug)]
+    struct RleDataGenerator {
+        pattern: Vec<i32>,
+        idx: usize,
+    }
+
+    impl RleDataGenerator {
+        fn new(pattern: Vec<i32>) -> Self {
+            Self { pattern, idx: 0 }
+        }
+    }
+
+    impl lance_datagen::ArrayGenerator for RleDataGenerator {
+        fn generate(
+            &mut self,
+            _length: lance_datagen::RowCount,
+            _rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+        ) -> std::result::Result<std::sync::Arc<dyn arrow_array::Array>, arrow_schema::ArrowError>
+        {
+            use arrow_array::Int32Array;
+            use std::sync::Arc;
+
+            // Generate enough repetitive data to trigger RLE
+            let mut values = Vec::new();
+            for _ in 0..10000 {
+                values.push(self.pattern[self.idx]);
+                self.idx = (self.idx + 1) % self.pattern.len();
+            }
+            Ok(Arc::new(Int32Array::from(values)))
+        }
+
+        fn data_type(&self) -> &arrow_schema::DataType {
+            &arrow_schema::DataType::Int32
+        }
+
+        fn element_size_bytes(&self) -> Option<lance_datagen::ByteCount> {
+            Some(lance_datagen::ByteCount::from(4))
         }
     }
 }

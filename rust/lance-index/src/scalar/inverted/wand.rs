@@ -187,11 +187,11 @@ impl PostingIterator {
         }
     }
 
-    fn positions(&self, index: usize) -> Option<Arc<dyn Array>> {
+    fn positions(&self) -> Option<Arc<dyn Array>> {
         match self.list {
-            PostingList::Plain(ref list) => list.positions(index),
+            PostingList::Plain(ref list) => list.positions(self.index),
             PostingList::Compressed(ref list) => list.positions.as_ref().map(|p| {
-                let positions = p.value(index);
+                let positions = p.value(self.index);
                 let positions = decompress_positions(positions.as_binary());
                 Arc::new(UInt32Array::from(positions)) as Arc<dyn Array>
             }),
@@ -269,6 +269,8 @@ impl PostingIterator {
 
 pub struct Wand<'a, S: Scorer> {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
+    operator: Operator,
+    num_terms: usize,
     // we need to sort the posting iterators frequently,
     // so wrap them in `Box` to avoid the cost of copying
     #[allow(clippy::vec_box)]
@@ -290,16 +292,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
     ) -> Self {
         let mut posting_lists = postings.collect::<Vec<_>>();
         posting_lists.sort_unstable();
-        let threshold = match operator {
-            Operator::Or => 0.0,
-            Operator::And => posting_lists
-                .iter()
-                .map(|posting| posting.approximate_upper_bound())
-                .sum::<f32>(),
-        };
 
         Self {
-            threshold,
+            threshold: 0.0,
+            operator,
+            num_terms: posting_lists.len(),
             postings: posting_lists.into_iter().map(Box::new).collect(),
             docs,
             scorer,
@@ -325,12 +322,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
         while let Some((pivot, doc)) = self.next()? {
             self.cur_doc = Some(doc);
             num_comparisons += 1;
-            if params.phrase_slop.is_some()
-                && !self.check_positions(params.phrase_slop.unwrap() as i32)
-            {
-                self.move_preceding(pivot, doc.doc_id() + 1);
-                continue;
-            }
 
             // if the doc is not located, we need to find the row id
             let row_id = match &doc {
@@ -345,6 +336,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.move_preceding(pivot, doc.doc_id() + 1);
                 continue;
             }
+
+            if params.phrase_slop.is_some()
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+            {
+                self.move_preceding(pivot, doc.doc_id() + 1);
+                continue;
+            }
+
             let doc_length = match &doc {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
@@ -453,6 +452,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
     // are greater than or equal to the threshold
     #[instrument(level = "debug", skip_all)]
     fn find_pivot_term(&self) -> Option<usize> {
+        if self.operator == Operator::And {
+            // for AND query, we always require all terms to be present in the document,
+            // so the pivot is always the last term as long as no posting list is exhausted
+            if self.postings.len() == self.num_terms {
+                return Some(self.num_terms - 1);
+            }
+            return None;
+        }
         let mut acc = 0.0;
         let mut pivot = None;
         for (idx, posting) in self.postings.iter().enumerate() {
@@ -528,9 +535,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .iter()
             .map(|posting| {
                 PositionIterator::new(
-                    posting
-                        .positions(posting.index)
-                        .expect("positions must exist"),
+                    posting.positions().expect("positions must exist"),
                     posting.position as i32,
                 )
             })
@@ -546,7 +551,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 let (Some(last), Some(next)) = (last, next) else {
                     return false;
                 };
-                max_relative_pos = Some(std::cmp::max(last, next) - slop);
+
+                let move_to = if last > next {
+                    last
+                } else {
+                    std::cmp::max(last + 1, next - slop)
+                };
+                max_relative_pos = max_relative_pos.max(Some(move_to));
                 if !(last <= next && next <= last + slop) {
                     all_same = false;
                     break;

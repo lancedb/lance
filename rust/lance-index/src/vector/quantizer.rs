@@ -221,7 +221,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
 
     fn metadata(&self) -> &Self::Metadata;
@@ -268,7 +268,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>;
 }
 

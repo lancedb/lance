@@ -7,6 +7,7 @@ use std::{collections::HashMap, pin::Pin};
 use arrow::datatypes;
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::Fields;
 use futures::stream;
 use futures::{
     prelude::stream::{StreamExt, TryStreamExt},
@@ -97,7 +98,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     // fields for merging indices / remapping
     existing_indices: Vec<Arc<dyn VectorIndex>>,
 
-    fri: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
 type BuildStream<S, Q> =
@@ -114,7 +115,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf_params: Option<IvfBuildParams>,
         quantizer_params: Option<Q::BuildParams>,
         sub_index_params: S::BuildParams,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let temp_dir = tempdir()?;
         let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
@@ -136,7 +137,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             quantizer: None,
             shuffle_reader: None,
             existing_indices: Vec::new(),
-            fri,
+            frag_reuse_index,
         })
     }
 
@@ -147,7 +148,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         distance_type: DistanceType,
         shuffler: Box<dyn Shuffler>,
         sub_index_params: S::BuildParams,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         Self::new(
             dataset,
@@ -158,7 +159,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             None,
             None,
             sub_index_params,
-            fri,
+            frag_reuse_index,
         )
     }
 
@@ -196,7 +197,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             quantizer: Some(ivf_index.quantizer().try_into()?),
             shuffle_reader: None,
             existing_indices: vec![index],
-            fri: None,
+            frag_reuse_index: None,
         })
     }
 
@@ -409,6 +410,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(quantizer)
     }
 
+    fn rename_row_id(
+        stream: impl RecordBatchStream + Unpin + 'static,
+        row_id_idx: usize,
+    ) -> impl RecordBatchStream + Unpin + 'static {
+        let new_schema = Arc::new(arrow_schema::Schema::new(
+            stream
+                .schema()
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(field_idx, field)| {
+                    if field_idx == row_id_idx {
+                        arrow_schema::Field::new(
+                            ROW_ID,
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        )
+                    } else {
+                        field.as_ref().clone()
+                    }
+                })
+                .collect::<Fields>(),
+        ));
+        RecordBatchStreamAdapter::new(
+            new_schema.clone(),
+            stream.map_ok(move |batch| {
+                RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec()).unwrap()
+            }),
+        )
+    }
+
     async fn shuffle_dataset(&mut self) -> Result<()> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
@@ -448,7 +480,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         };
 
-        self.shuffle_data(Some(stream)).await?;
+        if let Some((row_id_idx, _)) = stream.schema().column_with_name("row_id") {
+            // When using precomputed shuffle buffers we can't use the column name _rowid
+            // since it is reserved.  So we tolerate `row_id` as well here (and rename it
+            // to _rowid to match the non-precomputed path)
+            self.shuffle_data(Some(Self::rename_row_id(stream, row_id_idx)))
+                .await?;
+        } else {
+            self.shuffle_data(Some(stream)).await?;
+        }
         Ok(())
     }
 
@@ -608,7 +648,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let existing_indices = Arc::new(self.existing_indices.clone());
         let distance_type = self.distance_type;
         let column = self.column.clone();
-        let fri = self.fri.clone();
+        let frag_reuse_index = self.frag_reuse_index.clone();
         let build_iter = (0..ivf.num_partitions()).map(move |partition| {
             let reader = reader.clone();
             let existing_indices = existing_indices.clone();
@@ -616,7 +656,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let quantizer = quantizer.clone();
             let sub_index_params = sub_index_params.clone();
             let column = column.clone();
-            let fri = fri.clone();
+            let frag_reuse_index = frag_reuse_index.clone();
             async move {
                 let (batches, loss) = Self::take_partition_batches(
                     partition,
@@ -636,7 +676,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     sub_index_params,
                     batches,
                     column,
-                    fri,
+                    frag_reuse_index,
                 )?;
                 Ok(Some((storage, sub_index, loss)))
             }
@@ -654,9 +694,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         batches: Vec<RecordBatch>,
         column: String,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<(Q::Storage, S)> {
-        let storage = StorageBuilder::new(column, distance_type, quantizer, fri)?.build(batches)?;
+        let storage = StorageBuilder::new(column, distance_type, quantizer, frag_reuse_index)?
+            .build(batches)?;
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
 
         Ok((storage, sub_index))

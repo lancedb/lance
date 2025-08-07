@@ -274,48 +274,14 @@ impl U64Segment {
     }
 
     pub fn slice(&self, offset: usize, len: usize) -> Self {
-        match self {
-            Self::Range(range) => {
-                let start = range.start + offset as u64;
-                Self::Range(start..(start + len as u64))
-            }
-            Self::RangeWithHoles { range, holes } => {
-                let start = range.start + offset as u64;
-                let end = start + len as u64;
-
-                let start = holes.binary_search(start).unwrap_or_else(|x| x) as u64;
-                let end = holes.binary_search(end).unwrap_or_else(|x| x) as u64;
-                let holes_len = end - start;
-
-                if holes_len == 0 {
-                    Self::Range(start..end)
-                } else {
-                    let holes = holes.slice(start as usize, holes_len as usize);
-                    Self::RangeWithHoles {
-                        range: start..end,
-                        holes,
-                    }
-                }
-            }
-            Self::RangeWithBitmap { range, bitmap } => {
-                let start = range.start + offset as u64;
-                let end = start + len as u64;
-
-                let bitmap = bitmap.slice(offset, len);
-                if bitmap.count_ones() == len {
-                    // Bitmap no longer serves a purpose
-                    Self::Range(start..end)
-                    // TODO: could also have a case where we switch back to RangeWithHoles
-                } else {
-                    Self::RangeWithBitmap {
-                        range: start..end,
-                        bitmap: bitmap.into(),
-                    }
-                }
-            }
-            Self::SortedArray(array) => Self::SortedArray(array.slice(offset, len)),
-            Self::Array(array) => Self::Array(array.slice(offset, len)),
+        if len == 0 {
+            return Self::Range(0..0);
         }
+
+        let values: Vec<u64> = self.iter().skip(offset).take(len).collect();
+
+        // `from_slice` will compute stats and select the best representation.
+        Self::from_slice(&values)
     }
 
     pub fn position(&self, val: u64) -> Option<usize> {

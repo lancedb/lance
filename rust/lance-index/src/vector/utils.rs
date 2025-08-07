@@ -19,7 +19,7 @@ use std::{ops::Range, sync::Arc};
 use super::pb;
 use crate::pb::Tensor;
 use crate::vector::flat::storage::FlatFloatStorage;
-use crate::vector::hnsw::builder::HnswBuildParams;
+use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::hnsw::HNSW;
 use crate::vector::v3::subindex::IvfSubIndex;
 
@@ -91,7 +91,17 @@ impl SimpleIndex {
     }
 
     pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
-        let res = self.index.search_basic(query, 1, 15, None, &self.store)?;
+        let res = self.index.search_basic(
+            query,
+            1,
+            &HnswQueryParams {
+                ef: 15,
+                lower_bound: None,
+                upper_bound: None,
+            },
+            None,
+            &self.store,
+        )?;
         Ok((res[0].id, res[0].dist.0))
     }
 }

@@ -4,7 +4,7 @@
 syntax = "proto3";
 
 package lance.file;
-  
+
 // A file descriptor that describes the contents of a Lance file
 message FileDescriptor {
   // The schema of the file

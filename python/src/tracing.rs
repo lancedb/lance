@@ -15,16 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
-use std::sync::mpsc::TryRecvError;
-use std::sync::mpsc::TrySendError;
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::Mutex;
-use std::sync::RwLock;
-use std::thread::JoinHandle;
-
+use crate::CLIENT_VERSION;
+use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
 use pyo3::pyclass;
 use pyo3::pyfunction;
@@ -38,6 +30,15 @@ use pyo3::PyErr;
 use pyo3::PyObject;
 use pyo3::PyResult;
 use pyo3::Python;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
+use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::TrySendError;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::thread::JoinHandle;
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
@@ -253,6 +254,12 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
         if let Some(callback_sender) = state.callback_sender.as_ref() {
             let mut args = EventToMap::default();
             event.record(&mut args);
+
+            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            args.args.insert("timestamp".to_string(), now.to_string());
+            args.args
+                .insert("client_version".to_string(), CLIENT_VERSION.to_string());
+
             match callback_sender.try_send(TraceEvent {
                 target: event.metadata().target().to_string(),
                 args: args.args,
@@ -357,17 +364,20 @@ pub fn initialize_tracing(level: log::Level) {
 
 #[pyfunction]
 #[pyo3(signature=(callback))]
-pub fn capture_trace_events(callback: PyObject) {
+pub fn capture_trace_events(callback: PyObject, py: Python<'_>) {
     SUBSCRIBER
         .write()
         .unwrap()
         .as_mut()
         .unwrap()
-        .set_callback(callback);
+        .set_callback(callback.clone_ref(py));
 }
 
 #[pyfunction]
 #[pyo3(signature=())]
-pub fn shutdown_tracing() {
-    SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
+pub fn shutdown_tracing(py: Python<'_>) {
+    // Release Python GIL to avoid deadlock between current thread with the receiver thread.
+    py.allow_threads(|| {
+        SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
+    });
 }

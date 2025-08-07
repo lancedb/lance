@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -221,10 +222,25 @@ class LanceDataset(pa.dataset.Dataset):
         serialized_manifest: Optional[bytes] = None,
         default_scan_options: Optional[Dict[str, Any]] = None,
         metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
+
+        # Handle deprecation warning for index_cache_size
+        if index_cache_size is not None:
+            import warnings
+
+            warnings.warn(
+                "The 'index_cache_size' parameter is deprecated. "
+                "Use 'index_cache_size_bytes' instead. "
+                "The old parameter will be converted to bytes using 20 MiB per entry.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         self._ds = _Dataset(
             uri,
             version,
@@ -235,8 +251,11 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options,
             serialized_manifest,
             metadata_cache_size_bytes=metadata_cache_size_bytes,
+            index_cache_size_bytes=index_cache_size_bytes,
+            read_params=read_params,
         )
         self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     @classmethod
     def __deserialize__(
@@ -246,6 +265,7 @@ class LanceDataset(pa.dataset.Dataset):
         version: int,
         manifest: bytes,
         default_scan_options: Optional[Dict[str, Any]],
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         return cls(
             uri,
@@ -253,6 +273,7 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options=storage_options,
             serialized_manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
 
     def __reduce__(self):
@@ -262,6 +283,7 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __getstate__(self):
@@ -271,23 +293,30 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __setstate__(self, state):
+        # Handle backwards compatibility - state may not have read_params
         (
             self._uri,
             self._storage_options,
             version,
             manifest,
             default_scan_options,
+            *rest,  # Capture optional read_params
         ) = state
+        read_params = rest[0] if rest else None
         self._ds = _Dataset(
             self._uri,
             version,
             storage_options=self._storage_options,
             manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
+        self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
@@ -295,6 +324,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = self._storage_options
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params.copy() if self._read_params else None
         return ds
 
     def __len__(self):
@@ -380,6 +410,7 @@ class LanceDataset(pa.dataset.Dataset):
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
+        order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -485,6 +516,11 @@ class LanceDataset(pa.dataset.Dataset):
 
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
+        order_by: list of ColumnOrdering or str, default None
+            If not specified, the rows will be returned as the file order
+            if scan_in_order is true. Otherwise it will fellow as a random order.
+            If specified, the return rows will follow the orderings. If a string is
+            specified, it will assume ascending and nulls last ordering.
 
 
         .. note::
@@ -513,6 +549,11 @@ class LanceDataset(pa.dataset.Dataset):
         builder = ScannerBuilder(self)
         builder = self._apply_default_scan_options(builder)
 
+        if order_by is not None:
+            order_by = [
+                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
+            ]
+
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
         # we don't override any defaults from _default_scan_options
@@ -539,6 +580,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
         setopt(builder.strict_batch_size, strict_batch_size)
+        setopt(builder.order_by, order_by)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -619,6 +661,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -697,6 +740,11 @@ class LanceDataset(pa.dataset.Dataset):
 
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
+        order_by: list of ColumnOrdering, default None
+            If not specified, the rows will be returned as the file order
+            if scan_in_order is true. Otherwise it will fellow as a random order.
+            If specified, the return rows will follow the orderings. If a string is
+            specified, it will assume ascending and nulls last ordering.
 
         Notes
         -----
@@ -725,6 +773,7 @@ class LanceDataset(pa.dataset.Dataset):
             fast_search=fast_search,
             full_text_query=full_text_query,
             include_deleted_rows=include_deleted_rows,
+            order_by=order_by,
         ).to_table()
 
     @property
@@ -810,6 +859,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
+        order_by: Optional[List[ColumnOrdering]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -842,6 +892,7 @@ class LanceDataset(pa.dataset.Dataset):
             use_stats=use_stats,
             full_text_query=full_text_query,
             strict_batch_size=strict_batch_size,
+            order_by=order_by,
         ).to_batches()
 
     def sample(
@@ -1248,6 +1299,7 @@ class LanceDataset(pa.dataset.Dataset):
             and isinstance(transforms[0], pa.Field)
         ):
             transforms = pa.schema(transforms)
+
         if isinstance(transforms, pa.Schema):
             self._ds.add_columns_with_schema(transforms)
             return
@@ -1469,6 +1521,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
+        conflict_retries: int = 10,
+        retry_timeout: timedelta = timedelta(seconds=30),
     ) -> UpdateResult:
         """
         Update column values for rows matching where.
@@ -1479,6 +1533,14 @@ class LanceDataset(pa.dataset.Dataset):
             A mapping of column names to a SQL expression.
         where : str, optional
             A SQL predicate indicating which rows should be updated.
+        conflict_retries : int, optional
+            Number of times to retry the operation if there is contention.
+            Default is 10.
+        retry_timeout : timedelta, optional
+            The timeout used to limit retries. This is the maximum time to spend on
+            the operation before giving up. At least one attempt will be made,
+            regardless of how long it takes to complete. Subsequent attempts will be
+            cancelled once this timeout is reached. Default is 30 seconds.
 
         Returns
         -------
@@ -1501,7 +1563,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        return self._ds.update(updates, where)
+        return self._ds.update(updates, where, conflict_retries, retry_timeout)
 
     def versions(self):
         """
@@ -2577,6 +2639,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
+        ds._read_params = None
         return ds
 
     @staticmethod
@@ -2666,7 +2729,9 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
+        ds._storage_options = storage_options
         ds._default_scan_options = None
+        ds._read_params = None
         return BulkCommitResult(
             dataset=ds,
             merged=merged,
@@ -2732,6 +2797,74 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.config()
 
+    def read_transaction(self, version: int) -> Optional[Transaction]:
+        """Get Transaction at a specific version.
+
+        Parameters
+        ----------
+        version: int
+            The version number of the dataset to retrieve properties from
+
+        Returns
+        -------
+        Dict[str, str] or None
+            A dictionary containing the properties of the Transaction
+            , or None if the transaction doesn't exist.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
+        >>> table1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> ds = lance.write_dataset(   \\
+        ... table1, \\
+        ... "properties_example",   \\
+        ... commit_message="initial")
+        >>> table2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> properties2 = {LANCE_COMMIT_MESSAGE_KEY: "Second commit", \\
+        ... "another_prop": "another_value"}
+        >>> ds = lance.write_dataset( \\
+        ... table2, \\
+        ... "properties_example",   \\
+        ... mode="append",  \\
+        ... transaction_properties=properties2)
+        >>> print(ds.read_transaction(1).transaction_properties)
+        {'__lance_commit_message': 'initial'}
+        >>> print(ds.read_transaction(2).transaction_properties.get("another_prop"))
+        another_value
+        """
+        return self._ds.read_transaction(version)
+
+    def get_transactions(self, recent_transactions=10) -> Optional[List[Transaction]]:
+        return self._ds.get_transactions(recent_transactions)
+
+    def sql(self, sql: str) -> "SqlQueryBuilder":
+        """Execute SQL query on the dataset.
+
+        Parameters
+        ----------
+        sql : str
+            SQL SELECT statement to execute. The query must reference the dataset
+            as the FROM clause or omit the FROM clause to query the current dataset.
+
+        Returns
+        -------
+        SqlQueryBuilder
+            A builder that can be used to configure and build the query.
+
+        Examples
+        --------
+         .. code-block:: python
+
+            import lance
+            dataset = lance.dataset("/tmp/data.lance")
+            query = dataset.sql("SELECT id, name FROM dataset WHERE age > 30").build()
+            query.to_list()
+
+        """
+        return SqlQueryBuilder(self._ds.sql(sql))
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -2751,6 +2884,168 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> None:
         _Dataset.drop(str(base_uri), storage_options, ignore_not_found=ignore_not_found)
 
+    def get_ivf_model(self, index_name: str):
+        """Return the IVF model for a vector index.
+
+        This directly forwards to the underlying Rust Dataset implementation
+        and returns a ``PyIvfModel`` instance (see ``lance.indices``).
+
+        Parameters
+        ----------
+        index_name : str
+            The name of the vector index (e.g. ``"vector_idx"``).
+        """
+        return self._ds.get_ivf_model(index_name)
+
+    def _default_vector_index_for_column(self, column: str) -> str:
+        """Return the first index name that covers *column* and is IVF-based.
+
+        Raises KeyError if no such index exists.
+        """
+        for meta in self.list_indices():
+            if column in meta["fields"] and meta["type"].startswith("IVF"):
+                return meta["name"]
+        raise KeyError(f"No IVF index for column '{column}'")
+
+    def centroids(
+        self,
+        *,
+        index_name: str | None = None,
+        column: str | None = None,
+    ):
+        """Return IVF centroids for a given index/column.
+
+        Parameters
+        ----------
+        index_name : str, optional
+            Explicit index name.  If omitted, *column* must be provided.
+        column : str, optional
+            Column whose default IVF index should be inspected.
+        """
+
+        if index_name is None:
+            if column is None:
+                raise ValueError("Must provide 'index_name' or 'column'.")
+            index_name = self._default_vector_index_for_column(column)
+
+        ivf = self.get_ivf_model(index_name)
+        if ivf is None:
+            return None
+
+        return ivf.centroids
+
+
+class SqlQuery:
+    """
+    An executable SQL query.
+
+    This is created by calling :meth:`SqlQueryBuilder.build`.
+    """
+
+    def __init__(self, query):
+        self._query = query
+
+    def to_batch_records(self) -> list[pa.RecordBatch]:
+        """
+        Execute the query and return a list of RecordBatches.
+
+        This is an eager operation that will load all results into memory.
+
+        Returns
+        -------
+        list[pyarrow.RecordBatch]
+        """
+        return self._query.to_batch_records()
+
+    def to_stream_reader(self) -> pa.RecordBatchReader:
+        """
+        Execute the query and return a RecordBatchReader.
+
+        This is a lazy operation that will stream results.
+
+        Returns
+        -------
+        pyarrow.RecordBatchReader
+        """
+        return self._query.to_stream_reader()
+
+    def explain_plan(self, verbose: bool = False, analyze: bool = False) -> str:
+        """
+        Explain the query plan.
+
+        Parameters
+        ----------
+        verbose: bool, default False
+            If True, print the verbose plan.
+        analyze: bool, default False
+            If True, analyze the query and print the statistics.
+
+        Returns
+        -------
+        str
+            The query plan.
+        """
+        return self._query.explain_plan(verbose, analyze)
+
+
+class SqlQueryBuilder:
+    """
+    A builder for SQL queries on a Lance dataset.
+
+    This builder allows for chaining of options to configure the SQL query.
+    It is returned by :meth:`LanceDataset.sql`.
+    """
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def table_name(self, table_name: str) -> "SqlQueryBuilder":
+        """
+        Set the table name for the query.
+
+        Parameters
+        ----------
+        table_name: str
+            The name of the table to query.
+        """
+        self._builder = self._builder.table_name(table_name)
+        return self
+
+    def with_row_id(self, with_row_id: bool = True) -> "SqlQueryBuilder":
+        """
+        Include the row ID in the query result.
+
+        Parameters
+        ----------
+        with_row_id: bool, default True
+            Whether to include the row ID column (`_rowid`).
+        """
+        self._builder = self._builder.with_row_id(with_row_id)
+        return self
+
+    def with_row_addr(self, with_row_addr: bool = True) -> "SqlQueryBuilder":
+        """
+        Include the row address in the query result.
+
+        Parameters
+        ----------
+        with_row_addr: bool, default True
+            Whether to include the row address column (`_rowaddr`).
+        """
+        self._builder = self._builder.with_row_addr(with_row_addr)
+        return self
+
+    def build(self) -> SqlQuery:
+        """
+        Build the query.
+
+        Returns
+        -------
+        SqlQuery
+            An executable query object.
+        """
+        return SqlQuery(self._builder.build())
+
 
 class BulkCommitResult(TypedDict):
     dataset: LanceDataset
@@ -2763,6 +3058,9 @@ class Transaction:
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     blobs_op: Optional[LanceOperation.BaseOperation] = None
+    transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 class Tag(TypedDict):
@@ -3214,6 +3512,19 @@ class LanceOperation:
         schema: LanceSchema
 
 
+@dataclass
+class ColumnOrdering:
+    """
+    This class is used to define the column ordering rules for the `sort` operator.
+    It allows users to specify the sorting order (ascending or descending)
+    and the position of null values (first or last).
+    """
+
+    column_name: str
+    ascending: bool = True
+    nulls_first: bool = False
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -3241,6 +3552,7 @@ class ScannerBuilder:
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
+        self._orderings = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3602,6 +3914,21 @@ class ScannerBuilder:
         self._strict_batch_size = strict_batch_size
         return self
 
+    def order_by(self, orderings: Optional[list[ColumnOrdering]]) -> ScannerBuilder:
+        if orderings is not None:
+            inner_orderings = []
+            for order in orderings:
+                if isinstance(order, ColumnOrdering):
+                    inner_orderings.append(order)
+                else:
+                    raise TypeError(
+                        f"orderings must be a list of ColumnOrdering. "
+                        f"Got {type(order)} instead."
+                    )
+            orderings = inner_orderings
+        self._orderings = orderings
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -3628,6 +3955,7 @@ class ScannerBuilder:
             self._include_deleted_rows,
             self._scan_stats_callback,
             self._strict_batch_size,
+            self._orderings,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -4061,11 +4389,15 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: Optional[str] = None,
+    data_storage_version: Optional[
+        Literal["stable", "2.0", "2.1", "next", "legacy", "0.1"]
+    ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
+    commit_message: Optional[str] = None,
+    transaction_properties: Optional[Dict[str, str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -4135,6 +4467,15 @@ def write_dataset(
         then no autocleaning will be performed.
         Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
+    commit_message: str, optional
+        A message to associate with this commit. This message will be stored in the
+        dataset's metadata and can be retrieved using read_transaction().
+    transaction_properties: dict of str to str, optional
+        Custom properties to associate with this transaction.
+        Properties will be stored in the dataset's transaction
+        and can be retrieved using read_transaction().
+        If both `commit_message` and `properties` are provided, `commit_message` will
+        override any "lance.commit.message" key in `properties`.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -4159,6 +4500,11 @@ def write_dataset(
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
 
+    # Merge properties and commit_message with priority to commit_message
+    merged_properties = _merge_message_to_properties(
+        commit_message, transaction_properties
+    )
+
     params = {
         "mode": mode,
         "max_rows_per_file": max_rows_per_file,
@@ -4170,6 +4516,7 @@ def write_dataset(
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_move_stable_row_ids": enable_move_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
+        "transaction_properties": merged_properties,
     }
 
     if commit_lock:
@@ -4191,6 +4538,7 @@ def write_dataset(
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
+    ds._read_params = None
     return ds
 
 
@@ -4271,6 +4619,23 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
+
+
+def _merge_message_to_properties(
+    commit_message: Optional[str],
+    properties: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    """
+    handles merging commit_message into properties,
+    prioritizing the commit_message if properties also has the same key
+    """
+    if properties is None and commit_message is None:
+        return None
+
+    merged_properties = properties.copy() if properties else {}
+    if commit_message is not None:
+        merged_properties[LANCE_COMMIT_MESSAGE_KEY] = commit_message
+    return merged_properties
 
 
 class VectorIndexReader:

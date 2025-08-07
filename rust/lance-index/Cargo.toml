@@ -41,7 +41,6 @@ lance-io.workspace = true
 lance-linalg.workspace = true
 lance-table.workspace = true
 log.workspace = true
-moka.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
@@ -77,8 +76,8 @@ rstest.workspace = true
 
 [features]
 protoc = ["dep:protobuf-src"]
-tokenizer-lindera = ["lindera", "lindera-tantivy"]
-tokenizer-jieba = ["jieba-rs"]
+tokenizer-lindera = ["dep:lindera", "dep:lindera-tantivy"]
+tokenizer-jieba = ["dep:jieba-rs"]
 
 [build-dependencies]
 prost-build.workspace = true
