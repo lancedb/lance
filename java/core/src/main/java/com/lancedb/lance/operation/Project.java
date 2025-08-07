@@ -40,7 +40,6 @@ public class Project extends SchemaOperation {
     return new Builder();
   }
 
-  // Builder class for Project
   public static class Builder {
     private Schema schema;
 
