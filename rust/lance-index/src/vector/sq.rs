@@ -15,7 +15,6 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use num_traits::*;
-use rand::Rng;
 use snafu::location;
 use storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage, SQ_METADATA_KEY};
 
@@ -266,14 +265,12 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Rang
         return vec![0; values.len()];
     }
 
-    let distr = rand_distr::Normal::new(0.0, 1.0).unwrap();
-    let mut rng = rand::rng();
     let range = bounds.end - bounds.start;
     values
         .iter()
         .map(|&v| {
             let v = v.to_f64().unwrap();
-            let v = ((v - bounds.start) * 255.0 / range) + rng.sample(distr);
+            let v = (v - bounds.start) * 255.0 / range;
             v as u8 // rust `as` performs saturating cast when casting float to int, so it's safe and expected here
         })
         .collect_vec()
