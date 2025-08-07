@@ -51,6 +51,7 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 pub struct FlatQueryParams {
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
+    dist_q_c: f32,
 }
 
 impl From<&Query> for FlatQueryParams {
@@ -58,6 +59,7 @@ impl From<&Query> for FlatQueryParams {
         Self {
             lower_bound: q.lower_bound,
             upper_bound: q.upper_bound,
+            dist_q_c: q.dist_q_c,
         }
     }
 }
@@ -88,7 +90,7 @@ impl IvfSubIndex for FlatIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         metrics.record_comparisons(storage.len());
 
         let res = match prefilter.is_empty() {

@@ -878,6 +878,7 @@ impl Scanner {
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
+            dist_q_c: 0.0,
         });
         Ok(self)
     }

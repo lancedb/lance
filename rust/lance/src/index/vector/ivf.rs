@@ -19,6 +19,7 @@ use crate::{
 };
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
+use arrow_array::Float32Array;
 use arrow_array::{
     cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
@@ -2107,8 +2108,9 @@ mod tests {
                     refine_factor: None,
                     metric_type: MetricType::L2,
                     use_index: true,
+                    dist_q_c: 0.0,
                 };
-                let partitions = index.find_partitions(&query).unwrap();
+                let (partitions, _) = index.find_partitions(&query, false).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;
                 let search_result = index
                     .search_in_partition(

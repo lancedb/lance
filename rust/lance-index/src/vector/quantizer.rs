@@ -62,6 +62,7 @@ pub trait Quantization:
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationType {
     Flat,
     Product,

@@ -380,7 +380,7 @@ impl VectorStore for ScalarQuantizationStorage {
     ///
     /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+    fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         SQDistCalculator::new(query, self, self.quantizer.bounds())
     }
 
@@ -506,10 +506,11 @@ mod tests {
     fn create_record_batch(row_ids: Range<u64>) -> RecordBatch {
         const DIM: usize = 64;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let row_ids = UInt64Array::from_iter_values(row_ids);
-        let sq_code =
-            UInt8Array::from_iter_values(repeat_with(|| rng.gen::<u8>()).take(row_ids.len() * DIM));
+        let sq_code = UInt8Array::from_iter_values(
+            repeat_with(|| rng.random::<u8>()).take(row_ids.len() * DIM),
+        );
         let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
 
         let schema = Arc::new(Schema::new(vec![

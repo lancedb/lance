@@ -47,6 +47,7 @@ pub const DIST_COL: &str = "_distance";
 pub const DISTANCE_TYPE_KEY: &str = "distance_type";
 pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
+pub const DIST_Q_C_COLUMN: &str = "__dist_q_c";
 // dist from vector to centroid
 pub const CENTROID_DIST_COLUMN: &str = "__centroid_dist";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
@@ -107,6 +108,10 @@ pub struct Query {
 
     /// Whether to use an ANN index if available
     pub use_index: bool,
+
+    /// the distance between the query and the centroid
+    /// this is only used for IVF index with Rabit quantization
+    pub dist_q_c: f32,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
@@ -176,6 +181,11 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         query: &Query,
         with_dist: bool,
     ) -> Result<(UInt32Array, Option<Float32Array>)>;
+
+    /// Indicate whether the distance between the query and the centroid is required.
+    fn require_centroid_dist(&self) -> bool {
+        false
+    }
 
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;

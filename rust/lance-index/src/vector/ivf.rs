@@ -17,7 +17,6 @@ use crate::vector::bq::builder::RabitQuantizer;
 use crate::vector::bq::transform::RQTransformer;
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array};
-use crate::vector::transform::NormalizeTransformer;
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
 
 use super::flat::transform::FlatTransformer;
@@ -290,7 +289,12 @@ impl IvfTransformer {
                 .keep_original(true),
         ));
 
-        transforms.push(Arc::new(RQTransformer::new(rq, vector_column)));
+        transforms.push(Arc::new(RQTransformer::new(
+            rq,
+            distance_type,
+            centroids.clone(),
+            vector_column,
+        )));
 
         Self::new(centroids, distance_type, transforms)
     }

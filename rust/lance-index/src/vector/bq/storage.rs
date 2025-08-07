@@ -5,20 +5,16 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt64Type, UInt8Type};
-use arrow_array::{
-    Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, PrimitiveArray, RecordBatch,
-    UInt64Array,
-};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
-use lance_linalg::distance::{DistanceType, Dot, L2};
-use lance_linalg::kernels::{self, normalize_arrow};
+use lance_linalg::distance::DistanceType;
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
@@ -27,11 +23,12 @@ use snafu::location;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
-use crate::vector::bq::transform::{CODE_BITCOUNT_COLUMN, IP_RQ_CENTROID_COLUMN, IP_RQ_RES_COLUMN};
+use crate::vector::bq::transform::{
+    ADD_FACTORS_COLUMN, CODE_BITCOUNT_COLUMN, SCALE_FACTORS_COLUMN,
+};
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::sq::scale_to_u8;
 use crate::vector::storage::{DistCalculator, VectorStore};
-use crate::vector::CENTROID_DIST_COLUMN;
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
@@ -109,11 +106,10 @@ pub struct RabitQuantizationStorage {
 
     // helper fields
     row_ids: UInt64Array,
-    centroid_dists: Float32Array,
     codes: FixedSizeListArray,
     code_bitcounts: Float32Array,
-    ip_rq_res: Float32Array,
-    ip_rq_centroid: Float32Array,
+    add_factors: Float32Array,
+    scale_factors: Float32Array,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -173,25 +169,10 @@ pub struct RabitDistCalculator<'a> {
     // we split the query codes into d/4 chunks, each chunk is with 4 elements,
     // then dist_table[i][j] is the distance between the i-th query code and the code j
     dist_table: Vec<u32>,
-    centroid_dists: &'a [f32],
     code_bitcounts: &'a [f32],
-    ip_rq_res: &'a [f32],
-    ip_rq_centroid: &'a [f32],
-
-    // factors for all computing distances to all vectors
-    // |v-c|^2  + 2 * |v-c|^2 * ip_rq_centroid[i] / ip_rq_res[i]
-    // add_factor: f32,
-    // -2 * |v-c| / ip_rq_res[i] * |v-c| = -2 * |v-c|^2 / ip_rq_res[i]
-    // scale_factor: f32,
-
-    // factors for query vector
-    // -(2^B - 1)/2 * sum(q') where B is the number of bits per dimension for RQ (not SQ)
-    // it's 0 for 1 bit RQ
-    // kbit_x_sq_sum: f32,
-
-    // for L2, it's |q-c|^2
-    // for dot, it's -q*c
-    q_factor: f32,
+    add_factors: &'a [f32],
+    scale_factors: &'a [f32],
+    query_factor: f32,
 
     sq_min: f32,
     sq_scale: f32,
@@ -204,12 +185,11 @@ impl<'a> RabitDistCalculator<'a> {
         query_codes: Vec<u8>,
         sq_min: f32,
         sq_scale: f32,
-        q_factor: f32,
         codes: &'a [u8],
-        centroid_dists: &'a [f32],
         code_bitcounts: &'a [f32],
-        ip_rq_res: &'a [f32],
-        ip_rq_centroid: &'a [f32],
+        add_factors: &'a [f32],
+        scale_factors: &'a [f32],
+        query_factor: f32,
     ) -> Self {
         let dim = query_codes.len();
         let sq_sum = query_codes.iter().map(|&v| v as u32).sum::<u32>() as f32;
@@ -220,11 +200,10 @@ impl<'a> RabitDistCalculator<'a> {
             num_bits: 1,
             codes,
             dist_table,
-            centroid_dists,
             code_bitcounts,
-            ip_rq_res,
-            ip_rq_centroid,
-            q_factor: q_factor,
+            add_factors,
+            scale_factors,
+            query_factor,
             sq_min,
             sq_scale,
             sq_sum,
@@ -277,9 +256,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
             - self.dim as f32 * self.sq_min)
             / self.sqrt_d;
 
-        let dist_v_q = dist_vq_qr / self.ip_rq_res[id];
-        let vr_norm_square = self.centroid_dists[id];
-        vr_norm_square + self.q_factor - 2.0 * vr_norm_square * dist_v_q
+        dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
     }
 
     fn distance_all(&self, _: usize) -> Vec<f32> {
@@ -356,12 +333,11 @@ impl VectorStore for RabitQuantizationStorage {
             query_codes,
             sq_min,
             sq_scale,
-            q_factor,
             codes,
-            self.centroid_dists.values(),
             self.code_bitcounts.values(),
-            self.ip_rq_res.values(),
-            self.ip_rq_centroid.values(),
+            self.add_factors.values(),
+            self.scale_factors.values(),
+            q_factor,
         )
     }
 
@@ -384,16 +360,13 @@ impl QuantizerStorage for RabitQuantizationStorage {
     ) -> Result<Self> {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
-        let centroid_dists = batch[CENTROID_DIST_COLUMN]
-            .as_primitive::<Float32Type>()
-            .clone();
         let code_bitcounts = batch[CODE_BITCOUNT_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
-        let ip_rq_res = batch[IP_RQ_RES_COLUMN]
+        let add_factors = batch[ADD_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
-        let ip_rq_centroid = batch[IP_RQ_CENTROID_COLUMN]
+        let scale_factors = batch[SCALE_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
         Ok(Self {
@@ -402,10 +375,9 @@ impl QuantizerStorage for RabitQuantizationStorage {
             distance_type,
             row_ids,
             codes,
-            centroid_dists,
             code_bitcounts,
-            ip_rq_res,
-            ip_rq_centroid,
+            add_factors,
+            scale_factors,
         })
     }
 
