@@ -1,13 +1,15 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::{import_vec, FromJObjectWithEnv, IntoJava};
+use crate::traits::{import_vec, FromJObjectWithEnv, FromJString, IntoJava};
 use crate::utils::{to_java_map, to_rust_map};
+use crate::Error;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::datatypes::Schema as LanceSchema;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[no_mangle]
@@ -140,6 +142,67 @@ fn convert_to_java_operation_inner<'local>(
                 "(Lorg/apache/arrow/vector/types/pojo/Schema;)V",
                 &[JValue::Object(&java_schema)],
             )?)
+        }
+        Operation::UpdateConfig {
+            upsert_values,
+            delete_keys,
+            schema_metadata,
+            field_metadata,
+        } => {
+            let upsert_values = match upsert_values {
+                Some(config_values) => to_java_map(env, &config_values)?,
+                _ => JObject::null(),
+            };
+            let delete_keys = match delete_keys {
+                Some(keys) => {
+                    let java_keys = env.new_object("java/util/ArrayList", "(I)V", &[])?;
+                    for key in keys {
+                        let java_key = env.new_string(key)?;
+                        env.call_method(
+                            &java_keys,
+                            "add",
+                            "(Ljava/lang/Object;)Z",
+                            &[JValue::Object(&java_key)],
+                        )?;
+                    }
+                    java_keys
+                }
+                _ => JObject::null(),
+            };
+            let schema_metadata = match schema_metadata {
+                Some(schema_metadata) => to_java_map(env, &schema_metadata)?,
+                _ => JObject::null(),
+            };
+            let field_metadata = match field_metadata {
+                Some(field_metadata) => {
+                    let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+                    let map = JMap::from_env(env, &java_map)?;
+
+                    for (field_id, field_meta) in field_metadata {
+                        let java_field_id = env.new_object(
+                            "java/lang/Integer",
+                            "(I)V",
+                            &[JValue::Int(field_id as i32)],
+                        )?;
+
+                        let java_field_metadata = to_java_map(env, &field_meta)?;
+                        map.put(env, &java_field_id, &java_field_metadata)?;
+                    }
+                    java_map
+                }
+                _ => JObject::null(),
+            };
+            let java_operation = env.new_object(
+                "com/lancedb/lance/operation/UpdateConfig",
+                "(Ljava/util/Map;Ljava/util/List;Ljava/util/Map;Ljava/util/Map;)V",
+                &[
+                    JValue::Object(&upsert_values),
+                    JValue::Object(&delete_keys),
+                    JValue::Object(&schema_metadata),
+                    JValue::Object(&field_metadata),
+                ],
+            )?;
+            Ok(java_operation)
         }
         Operation::Merge {
             fragments: rust_fragments,
@@ -285,6 +348,70 @@ fn convert_to_rust_operation(
         "Project" => Operation::Project {
             schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
         },
+        "UpdateConfig" => {
+            let upsert_values = env
+                .call_method(&java_operation, "upsertValues", "()Ljava/util/Map;", &[])?
+                .l()?;
+            let upsert_values = if !upsert_values.is_null() {
+                let upsert_values = JMap::from_env(env, &upsert_values)?;
+                Some(to_rust_map(env, &upsert_values)?)
+            } else {
+                None
+            };
+
+            let delete_keys = env
+                .call_method(&java_operation, "deleteKeys", "()Ljava/util/List;", &[])?
+                .l()?;
+            let delete_keys = if !delete_keys.is_null() {
+                let keys = import_vec(env, &delete_keys)?;
+                let keys = keys
+                    .into_iter()
+                    .map(|key| JString::from(key))
+                    .map(|key| key.extract(env))
+                    .collect::<Result<Vec<_>>>()?;
+                Some(keys)
+            } else {
+                None
+            };
+
+            let schema_metadata = env
+                .call_method(&java_operation, "schemaMetadata", "()Ljava/util/Map;", &[])?
+                .l()?;
+            let schema_metadata = if !schema_metadata.is_null() {
+                let schema_metadata = JMap::from_env(env, &schema_metadata)?;
+                Some(to_rust_map(env, &schema_metadata)?)
+            } else {
+                None
+            };
+
+            let field_metadata = env
+                .call_method(&java_operation, "fieldMetadata", "()Ljava/util/Map;", &[])?
+                .l()?;
+            let field_metadata = if !field_metadata.is_null() {
+                let field_metadata = JMap::from_env(env, &field_metadata)?;
+                let mut field_metadata_map = HashMap::new();
+                let mut iter = field_metadata.iter(env)?;
+                env.with_local_frame(16, |env| {
+                    while let Some((key, value)) = iter.next(env)? {
+                        let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
+                        let inner_map = JMap::from_env(env, &value)?;
+                        let value_map = to_rust_map(env, &inner_map)?;
+                        field_metadata_map.insert(field_id, value_map);
+                    }
+                    Ok::<(), Error>(())
+                })?;
+                Some(field_metadata_map)
+            } else {
+                None
+            };
+
+            Operation::UpdateConfig {
+                upsert_values,
+                delete_keys,
+                schema_metadata,
+                field_metadata,
+            }
+        }
         "Append" => {
             let fragment_objs = env
                 .call_method(&java_operation, "fragments", "()Ljava/util/List;", &[])?
