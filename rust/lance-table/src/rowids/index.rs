@@ -37,7 +37,7 @@ impl RowIdIndex {
     pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
         let chunks = fragment_indices
             .iter()
-            .flat_map(|frag_index| decompose_sequence(frag_index))
+            .flat_map(decompose_sequence)
             .collect::<Vec<_>>();
 
         let mut final_chunks = Vec::new();

@@ -206,11 +206,13 @@ impl U64Segment {
     pub fn from_slice(slice: &[u64]) -> Self {
         Self::from_iter(slice.iter().copied())
     }
+}
 
-    pub fn from_iter(iter: impl Iterator<Item = u64> + Clone) -> Self {
-        let stats_iter = iter.clone();
-        let stats = Self::compute_stats(stats_iter);
-        Self::from_stats_and_sequence(stats, iter)
+impl std::iter::FromIterator<u64> for U64Segment {
+    fn from_iter<I: IntoIterator<Item = u64>>(iter: I) -> Self {
+        let values: Vec<u64> = iter.into_iter().collect();
+        let stats = Self::compute_stats(values.iter().copied());
+        Self::from_stats_and_sequence(stats, values)
     }
 }
 
