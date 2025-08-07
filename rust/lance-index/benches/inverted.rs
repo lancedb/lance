@@ -27,6 +27,7 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
+use rand::Rng;
 
 fn bench_inverted(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;
@@ -96,7 +97,7 @@ fn bench_inverted(c: &mut Criterion) {
     c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             // Pick a random word from our sample
-            let word_idx = rand::random::<usize>() % sample_words.len();
+            let word_idx = rand::rng().random_range(0..sample_words.len());
             black_box(
                 invert_index
                     .bm25_search(
