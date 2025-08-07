@@ -946,11 +946,14 @@ mod tests {
             .with_file_version(LanceFileVersion::V2_1);
 
         // Test both explicit metadata and automatic selection
-        // 1. Test with explicit RLE threshold metadata
-        let metadata_explicit = HashMap::from([(
+        // 1. Test with explicit RLE threshold metadata (also disable BSS)
+        let mut metadata_explicit = HashMap::new();
+        metadata_explicit.insert(
             "lance-encoding:rle-threshold".to_string(),
             "0.8".to_string(),
-        )]);
+        );
+        metadata_explicit.insert("lance-encoding:bss".to_string(), "off".to_string());
+
         let mut generator = RleDataGenerator::new(vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
         let data_explicit = generator.generate_default(RowCount::from(10000)).unwrap();
         check_round_trip_encoding_of_data(vec![data_explicit], &test_cases, metadata_explicit)
@@ -958,10 +961,14 @@ mod tests {
 
         // 2. Test automatic RLE selection based on data characteristics
         // 80% repetition should trigger RLE (> default 50% threshold)
+        // Explicitly disable BSS to ensure RLE is tested
+        let mut metadata = HashMap::new();
+        metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+
         let mut values = vec![42i32; 8000]; // 80% repetition
         values.extend([1i32, 2i32, 3i32, 4i32, 5i32].repeat(400)); // 20% variety
         let arr = Arc::new(Int32Array::from(values)) as Arc<dyn Array>;
-        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
     }
 
     /// Generator that produces repetitive patterns suitable for RLE

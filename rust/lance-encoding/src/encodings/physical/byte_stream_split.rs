@@ -3,16 +3,17 @@
 
 //! # Byte Stream Split (BSS) Miniblock Format
 //!
-//! Byte Stream Split is a data transformation technique optimized for floating-point
-//! data compression. It improves compression ratios by reorganizing data to group
-//! similar byte patterns together.
+//! Byte Stream Split is a data transformation technique that improves compression
+//! by reorganizing multi-byte values to group bytes from the same position together.
+//! This is particularly effective for data where some byte positions have low entropy.
 //!
 //! ## How It Works
 //!
-//! BSS splits floating-point values by byte position, creating separate streams
-//! for each byte position across all values. This transformation exploits the
-//! fact that floating-point data often has patterns in specific byte positions
-//! (e.g., similar exponents or mantissa patterns).
+//! BSS splits multi-byte values by byte position, creating separate streams
+//! for each byte position across all values. This transformation is most beneficial
+//! when certain byte positions have low entropy (e.g., high-order bytes that are
+//! mostly zeros, sign-extended bytes, or floating-point sign/exponent bytes that
+//! cluster around common values).
 //!
 //! ### Example
 //!
