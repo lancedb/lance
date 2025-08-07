@@ -1504,6 +1504,7 @@ class LanceDataset(pa.dataset.Dataset):
     def delete(
         self,
         predicate: Union[str, pa.compute.Expression],
+        *,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
     ):
