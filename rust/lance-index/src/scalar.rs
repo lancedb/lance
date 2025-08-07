@@ -596,12 +596,6 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
 
-    /// Returns true if the query can be answered exactly
-    ///
-    /// If false is returned then the query still may be answered exactly but if true is returned
-    /// then the query must be answered exactly
-    fn can_answer_exact(&self, query: &dyn AnyQuery) -> bool;
-
     /// Load the scalar index from storage
     async fn load(
         store: Arc<dyn IndexStore>,
@@ -610,6 +604,9 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     ) -> Result<Arc<Self>>
     where
         Self: Sized;
+
+    /// Returns true if the remap operation is supported
+    fn can_answer_remap(&self) -> bool;
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
