@@ -136,15 +136,15 @@ impl Transformer for RQTransformer {
         let ip_rq_res = match residual_vectors.value_type() {
             DataType::Float16 => Float32Array::from(
                 self.rq
-                    .codes_res_dot_dists::<Float16Type>(&residual_vectors)?,
+                    .codes_res_dot_dists::<Float16Type>(residual_vectors)?,
             ),
             DataType::Float32 => Float32Array::from(
                 self.rq
-                    .codes_res_dot_dists::<Float32Type>(&residual_vectors)?,
+                    .codes_res_dot_dists::<Float32Type>(residual_vectors)?,
             ),
             DataType::Float64 => Float32Array::from(
                 self.rq
-                    .codes_res_dot_dists::<Float64Type>(&residual_vectors)?,
+                    .codes_res_dot_dists::<Float64Type>(residual_vectors)?,
             ),
             _ => {
                 return Err(Error::Index {
@@ -166,7 +166,7 @@ impl Transformer for RQTransformer {
                 let part_ids = part_ids.as_primitive::<UInt32Type>();
                 let centroids_norm_square =
                     self.centroids_norm_square.as_ref().ok_or(Error::Index {
-                        message: format!("RQ Transform: centroids norm square not found"),
+                        message: "RQ Transform: centroids norm square not found".to_string(),
                         location: location!(),
                     })?;
                 let centroids_norm_square =

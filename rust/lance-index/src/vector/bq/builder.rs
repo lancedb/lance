@@ -403,6 +403,5 @@ where
     let results = gram_schmidt(a);
 
     // cast f32 matrix to T::Native matrix
-    let results = results.mapv(|v| T::Native::from_f32(v).unwrap());
-    results
+    results.mapv(|v| T::Native::from_f32(v).unwrap())
 }

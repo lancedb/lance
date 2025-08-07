@@ -2354,7 +2354,7 @@ fn prepare_vector_index_params(
     let mut hnsw_params = HnswBuildParams::default();
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
-    let mut rq_params = RQBuildParams::default();
+    let rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
 
     if let Some(kwargs) = kwargs {

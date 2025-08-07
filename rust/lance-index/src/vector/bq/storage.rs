@@ -151,7 +151,7 @@ impl RabitQuantizationStorage {
             .into_option()
             .expect("failed to get min and max of query vector");
         let bounds = min.as_()..max.as_();
-        let query_codes = scale_to_u8::<T>(&rotated_qr, &bounds);
+        let query_codes = scale_to_u8::<T>(rotated_qr, &bounds);
 
         let (min, max): (f32, f32) = (min.as_(), max.as_());
         (query_codes, min, (max - min) / 255.0)
@@ -181,6 +181,7 @@ pub struct RabitDistCalculator<'a> {
 }
 
 impl<'a> RabitDistCalculator<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         query_codes: Vec<u8>,
         sq_min: f32,
