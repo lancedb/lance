@@ -2,11 +2,13 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{import_vec, FromJObjectWithEnv, IntoJava};
 use crate::utils::{to_java_map, to_rust_map};
+use crate::JNIEnvExt;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use jni::objects::{JMap, JObject, JString, JValue};
 use jni::JNIEnv;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use lance::table::format::Fragment;
 use lance_core::datatypes::Schema as LanceSchema;
 use std::sync::Arc;
 
@@ -297,6 +299,53 @@ fn convert_to_rust_operation(
                 fragments,
                 schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
                 config_upsert_values,
+            }
+        }
+        "Update" => {
+            let removed_fragment_ids_objs = env
+                .call_method(
+                    &java_operation,
+                    "removedFragmentIds",
+                    "()Ljava/util/List;",
+                    &[],
+                )?
+                .l()?;
+            let removed_fragment_ids: Vec<u64> = env
+                .get_longs(&removed_fragment_ids_objs)?
+                .into_iter()
+                .map(|x| x.try_into().unwrap())
+                .collect();
+
+            let updated_fragments_objs = env
+                .call_method(
+                    &java_operation,
+                    "updatedFragments",
+                    "()Ljava/util/List;",
+                    &[],
+                )?
+                .l()?;
+            let updated_fragments_objs = import_vec(env, &updated_fragments_objs)?;
+            let mut updated_fragments: Vec<Fragment> =
+                Vec::with_capacity(updated_fragments_objs.len());
+            for f in updated_fragments_objs {
+                updated_fragments.push(f.extract_object(env)?);
+            }
+
+            let new_fragments_objs = env
+                .call_method(&java_operation, "newFragments", "()Ljava/util/List;", &[])?
+                .l()?;
+            let new_fragments_objs = import_vec(env, &new_fragments_objs)?;
+            let mut new_fragments: Vec<Fragment> = Vec::with_capacity(new_fragments_objs.len());
+            for f in new_fragments_objs {
+                new_fragments.push(f.extract_object(env)?);
+            }
+
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified: vec![],
+                mem_wal_to_flush: None,
             }
         }
         _ => unimplemented!(),
