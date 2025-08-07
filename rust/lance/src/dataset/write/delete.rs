@@ -273,6 +273,8 @@ mod tests {
     use crate::dataset::InsertBuilder;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::utils::test::TestDatasetGenerator;
+    use arrow::array::AsArray;
+    use arrow::datatypes::UInt32Type;
     use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
@@ -533,6 +535,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_delete_with_retries() {
+        use futures::future::try_join_all;
+        use tokio::sync::Barrier;
+
         fn sequence_data(range: Range<u32>) -> RecordBatch {
             let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
@@ -551,55 +556,68 @@ mod tests {
             .make_hostile(&tmp_path)
             .await;
 
-        // Create two concurrent delete operations
-        let dataset1 = Arc::new(dataset.clone());
-        let dataset2 = Arc::new(dataset.clone());
+        let concurrency = 3;
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
+        let mut handles = Vec::new();
 
-        // Use a channel to coordinate the test
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        // Create multiple concurrent delete operations targeting the same overlapping range
+        // All tasks try to delete the same set of rows (0-49), creating maximum conflict
+        for _i in 0..concurrency {
+            let dataset_ref = Arc::new(dataset.clone());
+            let barrier_ref = barrier.clone();
 
-        // First delete task - delete rows 0-49
-        let task1 = tokio::spawn(async move {
-            // Wait for signal to start both tasks at the same time
-            let _ = rx.await;
-            DeleteBuilder::new(dataset1)
-                .predicate("i < 50")
-                .conflict_retries(3)
-                .execute()
-                .await
-        });
+            let handle = tokio::spawn(async move {
+                barrier_ref.wait().await;
 
-        // Second delete task - delete rows 50-99
-        let task2 = tokio::spawn(async move {
-            // Start immediately and signal the first task
-            let _ = tx.send(());
-            DeleteBuilder::new(dataset2)
-                .predicate("i >= 50")
-                .conflict_retries(3)
-                .execute()
-                .await
-        });
+                DeleteBuilder::new(dataset_ref)
+                    .predicate("i < 50") // All tasks delete the same rows
+                    .conflict_retries(5)
+                    .execute()
+                    .await
+            });
+            handles.push(handle);
+        }
 
-        // Both tasks should complete successfully
-        let result1 = task1.await.unwrap();
-        let result2 = task2.await.unwrap();
+        // All tasks should complete successfully with retry-based conflict resolution
+        let results = try_join_all(handles).await.unwrap();
 
-        // One should succeed, one should succeed after retry
-        assert!(result1.is_ok() || result2.is_ok());
+        // All delete operations should succeed
+        for result in &results {
+            assert!(
+                result.is_ok(),
+                "Delete operation should succeed with retries"
+            );
+        }
 
-        // Load the final dataset and verify all rows are deleted
-        let final_dataset = if result1.is_ok() {
-            result1.unwrap()
-        } else {
-            result2.unwrap()
-        };
+        // Get the final dataset from any successful result
+        let final_dataset = results.into_iter().find_map(|r| r.ok()).unwrap();
 
-        // All rows should be deleted
-        assert_eq!(final_dataset.count_rows(None).await.unwrap(), 0);
+        // Rows 0-49 should be deleted, rows 50-99 should remain
+        assert_eq!(final_dataset.count_rows(None).await.unwrap(), 50);
 
-        // Check that we have the expected number of fragments (empty or removed)
+        // Verify the remaining data is rows 50-99
+        let data = final_dataset.scan().try_into_batch().await.unwrap();
+        let remaining_values: Vec<u32> = data["i"].as_primitive::<UInt32Type>().values().to_vec();
+        let expected: Vec<u32> = (50..100).collect();
+        assert_eq!(remaining_values, expected);
+
+        // Check that we have the expected fragment structure
         let fragments = final_dataset.get_fragments();
-        assert!(fragments.is_empty());
+        assert_eq!(
+            fragments.len(),
+            1,
+            "Should have one fragment with deletion vector"
+        );
+
+        // The fragment should have a deletion vector with 50 deleted rows
+        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(deletion_vector.len(), 50, "Should have 50 deleted rows");
+
+        // Check that the deletion vector contains rows 0-49
+        let mut deleted_rows: Vec<u32> = deletion_vector.iter().collect();
+        deleted_rows.sort();
+        let expected_deleted: Vec<u32> = (0..50).collect();
+        assert_eq!(deleted_rows, expected_deleted);
     }
 
     #[tokio::test]
