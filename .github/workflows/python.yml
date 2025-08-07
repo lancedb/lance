@@ -86,7 +86,7 @@ jobs:
       - name: Build
         run: |
           uv sync --group dev --group test --group ray --group torch-cpu
-          uv run maturin develop --locked --extras tests,ray
+          uv run maturin develop --locked
       - name: Run doctest
         run: |
           uv run pytest --doctest-modules python/lance

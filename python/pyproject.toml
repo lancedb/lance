@@ -59,7 +59,7 @@ tests = [
     "tqdm",
     "datafusion",
 ]
-dev = ["maturin", "ruff==0.4.1", "pyright"]
+dev = ["maturin", "ruff==0.11.2", "pyright"]  # Updated to match dependency-groups
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 ray = ["ray[data]<2.38; python_version<'3.12'"]
