@@ -449,7 +449,7 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let stream = source.into_stream();
-        Box::pin(self.execute(stream)).await
+        self.execute(stream).await
     }
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
@@ -1120,7 +1120,7 @@ impl MergeInsertJob {
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
-        execute_with_retry(wrapper, dataset, config).await
+        Box::pin(execute_with_retry(wrapper, dataset, config)).await
     }
 
     /// Execute the merge insert job without committing the changes.
