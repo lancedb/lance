@@ -706,6 +706,57 @@ impl Dataset {
         Transaction::try_from(transaction).map(Some)
     }
 
+    /// Read the transaction file for this version of the dataset.
+    ///
+    /// If there was no transaction file written for this version of the dataset
+    /// then this will return None.
+    pub async fn read_transaction_by_version(&self, version: u64) -> Result<Option<Transaction>> {
+        let dataset_version = self.checkout_version(version).await?;
+        dataset_version.read_transaction().await
+    }
+
+    /// List transactions for the dataset, up to a maximum number.
+    ///
+    /// This method iterates through dataset versions, starting from the current version,
+    /// and collects the transaction for each version. It stops when either `recent_transactions`
+    /// is reached or there are no more versions.
+    ///
+    /// # Arguments
+    ///
+    /// * `recent_transactions` - Maximum number of transactions to return
+    ///
+    /// # Returns
+    ///
+    /// A vector of optional transactions. Each element corresponds to a version,
+    /// and may be None if no transaction file exists for that version.
+    pub async fn get_transactions(
+        &self,
+        recent_transactions: usize,
+    ) -> Result<Vec<Option<Transaction>>> {
+        let mut transactions = vec![];
+        let mut dataset = self.clone();
+
+        loop {
+            let transaction = dataset.read_transaction().await?;
+            transactions.push(transaction);
+
+            if transactions.len() >= recent_transactions {
+                break;
+            } else {
+                match dataset
+                    .checkout_version(dataset.version().version - 1)
+                    .await
+                {
+                    Ok(ds) => dataset = ds,
+                    Err(Error::DatasetNotFound { .. }) => break,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        Ok(transactions)
+    }
+
     /// Restore the currently checked out version of the dataset as the latest version.
     pub async fn restore(&mut self) -> Result<()> {
         let (latest_manifest, _) = self.latest_manifest().await?;
@@ -5753,6 +5804,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_transaction_properties() {
+        const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
+        // Create a test dataset
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create WriteParams with properties
+        let mut properties1 = HashMap::new();
+        properties1.insert(
+            LANCE_COMMIT_MESSAGE_KEY.to_string(),
+            "First commit".to_string(),
+        );
+        properties1.insert("custom_prop".to_string(), "custom_value".to_string());
+
+        let write_params = WriteParams {
+            transaction_properties: Some(Arc::new(properties1)),
+            ..Default::default()
+        };
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+            test_uri,
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        let transaction = dataset.read_transaction_by_version(1).await.unwrap();
+        assert!(transaction.is_some());
+        let props = transaction.unwrap().transaction_properties.unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(
+            props.get(LANCE_COMMIT_MESSAGE_KEY),
+            Some(&"First commit".to_string())
+        );
+        assert_eq!(props.get("custom_prop"), Some(&"custom_value".to_string()));
+
+        let mut properties2 = HashMap::new();
+        properties2.insert(
+            LANCE_COMMIT_MESSAGE_KEY.to_string(),
+            "Second commit".to_string(),
+        );
+        properties2.insert("another_prop".to_string(), "another_value".to_string());
+
+        let write_params = WriteParams {
+            transaction_properties: Some(Arc::new(properties2)),
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 5])),
+                Arc::new(StringArray::from(vec!["d", "e"])),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = dataset;
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch2)], schema.clone()),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+
+        let transaction = dataset.read_transaction_by_version(2).await.unwrap();
+        assert!(transaction.is_some());
+        let props = transaction.unwrap().transaction_properties.unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(
+            props.get(LANCE_COMMIT_MESSAGE_KEY),
+            Some(&"Second commit".to_string())
+        );
+        assert_eq!(
+            props.get("another_prop"),
+            Some(&"another_value".to_string())
+        );
+
+        let transaction = dataset.read_transaction_by_version(1).await.unwrap();
+        assert!(transaction.is_some());
+        let props = transaction.unwrap().transaction_properties.unwrap();
+        assert_eq!(props.len(), 2);
+        assert_eq!(
+            props.get(LANCE_COMMIT_MESSAGE_KEY),
+            Some(&"First commit".to_string())
+        );
+        assert_eq!(props.get("custom_prop"), Some(&"custom_value".to_string()));
+
+        let result = dataset.read_transaction_by_version(999).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_insert_subschema() {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", DataType::Int32, false),
@@ -6798,6 +6959,95 @@ mod tests {
         assert!(
             dataset3.checkout_version(3).await.is_ok(),
             "Version 3 should still exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nullable_struct_v2_1_issue_4385() {
+        // Test for issue #4385: nullable struct should preserve null values in v2.1 format
+        use arrow_array::cast::AsArray;
+        use arrow_schema::Fields;
+
+        // Create a struct field with nullable float field
+        let struct_fields = Fields::from(vec![ArrowField::new("x", DataType::Float32, true)]);
+
+        // Create outer struct with the nullable struct as a field (not root)
+        let outer_fields = Fields::from(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("data", DataType::Struct(struct_fields.clone()), true),
+        ]);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "record",
+            DataType::Struct(outer_fields.clone()),
+            false,
+        )]));
+
+        // Create data with null struct
+        let id_values = Int32Array::from(vec![1, 2, 3]);
+        let x_values = Float32Array::from(vec![Some(1.0), Some(2.0), Some(3.0)]);
+        let inner_struct_array = StructArray::new(
+            struct_fields,
+            vec![Arc::new(x_values) as ArrayRef],
+            Some(vec![true, false, true].into()), // Second struct is null
+        );
+
+        let outer_struct_array = StructArray::new(
+            outer_fields,
+            vec![
+                Arc::new(id_values) as ArrayRef,
+                Arc::new(inner_struct_array.clone()) as ArrayRef,
+            ],
+            None, // Outer struct is not nullable
+        );
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(outer_struct_array)]).unwrap();
+
+        // Write dataset with v2.1 format
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+
+        let batches = vec![batch.clone()];
+        let batch_reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        Dataset::write(batch_reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Read back the dataset
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let scanner = dataset.scan();
+        let result_batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(result_batches.len(), 1);
+        let result_batch = &result_batches[0];
+        let read_outer_struct = result_batch.column(0).as_struct();
+        let read_inner_struct = read_outer_struct.column(1).as_struct(); // "data" field
+
+        // The bug: null struct is not preserved
+        assert!(
+            read_inner_struct.is_null(1),
+            "Second struct should be null but it's not. Read value: {:?}",
+            read_inner_struct
+        );
+
+        // Verify the null count is preserved
+        assert_eq!(
+            inner_struct_array.null_count(),
+            read_inner_struct.null_count(),
+            "Null count should be preserved"
         );
     }
 }

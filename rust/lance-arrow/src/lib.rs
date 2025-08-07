@@ -18,7 +18,7 @@ use arrow_array::{
 };
 use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
@@ -784,7 +784,8 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
             )));
         }
     }
-    StructArray::try_new(fields.clone(), columns, None)
+    // Preserve the struct's validity when projecting
+    StructArray::try_new(fields.clone(), columns, struct_array.nulls().cloned())
 }
 
 fn lists_have_same_offsets_helper<T: OffsetSizeTrait>(left: &dyn Array, right: &dyn Array) -> bool {
@@ -931,11 +932,115 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
+/// Helper function to normalize validity buffers
+/// Returns None for all-null validity (placeholder structs)
+fn normalize_validity(
+    validity: Option<&arrow_buffer::NullBuffer>,
+) -> Option<&arrow_buffer::NullBuffer> {
+    validity.and_then(|v| {
+        if v.null_count() == v.len() {
+            None
+        } else {
+            Some(v)
+        }
+    })
+}
+
+/// Helper function to merge validity buffers from two struct arrays
+/// Returns None only if both arrays are null at the same position
+///
+/// Special handling for placeholder structs (all-null validity)
+fn merge_struct_validity(
+    left_validity: Option<&arrow_buffer::NullBuffer>,
+    right_validity: Option<&arrow_buffer::NullBuffer>,
+) -> Option<arrow_buffer::NullBuffer> {
+    // Normalize both validity buffers (convert all-null to None)
+    let left_normalized = normalize_validity(left_validity);
+    let right_normalized = normalize_validity(right_validity);
+
+    match (left_normalized, right_normalized) {
+        // Fast paths: no computation needed
+        (None, None) => None,
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right.clone()),
+        (Some(left), Some(right)) => {
+            // Fast path: if both have no nulls, can return either one
+            if left.null_count() == 0 && right.null_count() == 0 {
+                return Some(left.clone());
+            }
+
+            let left_buffer = left.inner();
+            let right_buffer = right.inner();
+
+            // Perform bitwise OR directly on BooleanBuffers
+            // This preserves the correct semantics: 1 = valid, 0 = null
+            let merged_buffer = left_buffer | right_buffer;
+
+            Some(arrow_buffer::NullBuffer::from(merged_buffer))
+        }
+    }
+}
+
+// Helper function to adjust child array validity based on parent struct validity
+// When parent struct is null, propagates null to child array
+// Optimized with fast paths and SIMD operations
+fn adjust_child_validity(
+    child: &ArrayRef,
+    parent_validity: Option<&arrow_buffer::NullBuffer>,
+) -> ArrayRef {
+    // Fast path: no parent validity means no adjustment needed
+    let parent_validity = match parent_validity {
+        None => return child.clone(),
+        Some(p) if p.null_count() == 0 => return child.clone(), // No nulls to propagate
+        Some(p) => p,
+    };
+
+    let child_validity = child.nulls();
+
+    // Compute the new validity: child_validity AND parent_validity
+    let new_validity = match child_validity {
+        None => {
+            // Fast path: child has no existing validity, just use parent's
+            parent_validity.clone()
+        }
+        Some(child_nulls) => {
+            let child_buffer = child_nulls.inner();
+            let parent_buffer = parent_validity.inner();
+
+            // Perform bitwise AND directly on BooleanBuffers
+            // This preserves the correct semantics: 1 = valid, 0 = null
+            let merged_buffer = child_buffer & parent_buffer;
+
+            arrow_buffer::NullBuffer::from(merged_buffer)
+        }
+    };
+
+    // Create new array with adjusted validity
+    arrow_array::make_array(
+        arrow_data::ArrayData::try_new(
+            child.data_type().clone(),
+            child.len(),
+            Some(new_validity.into_inner().into_inner()),
+            child.offset(),
+            child.to_data().buffers().to_vec(),
+            child.to_data().child_data().to_vec(),
+        )
+        .unwrap(),
+    )
+}
+
 fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> StructArray {
     let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
     let right_fields = right_struct_array.fields();
     let right_columns = right_struct_array.columns();
+
+    // Get the validity buffers from both structs
+    let left_validity = left_struct_array.nulls();
+    let right_validity = right_struct_array.nulls();
+
+    // Compute merged validity
+    let merged_validity = merge_struct_validity(left_validity, right_validity);
 
     // iterate through the fields on the left hand side
     for (left_field, left_column) in left_struct_array
@@ -989,13 +1094,17 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                     _ => {
                         // TODO handle list-of-struct and other types
                         fields.push(left_field.as_ref().clone());
-                        columns.push(left_column.clone());
+                        // Adjust the column validity: if left struct was null, propagate to child
+                        let adjusted_column = adjust_child_validity(left_column, left_validity);
+                        columns.push(adjusted_column);
                     }
                 }
             }
             None => {
                 fields.push(left_field.as_ref().clone());
-                columns.push(left_column.clone());
+                // Adjust the column validity: if left struct was null, propagate to child
+                let adjusted_column = adjust_child_validity(left_column, left_validity);
+                columns.push(adjusted_column);
             }
         }
     }
@@ -1012,17 +1121,14 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                 .any(|f| f.name() == field.name())
             {
                 fields.push(field.as_ref().clone());
-                columns.push(column.clone() as ArrayRef);
+                // This field doesn't exist on the left
+                // We use the right's column but need to adjust for struct validity
+                let adjusted_column = adjust_child_validity(column, right_validity);
+                columns.push(adjusted_column);
             }
         });
 
-    let zipped: Vec<(FieldRef, ArrayRef)> = fields
-        .iter()
-        .cloned()
-        .map(Arc::new)
-        .zip(columns.iter().cloned())
-        .collect::<Vec<_>>();
-    StructArray::from(zipped)
+    StructArray::try_new(Fields::from(fields), columns, merged_validity).unwrap()
 }
 
 fn merge_with_schema(
@@ -1048,6 +1154,13 @@ fn merge_with_schema(
     let right_fields = right_struct_array.fields();
     let right_columns = right_struct_array.columns();
 
+    // Get the validity buffers from both structs
+    let left_validity = left_struct_array.nulls();
+    let right_validity = right_struct_array.nulls();
+
+    // Compute merged validity
+    let merged_validity = merge_struct_validity(left_validity, right_validity);
+
     for field in fields {
         let left_match_idx = left_fields.iter().position(|f| {
             f.name() == field.name() && same_type_kind(f.data_type(), field.data_type())
@@ -1059,11 +1172,16 @@ fn merge_with_schema(
         match (left_match_idx, right_match_idx) {
             (None, Some(right_idx)) => {
                 output_fields.push(right_fields[right_idx].as_ref().clone());
-                columns.push(right_columns[right_idx].clone());
+                // Adjust validity if the right struct was null
+                let adjusted_column =
+                    adjust_child_validity(&right_columns[right_idx], right_validity);
+                columns.push(adjusted_column);
             }
             (Some(left_idx), None) => {
                 output_fields.push(left_fields[left_idx].as_ref().clone());
-                columns.push(left_columns[left_idx].clone());
+                // Adjust validity if the left struct was null
+                let adjusted_column = adjust_child_validity(&left_columns[left_idx], left_validity);
+                columns.push(adjusted_column);
             }
             (Some(left_idx), Some(right_idx)) => {
                 if let DataType::Struct(child_fields) = field.data_type() {
@@ -1079,7 +1197,10 @@ fn merge_with_schema(
                     columns.push(Arc::new(merged_sub_array) as ArrayRef);
                 } else {
                     output_fields.push(left_fields[left_idx].as_ref().clone());
-                    columns.push(left_columns[left_idx].clone());
+                    // For fields that exist in both, use left but adjust validity
+                    let adjusted_column =
+                        adjust_child_validity(&left_columns[left_idx], left_validity);
+                    columns.push(adjusted_column);
                 }
             }
             (None, None) => {
@@ -1088,12 +1209,7 @@ fn merge_with_schema(
         }
     }
 
-    let zipped: Vec<(FieldRef, ArrayRef)> = output_fields
-        .into_iter()
-        .map(Arc::new)
-        .zip(columns)
-        .collect::<Vec<_>>();
-    StructArray::from(zipped)
+    StructArray::try_new(Fields::from(output_fields), columns, merged_validity).unwrap()
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
@@ -1201,7 +1317,8 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{new_empty_array, new_null_array, Int32Array, ListArray, StringArray};
+    use arrow_array::{new_empty_array, new_null_array, ListArray, StringArray};
+    use arrow_array::{Float32Array, Int32Array, StructArray};
     use arrow_buffer::OffsetBuffer;
 
     #[test]
@@ -1545,5 +1662,85 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn test_project_preserves_struct_validity() {
+        // Test that projecting a struct array preserves its validity (fix for issue #4385)
+        let fields = Fields::from(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Float32, true),
+        ]);
+
+        // Create a struct array with validity
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let value_array = Float32Array::from(vec![Some(1.0), Some(2.0), Some(3.0)]);
+        let struct_array = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(id_array) as ArrayRef,
+                Arc::new(value_array) as ArrayRef,
+            ],
+            Some(vec![true, false, true].into()), // Second struct is null
+        );
+
+        // Project the struct array
+        let projected = project(&struct_array, &fields).unwrap();
+
+        // Verify the validity is preserved
+        assert_eq!(projected.null_count(), 1);
+        assert!(!projected.is_null(0));
+        assert!(projected.is_null(1));
+        assert!(!projected.is_null(2));
+    }
+
+    #[test]
+    fn test_merge_struct_with_different_validity() {
+        // Test case from Weston's review comment
+        // File 1 has height field with some nulls
+        let height_array = Int32Array::from(vec![Some(500), None, Some(600), None]);
+        let left_fields = Fields::from(vec![Field::new("height", DataType::Int32, true)]);
+        let left_struct = StructArray::new(
+            left_fields,
+            vec![Arc::new(height_array) as ArrayRef],
+            Some(vec![true, false, true, false].into()), // Rows 2 and 4 are null structs
+        );
+
+        // File 2 has width field with some nulls
+        let width_array = Int32Array::from(vec![Some(300), Some(200), None, None]);
+        let right_fields = Fields::from(vec![Field::new("width", DataType::Int32, true)]);
+        let right_struct = StructArray::new(
+            right_fields,
+            vec![Arc::new(width_array) as ArrayRef],
+            Some(vec![true, true, false, false].into()), // Rows 3 and 4 are null structs
+        );
+
+        // Merge the two structs
+        let merged = merge(&left_struct, &right_struct);
+
+        // Expected:
+        // Row 1: both non-null -> {width: 300, height: 500}
+        // Row 2: left null, right non-null -> {width: 200, height: null}
+        // Row 3: left non-null, right null -> {width: null, height: 600}
+        // Row 4: both null -> null struct
+
+        assert_eq!(merged.null_count(), 1); // Only row 4 is null
+        assert!(!merged.is_null(0));
+        assert!(!merged.is_null(1));
+        assert!(!merged.is_null(2));
+        assert!(merged.is_null(3));
+
+        // Check field values
+        let height_col = merged.column_by_name("height").unwrap();
+        let height_values = height_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(height_values.value(0), 500);
+        assert!(height_values.is_null(1)); // height is null when left struct was null
+        assert_eq!(height_values.value(2), 600);
+
+        let width_col = merged.column_by_name("width").unwrap();
+        let width_values = width_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(width_values.value(0), 300);
+        assert_eq!(width_values.value(1), 200);
+        assert!(width_values.is_null(2)); // width is null when right struct was null
     }
 }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::CLIENT_VERSION;
 use chrono::{SecondsFormat, Utc};
 use datafusion_common::HashMap;
 use pyo3::pyclass;
@@ -256,6 +257,8 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
 
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             args.args.insert("timestamp".to_string(), now.to_string());
+            args.args
+                .insert("client_version".to_string(), CLIENT_VERSION.to_string());
 
             match callback_sender.try_send(TraceEvent {
                 target: event.metadata().target().to_string(),
@@ -361,17 +364,20 @@ pub fn initialize_tracing(level: log::Level) {
 
 #[pyfunction]
 #[pyo3(signature=(callback))]
-pub fn capture_trace_events(callback: PyObject) {
+pub fn capture_trace_events(callback: PyObject, py: Python<'_>) {
     SUBSCRIBER
         .write()
         .unwrap()
         .as_mut()
         .unwrap()
-        .set_callback(callback);
+        .set_callback(callback.clone_ref(py));
 }
 
 #[pyfunction]
 #[pyo3(signature=())]
-pub fn shutdown_tracing() {
-    SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
+pub fn shutdown_tracing(py: Python<'_>) {
+    // Release Python GIL to avoid deadlock between current thread with the receiver thread.
+    py.allow_threads(|| {
+        SUBSCRIBER.write().unwrap().as_mut().unwrap().shutdown();
+    });
 }

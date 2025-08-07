@@ -176,6 +176,7 @@ impl ColumnOrdering {
 ///
 /// This parameter only affects scans.  Vector search and full text search
 /// always use late materialization.
+#[derive(Clone)]
 pub enum MaterializationStyle {
     /// Heuristic-based materialization style
     ///
@@ -217,7 +218,7 @@ struct PlannedFilteredScan {
 }
 
 /// Filter for filtering rows
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LanceFilter {
     /// The filter is an SQL string
     Sql(String),
@@ -263,10 +264,12 @@ impl LanceFilter {
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
-                use futures::FutureExt;
+                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
 
+                let ctx = get_session_context(&LanceExecutionOptions::default());
+                let state = ctx.state();
                 let schema = Arc::new(ArrowSchema::from(dataset_schema));
-                let expr = parse_substrait(expr, schema.clone())
+                let expr = parse_substrait(expr, schema.clone(), &ctx.state())
                     .now_or_never()
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
@@ -299,6 +302,7 @@ impl LanceFilter {
 ///   .buffered(16)
 ///   .sum()
 /// ```
+#[derive(Clone)]
 pub struct Scanner {
     dataset: Arc<Dataset>,
 
@@ -404,6 +408,7 @@ impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         // By default, we only scan the local schema
         let projection_plan = ProjectionPlan::new(dataset.clone());
+        let file_reader_options = dataset.file_reader_options.clone();
         Self {
             dataset,
             projection_plan,
@@ -427,7 +432,7 @@ impl Scanner {
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
-            file_reader_options: None,
+            file_reader_options,
         }
     }
 
@@ -477,13 +482,11 @@ impl Scanner {
         self.fragments.is_some()
     }
 
-    /// Empty Projection
+    /// Empty Projection (useful for count queries)
     ///
-    /// The row_address will be scanned.
+    /// The row_address will be scanned (no I/O required) but not included in the output
     pub fn empty_project(&mut self) -> Result<&mut Self> {
-        self.with_row_address();
-        self.projection_plan.final_projection_is_empty = true;
-        self.project(&[ROW_ADDR])
+        self.project(&[] as &[&str])
     }
 
     /// Projection.
@@ -495,8 +498,8 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
             .collect();
 
-        let with_row_id = self.projection_plan.physical_projection.with_row_id;
-        let with_row_addr = self.projection_plan.physical_projection.with_row_addr;
+        let with_row_id = self.projection_plan.desires_row_id;
+        let with_row_addr = self.projection_plan.desires_row_addr;
 
         for (col, _) in &transformed_columns {
             if *col == ROW_ID && !with_row_id {
@@ -530,7 +533,10 @@ impl Scanner {
             .iter()
             .filter(|(col, _)| {
                 let col_name = col.as_ref();
-                !(col_name == ROW_ID || col_name == ROW_ADDR)
+                !(col_name == ROW_ID
+                    || col_name == ROW_ADDR
+                    || col_name == DIST_COL
+                    || col_name == SCORE_COL)
             })
             .map(|(c, t)| (c.as_ref(), t.as_ref()))
             .collect();
@@ -883,6 +889,11 @@ impl Scanner {
         Ok(self)
     }
 
+    #[cfg(test)]
+    fn nearest_mut(&mut self) -> Option<&mut Query> {
+        self.nearest.as_mut()
+    }
+
     /// Set the distance thresholds for the nearest neighbor search.
     pub fn distance_range(
         &mut self,
@@ -1121,14 +1132,15 @@ impl Scanner {
             output_expr.push((score_expr, SCORE_COL.to_string()));
         }
 
-        if self.projection_plan.physical_projection.with_row_id
-            && output_expr.iter().all(|(_, name)| name != ROW_ID)
+        // TODO: These output_expr.iter().all() checks seem redundant.  We should never have ROW_ID
+        // or ROW_ADDR in the output exprs.
+        if self.projection_plan.desires_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID)
         {
             let row_id_expr = expressions::col(ROW_ID, current_schema)?;
             output_expr.push((row_id_expr, ROW_ID.to_string()));
         }
 
-        if self.projection_plan.physical_projection.with_row_addr
+        if self.projection_plan.desires_row_addr
             && output_expr.iter().all(|(_, name)| name != ROW_ADDR)
         {
             let row_addr_expr = expressions::col(ROW_ADDR, current_schema)?;
@@ -1345,21 +1357,7 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
-        // Note: it's _ok_ (though maybe dubious) if the projection is empty and there is a vector search
-        // or FTS because we might be projecting just the _distance / _score columns
-        if self.projection_plan.physical_projection.is_empty()
-            && self.nearest.is_none()
-            && self.full_text_query.is_none()
-        {
-            return Err(Error::InvalidInput {
-                source:
-                    "no columns were selected and with_row_id is false, there is nothing to scan"
-                        .into(),
-                location: location!(),
-            });
-        }
-
-        if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
+        if self.include_deleted_rows && !self.projection_plan.desires_row_id {
             return Err(Error::InvalidInput {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
                 location: location!(),
@@ -1483,6 +1481,7 @@ impl Scanner {
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
+
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
@@ -1493,6 +1492,26 @@ impl Scanner {
             (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
             (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
             (None, None) => {
+                if self.projection_plan.has_output_cols()
+                    && self.projection_plan.physical_projection.is_empty()
+                {
+                    // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
+                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
+                    //
+                    // It's also possible we get here from `SELECT does_not_exist`
+
+                    // Note: even though we are just going to return an error we still want to calculate the
+                    // output_expr here.  This lets us distinguish between a user doing something like:
+                    //
+                    // SELECT 1 FROM t (not supported error)
+                    // SELECT non_existent_column FROM t (column not found error)
+                    let output_expr = self.output_expr(&ArrowSchema::empty())?;
+                    return Err(Error::NotSupported {
+                        source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
+                        location: location!(),
+                    });
+                }
+
                 let planned_read = self.filtered_read_source(&mut filter_plan).await?;
                 if planned_read.limit_pushed_down {
                     use_limit_node = false;
@@ -1575,10 +1594,8 @@ impl Scanner {
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
         // Stage 7: final projection
-        let output_expr = match self.projection_plan.final_projection_is_empty {
-            true => vec![],
-            false => self.output_expr(plan.schema().as_ref())?,
-        };
+        let output_expr = self.output_expr(plan.schema().as_ref())?;
+
         plan = Arc::new(DFProjectionExec::try_new(output_expr, plan)?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
@@ -1773,7 +1790,7 @@ impl Scanner {
         filter_plan: &mut FilterPlan,
     ) -> Result<PlannedFilteredScan> {
         log::trace!("source is a filtered read");
-        let projection = if filter_plan.has_refine() {
+        let mut projection = if filter_plan.has_refine() {
             // If the filter plan has two steps (a scalar indexed portion and a refine portion) then
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
@@ -1784,6 +1801,12 @@ impl Scanner {
             // columns that the user asked for.
             self.projection_plan.physical_projection.clone()
         };
+
+        if projection.is_empty() {
+            // If the user is not requesting any columns then we will scan the row address which
+            // is cheap
+            projection.with_row_addr = true;
+        }
 
         let scan_range = if filter_plan.is_empty() {
             log::trace!("pushing scan_range into filtered_read");
@@ -1978,7 +2001,13 @@ impl Scanner {
         let columns = query.columns();
         let mut params = query.params();
         if params.limit.is_none() {
-            params = params.with_limit(self.limit.map(|l| l as usize));
+            let search_limit = match (self.limit, self.offset) {
+                (Some(limit), Some(offset)) => Some((limit + offset) as usize),
+                (Some(limit), None) => Some(limit as usize),
+                (None, Some(_)) => None, // No limit but has offset - fetch all and let limit_node handle
+                (None, None) => None,
+            };
+            params = params.with_limit(search_limit);
         }
         let query = if columns.is_empty() {
             // the field is not specified,
@@ -2848,13 +2877,22 @@ impl Scanner {
 
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
-            LexOrdering::new(vec![PhysicalSortExpr {
-                expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
+            LexOrdering::new(vec![
+                PhysicalSortExpr {
+                    expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
                 },
-            }]),
+                PhysicalSortExpr {
+                    expr: expressions::col(ROW_ID, knn_plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                },
+            ]),
             knn_plan,
         )
         .with_fetch(Some(q.k));
@@ -2908,9 +2946,19 @@ impl Scanner {
                 nulls_first: false,
             },
         };
+        let sort_expr_row_id = PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, inner_fanout_search.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
         Ok(Arc::new(
-            SortExec::new(LexOrdering::new(vec![sort_expr]), inner_fanout_search)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new(
+                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
+                inner_fanout_search,
+            )
+            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
     }
 
@@ -2960,9 +3008,19 @@ impl Scanner {
                     nulls_first: false,
                 },
             };
+            let sort_expr_row_id = PhysicalSortExpr {
+                expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
             let ann_node = Arc::new(
-                SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
-                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
+                SortExec::new(
+                    LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
+                    ann_node,
+                )
+                .with_fetch(Some(q.k * over_fetch_factor as usize)),
             );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
@@ -2976,9 +3034,19 @@ impl Scanner {
                 nulls_first: false,
             },
         };
+        let sort_expr_row_id = PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
         let ann_node = Arc::new(
-            SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
-                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new(
+                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
+                ann_node,
+            )
+            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         );
 
         Ok(ann_node)
@@ -3449,6 +3517,53 @@ mod test {
 
         let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
         assert_eq!(batch_sizes, vec![10, 10, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_column_not_exist() {
+        let dataset = lance_datagen::gen()
+            .col("x", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
+            .await
+            .unwrap();
+
+        let check_err_msg = |r: Result<DatasetRecordBatchStream>| {
+            let err = match r {
+                Ok(_) => panic!(
+                    "Expected an error to be raised saying column y is not found but got no error"
+                ),
+                Err(e) => e,
+            };
+
+            assert!(
+                err.to_string().contains("No field named y"),
+                "Expected error to contain 'No field named y' but got {}",
+                err
+            );
+        };
+
+        let mut scan = dataset.scan();
+        scan.project(&["x", "y"]).unwrap();
+        check_err_msg(scan.try_into_stream().await);
+
+        let mut scan = dataset.scan();
+        scan.project(&["y"]).unwrap();
+        check_err_msg(scan.try_into_stream().await);
+
+        // This represents a query like `SELECT 1 AS foo` which we could _technically_ satisfy
+        // but it is not supported today
+        let mut scan = dataset.scan();
+        scan.project_with_transform(&[("foo", "1")]).unwrap();
+        match scan.try_into_stream().await {
+            Ok(_) => panic!("Expected an error to be raised saying not supported"),
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("Received only dynamic expressions"),
+                    "Expected error to contain 'Received only dynamic expressions' but got {}",
+                    e
+                );
+            }
+        }
     }
 
     #[cfg(not(windows))]
@@ -6684,7 +6799,7 @@ mod test {
                     .fast_search()
                     .project(&["_rowid", "_distance"])
             },
-            "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6699,7 +6814,7 @@ mod test {
                     .with_row_id()
                     .project(&["_rowid", "_distance"])
             },
-            "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6716,18 +6831,18 @@ mod test {
             },
             "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
   FilterExec: _distance@2 IS NOT NULL
-    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@0 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
             ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
               FilterExec: _distance@2 IS NOT NULL
-                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
                     LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
             Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
-                SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
+                SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
                     ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -6941,14 +7056,14 @@ mod test {
 
         // Test explicit projection
         let mut scanner = dataset.scan();
-        scanner.projection_plan.physical_projection.with_row_id = with_row_id;
-        scanner.projection_plan.physical_projection.with_row_addr = with_row_address;
 
         let mut projection = vec!["data_item_id".to_string()];
         if with_row_id {
+            scanner.with_row_id();
             projection.push(ROW_ID.to_string());
         }
         if with_row_address {
+            scanner.with_row_address();
             projection.push(ROW_ADDR.to_string());
         }
 
@@ -6968,8 +7083,12 @@ mod test {
 
         // Test implicit inclusion
         let mut scanner = dataset.scan();
-        scanner.projection_plan.physical_projection.with_row_id = with_row_id;
-        scanner.projection_plan.physical_projection.with_row_addr = with_row_address;
+        if with_row_id {
+            scanner.with_row_id();
+        }
+        if with_row_address {
+            scanner.with_row_address();
+        }
         scanner.project(&["data_item_id"]).unwrap();
         let stream = scanner.try_into_stream().await.unwrap();
         let batch = stream.try_collect::<Vec<_>>().await.unwrap().pop().unwrap();
@@ -6978,13 +7097,112 @@ mod test {
 
         // Test error case
         let mut scanner = dataset.scan();
-        scanner.projection_plan.physical_projection.with_row_id = false;
-        scanner.projection_plan.physical_projection.with_row_addr = false;
         let result = if with_row_id {
             scanner.project(&[ROW_ID])
         } else {
             scanner.project(&[ROW_ADDR])
         };
         assert!(result.is_err());
+    }
+
+    async fn limit_offset_equivalency_test(scanner: &Scanner) {
+        async fn test_one(
+            scanner: &Scanner,
+            full_result: &RecordBatch,
+            limit: Option<i64>,
+            offset: Option<i64>,
+        ) {
+            let mut new_scanner = scanner.clone();
+            new_scanner.limit(limit, offset).unwrap();
+            if let Some(nearest) = new_scanner.nearest_mut() {
+                nearest.k = offset.unwrap_or(0).saturating_add(limit.unwrap_or(10_000)) as usize;
+            }
+            let result = new_scanner.try_into_batch().await.unwrap();
+
+            let resolved_offset = offset.unwrap_or(0).min(full_result.num_rows() as i64);
+            let resolved_length = limit
+                .unwrap_or(i64::MAX)
+                .min(full_result.num_rows() as i64 - resolved_offset);
+
+            let expected = full_result.slice(resolved_offset as usize, resolved_length as usize);
+
+            if expected != result {
+                let plan = new_scanner.analyze_plan().await.unwrap();
+                assert_eq!(
+                    &expected, &result,
+                    "Limit: {:?}, Offset: {:?}, Plan: \n{}",
+                    limit, offset, plan
+                );
+            }
+        }
+
+        let mut scanner_full = scanner.clone();
+        if let Some(nearest) = scanner_full.nearest_mut() {
+            nearest.k = 500;
+        }
+        let full_results = scanner_full.try_into_batch().await.unwrap();
+
+        test_one(scanner, &full_results, Some(1), None).await;
+        test_one(scanner, &full_results, Some(1), Some(1)).await;
+        test_one(scanner, &full_results, Some(1), Some(2)).await;
+        test_one(scanner, &full_results, Some(1), Some(10)).await;
+
+        test_one(scanner, &full_results, Some(3), None).await;
+        test_one(scanner, &full_results, Some(3), Some(2)).await;
+        test_one(scanner, &full_results, Some(3), Some(4)).await;
+
+        test_one(scanner, &full_results, None, Some(3)).await;
+        test_one(scanner, &full_results, None, Some(10)).await;
+    }
+
+    #[tokio::test]
+    async fn test_scan_limit_offset() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let scanner = test_ds.dataset.scan();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_knn_limit_offset() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query_vector, 5)
+            .unwrap()
+            .project(&["i"])
+            .unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_limit_offset() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        test_ds.append_new_data().await.unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 500).unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_fts_limit_offset() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        test_ds.append_new_data().await.unwrap();
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new("4".into()))
+            .unwrap();
+        limit_offset_equivalency_test(&scanner).await;
     }
 }

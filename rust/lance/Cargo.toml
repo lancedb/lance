@@ -47,6 +47,7 @@ half.workspace = true
 itertools.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
+aws-credential-types.optional = true
 pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -110,9 +111,9 @@ aws-sdk-s3 = { workspace = true }
 default = ["aws", "azure", "gcp", "oss"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
-cli = ["clap", "lzma-sys/static"]
-tensorflow = ["tfrecord", "prost_old"]
-dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
+cli = ["dep:clap", "lzma-sys/static"]
+tensorflow = ["dep:tfrecord", "dep:prost_old"]
+dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
 protoc = [
@@ -121,7 +122,7 @@ protoc = [
     "lance-index/protoc",
     "lance-table/protoc",
 ]
-aws = ["lance-io/aws"]
+aws = ["lance-io/aws", "dep:aws-credential-types"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]

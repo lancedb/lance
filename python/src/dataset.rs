@@ -57,6 +57,8 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_encoding::decoder::DecoderConfig;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -349,7 +351,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None))]
     fn new(
         py: Python,
         uri: String,
@@ -362,6 +364,7 @@ impl Dataset {
         manifest: Option<&[u8]>,
         metadata_cache_size_bytes: Option<usize>,
         index_cache_size_bytes: Option<usize>,
+        read_params: Option<&Bound<PyDict>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -387,6 +390,28 @@ impl Dataset {
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
+        }
+
+        // Handle read_params dict
+        if let Some(read_params_dict) = read_params {
+            let cache_repetition_index = read_params_dict
+                .get_item("cache_repetition_index")
+                .unwrap_or(None)
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+
+            let validate_on_decode = read_params_dict
+                .get_item("validate_on_decode")
+                .unwrap_or(None)
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+
+            let decoder_config = DecoderConfig {
+                cache_repetition_index,
+                validate_on_decode,
+            };
+            let file_reader_options = FileReaderOptions { decoder_config };
+            params.file_reader_options = Some(file_reader_options);
         }
 
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
@@ -419,7 +444,7 @@ impl Dataset {
             builder = builder.with_serialized_manifest(manifest).infer_error()?;
         }
 
-        let dataset = RT.runtime.block_on(builder.load());
+        let dataset = RT.block_on(Some(py), builder.load())?;
 
         match dataset {
             Ok(ds) => Ok(Self {
@@ -484,8 +509,7 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        RT.runtime
-            .block_on(self.ds.index_statistics(&index_name))
+        RT.block_on(None, self.ds.index_statistics(&index_name))?
             .map_err(|err| match err {
                 lance::Error::IndexNotFound { .. } => {
                     PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
@@ -925,8 +949,7 @@ impl Dataset {
 
     #[pyo3(signature=(filter=None))]
     fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
-        RT.runtime
-            .block_on(self.ds.count_rows(filter))
+        RT.block_on(None, self.ds.count_rows(filter))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -1197,9 +1220,7 @@ impl Dataset {
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
-        let versions = self_
-            .list_versions()
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let versions = self_.list_versions()?;
         Python::with_gil(|py| {
             let pyvers: Vec<PyObject> = versions
                 .iter()
@@ -1279,9 +1300,7 @@ impl Dataset {
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
-        let tags = self_
-            .list_tags_ordered(order.as_deref())
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let tags = self_.list_tags_ordered(order.as_deref())?;
 
         Python::with_gil(|py| {
             let pylist = PyList::empty(py);
@@ -1299,9 +1318,7 @@ impl Dataset {
     }
 
     fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let tags = self_
-            .list_tags()
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let tags = self_.list_tags()?;
 
         Python::with_gil(|py| {
             let pytags = PyDict::new(py);
@@ -1940,6 +1957,31 @@ impl Dataset {
         Py::new(py, PyIvfModel { inner: ivf_model })
     }
 
+    /// Read the transaction by specific version
+    ///
+    /// Returns None if the transaction file does not exist.
+    #[pyo3(signature = (version))]
+    fn read_transaction(&mut self, version: u64) -> PyResult<Option<PyLance<Transaction>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transaction = RT
+            .block_on(None, new_self.read_transaction_by_version(version))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(transaction.map(PyLance))
+    }
+
+    #[pyo3(signature = (recent_transactions=10))]
+    fn get_transactions(
+        &mut self,
+        recent_transactions: usize,
+    ) -> PyResult<Vec<Option<PyLance<Transaction>>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transactions = RT
+            .block_on(None, new_self.get_transactions(recent_transactions))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        Ok(transactions.into_iter().map(|t| t.map(PyLance)).collect())
+    }
+
     #[pyo3(signature=(sql))]
     fn sql(&self, sql: String) -> PyResult<SqlQueryBuilder> {
         let mut ds = self.ds.as_ref().clone();
@@ -2090,38 +2132,30 @@ impl Dataset {
         })
     }
 
-    fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
-        RT.runtime.block_on(self.ds.versions())
+    fn list_versions(&self) -> PyResult<Vec<Version>> {
+        RT.block_on(None, self.ds.versions())?.infer_error()
     }
 
-    fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
-        RT.runtime.block_on(self.ds.tags.list())
+    fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
+        RT.block_on(None, self.ds.tags.list())?.infer_error()
     }
 
-    fn list_tags_ordered(
-        &self,
-        order: Option<&str>,
-    ) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+    fn list_tags_ordered(&self, order: Option<&str>) -> PyResult<Vec<(String, TagContents)>> {
         let ordering = match order {
             Some("asc") => Some(std::cmp::Ordering::Less),
             Some("desc") => Some(std::cmp::Ordering::Greater),
             Some(invalid_order) => {
-                let error_msg = format!(
+                return Err(PyValueError::new_err(format!(
                     "Invalid sort order '{}'. Valid values are: asc, desc",
                     invalid_order
-                );
-                return Err(::lance::error::Error::InvalidInput {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        error_msg,
-                    )),
-                    location: location!(),
-                });
+                )));
             }
             None => None,
         };
-        RT.runtime
-            .block_on(async { self.ds.tags.list_tags_ordered(ordering).await })
+        RT.block_on(None, async {
+            self.ds.tags.list_tags_ordered(ordering).await
+        })?
+        .infer_error()
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
@@ -2288,6 +2322,21 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
         }
 
         p.commit_handler = get_commit_handler(options)?;
+
+        // Handle properties
+        if let Some(props) =
+            get_dict_opt::<HashMap<String, String>>(options, "transaction_properties")?
+        {
+            let mut new_props = p
+                .transaction_properties
+                .as_ref()
+                .map(|arc| (**arc).clone())
+                .unwrap_or_default();
+            for (key, value) in props {
+                new_props.insert(key, value);
+            }
+            p.transaction_properties = Some(Arc::new(new_props));
+        }
 
         Some(p)
     };

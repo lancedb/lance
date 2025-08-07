@@ -2,25 +2,16 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::{
-    datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
-};
-use datafusion_common::{
-    tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, TableReference,
-};
+use datafusion::{execution::SessionState, logical_expr::Expr};
 use datafusion_substrait::substrait::proto::{
-    expression::field_reference::{ReferenceType, RootType},
-    expression::reference_segment,
-    expression::RexType,
+    expression::{
+        field_reference::{ReferenceType, RootType},
+        reference_segment, RexType,
+    },
     expression_reference::ExprType,
-    extensions::{simple_extension_declaration::MappingType, SimpleExtensionDeclaration},
     function_argument::ArgType,
-    plan_rel::RelType,
     r#type::{Kind, Struct},
-    read_rel::{NamedTable, ReadType},
-    rel, Expression, ExtendedExpression, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel,
-    RelRoot, Type,
+    Expression, ExpressionReference, ExtendedExpression, NamedStruct, Type,
 };
 use lance_core::{Error, Result};
 use prost::Message;
@@ -37,12 +28,14 @@ use std::sync::Arc;
 ///
 /// As a result, it may be a good idea for now to remove those types from the schema before
 /// calling this function.
-pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>> {
+pub fn encode_substrait(
+    expr: Expr,
+    schema: Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<Vec<u8>> {
     use arrow_schema::Field;
     use datafusion::logical_expr::ExprSchemable;
     use datafusion_common::DFSchema;
-
-    let ctx = SessionContext::new();
 
     let df_schema = Arc::new(DFSchema::try_from(schema)?);
     let output_type = expr.get_type(&df_schema)?;
@@ -51,7 +44,7 @@ pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>>
     let extended_expr = datafusion_substrait::logical_plan::producer::to_substrait_extended_expr(
         &[(&expr, &output_field)],
         &df_schema,
-        &ctx.state(),
+        state,
     )?;
 
     Ok(extended_expr.encode_to_vec())
@@ -115,16 +108,6 @@ fn remove_extension_types(
         }),
     };
     Ok((new_substrait_schema, new_arrow_schema, index_mapping))
-}
-
-fn remove_type_extensions(
-    declarations: &[SimpleExtensionDeclaration],
-) -> Vec<SimpleExtensionDeclaration> {
-    declarations
-        .iter()
-        .filter(|d| matches!(d.mapping_type, Some(MappingType::ExtensionFunction(_))))
-        .cloned()
-        .collect()
 }
 
 fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
@@ -237,7 +220,11 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
 ///
 /// The ExtendedExpressions message must contain a single scalar expression
-pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Result<Expr> {
+pub async fn parse_substrait(
+    expr: &[u8],
+    input_schema: Arc<ArrowSchema>,
+    state: &SessionState,
+) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
     if envelope.referred_expr.is_empty() {
         return Err(Error::InvalidInput {
@@ -267,119 +254,63 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
         }),
     }?;
 
-    let (substrait_schema, input_schema) =
-        if envelope.base_schema.as_ref().unwrap().r#struct.is_some() {
-            let (substrait_schema, input_schema, index_mapping) = remove_extension_types(
-                envelope.base_schema.as_ref().unwrap(),
-                input_schema.clone(),
-            )?;
+    // The Substrait may have come from a producer that uses extension types that DF doesn't support (e.g.
+    // from pyarrow) so we need to remove them and remap expr references (since they are indexes into the
+    // schema and we may have removed some fields)
+    let substrait_schema = if envelope.base_schema.as_ref().unwrap().r#struct.is_some() {
+        let (substrait_schema, _, index_mapping) =
+            remove_extension_types(envelope.base_schema.as_ref().unwrap(), input_schema.clone())?;
 
-            if substrait_schema.r#struct.as_ref().unwrap().types.len()
-                != envelope
-                    .base_schema
-                    .as_ref()
-                    .unwrap()
-                    .r#struct
-                    .as_ref()
-                    .unwrap()
-                    .types
-                    .len()
-            {
-                remap_expr_references(&mut expr, &index_mapping)?;
-            }
+        if substrait_schema.r#struct.as_ref().unwrap().types.len()
+            != envelope
+                .base_schema
+                .as_ref()
+                .unwrap()
+                .r#struct
+                .as_ref()
+                .unwrap()
+                .types
+                .len()
+        {
+            remap_expr_references(&mut expr, &index_mapping)?;
+        }
 
-            (substrait_schema, input_schema)
-        } else {
-            (envelope.base_schema.as_ref().unwrap().clone(), input_schema)
-        };
-
-    // Datafusion's substrait consumer only supports Plan (not ExtendedExpression) and so
-    // we need to create a dummy plan with a single project node
-    let plan = Plan {
-        version: None,
-        extensions: remove_type_extensions(&envelope.extensions),
-        advanced_extensions: envelope.advanced_extensions.clone(),
-        parameter_bindings: vec![],
-        expected_type_urls: vec![],
-        extension_uris: vec![],
-        relations: vec![PlanRel {
-            rel_type: Some(RelType::Root(RelRoot {
-                input: Some(Rel {
-                    rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
-                        common: None,
-                        input: Some(Box::new(Rel {
-                            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
-                                common: None,
-                                base_schema: Some(substrait_schema),
-                                filter: None,
-                                best_effort_filter: None,
-                                projection: None,
-                                advanced_extension: None,
-                                read_type: Some(ReadType::NamedTable(NamedTable {
-                                    names: vec!["dummy".to_string()],
-                                    advanced_extension: None,
-                                })),
-                            }))),
-                        })),
-                        expressions: vec![expr],
-                        advanced_extension: None,
-                    }))),
-                }),
-                // Not technically accurate but pretty sure DF ignores this
-                names: vec![],
-            })),
-        }],
+        substrait_schema
+    } else {
+        envelope.base_schema.as_ref().unwrap().clone()
     };
 
-    let session_context = SessionContext::new();
-    let dummy_table = Arc::new(EmptyTable::new(input_schema));
-    session_context.register_table(
-        TableReference::Bare {
-            table: "dummy".into(),
-        },
-        dummy_table,
-    )?;
-    let df_plan = datafusion_substrait::logical_plan::consumer::from_substrait_plan(
-        &session_context.state(),
-        &plan,
-    )
-    .await?;
+    let extended_expr = ExtendedExpression {
+        base_schema: Some(substrait_schema),
+        referred_expr: vec![ExpressionReference {
+            output_names: envelope.referred_expr[0].output_names.clone(),
+            expr_type: Some(ExprType::Expression(expr)),
+        }],
+        ..envelope
+    };
 
-    let expr = df_plan.expressions().pop().unwrap();
+    let mut expr_container =
+        datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
+            state,
+            &extended_expr,
+        )
+        .await?;
 
-    // When DF parses the above plan it turns column references into qualified references
-    // into `dummy` (e.g. we get `WHERE dummy.x < 0` instead of `WHERE x < 0`)  We want
-    // these to be unqualified references instead and so we need a quick transformation pass
+    if expr_container.exprs.is_empty() {
+        return Err(Error::invalid_input(
+            "Substrait expression did not contain any expressions",
+            location!(),
+        ));
+    }
 
-    let expr = expr.transform(&|node| match node {
-        Expr::Column(column) => {
-            if let Some(relation) = column.relation {
-                match relation {
-                    TableReference::Bare { table } => {
-                        if table.as_ref() == "dummy" {
-                            Ok(Transformed::yes(Expr::Column(Column {
-                                relation: None,
-                                name: column.name,
-                                spans: column.spans.clone(), // Preserve spans if available
-                            })))
-                        } else {
-                            // This should not be possible
-                            Err(DataFusionError::Substrait(format!(
-                                "Unexpected reference to table {} found when parsing filter",
-                                table
-                            )))
-                        }
-                    }
-                            // This should not be possible
-                            _ => Err(DataFusionError::Substrait("Unexpected partially or fully qualified table reference encountered when parsing filter".into()))
-                }
-            } else {
-                Ok(Transformed::no(Expr::Column(column)))
-            }
-        }
-        _ => Ok(Transformed::no(node)),
-    })?;
-    Ok(expr.data)
+    if expr_container.exprs.len() > 1 {
+        return Err(Error::invalid_input(
+            "Substrait expression contained multiple expressions",
+            location!(),
+        ));
+    }
+
+    Ok(expr_container.exprs.pop().unwrap().0)
 }
 
 #[cfg(test)]
@@ -388,8 +319,9 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
+        execution::SessionState,
         logical_expr::{BinaryExpr, Operator},
-        prelude::Expr,
+        prelude::{Expr, SessionContext},
     };
     use datafusion_common::{Column, ScalarValue};
     use prost::Message;
@@ -400,6 +332,11 @@ mod tests {
     };
 
     use crate::substrait::{encode_substrait, parse_substrait};
+
+    fn session_state() -> SessionState {
+        let ctx = SessionContext::new();
+        ctx.state()
+    }
 
     #[tokio::test]
     async fn test_substrait_conversion() {
@@ -425,7 +362,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
 
-        let df_expr = parse_substrait(expr_bytes.as_slice(), schema)
+        let df_expr = parse_substrait(expr_bytes.as_slice(), schema, &session_state())
             .await
             .unwrap();
 
@@ -446,9 +383,10 @@ mod tests {
             right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)), None)),
         });
 
-        let bytes = encode_substrait(expr.clone(), Arc::new(schema.clone())).unwrap();
+        let bytes =
+            encode_substrait(expr.clone(), Arc::new(schema.clone()), &session_state()).unwrap();
 
-        let decoded = parse_substrait(bytes.as_slice(), Arc::new(schema.clone()))
+        let decoded = parse_substrait(bytes.as_slice(), Arc::new(schema.clone()), &session_state())
             .await
             .unwrap();
         assert_eq!(decoded, expr);

@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         np.ndarray,
         Iterable[float],
     ]
+LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -222,6 +223,7 @@ class LanceDataset(pa.dataset.Dataset):
         default_scan_options: Optional[Dict[str, Any]] = None,
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_size_bytes: Optional[int] = None,
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -250,8 +252,10 @@ class LanceDataset(pa.dataset.Dataset):
             serialized_manifest,
             metadata_cache_size_bytes=metadata_cache_size_bytes,
             index_cache_size_bytes=index_cache_size_bytes,
+            read_params=read_params,
         )
         self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     @classmethod
     def __deserialize__(
@@ -261,6 +265,7 @@ class LanceDataset(pa.dataset.Dataset):
         version: int,
         manifest: bytes,
         default_scan_options: Optional[Dict[str, Any]],
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         return cls(
             uri,
@@ -268,6 +273,7 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options=storage_options,
             serialized_manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
 
     def __reduce__(self):
@@ -277,6 +283,7 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __getstate__(self):
@@ -286,23 +293,30 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __setstate__(self, state):
+        # Handle backwards compatibility - state may not have read_params
         (
             self._uri,
             self._storage_options,
             version,
             manifest,
             default_scan_options,
+            *rest,  # Capture optional read_params
         ) = state
+        read_params = rest[0] if rest else None
         self._ds = _Dataset(
             self._uri,
             version,
             storage_options=self._storage_options,
             manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
+        self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
@@ -310,6 +324,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = self._storage_options
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params.copy() if self._read_params else None
         return ds
 
     def __len__(self):
@@ -1284,6 +1299,7 @@ class LanceDataset(pa.dataset.Dataset):
             and isinstance(transforms[0], pa.Field)
         ):
             transforms = pa.schema(transforms)
+
         if isinstance(transforms, pa.Schema):
             self._ds.add_columns_with_schema(transforms)
             return
@@ -2624,6 +2640,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
+        ds._read_params = None
         return ds
 
     @staticmethod
@@ -2713,7 +2730,9 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
+        ds._storage_options = storage_options
         ds._default_scan_options = None
+        ds._read_params = None
         return BulkCommitResult(
             dataset=ds,
             merged=merged,
@@ -2778,6 +2797,48 @@ class LanceDataset(pa.dataset.Dataset):
             A list of configuration items.
         """
         return self._ds.config()
+
+    def read_transaction(self, version: int) -> Optional[Transaction]:
+        """Get Transaction at a specific version.
+
+        Parameters
+        ----------
+        version: int
+            The version number of the dataset to retrieve properties from
+
+        Returns
+        -------
+        Dict[str, str] or None
+            A dictionary containing the properties of the Transaction
+            , or None if the transaction doesn't exist.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
+        >>> table1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> ds = lance.write_dataset(   \\
+        ... table1, \\
+        ... "properties_example",   \\
+        ... commit_message="initial")
+        >>> table2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> properties2 = {LANCE_COMMIT_MESSAGE_KEY: "Second commit", \\
+        ... "another_prop": "another_value"}
+        >>> ds = lance.write_dataset( \\
+        ... table2, \\
+        ... "properties_example",   \\
+        ... mode="append",  \\
+        ... transaction_properties=properties2)
+        >>> print(ds.read_transaction(1).transaction_properties)
+        {'__lance_commit_message': 'initial'}
+        >>> print(ds.read_transaction(2).transaction_properties.get("another_prop"))
+        another_value
+        """
+        return self._ds.read_transaction(version)
+
+    def get_transactions(self, recent_transactions=10) -> Optional[List[Transaction]]:
+        return self._ds.get_transactions(recent_transactions)
 
     def sql(self, sql: str) -> "SqlQueryBuilder":
         """Execute SQL query on the dataset.
@@ -2998,6 +3059,9 @@ class Transaction:
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     blobs_op: Optional[LanceOperation.BaseOperation] = None
+    transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 class Tag(TypedDict):
@@ -4326,11 +4390,15 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: Optional[str] = None,
+    data_storage_version: Optional[
+        Literal["stable", "2.0", "2.1", "next", "legacy", "0.1"]
+    ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
+    commit_message: Optional[str] = None,
+    transaction_properties: Optional[Dict[str, str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -4400,6 +4468,15 @@ def write_dataset(
         then no autocleaning will be performed.
         Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
+    commit_message: str, optional
+        A message to associate with this commit. This message will be stored in the
+        dataset's metadata and can be retrieved using read_transaction().
+    transaction_properties: dict of str to str, optional
+        Custom properties to associate with this transaction.
+        Properties will be stored in the dataset's transaction
+        and can be retrieved using read_transaction().
+        If both `commit_message` and `properties` are provided, `commit_message` will
+        override any "lance.commit.message" key in `properties`.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -4424,6 +4501,11 @@ def write_dataset(
     _validate_schema(reader.schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
 
+    # Merge properties and commit_message with priority to commit_message
+    merged_properties = _merge_message_to_properties(
+        commit_message, transaction_properties
+    )
+
     params = {
         "mode": mode,
         "max_rows_per_file": max_rows_per_file,
@@ -4435,6 +4517,7 @@ def write_dataset(
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_move_stable_row_ids": enable_move_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
+        "transaction_properties": merged_properties,
     }
 
     if commit_lock:
@@ -4456,6 +4539,7 @@ def write_dataset(
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
+    ds._read_params = None
     return ds
 
 
@@ -4536,6 +4620,23 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
+
+
+def _merge_message_to_properties(
+    commit_message: Optional[str],
+    properties: Optional[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    """
+    handles merging commit_message into properties,
+    prioritizing the commit_message if properties also has the same key
+    """
+    if properties is None and commit_message is None:
+        return None
+
+    merged_properties = properties.copy() if properties else {}
+    if commit_message is not None:
+        merged_properties[LANCE_COMMIT_MESSAGE_KEY] = commit_message
+    return merged_properties
 
 
 class VectorIndexReader:

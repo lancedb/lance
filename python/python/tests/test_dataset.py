@@ -29,7 +29,7 @@ import pytest
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
-from lance.dataset import AutoCleanupConfig
+from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
@@ -2737,9 +2737,12 @@ def test_scan_no_columns(tmp_path: Path):
     for batch in batches:
         assert batch.schema == expected_schema
 
-    # if with_row_id is not True then columns=[] is an error
-    with pytest.raises(ValueError, match="no columns were selected"):
-        dataset.scanner(columns=[]).to_table()
+    # Can specify nothing at all to get empty batches (with correct counts)
+    batches = list(dataset.scanner(columns=[], batch_size=10).to_batches())
+    assert len(batches) == 10
+    for batch in batches:
+        assert batch.schema.names == []
+        assert batch.num_rows == 10
 
     # also test with deleted data to make sure deleted ids not included
     dataset.delete("a = 5")
@@ -3727,3 +3730,186 @@ def test_dataset_sql(tmp_path: Path):
     complex_result = complex_query.to_batch_records()
     expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
     assert pa.Table.from_batches(complex_result) == expected_complex
+
+
+def test_file_reader_options(tmp_path: Path):
+    """Test cache_repetition_index and validate_on_decode options"""
+    # Create a dataset with large repetitive strings to test cache_repetition_index
+    # Using large strings to ensure repetition index is used
+    large_string = "x" * 1000
+    table = pa.table(
+        {
+            "id": range(10000),
+            "text": [large_string] * 10000,  # Highly repetitive column
+            "unique": [f"unique_{i}" for i in range(10000)],  # Non-repetitive column
+        }
+    )
+    lance.write_dataset(table, tmp_path / "test")
+
+    # Test cache_repetition_index reduces I/O operations
+    # First read without cache
+    dataset_no_cache = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": False}
+    )
+    iops_before = lance.iops_counter()
+    result1 = dataset_no_cache.scanner(columns=["text"]).to_table()
+    iops_without_cache = lance.iops_counter() - iops_before
+    assert result1.num_rows == 10000
+
+    # Second read with cache enabled
+    dataset_with_cache = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": True}
+    )
+    iops_before = lance.iops_counter()
+    result2 = dataset_with_cache.scanner(columns=["text"]).to_table()
+    iops_with_cache = lance.iops_counter() - iops_before
+    assert result2.num_rows == 10000
+
+    # With cache, we should see fewer I/O operations for repetitive data
+    # The difference might be small for small datasets, but should be measurable
+    assert iops_with_cache <= iops_without_cache
+
+    # Test validate_on_decode option
+    # For now just verify it doesn't break normal operation
+    dataset_validate = lance.dataset(
+        tmp_path / "test", read_params={"validate_on_decode": True}
+    )
+    result3 = dataset_validate.to_table()
+    assert result3.num_rows == 10000
+
+    # Test both options together
+    dataset_both = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": False},
+    )
+    result4 = dataset_both.to_table()
+    assert result4.num_rows == 10000
+
+    # Test that scanner inherits options from dataset
+    dataset_inherit = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": True},
+    )
+    scanner = dataset_inherit.scanner()
+    result5 = scanner.to_table()
+    assert result5.num_rows == 10000
+
+    # Verify the scanner is using the same options by checking I/O pattern
+    iops_before = lance.iops_counter()
+    scanner2 = dataset_inherit.scanner(columns=["text"])
+    result6 = scanner2.to_table()
+    assert result6.num_rows == 10000
+    iops_scanner = lance.iops_counter() - iops_before
+
+    # Scanner with inherited cache option should have similar I/O pattern as
+    # direct dataset read
+    assert iops_scanner <= iops_without_cache
+
+
+def test_read_transaction_properties(tmp_path):
+    """Test retrieving properties from transactions at different versions."""
+    # Create schema and data for the dataset
+    schema = pa.schema([pa.field("id", pa.int32()), pa.field("value", pa.string())])
+
+    # First batch with properties
+    batch1 = pa.RecordBatch.from_arrays(
+        [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])], schema=schema
+    )
+
+    # Create the first version with properties
+    properties1 = {
+        LANCE_COMMIT_MESSAGE_KEY: "First commit",
+        "custom_prop": "custom_value",
+    }
+
+    dataset = lance.write_dataset(batch1, tmp_path, transaction_properties=properties1)
+    mytrans = dataset.read_transaction(1)
+    print(mytrans)
+
+    # Test retrieving properties from the first version
+    transaction = dataset.read_transaction(1)
+    props = transaction.transaction_properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "First commit"
+    assert props.get("custom_prop") == "custom_value"
+
+    # Create a second batch with different properties
+    batch2 = pa.RecordBatch.from_arrays(
+        [pa.array([4, 5]), pa.array(["d", "e"])], schema=schema
+    )
+
+    # Add the second batch with different properties
+    properties2 = {
+        LANCE_COMMIT_MESSAGE_KEY: "Second commit",
+        "another_prop": "another_value",
+    }
+
+    dataset = lance.write_dataset(
+        batch2, tmp_path, mode="append", transaction_properties=properties2
+    )
+
+    # Test retrieving properties from the second version
+    transaction = dataset.read_transaction(2)
+    props = transaction.transaction_properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "Second commit"
+    assert props.get("another_prop") == "another_value"
+
+    # Test retrieving properties from the first version again
+    # to ensure old versions' properties are still accessible
+    transaction = dataset.read_transaction(1)
+    props = transaction.transaction_properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "First commit"
+    assert props.get("custom_prop") == "custom_value"
+
+
+def test_get_properties_with_no_properties(tmp_path):
+    """Test retrieving properties when none were set."""
+    # Create a test dataset without properties
+
+    # Create schema and data for the dataset
+    schema = pa.schema([pa.field("id", pa.int32())])
+    batch = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], schema=schema)
+
+    # Create the dataset without properties
+    dataset = lance.write_dataset(batch, tmp_path)
+
+    # Test retrieving properties - should return None
+    transaction = dataset.read_transaction(1)
+    assert transaction.transaction_properties == {}
+
+
+def test_commit_message_and_get_properties(tmp_path):
+    """Test accessing commit messages via get_transactions."""
+    table = pa.table({"a": [1]})
+
+    # 1. Test case: Commit with a message
+    dataset = lance.write_dataset(table, tmp_path, commit_message="first commit")
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 1
+    assert (
+        transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "first commit"
+    )
+    # 2. Test case: Commit without a message
+    lance.write_dataset(table, tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    transactions = dataset.get_transactions()
+    # Transactions are listed in reverse chronological order
+    assert len(transactions) == 2
+    # The latest transaction has no message,
+    # so the key should be missing or properties is None
+    assert (
+        transactions[0].transaction_properties == {}
+        or LANCE_COMMIT_MESSAGE_KEY not in transactions[0].transaction_properties
+    )
+    # The first transaction should still have the message
+    assert (
+        transactions[1].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "first commit"
+    )
+    # 3. Test case: Transaction with no properties at all
+    # A delete operation creates a new version that may have no properties.
+    dataset.delete("a > 100")  # A no-op delete
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 3
+    # The latest transaction from delete should have no properties.
+    assert transactions[0].transaction_properties == {}

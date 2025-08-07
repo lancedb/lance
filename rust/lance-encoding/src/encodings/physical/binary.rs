@@ -473,7 +473,7 @@ pub mod tests {
     };
     use arrow_schema::{DataType, Field};
 
-    use lance_core::datatypes::{
+    use crate::constants::{
         COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
@@ -505,8 +505,6 @@ pub mod tests {
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
-
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
@@ -546,25 +544,6 @@ pub mod tests {
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             structural_encoding.into(),
         );
-        field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
-        let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
-    }
-
-    #[rstest]
-    #[test_log::test(tokio::test)]
-    async fn test_large_binary_fsst_with_dict(
-        #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
-    ) {
-        use lance_core::datatypes::DICT_DIVISOR_META_KEY;
-
-        let mut field_metadata = HashMap::new();
-        field_metadata.insert(
-            STRUCTURAL_ENCODING_META_KEY.to_string(),
-            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
-        );
-        // Force it to use dictionary encoding
-        field_metadata.insert(DICT_DIVISOR_META_KEY.to_string(), "1".into());
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
@@ -615,8 +594,6 @@ pub mod tests {
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
-
         let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
         let string_array = arrow_cast::cast(&string_array, &data_type).unwrap();
 
@@ -742,9 +719,12 @@ pub mod tests {
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
     #[ignore] // This test is quite slow in debug mode
-    async fn test_jumbo_string() {
+    async fn test_jumbo_string(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         // This is an overflow test.  We have a list of lists where each list
         // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
         // offsets range
@@ -758,7 +738,9 @@ pub mod tests {
         let arrs = vec![giant_array];
 
         // // We can't validate because our validation relies on concatenating all input arrays
-        let test_cases = TestCases::default().without_validation();
+        let test_cases = TestCases::default()
+            .without_validation()
+            .with_file_version(version);
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 
@@ -788,5 +770,35 @@ pub mod tests {
             .collect();
         let string_array = Arc::new(StringArray::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_binary_encoding_verification() {
+        use lance_datagen::{ByteCount, RowCount};
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("variable")
+            .with_file_version(LanceFileVersion::V2_1);
+
+        // Test both automatic selection and explicit configuration
+        // 1. Test automatic binary encoding selection (small strings that won't trigger FSST)
+        let arr_small = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(10), false))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr_small], &test_cases, HashMap::new()).await;
+
+        // 2. Test explicit "none" compression to force binary encoding
+        let metadata_explicit =
+            HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
+        let arr_large = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(50), false))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr_large], &test_cases, metadata_explicit).await;
     }
 }
