@@ -1063,7 +1063,7 @@ mod tests {
 
         let mut rng = SmallRng::from_rng(&mut rand::rng());
         let values =
-            UInt8Array::from_iter_values((0..NUM_VALUES * DIM).map(|_| rng.gen_range(0..255)));
+            UInt8Array::from_iter_values((0..NUM_VALUES * DIM).map(|_| rng.random_range(0..255)));
 
         let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
 

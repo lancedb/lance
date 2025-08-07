@@ -11,7 +11,7 @@ const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors
 
 fn bench_hamming(c: &mut Criterion) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let key = repeat_with(|| rng.gen::<u8>())
         .take(DIMENSION)

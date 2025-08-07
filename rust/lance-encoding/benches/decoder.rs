@@ -182,8 +182,8 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
         let string_array = string_data.column(0);
 
         // generate random int column with 100000 rows
-        let mut rng = rand::thread_rng();
-        let integer_arr: Vec<u32> = (0..100_000).map(|_| rng.gen_range(0..20)).collect();
+        let mut rng = rand::rng();
+        let integer_arr: Vec<u32> = (0..100_000).map(|_| rng.random_range(0..20)).collect();
         let integer_array = UInt32Array::from(integer_arr);
 
         let mapped_strings = take(string_array, &integer_array, None).unwrap();

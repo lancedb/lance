@@ -30,10 +30,10 @@ use std::time::Duration;
 const BATCH_SIZE: u64 = 1024;
 
 fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut ranges = Vec::with_capacity(n);
     for i in 0..n {
-        ranges.push(rng.gen_range(1..num_rows));
+        ranges.push(rng.random_range(1..num_rows));
         ranges[i] = ((ranges[i] / file_size) << 32) | (ranges[i] % file_size);
     }
 

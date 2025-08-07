@@ -1172,7 +1172,7 @@ pub mod test {
         array::{fill, rand_with_distribution},
         gen, ArrayGenerator, ArrayGeneratorExt, RowCount,
     };
-    use rand::distributions::Uniform;
+    use rand::distr::Uniform;
 
     #[test]
     fn test_bitpack_params() {
@@ -1471,7 +1471,7 @@ pub mod test {
 
     struct DistributionArrayGeneratorProvider<
         DataType,
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
     >
     where
         DataType::Native: Copy + 'static,
@@ -1484,7 +1484,7 @@ pub mod test {
 
     impl<DataType, Dist> DistributionArrayGeneratorProvider<DataType, Dist>
     where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
@@ -1499,7 +1499,7 @@ pub mod test {
 
     impl<DataType, Dist> ArrayGeneratorProvider for DistributionArrayGeneratorProvider<DataType, Dist>
     where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,

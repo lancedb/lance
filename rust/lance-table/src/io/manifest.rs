@@ -254,13 +254,13 @@ mod test {
         let mut writer = store.create(&path).await.unwrap();
 
         // Write prefix we should ignore
-        let prefix: Vec<u8> = rand::thread_rng()
+        let prefix: Vec<u8> = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(prefix_size)
             .collect();
         writer.write_all(&prefix).await.unwrap();
 
-        let long_name: String = rand::thread_rng()
+        let long_name: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(manifest_min_size)
             .map(char::from)

@@ -128,7 +128,7 @@ fn l2_distance_uint_scalar_auto_vectorized(key: &[u8], target: &[u8]) -> f32 {
 }
 
 fn bench_uint_distance(c: &mut Criterion) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let key = repeat_with(|| rng.gen::<u8>())
         .take(DIMENSION)
         .collect::<Vec<_>>();

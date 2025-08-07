@@ -74,7 +74,7 @@ fn run_bench<T: ArrowFloatType>(
 }
 
 fn bench_distance(c: &mut Criterion) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let target = repeat_with(|| rng.gen::<u16>())
         .map(bf16::from_bits)
         .take(TOTAL * DIMENSION)
