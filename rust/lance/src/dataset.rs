@@ -624,7 +624,7 @@ impl Dataset {
         &self.manifest_location
     }
 
-    async fn validate_version(&self, compared_version: u64) -> Result<()> {
+    async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
         if compared_version < 1 {
             return Err(Error::invalid_input(
                 format!("Compared version must be > 0 (got {})", compared_version),
@@ -635,7 +635,7 @@ impl Dataset {
         let current = self.version().version;
         if current == compared_version {
             return Err(Error::invalid_input(
-                "Compared version cannot equal current version",
+                "Compared version cannot equal to the current version",
                 Default::default(),
             ));
         }
@@ -646,54 +646,30 @@ impl Dataset {
     async fn build_delta_dataset(&self, compared_version: u64) -> Result<DatasetDelta> {
         let current_version = self.version().version;
 
-        let (begin_ver, begin_manifest, end_ver, end_manifest) = if current_version
+        let (begin_version, end_version) = if current_version
             > compared_version
         {
-            let location = self
-                .commit_handler
-                .resolve_version_location(&self.base, compared_version, &self.object_store.inner)
-                .await?;
-
-            let manifest =
-                Self::load_manifest(&self.object_store, &location, (&self.base).as_ref(), &self.session)
-                    .await?;
-
             (
                 compared_version,
-                Arc::new(manifest),
                 current_version,
-                self.manifest.clone(),
             )
         } else {
-            let location = self
-                .commit_handler
-                .resolve_version_location(&self.base, compared_version, &self.object_store.inner)
-                .await?;
-
-            let manifest =
-                Self::load_manifest(&self.object_store, &location, (&self.base).as_ref(), &self.session)
-                    .await?;
-
             (
                 current_version,
-                self.manifest.clone(),
                 compared_version,
-                Arc::new(manifest),
             )
         };
 
         Ok(DatasetDelta {
-            begin_version: begin_ver,
-            begin_manifest,
-            end_version: end_ver,
-            end_manifest,
+            begin_version,
+            end_version,
             base_dataset: self.clone(),
         })
     }
 
     /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
     pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
-        self.validate_version(compared_version).await?;
+        self.validate_compared_version(compared_version).await?;
         let ds_delta = self.build_delta_dataset(compared_version).await?;
         ds_delta.diff_meta().await
     }

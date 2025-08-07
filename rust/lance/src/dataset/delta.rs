@@ -4,20 +4,13 @@
 use super::transaction::Transaction;
 use crate::Dataset;
 use crate::Result;
-use lance_arrow::RecordBatchExt;
-use lance_table::format::Manifest;
-use std::sync::Arc;
 
 /// The delta dataset between two versions of a dataset.
 pub struct DatasetDelta {
     /// The base version number for comparison.
     pub(crate) begin_version: u64,
-    /// Manifest of the beginning version.
-    pub(crate) begin_manifest: Arc<Manifest>,
     /// The current version number.
     pub(crate) end_version: u64,
-    /// Manifest of the ending version.
-    pub(crate) end_manifest: Arc<Manifest>,
     /// Base path of the dataset.
     pub(crate) base_dataset: Dataset,
 }
@@ -43,7 +36,6 @@ mod tests {
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::types::Int32Type;
     use lance_datagen::{array, BatchCount, RowCount};
-    use std::sync::Arc;
 
     async fn create_test_dataset() -> Dataset {
         let data = lance_datagen::gen()
@@ -73,9 +65,7 @@ mod tests {
 
         let delta_struct = crate::dataset::delta::DatasetDelta {
             begin_version: 1,
-            begin_manifest: Arc::from(ds.manifest().clone()),
             end_version: ds.version().version,
-            end_manifest: Arc::from(ds.manifest().clone()),
             base_dataset: ds.clone(),
         };
         let txs = delta_struct.diff_meta().await.unwrap();
@@ -91,9 +81,7 @@ mod tests {
 
         let delta_struct = crate::dataset::delta::DatasetDelta {
             begin_version: 1,
-            begin_manifest: Arc::from(ds.manifest().clone()),
             end_version: ds.version().version,
-            end_manifest: Arc::from(ds.manifest().clone()),
             base_dataset: ds.clone(),
         };
         let txs = delta_struct.diff_meta().await.unwrap();
