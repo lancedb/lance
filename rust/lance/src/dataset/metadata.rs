@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::collections::HashMap;
 
 use crate::dataset::transaction::{Operation, UpdateMap, UpdateMapEntry};
