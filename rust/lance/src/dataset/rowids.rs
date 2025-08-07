@@ -8,12 +8,12 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use snafu::location;
 use std::sync::Arc;
 
+use lance_core::utils::deletion::DeletionVector;
+use lance_table::rowids::FragmentRowIdIndex;
 use lance_table::{
     format::{Fragment, RowIdMeta},
     rowids::{read_row_ids, RowIdIndex, RowIdSequence},
 };
-use lance_table::rowids::FragmentRowIdIndex;
-use lance_core::utils::deletion::DeletionVector;
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -116,9 +116,9 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
                     deletion_vector,
                 })
             }
-        })
+        }),
     )
-        .await?;
+    .await?;
 
     let index = RowIdIndex::new(&frag_indices)?;
 

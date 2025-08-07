@@ -8,7 +8,7 @@ use super::{RowIdSequence, U64Segment};
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::{Result};
+use lance_core::Result;
 use rangemap::RangeInclusiveMap;
 
 /// An index of row ids
@@ -96,15 +96,14 @@ fn decompose_sequence(
     frag_index: &FragmentRowIdIndex,
 ) -> Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))> {
     let mut start_address: u64 = RowAddress::first_row(frag_index.fragment_id).into();
-    frag_index.row_id_sequence
+    frag_index
+        .row_id_sequence
         .0
         .iter()
         .filter_map(|segment| {
             let filtered_row_ids: Vec<u64> = segment
                 .iter()
-                .filter(|rowid| {
-                    !frag_index.deletion_vector.contains(*rowid as u32)
-                })
+                .filter(|rowid| !frag_index.deletion_vector.contains(*rowid as u32))
                 .collect();
 
             if filtered_row_ids.is_empty() {
@@ -119,7 +118,6 @@ fn decompose_sequence(
             let coverage = row_id_segment.range()?;
 
             Some((coverage, (row_id_segment, address_segment)))
-
         })
         .collect()
 }
