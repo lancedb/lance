@@ -22,6 +22,7 @@ import com.lancedb.lance.operation.ReserveFragments;
 import com.lancedb.lance.operation.Restore;
 import com.lancedb.lance.operation.Rewrite;
 import com.lancedb.lance.operation.RewriteGroup;
+import com.lancedb.lance.operation.Update;
 import com.lancedb.lance.operation.UpdateConfig;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -194,6 +195,66 @@ public class TransactionTest {
           assertEquals(testDataset.getSchema(), schemaRes);
         }
         assertEquals(transaction, dataset.readTransaction().orElse(null));
+      }
+    }
+  }
+
+  @Test
+  void testUpdate(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testUpdate").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Commit fragment
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      Transaction transaction =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build();
+
+      try (Dataset dataset = transaction.commit()) {
+        assertEquals(2, dataset.version());
+        assertEquals(2, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset
+                    .newTransactionBuilder()
+                    .operation(Append.builder().fragments(new ArrayList<>()).build())
+                    .build()
+                    .commit()
+                    .close());
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+      // Update fragments
+      rowCount = 40;
+      FragmentMetadata newFragment = testDataset.createNewFragment(rowCount);
+      transaction =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Update.builder()
+                      .removedFragmentIds(
+                          Collections.singletonList(
+                              Long.valueOf(dataset.getFragments().get(0).getId())))
+                      .newFragments(Collections.singletonList(newFragment))
+                      .build())
+              .build();
+
+      try (Dataset dataset = transaction.commit()) {
+        assertEquals(3, dataset.version());
+        assertEquals(3, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+
+        Transaction txn = dataset.readTransaction().orElse(null);
+        assertEquals(transaction, txn);
       }
     }
   }

@@ -182,6 +182,12 @@ impl IntoJava for JLance<i64> {
     }
 }
 
+impl IntoJava for &JLance<i64> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        Ok(env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(self.0)])?)
+    }
+}
+
 impl IntoJava for JLance<Option<usize>> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let obj = match self.0 {
