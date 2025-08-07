@@ -101,23 +101,12 @@ fn decompose_sequence(
         .0
         .iter()
         .filter_map(|segment| {
-            let filtered_row_ids: Vec<u64> = segment
-                .iter()
-                .filter(|rowid| !frag_index.deletion_vector.contains(*rowid as u32))
-                .collect();
-
-            if filtered_row_ids.is_empty() {
-                return None;
-            }
-
-            let segment_len = filtered_row_ids.len() as u64;
+            let segment_len = segment.len() as u64;
             let address_segment = U64Segment::Range(start_address..(start_address + segment_len));
             start_address += segment_len;
 
-            let row_id_segment = U64Segment::from_iter(filtered_row_ids.iter().copied());
-            let coverage = row_id_segment.range()?;
-
-            Some((coverage, (row_id_segment, address_segment)))
+            let coverage = segment.range()?;
+            Some((coverage, (segment.clone(), address_segment)))
         })
         .collect()
 }
