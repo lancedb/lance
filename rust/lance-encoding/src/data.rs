@@ -422,6 +422,7 @@ impl DataBlockBuilderImpl for StructDataBlockBuilder {
         DataBlock::Struct(StructDataBlock {
             children: children_data_block,
             block_info: BlockInfo::new(),
+            validity: None,
         })
     }
 }
@@ -717,6 +718,8 @@ pub struct StructDataBlock {
     /// The child arrays
     pub children: Vec<DataBlock>,
     pub block_info: BlockInfo,
+    /// The validity bitmap for the struct (None means all valid)
+    pub validity: Option<NullBuffer>,
 }
 
 impl StructDataBlock {
@@ -729,7 +732,18 @@ impl StructDataBlock {
                 num_rows = child_data.len();
                 builder = builder.add_child_data(child_data);
             }
-            let builder = builder.null_count(0).len(num_rows);
+
+            // Apply validity if present
+            let builder = if let Some(validity) = self.validity {
+                let null_count = validity.null_count();
+                builder
+                    .null_bit_buffer(Some(validity.into_inner().into_inner()))
+                    .null_count(null_count)
+            } else {
+                builder.null_count(0)
+            };
+
+            let builder = builder.len(num_rows);
             if validate {
                 Ok(builder.build()?)
             } else {
@@ -751,6 +765,7 @@ impl StructDataBlock {
                 .map(|c| c.remove_outer_validity())
                 .collect(),
             block_info: self.block_info,
+            validity: None, // Remove the validity
         }
     }
 
@@ -769,6 +784,7 @@ impl StructDataBlock {
                 .map(|c| c.borrow_and_clone())
                 .collect(),
             block_info: self.block_info.clone(),
+            validity: self.validity.clone(),
         }
     }
 
@@ -780,6 +796,7 @@ impl StructDataBlock {
                 .map(|c| c.try_clone())
                 .collect::<Result<_>>()?,
             block_info: self.block_info.clone(),
+            validity: self.validity.clone(),
         })
     }
 
@@ -1586,9 +1603,18 @@ impl DataBlock {
                         .collect::<Vec<_>>();
                     children.push(Self::from_arrays(&child_vec, num_values));
                 }
+
+                // Extract validity for the struct array
+                let validity = match &nulls {
+                    Nullability::None => None,
+                    Nullability::Some(null_buffer) => Some(null_buffer.clone()),
+                    Nullability::All => unreachable!("Should have returned AllNull earlier"),
+                };
+
                 Self::Struct(StructDataBlock {
                     children,
                     block_info: BlockInfo::default(),
+                    validity,
                 })
             }
             DataType::FixedSizeList(_, dim) => {

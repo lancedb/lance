@@ -174,7 +174,13 @@ impl<I: Iterator<Item = u64> + Send> Iterator for DvToValidRanges<I> {
         }
         let position = self.position;
         self.position = self.num_rows;
-        Some(position..self.num_rows)
+        if position == self.num_rows {
+            // Last deleted row was end of the fragment, return None
+            None
+        } else {
+            // Still some rows after the last deleted row, return them
+            Some(position..self.num_rows)
+        }
     }
 }
 
@@ -1479,6 +1485,8 @@ impl ExecutionPlan for FilteredReadExec {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use arrow::{
         compute::concat_batches,
         datatypes::{Float32Type, UInt32Type, UInt64Type},
@@ -2169,5 +2177,15 @@ mod tests {
             FilteredReadStream::trim_ranges(ranges, 0..25, &(15..25)),
             vec![20..25, 30..35]
         );
+    }
+
+    #[test]
+    fn test_full_frag_range() {
+        let dv = Arc::new(DeletionVector::Set(HashSet::from_iter([
+            13, 52, 51, 51, 17,
+        ])));
+        let ranges = FilteredReadStream::full_frag_range(53, &Some(dv));
+        let expected = vec![0..13, 14..17, 18..51];
+        assert_eq!(ranges, expected);
     }
 }

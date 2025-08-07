@@ -94,6 +94,7 @@ impl SqlQuery {
 
     pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {
         use futures::TryStreamExt;
+
         Ok(self
             .dataframe
             .execute_stream()
