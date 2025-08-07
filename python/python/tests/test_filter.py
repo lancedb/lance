@@ -311,3 +311,15 @@ def test_struct_field_order(tmp_path):
         )
         expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
         assert result == expected
+
+
+def test_filter_depth_limit():
+    column_name = "a_very_long_column_name"
+    ds = lance.write_dataset(pa.table({column_name: [1, 2]}), "memory://")
+    ds.create_scalar_index(column_name, "BTREE")
+
+    filter = " AND ".join([f"{column_name} = {i}" for i in range(500)])
+    ds.to_table(filter=filter)
+    with pytest.raises(ValueError, match="the filter expression is too long"):
+        filter = " AND ".join([f"{column_name} = {i}" for i in range(501)])
+        ds.to_table(filter=filter)
