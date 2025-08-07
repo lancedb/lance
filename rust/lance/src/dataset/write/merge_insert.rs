@@ -17,12 +17,13 @@
 //! meaningful key column to be able to perform a merge insert.
 
 use assign_action::merge_insert_action;
-use futures::FutureExt;
 use std::{
     collections::{BTreeMap, HashSet},
-    future::Future,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 use arrow_array::{
@@ -73,17 +74,13 @@ use crate::{
 };
 use datafusion_physical_expr::expressions::Column;
 use futures::{
-    future::Either,
     stream::{self},
-    Stream, StreamExt, TryFutureExt, TryStreamExt,
+    Stream, StreamExt, TryStreamExt,
 };
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{
-        backoff::SlotBackoff, futures::Capacity, mask::RowIdTreeMap,
-        tokio::get_num_compute_intensive_cpus,
-    },
+    utils::{futures::Capacity, mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -100,6 +97,7 @@ use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
 
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 
 mod assign_action;
@@ -233,11 +231,6 @@ struct MergeInsertParams {
     // If set, this MemWAL should be marked as flushed, and will be committed to replace the
     // MemWAL that is currently in the index with the same ID.
     mem_wal_to_flush: Option<MemWal>,
-    // If true, skip auto cleanup during commits. This should be set to true
-    // for high frequency writes to improve performance. This is also useful
-    // if the writer does not have delete permissions and the clean up would
-    // just try and log a failure anyway.
-    skip_auto_cleanup: bool,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -317,7 +310,6 @@ impl MergeInsertBuilder {
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
                 mem_wal_to_flush: None,
-                skip_auto_cleanup: false,
             },
         })
     }
@@ -370,11 +362,6 @@ impl MergeInsertBuilder {
     /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.params.retry_timeout = timeout;
-        self
-    }
-
-    pub fn skip_auto_cleanup(&mut self, skip: bool) -> &mut Self {
-        self.params.skip_auto_cleanup = skip;
         self
     }
 
@@ -1103,110 +1090,23 @@ impl MergeInsertJob {
     /// This will take in the source, merge it with the existing target data, and insert new
     /// rows, update existing rows, and delete existing rows
     pub async fn execute(
-        mut self,
+        self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let start = Instant::now();
-        let mut source_iter =
-            super::new_source_iter(source, self.params.conflict_retries > 0).await?;
+        let source_iter = super::new_source_iter(source, self.params.conflict_retries > 0).await?;
+        let dataset = self.dataset.clone();
+        let config = RetryConfig {
+            max_retries: self.params.conflict_retries,
+            retry_timeout: self.params.retry_timeout,
+        };
 
-        let mut dataset_ref = self.dataset.clone();
-        let max_retries = self.params.conflict_retries;
-        let mut backoff = SlotBackoff::default();
+        let wrapper = MergeInsertJobWithIterator {
+            job: self,
+            source_iter: Arc::new(Mutex::new(source_iter)),
+            attempt_count: Arc::new(AtomicU32::new(0)),
+        };
 
-        fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
-            Error::TooMuchWriteContention {
-                message: format!(
-                    "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
-                    attempts,
-                    retry_timeout.as_secs_f32()
-                ),
-                location: location!(),
-            }
-        }
-
-        fn maybe_timeout<T>(
-            backoff: &SlotBackoff,
-            start: Instant,
-            retry_timeout: Duration,
-            future: impl Future<Output = T>,
-        ) -> impl Future<Output = Result<T>> {
-            let attempt = backoff.attempt();
-            if attempt == 0 {
-                // No timeout on first attempt
-                Either::Left(future.map(|res| Ok(res)))
-            } else {
-                let remaining = retry_timeout.saturating_sub(start.elapsed());
-                Either::Right(
-                    tokio::time::timeout(remaining, future)
-                        .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
-                )
-            }
-        }
-
-        while backoff.attempt() <= max_retries {
-            let ds = dataset_ref.clone();
-            let execute_fut = self
-                .clone()
-                .execute_uncommitted_impl(source_iter.next().unwrap());
-            let execute_fut =
-                maybe_timeout(&backoff, start, self.params.retry_timeout, execute_fut);
-            let UncommittedMergeInsert {
-                transaction,
-                mut stats,
-                affected_rows,
-            } = execute_fut.await??;
-            stats.num_attempts = backoff.attempt() + 1;
-
-            let mut commit_builder = CommitBuilder::new(ds.clone())
-                .with_skip_auto_cleanup(self.params.skip_auto_cleanup);
-            if let Some(affected_rows) = affected_rows {
-                commit_builder = commit_builder.with_affected_rows(affected_rows);
-            }
-            let commit_future = commit_builder.execute(transaction);
-            let commit_future =
-                maybe_timeout(&backoff, start, self.params.retry_timeout, commit_future);
-            match commit_future.await? {
-                Ok(ds) => return Ok((Arc::new(ds), stats)),
-                Err(Error::RetryableCommitConflict { .. }) => {
-                    // Check whether we have exhausted our retries *before*
-                    // we sleep.
-                    if backoff.attempt() >= max_retries {
-                        break;
-                    }
-                    if start.elapsed() > self.params.retry_timeout {
-                        return Err(timeout_error(
-                            self.params.retry_timeout,
-                            backoff.attempt() + 1,
-                        ));
-                    }
-                    if backoff.attempt() == 0 {
-                        // We add 10% buffer here, to allow concurrent writes to complete.
-                        // We pass the first attempt's time to the backoff so it's used
-                        // as the unit for backoff time slots.
-                        // See SlotBackoff implementation for more details on how this works.
-                        backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
-                    }
-
-                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
-                    let sleep_fut =
-                        maybe_timeout(&backoff, start, self.params.retry_timeout, sleep_fut);
-                    sleep_fut.await?;
-
-                    let mut ds = dataset_ref.as_ref().clone();
-                    ds.checkout_latest().await?;
-
-                    dataset_ref = Arc::new(ds);
-                    self.dataset = dataset_ref.clone();
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-        }
-        Err(Error::TooMuchWriteContention {
-            message: format!("Attempted {} retries.", max_retries),
-            location: location!(),
-        })
+        execute_with_retry(wrapper, dataset, config).await
     }
 
     /// Execute the merge insert job without committing the changes.
@@ -1659,6 +1559,46 @@ pub struct UncommittedMergeInsert {
     pub stats: MergeStats,
 }
 
+/// Wrapper struct that combines MergeInsertJob with the source iterator for retry functionality
+#[derive(Clone)]
+struct MergeInsertJobWithIterator {
+    job: MergeInsertJob,
+    source_iter: Arc<Mutex<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>>>,
+    attempt_count: Arc<AtomicU32>,
+}
+
+impl RetryExecutor for MergeInsertJobWithIterator {
+    type Data = UncommittedMergeInsert;
+    type Result = (Arc<Dataset>, MergeStats);
+
+    async fn execute_impl(&self) -> Result<Self::Data> {
+        // Increment attempt counter
+        self.attempt_count.fetch_add(1, Ordering::SeqCst);
+
+        // We need to get a fresh stream for each retry attempt
+        // The source_iter provides unlimited streams from the same source data
+        let stream = self.source_iter.lock().unwrap().next().unwrap();
+        self.job.clone().execute_uncommitted_impl(stream).await
+    }
+
+    async fn commit(&self, dataset: Arc<Dataset>, mut data: Self::Data) -> Result<Self::Result> {
+        // Update stats with the current attempt count
+        data.stats.num_attempts = self.attempt_count.load(Ordering::SeqCst);
+
+        let mut commit_builder = CommitBuilder::new(dataset);
+        if let Some(affected_rows) = data.affected_rows {
+            commit_builder = commit_builder.with_affected_rows(affected_rows);
+        }
+        let new_dataset = commit_builder.execute(data.transaction).await?;
+
+        Ok((Arc::new(new_dataset), data.stats))
+    }
+
+    fn update_dataset(&mut self, dataset: Arc<Dataset>) {
+        self.job.dataset = dataset;
+    }
+}
+
 // A sync-safe structure that is shared by all of the "process batch" tasks.
 //
 // Note: we are not currently using parallelism but this still needs to be sync because it is
@@ -1933,6 +1873,9 @@ impl Merger {
 
 #[cfg(test)]
 mod tests {
+
+    use std::collections::HashMap;
+
     use arrow_array::{
         types::{Int32Type, UInt32Type},
         Int32Array, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
@@ -1948,7 +1891,6 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
-    use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
@@ -1983,7 +1925,7 @@ mod tests {
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
 
-        let (merged_dataset, merge_stats) = job.execute(new_stream).boxed().await.unwrap();
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
 
         let batches = merged_dataset
             .scan()
@@ -3300,6 +3242,7 @@ mod tests {
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
+
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
         use lance_core::utils::testing::MockClock;
