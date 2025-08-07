@@ -69,6 +69,21 @@ async fn apply_deletions(
 }
 
 /// Builder for configuring delete operations with retry support
+///
+/// This operation is similar to SQL's DELETE statement. It allows you to remove
+/// rows from a dataset based on a filter predicate with automatic retry support
+/// for handling concurrent write conflicts.
+///
+/// Use the [DeleteBuilder] to construct a delete operation. For example:
+///
+/// ```ignore
+/// let new_dataset = DeleteBuilder::new(dataset)
+///     .predicate("age > 65")
+///     .conflict_retries(5)
+///     .execute()
+///     .await?;
+/// ```
+///
 #[derive(Debug, Clone)]
 pub struct DeleteBuilder {
     dataset: Arc<Dataset>,
