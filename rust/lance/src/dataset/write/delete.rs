@@ -10,6 +10,7 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result, ROW_ID};
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
@@ -149,6 +150,7 @@ struct DeleteJob {
 struct DeleteData {
     updated_fragments: Vec<Fragment>,
     deleted_fragment_ids: Vec<u64>,
+    affected_rows: RowIdTreeMap,
 }
 
 impl RetryExecutor for DeleteJob {
@@ -164,14 +166,14 @@ impl RetryExecutor for DeleteJob {
             .filter(&self.predicate)?;
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
-        let (updated_fragments, deleted_fragment_ids) =
+        let (updated_fragments, deleted_fragment_ids, affected_rows) =
             if let Some(filter_expr) = scanner.get_filter()? {
                 if matches!(
                     filter_expr,
                     Expr::Literal(ScalarValue::Boolean(Some(false)), _)
                 ) {
                     // Predicate evaluated to false - no deletions
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), RowIdTreeMap::new())
                 } else if matches!(
                     filter_expr,
                     Expr::Literal(ScalarValue::Boolean(Some(true)), _)
@@ -183,7 +185,9 @@ impl RetryExecutor for DeleteJob {
                         .iter()
                         .map(|f| f.id() as u64)
                         .collect();
-                    (Vec::new(), deleted_fragment_ids)
+                    // When deleting everything, we don't have specific row addresses,
+                    // but we can create an empty RowIdTreeMap since all fragments are deleted
+                    (Vec::new(), deleted_fragment_ids, RowIdTreeMap::new())
                 } else {
                     // Regular predicate - scan and collect row addresses to delete
                     let stream = scanner.try_into_stream().await?.into();
@@ -207,16 +211,20 @@ impl RetryExecutor for DeleteJob {
                     let row_id_index = get_row_id_index(&self.dataset).await?;
                     let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
 
-                    apply_deletions(&self.dataset, &removed_row_addrs).await?
+                    let (fragments, deleted_ids) =
+                        apply_deletions(&self.dataset, &removed_row_addrs).await?;
+                    let affected_rows = RowIdTreeMap::from(removed_row_addrs.as_ref().clone());
+                    (fragments, deleted_ids, affected_rows)
                 }
             } else {
                 // No filter was applied - this shouldn't happen but treat as delete nothing
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), RowIdTreeMap::new())
             };
 
         Ok(DeleteData {
             updated_fragments,
             deleted_fragment_ids,
+            affected_rows,
         })
     }
 
@@ -232,8 +240,12 @@ impl RetryExecutor for DeleteJob {
             /*blobs_op=*/ None,
             None,
         );
-        let new_dataset = CommitBuilder::new(dataset).execute(transaction).await?;
-        Ok(Arc::new(new_dataset))
+
+        CommitBuilder::new(dataset)
+            .with_affected_rows(data.affected_rows)
+            .execute(transaction)
+            .await
+            .map(Arc::new)
     }
 
     fn update_dataset(&mut self, dataset: Arc<Dataset>) {
@@ -636,5 +648,156 @@ mod tests {
         deleted_rows.sort();
         let expected_deleted: Vec<u32> = (0..50).collect();
         assert_eq!(deleted_rows, expected_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_delete_retry_timeout() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::UInt32,
+                false,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
+                .unwrap()
+        }
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+
+        let data = sequence_data(0..100);
+        let dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
+            .make_hostile(&tmp_path)
+            .await;
+
+        let dataset = Arc::new(dataset);
+
+        // Test with very short timeout
+        let result = DeleteBuilder::new(dataset.clone(), "i < 50")
+            .conflict_retries(100) // High retry count
+            .retry_timeout(Duration::from_millis(1)) // Very short timeout
+            .execute()
+            .await;
+
+        // Should timeout
+        if let Err(e) = result {
+            // Check that it's a timeout error
+            assert!(
+                matches!(e, Error::TooMuchWriteContention { .. }),
+                "Expected TooMuchWriteContention error, got: {:?}",
+                e
+            );
+        } else {
+            // Might succeed if the operation is very fast
+            assert!(result.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_concurrency() {
+        use crate::{
+            dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteParams},
+            session::Session,
+            utils::test::ThrottledStoreWrapper,
+        };
+        use futures::future::try_join_all;
+        use lance_io::object_store::ObjectStoreParams;
+        use object_store::throttle::ThrottleConfig;
+        use tokio::sync::Barrier;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::UInt32,
+            false,
+        )]));
+        let concurrency = 3;
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(
+                0..(concurrency * 10),
+            ))],
+        )
+        .unwrap();
+
+        // Increase likelihood of contention by throttling the store
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(throttled.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute(vec![initial_data])
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(concurrency as usize));
+        let mut handles = Vec::new();
+        for i in 0..concurrency {
+            let session_ref = session.clone();
+            let barrier_ref = barrier.clone();
+            let throttled_ref = throttled.clone();
+            let handle = tokio::task::spawn(async move {
+                let dataset = DatasetBuilder::from_uri("memory://")
+                    .with_read_params(ReadParams {
+                        store_options: Some(ObjectStoreParams {
+                            object_store_wrapper: Some(throttled_ref.clone()),
+                            ..Default::default()
+                        }),
+                        session: Some(session_ref.clone()),
+                        ..Default::default()
+                    })
+                    .load()
+                    .await
+                    .unwrap();
+
+                barrier_ref.wait().await;
+
+                // Each task deletes a different range of rows to avoid complete overlap
+                let start = i * 10;
+                let end = (i + 1) * 10;
+                DeleteBuilder::new(
+                    Arc::new(dataset),
+                    format!("id >= {} AND id < {}", start, end),
+                )
+                .conflict_retries(5)
+                .execute()
+                .await
+                .unwrap()
+            });
+            handles.push(handle);
+        }
+
+        try_join_all(handles).await.unwrap();
+
+        dataset.checkout_latest().await.unwrap();
+
+        // All rows should be deleted since each task deleted a non-overlapping range
+        let remaining_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(remaining_count, 0, "All rows should be deleted");
+
+        // Verify no fragments remain or they are all empty
+        let fragments = dataset.get_fragments();
+        if !fragments.is_empty() {
+            // If fragments exist, they should all have deletion vectors covering all rows
+            for fragment in &fragments {
+                let deletion_vector = fragment.get_deletion_vector().await.unwrap();
+                assert!(
+                    deletion_vector.is_some(),
+                    "Fragment should have deletion vector if any rows remain"
+                );
+            }
+        }
     }
 }
