@@ -2624,15 +2624,15 @@ mod tests {
     fn test_rng() {
         // Note: these tests are heavily dependent on the default seed.
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
-        let mut gen = array::rand::<Int32Type>();
+        let mut generator = array::rand::<Int32Type>();
         assert_eq!(
-            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            *generator.generate(RowCount::from(3), &mut rng).unwrap(),
             Int32Array::from_iter([-797553329, 1369325940, -69174021])
         );
 
-        let mut gen = array::rand_fixedbin(ByteCount::from(3), false);
+        let mut generator = array::rand_fixedbin(ByteCount::from(3), false);
         assert_eq!(
-            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            *generator.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values([
                 [184, 53, 216],
                 [12, 96, 159],
@@ -2640,14 +2640,14 @@ mod tests {
             ])
         );
 
-        let mut gen = array::rand_utf8(ByteCount::from(3), false);
+        let mut generator = array::rand_utf8(ByteCount::from(3), false);
         assert_eq!(
-            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            *generator.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::StringArray::from_iter_values([">@p", "n `", "NWa"])
         );
 
-        let mut gen = array::random_sentence(1, 5, false);
-        let words = gen.generate(RowCount::from(10), &mut rng).unwrap();
+        let mut generator = array::random_sentence(1, 5, false);
+        let words = generator.generate(RowCount::from(10), &mut rng).unwrap();
         assert_eq!(words.data_type(), &DataType::Utf8);
         let words_array = words.as_any().downcast_ref::<StringArray>().unwrap();
         // Verify each string contains 1-5 words
@@ -2657,29 +2657,29 @@ mod tests {
             assert!((1..=5).contains(&word_count));
         }
 
-        let mut gen = array::rand_date32();
-        let days_32 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut generator = array::rand_date32();
+        let days_32 = generator.generate(RowCount::from(3), &mut rng).unwrap();
         assert_eq!(days_32.data_type(), &DataType::Date32);
 
-        let mut gen = array::rand_date64();
-        let days_64 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut generator = array::rand_date64();
+        let days_64 = generator.generate(RowCount::from(3), &mut rng).unwrap();
         assert_eq!(days_64.data_type(), &DataType::Date64);
 
-        let mut gen = array::rand_boolean();
-        let bools = gen.generate(RowCount::from(1024), &mut rng).unwrap();
+        let mut generator = array::rand_boolean();
+        let bools = generator.generate(RowCount::from(1024), &mut rng).unwrap();
         assert_eq!(bools.data_type(), &DataType::Boolean);
         let bools = bools.as_any().downcast_ref::<BooleanArray>().unwrap();
         // Sanity check to ensure we're getting at least some rng
         assert!(bools.false_count() > 100);
         assert!(bools.true_count() > 100);
 
-        let mut gen = array::rand_varbin(ByteCount::from(2), ByteCount::from(4));
+        let mut generator = array::rand_varbin(ByteCount::from(2), ByteCount::from(4));
         assert_eq!(
-            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            *generator.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values([
-                vec![211, 239],
-                vec![126, 73, 74, 131],
-                vec![145, 222]
+                vec![234, 107],
+                vec![220, 152],
+                vec![21, 16, 184, 220]
             ])
         );
     }
