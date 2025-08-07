@@ -19,7 +19,9 @@ use lance_table::{
     format::Manifest,
     io::commit::{commit_handler_from_url, CommitHandler},
 };
-use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
+#[cfg(feature = "aws")]
+use object_store::aws::AwsCredentialProvider;
+use object_store::{path::Path, DynObjectStore};
 use prost::Message;
 use snafu::location;
 use tracing::{info, instrument};
@@ -128,6 +130,7 @@ impl DatasetBuilder {
 
     /// Sets the aws credentials provider.
     /// This only applies to aws object store.
+    #[cfg(feature = "aws")]
     pub fn with_aws_credentials_provider(mut self, credentials: AwsCredentialProvider) -> Self {
         self.options.aws_credentials = Some(credentials);
         self
