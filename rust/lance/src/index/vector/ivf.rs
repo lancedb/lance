@@ -964,11 +964,7 @@ impl VectorIndex for IVFIndex {
     /// Internal API with no stability guarantees.
     ///
     /// Assumes the query vector is normalized if the metric type is cosine.
-    fn find_partitions(
-        &self,
-        query: &Query,
-        with_dist: bool,
-    ) -> Result<(UInt32Array, Option<Float32Array>)> {
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
         let mt = if self.metric_type == MetricType::Cosine {
             MetricType::L2
         } else {
@@ -977,8 +973,7 @@ impl VectorIndex for IVFIndex {
 
         let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
 
-        self.ivf
-            .find_partitions(&query.key, max_nprobes, mt, with_dist)
+        self.ivf.find_partitions(&query.key, max_nprobes, mt)
     }
 
     async fn search_in_partition(
@@ -2110,7 +2105,7 @@ mod tests {
                     use_index: true,
                     dist_q_c: 0.0,
                 };
-                let (partitions, _) = index.find_partitions(&query, false).unwrap();
+                let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;
                 let search_result = index
                     .search_in_partition(

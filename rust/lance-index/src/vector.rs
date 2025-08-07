@@ -176,16 +176,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// partitions to the query vector).
     ///
     /// The results should be in sorted order from closest to farthest.
-    fn find_partitions(
-        &self,
-        query: &Query,
-        with_dist: bool,
-    ) -> Result<(UInt32Array, Option<Float32Array>)>;
-
-    /// Indicate whether the distance between the query and the centroid is required.
-    fn require_centroid_dist(&self) -> bool {
-        false
-    }
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)>;
 
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;

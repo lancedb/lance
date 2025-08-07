@@ -316,14 +316,12 @@ impl IvfTransformer {
         &self,
         query: &dyn Array,
         nprobes: usize,
-        with_dist: bool,
-    ) -> Result<(UInt32Array, Option<Float32Array>)> {
+    ) -> Result<(UInt32Array, Float32Array)> {
         Ok(kmeans_find_partitions_arrow_array(
             &self.centroids,
             query,
             nprobes,
             self.distance_type,
-            with_dist,
         )?)
     }
 }

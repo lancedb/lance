@@ -455,11 +455,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
     }
 
-    fn find_partitions(
-        &self,
-        query: &Query,
-        with_dist: bool,
-    ) -> Result<(UInt32Array, Option<Float32Array>)> {
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
         let dt = if self.distance_type == DistanceType::Cosine {
             DistanceType::L2
         } else {
@@ -468,12 +464,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
 
-        self.ivf
-            .find_partitions(&query.key, max_nprobes, dt, with_dist)
-    }
-
-    fn require_centroid_dist(&self) -> bool {
-        Q::quantization_type() == QuantizationType::Rabit
+        self.ivf.find_partitions(&query.key, max_nprobes, dt)
     }
 
     fn total_partitions(&self) -> usize {
@@ -1396,7 +1387,9 @@ mod tests {
     // need to verify recall with real-world dataset (e.g. sift1m)
     #[rstest]
     #[case(1, DistanceType::L2, 0.6)]
+    #[case(1, DistanceType::Dot, 0.6)]
     #[case(4, DistanceType::L2, 0.6)]
+    #[case(4, DistanceType::Dot, 0.6)]
     #[tokio::test]
     async fn test_build_ivf_rq(
         #[case] nlist: usize,
@@ -1407,9 +1400,9 @@ mod tests {
         let rq_params = RQBuildParams::default();
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
-        // if distance_type == DistanceType::Cosine {
-        //     test_index_multivec(params.clone(), nlist, recall_requirement).await;
-        // }
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         // test_remap(params.clone(), nlist).await;
         // test_optimize_strategy(params).await;
     }

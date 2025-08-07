@@ -180,6 +180,7 @@ impl IndexType {
                 | Self::IvfHnswFlat
                 | Self::IvfFlat
                 | Self::IvfSq
+                | Self::IvfRq
         )
     }
 

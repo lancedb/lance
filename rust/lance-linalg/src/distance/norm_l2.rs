@@ -3,6 +3,10 @@
 
 use std::{iter::Sum, ops::AddAssign};
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::FixedSizeListArray;
+use arrow_schema::DataType;
 use half::{bf16, f16};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
@@ -132,6 +136,36 @@ pub fn norm_l2_impl<
 #[inline]
 pub fn norm_l2<T: Normalize>(vector: &[T]) -> f32 {
     T::norm_l2(vector)
+}
+
+pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
+    let dim = fsl.value_length() as usize;
+    match fsl.value_type() {
+        DataType::Float16 => fsl
+            .values()
+            .as_primitive::<Float16Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(|v| v.iter().map(|v| v * v).sum::<f16>().to_f32())
+            .collect::<Vec<_>>(),
+        DataType::Float32 => fsl
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(|v| v.iter().map(|v| v * v).sum::<f32>())
+            .collect::<Vec<_>>(),
+        DataType::Float64 => fsl
+            .values()
+            .as_primitive::<Float64Type>()
+            .values()
+            .chunks_exact(dim)
+            .map(|v| v.iter().map(|v| v * v).sum::<f64>() as f32)
+            .collect::<Vec<_>>(),
+        _ => {
+            unimplemented!("Unsupported data type: {}", fsl.value_type())
+        }
+    }
 }
 
 #[cfg(test)]

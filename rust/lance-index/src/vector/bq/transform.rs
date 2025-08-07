@@ -5,11 +5,12 @@ use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::AsArray;
-use arrow::datatypes::{Float32Type, UInt32Type, UInt8Type};
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type, UInt8Type};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::{norm_squared_fsl, DistanceType};
 use snafu::location;
 use tracing::instrument;
 
@@ -51,23 +52,8 @@ impl RQTransformer {
         vector_column: impl Into<String>,
     ) -> Self {
         // for dot product, the add factor is `1 - v*c + |c|^2`, so we need to compute |c|^2
-        let centroids_norm_square = (distance_type == DistanceType::Dot).then(|| {
-            Float32Array::from(
-                centroids
-                    .iter()
-                    .map(|v| {
-                        v.map(|v| {
-                            v.as_primitive::<Float32Type>()
-                                .values()
-                                .iter()
-                                .map(|v| v * v)
-                                .sum::<f32>()
-                        })
-                        .unwrap_or_default()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        });
+        let centroids_norm_square = (distance_type == DistanceType::Dot)
+            .then(|| Float32Array::from(norm_squared_fsl(&centroids)));
 
         Self {
             rq,
@@ -123,20 +109,7 @@ impl Transformer for RQTransformer {
         let res_norm_square = match self.distance_type {
             // for L2, |v-c|^2 is just the distance to the centroid
             DistanceType::L2 => dist_v_c.clone(),
-            DistanceType::Dot => Float32Array::from(
-                residual_vectors
-                    .iter()
-                    .map(|v| {
-                        v.map(|v| {
-                            v.as_primitive::<Float32Type>()
-                                .values()
-                                .iter()
-                                .map(|v| v * v)
-                                .sum::<f32>()
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+            DistanceType::Dot => Float32Array::from(norm_squared_fsl(residual_vectors)),
             _ => {
                 return Err(Error::Index {
                     message: format!(
@@ -160,10 +133,29 @@ impl Transformer for RQTransformer {
                 })
                 .unwrap_or_default()
             }));
-        let ip_rq_res = Float32Array::from(
-            self.rq
-                .codes_res_dot_dists::<Float32Type>(&residual_vectors)?,
-        );
+        let ip_rq_res = match residual_vectors.value_type() {
+            DataType::Float16 => Float32Array::from(
+                self.rq
+                    .codes_res_dot_dists::<Float16Type>(&residual_vectors)?,
+            ),
+            DataType::Float32 => Float32Array::from(
+                self.rq
+                    .codes_res_dot_dists::<Float32Type>(&residual_vectors)?,
+            ),
+            DataType::Float64 => Float32Array::from(
+                self.rq
+                    .codes_res_dot_dists::<Float64Type>(&residual_vectors)?,
+            ),
+            _ => {
+                return Err(Error::Index {
+                    message: format!(
+                        "RQ Transform: unsupported residual vector data type: {}",
+                        residual_vectors.data_type()
+                    ),
+                    location: location!(),
+                });
+            }
+        };
         debug_assert_eq!(rq_code.len(), batch.num_rows());
 
         let add_factors = match self.distance_type {
@@ -231,7 +223,11 @@ impl Transformer for RQTransformer {
             .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?
             .drop_column(CENTROID_DIST_COLUMN)?;
         let batch = batch.try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
-        let batch = batch.drop_column(&self.vector_column)?;
+
+        let batch = batch
+            .drop_column(&self.vector_column)?
+            .drop_column(RESIDUAL_COLUMN)?
+            .drop_column(CENTROID_DIST_COLUMN)?;
         Ok(batch)
     }
 }

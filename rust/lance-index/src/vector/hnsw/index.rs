@@ -186,7 +186,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         )
     }
 
-    fn find_partitions(&self, _: &Query, _: bool) -> Result<(UInt32Array, Option<Float32Array>)> {
+    fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
         unimplemented!("only for IVF")
     }
 

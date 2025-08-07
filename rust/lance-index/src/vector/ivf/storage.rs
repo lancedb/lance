@@ -107,14 +107,13 @@ impl IvfModel {
         query: &dyn Array,
         nprobes: usize,
         distance_type: DistanceType,
-        with_dist: bool,
-    ) -> Result<(UInt32Array, Option<Float32Array>)> {
+    ) -> Result<(UInt32Array, Float32Array)> {
         let internal = crate::vector::ivf::new_ivf_transformer(
             self.centroids.clone().unwrap(),
             distance_type,
             vec![],
         );
-        internal.find_partitions(query, nprobes, with_dist)
+        internal.find_partitions(query, nprobes)
     }
 
     /// Add the offset and length of one partition.

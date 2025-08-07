@@ -22,7 +22,6 @@ use crate::vector::bq::storage::{
 use crate::vector::bq::transform::{ADD_FACTORS_FIELD, CODE_BITCOUNT_FIELD, SCALE_FACTORS_FIELD};
 use crate::vector::bq::RQBuildParams;
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
-use crate::vector::CENTROID_DIST_FIELD;
 
 /// Build parameters for RabitQuantizer.
 ///
@@ -341,7 +340,6 @@ impl Quantization for RabitQuantizer {
 
     fn extra_fields(&self) -> Vec<Field> {
         vec![
-            CENTROID_DIST_FIELD.clone(),
             CODE_BITCOUNT_FIELD.clone(),
             ADD_FACTORS_FIELD.clone(),
             SCALE_FACTORS_FIELD.clone(),

@@ -109,11 +109,7 @@ mod test {
             Ok(self.ret_val.clone())
         }
 
-        fn find_partitions(
-            &self,
-            _: &Query,
-            _: bool,
-        ) -> Result<(UInt32Array, Option<Float32Array>)> {
+        fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
             unimplemented!("only for IVF")
         }
 
@@ -268,7 +264,7 @@ mod test {
                 dist_q_c: 0.0,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
-            let (partition_ids, _) = idx.find_partitions(&q, false).unwrap();
+            let (partition_ids, _) = idx.find_partitions(&q).unwrap();
             assert_eq!(partition_ids.len(), 4);
             let nearest_partition_id = partition_ids.value(0);
             idx.search_in_partition(

@@ -497,11 +497,9 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
-                    let (partitions, dist_q_c) = index
-                        .find_partitions(&query, index.require_centroid_dist())
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to find partitions: {}", e))
-                        })?;
+                    let (partitions, dist_q_c) = index.find_partitions(&query).map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to find partitions: {}", e))
+                    })?;
 
                     let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
                         .with_field(Field::new("item", DataType::UInt32, false));
@@ -510,9 +508,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new())
                         .with_field(Field::new("item", DataType::Float32, false));
-                    if let Some(dist_q_c) = dist_q_c {
-                        dist_q_c_list_builder.append_value(dist_q_c.iter());
-                    }
+                    dist_q_c_list_builder.append_value(dist_q_c.iter());
                     let dist_q_c_col = dist_q_c_list_builder.finish();
 
                     let uuid_col = StringArray::from(vec![uuid.as_str()]);

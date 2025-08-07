@@ -290,7 +290,7 @@ impl VectorIndex for PQIndex {
         .await
     }
 
-    fn find_partitions(&self, _: &Query, _: bool) -> Result<(UInt32Array, Option<Float32Array>)> {
+    fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
         unimplemented!("only for IVF")
     }
 
