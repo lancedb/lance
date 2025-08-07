@@ -313,6 +313,10 @@ def test_struct_field_order(tmp_path):
         assert result == expected
 
 
+@pytest.mark.skip(
+    reason="enable this in recurring test https://github.com/lancedb/lance/pull/4190"
+    " as it requires release mode"
+)
 def test_filter_depth_limit():
     column_name = "a_very_long_column_name"
     ds = lance.write_dataset(pa.table({column_name: [1, 2]}), "memory://")
