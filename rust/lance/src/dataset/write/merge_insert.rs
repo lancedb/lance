@@ -449,7 +449,7 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let stream = source.into_stream();
-        self.execute(stream).await
+        Box::pin(self.execute(stream)).await
     }
 
     fn check_compatible_schema(&self, schema: &Schema) -> Result<SchemaComparison> {
