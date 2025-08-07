@@ -29,8 +29,10 @@ jobs:
     - name: Install dependencies
       working-directory: python
       run: |
-        uv sync --group test  # includes pandas and other benchmark deps
+        # First install the pre-built wheel
         uv pip install $(ls target/wheels/*.whl)
+        # Then sync other dependencies
+        uv sync --group test  # includes pandas and other benchmark deps
     - name: Run test
       working-directory: benchmarks/${{ matrix.dataset }}
       run: |

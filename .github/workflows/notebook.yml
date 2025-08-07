@@ -39,8 +39,10 @@ jobs:
       working-directory: python
       shell: bash
       run: |
-        uv sync --group test  # includes jupyter and duckdb
+        # First install the pre-built wheel
         uv pip install $(ls target/wheels/*.whl)
+        # Then sync other dependencies
+        uv sync --group test  # includes jupyter and duckdb
     - name: Run notebook tests
       shell: bash
       working-directory: notebooks
