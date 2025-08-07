@@ -366,7 +366,7 @@ fn convert_to_rust_operation(
                 let keys = import_vec(env, &delete_keys)?;
                 let keys = keys
                     .into_iter()
-                    .map(|key| JString::from(key))
+                    .map(JString::from)
                     .map(|key| key.extract(env))
                     .collect::<Result<Vec<_>>>()?;
                 Some(keys)
