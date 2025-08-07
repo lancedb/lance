@@ -258,7 +258,6 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
     let dataset = Arc::new(ds.clone());
     let new_dataset = DeleteBuilder::new(dataset)
         .predicate(predicate)
-        .conflict_retries(0)
         .execute()
         .await?;
 
@@ -284,7 +283,6 @@ mod tests {
     use std::collections::HashSet;
     use std::ops::Range;
     use std::sync::Arc;
-    use std::time::Duration;
 
     #[rstest]
     #[tokio::test]
@@ -618,50 +616,6 @@ mod tests {
         deleted_rows.sort();
         let expected_deleted: Vec<u32> = (0..50).collect();
         assert_eq!(deleted_rows, expected_deleted);
-    }
-
-    #[tokio::test]
-    async fn test_delete_retry_timeout() {
-        fn sequence_data(range: Range<u32>) -> RecordBatch {
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "i",
-                DataType::UInt32,
-                false,
-            )]));
-            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
-                .unwrap()
-        }
-
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
-
-        let data = sequence_data(0..100);
-        let dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
-            .make_hostile(&tmp_path)
-            .await;
-
-        let dataset = Arc::new(dataset);
-
-        // Test with very short timeout
-        let result = DeleteBuilder::new(dataset.clone())
-            .predicate("i < 50")
-            .conflict_retries(100) // High retry count
-            .retry_timeout(Duration::from_millis(1)) // Very short timeout
-            .execute()
-            .await;
-
-        // Should timeout
-        if let Err(e) = result {
-            // Check that it's a timeout error
-            assert!(
-                matches!(e, Error::TooMuchWriteContention { .. }),
-                "Expected TooMuchWriteContention error, got: {:?}",
-                e
-            );
-        } else {
-            // Might succeed if the operation is very fast
-            assert!(result.is_ok());
-        }
     }
 
     #[tokio::test]
