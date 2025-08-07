@@ -1876,9 +1876,6 @@ impl Merger {
 
 #[cfg(test)]
 mod tests {
-
-    use std::collections::HashMap;
-
     use arrow_array::{
         types::{Int32Type, UInt32Type},
         Int32Array, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
@@ -1894,6 +1891,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
+    use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
 
@@ -1928,7 +1926,7 @@ mod tests {
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
 
-        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+        let (merged_dataset, merge_stats) = job.execute(new_stream).boxed().await.unwrap();
 
         let batches = merged_dataset
             .scan()
