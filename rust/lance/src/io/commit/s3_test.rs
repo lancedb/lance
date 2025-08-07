@@ -14,6 +14,9 @@ use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
 use aws_sdk_s3::{config::Credentials, Client as S3Client};
 use futures::future::try_join_all;
 use lance_datagen::{array, gen, RowCount};
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
+use tempfile::tempdir;
 
 const CONFIG: &[(&str, &str)] = &[
     ("access_key_id", "ACCESS_KEY"),
@@ -351,4 +354,28 @@ async fn test_ddb_open_iops() {
     // Checkout: 1 IOPS: manifest file
     assert_eq!(stats.read_iops, 1);
     assert_eq!(stats.write_iops, 0);
+}
+
+#[tokio::test]
+async fn test_path_exists_local() {
+    let tmp_dir = tempdir().unwrap();
+    let tmp_path = tmp_dir.path().canonicalize().unwrap();
+    // add schema
+    #[cfg(unix)]
+    let storage_path = format!("file://{}", tmp_path.display());
+    #[cfg(windows)]
+    let storage_path = {
+        let win_path = tmp_path.display().to_string().replace('\\', "/");
+        format!("file:///{}", win_path.trim_start_matches('/'))
+    };
+
+    let existing_path = Path::parse(&storage_path).unwrap();
+
+    let object_store = ObjectStore::local();
+    let exists = object_store.path_exists(&existing_path).await.unwrap();
+    assert!(exists);
+
+    let non_existing_path = existing_path.child("non_existing");
+    let exists = object_store.path_exists(&non_existing_path).await.unwrap();
+    assert!(!exists);
 }
