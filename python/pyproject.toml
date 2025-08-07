@@ -64,6 +64,56 @@ benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 ray = ["ray[data]<2.38; python_version<'3.12'"]
 
+[dependency-groups]
+# Core test dependencies
+test = [
+    "boto3",
+    "datasets",
+    "duckdb>=0.7",
+    "ml_dtypes",
+    "pillow",
+    "pandas",
+    "polars[pyarrow,pandas]",
+    "pytest",
+    "pytest-benchmark",
+    "tensorflow",
+    "tqdm",
+    "datafusion",
+    "jupyter",  # for notebook tests
+    "requests",  # for benchmarks
+]
+
+# Development and linting tools
+dev = [
+    "maturin>=1.4",
+    "ruff==0.11.2",
+    "pyright",
+    "ipython",
+]
+
+# Optional heavy dependencies
+ray = ["ray[data]<2.38; python_version<'3.12'"]
+torch-cpu = ["torch"]
+
+# CI/CD tools
+ci = [
+    "twine",
+    "packaging",
+    "PyGithub",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pre-commit",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 

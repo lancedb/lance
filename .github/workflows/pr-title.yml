@@ -41,11 +41,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install PyGithub
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - working-directory: python
+        run: uv sync --group ci  # includes PyGithub
       - env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         working-directory: pr
-        run: python ../base/ci/check_versions.py
+        run: uv run --directory ../base/python python ../base/ci/check_versions.py
   commitlint:
     permissions:
       pull-requests: write

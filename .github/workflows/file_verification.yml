@@ -15,6 +15,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
       - name: Install Build Requirements
         run: |
           sudo apt update
@@ -46,16 +51,13 @@ jobs:
       - name: Build Lance
         working-directory: ./python
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install pyarrow maturin
-          maturin develop --release
+          uv sync --group dev  # includes maturin and pyarrow is in core deps
+          uv run maturin develop --release
 
       - name: Test Lance File Write Read Round Trip
         run: |
-          source python/venv/bin/activate
           cd .github/workflows/file_verification
-          python test_write_read.py
+          uv run python test_write_read.py
 
 
       - name: Cleanup

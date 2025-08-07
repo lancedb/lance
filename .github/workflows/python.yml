@@ -56,6 +56,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.11 # Ray does not support 3.12 yet.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -64,13 +68,12 @@ jobs:
           cache-workspace-crates: true
       - name: Install linting tools
         run: |
-          pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          uv sync --group dev --group test --group ray --group torch-cpu
       - name: Lint Python
         run: |
-          ruff format --check --diff python
-          ruff check python
-          pyright
+          uv run ruff format --check --diff python
+          uv run ruff check python
+          uv run pyright
       - name: Install dependencies
         run: |
           sudo apt update
@@ -82,15 +85,11 @@ jobs:
           cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-          pip install maturin
-          maturin develop --locked --extras tests,ray
+          uv sync --group dev --group test --group ray --group torch-cpu
+          uv run maturin develop --locked --extras tests,ray
       - name: Run doctest
         run: |
-          source venv/bin/activate
-          pytest --doctest-modules python/lance
+          uv run pytest --doctest-modules python/lance
   linux:
     timeout-minutes: 45
     strategy:
@@ -111,6 +110,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.${{ matrix.python-minor-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -120,18 +123,18 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
       - name: Generate forward compatibility files
-        run: python python/tests/forward_compat/datagen.py
+        run: uv run python python/tests/forward_compat/datagen.py
       - name: Run forward compatibility tests (pylance 0.16.0)
         run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install pytest pylance==0.16.0
-          pytest python/tests/forward_compat --run-forward
+          # Create a separate venv for testing specific pylance version
+          uv venv --python 3.${{ matrix.python-minor-version }}
+          uv pip install pytest pylance==0.16.0
+          uv run pytest python/tests/forward_compat --run-forward
       - name: Run forward compatibility tests (pylance 0.29.1.beta2)
         run: |
-          source venv/bin/activate
-          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
-          pytest python/tests/forward_compat --run-forward
+          # Reuse venv but install different version
+          uv pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
+          uv run pytest python/tests/forward_compat --run-forward
 
   linux-arm:
     timeout-minutes: 45
@@ -150,6 +153,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.12
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -182,6 +189,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -205,6 +216,10 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -229,6 +244,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11" # TODO: upgrade when ray supports 3.12
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -238,6 +257,5 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
       - name: Install dependencies
         run: |
-          pip install ray[data]
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          uv sync --group ray --group torch-cpu
       - uses: ./.github/workflows/run_integtests

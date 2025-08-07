@@ -16,15 +16,16 @@ runs:
       working-directory: python
       shell: bash
       run: |
-        pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+        uv sync --group test --group ray
+        uv pip install $(ls target/wheels/pylance-*.whl)
     - name: Install torch
       working-directory: python
       shell: bash
       if: inputs.skip-torch == 'false'
       run: |
         # Install cpu only pytorch
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        uv sync --group torch-cpu
     - name: Run python tests
       shell: bash
       working-directory: python
-      run: make test
+      run: uv run make test

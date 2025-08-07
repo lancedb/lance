@@ -26,9 +26,10 @@ runs:
   steps:
   - name: Install dependencies
     shell: bash
+    working-directory: python
     run: |
-      python -m pip install --upgrade pip
-      pip install twine
+      # Install publishing tools using uv
+      uv sync --group ci  # includes twine
   - name: Publish to PyPI
     working-directory: python
     shell: bash
@@ -41,7 +42,7 @@ runs:
         echo "Uploading $WHEEL to Fury"
         curl -f -F package=@$WHEEL https://$FURY_TOKEN@push.fury.io/lancedb/
       else
-        twine upload --repository ${{ inputs.repo }} \
+        uv run twine upload --repository ${{ inputs.repo }} \
           --username __token__ \
           --password $PYPI_TOKEN \
           target/wheels/pylance-*.whl

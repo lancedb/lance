@@ -35,9 +35,13 @@ jobs:
         fetch-depth: 0
         lfs: true
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: 3.${{ matrix.python-minor-version }}
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
     - name: Handle tag
       id: handle_tag
       run: |
@@ -45,8 +49,8 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-          pip install packaging
-          python ci/setup_version.py $TAG
+          uv sync --group ci  # includes packaging
+          uv run python ci/setup_version.py $TAG
           echo "repo=fury" >> $GITHUB_OUTPUT
         else
           echo "repo=pypi" >> $GITHUB_OUTPUT
@@ -82,9 +86,13 @@ jobs:
         fetch-depth: 0
         lfs: true
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: 3.12
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
     - name: Handle tag
       id: handle_tag
       run: |
@@ -92,8 +100,8 @@ jobs:
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-          pip install packaging
-          python ci/setup_version.py $TAG
+          uv sync --group ci  # includes packaging
+          uv run python ci/setup_version.py $TAG
           echo "repo=fury" >> $GITHUB_OUTPUT
         else
           echo "repo=pypi" >> $GITHUB_OUTPUT
@@ -120,9 +128,13 @@ jobs:
           fetch-depth: 0
           lfs: true
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: 3.${{ matrix.python-minor-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - name: Handle tag
         id: handle_tag
         shell: bash
@@ -131,8 +143,8 @@ jobs:
           # and export repo as "fury" instead of "pypi"
           if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
             TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
-            pip install packaging
-            python ci/setup_version.py $TAG
+            uv pip install packaging
+            uv run python ci/setup_version.py $TAG
             echo "repo=fury" >> $GITHUB_OUTPUT
           else
             echo "repo=pypi" >> $GITHUB_OUTPUT

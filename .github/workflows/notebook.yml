@@ -25,20 +25,24 @@ jobs:
         fetch-depth: 0
         lfs: true
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: "3.10"
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: "10"
-    - name: Pip install
+    - name: Install dependencies
       working-directory: python
       shell: bash
       run: |
-        pip3 install jupyter duckdb>=0.7
-        pip3 install $(ls target/wheels/*.whl)
-    - name: Run python tests
+        uv sync --group test  # includes jupyter and duckdb
+        uv pip install $(ls target/wheels/*.whl)
+    - name: Run notebook tests
       shell: bash
       working-directory: notebooks
       run: |
-        jupyter nbconvert --to notebook --execute quickstart.ipynb
+        uv run jupyter nbconvert --to notebook --execute quickstart.ipynb
