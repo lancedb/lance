@@ -441,19 +441,19 @@ impl TakeOperation {
         Some(u64s)
     }
 
-    fn merge(self, other: TakeOperation) -> Option<TakeOperation> {
+    fn merge(self, other: Self) -> Option<Self> {
         match (self, other) {
-            (TakeOperation::RowIds(mut left), TakeOperation::RowIds(right)) => {
+            (Self::RowIds(mut left), Self::RowIds(right)) => {
                 left.extend(right);
-                Some(TakeOperation::RowIds(left))
+                Some(Self::RowIds(left))
             }
-            (TakeOperation::RowAddrs(mut left), TakeOperation::RowAddrs(right)) => {
+            (Self::RowAddrs(mut left), Self::RowAddrs(right)) => {
                 left.extend(right);
-                Some(TakeOperation::RowAddrs(left))
+                Some(Self::RowAddrs(left))
             }
-            (TakeOperation::RowOffsets(mut left), TakeOperation::RowOffsets(right)) => {
+            (Self::RowOffsets(mut left), Self::RowOffsets(right)) => {
                 left.extend(right);
-                Some(TakeOperation::RowOffsets(left))
+                Some(Self::RowOffsets(left))
             }
             _ => None,
         }
@@ -472,7 +472,7 @@ impl TakeOperation {
     ///  - `_rowoffset IN (10, 20, 30)`
     ///
     /// The _rowid / _rowaddr / _rowoffset determine if we are taking by row id, address, or offset.
-    fn try_from_expr(expr: &Expr) -> Option<TakeOperation> {
+    fn try_from_expr(expr: &Expr) -> Option<Self> {
         if let Expr::BinaryExpr(binary) = expr {
             match binary.op {
                 datafusion_expr::Operator::Eq => {
@@ -484,11 +484,11 @@ impl TakeOperation {
                             safe_coerce_scalar(lit, &DataType::UInt64)
                         {
                             if col.name == ROW_ID {
-                                return Some(TakeOperation::RowIds(vec![val]));
+                                return Some(Self::RowIds(vec![val]));
                             } else if col.name == ROW_ADDR {
-                                return Some(TakeOperation::RowAddrs(vec![val]));
+                                return Some(Self::RowAddrs(vec![val]));
                             } else if col.name == ROW_OFFSET {
-                                return Some(TakeOperation::RowOffsets(vec![val]));
+                                return Some(Self::RowOffsets(vec![val]));
                             }
                         }
                     }
@@ -506,11 +506,11 @@ impl TakeOperation {
             if let Expr::Column(col) = in_expr.expr.as_ref() {
                 if let Some(u64s) = Self::extract_u64_list(&in_expr.list) {
                     if col.name == ROW_ID {
-                        return Some(TakeOperation::RowIds(u64s));
+                        return Some(Self::RowIds(u64s));
                     } else if col.name == ROW_ADDR {
-                        return Some(TakeOperation::RowAddrs(u64s));
+                        return Some(Self::RowAddrs(u64s));
                     } else if col.name == ROW_OFFSET {
-                        return Some(TakeOperation::RowOffsets(u64s));
+                        return Some(Self::RowOffsets(u64s));
                     }
                 }
             }
@@ -1626,8 +1626,7 @@ impl Scanner {
                 let take_op = filter_plan
                     .full_expr
                     .as_ref()
-                    .and_then(TakeOperation::try_from_expr)
-                    .map(|x| dbg!(x));
+                    .and_then(TakeOperation::try_from_expr);
                 if let Some(take_op) = take_op {
                     // Reset the filter plan because we are going to apply it in the take
                     filter_plan = FilterPlan::default();
