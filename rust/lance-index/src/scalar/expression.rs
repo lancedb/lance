@@ -1026,7 +1026,7 @@ fn visit_not(
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     let node = visit_node(expr, index_info, depth + 1)?;
-    Ok(node.map(|node| node.maybe_not()).flatten())
+    Ok(node.and_then(|node| node.maybe_not()))
 }
 
 fn visit_comparison(
