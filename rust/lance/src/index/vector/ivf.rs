@@ -47,6 +47,7 @@ use lance_file::{
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
@@ -482,7 +483,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .await?;
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,

@@ -1403,8 +1403,8 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        // test_remap(params.clone(), nlist).await;
-        // test_optimize_strategy(params).await;
+        test_remap(params.clone(), nlist).await;
+        test_optimize_strategy(params).await;
     }
 
     #[rstest]
