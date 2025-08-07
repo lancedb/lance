@@ -280,7 +280,10 @@ mod tests {
     fn test_compress_posting_list() -> Result<()> {
         let num_rows: usize = BLOCK_SIZE * 1024 - 7;
         let mut rng = rand::rng();
-        let doc_ids: Vec<u32> = (0..num_rows).map(|_| rng.gen()).sorted_unstable().collect();
+        let doc_ids: Vec<u32> = (0..num_rows)
+            .map(|_| rng.random())
+            .sorted_unstable()
+            .collect();
         let frequencies: Vec<u32> = (0..num_rows)
             .map(|_| rng.random_range(1..=u32::MAX))
             .collect();
@@ -315,7 +318,7 @@ mod tests {
         let num_positions: usize = BLOCK_SIZE * 2 - 7;
         let mut rng = rand::rng();
         let positions: Vec<u32> = (0..num_positions)
-            .map(|_| rng.gen())
+            .map(|_| rng.random())
             .sorted_unstable()
             .collect();
         let compressed = compress_positions(&positions)?;
