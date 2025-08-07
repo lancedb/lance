@@ -257,6 +257,11 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
+            // TODO: Check with Weston
+            // If the index doesn't support remap, we can just return the same index ID.
+            if !scalar_index.can_answer_remap() {
+                return Ok(new_id);
+            }
 
             match scalar_index.index_type() {
                 IndexType::Inverted => {

@@ -465,8 +465,8 @@ impl ScalarIndex for NGramIndex {
         }
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
-        false
+    fn can_answer_remap(&self) -> bool {
+        true
     }
 
     async fn load(

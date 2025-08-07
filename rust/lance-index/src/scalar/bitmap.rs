@@ -206,7 +206,7 @@ impl ScalarIndex for BitmapIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_answer_remap(&self) -> bool {
         true
     }
 
