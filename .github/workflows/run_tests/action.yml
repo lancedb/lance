@@ -23,8 +23,8 @@ runs:
       shell: bash
       if: inputs.skip-torch == 'false'
       run: |
-        # Install cpu only pytorch
-        uv sync --group torch-cpu
+        # Install cpu only pytorch with proper index strategy
+        uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
     - name: Run python tests
       shell: bash
       working-directory: python

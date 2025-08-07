@@ -68,7 +68,10 @@ jobs:
           cache-workspace-crates: true
       - name: Install linting tools
         run: |
-          uv sync --group dev --group test --group ray --group torch-cpu
+          # Install most dependencies first
+          uv sync --group dev --group test --group ray
+          # Install torch separately with CPU-only index as extra index
+          uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Lint Python
         run: |
           uv run ruff format --check --diff python
@@ -85,7 +88,8 @@ jobs:
           cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
-          uv sync --group dev --group test --group ray --group torch-cpu
+          uv sync --group dev --group test --group ray
+          uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
           uv run maturin develop --locked
       - name: Run doctest
         run: |
@@ -257,5 +261,6 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
       - name: Install dependencies
         run: |
-          uv sync --group ray --group torch-cpu
+          uv sync --group ray
+          uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
       - uses: ./.github/workflows/run_integtests

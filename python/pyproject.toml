@@ -93,7 +93,6 @@ dev = [
 
 # Optional heavy dependencies
 ray = ["ray[data]<2.38; python_version<'3.12'"]
-torch-cpu = ["torch"]
 
 # CI/CD tools
 ci = [
@@ -106,13 +105,6 @@ ci = [
 dev-dependencies = [
     "pre-commit",
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
