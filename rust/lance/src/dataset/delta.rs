@@ -51,14 +51,14 @@ mod tests {
             .unwrap()
     }
 
-    #[lance_test_macros::test(tokio::test)]
+    #[tokio::test]
     async fn test_diff_meta_no_transaction() {
         let ds = create_test_dataset().await;
         let result = ds.diff_meta(1).await;
         assert!(result.is_err());
     }
 
-    #[lance_test_macros::test(tokio::test)]
+    #[tokio::test]
     async fn test_diff_meta_single_transaction() {
         let mut ds = create_test_dataset().await;
         ds.delete("key = 5").await.unwrap();
@@ -73,7 +73,7 @@ mod tests {
         assert!(matches!(txs[0].operation, Operation::Delete { .. }));
     }
 
-    #[lance_test_macros::test(tokio::test)]
+    #[tokio::test]
     async fn test_diff_meta_multiple_transactions() {
         let mut ds = create_test_dataset().await;
         ds.delete("key = 5").await.unwrap();

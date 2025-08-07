@@ -646,18 +646,10 @@ impl Dataset {
     async fn build_delta_dataset(&self, compared_version: u64) -> Result<DatasetDelta> {
         let current_version = self.version().version;
 
-        let (begin_version, end_version) = if current_version
-            > compared_version
-        {
-            (
-                compared_version,
-                current_version,
-            )
+        let (begin_version, end_version) = if current_version > compared_version {
+            (compared_version, current_version)
         } else {
-            (
-                current_version,
-                compared_version,
-            )
+            (current_version, compared_version)
         };
 
         Ok(DatasetDelta {
