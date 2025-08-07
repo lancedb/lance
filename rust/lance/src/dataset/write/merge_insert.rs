@@ -250,32 +250,26 @@ pub struct MergeInsertJob {
 ///
 /// Use the [MergeInsertBuilder] to construct an merge insert job. For example:
 ///
-/// ```ignore
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::{MergeInsertBuilder, WhenNotMatched, WhenNotMatchedBySource};
+/// # use datafusion::physical_plan::SendableRecordBatchStream;
+/// # use std::sync::Arc;
+/// # async fn example(dataset: Arc<Dataset>, new_data1: SendableRecordBatchStream, new_data2: SendableRecordBatchStream) -> Result<()> {
 /// // find-or-create, insert new rows only
-/// let builder = MergeInsertBuilder::new(dataset, vec!["my_key"]);
-/// let dataset = builder
-///     .build()?
-///     .execute(new_data)
+/// let (updated_dataset, _stats) = MergeInsertBuilder::try_new(dataset.clone(), vec!["my_key".to_string()])?
+///     .try_build()?
+///     .execute(new_data1)
 ///     .await?;
 ///
 /// // upsert, insert or update
-/// let builder = MergeInsertBuilder::new(dataset, vec!["my_key"]);
-/// let dataset = builder
-///     .when_not_matched(WhenNotMatched::UpdateAll)
-///     .build()?
-///     .execute(new_data)
+/// let (updated_dataset, _stats) = MergeInsertBuilder::try_new(dataset.clone(), vec!["my_key".to_string()])?
+///     .when_not_matched(WhenNotMatched::InsertAll)
+///     .try_build()?
+///     .execute(new_data2)
 ///     .await?;
-///
-/// // replace data for month=january
-/// let builder = MergeInsertBuilder::new(dataset, vec!["my_key"]);
-/// let dataset = builder
-///     .when_not_matched(WhenNotMatched::UpdateAll)
-///     .when_not_matched_by_source(
-///         WhenNotMatchedBySource::DeleteIf(month_eq_jan)
-///     )
-///     .build()?
-///     .execute(new_data)
-///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 #[derive(Debug, Clone)]
