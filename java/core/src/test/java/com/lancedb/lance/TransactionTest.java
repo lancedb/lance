@@ -103,7 +103,9 @@ public class TransactionTest {
               .newTransactionBuilder()
               .operation(
                   Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
+      assertEquals("value", transaction.transactionProperties().get("key"));
       try (Dataset dataset = transaction.commit()) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
@@ -166,7 +168,9 @@ public class TransactionTest {
                       .schema(testDataset.getSchema())
                       .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
                       .build())
+              .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
+      assertEquals("value", transaction.transactionProperties().get("key"));
       try (Dataset dataset = transaction.commit()) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
