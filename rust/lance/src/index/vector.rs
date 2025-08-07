@@ -148,6 +148,17 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn ivf_rq(num_partitions: usize, num_bits: u8, distance_type: DistanceType) -> Self {
+        let ivf = IvfBuildParams::new(num_partitions);
+        let rq = RQBuildParams { num_bits };
+        let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
+        Self {
+            stages,
+            metric_type: distance_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
     /// Create index parameters with `IVF` and `PQ` parameters, respectively.
     pub fn with_ivf_pq_params(
         metric_type: MetricType,
