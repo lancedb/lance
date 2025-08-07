@@ -39,13 +39,19 @@ use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 ///
 /// Use the [UpdateBuilder] to construct an update job. For example:
 ///
-/// ```ignore
-/// let dataset = UpdateBuilder::new(dataset.clone())
-///     .update_where("region_id = 10")
-///     .set("region_name", "New York")
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::UpdateBuilder;
+/// # use std::sync::Arc;
+/// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+/// let result = UpdateBuilder::new(dataset)
+///     .update_where("region_id = 10")?
+///     .set("region_name", "New York")?
 ///     .build()?
 ///     .execute()
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 #[derive(Debug, Clone)]

@@ -76,12 +76,18 @@ async fn apply_deletions(
 ///
 /// Use the [DeleteBuilder] to construct a delete operation. For example:
 ///
-/// ```ignore
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::DeleteBuilder;
+/// # use std::sync::Arc;
+/// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
 /// let new_dataset = DeleteBuilder::new(dataset)
 ///     .predicate("age > 65")
 ///     .conflict_retries(5)
 ///     .execute()
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 #[derive(Debug, Clone)]
