@@ -8,9 +8,8 @@ use super::{RowIdSequence, U64Segment};
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::{Error, Result};
+use lance_core::{Result};
 use rangemap::RangeInclusiveMap;
-use snafu::location;
 
 /// An index of row ids
 ///
@@ -101,13 +100,26 @@ fn decompose_sequence(
         .0
         .iter()
         .filter_map(|segment| {
-            let segment_len = segment.len() as u64;
+            let filtered_row_ids: Vec<u64> = segment
+                .iter()
+                .filter(|rowid| {
+                    !frag_index.deletion_vector.contains(*rowid as u32)
+                })
+                .collect();
+
+            if filtered_row_ids.is_empty() {
+                return None;
+            }
+
+            let segment_len = filtered_row_ids.len() as u64;
             let address_segment = U64Segment::Range(start_address..(start_address + segment_len));
             start_address += segment_len;
 
-            let coverage = segment.range()?;
+            let row_id_segment = U64Segment::from_iter(filtered_row_ids.iter().copied());
+            let coverage = row_id_segment.range()?;
 
-            Some((coverage, (segment.clone(), address_segment)))
+            Some((coverage, (row_id_segment, address_segment)))
+
         })
         .collect()
 }
@@ -239,35 +251,6 @@ fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = Someth
     output.into_iter()
 }
 
-/// Split off part of a piece from the front, at the row id `at`.
-fn split_off_front(
-    piece: &mut (RangeInclusive<u64>, (U64Segment, U64Segment)),
-    row_id_at: u64,
-) -> (RangeInclusive<u64>, (U64Segment, U64Segment)) {
-    let (range, (row_id_segment, address_segment)) = piece;
-    let at = row_id_segment
-        .iter()
-        .enumerate()
-        .find(|(_i, x)| *x == row_id_at)
-        .unwrap()
-        .0 as u64;
-
-    let remaining_offset = (*range.start() - at) as usize;
-    let split_row_id_segment = row_id_segment.slice(0, remaining_offset);
-    let split_address_segment = address_segment.slice(0, remaining_offset);
-    let split_range = split_row_id_segment.range().unwrap();
-
-    let remaining_len = row_id_segment.len() - split_row_id_segment.len();
-    *row_id_segment = row_id_segment.slice(remaining_offset, remaining_len);
-    *address_segment = address_segment.slice(remaining_offset, remaining_len);
-    *range = row_id_segment.range().unwrap();
-
-    (
-        split_range,
-        (split_row_id_segment.clone(), split_address_segment.clone()),
-    )
-}
-
 fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<IndexChunk> {
     let total_capacity = overlapping_chunks
         .iter()
@@ -288,8 +271,6 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 
 #[cfg(test)]
 mod tests {
-    use proptest::{prelude::Strategy, prop_assert_eq};
-
     use super::*;
 
     #[test]
@@ -418,50 +399,4 @@ mod tests {
         assert_eq!(index.get(51), Some(RowAddress::new_from_parts(0, 50)));
         assert_eq!(index.get(99), Some(RowAddress::new_from_parts(0, 98)));
     }
-
-    // fn arbitrary_row_ids(
-    //     num_fragments_range: std::ops::Range<usize>,
-    //     frag_size_range: std::ops::Range<usize>,
-    // ) -> impl Strategy<Value = Vec<(u32, Arc<RowIdSequence>)>> {
-    //     let fragment_sizes = proptest::collection::vec(frag_size_range, num_fragments_range);
-    //     fragment_sizes.prop_flat_map(|fragment_sizes| {
-    //         let num_rows = fragment_sizes.iter().sum::<usize>() as u64;
-    //         let row_ids = 0..num_rows;
-    //         let row_ids = row_ids.collect::<Vec<_>>();
-    //         let row_ids_shuffled = proptest::strategy::Just(row_ids).prop_shuffle();
-    //         row_ids_shuffled.prop_map(move |row_ids| {
-    //             let mut sequences = Vec::with_capacity(fragment_sizes.len());
-    //             let mut i = 0;
-    //             for size in &fragment_sizes {
-    //                 let end = i + size;
-    //                 let sequence =
-    //                     RowIdSequence(vec![U64Segment::from_slice(row_ids[i..end].into())]);
-    //                 sequences.push((i as u32, Arc::new(sequence)));
-    //                 i = end;
-    //             }
-    //             sequences
-    //         })
-    //     })
-    // }
-    //
-    // proptest::proptest! {
-    //     #[test]
-    //     fn test_new_index_robustness(
-    //         row_ids in arbitrary_row_ids(0..5, 0..32)
-    //     ) {
-    //         let index = RowIdIndex::new(&row_ids).unwrap();
-    //         for (frag_id, sequence) in row_ids.iter() {
-    //             for (local_offset, row_id) in sequence.iter().enumerate() {
-    //                 prop_assert_eq!(
-    //                     index.get(row_id),
-    //                     Some(RowAddress::new_from_parts(*frag_id, local_offset as u32)),
-    //                     "Row id {} in sequence {:?} not found in index {:?}",
-    //                     row_id,
-    //                     sequence,
-    //                     index
-    //                 );
-    //             }
-    //         }
-    //     }
-    // }
 }
