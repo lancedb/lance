@@ -24,6 +24,7 @@ mod serde;
 
 use deepsize::DeepSizeOf;
 // These are the public API.
+pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
 use lance_core::{
     utils::mask::{RowIdMask, RowIdTreeMap},
@@ -51,7 +52,7 @@ use crate::utils::LanceIteratorExtension;
 /// contiguous or sorted.
 ///
 /// We can make optimizations that assume uniqueness.
-#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq, Default)]
 pub struct RowIdSequence(Vec<U64Segment>);
 
 impl std::fmt::Display for RowIdSequence {
@@ -96,7 +97,17 @@ impl From<Range<u64>> for RowIdSequence {
     }
 }
 
+impl From<&[u64]> for RowIdSequence {
+    fn from(row_ids: &[u64]) -> Self {
+        Self(vec![U64Segment::from_slice(row_ids)])
+    }
+}
+
 impl RowIdSequence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
         self.0.iter().flat_map(|segment| segment.iter())
     }
