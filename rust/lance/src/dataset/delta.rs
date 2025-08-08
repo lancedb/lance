@@ -61,7 +61,7 @@ mod tests {
     use lance_datagen::{array, BatchCount, RowCount};
 
     async fn create_test_dataset() -> Dataset {
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
             .col("value", array::fill_utf8("value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
