@@ -228,9 +228,9 @@ impl RowIdMask {
     /// list contains "full fragment" blocks but that would require some
     /// extra logic.
     pub fn iter_addrs(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
-        if let Some(mut allow_iter) = self.allow_list.as_ref().and_then(|list| list.row_addrs()) {
+        if let Some(mut allow_iter) = self.allow_list.as_ref().and_then(|list| list.row_ids()) {
             if let Some(block_list) = &self.block_list {
-                if let Some(block_iter) = block_list.row_addrs() {
+                if let Some(block_iter) = block_list.row_ids() {
                     let mut block_iter = block_iter.peekable();
                     Some(Box::new(iter::from_fn(move || {
                         for allow_id in allow_iter.by_ref() {
@@ -402,11 +402,11 @@ impl RowIdTreeMap {
             .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
     }
 
-    /// An iterator of row addrs
+    /// An iterator of row ids
     ///
     /// If there are any "full fragment" items then this can't be calculated and None
     /// is returned
-    pub fn row_addrs(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
+    pub fn row_ids(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
         let inner_iters = self
             .inner
             .iter()
