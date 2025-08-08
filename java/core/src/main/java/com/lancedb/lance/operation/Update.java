@@ -17,6 +17,7 @@ import com.lancedb.lance.FragmentMetadata;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 public class Update implements Operation {
   private List<Long> removedFragmentIds;
@@ -57,6 +58,16 @@ public class Update implements Operation {
     return String.format(
         "Update{removedFragmentIds=%s, updatedFragments=%s, newFragments=%s}",
         removedFragmentIds, updatedFragments, newFragments);
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    Update that = (Update) o;
+    return Objects.equals(removedFragmentIds, that.removedFragmentIds)
+        && Objects.equals(updatedFragments, that.updatedFragments)
+        && Objects.equals(newFragments, that.newFragments);
   }
 
   public static class Builder {

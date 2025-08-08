@@ -241,6 +241,9 @@ public class TransactionTest {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
+
+        Transaction txn = dataset.readTransaction().orElse(null);
+        assertEquals(transaction, txn);
       }
     }
   }

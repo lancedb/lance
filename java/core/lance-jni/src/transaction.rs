@@ -1,6 +1,6 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::{import_vec, FromJObjectWithEnv, IntoJava};
+use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava, JLance};
 use crate::utils::{to_java_map, to_rust_map};
 use crate::JNIEnvExt;
 use arrow::datatypes::Schema;
@@ -131,6 +131,31 @@ fn convert_to_java_operation_inner<'local>(
                     JValue::Object(&java_fragments),
                     JValue::Object(&java_schema),
                     JValue::Object(&java_config),
+                ],
+            )?)
+        }
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            fields_modified: _,
+            mem_wal_to_flush: _,
+        } => {
+            let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
+                .iter()
+                .map(|x| JLance(*x as i64))
+                .collect();
+            let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
+            let updated_fragments_obj = export_vec(env, &updated_fragments)?;
+            let new_fragments_obj = export_vec(env, &new_fragments)?;
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/Update",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;)V",
+                &[
+                    JValue::Object(&removed_fragment_ids_obj),
+                    JValue::Object(&updated_fragments_obj),
+                    JValue::Object(&new_fragments_obj),
                 ],
             )?)
         }
