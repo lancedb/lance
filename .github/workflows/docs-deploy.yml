@@ -30,7 +30,7 @@ jobs:
         with:
           repository: lancedb/lance-spark
           path: lance-spark
-      - name: Checkout lance-spark
+      - name: Checkout lance-namespace
         uses: actions/checkout@v4
         with:
           repository: lancedb/lance-namespace
