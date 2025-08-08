@@ -15,7 +15,7 @@ use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::{cache::LanceCache, utils::bit::pad_bytes, Result};
-use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
+use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
 
 use crate::{
     buffer::LanceBuffer,
@@ -931,7 +931,7 @@ async fn check_round_trip_field_encoding_random(
                 // example, a list array sliced into smaller arrays will have arrays whose
                 // starting offset is not 0.
                 if use_slicing {
-                    let mut generator = gen().anon_col(array_generator_provider.provide());
+                    let mut generator = gen_batch().anon_col(array_generator_provider.provide());
                     if let Some(null_rate) = null_rate {
                         // The null generator is the only generator that already inserts nulls
                         // and attempting to do so again makes arrow-rs grumpy
@@ -951,7 +951,7 @@ async fn check_round_trip_field_encoding_random(
                     }
                 } else {
                     for i in 0..num_ingest_batches {
-                        let mut generator = gen()
+                        let mut generator = gen_batch()
                             .with_seed(Seed::from(i as u64))
                             .anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {

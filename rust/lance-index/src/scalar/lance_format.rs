@@ -331,7 +331,7 @@ pub mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::utils::mask::RowIdTreeMap;
-    use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
@@ -404,7 +404,7 @@ pub mod tests {
     async fn test_basic_btree() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -463,7 +463,7 @@ pub mod tests {
     async fn test_btree_update() {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -472,7 +472,7 @@ pub mod tests {
             .await
             .unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step_custom::<Int32Type>(4096 * 100, 1))
             .col("row_ids", array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -530,22 +530,22 @@ pub mod tests {
     async fn test_btree_with_gaps() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch_one = gen()
+        let batch_one = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
-        let batch_two = gen()
+        let batch_two = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
-        let batch_three = gen()
+        let batch_three = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
             .col(
                 "row_ids",
                 array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
             )
             .into_batch_rows(RowCount::from(4));
-        let batch_four = gen()
+        let batch_four = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
             .col(
                 "row_ids",
@@ -758,7 +758,7 @@ pub mod tests {
         ] {
             let tempdir = tempdir().unwrap();
             let index_store = test_store(&tempdir);
-            let data: RecordBatch = gen()
+            let data: RecordBatch = gen_batch()
                 .col("values", array::rand_type(data_type))
                 .col("row_ids", array::step::<UInt64Type>())
                 .into_batch_rows(RowCount::from(4096 * 3))
@@ -821,7 +821,7 @@ pub mod tests {
     async fn btree_entire_null_page() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch = gen()
+        let batch = gen_batch()
             .col(
                 "values",
                 array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
@@ -956,7 +956,7 @@ pub mod tests {
     async fn test_basic_bitmap() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -1020,22 +1020,22 @@ pub mod tests {
     async fn test_bitmap_with_gaps() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch_one = gen()
+        let batch_one = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
-        let batch_two = gen()
+        let batch_two = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
-        let batch_three = gen()
+        let batch_three = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
             .col(
                 "row_ids",
                 array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
             )
             .into_batch_rows(RowCount::from(4));
-        let batch_four = gen()
+        let batch_four = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
             .col(
                 "row_ids",
@@ -1232,7 +1232,7 @@ pub mod tests {
     async fn test_bitmap_update() {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
@@ -1241,7 +1241,7 @@ pub mod tests {
             .await
             .unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step_custom::<Int32Type>(4096, 1))
             .col("row_ids", array::step_custom::<UInt64Type>(4096, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
@@ -1277,7 +1277,7 @@ pub mod tests {
     async fn test_bitmap_remap() {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
@@ -1355,7 +1355,7 @@ pub mod tests {
     async fn test_label_list_index() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "values",
                 array::rand_type(&DataType::List(Arc::new(Field::new(

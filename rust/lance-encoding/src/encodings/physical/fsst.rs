@@ -384,7 +384,7 @@ mod tests {
             .with_file_version(LanceFileVersion::V2_1);
 
         // Generate data suitable for FSST (large strings, total size > 32KB)
-        let arr = lance_datagen::gen()
+        let arr = lance_datagen::gen_batch()
             .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(100), false))
             .into_batch_rows(RowCount::from(5000))
             .unwrap()

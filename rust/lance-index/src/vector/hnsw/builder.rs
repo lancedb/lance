@@ -25,7 +25,7 @@ use std::sync::RwLock;
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
@@ -384,10 +384,10 @@ impl HnswBuilder {
     ///
     /// See paper `Algorithm 1`
     fn random_level(&self) -> u16 {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let ml = 1.0 / (self.params.m as f32).ln();
         min(
-            (-rng.gen::<f32>().ln() * ml) as u16,
+            (-rng.random::<f32>().ln() * ml) as u16,
             self.params.max_level - 1,
         )
     }
