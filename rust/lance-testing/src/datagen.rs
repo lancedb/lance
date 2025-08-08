@@ -146,18 +146,18 @@ impl BatchGenerator {
         Default::default()
     }
 
-    pub fn col(mut self, gen: Box<dyn ArrayGenerator>) -> Self {
-        self.generators.push(gen);
+    pub fn col(mut self, genn: Box<dyn ArrayGenerator>) -> Self {
+        self.generators.push(genn);
         self
     }
 
     fn gen_batch(&mut self, num_rows: u32) -> RecordBatch {
         let mut fields = Vec::with_capacity(self.generators.len());
         let mut arrays = Vec::with_capacity(self.generators.len());
-        for (field_index, gen) in self.generators.iter_mut().enumerate() {
-            let arr = gen.generate(num_rows as usize);
+        for (field_index, genn) in self.generators.iter_mut().enumerate() {
+            let arr = genn.generate(num_rows as usize);
             let default_name = format!("field_{}", field_index);
-            let name = gen.name().unwrap_or(&default_name);
+            let name = genn.name().unwrap_or(&default_name);
             fields.push(Field::new(name, arr.data_type().clone(), true));
             arrays.push(arr);
         }

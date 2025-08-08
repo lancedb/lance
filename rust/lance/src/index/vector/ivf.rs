@@ -1873,7 +1873,7 @@ mod tests {
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
@@ -2455,7 +2455,7 @@ mod tests {
         index_params.version(index_version);
 
         let nrows = 2_000;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(test_case.dimension as u32)),
@@ -2509,7 +2509,7 @@ mod tests {
         // Generate random data with nulls
         let nrows = 2_000;
         let dims = 32;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),
@@ -2550,7 +2550,7 @@ mod tests {
         check_index(&dataset, num_non_null, dims).await;
 
         // Append more data
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),

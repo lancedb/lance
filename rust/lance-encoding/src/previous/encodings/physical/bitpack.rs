@@ -1170,14 +1170,14 @@ pub mod test {
     use arrow_schema::Field;
     use lance_datagen::{
         array::{fill, rand_with_distribution},
-        gen, ArrayGenerator, ArrayGeneratorExt, RowCount,
+        gen_batch, ArrayGenerator, ArrayGeneratorExt, RowCount,
     };
     use rand::distr::Uniform;
 
     #[test]
     fn test_bitpack_params() {
         fn gen_array(generator: Box<dyn ArrayGenerator>) -> ArrayRef {
-            let arr = gen()
+            let arr = gen_batch()
                 .anon_col(generator)
                 .into_batch_rows(RowCount::from(10000))
                 .unwrap()

@@ -798,7 +798,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_file::reader::FileReader;
     use lance_io::traits::Reader;
 
@@ -925,7 +925,7 @@ mod tests {
         // To avoid generating and writing millions of rows (which is a bit slow for a unit
         // test) we can use a large data type (1KiB binary)
         let data_reader = Box::new(
-            gen()
+            gen_batch()
                 .anon_col(array::rand_fsb(1024))
                 .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
         );

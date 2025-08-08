@@ -701,7 +701,7 @@ impl NoContextTestFixture {
         runtime.block_on(async move {
             let tempdir = tempdir().unwrap();
             let tmppath = tempdir.path().to_str().unwrap();
-            let dataset = lance_datagen::gen()
+            let dataset = lance_datagen::gen_batch()
                 .col(
                     "text",
                     lance_datagen::array::rand_utf8(ByteCount::from(10), false),
