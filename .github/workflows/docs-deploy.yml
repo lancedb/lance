@@ -53,6 +53,7 @@ jobs:
           cat >> docs/src/format/.pages << 'EOF'
             - Namespace Spec: namespace
           EOF
+          cp docs/src/format/namespace/rest.yaml docs/src/rest.yaml
       - name: Copy lance-spark docs
         run: |
           cp -r lance-spark/docs/src docs/src/integrations/spark
