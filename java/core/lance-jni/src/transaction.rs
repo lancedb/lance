@@ -182,7 +182,7 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
             .into_iter()
             .map(|java_integer| {
                 let java_int = env.call_method(java_integer, "intValue", "()I", &[])?.i()?;
-                Ok(java_int as i32)
+                Ok(java_int)
             })
             .collect::<Result<Vec<i32>>>()?;
 
@@ -195,7 +195,7 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
         let fragment_bitmap = if fragment_bitmap_obj.is_null() {
             None
         } else {
-            let byte_array: JByteArray = JObject::from(fragment_bitmap_obj).into();
+            let byte_array: JByteArray = fragment_bitmap_obj.into();
             let bytes = env.convert_byte_array(&byte_array)?;
             let bitmap = RoaringBitmap::deserialize_from(Cursor::new(bytes))
                 .map_err(|e| Error::input_error(format!("Invalid RoaringBitmap data: {}", e)))?;
@@ -206,11 +206,10 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
         let index_details = if index_details_obj.is_null() {
             None
         } else {
-            let byte_array: JByteArray = JObject::from(index_details_obj).into();
+            let byte_array: JByteArray = index_details_obj.into();
             let bytes = env.convert_byte_array(&byte_array)?;
-            let any = Any::decode(&bytes[..]).map_err(|e| {
-                Error::input_error(format!("Invalid index_details data: {}", e.to_string()))
-            })?;
+            let any = Any::decode(&bytes[..])
+                .map_err(|e| Error::input_error(format!("Invalid index_details data: {}", e)))?;
             Some(any)
         };
 
@@ -265,13 +264,12 @@ impl FromJObjectWithEnv<Uuid> for JObject<'_> {
         let uuid_string = env
             .call_method(self, "toString", "()Ljava/lang/String;", &[])?
             .l()?;
-        let uuid_string = JString::from(JObject::from(uuid_string));
+        let uuid_string = JString::from(uuid_string);
         let uuid_string: String = env.get_string(&uuid_string)?.into();
         let uuid = Uuid::parse_str(uuid_string.to_string().as_str()).map_err(|e| {
             Error::input_error(format!(
                 "Invalid UUID string: {}, error: {}",
-                uuid_string,
-                e.to_string()
+                uuid_string, e
             ))
         })?;
         Ok(uuid)
