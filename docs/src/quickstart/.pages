@@ -1,0 +1,4 @@
+nav:
+  - Getting Started with Lance: index.md
+  - Versioning: versioning.md
+  - Vector Search: vector-search.md

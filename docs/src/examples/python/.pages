@@ -1,0 +1,6 @@
+nav:
+  - LLM Dataset Creation: llm_dataset_creation.md
+  - LLM Training: llm_training.md
+  - Multimodal Dataset Creation: flickr8k_dataset_creation.md
+  - Multimodal Training: clip_training.md
+  - Deep Learning Artifact Management: artifact_management.md

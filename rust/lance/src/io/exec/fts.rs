@@ -1058,7 +1058,7 @@ pub mod tests {
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
 
-        let flat_input = lance_datagen::gen()
+        let flat_input = lance_datagen::gen_batch()
             .col(
                 "text",
                 lance_datagen::array::rand_utf8(ByteCount::from(10), false),

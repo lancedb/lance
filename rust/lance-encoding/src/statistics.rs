@@ -525,10 +525,10 @@ mod tests {
     #[test]
     fn test_data_size_stat() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
-        let arr1 = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let arr2 = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let arr3 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
+        let arr1 = genn.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr2 = genn.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr3 = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9);
 
         let concatenated_array = concat(&[
@@ -549,8 +549,8 @@ mod tests {
         assert!(data_size == total_buffer_size as u64);
 
         // test DataType::Binary
-        let mut gen = lance_datagen::array::rand_type(&DataType::Binary);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = lance_datagen::array::rand_type(&DataType::Binary);
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         let data_size = block.expect_single_stat::<UInt64Type>(Stat::DataSize);
 
@@ -569,8 +569,8 @@ mod tests {
         ]
         .into();
 
-        let mut gen = lance_datagen::array::rand_type(&DataType::Struct(fields));
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = lance_datagen::array::rand_type(&DataType::Struct(fields));
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         let (_, arr_parts, _) = arr.as_struct().clone().into_parts();
         let total_buffer_size: usize = arr_parts
@@ -587,16 +587,16 @@ mod tests {
         assert!(data_size == total_buffer_size as u64);
 
         // test DataType::Dictionary
-        let mut gen = array::rand_type(&DataType::Dictionary(
+        let mut genn = array::rand_type(&DataType::Dictionary(
             Box::new(DataType::Int32),
             Box::new(DataType::Utf8),
         ));
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         assert!(block.get_stat(Stat::DataSize).is_none());
 
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         let data_size = block.expect_single_stat::<UInt64Type>(Stat::DataSize);
         let total_buffer_size: usize = arr
@@ -966,8 +966,8 @@ mod tests {
     #[test]
     fn test_bit_width_when_none() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
-        let mut gen = lance_datagen::array::rand_type(&DataType::Binary);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = lance_datagen::array::rand_type(&DataType::Binary);
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         assert!(block.get_stat(Stat::BitWidth).is_none(),);
     }

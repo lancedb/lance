@@ -447,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replay() {
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("x", array::step::<UInt32Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(16));
         let schema = data.schema();

@@ -805,7 +805,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_datagen::gen;
+    use lance_datagen::gen_batch;
     use lance_index::{
         scalar::{
             expression::{ScalarIndexExpr, ScalarIndexSearch},
@@ -832,7 +832,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut dataset = gen()
+        let mut dataset = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())
             .into_dataset(
                 test_uri,

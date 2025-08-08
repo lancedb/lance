@@ -9,6 +9,7 @@ dependencies = [
     "mkdocs-material>=9.4.0",
     "mkdocs-protobuf>=0.1.0",
     "mkdocs-linkcheck>=1.0.0",
+    "mkdocs-awesome-pages-plugin>=2.10.1"
 ]
 
 [tool.uv]

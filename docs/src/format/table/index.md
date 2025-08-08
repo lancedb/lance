@@ -1,4 +1,4 @@
-# Table Format
+# Lance Table Format
 
 ## Dataset Directory
 
@@ -33,7 +33,7 @@ The overall structure of a fragment is shown below. One or more data files store
 New columns can be added to a fragment by adding new data files. The deletion file (if present),
 stores the rows that have been deleted from the fragment.
 
-![Fragment Structure](../images/fragment_structure.png)
+![Fragment Structure](../../images/fragment_structure.png)
 
 Every row has a unique id, which is an u64 that is composed of two u32s: the fragment id and the local row id.
 The local row id is just the index of the row in the data files.
@@ -46,7 +46,7 @@ The local row id is just the index of the row in the data files.
 by adding new `DataFile` of the new columns to each `Fragment`. Finally,
 `Overwrite` a dataset can be done by resetting the `Fragment` list of the `Manifest`.
 
-![Data Evolution](../images/data_evolution.png)
+![Data Evolution](../../images/data_evolution.png)
 
 ## Schema & Fields
 
@@ -178,7 +178,7 @@ under the `_transactions` prefix in the dataset directory.
 The transaction file is a serialized `Transaction` protobuf message.
 See the `transaction.proto` file for its definition.
 
-![Conflict Resolution Flow](../images/conflict_resolution_flow.png)
+![Conflict Resolution Flow](../../images/conflict_resolution_flow.png)
 
 The commit process is as follows:
 
@@ -205,7 +205,7 @@ The external manifest store supplements but does not replace the manifests in ob
 A reader unaware of the external manifest store could read a table that uses it,
 but it might be up to one version behind the true latest version of the table.
 
-![External Store Commit](../images/external_store_commit.gif)
+![External Store Commit](../../images/external_store_commit.gif)
 
 The commit process is as follows:
 
@@ -216,7 +216,7 @@ The commit process is as follows:
 
 Note that the commit is effectively complete after step 2. If the writer fails after step 2, a reader will be able to detect the external store and object store are out-of-sync, and will try to synchronize the two stores. If the reattempt at synchronization fails, the reader will refuse to load. This is to ensure that the dataset is always portable by copying the dataset directory without special tool.
 
-![External Store Reader](../images/external_store_reader.gif)
+![External Store Reader](../../images/external_store_reader.gif)
 
 The reader load process is as follows:
 

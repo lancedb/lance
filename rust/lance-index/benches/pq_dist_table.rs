@@ -72,7 +72,7 @@ fn compute_distances(c: &mut Criterion) {
     let query = generate_random_array_with_seed::<Float32Type>(DIM, [32; 32]);
 
     let mut rnd = StdRng::from_seed([32; 32]);
-    let code = UInt8Array::from_iter_values(repeat_n(rnd.gen::<u8>(), TOTAL * PQ));
+    let code = UInt8Array::from_iter_values(repeat_n(rnd.random::<u8>(), TOTAL * PQ));
 
     for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot].iter() {
         let pq = ProductQuantizer::new(
