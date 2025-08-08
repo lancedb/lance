@@ -6,14 +6,14 @@ The main documentation website is built using [mkdocs-material](https://squidfun
 To build the docs, first install requirements:
 
 ```bash
-pip install -r docs/requirements.txt
+cd docs
+uc sync --dev
 ```
 
 Then build and start the docs server:
 
 ```bash
-cd docs
-mkdocs serve
+uv run mkdocs serve
 ```
 
 ### Python Generated Doc
@@ -25,3 +25,8 @@ and published through [Github Pages](https://lancedb.github.io/lance-python-doc/
 
 Rust code documentation is built and published to the [Rust official docs website](https://docs.rs/lance/latest/lance/)
 as a part of the release process.
+
+### Java Generated Doc
+
+Java code documentation is built and published to Maven Central.
+You can find the doc page for the specific project at [javadoc.io](https://javadoc.io).
