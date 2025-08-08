@@ -1,6 +1,5 @@
 nav:
   - Apache DataFusion: datafusion.md
-  - Apache Spark: spark
   - DuckDB: duckdb.md
   - Huggingface: huggingface.md
   - PostgreSQL: https://github.com/lancedb/pglance

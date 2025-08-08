@@ -49,23 +49,15 @@ jobs:
           enable-cache: true
       - name: Copy lance-namespace docs
         run: |
-          mkdir -p docs/src/format/namespace
-          cp -r lance-spark/docs/src docs/src/format/namespace
-          mv docs/src/format/namespace docs/src/community/contributing/namespace.md
-          
-          # Create contributing .pages file with Namespace entry
-          cat >> docs/src/community/contributing/.pages << 'EOF'
-            - Lance Namespace: namespace.md
+          cp -r lance-namespace/docs/src docs/src/format/namespace
+          cat >> docs/src/format/.pages << 'EOF'
+            - Namespace Spec: namespace
           EOF
       - name: Copy lance-spark docs
         run: |
-          mkdir -p docs/src/integrations/spark
           cp -r lance-spark/docs/src docs/src/integrations/spark
-          mv docs/src/integrations/spark/contributing.md docs/src/community/contributing/spark.md
-          
-          # Create contributing .pages file with Spark entry
-          cat > docs/src/community/contributing/.pages << 'EOF'
-            - Spark Lance Connector: spark.md
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Apache Spark: spark
           EOF
       - name: Deploy
         working-directory: docs
