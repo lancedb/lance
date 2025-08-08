@@ -296,7 +296,7 @@ fn random_ranges(
     byte_width: usize,
 ) -> impl Iterator<Item = std::ops::Range<u64>> + Send {
     let rows_per_batch = 1.max(block_size / byte_width);
-    let mut rng = SmallRng::from_entropy();
+    let mut rng = SmallRng::from_os_rng();
     let num_bins = num_rows.div_ceil(rows_per_batch);
 
     let bins_iter: Box<dyn Iterator<Item = usize> + Send> = if sample_size_hint * 5 >= num_rows {

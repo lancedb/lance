@@ -743,7 +743,7 @@ pub(crate) mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
-    use lance_datagen::{array, gen, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use rstest::rstest;
 
     use crate::{
@@ -1020,7 +1020,7 @@ pub(crate) mod tests {
         let list_three = array::cycle_vec(list_two, Dimension::from(2));
 
         // Should be 256Ki rows ~ 1MiB of data
-        let batch = gen()
+        let batch = gen_batch()
             .anon_col(list_three)
             .into_batch_rows(RowCount::from(8 * 1024))
             .unwrap();

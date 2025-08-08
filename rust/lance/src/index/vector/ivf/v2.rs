@@ -680,7 +680,7 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
-    use rand::distributions::uniform::SampleUniform;
+    use rand::distr::uniform::SampleUniform;
     use rstest::rstest;
     use tempfile::tempdir;
 

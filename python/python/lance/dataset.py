@@ -206,6 +206,161 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def explain_plan(
+        self, schema: Optional[pa.Schema] = None, verbose: bool = False
+    ) -> str:
+        """
+        Generate the execution plan for the merge insert operation.
+
+        This method creates the execution plan that would be used for the given
+        source schema and returns it as a formatted string for debugging and
+        analysis purposes.
+
+        Parameters
+        ----------
+        schema : Optional[pa.Schema], default None
+            The schema of the source data that would be merged into the dataset.
+            If None, defaults to the dataset's schema. This determines the columns
+            available and their types, which affects the generated execution plan.
+        verbose : bool, default False
+            If True, provides more detailed information in the plan output.
+
+        Returns
+        -------
+        str
+            A formatted string representation of the execution plan.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([
+        ...     pa.array([1, 2, 3]),
+        ...     pa.array(['alice', 'bob', 'charlie']),
+        ...     pa.array([100.0, 200.0, 300.0])
+        ... ], names=['id', 'name', 'score'])
+        >>> dataset = lance.write_dataset(data, "memory://test_dataset")
+
+        >>> # Using default dataset schema
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
+        >>> plan = builder.explain_plan()  # Uses dataset schema
+        >>> print(plan) # doctest: +ELLIPSIS
+        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
+          CoalescePartitionsExec
+            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
+              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+                CoalesceBatchesExec: target_batch_size=...
+                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                    LanceRead: uri=test_dataset/data, projection=[id], ...
+                    RepartitionExec: ...
+                      StreamingTableExec: partition_sizes=1, ...
+        <BLANKLINE>
+
+        >>> # Or with explicit schema
+        >>> source_schema = pa.schema([
+        ...     pa.field("id", pa.int64()),
+        ...     pa.field("name", pa.string()),
+        ...     pa.field("score", pa.float64())
+        ... ])
+        >>> plan = builder.explain_plan(source_schema, verbose=True)
+        >>> print(plan) # doctest: +ELLIPSIS
+        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
+          CoalescePartitionsExec
+            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
+              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+                CoalesceBatchesExec: target_batch_size=...
+                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                    ...
+        """
+        return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
+
+    def analyze_plan(
+        self,
+        data_obj: ReaderLike,
+        *,
+        schema: Optional[pa.Schema] = None,
+    ) -> str:
+        """
+        Generate the execution plan and analyze its performance with real data.
+
+        This method creates the execution plan using the provided source data,
+        executes it to collect performance metrics, and returns the analysis
+        as a formatted string. This is useful for understanding the actual
+        performance characteristics of the merge insert operation with your data.
+
+        .. warning::
+            This method executes the merge insert operation to collect metrics
+            but **does not commit the changes**. While data files may be written
+            to storage during execution, they will not be referenced by any dataset
+            version and the dataset remains unchanged. This is intended for
+            performance analysis only.
+
+        Parameters
+        ----------
+        data_obj : ReaderLike
+            The source data that would be merged into the dataset. This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema : Optional[pa.Schema], default None
+            The schema of the data. This only needs to be supplied whenever the data
+            source is some kind of generator.
+
+        Returns
+        -------
+        str
+            A formatted string representation of the plan analysis with metrics.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([
+        ...     pa.array([1, 2, 3]),
+        ...     pa.array(['alice', 'bob', 'charlie']),
+        ...     pa.array([100.0, 200.0, 300.0])
+        ... ], names=['id', 'name', 'score'])
+        >>> dataset = lance.write_dataset(data, "memory://analyze_dataset")
+        >>> new_data = pa.table([
+        ...     pa.array([1, 4]),
+        ...     pa.array(["updated_alice", "david"]),
+        ...     pa.array([150.0, 400.0])
+        ... ], names=["id", "name", "score"])
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
+        >>> analysis = builder.analyze_plan(new_data)
+        >>> print(analysis) # doctest: +ELLIPSIS
+            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...]
+              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...]
+                ProjectionExec: expr=[_rowaddr@1 as _rowaddr, ...], metrics=[...]
+                  ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...], ...
+                    CoalesceBatchesExec: ..., metrics=[...]
+                      HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                        LanceRead: ..., metrics=[..., bytes_read=..., ...]
+                        RepartitionExec: ...
+                          StreamingTableExec: ..., metrics=[]
+
+        The two key parts of the plan analysis are LanceRead and MergeInsert.
+        LanceRead scans join keys and columns in conditions. MergeInsert writes
+        data files to storage.
+
+        Key metrics in MergeInsert operations:
+        - bytes_written: total bytes written to storage
+        - num_files_written: number of new data files created
+        - num_inserted_rows: rows added that didn't match existing data
+        - num_updated_rows: existing rows that were updated
+        - num_deleted_rows: rows removed (when using delete conditions)
+
+        Key metrics in LanceRead operations:
+        - bytes_read: bytes read from storage
+        - fragments_scanned: number of data fragments accessed
+        - rows_scanned: total rows examined during the scan
+        - iops: number of I/O operations performed
+        - requests: number of storage requests made
+        """
+        reader = _coerce_reader(data_obj, schema)
+        return super(MergeInsertBuilder, self).analyze_plan(reader)
+
 
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""

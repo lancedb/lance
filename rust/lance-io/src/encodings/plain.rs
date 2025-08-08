@@ -539,8 +539,8 @@ mod tests {
         }
 
         let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
-        let mut rng = rand::thread_rng();
-        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.random()).collect();
         for t in float_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let mut arrs: Vec<ArrayRef> = Vec::new();

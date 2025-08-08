@@ -258,7 +258,7 @@ impl ObjectWriter {
                                     mut_self.connection_resets += 1;
 
                                     // Resubmit with random jitter
-                                    let sleep_time_ms = rand::thread_rng().gen_range(2_000..8_000);
+                                    let sleep_time_ms = rand::rng().random_range(2_000..8_000);
                                     let sleep_time =
                                         std::time::Duration::from_millis(sleep_time_ms);
 

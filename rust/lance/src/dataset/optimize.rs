@@ -2401,7 +2401,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_cleanup_and_compaction_rebase_cleanup() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2527,7 +2527,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_cleanup_and_compaction_rebase_compaction() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2640,7 +2640,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_compactions_with_defer_index_remap() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2706,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_bitmap_index_with_defer_index_remap() {
         // Create a dataset with categorical values
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2806,7 +2806,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_btree_index_with_defer_index_remap() {
         // Create a dataset with an incremental ID column
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -3164,7 +3164,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_label_list_index_with_defer_index_remap() {
         // Create a dataset with list data for labels
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -3262,7 +3262,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_ivf_pq_index_v3_with_defer_index_remap() {
         // Create a dataset with vector data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
