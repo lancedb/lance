@@ -1839,6 +1839,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["INVERTED"],
             Literal["FTS"],
             Literal["NGRAM"],
+            Literal["ZONEMAP"],
         ],
         name: Optional[str] = None,
         *,
@@ -1897,6 +1898,10 @@ class LanceDataset(pa.dataset.Dataset):
           creates a bitmap for each ngram in the string.  By default we use trigrams.
           This index can currently speed up queries using the ``contains`` function
           in filters.
+        * ``ZONEMAP``. This index breaks the column into fixed-size chunks called zones
+          and store summary statistics for each zone(min, max, null_count, fragment_id).
+          It's inexact but enables efficient filtering by eliminating zones that cannot
+          contain matching values.
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
@@ -1914,7 +1919,7 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"FTS"`` or ``"INVERTED"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"`` or ``"INVERTED"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2003,11 +2008,11 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED"]:
+        if index_type not in ["BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", "INVERTED"]:
             raise NotImplementedError(
                 (
-                    'Only "BTREE", "LABEL_LIST", "INVERTED", "NGRAM", '
-                    'or "BITMAP" are supported for '
+                    'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
+                    'or "INVERTED" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
             )
@@ -2018,7 +2023,7 @@ class LanceDataset(pa.dataset.Dataset):
         if hasattr(field_type, "storage_type"):
             field_type = field_type.storage_type
 
-        if index_type in ["BTREE", "BITMAP"]:
+        if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
             if (
                 not pa.types.is_integer(field_type)
                 and not pa.types.is_floating(field_type)

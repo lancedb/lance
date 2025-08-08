@@ -1458,6 +1458,7 @@ impl Dataset {
             "BTREE" => IndexType::Scalar,
             "BITMAP" => IndexType::Bitmap,
             "NGRAM" => IndexType::NGram,
+            "ZONEMAP" => IndexType::ZoneMap,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
@@ -1479,6 +1480,9 @@ impl Dataset {
             }),
             "NGRAM" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::NGram),
+            }),
+            "ZONEMAP" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::ZoneMap),
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
