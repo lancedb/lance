@@ -16,10 +16,10 @@ runs:
       working-directory: python
       shell: bash
       run: |
-        # First install the pre-built wheel
+        # Create venv first without installing the package itself
+        uv sync --no-install-project --group test --group ray
+        # Then install the pre-built wheel
         uv pip install $(ls target/wheels/pylance-*.whl)
-        # Then sync other dependencies (uv will see pylance is already installed)
-        uv sync --group test --group ray
     - name: Install torch
       working-directory: python
       shell: bash

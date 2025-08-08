@@ -29,10 +29,10 @@ jobs:
     - name: Install dependencies
       working-directory: python
       run: |
-        # First install the pre-built wheel
+        # Create venv and install dependencies without the project
+        uv sync --no-install-project --group test  # includes pandas and other benchmark deps
+        # Then install the pre-built wheel
         uv pip install $(ls target/wheels/*.whl)
-        # Then sync other dependencies
-        uv sync --group test  # includes pandas and other benchmark deps
     - name: Run test
       working-directory: benchmarks/${{ matrix.dataset }}
       run: |
