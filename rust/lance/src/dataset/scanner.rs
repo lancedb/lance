@@ -3412,7 +3412,7 @@ mod test {
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_arrow::SchemaExt;
-    use lance_datagen::{array, gen, BatchCount, ByteCount, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -3493,7 +3493,7 @@ mod test {
 
     #[tokio::test]
     async fn test_strict_batch_size() {
-        let dataset = lance_datagen::gen()
+        let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .anon_col(array::step::<Int64Type>())
             .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
@@ -3520,7 +3520,7 @@ mod test {
 
     #[tokio::test]
     async fn test_column_not_exist() {
-        let dataset = lance_datagen::gen()
+        let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
             .await
@@ -4243,14 +4243,14 @@ mod test {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]))
             .col(
                 "str",
                 array::cycle_utf8_literals(&["a", "b", "c", "e", "d"]),
             );
 
-        let sorted_by_int = gen()
+        let sorted_by_int = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![1, 2, 3, 4, 5]))
             .col(
                 "str",
@@ -4259,7 +4259,7 @@ mod test {
             .into_batch_rows(RowCount::from(5))
             .unwrap();
 
-        let sorted_by_str = gen()
+        let sorted_by_str = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 3, 2]))
             .col(
                 "str",
@@ -4333,14 +4333,14 @@ mod test {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 5, 1, 1, 3]))
             .col(
                 "float",
                 array::cycle::<Float32Type>(vec![7.3, -f32::NAN, f32::NAN, 4.3, f32::INFINITY]),
             );
 
-        let sorted_by_int_then_float = gen()
+        let sorted_by_int_then_float = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![1, 1, 3, 5, 5]))
             .col(
                 "float",
@@ -4864,7 +4864,7 @@ mod test {
     #[tokio::test]
     async fn test_projection_order() {
         let vec_params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2);
-        let mut data = gen()
+        let mut data = gen_batch()
             .col("vec", array::rand_vec::<Float32Type>(Dimension::from(4)))
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
@@ -5079,7 +5079,7 @@ mod test {
             //
             // The first row where indexed == 50 is our sample query.
             // The first row where indexed == 75 is our deleted row (and delete query)
-            let data = gen()
+            let data = gen_batch()
                 .col(
                     "vector",
                     array::rand_vec::<Float32Type>(Dimension::from(32)),
@@ -5533,7 +5533,7 @@ mod test {
 
     #[tokio::test]
     async fn can_filter_row_id() {
-        let dataset = lance_datagen::gen()
+        let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1000))
             .await
@@ -5631,7 +5631,7 @@ mod test {
 
     #[tokio::test]
     async fn test_inexact_scalar_index_plans() {
-        let data = gen()
+        let data = gen_batch()
             .col("ngram", array::rand_utf8(ByteCount::from(5), false))
             .col("exact", array::rand_type(&DataType::UInt32))
             .col("no_index", array::rand_type(&DataType::UInt32))
@@ -5709,7 +5709,7 @@ mod test {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
         use lance_table::io::commit::RenameCommitHandler;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vector",
                 array::rand_vec::<Float32Type>(Dimension::from(32)),
@@ -6859,7 +6859,7 @@ mod test {
         // indexed column
 
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vector",
                 array::rand_vec::<Float32Type>(Dimension::from(32)),

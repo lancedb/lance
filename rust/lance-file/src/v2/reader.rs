@@ -1533,7 +1533,7 @@ pub mod tests {
     use futures::{prelude::stream::TryStreamExt, StreamExt};
     use lance_arrow::RecordBatchExt;
     use lance_core::{datatypes::Schema, ArrowResult};
-    use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
         decoder::{decode_batch, DecodeBatchScheduler, DecoderPlugins, FilterExpression},
         encoder::{default_encoding_strategy, encode_batch, EncodedBatch, EncodingOptions},
@@ -1558,7 +1558,7 @@ pub mod tests {
         ]));
         let categories_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
 
-        let mut reader = gen()
+        let mut reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
             .col("location", array::rand_type(&location_type))
             .col("categories", array::rand_type(&categories_type))
@@ -1675,7 +1675,7 @@ pub mod tests {
         // TODO: Add V2_1 (currently fails)
         #[values(LanceFileVersion::V2_0)] version: LanceFileVersion,
     ) {
-        let data = gen()
+        let data = gen_batch()
             .col("x", array::rand::<Int32Type>())
             .col("y", array::rand_utf8(ByteCount::from(16), false))
             .into_batch_rows(RowCount::from(10000))

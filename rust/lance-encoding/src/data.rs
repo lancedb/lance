@@ -2023,19 +2023,19 @@ mod tests {
     fn test_data_size() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
         // test data_size() when input has no nulls
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
 
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
 
-        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(400), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
 
         // test data_size() when input has nulls
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2044,7 +2044,7 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(400), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2052,8 +2052,8 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2061,7 +2061,7 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(400), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2069,10 +2069,10 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
-        let arr1 = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let arr2 = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let arr3 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr1 = genn.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr2 = genn.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr3 = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9);
 
         let concatenated_array = concat(&[

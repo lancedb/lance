@@ -137,11 +137,11 @@ mod tests {
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
-    use lance_datagen::{array, gen};
+    use lance_datagen::{array, gen_batch};
 
     #[tokio::test]
     async fn test_sql_execute() {
-        let mut ds = gen()
+        let mut ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -190,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_count() {
-        let mut ds = gen()
+        let mut ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -234,7 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_explain_plan() {
-        let mut ds = gen()
+        let mut ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(

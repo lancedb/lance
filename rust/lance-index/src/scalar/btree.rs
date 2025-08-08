@@ -1455,7 +1455,7 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
-    use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use tempfile::tempdir;
@@ -1499,7 +1499,7 @@ mod tests {
         ));
 
         // Generate 50,000 rows of random data with 80% nulls
-        let stream = gen()
+        let stream = gen_batch()
             .col(
                 "value",
                 array::rand::<Float32Type>().with_nulls(&[true, false, false, false, false]),
@@ -1582,7 +1582,7 @@ mod tests {
         // This is a bit overkill but we've had bugs in the past where DF's sort
         // didn't agree with Arrow's sort so we do an end-to-end test here
         // and use DF to sort the data like we would in a real dataset.
-        let data = gen()
+        let data = gen_batch()
             .col("value", array::cycle::<Float64Type>(values.clone()))
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(10), BatchCount::from(100));
@@ -1625,7 +1625,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let data = gen()
+        let data = gen_batch()
             .col("value", array::step::<Float32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(1000), BatchCount::from(10));

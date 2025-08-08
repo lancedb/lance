@@ -1494,7 +1494,7 @@ mod tests {
     use arrow_array::{cast::AsArray, Array, UInt32Array};
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
-    use lance_datagen::{array, r#gen, BatchCount, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_index::{
         optimize::OptimizeOptions,
         scalar::{expression::PlannerIndexExt, ScalarIndexParams},
@@ -1529,7 +1529,7 @@ mod tests {
         async fn new() -> Self {
             let tmp_path = tempfile::tempdir().unwrap();
 
-            let mut dataset = gen()
+            let mut dataset = gen_batch()
                 .col("fully_indexed", array::step::<UInt32Type>())
                 .col("partly_indexed", array::step::<UInt64Type>())
                 .col("not_indexed", array::step::<UInt32Type>())
@@ -1577,7 +1577,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let new_data = gen()
+            let new_data = gen_batch()
                 .col("fully_indexed", array::step_custom::<UInt32Type>(200, 1))
                 .col("partly_indexed", array::step_custom::<UInt64Type>(200, 1))
                 .col("not_indexed", array::step_custom::<UInt32Type>(200, 1))
@@ -2115,7 +2115,7 @@ mod tests {
         // This test reproduces the issue from the Python test_limit_offset[stable] failure
         // Create a simple dataset with 10 rows (0-9)
         let tmp_path = tempfile::tempdir().unwrap();
-        let mut dataset = gen()
+        let mut dataset = gen_batch()
             .col("a", array::step::<UInt32Type>())
             .into_dataset(
                 tmp_path.path().to_str().unwrap(),
