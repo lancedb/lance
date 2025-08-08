@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava};
@@ -19,6 +18,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
+use std::io::Cursor;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -111,7 +111,7 @@ impl IntoJava for Index {
                 "(JJ)Ljava/time/Instant;",
                 &[JValue::Long(seconds), JValue::Long(nanos)],
             )?
-                .l()?
+            .l()?
         } else {
             JObject::null()
         };
@@ -136,8 +136,12 @@ impl IntoJava for Index {
 
 impl FromJObjectWithEnv<RewriteGroup> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<RewriteGroup> {
-        let java_new_fragments = env.get_field(self, "newFragments", "Ljava/util/List;")?.l()?;
-        let java_old_fragments = env.get_field(self, "oldFragments", "Ljava/util/List;")?.l()?;
+        let java_new_fragments = env
+            .get_field(self, "newFragments", "Ljava/util/List;")?
+            .l()?;
+        let java_old_fragments = env
+            .get_field(self, "oldFragments", "Ljava/util/List;")?
+            .l()?;
         let java_new_fragments = import_vec(env, &java_new_fragments)?;
         let java_old_fragments = import_vec(env, &java_old_fragments)?;
         let mut new_fragments = Vec::with_capacity(java_new_fragments.len());
@@ -204,19 +208,26 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
         } else {
             let byte_array: JByteArray = JObject::from(index_details_obj).into();
             let bytes = env.convert_byte_array(&byte_array)?;
-            let any = Any::decode(&bytes[..])
-                .map_err(|e| Error::input_error(format!("Invalid index_details data: {}", e.to_string())))?;
+            let any = Any::decode(&bytes[..]).map_err(|e| {
+                Error::input_error(format!("Invalid index_details data: {}", e.to_string()))
+            })?;
             Some(any)
         };
 
         let index_version = env.get_field(self, "indexVersion", "I")?.i()?;
 
-        let created_at_obj = env.get_field(self, "createdAt", "Ljava/time/Instant;")?.l()?;
+        let created_at_obj = env
+            .get_field(self, "createdAt", "Ljava/time/Instant;")?
+            .l()?;
         let created_at = if created_at_obj.is_null() {
             None
         } else {
-            let seconds = env.call_method(&created_at_obj, "getEpochSecond", "()J", &[])?.j()?;
-            let nanos = env.call_method(&created_at_obj, "getNano", "()I", &[])?.i()? as u32;
+            let seconds = env
+                .call_method(&created_at_obj, "getEpochSecond", "()J", &[])?
+                .j()?;
+            let nanos = env
+                .call_method(&created_at_obj, "getNano", "()I", &[])?
+                .i()? as u32;
             Some(DateTime::from_timestamp(seconds, nanos).unwrap())
         };
 
@@ -244,18 +255,25 @@ impl IntoJava for Uuid {
             "(Ljava/lang/String;)Ljava/util/UUID;",
             &[JValue::Object(&uuid_string)],
         )?
-            .l()
-            .map_err(Into::into)
+        .l()
+        .map_err(Into::into)
     }
 }
 
 impl FromJObjectWithEnv<Uuid> for JObject<'_> {
-    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Uuid>  {
-        let uuid_string = env.call_method(self, "toString", "()Ljava/lang/String;", &[])?.l()?;
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Uuid> {
+        let uuid_string = env
+            .call_method(self, "toString", "()Ljava/lang/String;", &[])?
+            .l()?;
         let uuid_string = JString::from(JObject::from(uuid_string));
         let uuid_string: String = env.get_string(&uuid_string)?.into();
-        let uuid = Uuid::parse_str(uuid_string.to_string().as_str())
-            .map_err(|e| Error::input_error(format!("Invalid UUID string: {}, error: {}", uuid_string, e.to_string())))?;
+        let uuid = Uuid::parse_str(uuid_string.to_string().as_str()).map_err(|e| {
+            Error::input_error(format!(
+                "Invalid UUID string: {}, error: {}",
+                uuid_string,
+                e.to_string()
+            ))
+        })?;
         Ok(uuid)
     }
 }
@@ -759,7 +777,7 @@ fn convert_to_rust_operation(
                 )?
                 .l()?;
             let rewritten_indices_objs = import_vec(env, &rewritten_indices_obj)?;
-            let mut rewritten_indices =  Vec::with_capacity(rewritten_indices_objs.len());
+            let mut rewritten_indices = Vec::with_capacity(rewritten_indices_objs.len());
             for i in rewritten_indices_objs {
                 rewritten_indices.push(i.extract_object(env)?);
             }
