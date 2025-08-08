@@ -29,7 +29,7 @@ impl IntoJava for RewriteGroup {
         let new_fragments = export_vec(env, &self.new_fragments)?;
 
         Ok(env.new_object(
-            "com/lancedb/lance/index/RewriteGroup",
+            "com/lancedb/lance/operation/RewriteGroup",
             "(Ljava/util/List;Ljava/util/List;)V",
             &[
                 JValue::Object(&old_fragments),
@@ -45,7 +45,7 @@ impl IntoJava for RewrittenIndex {
         let new_id = self.new_id.into_java(env)?;
 
         Ok(env.new_object(
-            "com/lancedb/lance/index/RewrittenIndex",
+            "com/lancedb/lance/operation/RewrittenIndex",
             "(Ljava/util/UUID;Ljava/util/UUID;)V",
             &[JValue::Object(&old_id), JValue::Object(&new_id)],
         )?)
@@ -439,7 +439,7 @@ fn convert_to_java_operation_inner<'local>(
 
             Ok(env.new_object(
                 "com/lancedb/lance/operation/Rewrite",
-                "(Ljava/util/List;Ljava/util/List;Lcom/lancedb/lance/Index;)V",
+                "(Ljava/util/List;Ljava/util/List;Lcom/lancedb/lance/index/Index;)V",
                 &[
                     JValue::Object(&java_groups),
                     JValue::Object(&java_indices),
