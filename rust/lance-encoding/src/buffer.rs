@@ -164,6 +164,32 @@ impl LanceBuffer {
         }
     }
 
+    /// Ensure the buffer is aligned for type T
+    ///
+    /// If the buffer is already aligned for type T, this is a no-op.
+    /// If the buffer is not aligned, a copy will be made to ensure alignment.
+    ///
+    /// This method logs a debug message when a copy is made for alignment.
+    pub fn align_with<T>(self) -> Self {
+        let alignment = std::mem::align_of::<T>();
+        let ptr = self.as_ref().as_ptr();
+        
+        if ptr.align_offset(alignment) != 0 {
+            log::debug!(
+                "Buffer at {:p} is not {}-byte aligned for type {}, copying to aligned buffer",
+                ptr,
+                alignment,
+                std::any::type_name::<T>()
+            );
+            // Buffer is not aligned, need to copy
+            let aligned_vec = self.as_ref().to_vec();
+            Self::Owned(aligned_vec)
+        } else {
+            // Buffer is already aligned
+            self
+        }
+    }
+
     /// Convert a buffer into a bytes::Bytes object
     pub fn into_bytes(self) -> bytes::Bytes {
         match self {

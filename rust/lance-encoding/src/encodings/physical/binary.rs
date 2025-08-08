@@ -248,6 +248,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             // offset and at least one value
             assert!(data.len() >= 16);
 
+            // Ensure buffer is aligned for u64 access
+            let data = data.align_with::<u64>();
             let offsets: &[u64] = try_cast_slice(&data)
                 .expect("casting buffer failed during BinaryMiniBlock decompression");
 
@@ -269,6 +271,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             // offset and at least one value
             assert!(data.len() >= 8);
 
+            // Ensure buffer is aligned for u32 access
+            let data = data.align_with::<u32>();
             let offsets: &[u32] = try_cast_slice(&data)
                 .expect("casting buffer failed during BinaryMiniBlock decompression");
 
