@@ -1119,7 +1119,7 @@ mod test {
         let schema2 = schema.clone();
 
         let stream = stream::iter(0..num_batches).map(move |idx| {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let row_ids = Arc::new(UInt64Array::from_iter(
                 (idx * 1024..(idx + 1) * 1024).map(u64::from),
             ));

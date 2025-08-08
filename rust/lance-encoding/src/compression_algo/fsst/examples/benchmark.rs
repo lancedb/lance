@@ -18,8 +18,8 @@ fn read_random_8_m_chunk(file_path: &str) -> Result<StringArray, std::io::Error>
     let lines: Vec<String> = reader.lines().collect::<std::result::Result<_, _>>()?;
     let num_lines = lines.len();
 
-    let mut rng = rand::thread_rng();
-    let mut curr_line = rng.gen_range(0..num_lines);
+    let mut rng = rand::rng();
+    let mut curr_line = rng.random_range(0..num_lines);
 
     let chunk_size = BUFFER_SIZE;
     let mut size = 0;

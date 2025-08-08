@@ -242,7 +242,7 @@ mod test {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::{reader::FileReader, writer::FileWriter};
-    use rand::{distributions::Alphanumeric, Rng};
+    use rand::{distr::Alphanumeric, Rng};
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -254,13 +254,13 @@ mod test {
         let mut writer = store.create(&path).await.unwrap();
 
         // Write prefix we should ignore
-        let prefix: Vec<u8> = rand::thread_rng()
+        let prefix: Vec<u8> = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(prefix_size)
             .collect();
         writer.write_all(&prefix).await.unwrap();
 
-        let long_name: String = rand::thread_rng()
+        let long_name: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(manifest_min_size)
             .map(char::from)

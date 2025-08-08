@@ -474,7 +474,7 @@ mod test {
             dataset.delete(expr).await.unwrap();
         }
 
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .col(
                 "vec",

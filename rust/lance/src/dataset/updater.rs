@@ -420,7 +420,7 @@ mod tests {
                 *batch_size,
             );
 
-            let batch = lance_datagen::gen()
+            let batch = lance_datagen::gen_batch()
                 .col("x", lance_datagen::array::step::<Int32Type>())
                 .into_batch_rows(RowCount::from(10))
                 .unwrap();
@@ -428,7 +428,7 @@ mod tests {
             let restored = restorer.restore(batch.clone()).unwrap();
             assert_eq!(restored, batch);
 
-            let batch = lance_datagen::gen()
+            let batch = lance_datagen::gen_batch()
                 .col("x", lance_datagen::array::step::<Int32Type>())
                 .into_batch_rows(RowCount::from(7))
                 .unwrap();
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_add_blanks() {
-        let batch = lance_datagen::gen()
+        let batch = lance_datagen::gen_batch()
             .col("x", lance_datagen::array::step::<Int32Type>())
             .into_batch_rows(RowCount::from(10))
             .unwrap();

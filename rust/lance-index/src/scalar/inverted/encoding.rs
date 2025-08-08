@@ -279,10 +279,16 @@ mod tests {
     #[test]
     fn test_compress_posting_list() -> Result<()> {
         let num_rows: usize = BLOCK_SIZE * 1024 - 7;
-        let mut rng = rand::thread_rng();
-        let doc_ids: Vec<u32> = (0..num_rows).map(|_| rng.gen()).sorted_unstable().collect();
-        let frequencies: Vec<u32> = (0..num_rows).map(|_| rng.gen_range(1..=u32::MAX)).collect();
-        let block_max_scores = (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.gen_range(0.0..1.0));
+        let mut rng = rand::rng();
+        let doc_ids: Vec<u32> = (0..num_rows)
+            .map(|_| rng.random())
+            .sorted_unstable()
+            .collect();
+        let frequencies: Vec<u32> = (0..num_rows)
+            .map(|_| rng.random_range(1..=u32::MAX))
+            .collect();
+        let block_max_scores =
+            (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.random_range(0.0..1.0));
         let posting_list = compress_posting_list(
             doc_ids.len(),
             doc_ids.iter(),
@@ -310,9 +316,9 @@ mod tests {
     #[test]
     fn test_compress_positions() -> Result<()> {
         let num_positions: usize = BLOCK_SIZE * 2 - 7;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let positions: Vec<u32> = (0..num_positions)
-            .map(|_| rng.gen())
+            .map(|_| rng.random())
             .sorted_unstable()
             .collect();
         let compressed = compress_positions(&positions)?;

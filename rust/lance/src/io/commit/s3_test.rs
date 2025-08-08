@@ -13,7 +13,7 @@ use crate::{
 use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
 use aws_sdk_s3::{config::Credentials, Client as S3Client};
 use futures::future::try_join_all;
-use lance_datagen::{array, gen, RowCount};
+use lance_datagen::{array, gen_batch, RowCount};
 
 const CONFIG: &[(&str, &str)] = &[
     ("access_key_id", "ACCESS_KEY"),
@@ -177,7 +177,7 @@ impl Drop for DynamoDBCommitTable {
 async fn test_concurrent_writers() {
     use crate::utils::test::IoTrackingStore;
 
-    let datagen = gen().col("values", array::step::<Int32Type>());
+    let datagen = gen_batch().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
 
     let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
@@ -265,7 +265,7 @@ async fn test_ddb_open_iops() {
     let ddb_table = DynamoDBCommitTable::new("test-ddb-iops").await;
     let uri = format!("s3+ddb://{}/test?ddbTableName={}", bucket.0, ddb_table.0);
 
-    let datagen = gen().col("values", array::step::<Int32Type>());
+    let datagen = gen_batch().col("values", array::step::<Int32Type>());
     let data = datagen.into_batch_rows(RowCount::from(100)).unwrap();
 
     let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
