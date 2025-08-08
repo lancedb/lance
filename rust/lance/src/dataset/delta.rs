@@ -135,6 +135,7 @@ mod tests {
         ds.cleanup_old_versions(Duration::seconds(1), Some(true), None)
             .await
             .expect("Cleanup old versions failed");
+
         clock.set_system_time(Duration::seconds(5));
 
         let delta_struct = crate::dataset::delta::DatasetDelta {
