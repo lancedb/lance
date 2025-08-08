@@ -21,6 +21,7 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::v2::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::bq::storage::RABIT_CODE_COLUMN;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
@@ -722,26 +723,50 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let part_storage = existing_index.load_partition_storage(part_id).await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
-            if matches!(Q::quantization_type(), QuantizationType::Product) {
-                for batch in part_batches.iter_mut() {
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
+            match Q::quantization_type() {
+                QuantizationType::Product => {
+                    for batch in part_batches.iter_mut() {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
 
-                    let codes = batch[PQ_CODE_COLUMN]
-                        .as_fixed_size_list()
-                        .values()
-                        .as_primitive::<datatypes::UInt8Type>();
-                    let codes_num_bytes = codes.len() / batch.num_rows();
-                    let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
-                    let original_codes = FixedSizeListArray::try_new_from_values(
-                        original_codes,
-                        codes_num_bytes as i32,
-                    )?;
-                    *batch = batch
-                        .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?
-                        .drop_column(PART_ID_COLUMN)?;
+                        let codes = batch[PQ_CODE_COLUMN]
+                            .as_fixed_size_list()
+                            .values()
+                            .as_primitive::<datatypes::UInt8Type>();
+                        let codes_num_bytes = codes.len() / batch.num_rows();
+                        let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
+                        let original_codes = FixedSizeListArray::try_new_from_values(
+                            original_codes,
+                            codes_num_bytes as i32,
+                        )?;
+                        *batch = batch
+                            .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?
+                            .drop_column(PART_ID_COLUMN)?;
+                    }
                 }
+                QuantizationType::Rabit => {
+                    for batch in part_batches.iter_mut() {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+
+                        let codes = batch[RABIT_CODE_COLUMN]
+                            .as_fixed_size_list()
+                            .values()
+                            .as_primitive::<datatypes::UInt8Type>();
+                        let codes_num_bytes = codes.len() / batch.num_rows();
+                        let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
+                        let original_codes = FixedSizeListArray::try_new_from_values(
+                            original_codes,
+                            codes_num_bytes as i32,
+                        )?;
+                        *batch = batch
+                            .replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(original_codes))?
+                            .drop_column(PART_ID_COLUMN)?;
+                    }
+                }
+                _ => {}
             }
             batches.extend(part_batches);
         }

@@ -76,6 +76,7 @@ impl RabitQuantizer {
             inv_p: Some(inv_p),
             inv_p_position: 0,
             num_bits,
+            transposed: false,
         };
         Self { metadata }
     }
@@ -313,9 +314,11 @@ impl Quantization for RabitQuantizer {
 
     fn metadata(
         &self,
-        _: Option<crate::vector::quantizer::QuantizationMetadata>,
+        args: Option<crate::vector::quantizer::QuantizationMetadata>,
     ) -> Self::Metadata {
-        self.metadata.clone()
+        let mut metadata = self.metadata.clone();
+        metadata.transposed = args.map(|args| args.transposed).unwrap_or_default();
+        metadata
     }
 
     fn from_metadata(

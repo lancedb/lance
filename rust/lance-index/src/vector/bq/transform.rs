@@ -121,18 +121,20 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let rq_code = self.rq.quantize(&residual_vectors)?;
-        let code_bitcount =
-            Float32Array::from_iter_values(rq_code.as_fixed_size_list().iter().map(|v| {
-                v.map(|v| {
-                    v.as_primitive::<UInt8Type>()
-                        .values()
-                        .iter()
-                        .map(|v| v.count_ones())
-                        .sum::<u32>() as f32
-                })
-                .unwrap_or_default()
-            }));
+        let rq_codes = self.rq.quantize(&residual_vectors)?;
+        let codes_fsl = rq_codes.as_fixed_size_list();
+
+        let code_bitcount = Float32Array::from_iter_values(codes_fsl.iter().map(|v| {
+            v.map(|v| {
+                v.as_primitive::<UInt8Type>()
+                    .values()
+                    .iter()
+                    .map(|v| v.count_ones())
+                    .sum::<u32>() as f32
+            })
+            .unwrap_or_default()
+        }));
+
         let ip_rq_res = match residual_vectors.value_type() {
             DataType::Float16 => Float32Array::from(
                 self.rq
@@ -156,7 +158,7 @@ impl Transformer for RQTransformer {
                 });
             }
         };
-        debug_assert_eq!(rq_code.len(), batch.num_rows());
+        debug_assert_eq!(codes_fsl.len(), batch.num_rows());
 
         let add_factors = match self.distance_type {
             DistanceType::L2 => res_norm_square.clone(),
@@ -217,7 +219,7 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let batch = batch.try_with_column(self.rq.field(), Arc::new(rq_code))?;
+        let batch = batch.try_with_column(self.rq.field(), Arc::new(rq_codes))?;
         let batch = batch.try_with_column(CODE_BITCOUNT_FIELD.clone(), Arc::new(code_bitcount))?;
         let batch = batch
             .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?

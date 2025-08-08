@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt64Type, UInt8Type};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array, UInt8Array,
+};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
-use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
@@ -26,12 +29,15 @@ use crate::pb;
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, CODE_BITCOUNT_COLUMN, SCALE_FACTORS_COLUMN,
 };
+use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::sq::scale_to_u8;
 use crate::vector::storage::{DistCalculator, VectorStore};
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
+pub const SEGMENT_LENGTH: usize = 4;
+pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RabitQuantizationMetadata {
@@ -39,6 +45,7 @@ pub struct RabitQuantizationMetadata {
     pub inv_p: Option<FixedSizeListArray>,
     pub inv_p_position: u32,
     pub num_bits: u8,
+    pub transposed: bool,
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
@@ -213,40 +220,45 @@ impl<'a> RabitDistCalculator<'a> {
     }
 
     fn build_dist_table(query_codes: Vec<u8>) -> Vec<u32> {
-        // TODO: optimize this with SIMD
+        // divide query codes into segments of 4 bytes,
+        // and calculate the distance between the segment and binary vector (4 bits),
+        // dist_table[i][j] is the distance between the i-th query code segment and the code j
         query_codes
-            .chunks_exact(4)
+            .chunks_exact(SEGMENT_LENGTH)
             .flat_map(|sub_vec| {
-                (0..16).map(|j| {
+                debug_assert_eq!(sub_vec.len(), SEGMENT_LENGTH);
+                (0..SEGMENT_NUM_CODES).map(|j| {
                     let mut dist = 0;
                     for (b, &v) in sub_vec.iter().enumerate() {
-                        dist += (v * ((j >> b) & 0x1)) as u32;
+                        if (j >> b) & 0x1 != 0 {
+                            dist += v as u32;
+                        }
                     }
                     dist
                 })
             })
-            .exact_size(query_codes.len() * 4)
+            .exact_size(query_codes.len() / SEGMENT_LENGTH * SEGMENT_NUM_CODES)
             .collect()
     }
 }
 
-// TODO: optimize this with SIMD
 impl DistCalculator for RabitDistCalculator<'_> {
+    #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
-        let mut dist = 0;
         let id = id as usize;
         let code_len = self.dim * (self.num_bits as usize) / 8;
-        let code = &self.codes[id * code_len..(id + 1) * code_len];
-        for (i, code_byte) in code.iter().enumerate() {
-            // code is a bit vector, we iterate over 8 bits at a time,
-            // every 4 bits is a sub-vector, we need to extract the bits
-            let dist_table = &self.dist_table[2 * i * 16..(2 * i + 1) * 16];
-            let next_dist_table = &self.dist_table[(2 * i + 1) * 16..(2 * i + 2) * 16];
-            let current_code = (code_byte & 0x0F) as usize;
-            let next_code = (code_byte >> 4) as usize;
-            dist += dist_table[current_code];
-            dist += next_dist_table[next_code];
-        }
+        let num_vectors = self.codes.len() / code_len;
+        let code = get_rq_code(self.codes, id, num_vectors, code_len);
+        let dist = code
+            .zip(self.dist_table.chunks_exact(SEGMENT_NUM_CODES).tuples())
+            .map(|(code_byte, (dist_table, next_dist_table))| {
+                // code is a bit vector, we iterate over 8 bits at a time,
+                // every 4 bits is a sub-vector, we need to extract the bits
+                let current_code = (code_byte & 0x0F) as usize;
+                let next_code = (code_byte >> 4) as usize;
+                dist_table[current_code] + next_dist_table[next_code]
+            })
+            .sum::<u32>();
 
         let vec_bitcount = self.code_bitcounts[id];
         let dist = dist as f32;
@@ -263,11 +275,40 @@ impl DistCalculator for RabitDistCalculator<'_> {
     fn distance_all(&self, _: usize) -> Vec<f32> {
         let code_len = self.dim * (self.num_bits as usize) / 8;
         let n = self.codes.len() / code_len;
-        let mut dists = vec![0.0; n];
-        for (i, dist) in dists.iter_mut().enumerate() {
-            *dist = self.distance(i as u32);
+        if n == 0 {
+            return Vec::new();
         }
+
+        let mut dists = vec![0; n];
+        for (sub_vec_idx, code) in self.codes.chunks_exact(n).enumerate() {
+            debug_assert_eq!(code.len(), n);
+            let current_dist_table = &self.dist_table
+                [sub_vec_idx * 2 * SEGMENT_NUM_CODES..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
+            let next_dist_table = &self.dist_table[(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES
+                ..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
+
+            code.iter()
+                .zip(dists.iter_mut())
+                .for_each(|(code_byte, dist)| {
+                    let current_code = (code_byte & 0x0F) as usize;
+                    let next_code = (code_byte >> 4) as usize;
+                    *dist += current_dist_table[current_code] + next_dist_table[next_code];
+                });
+        }
+
         dists
+            .into_iter()
+            .enumerate()
+            .map(|(id, dist)| {
+                let dist = dist as f32;
+                let vec_bitcount = self.code_bitcounts[id];
+                let dist_vq_qr = (2.0 * self.sq_scale * dist + 2.0 * self.sq_min * vec_bitcount
+                    - self.sq_scale * self.sq_sum
+                    - self.dim as f32 * self.sq_min)
+                    / self.sqrt_d;
+                dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
+            })
+            .collect()
     }
 }
 
@@ -370,8 +411,27 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let scale_factors = batch[SCALE_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
+
+        let (batch, codes) = if !metadata.transposed {
+            let num_code_bytes = codes.value_length();
+            let codes = transpose(
+                codes.values().as_primitive::<UInt8Type>(),
+                row_ids.len(),
+                num_code_bytes as usize,
+            );
+            let codes = FixedSizeListArray::try_new_from_values(codes, num_code_bytes)?;
+            let batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(codes))?;
+            let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+            (batch, codes)
+        } else {
+            (batch, codes)
+        };
+
+        let mut metadata = metadata.clone();
+        metadata.transposed = true;
+
         Ok(Self {
-            metadata: metadata.clone(),
+            metadata,
             batch,
             distance_type,
             row_ids,
@@ -397,4 +457,73 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let batch = reader.read_range(range, schema).await?;
         Self::try_from_batch(batch, metadata, distance_type, frag_reuse_index)
     }
+
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        let num_vectors = self.codes.len();
+        let num_code_bytes = self.codes.value_length() as usize;
+        let codes = self.codes.values().as_primitive::<UInt8Type>().values();
+        let mut indices = Vec::with_capacity(num_vectors);
+        let mut new_row_ids = Vec::with_capacity(num_vectors);
+        let mut new_codes = Vec::with_capacity(codes.len());
+
+        let row_ids = self.row_ids.values();
+        for (i, row_id) in row_ids.iter().enumerate() {
+            match mapping.get(row_id) {
+                Some(Some(new_id)) => {
+                    indices.push(i as u32);
+                    new_row_ids.push(*new_id);
+                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
+                }
+                Some(None) => {}
+                None => {
+                    indices.push(i as u32);
+                    new_row_ids.push(*row_id);
+                    new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
+                }
+            }
+        }
+
+        let new_row_ids = UInt64Array::from(new_row_ids);
+        let new_codes = UInt8Array::from(new_codes);
+        let batch = if new_row_ids.is_empty() {
+            RecordBatch::new_empty(self.schema().clone())
+        } else {
+            let codes = transpose(&new_codes, new_row_ids.len(), num_code_bytes);
+            let codes = Arc::new(FixedSizeListArray::try_new_from_values(
+                codes,
+                num_code_bytes as i32,
+            )?);
+
+            self.batch
+                .take(&UInt32Array::from(indices))?
+                .replace_column_by_name(ROW_ID, Arc::new(new_row_ids.clone()))?
+                .replace_column_by_name(RABIT_CODE_COLUMN, codes)?
+        };
+        let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+
+        Ok(Self {
+            metadata: self.metadata.clone(),
+            distance_type: self.distance_type,
+            batch,
+            codes,
+            code_bitcounts: self.code_bitcounts.clone(),
+            add_factors: self.add_factors.clone(),
+            scale_factors: self.scale_factors.clone(),
+            row_ids: new_row_ids,
+        })
+    }
+}
+
+fn get_rq_code(
+    codes: &[u8],
+    id: usize,
+    num_vectors: usize,
+    num_code_bytes: usize,
+) -> impl Iterator<Item = u8> + '_ {
+    codes
+        .iter()
+        .skip(id as usize)
+        .step_by(num_vectors)
+        .copied()
+        .exact_size(num_code_bytes)
 }
