@@ -39,8 +39,8 @@ jobs:
       working-directory: python
       shell: bash
       run: |
-        # Create venv and install dependencies without the project
-        uv sync --no-install-project --group test  # includes jupyter and duckdb
+        # Create virtual environment and sync dependencies without installing workspace packages
+        uv sync --no-install-workspace --group test  # includes jupyter and duckdb
         # Then install the pre-built wheel
         uv pip install $(ls target/wheels/*.whl)
     - name: Run notebook tests

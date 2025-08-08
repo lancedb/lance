@@ -29,8 +29,8 @@ jobs:
     - name: Install dependencies
       working-directory: python
       run: |
-        # Create venv and install dependencies without the project
-        uv sync --no-install-project --group test  # includes pandas and other benchmark deps
+        # Create virtual environment and sync dependencies without installing workspace packages
+        uv sync --no-install-workspace --group test  # includes pandas and other benchmark deps
         # Then install the pre-built wheel
         uv pip install $(ls target/wheels/*.whl)
     - name: Run test

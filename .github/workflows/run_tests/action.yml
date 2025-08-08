@@ -16,8 +16,8 @@ runs:
       working-directory: python
       shell: bash
       run: |
-        # Create venv first without installing the package itself
-        uv sync --no-install-project --group test --group ray
+        # Create virtual environment and sync dependencies without installing workspace packages
+        uv sync --no-install-workspace --group test --group ray
         # Then install the pre-built wheel
         uv pip install $(ls target/wheels/pylance-*.whl)
     - name: Install torch
