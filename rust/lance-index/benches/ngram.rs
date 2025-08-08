@@ -20,7 +20,6 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
-use rand::Rng;
 
 fn bench_ngram(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;

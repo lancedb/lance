@@ -23,7 +23,7 @@ use tracing::instrument;
 
 use super::{transform::Transformer, PQ_CODE_COLUMN};
 
-pub const RESIDUAL_COLUMN: &str = "__residual";
+pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 
 /// Compute the residual vector of a Vector Matrix to their centroids.
 ///
