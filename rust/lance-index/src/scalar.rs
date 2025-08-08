@@ -606,7 +606,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         Self: Sized;
 
     /// Returns true if the remap operation is supported
-    fn can_answer_remap(&self) -> bool;
+    fn can_remap(&self) -> bool;
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(

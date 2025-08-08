@@ -17,6 +17,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::datatypes::Field;
+use lance_core::ROW_ADDR;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::metrics::MetricsCollector;
@@ -151,7 +152,7 @@ impl TrainingRequest {
         );
 
         let scan = if aligned {
-            // When aligned is true, add row_address column
+            // Since Lance will return data in the order of the row_address, no need to sort.
             scan.with_row_id()
                 .with_row_address()
                 .project(&[&self.column])?

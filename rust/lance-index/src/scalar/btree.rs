@@ -1079,7 +1079,7 @@ impl ScalarIndex for BTreeIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_answer_remap(&self) -> bool {
+    fn can_remap(&self) -> bool {
         true
     }
 
