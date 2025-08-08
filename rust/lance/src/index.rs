@@ -1577,7 +1577,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
-    use lance_datagen::r#gen;
+    use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
     use lance_index::scalar::FullTextSearchQuery;
     use lance_index::vector::{
@@ -2402,7 +2402,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remap_empty() {
-        let data = gen()
+        let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
                 "vector",

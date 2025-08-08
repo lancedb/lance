@@ -160,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),

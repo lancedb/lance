@@ -123,7 +123,7 @@ impl Default for SlotBackoff {
             unit: 50,
             starting_i: 2, // start with 4 slots
             attempt: 0,
-            rng: rand::rngs::SmallRng::from_rng(&mut rand::rng()),
+            rng: rand::rngs::SmallRng::from_os_rng(),
         }
     }
 }

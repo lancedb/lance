@@ -2756,7 +2756,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3701,7 +3701,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3718,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3753,7 +3753,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3782,7 +3782,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3798,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrayref",
  "arrow",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3871,7 +3871,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3915,7 +3915,6 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "rand 0.9.1",
- "rand_distr 0.5.1",
  "rayon",
  "roaring",
  "serde",
@@ -3930,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3970,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3993,7 +3992,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5368,7 +5367,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5630,16 +5629,6 @@ checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
 dependencies = [
  "num-traits",
  "rand 0.8.5",
-]
-
-[[package]]
-name = "rand_distr"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
-dependencies = [
- "num-traits",
- "rand 0.9.1",
 ]
 
 [[package]]

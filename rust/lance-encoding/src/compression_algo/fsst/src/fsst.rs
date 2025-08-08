@@ -47,8 +47,7 @@ pub const FSST_SYMBOL_TABLE_SIZE: usize = 8 + 256 * 8 + 256; // 8 bytes for the 
 
 use arrow_array::OffsetSizeTrait;
 use rand::rngs::StdRng;
-use rand::Rng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::HashSet;
@@ -539,8 +538,7 @@ fn make_sample<T: OffsetSizeTrait>(in_buf: &[u8], offsets: &[T]) -> (Vec<u8>, Ve
     let mut sample_offsets: Vec<T> = Vec::new();
 
     sample_offsets.push(T::from_usize(0).unwrap());
-    let mut rng = rand::rng();
-    let mut rng = StdRng::from_rng(&mut rng);
+    let mut rng = StdRng::from_os_rng();
     while sample_buf.len() < FSST_SAMPLETARGET {
         let rand_num = rng.random_range(0..offsets.len()) % (offsets.len() - 1);
         sample_buf.extend_from_slice(

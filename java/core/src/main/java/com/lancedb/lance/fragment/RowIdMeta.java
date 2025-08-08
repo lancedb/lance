@@ -16,6 +16,7 @@ package com.lancedb.lance.fragment;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
+import java.util.Objects;
 
 public class RowIdMeta implements Serializable {
   private static final long serialVersionUID = -6532828695072614148L;
@@ -28,6 +29,18 @@ public class RowIdMeta implements Serializable {
 
   public String getMetadata() {
     return metadata;
+  }
+
+  @Override
+  public boolean equals(Object obj) {
+    if (this == obj) {
+      return true;
+    }
+    if (obj == null || getClass() != obj.getClass()) {
+      return false;
+    }
+    RowIdMeta that = (RowIdMeta) obj;
+    return Objects.equals(metadata, that.metadata);
   }
 
   @Override

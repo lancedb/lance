@@ -19,6 +19,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Overwrite the dataset with new fragments. This operation will overwrite the existing dataset.
@@ -66,7 +67,15 @@ public class Overwrite extends SchemaOperation {
         + '}';
   }
 
-  // Builder class for Overwrite
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    if (!super.equals(o)) return false;
+    Overwrite that = (Overwrite) o;
+    return Objects.equals(fragments, that.fragments);
+  }
+
   public static class Builder {
     private List<FragmentMetadata> fragments;
     private Schema schema;

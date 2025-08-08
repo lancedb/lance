@@ -19,6 +19,7 @@ import org.apache.arrow.util.Preconditions;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -90,6 +91,30 @@ public class Transaction {
     if (blobOp != null) {
       blobOp.release();
     }
+  }
+
+  @Override
+  public String toString() {
+    return String.format(
+        "Transaction{readVersion=%d, uuid='%s', operation=%s, blobOp=%s}",
+        readVersion, uuid, operation, blobOp);
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    Transaction that = (Transaction) o;
+    return readVersion == that.readVersion
+        && uuid.equals(that.uuid)
+        && Objects.equals(operation, that.operation)
+        && Objects.equals(blobOp, that.blobOp)
+        && Objects.equals(writeParams, that.writeParams)
+        && Objects.equals(transactionProperties, that.transactionProperties);
   }
 
   public static class Builder {

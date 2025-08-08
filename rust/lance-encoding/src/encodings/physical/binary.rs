@@ -782,7 +782,7 @@ pub mod tests {
 
         // Test both automatic selection and explicit configuration
         // 1. Test automatic binary encoding selection (small strings that won't trigger FSST)
-        let arr_small = lance_datagen::gen()
+        let arr_small = lance_datagen::gen_batch()
             .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(10), false))
             .into_batch_rows(RowCount::from(1000))
             .unwrap()
@@ -793,7 +793,7 @@ pub mod tests {
         // 2. Test explicit "none" compression to force binary encoding
         let metadata_explicit =
             HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
-        let arr_large = lance_datagen::gen()
+        let arr_large = lance_datagen::gen_batch()
             .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(50), false))
             .into_batch_rows(RowCount::from(2000))
             .unwrap()

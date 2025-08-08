@@ -769,7 +769,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::version::LanceFileVersion;
@@ -786,7 +786,7 @@ mod tests {
         let tmp_path = tmp_path.child("some_file.lance");
         let obj_store = Arc::new(ObjectStore::local());
 
-        let reader = gen()
+        let reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(10));
 
@@ -814,7 +814,7 @@ mod tests {
         let tmp_path = tmp_path.child("some_file.lance");
         let obj_store = Arc::new(ObjectStore::local());
 
-        let reader = gen()
+        let reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
             .into_reader_rows(RowCount::from(0), BatchCount::from(0));
 

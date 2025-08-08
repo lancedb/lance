@@ -1523,7 +1523,7 @@ mod tests {
             let num_frags = 100;
             let frags_per_delta = num_frags / num_deltas;
 
-            let batches = lance_datagen::gen()
+            let batches = lance_datagen::gen_batch()
                 .col("vector", array::jitter_centroids(centroids.clone(), 0.0001))
                 .col("label", array::cycle::<UInt32Type>(Vec::from_iter(0..61)))
                 .col("userid", array::step::<UInt64Type>())

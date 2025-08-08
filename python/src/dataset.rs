@@ -57,6 +57,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
@@ -250,6 +251,37 @@ impl MergeInsertBuilder {
         let stats = Self::build_stats(&stats, py)?;
 
         Ok((PyLance(transaction), stats))
+    }
+
+    #[pyo3(signature=(schema = None, verbose = false))]
+    pub fn explain_plan(
+        &mut self,
+        schema: Option<PyArrowType<ArrowSchema>>,
+        verbose: Option<bool>,
+    ) -> PyResult<String> {
+        let verbose = verbose.unwrap_or(false);
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let schema_ref = schema.as_ref().map(|s| &s.0);
+        RT.block_on(None, job.explain_plan(schema_ref, verbose))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    pub fn analyze_plan(&mut self, new_data: &Bound<PyAny>) -> PyResult<String> {
+        let new_data_reader = convert_reader(new_data)?;
+        let new_data_stream = reader_to_stream(new_data_reader);
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        RT.block_on(None, job.analyze_plan(new_data_stream))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
 
