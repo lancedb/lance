@@ -25,6 +25,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout lance-spark
+        uses: actions/checkout@v4
+        with:
+          repository: lancedb/lance-spark
+          path: lance-spark
+      - name: Checkout lance-spark
+        uses: actions/checkout@v4
+        with:
+          repository: lancedb/lance-namespace
+          path: lance-namespace
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
@@ -37,6 +47,26 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      - name: Copy lance-namespace docs
+        run: |
+          mkdir -p docs/src/format/namespace
+          cp -r lance-spark/docs/src docs/src/format/namespace
+          mv docs/src/format/namespace docs/src/community/contributing/namespace.md
+          
+          # Create contributing .pages file with Namespace entry
+          cat >> docs/src/community/contributing/.pages << 'EOF'
+            - Lance Namespace: namespace.md
+          EOF
+      - name: Copy lance-spark docs
+        run: |
+          mkdir -p docs/src/integrations/spark
+          cp -r lance-spark/docs/src docs/src/integrations/spark
+          mv docs/src/integrations/spark/contributing.md docs/src/community/contributing/spark.md
+          
+          # Create contributing .pages file with Spark entry
+          cat > docs/src/community/contributing/.pages << 'EOF'
+            - Spark Lance Connector: spark.md
+          EOF
       - name: Deploy
         working-directory: docs
         run: uv run mkdocs gh-deploy --force

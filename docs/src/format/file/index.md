@@ -1,4 +1,4 @@
-# File Format
+# Lance File Format
 
 ## File Structure
 

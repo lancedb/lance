@@ -1,4 +1,4 @@
-# Table Format
+# Lance Table Format
 
 ## Dataset Directory
 
