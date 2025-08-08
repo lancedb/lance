@@ -37,6 +37,7 @@ use datafusion::{
     },
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
+        display::DisplayableExecutionPlan,
         joins::{HashJoinExec, PartitionMode},
         projection::ProjectionExec,
         repartition::RepartitionExec,
@@ -51,7 +52,9 @@ use datafusion::{
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
 use lance_datafusion::{
-    chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context,
+    chunker::chunk_stream,
+    dataframe::DataFrameExt,
+    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
     utils::reader_to_stream,
 };
 
@@ -84,7 +87,7 @@ use lance_core::{
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
-    exec::{execute_plan, LanceExecutionOptions, OneShotExec},
+    exec::{execute_plan, OneShotExec},
     utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
@@ -1341,25 +1344,28 @@ impl MergeInsertJob {
         Ok((transaction, stats, affected_rows))
     }
 
-    async fn execute_uncommitted_impl(
-        self,
-        source: SendableRecordBatchStream,
-    ) -> Result<UncommittedMergeInsert> {
-        // Erase metadata on source / dataset schemas to avoid comparing metadata
-        let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
+    /// Check if the merge insert operation can use the fast path (create_plan).
+    ///
+    /// The fast path is only available for specific conditions:
+    /// - when_matched is UpdateAll or UpdateIf
+    /// - No scalar index on join key
+    /// - Source schema matches dataset schema exactly
+    /// - when_not_matched_by_source is Keep
+    async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
+        // Convert to lance schema for comparison
+        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.local_schema();
         let is_full_schema = full_schema.compare_with_options(
-            &schema,
+            &lance_schema,
             &SchemaCompareOptions {
                 compare_metadata: false,
                 ..Default::default()
             },
         );
 
-        // We are migrating a new plan-based code path. For now, only using this
-        // for select supported queries: upsert with full schema, no scalar index, and keeping unmatched rows.
         let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
-        let can_use_fast_path = matches!(
+
+        Ok(matches!(
             self.params.when_matched,
             WhenMatched::UpdateAll | WhenMatched::UpdateIf(_)
         ) && !has_scalar_index
@@ -1367,7 +1373,15 @@ impl MergeInsertJob {
             && matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
-            );
+            ))
+    }
+
+    async fn execute_uncommitted_impl(
+        self,
+        source: SendableRecordBatchStream,
+    ) -> Result<UncommittedMergeInsert> {
+        // Check if we can use the fast path
+        let can_use_fast_path = self.can_use_create_plan(source.schema().as_ref()).await?;
 
         if can_use_fast_path {
             let (transaction, stats, affected_rows) = self.execute_uncommitted_v2(source).await?;
@@ -1379,6 +1393,15 @@ impl MergeInsertJob {
         }
 
         let source_schema = source.schema();
+        let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
+        let full_schema = self.dataset.local_schema();
+        let is_full_schema = full_schema.compare_with_options(
+            &lance_schema,
+            &SchemaCompareOptions {
+                compare_metadata: false,
+                ..Default::default()
+            },
+        );
         let joined = self.create_joined_stream(source).await?;
         let merger = Merger::try_new(self.params.clone(), source_schema, !is_full_schema)?;
         let merge_statistics = merger.merge_stats.clone();
@@ -1513,6 +1536,100 @@ impl MergeInsertJob {
 
         Ok((updated_fragments, removed_fragments))
     }
+
+    /// Generate the execution plan and return it as a formatted string for debugging.
+    ///
+    /// This method takes an optional schema representing the source data and calls `create_plan()`
+    /// to generate the execution plan, then formats it for display. If no schema is provided,
+    /// defaults to the dataset's schema. The verbose flag controls the level of detail shown.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - Optional schema of the source data. If None, uses the dataset's schema
+    /// * `verbose` - If true, provides more detailed information in the plan output
+    ///
+    /// # Errors
+    ///
+    /// Returns Error::NotSupported if the merge insert configuration doesn't support
+    /// the fast path required for plan generation.
+    pub async fn explain_plan(&self, schema: Option<&Schema>, verbose: bool) -> Result<String> {
+        // Use provided schema or default to dataset schema
+        let schema = match schema {
+            Some(s) => s.clone(),
+            None => arrow_schema::Schema::from(self.dataset.schema()),
+        };
+
+        // Check if we can use create_plan
+        if !self.can_use_create_plan(&schema).await? {
+            return Err(Error::NotSupported {
+                source: "This merge insert configuration does not support explain_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into(),
+                location: location!(),
+            });
+        }
+
+        // Create an empty batch with the provided schema to pass to create_plan
+        let empty_batch = RecordBatch::new_empty(Arc::new(schema.clone()));
+        let stream = RecordBatchStreamAdapter::new(
+            Arc::new(schema.clone()),
+            futures::stream::once(async { Ok(empty_batch) }).boxed(),
+        );
+
+        // Clone self since create_plan consumes the job
+        let cloned_job = self.clone();
+        let plan = cloned_job.create_plan(Box::pin(stream)).await?;
+        let display = DisplayableExecutionPlan::new(plan.as_ref());
+
+        Ok(format!("{}", display.indent(verbose)))
+    }
+
+    /// Generate the execution plan, execute it with the provided data to collect metrics,
+    /// and return the analysis.
+    ///
+    /// This method takes actual source data, calls `create_plan()` to generate the plan,
+    /// and executes it to collect performance metrics and analysis.
+    ///
+    /// **Note:** This method executes the merge insert operation to collect metrics
+    /// but **does not commit the changes**. While data files may be written to storage
+    /// during execution, they will not be referenced by any dataset version and the
+    /// dataset remains unchanged. This is intended for performance analysis only.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The source data stream that would be used in the merge insert
+    ///
+    /// # Errors
+    ///
+    /// Returns Error::NotSupported if the merge insert configuration doesn't support
+    /// the fast path required for plan generation.
+    pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
+        // Check if we can use create_plan
+        if !self.can_use_create_plan(source.schema().as_ref()).await? {
+            return Err(Error::NotSupported {
+                source: "This merge insert configuration does not support analyze_plan. Only upsert operations with full schema, no scalar index, and keeping unmatched rows are supported.".into(),
+                location: location!(),
+            });
+        }
+
+        // Clone self since create_plan consumes the job
+        let cloned_job = self.clone();
+        let plan = cloned_job.create_plan(source).await?;
+
+        // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
+        let options = LanceExecutionOptions::default();
+        let full_analysis = analyze_plan(plan, options).await?;
+
+        // Remove the AnalyzeExec and TracedExec lines from the output
+        let lines: Vec<&str> = full_analysis.lines().collect();
+        let filtered_lines: Vec<&str> = lines
+            .into_iter()
+            .filter(|line| {
+                !line.trim_start().starts_with("AnalyzeExec")
+                    && !line.trim_start().starts_with("TracedExec")
+            })
+            .collect();
+
+        Ok(filtered_lines.join("\n"))
+    }
 }
 
 /// Merger will store these statistics as it runs (for each batch)
@@ -1530,6 +1647,10 @@ pub struct MergeStats {
     ///
     /// See [`MergeInsertBuilder::conflict_retries`] for more information.
     pub num_attempts: u32,
+    /// Total bytes written to storage. This currently only includes data files.
+    pub bytes_written: u64,
+    /// Number of data files written. This currently only includes data files.
+    pub num_files_written: u64,
 }
 
 pub struct UncommittedMergeInsert {
@@ -1813,12 +1934,14 @@ impl Merger {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        types::UInt32Type, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray,
-        UInt32Array,
+        types::{Int32Type, UInt32Type},
+        Int32Array, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::future::try_join_all;
+    use futures::{StreamExt, TryStreamExt};
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
@@ -1833,8 +1956,8 @@ mod tests {
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
         utils::test::{
-            assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
-            ThrottledStoreWrapper,
+            assert_plan_node_equals, assert_string_matches, DatagenExt, FragmentCount,
+            FragmentRowCount, ThrottledStoreWrapper,
         },
     };
 
@@ -3150,7 +3273,6 @@ mod tests {
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
     }
-
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
         use lance_core::utils::testing::MockClock;
@@ -3282,5 +3404,123 @@ mod tests {
             ds_check2.checkout_version(3).await.is_ok(),
             "Version 3 should still exist"
         );
+    }
+
+    #[tokio::test]
+    async fn test_explain_plan() {
+        // Set up test data using lance_datagen
+        let dataset = lance_datagen::gen()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("name", array::cycle_utf8_literals(&["a", "b", "c"]))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+
+        // Create merge insert job
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Test explain_plan with default schema (None)
+        let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
+
+        // Also validate the full string structure with pattern matching
+        let expected_pattern = "\
+MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
+  CoalescePartitionsExec...
+    HashJoinExec...
+      LanceRead...
+      StreamingTableExec: partition_sizes=1, projection=[id, name]";
+        assert_string_matches(&plan, expected_pattern).unwrap();
+
+        // Test with explicit schema
+        let source_schema = arrow_schema::Schema::from(dataset.schema());
+        let explicit_plan = merge_insert_job
+            .explain_plan(Some(&source_schema), false)
+            .await
+            .unwrap();
+        assert_eq!(plan, explicit_plan); // Should be the same as default
+
+        // Test verbose mode produces different (likely longer) output
+        let verbose_plan = merge_insert_job.explain_plan(None, true).await.unwrap();
+        assert!(verbose_plan.contains("MergeInsert"));
+        // Verbose should also match the expected pattern
+        assert_string_matches(&verbose_plan, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_analyze_plan() {
+        // Set up test data using lance_datagen
+        let mut dataset = lance_datagen::gen()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("name", array::cycle_utf8_literals(&["a", "b", "c"]))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+
+        // Capture the original version before analyze_plan
+        let original_version = dataset.version().version;
+
+        // Create merge insert job
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Create source data stream with exact same schema
+        let schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 4])), // 1 matches, 4 is new
+                Arc::new(StringArray::from(vec!["updated_a", "d"])),
+            ],
+        )
+        .unwrap();
+
+        let source_stream = RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async { Ok(source_batch) }).boxed(),
+        );
+
+        // Test analyze_plan
+        let analysis = merge_insert_job
+            .analyze_plan(Box::pin(source_stream))
+            .await
+            .unwrap();
+
+        // Verify the analysis contains expected components
+        assert!(analysis.contains("MergeInsert"));
+        assert!(analysis.contains("metrics"));
+        // Note: AnalyzeExec is no longer in the output
+
+        // Should show execution metrics including new write metrics
+        assert!(analysis.contains("bytes_written"));
+        assert!(analysis.contains("num_files_written"));
+
+        // IMPORTANT: Verify that no new version was created
+        // analyze_plan should not commit the transaction
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            original_version,
+            "analyze_plan should not create a new dataset version"
+        );
+
+        // Also validate the full string structure with pattern matching
+        let expected_pattern = "MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1]
+    ...
+    StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[]";
+        assert_string_matches(&analysis, expected_pattern).unwrap();
+        assert!(analysis.contains("bytes_written"));
+        assert!(analysis.contains("num_files_written"));
+        assert!(analysis.contains("elapsed_compute"));
     }
 }

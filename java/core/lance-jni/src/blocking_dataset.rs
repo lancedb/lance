@@ -14,11 +14,8 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::schema::convert_to_java_field;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
-use crate::utils::{
-    extract_storage_options, extract_write_params, get_index_params, to_java_map, to_rust_map,
-};
+use crate::utils::{extract_storage_options, extract_write_params, get_index_params, to_rust_map};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -253,6 +250,11 @@ impl BlockingDataset {
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })
+    }
+
+    pub fn read_transaction(&self) -> Result<Option<Transaction>> {
+        let transaction = RT.block_on(self.inner.read_transaction())?;
+        Ok(transaction)
     }
 
     pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
@@ -759,22 +761,7 @@ fn inner_get_lance_schema<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
         dataset.inner.schema().clone()
     };
-    let jfield_list = env.new_object("java/util/ArrayList", "()V", &[])?;
-    for lance_field in schema.fields.iter() {
-        let java_field = convert_to_java_field(env, lance_field)?;
-        env.call_method(
-            &jfield_list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[JValue::Object(&java_field)],
-        )?;
-    }
-    let metadata = to_java_map(env, &schema.metadata)?;
-    Ok(env.new_object(
-        "com/lancedb/lance/schema/LanceSchema",
-        "(Ljava/util/List;Ljava/util/Map;)V",
-        &[JValue::Object(&jfield_list), JValue::Object(&metadata)],
-    )?)
+    schema.into_java(env)
 }
 
 #[no_mangle]

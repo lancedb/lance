@@ -18,6 +18,7 @@ import com.lancedb.lance.FragmentMetadata;
 import org.apache.arrow.util.Preconditions;
 
 import java.util.List;
+import java.util.Objects;
 
 public class Append implements Operation {
 
@@ -27,6 +28,14 @@ public class Append implements Operation {
     Preconditions.checkArgument(
         fragments != null && !fragments.isEmpty(), "fragments cannot be null or empty");
     this.fragments = fragments;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    Append that = (Append) o;
+    return Objects.equals(fragments, that.fragments);
   }
 
   public List<FragmentMetadata> fragments() {
