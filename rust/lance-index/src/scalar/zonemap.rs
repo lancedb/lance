@@ -49,7 +49,7 @@ const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "zonemap_size";
 
 /// Basic stats about zonemap index
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct ZoneMapStatistics {
     min: ScalarValue,
     max: ScalarValue,
@@ -315,7 +315,13 @@ impl Index for ZoneMapIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        let frag_ids = RoaringBitmap::new();
+        let mut frag_ids = RoaringBitmap::new();
+
+        // Loop through zones and add unique fragment IDs to the bitmap
+        for zone in &self.zones {
+            frag_ids.insert(zone.fragment_id as u32);
+        }
+
         Ok(frag_ids)
     }
 }
@@ -370,7 +376,7 @@ impl ScalarIndex for ZoneMapIndex {
         Ok(SearchResult::AtMost(row_id_tree_map))
     }
 
-    fn can_answer_remap(&self) -> bool {
+    fn can_remap(&self) -> bool {
         false
     }
 
@@ -409,17 +415,47 @@ impl ScalarIndex for ZoneMapIndex {
         _mapping: &HashMap<u64, Option<u64>>,
         _dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        // TODO: Implement remap logic
-        Ok(())
+        Err(Error::InvalidInput {
+            source: "ZoneMapIndex does not support remap".into(),
+            location: location!(),
+        })
     }
 
-    /// Add the new data into the index, creating an updated version of the index in `dest_store`
+    /// Add the new data , creating an updated version of the index in `dest_store`
     async fn update(
         &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        // TODO: Implement update logic
+        // Process the new data to create zones
+        let mut batches_source = new_data;
+        let value_type = batches_source.schema().field(0).data_type().clone();
+
+        let mut builder = ZoneMapIndexBuilder::try_new(
+            ZoneMapIndexBuilderOptions::new(self.max_zonemap_size),
+            value_type,
+        )?;
+
+        builder.train(batches_source).await?;
+
+        // Get the new zones from the builder
+        let new_zone_stats = builder.maps;
+
+        // Combine existing zones with new zones
+        let mut all_zones = self.zones.clone();
+        all_zones.extend(new_zone_stats);
+
+        // Create a new builder with all zones to write them out
+        let mut combined_builder = ZoneMapIndexBuilder::try_new(
+            ZoneMapIndexBuilderOptions::new(self.max_zonemap_size),
+            self.data_type.clone(),
+        )?;
+        combined_builder.maps = all_zones;
+        combined_builder.options.rows_per_zone = self.max_zonemap_size;
+
+        // Write the updated index to dest_store
+        combined_builder.write_index(dest_store).await?;
+
         Ok(())
     }
 }
@@ -526,6 +562,12 @@ impl ZoneMapIndexBuilder {
 
             let mut remaining = batch.num_rows() as usize;
             let mut array_offset: usize = 0;
+
+            // Initialize cur_fragment_id from the first row address if this is the first batch
+            if self.maps.is_empty() && self.cur_zone_offset == 0 {
+                let first_row_addr = row_addrs_array.value(0);
+                self.cur_fragment_id = (first_row_addr >> 32) as u64;
+            }
 
             while remaining > 0 {
                 // Find the next fragment boundary in this batch
@@ -707,6 +749,8 @@ mod tests {
     // Add missing imports for the tests
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::{AnyQuery, MetricsCollector};
+    use crate::Index; // Import Index trait to access calculate_included_frags
+    use roaring::RoaringBitmap; // Import RoaringBitmap for the test
     use std::collections::Bound;
 
     #[tokio::test]
@@ -809,6 +853,77 @@ mod tests {
             expected.insert_range(start..end);
         }
         assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test update - add new data with Float32 values (matching the original data type)
+        let new_data =
+            arrow_array::Float32Array::from_iter_values((0..5000).map(|i| i as f32 / 1000.0));
+        // Create row addresses for fragment 10 (next fragment after 0-9)
+        let new_row_addr =
+            UInt64Array::from_iter_values((0..5000).map(|i| (10u64 << 32) | (i as u64)));
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float32, false), // Match original schema
+            Field::new("_rowaddr", DataType::UInt64, false), // Use _rowaddr as expected by the builder
+        ]));
+        let new_data_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(new_data), Arc::new(new_row_addr)],
+        )
+        .unwrap();
+        let new_data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            new_schema,
+            stream::once(std::future::ready(Ok(new_data_batch))),
+        ));
+
+        // Directly pass the stream with proper row addresses instead of using MockTrainingSource
+        // which would regenerate row addresses starting from 0
+        index
+            .update(new_data_stream, test_store.as_ref())
+            .await
+            .unwrap();
+
+        // Verify the updated index has more zones
+        let updated_index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load updated ZoneMapIndex");
+
+        // Should have original 10 zones + 1 new zone (5000 rows with zone size 5000)
+        assert_eq!(updated_index.zones.len(), 11);
+
+        // Verify the new zone was added
+        let new_zone = &updated_index.zones[10]; // Last zone should be the new one
+        assert_eq!(new_zone.fragment_id, 10); // New fragment ID
+        assert_eq!(new_zone.zone_size, 5000);
+        assert_eq!(new_zone.null_count, 0); // New data has no nulls
+
+        // Test search on updated index - search for null values should still work
+        let query = SargableQuery::Equals(ScalarValue::Float32(None));
+        let result = updated_index
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Should match original 10 zones (with nulls) but not the new zone (no nulls)
+        let mut expected = RowIdTreeMap::new();
+        for fragment_id in 0..10 {
+            let start = (fragment_id as u64) << 32;
+            let end = start + 5000;
+            expected.insert_range(start..end);
+        }
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value that should be in the new zone
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(2.5))); // Value 2500/1000 = 2.5
+        let result = updated_index
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Should match the new zone (fragment 10)
+        let mut expected = RowIdTreeMap::new();
+        let start = (10u64 << 32);
+        let end = start + 5000;
+        expected.insert_range(start..end);
+        assert_eq!(result, SearchResult::AtMost(expected));
     }
 
     #[tokio::test]
@@ -909,6 +1024,10 @@ mod tests {
         );
         assert_eq!(index.data_type, DataType::Int32);
         assert_eq!(index.max_zonemap_size, 100);
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter(0..1)
+        );
 
         // Test search functionality
 
@@ -1082,6 +1201,10 @@ mod tests {
         );
         assert_eq!(index.data_type, DataType::Int64);
         assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter(0..1)
+        );
 
         // TODO: Test search functionality
         // Test search functionality
@@ -1236,6 +1359,10 @@ mod tests {
             );
             assert_eq!(index.data_type, DataType::Int64);
             assert_eq!(index.max_zonemap_size, 5000);
+            assert_eq!(
+                index.calculate_included_frags().await.unwrap(),
+                RoaringBitmap::from_iter(0..3)
+            );
 
             // Verify _rowaddr column values are properly assigned
             let verify_data_stream: SendableRecordBatchStream =
@@ -1398,6 +1525,10 @@ mod tests {
             );
             assert_eq!(index.data_type, DataType::Int64);
             assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE);
+            assert_eq!(
+                index.calculate_included_frags().await.unwrap(),
+                RoaringBitmap::from_iter(0..3)
+            );
         }
 
         //  All fragments are in the same batch
