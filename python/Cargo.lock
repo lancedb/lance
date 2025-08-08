@@ -1111,7 +1111,7 @@ dependencies = [
  "bitflags 2.9.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "lazy_static",
  "lazycell",
  "log",
@@ -2759,7 +2759,7 @@ name = "fsst"
 version = "0.32.2"
 dependencies = [
  "arrow-array",
- "rand 0.8.5",
+ "rand 0.9.1",
 ]
 
 [[package]]
@@ -3685,7 +3685,7 @@ dependencies = [
  "prost 0.12.6",
  "prost 0.13.5",
  "prost-types 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "roaring",
  "serde",
  "serde_json",
@@ -3713,7 +3713,7 @@ dependencies = [
  "getrandom 0.2.16",
  "half",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.1",
 ]
 
 [[package]]
@@ -3740,7 +3740,7 @@ dependencies = [
  "object_store",
  "pin-project",
  "prost 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "roaring",
  "serde_json",
  "snafu",
@@ -3791,7 +3791,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rand_xoshiro",
  "random_word",
 ]
@@ -3826,7 +3826,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "seq-macro",
  "snafu",
  "tokio",
@@ -3912,7 +3912,7 @@ dependencies = [
  "object_store",
  "prost 0.13.5",
  "prost-build 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rayon",
  "roaring",
  "serde",
@@ -3956,7 +3956,7 @@ dependencies = [
  "path_abs",
  "pin-project",
  "prost 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "serde",
  "shellexpand",
  "snafu",
@@ -3982,7 +3982,7 @@ dependencies = [
  "lance-core",
  "log",
  "num-traits",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rayon",
  "tokio",
  "tracing",
@@ -4014,7 +4014,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
- "rand 0.8.5",
+ "rand 0.9.1",
  "rangemap",
  "roaring",
  "serde",
@@ -5226,8 +5226,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -5246,8 +5246,8 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -5280,7 +5280,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -5293,7 +5293,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -5603,11 +5603,11 @@ dependencies = [
 
 [[package]]
 name = "rand_xoshiro"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
+checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
 dependencies = [
- "rand_core 0.6.4",
+ "rand_core 0.9.3",
 ]
 
 [[package]]
@@ -6334,7 +6334,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1961e2ef424c1424204d3a5d6975f934f56b6d50ff5732382d84ebf460e147f7"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
