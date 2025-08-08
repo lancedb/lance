@@ -16,6 +16,7 @@ package com.lancedb.lance.fragment;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
+import java.util.Objects;
 
 public class DeletionFile implements Serializable {
   private static final long serialVersionUID = 3786348766842875859L;
@@ -46,6 +47,17 @@ public class DeletionFile implements Serializable {
 
   public DeletionFileType getFileType() {
     return fileType;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    DeletionFile that = (DeletionFile) o;
+    return id == that.id
+        && readVersion == that.readVersion
+        && fileType == that.fileType
+        && Objects.equals(numDeletedRows, that.numDeletedRows);
   }
 
   @Override

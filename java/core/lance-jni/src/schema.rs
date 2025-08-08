@@ -1,11 +1,33 @@
 use crate::error::{Error, Result};
+use crate::traits::IntoJava;
 use crate::utils::to_java_map;
 use arrow::datatypes::DataType;
 use arrow_schema::{TimeUnit, UnionFields};
 use jni::objects::{JObject, JValue};
 use jni::sys::{jboolean, jint};
 use jni::JNIEnv;
-use lance_core::datatypes::{Field, StorageClass};
+use lance_core::datatypes::{Field, Schema, StorageClass};
+
+impl IntoJava for Schema {
+    fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
+        let jfield_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+        for lance_field in self.fields.iter() {
+            let java_field = convert_to_java_field(env, lance_field)?;
+            env.call_method(
+                &jfield_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&java_field)],
+            )?;
+        }
+        let metadata = to_java_map(env, &self.metadata)?;
+        Ok(env.new_object(
+            "com/lancedb/lance/schema/LanceSchema",
+            "(Ljava/util/List;Ljava/util/Map;)V",
+            &[JValue::Object(&jfield_list), JValue::Object(&metadata)],
+        )?)
+    }
+}
 
 pub fn convert_to_java_field<'local>(
     env: &mut JNIEnv<'local>,

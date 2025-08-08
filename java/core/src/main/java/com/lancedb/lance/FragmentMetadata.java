@@ -21,15 +21,16 @@ import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
 import java.util.List;
+import java.util.Objects;
 
 /** Metadata of a Fragment in the dataset. Matching to lance Fragment. */
 public class FragmentMetadata implements Serializable {
   private static final long serialVersionUID = -5886811251944130460L;
-  private int id;
-  private List<DataFile> files;
-  private long physicalRows;
-  private DeletionFile deletionFile;
-  private RowIdMeta rowIdMeta;
+  private final int id;
+  private final List<DataFile> files;
+  private final long physicalRows;
+  private final DeletionFile deletionFile;
+  private final RowIdMeta rowIdMeta;
 
   public FragmentMetadata(
       int id,
@@ -77,6 +78,22 @@ public class FragmentMetadata implements Serializable {
 
   public RowIdMeta getRowIdMeta() {
     return rowIdMeta;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    FragmentMetadata that = (FragmentMetadata) o;
+    return id == that.id
+        && physicalRows == that.physicalRows
+        && Objects.equals(this.files, that.files)
+        && Objects.equals(deletionFile, that.deletionFile)
+        && Objects.equals(rowIdMeta, that.rowIdMeta);
   }
 
   @Override

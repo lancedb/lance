@@ -60,36 +60,36 @@ public class TransactionTest {
       assertEquals(testDataset.getSchema(), dataset.getSchema());
       List<Field> fieldList = new ArrayList<>(testDataset.getSchema().getFields());
       Collections.reverse(fieldList);
-      Transaction txn =
+      Transaction txn1 =
           dataset
               .newTransactionBuilder()
               .operation(Project.builder().schema(new Schema(fieldList)).build())
               .build();
-      assertEquals(1, txn.readVersion());
-      assertEquals(1, dataset.version());
-      try (Dataset committedDataset = txn.commit()) {
-        assertEquals(1, txn.readVersion());
+      try (Dataset committedDataset = txn1.commit()) {
+        assertEquals(1, txn1.readVersion());
         assertEquals(1, dataset.version());
         assertEquals(2, committedDataset.version());
         assertEquals(new Schema(fieldList), committedDataset.getSchema());
         fieldList.remove(1);
-        txn =
+        Transaction txn2 =
             committedDataset
                 .newTransactionBuilder()
                 .operation(Project.builder().schema(new Schema(fieldList)).build())
                 .build();
-        try (Dataset committedDataset2 = txn.commit()) {
-          assertEquals(2, txn.readVersion());
+        try (Dataset committedDataset2 = txn2.commit()) {
+          assertEquals(2, txn2.readVersion());
           assertEquals(2, committedDataset.version());
           assertEquals(3, committedDataset2.version());
           assertEquals(new Schema(fieldList), committedDataset2.getSchema());
+          assertEquals(txn1, committedDataset.readTransaction().orElse(null));
+          assertEquals(txn2, committedDataset2.readTransaction().orElse(null));
         }
       }
     }
   }
 
   @Test
-  void testAppend(@TempDir Path tempDir) throws Exception {
+  void testAppend(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("testAppend").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -103,7 +103,9 @@ public class TransactionTest {
               .newTransactionBuilder()
               .operation(
                   Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
+      assertEquals("value", transaction.transactionProperties().get("key"));
       try (Dataset dataset = transaction.commit()) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
@@ -117,6 +119,7 @@ public class TransactionTest {
                     .build()
                     .commit()
                     .close());
+        assertEquals(transaction, dataset.readTransaction().orElse(null));
       }
     }
   }
@@ -165,7 +168,9 @@ public class TransactionTest {
                       .schema(testDataset.getSchema())
                       .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
                       .build())
+              .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
+      assertEquals("value", transaction.transactionProperties().get("key"));
       try (Dataset dataset = transaction.commit()) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
@@ -177,6 +182,7 @@ public class TransactionTest {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
         }
+        assertEquals(transaction, dataset.readTransaction().orElse(null));
       }
     }
   }

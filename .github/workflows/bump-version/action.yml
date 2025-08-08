@@ -1,81 +1,47 @@
-name: Bump version for releases
-description: "Call bumpversion"
+name: Bump version using bump-my-version
+description: "Automated version bumping using bump-my-version tool"
 inputs:
-  part:
-    description: "What kind of release is this?"
+  bump_type:
+    description: "Type of version bump (major, minor, patch)"
     required: true
-    default: "release"
+    default: "patch"
+  dry_run:
+    description: "Perform a dry run without making changes"
+    required: false
+    default: "false"
 runs:
   using: "composite"
   steps:
-    - name: Set git configs for bumpversion
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
       shell: bash
       run: |
-        git config user.name 'Lance Release'
+        pip install bump-my-version
+    
+    - name: Set git configs
+      shell: bash
+      run: |
+        git config user.name 'Lance Release Bot'
         git config user.email 'lance-dev@lancedb.com'
-    - name: Create release version and tags
-      working-directory: python
+    
+    - name: Run version bump
       shell: bash
       run: |
-        cargo install cargo-bump
-        cargo bump ${{ inputs.part }}
-    - name: Synchronize rust version
-      shell: bash
-      run: |
-        cargo install cargo-workspaces --version 0.2.44
-        cargo ws version --no-git-commit -y --exact --force 'lance*' ${{ inputs.part }}
-    - name: Update python lockfile
-      working-directory: python
-      shell: bash
-      run: |
-        cargo update -p lance
-    - name: Bump lance-jni version
-      working-directory: java/core/lance-jni
-      shell: bash
-      run: |
-        cargo bump ${{ inputs.part }}
-    - name: Update lance-jni lockfile
-      working-directory: java/core/lance-jni
-      shell: bash
-      run: |
-        cargo update -p lance
-    - name: Bump java version
-      working-directory: java
-      shell: bash
-      run: |
-        # Get current version
-        current_version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
-        current_version=${current_version%%}
-
-        base_version="${current_version%-*}"
-        if [[ "$current_version" == *-* ]]; then
-          suffix="-${current_version#*-}"
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          python ci/bump_version.py ${{ inputs.bump_type }} --dry-run
         else
-          suffix=""
+          python ci/bump_version.py ${{ inputs.bump_type }}
         fi
-
-        # Split the version into components using parameter expansion
-        IFS=. read major minor patch <<<"$base_version"
-
-        case "${{ inputs.part }}" in
-          patch)
-            patch=$((patch + 1))
-            ;;
-          minor)
-            minor=$((minor + 1))
-            patch=0
-            ;;
-          major)
-            major=$((major + 1))
-            minor=0
-            patch=0
-            ;;
-          *)
-            echo "Invalid part specified"
-            exit 1
-            ;;
-        esac
-
-        new_version="${major}.${minor}.${patch}${suffix}"
-
-        mvn versions:set versions:commit -DnewVersion=$new_version
+    
+    - name: Show changes
+      shell: bash
+      run: |
+        echo "## Version changes:"
+        git diff --name-only
+        echo ""
+        echo "## Detailed changes:"
+        git diff --stat

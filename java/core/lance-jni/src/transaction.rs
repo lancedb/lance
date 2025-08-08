@@ -1,7 +1,7 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{import_vec, FromJObjectWithEnv, IntoJava};
-use crate::utils::to_rust_map;
+use crate::utils::{to_java_map, to_rust_map};
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use jni::objects::{JMap, JObject, JString, JValue};
@@ -9,6 +9,156 @@ use jni::JNIEnv;
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance_core::datatypes::Schema as LanceSchema;
 use std::sync::Arc;
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReadTransaction<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_read_transaction(&mut env, java_dataset))
+}
+
+fn inner_read_transaction<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let transaction = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.read_transaction()?
+    };
+
+    let transaction = match transaction {
+        Some(transaction) => convert_to_java_transaction(env, transaction, &java_dataset)?,
+        None => JObject::null(),
+    };
+    Ok(transaction)
+}
+
+fn convert_to_java_transaction<'local>(
+    env: &mut JNIEnv<'local>,
+    transaction: Transaction,
+    java_dataset: &JObject,
+) -> Result<JObject<'local>> {
+    let uuid = env.new_string(transaction.uuid)?;
+    let transaction_properties = match transaction.transaction_properties {
+        Some(properties) => to_java_map(env, &properties)?,
+        _ => JObject::null(),
+    };
+    let operation = convert_to_java_operation_inner(env, transaction.operation)?;
+    let blobs_op = convert_to_java_operation(env, transaction.blobs_op)?;
+
+    let java_transaction = env.new_object(
+        "com/lancedb/lance/Transaction",
+        "(Lcom/lancedb/lance/Dataset;JLjava/lang/String;Lcom/lancedb/lance/operation/Operation;Lcom/lancedb/lance/operation/Operation;Ljava/util/Map;Ljava/util/Map;)V",
+        &[
+            JValue::Object(java_dataset),
+            JValue::Long(transaction.read_version as i64),
+            JValue::Object(&uuid),
+            JValue::Object(&operation),
+            JValue::Object(&blobs_op),
+            JValue::Object(&JObject::null()),
+            JValue::Object(&transaction_properties),
+        ],
+    )?;
+    Ok(java_transaction)
+}
+
+fn convert_to_java_operation<'local>(
+    env: &mut JNIEnv<'local>,
+    operation: Option<Operation>,
+) -> Result<JObject<'local>> {
+    let operation = match operation {
+        Some(operation) => convert_to_java_operation_inner(env, operation)?,
+        None => JObject::null(),
+    };
+    Ok(operation)
+}
+
+fn convert_to_java_operation_inner<'local>(
+    env: &mut JNIEnv<'local>,
+    operation: Operation,
+) -> Result<JObject<'local>> {
+    match operation {
+        Operation::Append {
+            fragments: rust_fragments,
+        } => {
+            let java_fragments = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for fragment in rust_fragments {
+                let java_fragment = fragment.into_java(env)?;
+                env.call_method(
+                    &java_fragments,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&java_fragment)],
+                )?;
+            }
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/Append",
+                "(Ljava/util/List;)V",
+                &[JValue::Object(&java_fragments)],
+            )?)
+        }
+        Operation::Overwrite {
+            fragments: rust_fragments,
+            schema,
+            config_upsert_values,
+        } => {
+            let java_fragments = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for fragment in rust_fragments {
+                let java_fragment = fragment.into_java(env)?;
+                env.call_method(
+                    &java_fragments,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&java_fragment)],
+                )?;
+            }
+
+            let java_schema = convert_to_java_schema(env, schema)?;
+            let java_config = match config_upsert_values {
+                Some(config_upsert_values) => to_java_map(env, &config_upsert_values)?,
+                _ => JObject::null(),
+            };
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/Overwrite",
+                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;Ljava/util/Map;)V",
+                &[
+                    JValue::Object(&java_fragments),
+                    JValue::Object(&java_schema),
+                    JValue::Object(&java_config),
+                ],
+            )?)
+        }
+        Operation::Project { schema } => {
+            let java_schema = convert_to_java_schema(env, schema)?;
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/Project",
+                "(Lorg/apache/arrow/vector/types/pojo/Schema;)V",
+                &[JValue::Object(&java_schema)],
+            )?)
+        }
+        _ => unimplemented!(),
+    }
+}
+
+fn convert_to_java_schema<'local>(
+    env: &mut JNIEnv<'local>,
+    schema: LanceSchema,
+) -> Result<JObject<'local>> {
+    let java_schema = schema.into_java(env)?;
+    Ok(env
+        .call_method(
+            &java_schema,
+            "asArrowSchema",
+            "()Lorg/apache/arrow/vector/types/pojo/Schema;",
+            &[],
+        )?
+        .l()?)
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCommitTransaction<'local>(

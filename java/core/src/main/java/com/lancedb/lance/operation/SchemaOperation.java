@@ -18,6 +18,8 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.util.Objects;
+
 /** Schema related base operation. */
 public abstract class SchemaOperation implements Operation {
 
@@ -50,5 +52,13 @@ public abstract class SchemaOperation implements Operation {
     if (cSchema != null) {
       cSchema.close();
     }
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    SchemaOperation that = (SchemaOperation) o;
+    return Objects.equals(schema, that.schema);
   }
 }
