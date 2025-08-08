@@ -173,7 +173,7 @@ impl LanceBuffer {
     pub fn align_with<T>(self) -> Self {
         let alignment = std::mem::align_of::<T>();
         let ptr = self.as_ref().as_ptr();
-        
+
         if ptr.align_offset(alignment) != 0 {
             log::debug!(
                 "Buffer at {:p} is not {}-byte aligned for type {}, copying to aligned buffer",
@@ -616,6 +616,56 @@ mod tests {
         let view_ptr2 = borrow2.as_ref().as_ptr();
 
         assert_ne!(view_ptr, view_ptr2);
+    }
+
+    #[test]
+    fn test_align_with() {
+        // Test that align_with works correctly for misaligned buffers
+
+        // Create a misaligned buffer
+        let mut padded = Vec::with_capacity(9);
+        padded.push(0xFF); // Padding to create misalignment
+        padded.extend_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]);
+
+        let bytes = bytes::Bytes::from(padded);
+        let misaligned = bytes.slice(1..); // Skip first byte to misalign
+
+        // Create LanceBuffer with bytes_per_value=1 (bypasses alignment check)
+        let buffer = LanceBuffer::from_bytes(misaligned, 1);
+
+        // Verify it's misaligned for u32
+        let ptr = buffer.as_ref().as_ptr();
+        assert_ne!(
+            ptr.align_offset(4),
+            0,
+            "Buffer should be misaligned for u32"
+        );
+
+        // Apply align_with
+        let aligned_buffer = buffer.align_with::<u32>();
+
+        // Verify it's now aligned
+        let aligned_ptr = aligned_buffer.as_ref().as_ptr();
+        assert_eq!(
+            aligned_ptr.align_offset(4),
+            0,
+            "Buffer should be aligned after align_with"
+        );
+
+        // Verify data is unchanged
+        assert_eq!(
+            aligned_buffer.as_ref(),
+            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]
+        );
+
+        // Test with u64 alignment
+        let buffer2 = LanceBuffer::from_bytes(bytes.slice(1..), 1);
+        let aligned_u64 = buffer2.align_with::<u64>();
+        assert_eq!(
+            aligned_u64.as_ref().as_ptr().align_offset(8),
+            0,
+            "Should be aligned for u64"
+        );
     }
 
     #[test]
