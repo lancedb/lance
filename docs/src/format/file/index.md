@@ -4,7 +4,7 @@
 
 Each `.lance` file is the container for the actual data.
 
-![Format Overview](../images/format_overview.png)
+![Format Overview](../../images/format_overview.png)
 
 At the tail of the file, `ColumnMetadata` protobuf blocks are used to describe the encoding of the columns in the file.
 
