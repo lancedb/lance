@@ -16,9 +16,9 @@ package com.lancedb.lance.fragment;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
-import java.util.Optional;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.Optional;
 
 public class DataFile implements Serializable {
   private static final long serialVersionUID = -2827710928026343591L;

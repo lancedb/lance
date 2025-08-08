@@ -16,8 +16,8 @@ package com.lancedb.lance.fragment;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
-import java.util.Optional;
 import java.util.Objects;
+import java.util.Optional;
 
 public class DeletionFile implements Serializable {
   private static final long serialVersionUID = 3786348766842875859L;
