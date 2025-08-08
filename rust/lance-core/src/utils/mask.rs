@@ -219,7 +219,7 @@ impl RowIdMask {
         }
     }
 
-    /// Iterate over the row addrs that are selected by the mask
+    /// Iterate over the row ids that are selected by the mask
     ///
     /// This is only possible if there is an allow list and neither the
     /// allow list nor the block list contain any "full fragment" blocks.
@@ -227,7 +227,7 @@ impl RowIdMask {
     /// TODO: We could probably still iterate efficiently even if the block
     /// list contains "full fragment" blocks but that would require some
     /// extra logic.
-    pub fn iter_addrs(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
+    pub fn iter_ids(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
         if let Some(mut allow_iter) = self.allow_list.as_ref().and_then(|list| list.row_ids()) {
             if let Some(block_list) = &self.block_list {
                 if let Some(block_iter) = block_list.row_ids() {
@@ -1135,16 +1135,16 @@ mod tests {
     #[test]
     fn test_iter_ids() {
         let mut mask = RowIdMask::default();
-        assert!(mask.iter_addrs().is_none());
+        assert!(mask.iter_ids().is_none());
 
         // Test with just an allow list
         let mut allow_list = RowIdTreeMap::default();
         allow_list.extend([1, 5, 10].iter().copied());
         mask.allow_list = Some(allow_list);
 
-        let addrs: Vec<_> = mask.iter_addrs().unwrap().collect();
+        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
         assert_eq!(
-            addrs,
+            ids,
             vec![
                 RowAddress::new_from_parts(0, 1),
                 RowAddress::new_from_parts(0, 5),
@@ -1157,9 +1157,9 @@ mod tests {
         block_list.extend([5].iter().copied());
         mask.block_list = Some(block_list);
 
-        let addrs: Vec<_> = mask.iter_addrs().unwrap().collect();
+        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
         assert_eq!(
-            addrs,
+            ids,
             vec![
                 RowAddress::new_from_parts(0, 1),
                 RowAddress::new_from_parts(0, 10)
@@ -1170,13 +1170,13 @@ mod tests {
         let mut block_list = RowIdTreeMap::default();
         block_list.insert_fragment(0);
         mask.block_list = Some(block_list);
-        assert!(mask.iter_addrs().is_none());
+        assert!(mask.iter_ids().is_none());
 
         // Test with full fragment in allow list
         mask.block_list = None;
         let mut allow_list = RowIdTreeMap::default();
         allow_list.insert_fragment(0);
         mask.allow_list = Some(allow_list);
-        assert!(mask.iter_addrs().is_none());
+        assert!(mask.iter_ids().is_none());
     }
 }
