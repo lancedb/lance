@@ -30,4 +30,6 @@ runs:
     - name: Run python tests
       shell: bash
       working-directory: python
-      run: uv run make test
+      run: |
+        # Run tests without trying to reinstall the project
+        uv run --no-project make test

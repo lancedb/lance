@@ -47,4 +47,4 @@ jobs:
       shell: bash
       working-directory: notebooks
       run: |
-        uv run jupyter nbconvert --to notebook --execute quickstart.ipynb
+        uv run --no-project jupyter nbconvert --to notebook --execute quickstart.ipynb
