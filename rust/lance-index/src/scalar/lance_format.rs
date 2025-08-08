@@ -7,10 +7,10 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
-use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use async_trait::async_trait;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
@@ -418,10 +418,12 @@ pub mod tests {
                 RecordBatch::try_new(schema_for_stream.clone(), new_columns).unwrap()
             });
 
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                new_schema,
-                data_with_rowaddr,
-            )))
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    new_schema,
+                    data_with_rowaddr,
+                ),
+            ))
         }
     }
 

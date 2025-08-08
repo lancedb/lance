@@ -17,7 +17,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::datatypes::Field;
-use lance_core::ROW_ADDR;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::metrics::MetricsCollector;
@@ -434,10 +433,6 @@ pub async fn open_scalar_index(
             let btree_index = BTreeIndex::load(index_store, frag_reuse_index, index_cache).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
-        _ => Err(Error::InvalidInput {
-            source: format!("Invalid index type: {:?}", index_type).into(),
-            location: location!(),
-        }),
     }
 }
 
