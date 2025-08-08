@@ -4427,6 +4427,7 @@ dependencies = [
  "prost-build 0.13.5",
  "protobuf-src",
  "rand 0.9.1",
+ "rand_distr 0.5.1",
  "rayon",
  "roaring",
  "rstest",
