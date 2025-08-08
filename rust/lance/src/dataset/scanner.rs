@@ -7418,7 +7418,7 @@ mod test {
 
     #[tokio::test]
     async fn test_filter_to_take() {
-        let mut ds = lance_datagen::gen()
+        let mut ds = lance_datagen::gen_batch()
             .col("idx", array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
             .await
