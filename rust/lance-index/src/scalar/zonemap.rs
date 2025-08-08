@@ -920,7 +920,7 @@ mod tests {
 
         // Should match the new zone (fragment 10)
         let mut expected = RowIdTreeMap::new();
-        let start = (10u64 << 32);
+        let start = 10u64 << 32;
         let end = start + 5000;
         expected.insert_range(start..end);
         assert_eq!(result, SearchResult::AtMost(expected));
