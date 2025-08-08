@@ -129,8 +129,8 @@ async fn load_precomputed_partitions(
                 .values()
                 .iter()
                 .zip(partitions.values().iter())
-                .for_each(|(row_addr, partition)| {
-                    let addr = RowAddress::from(*row_addr);
+                .for_each(|(row_id, partition)| {
+                    let addr = RowAddress::from(*row_id);
                     lookup[addr.fragment_id() as usize][addr.row_offset() as usize] =
                         *partition as i32;
                 });

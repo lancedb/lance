@@ -574,11 +574,11 @@ pub mod tests {
                 .unwrap_or_else(|| panic!("Key {} should exist", key_val));
 
             // Convert RowIdTreeMap to a vector for easier assertion
-            let row_addrs: Vec<u64> = bitmap.row_ids().unwrap().map(u64::from).collect();
+            let row_ids: Vec<u64> = bitmap.row_ids().unwrap().map(u64::from).collect();
 
             // Verify length
             assert_eq!(
-                row_addrs.len(),
+                row_ids.len(),
                 per_bitmap_size as usize,
                 "Bitmap for key {} has wrong size",
                 key_val
@@ -587,8 +587,8 @@ pub mod tests {
             // Verify first few and last few elements
             for i in 0..5.min(per_bitmap_size) {
                 assert!(
-                    row_addrs.contains(&i),
-                    "Bitmap for key {} should contain row_addr {}",
+                    row_ids.contains(&i),
+                    "Bitmap for key {} should contain row_id {}",
                     key_val,
                     i
                 );
@@ -596,8 +596,8 @@ pub mod tests {
 
             for i in (per_bitmap_size - 5)..per_bitmap_size {
                 assert!(
-                    row_addrs.contains(&i),
-                    "Bitmap for key {} should contain row_addr {}",
+                    row_ids.contains(&i),
+                    "Bitmap for key {} should contain row_id {}",
                     key_val,
                     i
                 );
@@ -606,7 +606,7 @@ pub mod tests {
             // Verify exact range
             let expected_range: Vec<u64> = (0..per_bitmap_size).collect();
             assert_eq!(
-                row_addrs, expected_range,
+                row_ids, expected_range,
                 "Bitmap for key {} doesn't contain expected values",
                 key_val
             );
@@ -614,7 +614,7 @@ pub mod tests {
             tracing::info!(
                 "✓ Verified bitmap for key {}: {} rows as expected",
                 key_val,
-                row_addrs.len()
+                row_ids.len()
             );
         }
 

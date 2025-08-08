@@ -152,10 +152,10 @@ pub fn transpose_row_addrs(
 ) -> HashMap<u64, Option<u64>> {
     let old_frag_digests: Vec<FragDigest> = old_fragments.iter().map(|frag| frag.into()).collect();
     let new_frag_digests: Vec<FragDigest> = new_fragments.iter().map(|frag| frag.into()).collect();
-    transpose_row_addrs_from_digest(row_addrs, &old_frag_digests, &new_frag_digests)
+    transpose_row_ids_from_digest(row_addrs, &old_frag_digests, &new_frag_digests)
 }
 
-pub fn transpose_row_addrs_from_digest(
+pub fn transpose_row_ids_from_digest(
     row_addrs: RoaringTreemap,
     old_fragments: &Vec<FragDigest>,
     new_fragments: &[FragDigest],
