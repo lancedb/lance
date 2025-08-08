@@ -17,6 +17,8 @@ import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.operation.Append;
 import com.lancedb.lance.operation.Overwrite;
 import com.lancedb.lance.operation.Project;
+import com.lancedb.lance.operation.Rewrite;
+import com.lancedb.lance.operation.RewriteGroup;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -28,6 +30,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
@@ -183,6 +186,65 @@ public class TransactionTest {
           assertEquals(testDataset.getSchema(), schemaRes);
         }
         assertEquals(transaction, dataset.readTransaction().orElse(null));
+      }
+    }
+  }
+
+  @Test
+  void testRewrite(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testRewrite").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // First, append some data
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta1 = testDataset.createNewFragment(rowCount);
+      FragmentMetadata fragmentMeta2 = testDataset.createNewFragment(rowCount);
+
+      Transaction appendTx =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Append.builder().fragments(Arrays.asList(fragmentMeta1, fragmentMeta2)).build())
+              .build();
+
+      try (Dataset datasetWithData = appendTx.commit()) {
+        assertEquals(2, datasetWithData.version());
+        assertEquals(rowCount * 2, datasetWithData.countRows());
+
+        // Now create a rewrite operation
+        List<RewriteGroup> groups = new ArrayList<>();
+
+        // Create a rewrite group with old fragments and new fragments
+        List<FragmentMetadata> oldFragments = new ArrayList<>();
+        oldFragments.add(fragmentMeta1);
+
+        List<FragmentMetadata> newFragments = new ArrayList<>();
+        FragmentMetadata newFragmentMeta = testDataset.createNewFragment(rowCount);
+        newFragments.add(newFragmentMeta);
+
+        RewriteGroup group =
+            RewriteGroup.builder().oldFragments(oldFragments).newFragments(newFragments).build();
+
+        groups.add(group);
+
+        // Create and commit the rewrite transaction
+        Transaction rewriteTx =
+            datasetWithData
+                .newTransactionBuilder()
+                .operation(Rewrite.builder().groups(groups).build())
+                .build();
+
+        try (Dataset rewrittenDataset = rewriteTx.commit()) {
+          assertEquals(3, rewrittenDataset.version());
+          // The row count should remain the same since we're just rewriting
+          assertEquals(rowCount * 2, rewrittenDataset.countRows());
+
+          // Verify that the transaction was recorded
+          assertEquals(rewriteTx, rewrittenDataset.readTransaction().orElse(null));
+        }
       }
     }
   }

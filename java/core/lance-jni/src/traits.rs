@@ -148,6 +148,9 @@ where
 }
 
 pub fn import_vec<'local>(env: &mut JNIEnv<'local>, obj: &JObject) -> Result<Vec<JObject<'local>>> {
+    if obj.is_null() {
+        return Ok(Vec::new());
+    }
     let size = env.call_method(obj, "size", "()I", &[])?.i()?;
     let mut ret = Vec::with_capacity(size as usize);
     for i in 0..size {
