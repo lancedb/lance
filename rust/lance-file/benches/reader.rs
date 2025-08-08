@@ -154,7 +154,7 @@ fn bench_random_access(c: &mut Criterion) {
         rt.block_on(writer.finish()).unwrap();
 
         let mut indices = (0..data.num_rows() as u32).collect::<Vec<_>>();
-        indices.partial_shuffle(&mut rand::thread_rng(), TAKE_SIZE);
+        indices.partial_shuffle(&mut rand::rng(), TAKE_SIZE);
         indices.truncate(TAKE_SIZE);
         let indices: UInt32Array = indices.into();
 

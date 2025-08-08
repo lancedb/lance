@@ -1109,7 +1109,7 @@ impl Dataset {
     pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
-        let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
+        let ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
         self.take(&ids, projection.clone()).await
     }
 
@@ -3700,7 +3700,7 @@ mod tests {
         let len = new_value.len() as u32;
         let new_batch = RecordBatch::try_new(new_schema.clone(), vec![row_ids, new_value]).unwrap();
         // shuffle new_batch
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut indices: Vec<u32> = (0..len).collect();
         indices.shuffle(&mut rng);
         let indices = arrow_array::UInt32Array::from_iter_values(indices);
@@ -3769,7 +3769,7 @@ mod tests {
         let new_batch =
             RecordBatch::try_new(new_schema.clone(), vec![row_addrs, new_value]).unwrap();
         // shuffle new_batch
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut indices: Vec<u32> = (0..len).collect();
         indices.shuffle(&mut rng);
         let indices = arrow_array::UInt32Array::from_iter_values(indices);
@@ -5676,10 +5676,10 @@ mod tests {
         let mut full_text_count = 0;
         let mut doc_array = (0..4096)
             .map(|_| {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut text = String::with_capacity(4);
-                for _ in 0..rng.gen_range(127..512) {
-                    text.push_str(words[rng.gen_range(0..words.len())]);
+                for _ in 0..rng.random_range(127..512) {
+                    text.push_str(words[rng.random_range(0..words.len())]);
                 }
                 if text.contains("lance search") {
                     lance_search_count += 1;

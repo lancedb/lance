@@ -1139,10 +1139,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_dist_between() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let storage = create_pq_storage().await;
-        let u = rng.gen_range(0..storage.len() as u32);
-        let v = rng.gen_range(0..storage.len() as u32);
+        let u = rng.random_range(0..storage.len() as u32);
+        let v = rng.random_range(0..storage.len() as u32);
         let dist1 = storage.dist_between(u, v);
         let dist2 = storage.dist_between(v, u);
         assert_eq!(dist1, dist2);

@@ -20,7 +20,7 @@ rand.workspace = true
 arrow-array.workspace = true
 test-log.workspace = true
 tokio.workspace = true
-rand_xoshiro = "0.6.0"
+rand_xoshiro = { workspace = true }
 lance-datagen = { workspace = true }
 
 [[example]]

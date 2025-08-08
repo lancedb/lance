@@ -1881,7 +1881,7 @@ mod tests {
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
     };
-    use rand::{seq::SliceRandom, thread_rng};
+    use rand::{rng, seq::SliceRandom};
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -2183,7 +2183,7 @@ mod tests {
         if num_parts > ids.len() as u32 {
             panic!("Not enough ids to break into {num_parts} parts");
         }
-        let mut rng = thread_rng();
+        let mut rng = rng();
         ids.shuffle(&mut rng);
 
         let values_per_part = ids.len() / num_parts as usize;
