@@ -766,7 +766,9 @@ pub(crate) async fn commit_transaction(
 
         // Check against committed transactions from oldest to latest
         for (other_version, other_transaction) in other_transactions.iter().rev() {
-            rebase.check_txn(other_transaction, *other_version)?;
+            rebase
+                .check_txn(other_transaction, *other_version, &dataset)
+                .await?;
         }
 
         transaction = rebase.finish(&dataset).await?;
