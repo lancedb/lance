@@ -17,6 +17,7 @@ import com.lancedb.lance.index.Index;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -33,8 +34,8 @@ public class Rewrite implements Operation {
 
   private Rewrite(
       List<RewriteGroup> groups, List<RewrittenIndex> rewrittenIndices, Index fragReuseIndex) {
-    this.groups = groups;
-    this.rewrittenIndices = rewrittenIndices;
+    this.groups = groups != null ? groups : new ArrayList<>();
+    this.rewrittenIndices = rewrittenIndices != null ? rewrittenIndices : new ArrayList<>();
     this.fragReuseIndex = fragReuseIndex;
   }
 
