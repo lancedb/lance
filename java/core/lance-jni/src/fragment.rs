@@ -16,7 +16,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
-use jni::objects::{JIntArray, JValueGen};
+use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -224,10 +224,11 @@ fn create_fragment<'a>(
 }
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
-const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[IIILjava/lang/Long;)V";
+const DATA_FILE_CONSTRUCTOR_SIG: &str =
+    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;)V";
+    "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFile;Lcom/lancedb/lance/fragment/RowIdMeta;)V";
@@ -243,6 +244,7 @@ impl IntoJava for &DataFile {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
         };
+        let path_base_index = convert_to_java_integer(env, self.path_base_index)?;
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -253,6 +255,7 @@ impl IntoJava for &DataFile {
                 JValueGen::Int(self.file_major_version as i32),
                 JValueGen::Int(self.file_minor_version as i32),
                 JValueGen::Object(&file_size_bytes),
+                JValueGen::Object(&path_base_index),
             ],
         )?)
     }
@@ -283,6 +286,7 @@ impl IntoJava for &DeletionFile {
             None => JObject::null(),
         };
         let file_type = self.file_type.into_java(env)?;
+        let path_base_index = convert_to_java_integer(env, self.path_base_index)?;
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -291,6 +295,7 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
+                JValueGen::Object(&path_base_index),
             ],
         )?)
     }
@@ -417,11 +422,13 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             )?
             .l()?
             .extract_object(env)?;
+        let path_base_index = get_path_base_index(env, self)?;
         Ok(DeletionFile {
             read_version,
             id,
             num_deleted_rows,
             file_type,
+            path_base_index,
         })
     }
 }
@@ -465,6 +472,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             .extract_object(env)?;
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
+        let path_base_index = get_path_base_index(env, self)?;
         Ok(DataFile {
             path,
             fields,
@@ -472,6 +480,40 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
+            path_base_index,
         })
+    }
+}
+
+fn get_path_base_index(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
+    let path_base_index = env
+        .call_method(obj, "getPathBaseIndex", "()Ljava/util/Optional;", &[])?
+        .l()?;
+
+    if env
+        .call_method(&path_base_index, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let inner_value = env
+            .call_method(&path_base_index, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
+        Ok(Some(int_value as u32))
+    } else {
+        Ok(None)
+    }
+}
+
+fn convert_to_java_integer<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<u32>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Integer",
+            "(I)V",
+            &[JValue::Int(base_index as jint)],
+        )?),
+        None => Ok(JObject::null()),
     }
 }
