@@ -165,7 +165,7 @@ impl ScalarIndex for LabelListIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
     }
 
@@ -326,6 +326,14 @@ impl TrainingSource for UnnestTrainingSource {
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
         let source = self.source.scan_unordered_chunks(chunk_size).await?;
+        unnest_chunks(source)
+    }
+
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        let source = self.source.scan_aligned_chunks(chunk_size).await?;
         unnest_chunks(source)
     }
 }
