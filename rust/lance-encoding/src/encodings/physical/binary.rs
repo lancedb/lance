@@ -10,7 +10,7 @@
 //! is needed in the encoding description.
 
 use arrow_array::OffsetSizeTrait;
-use bytemuck::{cast_slice, try_cast_slice};
+use bytemuck::cast_slice;
 use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
 use snafu::location;
@@ -242,16 +242,14 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // `num_values` <= number of values in the chunk.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
-        let data = data.into_iter().next().unwrap();
+        let mut data = data.into_iter().next().unwrap();
 
         if self.bits_per_offset == 64 {
             // offset and at least one value
             assert!(data.len() >= 16);
 
-            // Ensure buffer is aligned for u64 access
-            let data = data.align_with::<u64>();
-            let offsets: &[u64] = try_cast_slice(&data)
-                .expect("casting buffer failed during BinaryMiniBlock decompression");
+            let offsets_buffer = data.borrow_to_typed_slice::<u64>();
+            let offsets = offsets_buffer.as_ref();
 
             let result_offsets = offsets[0..(num_values + 1) as usize]
                 .iter()
@@ -271,10 +269,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             // offset and at least one value
             assert!(data.len() >= 8);
 
-            // Ensure buffer is aligned for u32 access
-            let data = data.align_with::<u32>();
-            let offsets: &[u32] = try_cast_slice(&data)
-                .expect("casting buffer failed during BinaryMiniBlock decompression");
+            let offsets_buffer = data.borrow_to_typed_slice::<u32>();
+            let offsets = offsets_buffer.as_ref();
 
             let result_offsets = offsets[0..(num_values + 1) as usize]
                 .iter()
