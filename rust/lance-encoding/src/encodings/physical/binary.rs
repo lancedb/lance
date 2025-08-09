@@ -10,7 +10,7 @@
 //! is needed in the encoding description.
 
 use arrow_array::OffsetSizeTrait;
-use bytemuck::{cast_slice, try_cast_slice};
+use bytemuck::cast_slice;
 use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
 use snafu::location;
@@ -242,14 +242,14 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // `num_values` <= number of values in the chunk.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
-        let data = data.into_iter().next().unwrap();
+        let mut data = data.into_iter().next().unwrap();
 
         if self.bits_per_offset == 64 {
             // offset and at least one value
             assert!(data.len() >= 16);
 
-            let offsets: &[u64] = try_cast_slice(&data)
-                .expect("casting buffer failed during BinaryMiniBlock decompression");
+            let offsets_buffer = data.borrow_to_typed_slice::<u64>();
+            let offsets = offsets_buffer.as_ref();
 
             let result_offsets = offsets[0..(num_values + 1) as usize]
                 .iter()
@@ -269,8 +269,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             // offset and at least one value
             assert!(data.len() >= 8);
 
-            let offsets: &[u32] = try_cast_slice(&data)
-                .expect("casting buffer failed during BinaryMiniBlock decompression");
+            let offsets_buffer = data.borrow_to_typed_slice::<u32>();
+            let offsets = offsets_buffer.as_ref();
 
             let result_offsets = offsets[0..(num_values + 1) as usize]
                 .iter()
@@ -800,5 +800,121 @@ pub mod tests {
             .column(0)
             .clone();
         check_round_trip_encoding_of_data(vec![arr_large], &test_cases, metadata_explicit).await;
+    }
+
+    #[test]
+    fn test_binary_miniblock_with_misaligned_buffer() {
+        use super::BinaryMiniBlockDecompressor;
+        use crate::buffer::LanceBuffer;
+        use crate::compression::MiniBlockDecompressor;
+        use crate::data::DataBlock;
+
+        // Test case 1: u32 offsets
+        {
+            let decompressor = BinaryMiniBlockDecompressor {
+                bits_per_offset: 32,
+            };
+
+            // Create test data with u32 offsets
+            // BinaryMiniBlock format: all offsets followed by all string data
+            // Need to ensure total size is divisible by 4 for u32
+            let mut test_data = Vec::new();
+
+            // Offsets section (3 offsets for 2 values + 1 end offset)
+            test_data.extend_from_slice(&12u32.to_le_bytes()); // offset to start of strings (after offsets)
+            test_data.extend_from_slice(&15u32.to_le_bytes()); // offset to second string
+            test_data.extend_from_slice(&20u32.to_le_bytes()); // offset to end
+
+            // String data section
+            test_data.extend_from_slice(b"ABCXYZ"); // 6 bytes of string data
+            test_data.extend_from_slice(&[0, 0]); // 2 bytes padding to make total 20 bytes (divisible by 4)
+
+            // Create a misaligned buffer by adding padding and slicing
+            let mut padded = Vec::with_capacity(test_data.len() + 1);
+            padded.push(0xFF); // Padding byte to misalign
+            padded.extend_from_slice(&test_data);
+
+            let bytes = bytes::Bytes::from(padded);
+            let misaligned = bytes.slice(1..); // Skip first byte to create misalignment
+
+            // Create LanceBuffer with bytes_per_value=1 to bypass alignment check
+            let buffer = LanceBuffer::from_bytes(misaligned, 1);
+
+            // Verify the buffer is actually misaligned
+            let ptr = buffer.as_ref().as_ptr();
+            assert_ne!(
+                ptr.align_offset(4),
+                0,
+                "Test setup: buffer should be misaligned for u32"
+            );
+
+            // Decompress with misaligned buffer - should work with borrow_to_typed_slice
+            let result = decompressor.decompress(vec![buffer], 2);
+            assert!(
+                result.is_ok(),
+                "Decompression should succeed with misaligned buffer"
+            );
+
+            // Verify the data is correct
+            if let Ok(DataBlock::VariableWidth(block)) = result {
+                assert_eq!(block.num_values, 2);
+                // Data should be the strings (including padding from the original buffer)
+                assert_eq!(&block.data.as_ref()[..6], b"ABCXYZ");
+            } else {
+                panic!("Expected VariableWidth block");
+            }
+        }
+
+        // Test case 2: u64 offsets
+        {
+            let decompressor = BinaryMiniBlockDecompressor {
+                bits_per_offset: 64,
+            };
+
+            // Create test data with u64 offsets
+            let mut test_data = Vec::new();
+
+            // Offsets section (3 offsets for 2 values + 1 end offset)
+            test_data.extend_from_slice(&24u64.to_le_bytes()); // offset to start of strings (after offsets)
+            test_data.extend_from_slice(&29u64.to_le_bytes()); // offset to second string
+            test_data.extend_from_slice(&40u64.to_le_bytes()); // offset to end (divisible by 8)
+
+            // String data section
+            test_data.extend_from_slice(b"HelloWorld"); // 10 bytes of string data
+            test_data.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // 6 bytes padding to make total 40 bytes (divisible by 8)
+
+            // Create misaligned buffer
+            let mut padded = Vec::with_capacity(test_data.len() + 3);
+            padded.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // 3 bytes padding for misalignment
+            padded.extend_from_slice(&test_data);
+
+            let bytes = bytes::Bytes::from(padded);
+            let misaligned = bytes.slice(3..); // Skip 3 bytes
+
+            let buffer = LanceBuffer::from_bytes(misaligned, 1);
+
+            // Verify misalignment for u64
+            let ptr = buffer.as_ref().as_ptr();
+            assert_ne!(
+                ptr.align_offset(8),
+                0,
+                "Test setup: buffer should be misaligned for u64"
+            );
+
+            // Decompress should succeed
+            let result = decompressor.decompress(vec![buffer], 2);
+            assert!(
+                result.is_ok(),
+                "Decompression should succeed with misaligned u64 buffer"
+            );
+
+            if let Ok(DataBlock::VariableWidth(block)) = result {
+                assert_eq!(block.num_values, 2);
+                // Data should be the strings (including padding from the original buffer)
+                assert_eq!(&block.data.as_ref()[..10], b"HelloWorld");
+            } else {
+                panic!("Expected VariableWidth block");
+            }
+        }
     }
 }
