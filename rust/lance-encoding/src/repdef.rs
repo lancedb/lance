@@ -49,7 +49,7 @@
 //! outer level is null then the validity of the inner levels is irrelevant.  To save space we instead
 //! encode a "level" which is the "depth" of the null.  Let's look at a more complete example:
 //!
-//! Array: [{"middle": {"inner": 1]}}, NULL, {"middle": NULL}, {"middle": {"inner": NULL}}]
+//! Array: [{"middle": {"inner": 1}}, NULL, {"middle": NULL}, {"middle": {"inner": NULL}}]
 //!
 //! In Arrow we would have the following validity arrays:
 //! Outer validity : 1, 0, 1, 1
