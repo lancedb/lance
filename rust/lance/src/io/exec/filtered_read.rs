@@ -954,6 +954,10 @@ impl FilteredReadOptions {
     /// This is the default behavior and you can use the various builder
     /// methods on this type to modify the behavior.
     pub fn basic_full_read(dataset: &Arc<Dataset>) -> Self {
+        Self::new(dataset.full_projection())
+    }
+
+    pub fn new(projection: Projection) -> Self {
         Self {
             scan_range_before_filter: None,
             scan_range_after_filter: None,
@@ -961,7 +965,7 @@ impl FilteredReadOptions {
             batch_size: None,
             fragment_readahead: None,
             fragments: None,
-            projection: dataset.full_projection(),
+            projection,
             refine_filter: None,
             full_filter: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(

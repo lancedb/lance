@@ -25,8 +25,23 @@ use snafu::location;
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
 
-/// Convert A list of ROW ids to a list of row addresses.
-pub(super) async fn row_indices_to_row_addresses(
+/// Convert a list of row offsets to a list of row addresses
+///
+/// A row offset is a 64-bit integer in the range [0, num_rows_in_dataset]
+///
+/// For example, if there are two fragments, each with 100 rows, then the row offset
+/// 150 maps to the address (1, 50), the 50th row in the second fragment
+///
+/// Row offsets are useful for sampling because you don't need to know the ids / addresses
+/// up front (you can just use the range [0, num_rows_in_dataset]) and they can be cheaply
+/// converted to row addresses in a single pass through fragment sizes (which is what this method does)
+///
+/// This method accounts for deletions.  If there is one fragment with 100 rows and rows 50-59 are
+/// deleted then the row offset 70 will map to the address (0, 80) and the row offset 100 will map
+/// to the address (1, 10), assuming the second fragment starts with 10 undeleted rows.
+///
+/// If any offsets are beyond the end of the dataset, they will be mapped to a tombstone row address.
+pub(super) async fn row_offsets_to_row_addresses(
     dataset: &Dataset,
     row_indices: &[u64],
 ) -> Result<Vec<u64>> {
@@ -99,7 +114,7 @@ pub async fn take(
     }
 
     // First, convert the dataset offsets into row addresses
-    let addrs = row_indices_to_row_addresses(dataset, offsets).await?;
+    let addrs = row_offsets_to_row_addresses(dataset, offsets).await?;
 
     let builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),

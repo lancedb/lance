@@ -51,7 +51,7 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use take::row_indices_to_row_addresses;
+use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
@@ -1134,7 +1134,7 @@ impl Dataset {
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
-        let row_addrs = row_indices_to_row_addresses(self, row_indices).await?;
+        let row_addrs = row_offsets_to_row_addresses(self, row_indices).await?;
         blob::take_blobs(self, &row_addrs, column.as_ref()).await
     }
 
