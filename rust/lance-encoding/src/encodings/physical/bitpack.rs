@@ -509,6 +509,10 @@ mod test {
 
         let arrays = vec![Arc::new(Int32Array::from(values)) as Arc<dyn Array>];
 
-        check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
+        // Explicitly disable BSS to ensure bitpacking is tested
+        let mut metadata = HashMap::new();
+        metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+
+        check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
     }
 }

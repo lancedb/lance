@@ -1049,6 +1049,7 @@ mod tests {
                 rle_threshold: Some(0.5), // Lower threshold to trigger RLE more easily
                 compression: None,        // Will use default compression if any
                 compression_level: None,
+                bss: None,
             },
         );
 

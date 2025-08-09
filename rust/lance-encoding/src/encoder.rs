@@ -648,6 +648,7 @@ mod tests {
                 rle_threshold: Some(0.5),
                 compression: Some("lz4".to_string()),
                 compression_level: None,
+                bss: None,
             },
         );
 

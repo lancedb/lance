@@ -26,6 +26,7 @@ pub enum Stat {
     NullCount,
     MaxLength,
     RunCount,
+    BytePositionEntropy,
 }
 
 impl fmt::Debug for Stat {
@@ -38,6 +39,7 @@ impl fmt::Debug for Stat {
             Self::NullCount => write!(f, "NullCount"),
             Self::MaxLength => write!(f, "MaxLength"),
             Self::RunCount => write!(f, "RunCount"),
+            Self::BytePositionEntropy => write!(f, "BytePositionEntropy"),
         }
     }
 }
@@ -110,11 +112,15 @@ impl ComputeStat for FixedWidthDataBlock {
         // compute run count
         let run_count_array = self.run_count();
 
+        // compute byte position entropy
+        let byte_position_entropy = self.byte_position_entropy();
+
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
         info.insert(Stat::BitWidth, max_bit_widths);
         info.insert(Stat::MaxLength, max_len_array);
         info.insert(Stat::RunCount, run_count_array);
+        info.insert(Stat::BytePositionEntropy, byte_position_entropy);
         if let Some(cardinality_array) = cardidinality_array {
             info.insert(Stat::Cardinality, cardinality_array);
         }
@@ -322,7 +328,9 @@ impl GetStat for FixedWidthDataBlock {
 
 impl FixedWidthDataBlock {
     fn max_bit_widths(&mut self) -> Arc<dyn Array> {
-        assert!(self.num_values > 0);
+        if self.num_values == 0 {
+            return Arc::new(UInt64Array::from(vec![0u64]));
+        }
 
         const CHUNK_SIZE: usize = 1024;
 
@@ -403,7 +411,9 @@ impl FixedWidthDataBlock {
     /// This count is used to determine if RLE compression would be effective.
     /// Fewer runs relative to the total number of values indicates better RLE compression potential.
     fn run_count(&mut self) -> Arc<dyn Array> {
-        assert!(self.num_values > 0);
+        if self.num_values == 0 {
+            return Arc::new(UInt64Array::from(vec![0u64]));
+        }
 
         // Inner function to count runs in typed data
         fn count_runs<T: PartialEq + Copy>(slice: &[T]) -> u64 {
@@ -451,6 +461,53 @@ impl FixedWidthDataBlock {
         };
 
         Arc::new(UInt64Array::from(vec![run_count]))
+    }
+
+    /// Calculates entropy for each byte position.
+    /// Returns an array with entropy values for each byte position (scaled by 1000 for integer storage).
+    /// Lower entropy in specific byte positions indicates better suitability for BSS.
+    fn byte_position_entropy(&mut self) -> Arc<dyn Array> {
+        const SAMPLE_SIZE: usize = 64; // Sample more values for better entropy estimation
+
+        // Get sample size (min of data length and SAMPLE_SIZE)
+        let sample_count = (self.num_values as usize).min(SAMPLE_SIZE);
+
+        if sample_count == 0 {
+            // Return empty array for empty data
+            return Arc::new(UInt64Array::from(vec![] as Vec<u64>));
+        }
+
+        let bytes_per_value = (self.bits_per_value / 8) as usize;
+        let mut entropies = Vec::with_capacity(bytes_per_value);
+
+        // Calculate entropy for each byte position
+        for pos in 0..bytes_per_value {
+            let mut byte_counts = [0u32; 256];
+
+            // Count occurrences of each byte value at this position
+            for i in 0..sample_count {
+                let byte_offset = i * bytes_per_value + pos;
+                if byte_offset < self.data.len() {
+                    byte_counts[self.data[byte_offset] as usize] += 1;
+                }
+            }
+
+            // Calculate Shannon entropy for this position
+            let mut entropy = 0.0f64;
+            let total = sample_count as f64;
+
+            for &count in &byte_counts {
+                if count > 0 {
+                    let p = count as f64 / total;
+                    entropy -= p * p.log2();
+                }
+            }
+
+            // Scale by 1000 and store as integer for efficient storage
+            entropies.push((entropy * 1000.0) as u64);
+        }
+
+        Arc::new(UInt64Array::from(entropies))
     }
 }
 
