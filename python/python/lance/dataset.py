@@ -1501,7 +1501,13 @@ class LanceDataset(pa.dataset.Dataset):
         # Indices might have changed
         self._list_indices_res = None
 
-    def delete(self, predicate: Union[str, pa.compute.Expression]):
+    def delete(
+        self,
+        predicate: Union[str, pa.compute.Expression],
+        *,
+        conflict_retries: int = 10,
+        retry_timeout: timedelta = timedelta(seconds=30),
+    ):
         """
         Delete rows from the dataset.
 
@@ -1513,6 +1519,14 @@ class LanceDataset(pa.dataset.Dataset):
         predicate : str or pa.compute.Expression
             The predicate to use to select rows to delete. May either be a SQL
             string or a pyarrow Expression.
+        conflict_retries : int, optional
+            Number of times to retry the operation if there is contention.
+            Default is 10.
+        retry_timeout : timedelta, optional
+            The timeout used to limit retries. This is the maximum time to spend on
+            the operation before giving up. At least one attempt will be made,
+            regardless of how long it takes to complete. Subsequent attempts will be
+            cancelled once this timeout is reached. Default is 30 seconds.
 
         Examples
         --------
@@ -1531,7 +1545,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
-        self._ds.delete(predicate)
+        self._ds.delete(predicate, conflict_retries, retry_timeout)
 
     def insert(
         self,
