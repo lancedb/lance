@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.operation.Append;
+import com.lancedb.lance.operation.Merge;
 import com.lancedb.lance.operation.Overwrite;
 import com.lancedb.lance.operation.Project;
 
@@ -183,6 +184,59 @@ public class TransactionTest {
           assertEquals(testDataset.getSchema(), schemaRes);
         }
         assertEquals(transaction, dataset.readTransaction().orElse(null));
+      }
+    }
+  }
+
+  @Test
+  void testMerge(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testMerge").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      Transaction transaction =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Append.builder().fragments(Collections.singletonList(fragmentMeta)).build())
+              .build();
+      try (Dataset dataset = transaction.commit()) {
+        assertEquals(2, dataset.version());
+        assertEquals(rowCount, dataset.countRows());
+
+        Schema newSchema = testDataset.getSchema();
+        FragmentMetadata newFragmentMeta = testDataset.createNewFragment(rowCount);
+
+        Transaction mergeTransaction =
+            dataset
+                .newTransactionBuilder()
+                .operation(
+                    Merge.builder()
+                        .fragments(Collections.singletonList(newFragmentMeta))
+                        .schema(newSchema)
+                        .build())
+                .transactionProperties(Collections.singletonMap("key", "value"))
+                .build();
+        assertEquals("value", mergeTransaction.transactionProperties().get("key"));
+        try (Dataset mergedDataset = mergeTransaction.commit()) {
+          assertEquals(3, mergedDataset.version());
+          assertEquals(3, mergedDataset.latestVersion());
+          assertEquals(rowCount, mergedDataset.countRows());
+
+          assertEquals(newSchema, mergedDataset.getSchema());
+
+          Fragment fragment = mergedDataset.getFragments().get(0);
+          try (LanceScanner scanner = fragment.newScan()) {
+            Schema schemaRes = scanner.schema();
+            assertEquals(newSchema, schemaRes);
+          }
+
+          assertEquals(mergeTransaction, mergedDataset.readTransaction().orElse(null));
+        }
       }
     }
   }
