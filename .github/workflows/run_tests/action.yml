@@ -16,15 +16,21 @@ runs:
       working-directory: python
       shell: bash
       run: |
-        pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
+        # Create a clean virtual environment
+        uv venv --seed
+        # Install the pre-built wheel with all extras
+        # This will automatically pull in all dependencies
+        uv pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
     - name: Install torch
       working-directory: python
       shell: bash
       if: inputs.skip-torch == 'false'
       run: |
-        # Install cpu only pytorch
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
+        # Install cpu only pytorch with proper index strategy
+        uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
     - name: Run python tests
       shell: bash
       working-directory: python
-      run: make test
+      run: |
+        # Run tests without trying to reinstall the project
+        uv run --no-project make test
