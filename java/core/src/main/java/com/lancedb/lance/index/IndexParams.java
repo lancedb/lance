@@ -29,6 +29,16 @@ public class IndexParams {
     this.vectorIndexParams = builder.vectorIndexParams;
   }
 
+  /**
+   * Creates an empty IndexParams instance with default values. This is useful for non-vector index
+   * types where IndexParams can be empty.
+   *
+   * @return an empty IndexParams instance
+   */
+  public static IndexParams empty() {
+    return new Builder().build();
+  }
+
   public static class Builder {
     private DistanceType distanceType = DistanceType.L2;
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
