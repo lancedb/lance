@@ -329,6 +329,14 @@ impl LanceFileWriter {
     }
 }
 
+impl Drop for LanceFileWriter {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner_lock() {
+            RT.runtime.block_on(inner.abort());
+        }
+    }
+}
+
 fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
     let mut parts = path.parts().collect::<Vec<_>>();
     if parts.is_empty() {
