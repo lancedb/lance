@@ -16,7 +16,7 @@ use crate::index::{
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -359,9 +359,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
+            (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat) => IndexType::IvfHnswFlat,
+            (sub_index_type, quantization_type) => {
+                unimplemented!(
+                    "unsupported index type: {}, {}",
+                    sub_index_type,
+                    quantization_type
+                )
+            }
         }
     }
 
@@ -447,7 +455,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
     }
 
-    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
         let dt = if self.distance_type == DistanceType::Cosine {
             DistanceType::L2
         } else {
@@ -639,6 +647,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::bq::RQBuildParams;
 
     use crate::index::{vector::is_ivf_hnsw, DatasetIndexInternalExt};
     use crate::utils::test::copy_test_data_to_tmp;
@@ -1366,6 +1375,30 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
         let params = VectorIndexParams::with_ivf_sq_params(distance_type, ivf_params, sq_params);
+        test_index(params.clone(), nlist, recall_requirement, None).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
+        test_remap(params.clone(), nlist).await;
+        test_optimize_strategy(params).await;
+    }
+
+    // RQ doesn't perform well for random data
+    // need to verify recall with real-world dataset (e.g. sift1m)
+    #[rstest]
+    #[case(1, DistanceType::L2, 0.6)]
+    #[case(1, DistanceType::Dot, 0.6)]
+    #[case(4, DistanceType::L2, 0.6)]
+    #[case(4, DistanceType::Dot, 0.6)]
+    #[tokio::test]
+    async fn test_build_ivf_rq(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let rq_params = RQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;

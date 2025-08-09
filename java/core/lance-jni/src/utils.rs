@@ -116,6 +116,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             refine_factor,
             metric_type: distance_type,
             use_index,
+            dist_q_c: 0.0,
         })
     })?;
 
