@@ -688,12 +688,12 @@ async fn rewrite_files(
     scanner
         .with_fragments(fragments.clone())
         .scan_in_order(true);
-    let (row_ids, reader) = if needs_remapping {
-        let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
+    let (row_addrs, reader) = if needs_remapping {
+        let row_addrs = Arc::new(RwLock::new(RoaringTreemap::new()));
         scanner.with_row_address();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let data_no_row_ids = make_rowaddr_capture_stream(row_ids.clone(), data)?;
-        (Some(row_ids), data_no_row_ids)
+        let data_no_row_ids = make_rowaddr_capture_stream(row_addrs.clone(), data)?;
+        (Some(row_addrs), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         (None, data)
@@ -742,25 +742,26 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let (row_id_map, changed_row_addrs) = if let Some(row_ids) = row_ids {
-        let row_ids = Arc::try_unwrap(row_ids)
-            .expect("Row ids lock still owned")
+    let (row_addr_map, changed_row_addrs) = if let Some(row_addrs) = row_addrs {
+        let row_addrs = Arc::try_unwrap(row_addrs)
+            .expect("Row addrs lock still owned")
             .into_inner()
-            .expect("Row ids mutex still locked");
+            .expect("Row addrs mutex still locked");
 
         log::info!(
-            "Compaction task {}: reserving fragment ids and transposing row ids",
+            "Compaction task {}: reserving fragment ids and transposing row addrs",
             task_id
         );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
         if options.defer_index_remap {
-            let mut changed_row_addrs = Vec::with_capacity(row_ids.serialized_size());
-            row_ids.serialize_into(&mut changed_row_addrs)?;
+            let mut changed_row_addrs = Vec::with_capacity(row_addrs.serialized_size());
+            row_addrs.serialize_into(&mut changed_row_addrs)?;
             (None, Some(changed_row_addrs))
         } else {
-            let row_id_map = remapping::transpose_row_ids(row_ids, &fragments, &new_fragments);
-            (Some(row_id_map), None)
+            let row_addr_map =
+                remapping::transpose_row_addrs(row_addrs, &fragments, &new_fragments);
+            (Some(row_addr_map), None)
         }
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
@@ -795,7 +796,7 @@ async fn rewrite_files(
         new_fragments,
         read_version: dataset.manifest.version,
         original_fragments: task.fragments,
-        row_id_map,
+        row_id_map: row_addr_map,
         changed_row_addrs,
     })
 }
@@ -971,7 +972,7 @@ mod tests {
     use self::remapping::RemappedIndex;
     use super::*;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
-    use crate::dataset::optimize::remapping::{transpose_row_ids, transpose_row_ids_from_digest};
+    use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
     use crate::dataset::WriteDestination;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
@@ -1227,7 +1228,7 @@ mod tests {
         assert_eq!(plan.tasks().len(), 0);
     }
 
-    fn row_ids(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
+    fn row_addrs(frag_idx: u32, offsets: Range<u32>) -> Range<u64> {
         let start = RowAddress::new_from_parts(frag_idx, offsets.start);
         let end = RowAddress::new_from_parts(frag_idx, offsets.end);
         start.into()..end.into()
@@ -1324,22 +1325,22 @@ mod tests {
             &[
                 vec![
                     // 3 small fragments are rewritten to frags 7 & 8
-                    (row_ids(0, 0..400), true),
-                    (row_ids(1, 0..400), true),
-                    (row_ids(2, 0..200), true),
+                    (row_addrs(0, 0..400), true),
+                    (row_addrs(1, 0..400), true),
+                    (row_addrs(2, 0..200), true),
                 ],
-                vec![(row_ids(2, 200..400), true)],
+                vec![(row_addrs(2, 200..400), true)],
                 // frag 3 is skipped since it does not have enough missing data
                 // Frags 4, 5, and 6 are rewritten to frags 9 & 10
                 vec![
                     // Only 800 of the 1000 rows taken from frag 4
-                    (row_ids(4, 0..200), true),
-                    (row_ids(4, 200..400), false),
-                    (row_ids(4, 400..1000), true),
+                    (row_addrs(4, 0..200), true),
+                    (row_addrs(4, 200..400), false),
+                    (row_addrs(4, 400..1000), true),
                     // frags 5 compacted with frag 4
-                    (row_ids(5, 0..200), true),
+                    (row_addrs(5, 0..200), true),
                 ],
-                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
             ],
             first_new_frag_idx,
         );
@@ -1347,19 +1348,19 @@ mod tests {
             &[
                 // Frags 4, 5, and 6 are rewritten to frags 7 & 8
                 vec![
-                    (row_ids(4, 0..200), true),
-                    (row_ids(4, 200..400), false),
-                    (row_ids(4, 400..1000), true),
-                    (row_ids(5, 0..200), true),
+                    (row_addrs(4, 0..200), true),
+                    (row_addrs(4, 200..400), false),
+                    (row_addrs(4, 400..1000), true),
+                    (row_addrs(5, 0..200), true),
                 ],
-                vec![(row_ids(5, 200..300), true), (row_ids(6, 0..300), true)],
+                vec![(row_addrs(5, 200..300), true), (row_addrs(6, 0..300), true)],
                 // 3 small fragments rewritten to frags 9 & 10
                 vec![
-                    (row_ids(0, 0..400), true),
-                    (row_ids(1, 0..400), true),
-                    (row_ids(2, 0..200), true),
+                    (row_addrs(0, 0..400), true),
+                    (row_addrs(1, 0..400), true),
+                    (row_addrs(2, 0..200), true),
                 ],
-                vec![(row_ids(2, 200..400), true)],
+                vec![(row_addrs(2, 200..400), true)],
             ],
             first_new_frag_idx,
         );
@@ -1458,8 +1459,8 @@ mod tests {
         let expected_remap = expect_remap(
             &[vec![
                 // 3 small fragments are rewritten entirely
-                (row_ids(0, 0..5000), true),
-                (row_ids(1, 0..5000), true),
+                (row_addrs(0, 0..5000), true),
+                (row_addrs(1, 0..5000), true),
             ]],
             2,
         );
@@ -1887,7 +1888,7 @@ mod tests {
             let changed_row_addrs = RoaringTreemap::deserialize_from(&mut cursor).unwrap();
 
             // Use transpose_row_ids to convert changed_row_addrs to row_id_map
-            let transposed_map = transpose_row_ids(
+            let transposed_map = transpose_row_addrs(
                 changed_row_addrs,
                 &deferred_result.original_fragments,
                 &deferred_result.new_fragments,
