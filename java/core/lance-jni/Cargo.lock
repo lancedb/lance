@@ -3244,10 +3244,11 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "0.32.1"
+version = "0.32.2"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "chrono",
  "env_logger",
  "jni",
  "lance",
@@ -3260,8 +3261,12 @@ dependencies = [
  "lance-linalg",
  "log",
  "object_store",
+ "prost",
+ "prost-types",
+ "roaring",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
