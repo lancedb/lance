@@ -522,7 +522,7 @@ fn get_rq_code(
 ) -> impl Iterator<Item = u8> + '_ {
     codes
         .iter()
-        .skip(id as usize)
+        .skip(id)
         .step_by(num_vectors)
         .copied()
         .exact_size(num_code_bytes)
