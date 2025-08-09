@@ -16,10 +16,11 @@ runs:
       working-directory: python
       shell: bash
       run: |
-        # Create virtual environment and sync dependencies without installing workspace packages
-        uv sync --no-install-workspace --group test --group ray
-        # Then install the pre-built wheel
-        uv pip install $(ls target/wheels/pylance-*.whl)
+        # Create a clean virtual environment
+        uv venv --seed
+        # Install the pre-built wheel with all extras
+        # This will automatically pull in all dependencies
+        uv pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
     - name: Install torch
       working-directory: python
       shell: bash
