@@ -141,6 +141,32 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&java_schema)],
             )?)
         }
+        Operation::Merge {
+            fragments: rust_fragments,
+            schema,
+        } => {
+            let java_fragments = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for fragment in rust_fragments {
+                let java_fragment = fragment.into_java(env)?;
+                env.call_method(
+                    &java_fragments,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&java_fragment)],
+                )?;
+            }
+
+            let java_schema = convert_to_java_schema(env, schema)?;
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/Merge",
+                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;)V",
+                &[
+                    JValue::Object(&java_fragments),
+                    JValue::Object(&java_schema),
+                ],
+            )?)
+        }
         _ => unimplemented!(),
     }
 }
@@ -297,6 +323,20 @@ fn convert_to_rust_operation(
                 fragments,
                 schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
                 config_upsert_values,
+            }
+        }
+        "Merge" => {
+            let fragment_objs = env
+                .call_method(&java_operation, "fragments", "()Ljava/util/List;", &[])?
+                .l()?;
+            let fragment_objs = import_vec(env, &fragment_objs)?;
+            let mut fragments = Vec::with_capacity(fragment_objs.len());
+            for f in fragment_objs {
+                fragments.push(f.extract_object(env)?);
+            }
+            Operation::Merge {
+                fragments,
+                schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
             }
         }
         _ => unimplemented!(),
