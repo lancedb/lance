@@ -245,7 +245,16 @@ public class TransactionTest {
                 "schema_value2", updatedDataset3.getLanceSchema().metadata().get("schema_key2"));
 
             // Test 4: Update field metadata using fieldMetadata
-            Map<Integer, Map<String, String>> fieldMetadata = generateTestFieldConfigMap();
+            Map<Integer, Map<String, String>> fieldMetadata = new HashMap<>();
+            Map<String, String> field0Metadata = new HashMap<>();
+            field0Metadata.put("field0_key1", "field0_value1");
+
+            Map<String, String> field1Metadata = new HashMap<>();
+            field1Metadata.put("field1_key1", "field1_value1");
+            field1Metadata.put("field1_key2", "field1_value2");
+
+            fieldMetadata.put(0, field0Metadata);
+            fieldMetadata.put(1, field1Metadata);
 
             transaction =
                 updatedDataset3
@@ -270,20 +279,6 @@ public class TransactionTest {
         }
       }
     }
-  }
-
-  private static Map<Integer, Map<String, String>> generateTestFieldConfigMap() {
-    Map<Integer, Map<String, String>> fieldMetadata = new HashMap<>();
-    Map<String, String> field0Metadata = new HashMap<>();
-    field0Metadata.put("field0_key1", "field0_value1");
-
-    Map<String, String> field1Metadata = new HashMap<>();
-    field1Metadata.put("field1_key1", "field1_value1");
-    field1Metadata.put("field1_key2", "field1_value2");
-
-    fieldMetadata.put(0, field0Metadata);
-    fieldMetadata.put(1, field1Metadata);
-    return fieldMetadata;
   }
 
   @Test
