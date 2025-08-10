@@ -104,9 +104,6 @@ pub enum BlobsOperation {
     Updated(u64),
 }
 
-#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
-pub struct DataReplacementGroup(pub u64, pub DataFile);
-
 /// An operation on a dataset.
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
@@ -228,6 +225,9 @@ pub enum Operation {
         removed: Vec<MemWal>,
     },
 }
+
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct DataReplacementGroup(pub u64, pub DataFile);
 
 impl std::fmt::Display for Operation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
