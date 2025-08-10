@@ -125,7 +125,7 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
       - name: Generate forward compatibility files
-        run: uv run python python/tests/forward_compat/datagen.py
+        run: uv run --no-project python python/tests/forward_compat/datagen.py
       - name: Run forward compatibility tests (pylance 0.16.0)
         run: |
           # Create a separate venv for testing specific pylance version
