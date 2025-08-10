@@ -32,5 +32,4 @@ runs:
       shell: bash
       working-directory: python
       run: |
-        # Run tests without trying to reinstall the project
-        uv run --no-project make test
+        uv run --no-project pytest -vvv -s --durations=30 python/tests

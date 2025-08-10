@@ -66,21 +66,21 @@ jobs:
           prefix-key: ${{ env.CACHE_PREFIX }}
           cache-targets: false
           cache-workspace-crates: true
-      - name: Install linting tools
-        run: |
-          # Install most dependencies first
-          uv sync --group dev --group test --group ray
-          # Install torch separately with CPU-only index as extra index
-          uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
-      - name: Lint Python
-        run: |
-          uv run ruff format --check --diff python
-          uv run ruff check python
-          uv run pyright
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install linting tools
+        run: |
+          # Install most dependencies first
+          uv sync --no-install-project --group dev --group test --group ray
+          # Install torch separately with CPU-only index as extra index
+          uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Lint Python
+        run: |
+          uv run --no-sync ruff format --check --diff python
+          uv run --no-sync ruff check python
+          uv run --no-sync pyright
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
@@ -88,8 +88,6 @@ jobs:
           cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
-          uv sync --group dev --group test --group ray
-          uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
           uv run maturin develop --locked
       - name: Run doctest
         run: |
