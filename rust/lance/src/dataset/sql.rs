@@ -3,7 +3,7 @@
 
 use crate::datafusion::LanceTableProvider;
 use crate::Dataset;
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
@@ -107,28 +107,6 @@ impl SqlQuery {
     pub fn into_dataframe(self) -> DataFrame {
         self.dataframe
     }
-
-    pub async fn into_explain_plan(
-        self,
-        verbose: bool,
-        analyze: bool,
-    ) -> lance_core::Result<String> {
-        let explained_df = self.dataframe.explain(verbose, analyze)?;
-        let batches = explained_df.collect().await?;
-        let mut lines = Vec::new();
-        for batch in &batches {
-            let column = batch.column(0);
-            let array = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Expected StringArray in 'plan' column for DataFrame.explain");
-            for i in 0..array.len() {
-                lines.push(array.value(i).to_string());
-            }
-        }
-
-        Ok(lines.join("\n"))
-    }
 }
 
 #[cfg(test)]
@@ -230,30 +208,5 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 1);
         pretty_assertions::assert_eq!(results.num_rows(), 1);
         pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 50);
-    }
-
-    #[tokio::test]
-    async fn test_sql_explain_plan() {
-        let mut ds = gen_batch()
-            .col("x", array::step::<Int32Type>())
-            .col("y", array::step_custom::<Int32Type>(0, 2))
-            .into_dataset(
-                "memory://test_sql_explain_plan",
-                FragmentCount::from(2),
-                FragmentRowCount::from(5),
-            )
-            .await
-            .unwrap();
-
-        let builder = ds
-            .sql("SELECT SUM(x) FROM foo WHERE y > 2")
-            .table_name("foo")
-            .build()
-            .await
-            .unwrap();
-
-        let plan = builder.into_explain_plan(true, false).await.unwrap();
-
-        assert!(plan.contains("Aggregate") || plan.contains("SUM"));
     }
 }

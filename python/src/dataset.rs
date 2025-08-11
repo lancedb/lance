@@ -2082,19 +2082,6 @@ impl SqlQuery {
             Box::new(LanceReader::from_stream(dataset_stream));
         Python::with_gil(|py| reader.into_pyarrow(py))
     }
-
-    #[pyo3(signature = (verbose=false, analyze=false))]
-    fn explain_plan(&self, verbose: bool, analyze: bool) -> PyResult<String> {
-        let builder = self.builder.clone();
-        let plan = RT
-            .block_on(None, async move {
-                let query = builder.build().await?;
-                query.into_explain_plan(verbose, analyze).await
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(plan)
-    }
 }
 
 #[pyclass(name = "SqlQueryBuilder", module = "_lib", subclass)]

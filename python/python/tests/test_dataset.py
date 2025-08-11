@@ -3757,13 +3757,32 @@ def test_metadata_cache_size(tmp_path):
     assert zero_cache_size < default_size
 
 
+def test_dataset_sql_explain_analyze(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    query = ds.sql("EXPLAIN SELECT * FROM test WHERE id > 1").table_name("test").build()
+    batch_records = query.to_batch_records()
+    explain_plan = pa.Table.from_batches(batch_records).to_pandas().to_string()
+    assert any(k in explain_plan for k in ("Filter", "full_filter", "refine_filter")), (
+        explain_plan
+    )
+
+    query = (
+        ds.sql("EXPLAIN ANALYZE SELECT * FROM test WHERE id > 1")
+        .table_name("test")
+        .build()
+    )
+    batch_records = query.to_batch_records()
+    analyze_plan = pa.Table.from_batches(batch_records).to_pandas().to_string()
+    assert "Metrics" in analyze_plan
+
+
 def test_dataset_sql(tmp_path: Path):
     table = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
     ds = lance.write_dataset(table, tmp_path / "test")
 
     query = ds.sql("SELECT * FROM test WHERE id > 1").table_name("test").build()
-    explain_plan = query.explain_plan(verbose=True)
-    assert "Filter" in explain_plan
 
     result = query.to_batch_records()
     expected = pa.table({"id": [2, 3], "value": ["b", "c"]})
