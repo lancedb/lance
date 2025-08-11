@@ -474,36 +474,6 @@ mod test {
 
     #[tokio::test]
     async fn test_stable_row_id_after_multiple_deletion_and_compaction() {
-        fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {
-            row_ids
-                .values()
-                .iter()
-                .zip(i_array.values().iter())
-                .map(|(&row_id, &i)| (row_id, i))
-                .collect()
-        }
-
-        async fn scan_rowid_map(dataset: &Dataset) -> HashMap<u64, i32> {
-            let mut scan = dataset.scan();
-            scan.with_row_id();
-            scan.scan_in_order(true);
-            let result = scan.try_into_batch().await.unwrap();
-            let i = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
-            let row_ids = result[ROW_ID]
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-            build_rowid_to_i_map(row_ids, i)
-        }
-
-        async fn compact(dataset: &mut Dataset, target_rows: usize) {
-            let options = CompactionOptions {
-                target_rows_per_fragment: target_rows,
-                ..Default::default()
-            };
-            let _ = compact_files(dataset, options, None).await.unwrap();
-        }
-
         async fn delete(dataset: &mut Dataset, expr: &str) {
             dataset.delete(expr).await.unwrap();
         }
