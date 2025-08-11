@@ -533,6 +533,16 @@ fn convert_to_java_operation_inner<'local>(
                 ],
             )?)
         }
+        Operation::Restore { version } => Ok(env.new_object(
+            "com/lancedb/lance/operation/Restore",
+            "(J)V",
+            &[JValue::Long(version as i64)],
+        )?),
+        Operation::ReserveFragments { num_fragments } => Ok(env.new_object(
+            "com/lancedb/lance/operation/ReserveFragments",
+            "(I)V",
+            &[JValue::Int(num_fragments as i32)],
+        )?),
         _ => unimplemented!(),
     }
 }
@@ -812,6 +822,16 @@ fn convert_to_rust_operation(
                 fragments,
                 schema: convert_schema_from_operation(env, &java_operation, java_dataset.unwrap())?,
             }
+        }
+        "Restore" => {
+            let version = env.call_method(java_operation, "version", "()J", &[])?;
+            let version = version.j()? as u64;
+            return Ok(Operation::Restore { version });
+        }
+        "ReserveFragments" => {
+            let num_fragments = env.call_method(java_operation, "numFragments", "()I", &[])?;
+            let num_fragments = num_fragments.i()? as u32;
+            return Ok(Operation::ReserveFragments { num_fragments });
         }
         _ => unimplemented!(),
     };
