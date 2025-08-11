@@ -17,7 +17,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::datatypes::Field;
-use lance_core::ROW_ADDR;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::metrics::MetricsCollector;
@@ -476,10 +475,6 @@ pub async fn open_scalar_index(
             let btree_index = BTreeIndex::load(index_store, frag_reuse_index, index_cache).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
-        _ => Err(Error::InvalidInput {
-            source: format!("Invalid index type: {:?}", index_type).into(),
-            location: location!(),
-        }),
     }
 }
 
@@ -660,7 +655,7 @@ mod tests {
     use arrow_schema::DataType;
     use futures::TryStreamExt;
     use lance_core::datatypes::Field;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, BatchCount, RowCount};
     use lance_table::format::pb::{
         BTreeIndexDetails, InvertedIndexDetails, NGramIndexDetails, VectorIndexDetails,
     };
@@ -806,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn test_scan_aligned_chunks() {
         // Create test data using lance_datagen
-        let data = gen()
+        let data = lance_datagen::gen_batch()
             .col("values", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
 
@@ -822,7 +817,7 @@ mod tests {
         // Append additional fragments using lance_datagen
         for i in 1..3 {
             let start = i * 10;
-            let additional_data = gen()
+            let additional_data = lance_datagen::gen_batch()
                 .col("values", array::step_custom::<Int32Type>(start, 1))
                 .into_reader_rows(RowCount::from(10), BatchCount::from(1));
 
@@ -836,14 +831,14 @@ mod tests {
         ));
 
         // Test scan_aligned_chunks with different chunk sizes
-        println!("Testing with chunk_size=10:");
+        log::info!("Testing with chunk_size=10:");
         let stream = training_request.scan_aligned_chunks(10).await.unwrap();
 
         // Collect all batches
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
         // Print information about the chunks and verify _rowaddr format
-        println!("Total number of chunks: {}", batches.len());
+        log::info!("Total number of chunks: {}", batches.len());
 
         // Collect all _rowaddr values to analyze fragment distribution
         let mut all_rowaddrs = Vec::new();
@@ -866,16 +861,19 @@ mod tests {
             let last_fragment_id = (last_rowaddr >> 32) as u32;
             let last_local_offset = (last_rowaddr & 0xFFFFFFFF) as u32;
 
-            println!(
+            log::info!(
                 "Chunk {}: {} rows, _rowaddr range: {} to {}",
                 i,
                 batch.num_rows(),
                 first_rowaddr,
                 last_rowaddr
             );
-            println!(
+            log::info!(
                 "  Fragment ID range: {} to {}, Local offset range: {} to {}",
-                first_fragment_id, last_fragment_id, first_local_offset, last_local_offset
+                first_fragment_id,
+                last_fragment_id,
+                first_local_offset,
+                last_local_offset
             );
 
             // Verify each _rowaddr value in this chunk
@@ -930,7 +928,7 @@ mod tests {
         }
 
         // Verify we have multiple fragments
-        println!("Unique fragment IDs: {:?}", fragment_ids);
+        log::info!("Unique fragment IDs: {:?}", fragment_ids);
         assert_eq!(fragment_ids, std::collections::HashSet::from([0, 1, 2]));
 
         // Verify _rowaddr values are properly ordered
@@ -939,7 +937,7 @@ mod tests {
             "_rowaddr values are not properly ordered"
         );
 
-        println!(
+        log::info!(
             "Total _rowaddr values: {}, Unique fragments: {}",
             all_rowaddrs.len(),
             fragment_ids.len()

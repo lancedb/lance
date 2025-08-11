@@ -1383,10 +1383,7 @@ impl DatasetIndexInternalExt for Dataset {
                 },
                 _ => {
                     // inexact index filter
-                    let needs_recheck = match index_type {
-                        ScalarIndexType::ZoneMap => true,
-                        _ => false,
-                    };
+                    let needs_recheck = matches!(index_type, ScalarIndexType::ZoneMap);
                     Box::new(SargableQueryParser::new(index.name.clone(), needs_recheck))
                         as Box<dyn ScalarQueryParser>
                 }

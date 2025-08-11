@@ -10,10 +10,9 @@ use chrono::{Duration, TimeDelta};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::PutMultipartOptions;
 use object_store::{
     Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutOptions, PutPayload, PutResult, Result as OSResult,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OSResult,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -138,7 +137,7 @@ impl ObjectStore for ProxyObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOptions,
+        opts: PutMultipartOpts,
     ) -> OSResult<Box<dyn MultipartUpload>> {
         self.before_method("put_multipart", location)?;
         self.target.put_multipart_opts(location, opts).await
