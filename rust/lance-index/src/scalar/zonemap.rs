@@ -102,6 +102,7 @@ pub struct ZoneMapIndex {
 impl std::fmt::Debug for ZoneMapIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZoneMapIndex")
+            .field("zones", &self.zones)
             .field("data_type", &self.data_type)
             .field("max_zonemap_size", &self.max_zonemap_size)
             .field("store", &self.store)

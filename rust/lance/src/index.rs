@@ -258,10 +258,8 @@ pub(crate) async fn remap_index(
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
             if !scalar_index.can_remap() {
-                return Err(Error::Index {
-                    message: "Index cannot be remapped".to_string(),
-                    location: location!(),
-                });
+                // If the index cannot be remapped, we just return the same index ID.
+                return Ok(*index_id);
             }
 
             match scalar_index.index_type() {

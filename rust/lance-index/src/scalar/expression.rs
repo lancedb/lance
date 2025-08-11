@@ -530,7 +530,7 @@ impl IndexedExpression {
             scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
                 column,
                 index_name,
-                query: query,
+                query,
                 needs_recheck,
             })),
             refine_expr: None,
