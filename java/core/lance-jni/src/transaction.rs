@@ -1,7 +1,6 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava};
-use crate::traits::{import_vec, FromJObjectWithEnv, FromJString, IntoJava};
+use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString, IntoJava};
 use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use arrow::datatypes::Schema;
@@ -18,8 +17,8 @@ use lance_core::datatypes::Schema as LanceSchema;
 use prost::Message;
 use prost_types::Any;
 use roaring::RoaringBitmap;
-use std::io::Cursor;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 use uuid::Uuid;
 
