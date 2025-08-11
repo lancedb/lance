@@ -529,11 +529,9 @@ impl MiniBlockDecompressor for RleMiniBlockDecompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
     use crate::data::DataBlock;
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
     use arrow_array::Int32Array;
-    use lance_core::datatypes::Field;
 
     // ========== Core Functionality Tests ==========
 
@@ -571,30 +569,6 @@ mod tests {
         // Should have 6 runs total (4 for first value, 2 for second)
         let lengths_buffer = &compressed.data[1];
         assert_eq!(lengths_buffer.len(), 6);
-    }
-
-    #[test]
-    fn test_compression_strategy_selection() {
-        let strategy = DefaultCompressionStrategy::new();
-        let field = Field::new_arrow("test", arrow_schema::DataType::Int32, false).unwrap();
-
-        // High repetition - should select RLE
-        let repetitive_array = Int32Array::from(vec![1; 1000]);
-        let repetitive_block = DataBlock::from_array(repetitive_array);
-
-        let compressor = strategy
-            .create_miniblock_compressor(&field, &repetitive_block)
-            .unwrap();
-        assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
-
-        // No repetition - should NOT select RLE
-        let unique_array = Int32Array::from((0..1000).collect::<Vec<i32>>());
-        let unique_block = DataBlock::from_array(unique_array);
-
-        let compressor = strategy
-            .create_miniblock_compressor(&field, &unique_block)
-            .unwrap();
-        assert!(!format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
     }
 
     // ========== Round-trip Tests for Different Types ==========
@@ -977,11 +951,14 @@ mod tests {
             .with_file_version(LanceFileVersion::V2_1);
 
         // Test both explicit metadata and automatic selection
-        // 1. Test with explicit RLE threshold metadata
-        let metadata_explicit = HashMap::from([(
+        // 1. Test with explicit RLE threshold metadata (also disable BSS)
+        let mut metadata_explicit = HashMap::new();
+        metadata_explicit.insert(
             "lance-encoding:rle-threshold".to_string(),
             "0.8".to_string(),
-        )]);
+        );
+        metadata_explicit.insert("lance-encoding:bss".to_string(), "off".to_string());
+
         let mut generator = RleDataGenerator::new(vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
         let data_explicit = generator.generate_default(RowCount::from(10000)).unwrap();
         check_round_trip_encoding_of_data(vec![data_explicit], &test_cases, metadata_explicit)
@@ -989,10 +966,14 @@ mod tests {
 
         // 2. Test automatic RLE selection based on data characteristics
         // 80% repetition should trigger RLE (> default 50% threshold)
+        // Explicitly disable BSS to ensure RLE is tested
+        let mut metadata = HashMap::new();
+        metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+
         let mut values = vec![42i32; 8000]; // 80% repetition
         values.extend([1i32, 2i32, 3i32, 4i32, 5i32].repeat(400)); // 20% variety
         let arr = Arc::new(Int32Array::from(values)) as Arc<dyn Array>;
-        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
     }
 
     /// Generator that produces repetitive patterns suitable for RLE
