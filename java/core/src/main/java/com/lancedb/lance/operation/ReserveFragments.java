@@ -17,7 +17,7 @@ package com.lancedb.lance.operation;
 public class ReserveFragments implements Operation {
   private final int numFragments;
 
-  ReserveFragments(int numFragments) {
+  private ReserveFragments(int numFragments) {
     this.numFragments = numFragments;
   }
 

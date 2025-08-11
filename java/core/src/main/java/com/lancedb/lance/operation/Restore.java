@@ -17,7 +17,7 @@ package com.lancedb.lance.operation;
 public class Restore implements Operation {
   private final long version;
 
-  Restore(long version) {
+  private Restore(long version) {
     this.version = version;
   }
 
