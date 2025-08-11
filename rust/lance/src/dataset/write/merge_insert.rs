@@ -16,20 +16,12 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
-use assign_action::merge_insert_action;
-use futures::FutureExt;
-use std::{
-    collections::{BTreeMap, HashSet},
-    future::Future,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
-
 use arrow_array::{
     cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchIterator, StructArray,
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use assign_action::merge_insert_action;
 use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
@@ -49,6 +41,13 @@ use datafusion::{
     prelude::DataFrame,
     scalar::ScalarValue,
 };
+use futures::FutureExt;
+use std::{
+    collections::{BTreeMap, HashSet},
+    future::Future,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
 use lance_datafusion::{
@@ -58,6 +57,8 @@ use lance_datafusion::{
     utils::reader_to_stream,
 };
 
+use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use crate::dataset::utils::CapturedRowIds;
 use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
@@ -94,13 +95,11 @@ use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::{MemWal, MemWalId};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{Fragment, Index, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
-
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
 
 mod assign_action;
 mod exec;
@@ -1403,9 +1402,15 @@ impl MergeInsertJob {
             },
         );
         let joined = self.create_joined_stream(source).await?;
-        let merger = Merger::try_new(self.params.clone(), source_schema, !is_full_schema)?;
+        let merger = Merger::try_new(
+            self.params.clone(),
+            source_schema,
+            !is_full_schema,
+            self.dataset.manifest.uses_move_stable_row_ids(),
+        )?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
+        let updating_row_ids = merger.updating_row_ids.clone();
         let merger_schema = merger.output_schema().clone();
         let stream = joined
             .and_then(move |batch| merger.clone().execute_batch(batch))
@@ -1448,7 +1453,30 @@ impl MergeInsertJob {
             .await?;
 
             assert!(written.blob.is_none());
-            let new_fragments = written.default.0;
+            let mut new_fragments = written.default.0;
+
+            if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
+                let fragment_sizes = new_fragments
+                    .iter()
+                    .map(|f| f.physical_rows.unwrap() as u64);
+
+                let sequences = lance_table::rowids::rechunk_sequences_for_merge_insert(
+                    [row_id_sequence.clone()],
+                    fragment_sizes,
+                )
+                .map_err(|e| Error::Internal {
+                    message: format!(
+                        "Captured row ids not equal to number of rows written: {}",
+                        e
+                    ),
+                    location: location!(),
+                })?;
+
+                for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                    let serialized = lance_table::rowids::write_row_ids(&sequence);
+                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                }
+            }
 
             // Apply deletions
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
@@ -1667,6 +1695,8 @@ pub struct UncommittedMergeInsert {
 struct Merger {
     // As the merger runs it will update the list of deleted rows
     deleted_rows: Arc<Mutex<RoaringTreemap>>,
+    // A channel to receive row ids that should be updated(marked deleted) from the target table.
+    updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
     // User statistics for merging
@@ -1681,6 +1711,8 @@ struct Merger {
     with_row_addr: bool,
     /// The output schema of the stream.
     output_schema: Arc<Schema>,
+    /// Whether to enable move stable row ids
+    enable_stable_row_ids: bool,
 }
 
 impl Merger {
@@ -1689,6 +1721,7 @@ impl Merger {
         params: MergeInsertParams,
         schema: Arc<Schema>,
         with_row_addr: bool,
+        enable_move_stable_row_ids: bool,
     ) -> Result<Self> {
         let delete_expr = if let WhenNotMatchedBySource::DeleteIf(expr) =
             &params.delete_not_matched_by_source
@@ -1726,6 +1759,7 @@ impl Merger {
 
         Ok(Self {
             deleted_rows: Arc::new(Mutex::new(RoaringTreemap::new())),
+            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_move_stable_row_ids))),
             delete_expr,
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
             match_filter_expr,
@@ -1733,6 +1767,7 @@ impl Merger {
             schema,
             with_row_addr,
             output_schema,
+            enable_stable_row_ids: enable_move_stable_row_ids,
         })
     }
 
@@ -1855,6 +1890,14 @@ impl Merger {
             if matched.num_rows() > 0 {
                 let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
+                if self.enable_stable_row_ids {
+                    let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
+                    self.updating_row_ids
+                        .lock()
+                        .unwrap()
+                        .capture(row_ids.values())?;
+                }
+
                 let projection = if let Some(row_addr_col) = row_addr_col {
                     let mut cols = Vec::from_iter(left_cols.iter().cloned());
                     cols.push(row_addr_col);
@@ -1933,6 +1976,14 @@ impl Merger {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
+        session::Session,
+        utils::test::{
+            assert_plan_node_equals, assert_string_matches, DatagenExt, FragmentCount,
+            FragmentRowCount, ThrottledStoreWrapper,
+        },
+    };
     use arrow_array::{
         types::{Int32Type, UInt32Type},
         Int32Array, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
@@ -1951,15 +2002,6 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
-
-    use crate::{
-        dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
-        session::Session,
-        utils::test::{
-            assert_plan_node_equals, assert_string_matches, DatagenExt, FragmentCount,
-            FragmentRowCount, ThrottledStoreWrapper,
-        },
-    };
 
     use super::*;
 
@@ -2250,6 +2292,210 @@ mod tests {
             .try_build()
             .unwrap();
         check(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_with_fast_path(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(true, false)] enable_move_stable_row_ids: bool,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+            Field::new("filterme", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
+                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            data_storage_version: Some(version),
+            enable_move_stable_row_ids,
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let ds = Arc::new(
+            Dataset::write(batches, test_uri, Some(write_params))
+                .await
+                .unwrap(),
+        );
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
+                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
+                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
+            ],
+        )
+        .unwrap();
+
+        let keys = vec!["key".to_string()];
+
+        // row ids before merge insert (fetch rowid for key 4,5,6)
+        let updating_batch = ds
+            .scan()
+            .filter("key IN (4, 5, 6)")
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids_before = updating_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // upsert, no delete, it matches fast path, so the row ids are not been affected
+        // and the row ids are stable.
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        check(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3],
+            &[4, 5, 6, 7, 8, 9],
+            &[3, 3, 0],
+        )
+        .await;
+
+        // row ids after merge insert (fetch rowid for key 4,5,6)
+        let updated_batch = ds
+            .scan()
+            .filter("key IN (4, 5, 6)")
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids_after = updated_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // verify row ids for key 4,5,6 are unchanged
+        assert_eq!(row_ids_before, row_ids_after);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_upsert_and_delete_all_with_stable_row_id(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(true, false)] enable_move_stable_row_ids: bool,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+            Field::new("filterme", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
+                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            enable_move_stable_row_ids,
+            data_storage_version: Some(version),
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let ds = Arc::new(
+            Dataset::write(batches, test_uri, Some(write_params))
+                .await
+                .unwrap(),
+        );
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
+                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
+                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
+            ],
+        )
+        .unwrap();
+
+        let keys = vec!["key".to_string()];
+
+        // row ids before merge insert (fetch rowid for keys in 4,5,6)
+        let updating_batch = ds
+            .scan()
+            .filter("key IN (4,5,6)")
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids_before = updating_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // upsert, with delete all
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+            .try_build()
+            .unwrap();
+        check(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3]).await;
+
+        // row ids after merge insert (fetch rowid for key = 4,5,6)
+        let ds = Dataset::open(test_uri).await.unwrap();
+        let updated_batch = ds
+            .scan()
+            .filter("key IN (4,5,6)")
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids_after = updated_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // verify row ids for key 4,5,6 is unchanged
+        if enable_move_stable_row_ids {
+            assert_eq!(row_ids_before, row_ids_after);
+        } else {
+            assert_ne!(row_ids_before, row_ids_after);
+        }
     }
 
     #[tokio::test]

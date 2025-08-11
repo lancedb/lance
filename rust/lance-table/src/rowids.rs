@@ -12,7 +12,6 @@
 //! sequences. The on-disk format is designed to align well with the in-memory
 //! representation, to avoid unnecessary deserialization.
 use std::ops::Range;
-
 // TODO: replace this with Arrow BooleanBuffer.
 
 // These are all internal data structures, and are private.
@@ -34,10 +33,9 @@ pub use serde::{read_row_ids, write_row_ids};
 
 use snafu::location;
 
+use crate::utils::LanceIteratorExtension;
 use segment::U64Segment;
 use tracing::instrument;
-
-use crate::utils::LanceIteratorExtension;
 
 /// A sequence of row ids.
 ///
@@ -611,6 +609,87 @@ pub fn rechunk_sequences(
                     let segment = segment_iter.next().ok_or_else(too_many_segments_error)?;
                     sequence.extend(RowIdSequence(vec![segment]));
                     remaining = 0;
+                }
+                (_, _) => {
+                    // Push remaining segment
+                    let segment = segment_iter
+                        .next()
+                        .ok_or_else(too_many_segments_error)?
+                        .slice(segment_offset as usize, remaining_in_segment as usize);
+                    sequence.extend(RowIdSequence(vec![segment]));
+                    segment_offset = 0;
+                    remaining -= remaining_in_segment;
+                }
+            }
+        }
+
+        chunked_sequences.push(sequence);
+    }
+
+    if segment_iter.peek().is_some() {
+        return Err(Error::invalid_input(
+            "Got too few segments for the provided chunk lengths",
+            location!(),
+        ));
+    }
+
+    Ok(chunked_sequences)
+}
+
+/// Here we need to rechunk sequences for a merge insert operation.
+/// The sequences may less than chunk sizes, because the sequences only
+/// contains the row ids that we want to keep, they come from the updates records.
+/// But the chunk sizes are based on the original fragment sizes.
+/// So if the sequences are smaller than the chunk sizes, we need to
+/// assign the incremental row ids.
+pub fn rechunk_sequences_for_merge_insert(
+    sequences: impl IntoIterator<Item = RowIdSequence>,
+    chunk_sizes: impl IntoIterator<Item = u64>,
+) -> Result<Vec<RowIdSequence>> {
+    // TODO: return an iterator. (with a good size hint?)
+    let chunk_size_iter = chunk_sizes.into_iter();
+    let mut chunked_sequences = Vec::with_capacity(chunk_size_iter.size_hint().0);
+    let mut segment_iter = sequences
+        .into_iter()
+        .flat_map(|sequence| sequence.0.into_iter())
+        .peekable();
+
+    let mut segment_offset = 0_u64;
+    for chunk_size in chunk_size_iter {
+        let mut sequence = RowIdSequence(Vec::new());
+        let mut remaining = chunk_size;
+
+        let too_many_segments_error = || {
+            Error::invalid_input(
+                "Got too many segments for the provided chunk lengths",
+                location!(),
+            )
+        };
+
+        while remaining > 0 {
+            let remaining_in_segment = segment_iter
+                .peek()
+                .map_or(0, |segment| segment.len() as u64 - segment_offset);
+            match (remaining_in_segment.cmp(&remaining), remaining_in_segment) {
+                (std::cmp::Ordering::Greater, _) => {
+                    // Can only push part of the segment, we are done with this chunk.
+                    let segment = segment_iter
+                        .peek()
+                        .ok_or_else(too_many_segments_error)?
+                        .slice(segment_offset as usize, remaining as usize);
+                    sequence.extend(RowIdSequence(vec![segment]));
+                    segment_offset += remaining;
+                    remaining = 0;
+                }
+                (_, 0) => {
+                    // Can push the entire segment.
+                    if let Some(segment) = segment_iter.next() {
+                        sequence.extend(RowIdSequence(vec![segment]));
+                        remaining = 0;
+                    } else {
+                        // just break
+                        remaining = 0;
+                    }
                 }
                 (_, _) => {
                     // Push remaining segment
