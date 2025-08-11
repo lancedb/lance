@@ -20,19 +20,15 @@ use datafusion_expr::Accumulator;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::ROW_ADDR;
-use std::env::temp_dir;
 use std::sync::LazyLock;
-use tempfile::{tempdir, TempDir};
 
 use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use futures::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
-use super::{AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
+use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::FragReuseIndex;
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
@@ -40,7 +36,6 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
-use log::debug;
 use roaring::RoaringBitmap;
 use snafu::location;
 const ZONEMAP_DEFAULT_SIZE: usize = 8192; // 1 zone every two batches
@@ -176,12 +171,10 @@ impl ZoneMapIndex {
                     }
                 }))
             }
-            SargableQuery::FullTextSearch(_) => {
-                return Err(Error::NotSupported {
-                    source: "full text search is not supported for zonemap indexes".into(),
-                    location: location!(),
-                });
-            }
+            SargableQuery::FullTextSearch(_) => Err(Error::NotSupported {
+                source: "full text search is not supported for zonemap indexes".into(),
+                location: location!(),
+            }),
         }
     }
 
@@ -245,8 +238,8 @@ impl ZoneMapIndex {
         if data.num_rows() == 0 {
             return Ok(Self {
                 zones: Vec::new(),
-                data_type: data_type,
-                max_zonemap_size: max_zonemap_size,
+                data_type,
+                max_zonemap_size,
                 store,
                 fri,
                 index_cache,
@@ -341,8 +334,7 @@ impl ScalarIndex for ZoneMapIndex {
         let mut cumulative_offset = 0;
 
         // Loop through zones sequentially to calculate offsets efficiently
-        for (i, zone) in self.zones.iter().enumerate() {
-            println!("i={}, zone={:?}", i, zone);
+        for zone in self.zones.iter() {
             // Check if we need to reset cumulative_offset for a new fragment
             if let Some(frag_id) = current_fragment_id {
                 if zone.fragment_id != frag_id {
@@ -359,7 +351,7 @@ impl ScalarIndex for ZoneMapIndex {
             if self.evaluate_zone_against_query(zone, query)? {
                 // Calculate the range of row addresses for this zone
                 // Row addresses are: (fragment_id << 32) + cumulative_offset
-                let zone_start = (zone.fragment_id << 32) as u64 + cumulative_offset as u64;
+                let zone_start = (zone.fragment_id << 32) + cumulative_offset as u64;
                 let zone_end = zone_start + (zone.zone_size as u64);
 
                 // Add all row addresses in this zone to the result
@@ -428,7 +420,7 @@ impl ScalarIndex for ZoneMapIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         // Process the new data to create zones
-        let mut batches_source = new_data;
+        let batches_source = new_data;
         let value_type = batches_source.schema().field(0).data_type().clone();
 
         let mut builder = ZoneMapIndexBuilder::try_new(
@@ -502,11 +494,11 @@ pub struct ZoneMapIndexBuilder {
 }
 
 impl ZoneMapIndexBuilder {
-    fn try_new(options: ZoneMapIndexBuilderOptions, items_type: DataType) -> Result<Self> {
+    pub fn try_new(options: ZoneMapIndexBuilderOptions, items_type: DataType) -> Result<Self> {
         let min = MinAccumulator::try_new(&items_type)?;
         let max = MaxAccumulator::try_new(&items_type)?;
         Ok(Self {
-            options: options.clone(),
+            options,
             items_type,
             maps: Vec::new(),
             cur_zone_offset: 0,
@@ -529,10 +521,10 @@ impl ZoneMapIndexBuilder {
             min: self.min.evaluate()?,
             max: self.max.evaluate()?,
             null_count: self.null_count,
-            fragment_id: fragment_id,
+            fragment_id,
             zone_size: self.cur_zone_offset,
         };
-        println!("new_map = {:?}", new_map);
+        // new_map = {:?}", new_map);
 
         self.maps.push(new_map);
 
@@ -547,7 +539,6 @@ impl ZoneMapIndexBuilder {
         assert!(batches_source.schema().field_with_name(ROW_ADDR).is_ok());
 
         while let Some(batch) = batches_source.try_next().await? {
-            println!("get a new batch");
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -560,20 +551,20 @@ impl ZoneMapIndexBuilder {
                 .downcast_ref::<arrow_array::UInt64Array>()
                 .unwrap();
 
-            let mut remaining = batch.num_rows() as usize;
+            let mut remaining = batch.num_rows();
             let mut array_offset: usize = 0;
 
             // Initialize cur_fragment_id from the first row address if this is the first batch
             if self.maps.is_empty() && self.cur_zone_offset == 0 {
                 let first_row_addr = row_addrs_array.value(0);
-                self.cur_fragment_id = (first_row_addr >> 32) as u64;
+                self.cur_fragment_id = first_row_addr >> 32;
             }
 
             while remaining > 0 {
                 // Find the next fragment boundary in this batch
                 let next_fragment_index = (array_offset..row_addrs_array.len()).find(|&i| {
                     let row_addr = row_addrs_array.value(i);
-                    let fragment_id = (row_addr >> 32) as u64;
+                    let fragment_id = row_addr >> 32;
                     fragment_id == self.cur_fragment_id + 1
                 });
                 let empty_rows_left_in_cur_zone: usize =
@@ -582,26 +573,24 @@ impl ZoneMapIndexBuilder {
                 // Check if there is enough data from the current fragment to fill the current zone
                 let desired = if let Some(idx) = next_fragment_index {
                     // We found a fragment boundary, update cur_fragment_id
-                    let next_fragment_id = (row_addrs_array.value(idx) >> 32) as u64;
+                    let next_fragment_id = row_addrs_array.value(idx) >> 32;
                     self.cur_fragment_id = next_fragment_id;
                     // Don't create an empty zone, just process the data up to the boundary
                     idx - array_offset
                 } else {
                     empty_rows_left_in_cur_zone
                 };
-                println!(
-                    "desired = {}, next_fragment_index = {:?}, remaining = {}",
-                    desired, next_fragment_index, remaining
-                );
+                // desired = {}, next_fragment_index = {:?}, remaining = {}",
+                // desired, next_fragment_index, remaining
 
                 if desired > remaining {
                     // Not enough data to fill a map, just increment counts
-                    self.update_stats(&data_array.slice(array_offset, remaining as usize))?;
+                    self.update_stats(&data_array.slice(array_offset, remaining))?;
                     self.cur_zone_offset += remaining;
                     break;
                 } else if desired > 0 {
                     // There is enough data, create a new zone map
-                    self.update_stats(&data_array.slice(array_offset, desired as usize))?;
+                    self.update_stats(&data_array.slice(array_offset, desired))?;
                     self.cur_zone_offset += desired;
                     self.new_map(row_addrs_array.value(array_offset) >> 32)?;
                 } else if desired == 0 {
@@ -613,9 +602,9 @@ impl ZoneMapIndexBuilder {
                     // to find the next fragment boundary
                     continue;
                 }
-                array_offset += desired as usize;
+                array_offset += desired;
                 remaining = remaining.saturating_sub(desired);
-                println!("array_offset = {}, remaining = {}", array_offset, remaining);
+                // array_offset = {}, remaining = {}", array_offset, remaining
             }
         }
         // Create the final map
@@ -667,7 +656,7 @@ impl ZoneMapIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(mut self, index_store: &dyn IndexStore) -> Result<()> {
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
         let record_batch = self.zonemap_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -690,14 +679,11 @@ pub async fn train_zonemap_index(
     index_store: &dyn IndexStore,
     options: Option<ZoneMapIndexBuilderOptions>,
 ) -> Result<()> {
-    println!("train_zonemap_index: calling scan_aligned_chunks");
+    // train_zonemap_index: calling scan_aligned_chunks
     let batches_source = data_source.scan_aligned_chunks(4096).await?;
     let value_type = batches_source.schema().field(0).data_type().clone();
 
-    let mut builder = ZoneMapIndexBuilder::try_new(
-        options.unwrap_or(ZoneMapIndexBuilderOptions::default()),
-        value_type,
-    )?;
+    let mut builder = ZoneMapIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
 
     builder.train(batches_source).await?;
 
@@ -708,38 +694,30 @@ pub async fn train_zonemap_index(
 #[cfg(test)]
 mod tests {
     use crate::scalar::{zonemap::ZONEMAP_DEFAULT_SIZE, IndexStore};
-    use std::{
-        collections::{HashMap, HashSet},
-        sync::Arc,
-    };
+    use std::sync::Arc;
 
     use crate::scalar::zonemap::{train_zonemap_index, ZoneMapStatistics};
     use arrow::datatypes::{Float32Type, UInt64Type};
-    use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::{
-        execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
-    };
-    use datafusion_common::DataFusionError;
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
-    use datafusion_sql::sqlparser::keywords::ZONE;
-    use futures::{stream, StreamExt, TryStreamExt};
+    use futures::{stream, TryStreamExt};
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
-    use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
+    use lance_datagen::{array, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
-    use tantivy::tokenizer::TextAnalyzer;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::tempdir;
 
     use crate::scalar::lance_format::tests::MockTrainingSource;
 
     use crate::scalar::{
         lance_format::LanceIndexStore,
         zonemap::{
-            ZoneMapIndex, ZoneMapIndexBuilder, ZoneMapIndexBuilderOptions, ZONEMAP_FILENAME,
-            ZONEMAP_SIZE_META_KEY,
+            ZoneMapIndex, ZoneMapIndexBuilderOptions, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY,
         },
         SargableQuery, ScalarIndex, SearchResult,
     };
@@ -748,7 +726,6 @@ mod tests {
 
     // Add missing imports for the tests
     use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::{AnyQuery, MetricsCollector};
     use crate::Index; // Import Index trait to access calculate_included_frags
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
     use std::collections::Bound;
@@ -811,7 +788,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let stream = gen()
+        let stream = lance_datagen::gen_batch()
             .col(
                 "value",
                 array::rand::<Float32Type>().with_nulls(&[true, false, false, false, false]),
@@ -835,7 +812,7 @@ mod tests {
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 10);
         for (i, zone) in index.zones.iter().enumerate() {
-            println!("zone = {:?} i= {}", zone, i);
+            // zone = {:?} i= {}", zone, i
             assert_eq!(zone.null_count, 1000);
             assert_eq!(zone.zone_size, 5000);
             assert_eq!(zone.fragment_id, i as u64);
@@ -1261,8 +1238,7 @@ mod tests {
         // Fragment 0: values 0-8191 (first zone)
         let fragment0_data =
             arrow_array::Int64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as i64);
-        let fragment0_row_ids =
-            UInt64Array::from_iter_values((0..ZONEMAP_DEFAULT_SIZE as u64).map(|i| i as u64));
+        let fragment0_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as u64);
         let fragment0_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment0_data), Arc::new(fragment0_row_ids)],
@@ -1273,8 +1249,7 @@ mod tests {
         let fragment1_data = arrow_array::Int64Array::from_iter_values(
             (ZONEMAP_DEFAULT_SIZE as i64)..((ZONEMAP_DEFAULT_SIZE * 2) as i64),
         );
-        let fragment1_row_ids =
-            UInt64Array::from_iter_values((0..ZONEMAP_DEFAULT_SIZE as u64).map(|i| i as u64));
+        let fragment1_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as u64);
         let fragment1_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],
@@ -1468,7 +1443,7 @@ mod tests {
             let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
             let mut expected = RowIdTreeMap::new();
             expected.insert_range(0..=16425);
-            println!("expected = {:?}", expected);
+            // expected = {:?}", expected
             assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
         }
 

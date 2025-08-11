@@ -7,10 +7,10 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
-use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use async_trait::async_trait;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
@@ -336,17 +336,6 @@ pub mod tests {
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
-    fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path: &Path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
-                .now_or_never()
-                .unwrap()
-                .unwrap();
-        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
-        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
-    }
-
     pub struct MockTrainingSource {
         data: SendableRecordBatchStream,
     }
@@ -418,11 +407,24 @@ pub mod tests {
                 RecordBatch::try_new(schema_for_stream.clone(), new_columns).unwrap()
             });
 
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                new_schema,
-                data_with_rowaddr,
-            )))
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    new_schema,
+                    data_with_rowaddr,
+                ),
+            ))
         }
+    }
+
+    fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
+        let test_path: &Path = tempdir.path();
+        let (object_store, test_path) =
+            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
     async fn train_index(

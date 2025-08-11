@@ -1900,7 +1900,7 @@ class LanceDataset(pa.dataset.Dataset):
           in filters.
         * ``ZONEMAP``. This index breaks the column into fixed-size chunks called zones
           and store summary statistics for each zone(min, max, null_count, fragment_id).
-          It's inexact but enables efficient filtering by eliminating zones that cannot
+          It's inexact but enables efficient filtering by eliminating zones that do not
           contain matching values.
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
@@ -2008,7 +2008,14 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", "INVERTED"]:
+        if index_type not in [
+            "BTREE",
+            "BITMAP",
+            "NGRAM",
+            "ZONEMAP",
+            "LABEL_LIST",
+            "INVERTED",
+        ]:
             raise NotImplementedError(
                 (
                     'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '

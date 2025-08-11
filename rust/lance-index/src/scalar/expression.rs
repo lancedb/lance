@@ -512,7 +512,7 @@ impl IndexedExpression {
             scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
                 column,
                 index_name,
-                query: query.clone(),
+                query,
                 needs_recheck: false, // Default to false, will be set by parser
             })),
             refine_expr: None,
@@ -530,7 +530,7 @@ impl IndexedExpression {
             scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
                 column,
                 index_name,
-                query: query.clone(),
+                query: query,
                 needs_recheck,
             })),
             refine_expr: None,
@@ -664,7 +664,7 @@ pub struct ScalarIndexSearch {
     pub index_name: String,
     /// The query to search for
     pub query: Arc<dyn AnyQuery>,
-    /// If true, the query results are inexact and will need rechecked
+    /// If true, the query results are inexact and will need a recheck
     pub needs_recheck: bool,
 }
 

@@ -1309,12 +1309,11 @@ def test_ngram_index(tmp_path: Path):
     )
     test_with(tbl)
 
+
 def test_zonemap_index(tmp_path: Path):
     """Test create zonemap index"""
     os.environ["LANCE_ZONEMAP_DEFAULT_ROWS_PER_ZONE"] = "100"
-    tbl = pa.Table.from_arrays(
-        [pa.array([i for i in range(101)])], names=["values"]
-    )
+    tbl = pa.Table.from_arrays([pa.array([i for i in range(101)])], names=["values"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     dataset.create_scalar_index("values", index_type="ZONEMAP")
     indices = dataset.list_indices()
@@ -1326,22 +1325,21 @@ def test_zonemap_index(tmp_path: Path):
     assert index_stats["index_type"] == "ZoneMap"
     assert "indices" in index_stats
     assert len(index_stats["indices"]) == 1
-    
+
     # Verify zonemap statistics
     zonemap_stats = index_stats["indices"][0]
     assert "max_zonemap_size" in zonemap_stats
     assert "num_zones" in zonemap_stats
     assert "type" in zonemap_stats
-    assert zonemap_stats["max_zonemap_size"] == 100  # Should match our environment variable
+    assert zonemap_stats["max_zonemap_size"] == 100
     assert zonemap_stats["num_zones"] == 2  # Should have 2 zones (100 rows + 1 row)
     assert zonemap_stats["type"] == "ZoneMap"
 
     # Test that the zonemap index is being used in the query plan
     scanner = dataset.scanner(filter="values > 50", prefilter=True)
     plan = scanner.explain_plan()
-    print(f"plan={plan}")
     assert "ZoneMapIndex" in plan or "zonemap" in plan.lower()
-    
+
     # Verify the query returns correct results
     result = scanner.to_table()
     expected_rows = 50  # values 51-100
