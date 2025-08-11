@@ -12,7 +12,6 @@
 //! sequences. The on-disk format is designed to align well with the in-memory
 //! representation, to avoid unnecessary deserialization.
 use std::ops::Range;
-
 // TODO: replace this with Arrow BooleanBuffer.
 
 // These are all internal data structures, and are private.
@@ -34,10 +33,9 @@ pub use serde::{read_row_ids, write_row_ids};
 
 use snafu::location;
 
+use crate::utils::LanceIteratorExtension;
 use segment::U64Segment;
 use tracing::instrument;
-
-use crate::utils::LanceIteratorExtension;
 
 /// A sequence of row ids.
 ///
@@ -571,6 +569,27 @@ pub fn rechunk_sequences(
     sequences: impl IntoIterator<Item = RowIdSequence>,
     chunk_sizes: impl IntoIterator<Item = u64>,
 ) -> Result<Vec<RowIdSequence>> {
+    rechunk_sequences_impl(sequences, chunk_sizes, false)
+}
+
+/// Re-chunk a sequences of row ids into chunks of a given size.
+/// The sequences may less than chunk sizes, because the sequences only
+/// contains the row ids that we want to keep, they come from the updates records.
+/// But the chunk sizes are based on the fragment physical rows(may contain inserted records).
+/// So if the sequences are smaller than the chunk sizes, we need to
+/// assign the incremental row ids in the further step.
+pub fn rechunk_sequences_for_merge_insert(
+    sequences: impl IntoIterator<Item = RowIdSequence>,
+    chunk_sizes: impl IntoIterator<Item = u64>,
+) -> Result<Vec<RowIdSequence>> {
+    rechunk_sequences_impl(sequences, chunk_sizes, true)
+}
+
+fn rechunk_sequences_impl(
+    sequences: impl IntoIterator<Item = RowIdSequence>,
+    chunk_sizes: impl IntoIterator<Item = u64>,
+    allow_incomplete: bool,
+) -> Result<Vec<RowIdSequence>> {
     // TODO: return an iterator. (with a good size hint?)
     let chunk_size_iter = chunk_sizes.into_iter();
     let mut chunked_sequences = Vec::with_capacity(chunk_size_iter.size_hint().0);
@@ -608,9 +627,14 @@ pub fn rechunk_sequences(
                 }
                 (_, 0) => {
                     // Can push the entire segment.
-                    let segment = segment_iter.next().ok_or_else(too_many_segments_error)?;
-                    sequence.extend(RowIdSequence(vec![segment]));
-                    remaining = 0;
+                    if let Some(segment) = segment_iter.next() {
+                        sequence.extend(RowIdSequence(vec![segment]));
+                        remaining = 0;
+                    } else if allow_incomplete {
+                        remaining = 0;
+                    } else {
+                        return Err(too_many_segments_error());
+                    }
                 }
                 (_, _) => {
                     // Push remaining segment
