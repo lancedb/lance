@@ -36,6 +36,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_encoding::format::pb as pbenc;
+use lance_encoding::format::pb21 as pbenc21;
 use lance_io::{
     scheduler::FileScheduler,
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
@@ -669,11 +670,11 @@ impl FileReader {
                                     page.encoding.as_ref().unwrap(),
                                 ))
                             }
-                            _ => {
-                                PageEncoding::Structural(Self::fetch_encoding::<pbenc::PageLayout>(
-                                    page.encoding.as_ref().unwrap(),
-                                ))
-                            }
+                            _ => PageEncoding::Structural(Self::fetch_encoding::<
+                                pbenc21::PageLayout,
+                            >(
+                                page.encoding.as_ref().unwrap()
+                            )),
                         };
                         let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets

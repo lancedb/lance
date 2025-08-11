@@ -11,7 +11,7 @@ use crate::{
         logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor},
         physical::block::{CompressionConfig, GeneralBufferCompressor},
     },
-    format::{pb, ProtobufUtils},
+    format::{pb21::CompressiveEncoding, ProtobufUtils21},
     Result,
 };
 
@@ -35,7 +35,7 @@ const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 4 * 1024;
 use super::super::logical::primitive::miniblock::MiniBlockChunk;
 
 impl MiniBlockCompressor for GeneralMiniBlockCompressor {
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
+    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         // First, compress with the inner compressor
         let (inner_compressed, inner_encoding) = self.inner.compress(page)?;
 
@@ -103,7 +103,7 @@ impl MiniBlockCompressor for GeneralMiniBlockCompressor {
         };
 
         // Return compressed encoding
-        let encoding = ProtobufUtils::general_mini_block(inner_encoding, self.compression);
+        let encoding = ProtobufUtils21::wrapped(self.compression, inner_encoding);
         Ok((compressed_result, encoding))
     }
 }
@@ -142,6 +142,7 @@ mod tests {
     use crate::encodings::physical::block::CompressionScheme;
     use crate::encodings::physical::rle::RleMiniBlockEncoder;
     use crate::encodings::physical::value::ValueEncoder;
+    use crate::format::pb21::compressive_encoding::Compression;
     use arrow_array::{Float64Array, Int32Array};
 
     #[derive(Debug)]
@@ -250,8 +251,8 @@ mod tests {
         let (compressed, encoding) = compressor.compress(test_case.data).unwrap();
 
         // Check if compression was applied as expected
-        match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
+        match &encoding.compression {
+            Some(Compression::Wrapped(cm)) => {
                 assert!(
                     test_case.expected_compressed,
                     "{}: Expected compression to be applied",
@@ -266,17 +267,17 @@ mod tests {
                 // Could be RLE or other encoding if compression didn't help
                 if test_case.expected_compressed {
                     // Check if it's RLE encoding (which means compression didn't help)
-                    match &encoding.array_encoding {
-                        Some(pb::array_encoding::ArrayEncoding::Rle(_)) => {
+                    match &encoding.compression {
+                        Some(Compression::Rle(_)) => {
                             // RLE encoding returned - compression didn't help
                         }
-                        Some(pb::array_encoding::ArrayEncoding::Flat(_)) => {
+                        Some(Compression::Flat(_)) => {
                             // Flat encoding returned - compression didn't help
                         }
                         _ => {
                             panic!(
                                 "{}: Expected GeneralMiniBlock but got {:?}",
-                                test_case.name, encoding.array_encoding
+                                test_case.name, encoding.compression
                             );
                         }
                     }
@@ -325,7 +326,7 @@ mod tests {
 
     fn decompress_miniblock_chunks(
         compressed: &MiniBlockCompressed,
-        encoding: &pb::ArrayEncoding,
+        encoding: &CompressiveEncoding,
     ) -> Vec<u8> {
         let mut decompressed_data = Vec::new();
         let mut offsets = vec![0usize; compressed.data.len()]; // Track offset for each buffer
@@ -462,15 +463,15 @@ mod tests {
         let (compressed, encoding) = compressor.compress(block).unwrap();
 
         // Should get GeneralMiniBlock encoding since buffer is 4KB
-        match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(cm)) => {
-                assert!(cm.inner.is_some());
+        match &encoding.compression {
+            Some(Compression::Wrapped(cm)) => {
+                assert!(cm.values.is_some());
                 assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
                 assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
 
                 // Verify inner encoding is Flat (from ValueEncoder)
-                match &cm.inner.as_ref().unwrap().array_encoding {
-                    Some(pb::array_encoding::ArrayEncoding::Flat(flat)) => {
+                match &cm.values.as_ref().unwrap().compression {
+                    Some(Compression::Flat(flat)) => {
                         assert_eq!(flat.bits_per_value, 32);
                     }
                     _ => panic!("Expected Flat inner encoding"),
@@ -537,19 +538,35 @@ mod tests {
         let (_compressed, encoding) = compressor.compress(test_32.data).unwrap();
 
         // Verify the encoding structure
-        match &encoding.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(gm)) => {
+        match &encoding.compression {
+            Some(Compression::Wrapped(cm)) => {
                 // Check inner encoding is RLE
-                match &gm.inner.as_ref().unwrap().array_encoding {
-                    Some(pb::array_encoding::ArrayEncoding::Rle(rle)) => {
-                        assert_eq!(rle.bits_per_value, 32);
+                match &cm.values.as_ref().unwrap().compression {
+                    Some(Compression::Rle(rle)) => {
+                        let Compression::Flat(values) =
+                            rle.values.as_ref().unwrap().compression.as_ref().unwrap()
+                        else {
+                            panic!("Expected flat for RLE values")
+                        };
+                        let Compression::Flat(run_lengths) = rle
+                            .run_lengths
+                            .as_ref()
+                            .unwrap()
+                            .compression
+                            .as_ref()
+                            .unwrap()
+                        else {
+                            panic!("Expected flat for RLE run lengths")
+                        };
+                        assert_eq!(values.bits_per_value, 32);
+                        assert_eq!(run_lengths.bits_per_value, 8);
                     }
                     _ => panic!("Expected RLE as inner encoding"),
                 }
                 // Check compression is LZ4
-                assert_eq!(gm.compression.as_ref().unwrap().scheme, "lz4");
+                assert_eq!(cm.compression.as_ref().unwrap().scheme, "lz4");
             }
-            Some(pb::array_encoding::ArrayEncoding::Rle(_)) => {
+            Some(Compression::Rle(_)) => {
                 // Also acceptable if compression didn't help
             }
             _ => panic!("Expected GeneralMiniBlock or Rle encoding"),
@@ -575,19 +592,35 @@ mod tests {
         let (_compressed_64, encoding_64) = compressor_64.compress(block_64).unwrap();
 
         // Verify the encoding structure for 64-bit
-        match &encoding_64.array_encoding {
-            Some(pb::array_encoding::ArrayEncoding::GeneralMiniBlock(gm)) => {
+        match &encoding_64.compression {
+            Some(Compression::Wrapped(cm)) => {
                 // Check inner encoding is RLE
-                match &gm.inner.as_ref().unwrap().array_encoding {
-                    Some(pb::array_encoding::ArrayEncoding::Rle(rle)) => {
-                        assert_eq!(rle.bits_per_value, 64);
+                match &cm.values.as_ref().unwrap().compression {
+                    Some(Compression::Rle(rle)) => {
+                        let Compression::Flat(values) =
+                            rle.values.as_ref().unwrap().compression.as_ref().unwrap()
+                        else {
+                            panic!("Expected flat for RLE values")
+                        };
+                        let Compression::Flat(run_lengths) = rle
+                            .run_lengths
+                            .as_ref()
+                            .unwrap()
+                            .compression
+                            .as_ref()
+                            .unwrap()
+                        else {
+                            panic!("Expected flat for RLE run lengths")
+                        };
+                        assert_eq!(values.bits_per_value, 64);
+                        assert_eq!(run_lengths.bits_per_value, 8);
                     }
                     _ => panic!("Expected RLE as inner encoding for 64-bit"),
                 }
                 // Check compression is LZ4
-                assert_eq!(gm.compression.as_ref().unwrap().scheme, "lz4");
+                assert_eq!(cm.compression.as_ref().unwrap().scheme, "lz4");
             }
-            Some(pb::array_encoding::ArrayEncoding::Rle(_)) => {
+            Some(Compression::Rle(_)) => {
                 // Also acceptable if compression didn't help
             }
             _ => panic!("Expected GeneralMiniBlock or Rle encoding for 64-bit"),

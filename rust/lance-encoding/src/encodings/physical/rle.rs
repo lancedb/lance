@@ -59,7 +59,8 @@ use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_BYTES,
     MAX_MINIBLOCK_VALUES,
 };
-use crate::format::{pb, ProtobufUtils};
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::ProtobufUtils21;
 
 use lance_core::{Error, Result};
 
@@ -348,7 +349,7 @@ impl RleMiniBlockEncoder {
 }
 
 impl MiniBlockCompressor for RleMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let num_values = fixed_width.num_values;
@@ -363,7 +364,10 @@ impl MiniBlockCompressor for RleMiniBlockEncoder {
                     num_values,
                 };
 
-                let encoding = ProtobufUtils::rle(bits_per_value);
+                let encoding = ProtobufUtils21::rle(
+                    ProtobufUtils21::flat(bits_per_value, None),
+                    ProtobufUtils21::flat(/*bits_per_value=*/ 8, None),
+                );
 
                 Ok((compressed, encoding))
             }

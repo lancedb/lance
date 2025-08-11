@@ -48,12 +48,15 @@ use crate::{
             value::{ValueDecompressor, ValueEncoder},
         },
     },
-    format::{pb, ProtobufUtils},
+    format::{
+        pb21::{compressive_encoding::Compression, CompressiveEncoding},
+        ProtobufUtils21,
+    },
     statistics::{GetStat, Stat},
 };
 use arrow::{array::AsArray, datatypes::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
-use lance_core::{datatypes::Field, Error, Result};
+use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
 use std::str::FromStr;
 
@@ -99,7 +102,7 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, pb::ArrayEncoding)>;
+    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)>;
 
     /// Create a per-value compressor for the given data
     fn create_per_value(
@@ -417,19 +420,22 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         &self,
         _field: &Field,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, pb::ArrayEncoding)> {
+    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
         // TODO: We should actually compress here!
         match data {
             // Currently, block compression is used for rep/def (which is fixed width) and for dictionary
             // encoding (which could be fixed width or variable width).
             DataBlock::FixedWidth(fixed_width) => {
                 let encoder = Box::new(ValueEncoder::default());
-                let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
+                let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
                 Ok((encoder, encoding))
             }
             DataBlock::VariableWidth(variable_width) => {
                 let encoder = Box::new(VariableEncoder::default());
-                let encoding = ProtobufUtils::variable(variable_width.bits_per_offset);
+                let encoding = ProtobufUtils21::variable(
+                    ProtobufUtils21::flat(variable_width.bits_per_offset as u64, None),
+                    None,
+                );
                 Ok((encoder, encoding))
             }
             _ => unreachable!(),
@@ -462,23 +468,23 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
 pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
     fn create_miniblock_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
         decompression_strategy: &dyn DecompressionStrategy,
     ) -> Result<Box<dyn MiniBlockDecompressor>>;
 
     fn create_fixed_per_value_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
     ) -> Result<Box<dyn FixedPerValueDecompressor>>;
 
     fn create_variable_per_value_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
     ) -> Result<Box<dyn VariablePerValueDecompressor>>;
 
     fn create_block_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
     ) -> Result<Box<dyn BlockDecompressor>>;
 }
 
@@ -488,22 +494,32 @@ pub struct DefaultDecompressionStrategy {}
 impl DecompressionStrategy for DefaultDecompressionStrategy {
     fn create_miniblock_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
         decompression_strategy: &dyn DecompressionStrategy,
     ) -> Result<Box<dyn MiniBlockDecompressor>> {
-        match description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::from_flat(flat)))
-            }
-            pb::array_encoding::ArrayEncoding::InlineBitpacking(description) => {
+        match description.compression.as_ref().unwrap() {
+            Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
+            Compression::InlineBitpacking(description) => {
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
-            pb::array_encoding::ArrayEncoding::Variable(variable) => Ok(Box::new(
-                BinaryMiniBlockDecompressor::new(variable.bits_per_offset as u8),
-            )),
-            pb::array_encoding::ArrayEncoding::Fsst(description) => {
+            Compression::Variable(variable) => {
+                let Compression::Flat(offsets) = variable
+                    .offsets
+                    .as_ref()
+                    .unwrap()
+                    .compression
+                    .as_ref()
+                    .unwrap()
+                else {
+                    panic!("Variable compression only supports flat offsets")
+                };
+                Ok(Box::new(BinaryMiniBlockDecompressor::new(
+                    offsets.bits_per_value as u8,
+                )))
+            }
+            Compression::Fsst(description) => {
                 let inner_decompressor = decompression_strategy.create_miniblock_decompressor(
-                    description.binary.as_ref().unwrap(),
+                    description.values.as_ref().unwrap(),
                     decompression_strategy,
                 )?;
                 Ok(Box::new(FsstMiniBlockDecompressor::new(
@@ -511,26 +527,52 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     inner_decompressor,
                 )))
             }
-            pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
-                Ok(Box::new(PackedStructFixedWidthMiniBlockDecompressor::new(
-                    description,
-                )))
-            }
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
+            Compression::PackedStruct(description) => Ok(Box::new(
+                PackedStructFixedWidthMiniBlockDecompressor::new(description),
+            )),
+            Compression::FixedSizeList(fsl) => {
                 // In the future, we might need to do something more complex here if FSL supports
                 // compression.
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
-            pb::array_encoding::ArrayEncoding::Rle(rle) => {
-                Ok(Box::new(RleMiniBlockDecompressor::new(rle.bits_per_value)))
+            Compression::Rle(rle) => {
+                let Compression::Flat(values) =
+                    rle.values.as_ref().unwrap().compression.as_ref().unwrap()
+                else {
+                    panic!("RLE compression only supports flat values")
+                };
+                let Compression::Flat(run_lengths) = rle
+                    .run_lengths
+                    .as_ref()
+                    .unwrap()
+                    .compression
+                    .as_ref()
+                    .unwrap()
+                else {
+                    panic!("RLE compression only supports flat run lengths")
+                };
+                assert_eq!(
+                    run_lengths.bits_per_value, 8,
+                    "RLE compression only supports 8-bit run lengths"
+                );
+                Ok(Box::new(RleMiniBlockDecompressor::new(
+                    values.bits_per_value,
+                )))
             }
-            pb::array_encoding::ArrayEncoding::ByteStreamSplit(bss) => Ok(Box::new(
-                ByteStreamSplitDecompressor::new(bss.bits_per_value as usize),
-            )),
-            pb::array_encoding::ArrayEncoding::GeneralMiniBlock(general) => {
+            Compression::ByteStreamSplit(bss) => {
+                let Compression::Flat(values) =
+                    bss.values.as_ref().unwrap().compression.as_ref().unwrap()
+                else {
+                    panic!("ByteStreamSplit compression only supports flat values")
+                };
+                Ok(Box::new(ByteStreamSplitDecompressor::new(
+                    values.bits_per_value as usize,
+                )))
+            }
+            Compression::Wrapped(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
-                    general.inner.as_ref().ok_or_else(|| {
+                    general.values.as_ref().ok_or_else(|| {
                         Error::invalid_input("GeneralMiniBlock missing inner encoding", location!())
                     })?,
                     decompression_strategy,
@@ -559,56 +601,58 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 
     fn create_fixed_per_value_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
     ) -> Result<Box<dyn FixedPerValueDecompressor>> {
-        match description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::from_flat(flat)))
-            }
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
-                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
-            }
+        match description.compression.as_ref().unwrap() {
+            Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
+            Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
             _ => todo!("fixed-per-value decompressor for {:?}", description),
         }
     }
 
     fn create_variable_per_value_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
     ) -> Result<Box<dyn VariablePerValueDecompressor>> {
-        match *description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Variable(variable) => {
-                assert!(variable.bits_per_offset < u8::MAX as u32);
+        match description.compression.as_ref().unwrap() {
+            Compression::Variable(variable) => {
+                let Compression::Flat(offsets) = variable
+                    .offsets
+                    .as_ref()
+                    .unwrap()
+                    .compression
+                    .as_ref()
+                    .unwrap()
+                else {
+                    panic!("Variable compression only supports flat offsets")
+                };
+                assert!(offsets.bits_per_value < u8::MAX as u64);
                 Ok(Box::new(VariableDecoder::default()))
             }
-            pb::array_encoding::ArrayEncoding::Fsst(ref fsst) => {
-                Ok(Box::new(FsstPerValueDecompressor::new(
-                    LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
-                    Box::new(VariableDecoder::default()),
-                )))
+            Compression::Fsst(ref fsst) => Ok(Box::new(FsstPerValueDecompressor::new(
+                LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
+                Box::new(VariableDecoder::default()),
+            ))),
+            Compression::Wrapped(ref wrapped) => {
+                Ok(Box::new(CompressedBufferEncoder::from_scheme(
+                    &wrapped.compression.as_ref().expect_ok()?.scheme,
+                )?))
             }
-            pb::array_encoding::ArrayEncoding::Block(ref block) => Ok(Box::new(
-                CompressedBufferEncoder::from_scheme(&block.scheme)?,
-            )),
             _ => todo!("variable-per-value decompressor for {:?}", description),
         }
     }
 
     fn create_block_decompressor(
         &self,
-        description: &pb::ArrayEncoding,
+        description: &CompressiveEncoding,
     ) -> Result<Box<dyn BlockDecompressor>> {
-        match description.array_encoding.as_ref().unwrap() {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::from_flat(flat)))
-            }
-            pb::array_encoding::ArrayEncoding::Constant(constant) => {
+        match description.compression.as_ref().unwrap() {
+            Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
+            Compression::Constant(constant) => {
                 let scalar = LanceBuffer::from_bytes(constant.value.clone(), 1);
                 Ok(Box::new(ConstantDecompressor::new(scalar)))
             }
-            pb::array_encoding::ArrayEncoding::Variable(_) => {
-                Ok(Box::new(BinaryBlockDecompressor::default()))
-            }
+            Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
             _ => todo!(),
         }
     }

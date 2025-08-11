@@ -20,8 +20,8 @@ use crate::{
     data::{BlockInfo, DataBlock, FixedWidthDataBlock, StructDataBlock},
     encodings::logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     format::{
-        pb::{self},
-        ProtobufUtils,
+        pb21::{compressive_encoding::Compression, CompressiveEncoding, PackedStruct},
+        ProtobufUtils21,
     },
     statistics::{GetStat, Stat},
 };
@@ -33,7 +33,7 @@ use super::value::{ValueDecompressor, ValueEncoder};
 // assumption that all fields has `bits_per_value % 8 == 0` is made.
 fn struct_data_block_to_fixed_width_data_block(
     struct_data_block: StructDataBlock,
-    bits_per_values: &[u32],
+    bits_per_values: &[u64],
 ) -> DataBlock {
     let data_size = struct_data_block.expect_single_stat::<UInt64Type>(Stat::DataSize);
     let mut output = Vec::with_capacity(data_size as usize);
@@ -66,13 +66,10 @@ fn struct_data_block_to_fixed_width_data_block(
 pub struct PackedStructFixedWidthMiniBlockEncoder {}
 
 impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
-    fn compress(
-        &self,
-        data: DataBlock,
-    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::Struct(struct_data_block) => {
-                let bits_per_values = struct_data_block.children.iter().map(|data_block| data_block.as_fixed_width_ref().unwrap().bits_per_value as u32).collect::<Vec<_>>();
+                let bits_per_values = struct_data_block.children.iter().map(|data_block| data_block.as_fixed_width_ref().unwrap().bits_per_value).collect::<Vec<_>>();
 
                 // transform struct datablock to fixed-width data block.
                 let data_block = struct_data_block_to_fixed_width_data_block(struct_data_block, &bits_per_values);
@@ -84,7 +81,7 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
 
                 Ok((
                     value_miniblock_compressed,
-                    ProtobufUtils::packed_struct_fixed_width_mini_block(value_array_encoding, bits_per_values),
+                    ProtobufUtils21::packed_struct(value_array_encoding, bits_per_values),
                 ))
             }
             _ => Err(Error::InvalidInput {
@@ -101,25 +98,18 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
 
 #[derive(Debug)]
 pub struct PackedStructFixedWidthMiniBlockDecompressor {
-    bits_per_values: Vec<u32>,
+    bits_per_values: Vec<u64>,
     array_encoding: Box<dyn MiniBlockDecompressor>,
 }
 
 impl PackedStructFixedWidthMiniBlockDecompressor {
-    pub fn new(description: &pb::PackedStructFixedWidthMiniBlock) -> Self {
-        let array_encoding: Box<dyn MiniBlockDecompressor> = match description
-            .flat
-            .as_ref()
-            .unwrap()
-            .array_encoding
-            .as_ref()
-            .unwrap()
-        {
-            pb::array_encoding::ArrayEncoding::Flat(flat) => Box::new(ValueDecompressor::from_flat(flat)),
+    pub fn new(description: &PackedStruct) -> Self {
+        let array_encoding: Box<dyn MiniBlockDecompressor> = match description.values.as_ref().unwrap().compression.as_ref().unwrap() {
+            Compression::Flat(flat) => Box::new(ValueDecompressor::from_flat(flat)),
             _ => panic!("Currently only `ArrayEncoding::Flat` is supported in packed struct encoding in Lance 2.1."),
         };
         Self {
-            bits_per_values: description.bits_per_values.clone(),
+            bits_per_values: description.bits_per_value.clone(),
             array_encoding,
         }
     }

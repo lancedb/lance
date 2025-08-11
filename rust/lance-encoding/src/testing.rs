@@ -3,7 +3,10 @@
 
 use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
-use crate::decoder::DecoderConfig;
+use crate::{
+    decoder::DecoderConfig,
+    format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
+};
 
 use arrow::array::make_comparator;
 use arrow_array::{Array, StructArray, UInt64Array};
@@ -27,7 +30,6 @@ use crate::{
         default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
         EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
     },
-    format::pb::{self, array_encoding::ArrayEncoding as ArrayEncodingEnum},
     repdef::RepDefBuilder,
     version::LanceFileVersion,
     EncodingsIo,
@@ -437,74 +439,92 @@ impl TestCases {
 
 /// Maps encoding enum variant to its string tag
 /// Uses exhaustive match to ensure compile-time checking when variants are added/removed
-fn tag(e: &ArrayEncodingEnum) -> &'static str {
-    use ArrayEncodingEnum::*;
+fn tag(e: &Compression) -> &'static str {
+    use Compression::*;
 
     match e {
         Flat(_) => "flat",
-        Binary(_) => "binary",
-        FixedSizeBinary(_) => "fixed_size_binary",
+        Variable(_) => "variable",
+        Constant(_) => "constant",
+        OutOfLineBitpacking(_) => "out_of_line_bitpacking",
+        InlineBitpacking(_) => "inline_bitpacking",
         Fsst(_) => "fsst",
         Dictionary(_) => "dictionary",
-        Constant(_) => "constant",
-        Variable(_) => "variable",
-        Bitpacked(_) => "bitpacked",
-        InlineBitpacking(_) => "inline_bitpacking",
-        OutOfLineBitpacking(_) => "out_of_line_bitpacking",
-        BitpackedForNonNeg(_) => "bitpacked_non_neg",
-        Block(_) => "block", // scheme handled separately
         Rle(_) => "rle",
-        PackedStruct(_) => "packed_struct",
-        PackedStructFixedWidthMiniBlock(_) => "packed_struct_fixed_width",
-        Nullable(_) => "nullable",             // has recursion
-        FixedSizeList(_) => "fixed_size_list", // has recursion
-        List(_) => "list",
-        Struct(_) => "struct",
-        GeneralMiniBlock(_) => "general_miniblock", // has recursion
         ByteStreamSplit(_) => "byte_stream_split",
+        Wrapped(_) => "wrapped",
+        FixedSizeList(_) => "fixed_size_list",
+        PackedStruct(_) => "packed_struct",
+    }
+}
+
+/// Returns any buffer outputs of this encoding
+fn buffer(c: &Compression) -> Option<Vec<&BufferCompression>> {
+    use Compression::*;
+
+    match c {
+        Flat(f) => f.data.as_ref().map(|b| vec![b]),
+        Variable(v) => v.values.as_ref().map(|b| vec![b]),
+        InlineBitpacking(i) => i.values.as_ref().map(|b| vec![b]),
+        Wrapped(w) => w.compression.as_ref().map(|c| vec![c]),
+        _ => None,
     }
 }
 
 /// Returns the child encoding if this variant contains nested ArrayEncoding
-fn child(e: &ArrayEncodingEnum) -> Option<&pb::ArrayEncoding> {
-    use ArrayEncodingEnum::*;
+fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
+    use Compression::*;
 
-    match e {
-        Nullable(n) => {
-            use pb::nullable::Nullability::*;
-            match &n.nullability {
-                Some(NoNulls(v)) => v.values.as_ref().map(|b| b.as_ref()),
-                Some(SomeNulls(v)) => v.values.as_ref().map(|b| b.as_ref()),
-                _ => None, // AllNulls or None have no child
+    match c {
+        Variable(v) => v.offsets.as_ref().map(|b| vec![b.as_ref()]),
+        OutOfLineBitpacking(o) => o.values.as_ref().map(|b| vec![b.as_ref()]),
+        Fsst(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        ByteStreamSplit(b) => b.values.as_ref().map(|b| vec![b.as_ref()]),
+        Wrapped(w) => w.values.as_ref().map(|b| vec![b.as_ref()]),
+        Dictionary(d) => {
+            let mut children = Vec::new();
+            if let Some(values) = d.items.as_ref() {
+                children.push(values.as_ref());
             }
+            if let Some(indices) = d.indices.as_ref() {
+                children.push(indices.as_ref());
+            }
+            Some(children)
         }
-        FixedSizeList(f) => f.items.as_ref().map(|b| b.as_ref()),
-        GeneralMiniBlock(g) => g.inner.as_ref().map(|b| b.as_ref()),
+        Rle(r) => {
+            let mut children = Vec::new();
+            if let Some(values) = r.values.as_ref() {
+                children.push(values.as_ref());
+            }
+            if let Some(run_lengths) = r.run_lengths.as_ref() {
+                children.push(run_lengths.as_ref());
+            }
+            Some(children)
+        }
+        FixedSizeList(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
         _ => None,
     }
 }
 
 /// Extract encoding types from array encoding (helper for nested encodings)
 /// Returns the encoding chain including compression schemes for Block variants
-pub fn extract_array_encoding_chain(enc: &pb::ArrayEncoding) -> Vec<String> {
+pub fn extract_array_encoding_chain(enc: &CompressiveEncoding) -> Vec<String> {
     let mut chain = Vec::with_capacity(8);
     let mut stack = vec![enc];
 
     while let Some(cur) = stack.pop() {
-        if let Some(inner) = &cur.array_encoding {
+        if let Some(inner) = &cur.compression {
             // 1. Add current layer's tag
             chain.push(tag(inner).to_string());
 
-            // 2. Special handling for Block: append compression scheme
-            if let ArrayEncodingEnum::Block(b) = inner {
-                if !b.scheme.is_empty() {
-                    chain.push(b.scheme.clone());
-                }
+            // 2. Extract any buffer output
+            if let Some(buffer) = buffer(inner) {
+                chain.extend(buffer.into_iter().map(|b| b.scheme.clone()));
             }
 
             // 3. Process child encoding if exists
-            if let Some(next) = child(inner) {
-                stack.push(next);
+            if let Some(children) = child(inner) {
+                stack.extend(children);
             }
         }
     }
@@ -526,7 +546,7 @@ fn verify_page_encoding(
     match &page.description {
         PageEncoding::Structural(layout) => {
             // Extract encodings from the page layout
-            use crate::format::pb::page_layout::Layout;
+            use crate::format::pb21::page_layout::Layout;
             if let Some(ref layout_type) = layout.layout {
                 match layout_type {
                     Layout::MiniBlockLayout(mini_block) => {

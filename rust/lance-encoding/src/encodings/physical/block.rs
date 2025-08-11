@@ -30,12 +30,13 @@ use std::{io::Write, str::FromStr};
 use zstd::bulk::decompress_to_buffer;
 use zstd::stream::copy_decode;
 
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::ProtobufUtils21;
 use crate::{
     buffer::LanceBuffer,
     compression::VariablePerValueDecompressor,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
-    format::{pb, ProtobufUtils},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,7 +100,7 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
-    fn name(&self) -> &str;
+    fn config(&self) -> CompressionConfig;
 }
 
 #[derive(Debug, Default)]
@@ -196,8 +197,11 @@ impl BufferCompressor for ZstdBufferCompressor {
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        "zstd"
+    fn config(&self) -> CompressionConfig {
+        CompressionConfig {
+            scheme: CompressionScheme::Zstd,
+            level: Some(self.compression_level),
+        }
     }
 }
 
@@ -260,8 +264,11 @@ impl BufferCompressor for Lz4BufferCompressor {
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        "lz4"
+    fn config(&self) -> CompressionConfig {
+        CompressionConfig {
+            scheme: CompressionScheme::Lz4,
+            level: None,
+        }
     }
 }
 
@@ -279,8 +286,11 @@ impl BufferCompressor for NoopBufferCompressor {
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        "none"
+    fn config(&self) -> CompressionConfig {
+        CompressionConfig {
+            scheme: CompressionScheme::None,
+            level: None,
+        }
     }
 }
 
@@ -376,7 +386,7 @@ impl CompressedBufferEncoder {
 }
 
 impl PerValueCompressor for CompressedBufferEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let data_type = data.name();
         let mut data = data.as_variable_width().ok_or(Error::Internal {
             message: format!(
@@ -411,7 +421,15 @@ impl PerValueCompressor for CompressedBufferEncoder {
             block_info: BlockInfo::new(),
         });
 
-        let encoding = ProtobufUtils::block(self.compressor.name());
+        // TODO: Support setting the level
+        // TODO: Support underlying compression of data (e.g. defer to binary encoding for offset bitpacking)
+        let encoding = ProtobufUtils21::wrapped(
+            self.compressor.config(),
+            ProtobufUtils21::variable(
+                ProtobufUtils21::flat(data.bits_per_offset as u64, None),
+                None,
+            ),
+        );
 
         Ok((compressed, encoding))
     }

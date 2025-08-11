@@ -34,7 +34,8 @@ use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValue
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::{pb, ProtobufUtils};
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::{pb21, ProtobufUtils21};
 use crate::statistics::{GetStat, Stat};
 use bytemuck::{cast_slice, AnyBitPattern};
 
@@ -53,7 +54,7 @@ impl InlineBitpacking {
         }
     }
 
-    pub fn from_description(description: &pb::InlineBitpacking) -> Self {
+    pub fn from_description(description: &pb21::InlineBitpacking) -> Self {
         Self {
             uncompressed_bit_width: description.uncompressed_bits_per_value,
         }
@@ -157,10 +158,7 @@ impl InlineBitpacking {
         }
     }
 
-    fn chunk_data(
-        &self,
-        data: FixedWidthDataBlock,
-    ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
+    fn chunk_data(&self, data: FixedWidthDataBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
         assert!(data.bits_per_value % 8 == 0);
         assert_eq!(data.bits_per_value, self.uncompressed_bit_width);
         let bits_per_value = data.bits_per_value;
@@ -171,7 +169,14 @@ impl InlineBitpacking {
             64 => Self::bitpack_chunked::<u64>(data),
             _ => unreachable!(),
         };
-        (compressed, ProtobufUtils::inline_bitpacking(bits_per_value))
+        (
+            compressed,
+            ProtobufUtils21::inline_bitpacking(
+                bits_per_value,
+                // TODO: Could potentially compress the data here
+                None,
+            ),
+        )
     }
 
     fn unchunk<T: ArrowNativeType + BitPacking + AnyBitPattern>(
@@ -209,10 +214,7 @@ impl InlineBitpacking {
 }
 
 impl MiniBlockCompressor for InlineBitpacking {
-    fn compress(
-        &self,
-        chunk: DataBlock,
-    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
             _ => Err(Error::InvalidInput {
@@ -402,7 +404,7 @@ pub struct OutOfLineBitpacking {
 }
 
 impl PerValueCompressor for OutOfLineBitpacking {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let fixed_width = data.as_fixed_width().unwrap();
         let num_values = fixed_width.num_values;
         let word_size = fixed_width.bits_per_value;
@@ -419,8 +421,16 @@ impl PerValueCompressor for OutOfLineBitpacking {
             num_values,
             block_info: BlockInfo::new(),
         };
-        let encoding =
-            ProtobufUtils::out_of_line_bitpacking(word_size, self.compressed_bit_width as u64);
+        let encoding = ProtobufUtils21::out_of_line_bitpacking(
+            word_size,
+            // TODO: Are there any other transparent encodings that could be used on the bitpacked
+            // output?
+            ProtobufUtils21::flat(
+                self.compressed_bit_width as u64,
+                // TODO: Could potentially compress the data here
+                None,
+            ),
+        );
         Ok((PerValueDataBlock::Fixed(compressed), encoding))
     }
 }
