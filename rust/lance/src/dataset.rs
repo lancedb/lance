@@ -7231,8 +7231,10 @@ mod tests {
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
         // V2.1 format triggers miniblock encoding for narrow structs
-        let mut write_params = WriteParams::default();
-        write_params.data_storage_version = Some(lance_file::version::LanceFileVersion::V2_1);
+        let write_params = WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_1),
+            ..Default::default()
+        };
 
         // Write dataset - this will panic with miniblock 16KB assertion
         let dataset = Dataset::write(reader, &test_uri, Some(write_params))
