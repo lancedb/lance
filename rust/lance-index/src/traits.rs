@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
+use roaring::RoaringBitmap;
 use snafu::location;
 
 use crate::{optimize::OptimizeOptions, scalar::ScalarIndexType, IndexParams, IndexType};
@@ -59,6 +60,23 @@ impl<'a> ScalarIndexCriteria<'a> {
 // Extends Lance Dataset with secondary index.
 #[async_trait]
 pub trait DatasetIndexExt {
+    type IndexBuilder<'a>
+    where
+        Self: 'a;
+
+    /// Create an index on columns.
+    ///
+    /// Parameters:
+    /// - `columns`: the columns to build the indices on.
+    /// - `index_type`: specify [`IndexType`].
+    /// - `params`: index parameters.
+    fn create_index_builder<'a>(
+        &'a mut self,
+        columns: &'a [&'a str],
+        index_type: IndexType,
+        params: &'a dyn IndexParams,
+    ) -> Self::IndexBuilder<'a>;
+
     /// Create indices on columns.
     ///
     /// Upon finish, a new dataset version is generated.

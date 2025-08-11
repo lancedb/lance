@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use lance_index::{IndexParams, IndexType};
+use lance_table::format::Index as IndexMetadata;
+use snafu::location;
+use tracing::instrument;
+use uuid::Uuid;
+
+use crate::{
+    dataset::{
+        transaction::{Operation, Transaction},
+        Dataset,
+    },
+    index::{
+        scalar::{build_inverted_index, build_scalar_index, inverted_index_details},
+        vector::{
+            build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
+        },
+        vector_index_details, DatasetIndexExt, DatasetIndexInternalExt,
+    },
+    Error, Result,
+};
+use lance_index::{
+    metrics::NoOpMetricsCollector,
+    scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
+};
+
+pub struct CreateIndexBuilder<'a> {
+    dataset: &'a mut Dataset,
+    columns: Vec<String>,
+    index_type: IndexType,
+    params: &'a dyn IndexParams,
+    name: Option<String>,
+    replace: bool,
+    train: bool,
+}
+
+impl<'a> CreateIndexBuilder<'a> {
+    pub fn new(
+        dataset: &'a mut Dataset,
+        columns: &[&str],
+        index_type: IndexType,
+        params: &'a dyn IndexParams,
+    ) -> Self {
+        Self {
+            dataset,
+            columns: columns.iter().map(|s| s.to_string()).collect(),
+            index_type,
+            params,
+            name: None,
+            replace: false,
+            train: true,
+        }
+    }
+
+    pub fn name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    pub fn replace(mut self, replace: bool) -> Self {
+        self.replace = replace;
+        self
+    }
+
+    pub fn train(mut self, train: bool) -> Self {
+        self.train = train;
+        self
+    }
+
+    #[instrument(skip_all)]
+    pub async fn execute(self) -> Result<()> {
+        if self.columns.len() != 1 {
+            return Err(Error::Index {
+                message: "Only support building index on 1 column at the moment".to_string(),
+                location: location!(),
+            });
+        }
+        let column = &self.columns[0];
+        let Some(field) = self.dataset.schema().field(column) else {
+            return Err(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
+            });
+        };
+
+        // Load indices from the disk.
+        let indices = self.dataset.load_indices().await?;
+        let fri = self
+            .dataset
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await?;
+        let index_name = self.name.unwrap_or(format!("{column}_idx"));
+        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
+            if idx.fields == [field.id] && !self.replace {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index name '{index_name} already exists, \
+                        please specify a different name or use replace=True"
+                    ),
+                    location: location!(),
+                });
+            };
+            if idx.fields != [field.id] {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index name '{index_name} already exists with different fields, \
+                        please specify a different name"
+                    ),
+                    location: location!(),
+                });
+            }
+        }
+
+        let index_id = Uuid::new_v4();
+        let index_details = match (self.index_type, self.params.index_name()) {
+            (
+                IndexType::Bitmap
+                | IndexType::BTree
+                | IndexType::Inverted
+                | IndexType::NGram
+                | IndexType::LabelList,
+                LANCE_SCALAR_INDEX,
+            ) => {
+                let params = ScalarIndexParams::new(self.index_type.try_into()?);
+                build_scalar_index(
+                    self.dataset,
+                    column,
+                    &index_id.to_string(),
+                    &params,
+                    self.train,
+                )
+                .await?
+            }
+            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
+                // Guess the index type
+                let params = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+                build_scalar_index(
+                    self.dataset,
+                    column,
+                    &index_id.to_string(),
+                    params,
+                    self.train,
+                )
+                .await?
+            }
+            (IndexType::Inverted, _) => {
+                // Inverted index params.
+                let inverted_params = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<InvertedIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+
+                build_inverted_index(
+                    self.dataset,
+                    column,
+                    &index_id.to_string(),
+                    inverted_params,
+                    self.train,
+                )
+                .await?;
+                inverted_index_details()
+            }
+            (IndexType::Vector, LANCE_VECTOR_INDEX) => {
+                // Vector index params.
+                let vec_params = self
+                    .params
+                    .as_any()
+                    .downcast_ref::<VectorIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Vector index type must take a VectorIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+
+                if self.train {
+                    // this is a large future so move it to heap
+                    Box::pin(build_vector_index(
+                        self.dataset,
+                        column,
+                        &index_name,
+                        &index_id.to_string(),
+                        vec_params,
+                        fri,
+                    ))
+                    .await?;
+                } else {
+                    // Create empty vector index
+                    build_empty_vector_index(
+                        self.dataset,
+                        column,
+                        &index_name,
+                        &index_id.to_string(),
+                        vec_params,
+                    )
+                    .await?;
+                }
+                vector_index_details()
+            }
+            // Can't use if let Some(...) here because it's not stable yet.
+            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
+            (IndexType::Vector, name)
+                if self
+                    .dataset
+                    .session
+                    .index_extensions
+                    .contains_key(&(IndexType::Vector, name.to_string())) =>
+            {
+                let ext = self
+                    .dataset
+                    .session
+                    .index_extensions
+                    .get(&(IndexType::Vector, name.to_string()))
+                    .expect("already checked")
+                    .clone()
+                    .to_vector()
+                    // this should never happen because we control the registration
+                    // if this fails, the registration logic has a bug
+                    .ok_or(Error::Internal {
+                        message: "unable to cast index extension to vector".to_string(),
+                        location: location!(),
+                    })?;
+
+                if self.train {
+                    ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
+                        .await?;
+                } else {
+                    todo!("create empty vector index when train=false");
+                }
+                vector_index_details()
+            }
+            (IndexType::FragmentReuse, _) => {
+                return Err(Error::Index {
+                    message: "Fragment reuse index can only be created through compaction"
+                        .to_string(),
+                    location: location!(),
+                })
+            }
+            (index_type, index_name) => {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index type {index_type} with name {index_name} is not supported"
+                    ),
+                    location: location!(),
+                });
+            }
+        };
+
+        let new_idx = IndexMetadata {
+            uuid: index_id,
+            name: index_name,
+            fields: vec![field.id],
+            dataset_version: self.dataset.manifest.version,
+            fragment_bitmap: if self.train {
+                // Include all fragments if training occurred
+                Some(
+                    self.dataset
+                        .get_fragments()
+                        .iter()
+                        .map(|f| f.id() as u32)
+                        .collect(),
+                )
+            } else {
+                // Empty bitmap for untrained indices
+                Some(roaring::RoaringBitmap::new())
+            },
+            index_details: Some(index_details),
+            index_version: self.index_type.version(),
+        };
+        let transaction = Transaction::new(
+            self.dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices: vec![],
+            },
+            /*blobs_op= */ None,
+            None,
+        );
+
+        self.dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+
+        Ok(())
+    }
+}
