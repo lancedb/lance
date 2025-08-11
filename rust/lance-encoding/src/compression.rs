@@ -126,12 +126,14 @@ fn try_bss_for_mini_block(
     data: &FixedWidthDataBlock,
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
-    // BSS only supports 32-bit and 64-bit values
-    if data.bits_per_value != 32 && data.bits_per_value != 64 {
+    // BSS requires general compression to be effective
+    // If compression is explicitly disabled, skip BSS
+    if params.compression.as_deref() == Some("none") {
         return None;
     }
 
     let mode = params.bss.unwrap_or(BssMode::Auto);
+    // should_use_bss already checks for supported bit widths (32/64)
     if should_use_bss(data, mode) {
         return Some(Box::new(ByteStreamSplitEncoder::new(
             data.bits_per_value as usize,

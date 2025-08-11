@@ -264,9 +264,10 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
 
 /// Determine if BSS should be used based on mode and data characteristics
 pub fn should_use_bss(data: &FixedWidthDataBlock, mode: BssMode) -> bool {
-    // Only support byte-aligned data
-    let bytes_per_value = data.bits_per_value / 8;
-    if data.bits_per_value % 8 != 0 || bytes_per_value < 2 {
+    // Only support 32-bit and 64-bit values
+    // BSS is most effective for these common types (floats, timestamps, etc.)
+    // 16-bit values have limited benefit with only 2 streams
+    if data.bits_per_value != 32 && data.bits_per_value != 64 {
         return false;
     }
 
