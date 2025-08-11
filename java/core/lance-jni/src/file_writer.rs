@@ -95,7 +95,7 @@ fn inner_open<'local>(
         Result::Ok(FileWriter::new_lazy(
             obj_writer,
             FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_1),
+                format_version: Some(LanceFileVersion::Stable),
                 ..Default::default()
             },
         ))
