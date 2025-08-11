@@ -114,12 +114,13 @@ jobs:
     - name: Determine tag name
       id: tag_name
       run: |
-        VERSION="${{ steps.new_version.outputs.version }}"
-        
         if [ "${{ inputs.release_channel }}" == "stable" ]; then
+          VERSION="${{ steps.new_version.outputs.version }}"
           TAG="v${VERSION}"
         else
-          # For preview releases, find the next beta number
+          # For preview releases, use current version
+          VERSION="${{ steps.current_version.outputs.version }}"
+          # Find the next beta number for current version
           BETA_TAGS=$(git tag -l "v${VERSION}-beta.*" | sort -V)
           if [ -z "$BETA_TAGS" ]; then
             BETA_NUM=1
@@ -139,11 +140,14 @@ jobs:
       run: |
         python ci/bump_version.py ${{ inputs.release_type }}
     
-    - name: Create release commit (stable releases only)
-      if: inputs.release_channel == 'stable'
+    - name: Configure git identity
       run: |
         git config user.name 'Lance Release Bot'
         git config user.email 'lance-dev@lancedb.com'
+    
+    - name: Create release commit (stable releases only)
+      if: inputs.release_channel == 'stable'
+      run: |
         git add -A
         git commit -m "chore: release version ${{ steps.new_version.outputs.version }}"
     
