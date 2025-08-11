@@ -50,7 +50,7 @@ impl ObjectStoreProvider for OssStoreProvider {
         config_map.insert("bucket".to_string(), bucket);
 
         if !prefix.is_empty() {
-            config_map.insert("root".to_string(), format!("/{}", prefix));
+            config_map.insert("root".to_string(), "/".to_string());
         }
 
         // Override with storage options if provided
@@ -118,7 +118,7 @@ mod tests {
 
         let url = Url::parse("oss://bucket/path/to/file").unwrap();
         let path = provider.extract_path(&url);
-        let expected_path = object_store::path::Path::from("/path/to/file");
+        let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
     }
 }
