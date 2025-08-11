@@ -2057,7 +2057,7 @@ mod tests {
         cast::as_string_array,
         types::{Float32Type, Int32Type},
         ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
-        Int8DictionaryArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
+        Int8DictionaryArray, ListArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_array::{
         Array, FixedSizeListArray, GenericStringArray, Int16Array, Int16DictionaryArray,
@@ -7094,5 +7094,152 @@ mod tests {
             read_inner_struct.null_count(),
             "Null count should be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn test_issue_4429_nested_struct_encoding_v2_1_with_over_65k_structs() {
+        // Regression test for miniblock 16KB limit with nested struct patterns
+        // Tests encoding behavior when a nested struct<list<struct>> contains
+        // large amounts of data that exceeds miniblock encoding limits
+
+        let test_dir = tempdir().unwrap();
+
+        // Create a struct with multiple fields that will trigger miniblock encoding
+        // Each field is 4 bytes, making the struct narrow enough for miniblock
+        let measurement_fields = vec![
+            ArrowField::new("val_a", DataType::Float32, true),
+            ArrowField::new("val_b", DataType::Float32, true),
+            ArrowField::new("val_c", DataType::Float32, true),
+            ArrowField::new("val_d", DataType::Float32, true),
+            ArrowField::new("seq_high", DataType::Int32, true),
+            ArrowField::new("seq_low", DataType::Int32, true),
+        ];
+        let measurement_type = DataType::Struct(measurement_fields.clone().into());
+
+        // Create nested schema: struct<measurements: list<struct>>
+        // This pattern can trigger encoding issues with large data volumes
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            DataType::Struct(
+                vec![ArrowField::new(
+                    "measurements",
+                    DataType::List(Arc::new(ArrowField::new(
+                        "item",
+                        measurement_type.clone(),
+                        true,
+                    ))),
+                    true,
+                )]
+                .into(),
+            ),
+            true,
+        )]));
+
+        // Create large number of measurements that will exceed encoding limits
+        // Using 70,520 to match the exact problematic size
+        const NUM_MEASUREMENTS: usize = 70_520;
+
+        // Generate data for two full sets (rows 0 and 2 will have data, row 1 empty)
+        const TOTAL_MEASUREMENTS: usize = NUM_MEASUREMENTS * 2;
+
+        // Create arrays with realistic values
+        let val_a_array = Float32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(16.66 + (i as f32 * 0.0001))),
+        );
+        let val_b_array = Float32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(-3.54 + (i as f32 * 0.0002))),
+        );
+        let val_c_array = Float32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(2.94 + (i as f32 * 0.0001))),
+        );
+        let val_d_array =
+            Float32Array::from_iter((0..TOTAL_MEASUREMENTS).map(|i| Some(((i % 50) + 10) as f32)));
+        let seq_high_array =
+            Int32Array::from_iter((0..TOTAL_MEASUREMENTS).map(|_| Some(1736962329)));
+        let seq_low_array = Int32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(304403000 + (i * 1000) as i32)),
+        );
+
+        // Create the struct array with all measurements
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("val_a", DataType::Float32, true)),
+                Arc::new(val_a_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("val_b", DataType::Float32, true)),
+                Arc::new(val_b_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("val_c", DataType::Float32, true)),
+                Arc::new(val_c_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("val_d", DataType::Float32, true)),
+                Arc::new(val_d_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("seq_high", DataType::Int32, true)),
+                Arc::new(seq_high_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("seq_low", DataType::Int32, true)),
+                Arc::new(seq_low_array) as ArrayRef,
+            ),
+        ]);
+
+        // Create list array with pattern: [70520 items, 0 items, 70520 items]
+        // This pattern triggers the issue with V2.1 encoding
+        let offsets = vec![
+            0i32,
+            NUM_MEASUREMENTS as i32,       // End of row 0
+            NUM_MEASUREMENTS as i32,       // End of row 1 (empty)
+            (NUM_MEASUREMENTS * 2) as i32, // End of row 2
+        ];
+        let list_array = ListArray::try_new(
+            Arc::new(ArrowField::new("item", measurement_type, true)),
+            arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(offsets)),
+            Arc::new(struct_array) as ArrayRef,
+            None,
+        )
+        .unwrap();
+
+        // Create the outer struct wrapping the list
+        let data_struct = StructArray::from(vec![(
+            Arc::new(ArrowField::new(
+                "measurements",
+                DataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(measurement_fields.into()),
+                    true,
+                ))),
+                true,
+            )),
+            Arc::new(list_array) as ArrayRef,
+        )]);
+
+        // Create the final record batch with 3 rows
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data_struct) as ArrayRef]).unwrap();
+
+        assert_eq!(batch.num_rows(), 3, "Should have exactly 3 rows");
+
+        let test_uri = test_dir.path().to_str().unwrap().to_string();
+
+        // Test with V2.1 format which has different encoding behavior
+        let batches = vec![batch];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        // V2.1 format triggers miniblock encoding for narrow structs
+        let mut write_params = WriteParams::default();
+        write_params.data_storage_version = Some(lance_file::version::LanceFileVersion::V2_1);
+
+        // Write dataset - this will panic with miniblock 16KB assertion
+        let dataset = Dataset::write(reader, &test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
     }
 }
