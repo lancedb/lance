@@ -602,7 +602,7 @@ mod test {
     #[tokio::test]
     async fn test_stable_row_id_after_deletion_update_and_compaction() {
         // gen dataset
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "i",
                 lance_datagen::array::step::<arrow_array::types::Int32Type>(),
