@@ -349,6 +349,41 @@ fn vector_index_details() -> prost_types::Any {
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
 
+    /// Create a builder for creating an index on columns.
+    ///
+    /// This returns a builder that can be configured with additional options
+    /// before awaiting to execute.
+    ///
+    /// # Examples
+    ///
+    /// Create a scalar BTREE index:
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let params = ScalarIndexParams::default();
+    /// dataset
+    ///     .create_index_builder(&["id"], IndexType::BTree, &params)
+    ///     .name("id_index".to_string())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Create an empty index that will be populated later:
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let params = ScalarIndexParams::default();
+    /// dataset
+    ///     .create_index_builder(&["category"], IndexType::Bitmap, &params)
+    ///     .train(false)  // Create empty index
+    ///     .replace(true)  // Replace if exists
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     fn create_index_builder<'a>(
         &'a mut self,
         columns: &[&str],
@@ -374,7 +409,7 @@ impl DatasetIndexExt for Dataset {
             builder = builder.name(name);
         }
 
-        builder.replace(replace).execute().await
+        builder.replace(replace).await
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {
@@ -2620,11 +2655,11 @@ mod tests {
         let mut dataset = Dataset::write(reader, "memory://test", None).await.unwrap();
 
         // Create an empty index with train=false
+        // Test using IntoFuture - can await directly without calling .execute()
         dataset
             .create_index_builder(&[column_name], index_type, params.as_ref())
             .name("index".to_string())
             .train(false)
-            .execute()
             .await
             .unwrap();
 
@@ -2736,7 +2771,6 @@ mod tests {
             .create_index_builder(&[column_name], index_type, params.as_ref())
             .name("index".to_string())
             .train(true)
-            .execute()
             .await
             .unwrap();
 
@@ -2940,7 +2974,6 @@ mod tests {
             .create_index_builder(&[column_name], index_type, params.as_ref())
             .name("index".to_string())
             .train(true)
-            .execute()
             .await
             .unwrap();
 

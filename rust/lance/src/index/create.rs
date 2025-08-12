@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use futures::future::BoxFuture;
 use lance_index::{IndexParams, IndexType};
 use lance_table::format::Index as IndexMetadata;
 use snafu::location;
+use std::future::IntoFuture;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -69,9 +71,8 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    // TODO: move execute() into a IntoFuture trait implementation.
     #[instrument(skip_all)]
-    pub async fn execute(self) -> Result<()> {
+    async fn execute(self) -> Result<()> {
         if self.columns.len() != 1 {
             return Err(Error::Index {
                 message: "Only support building index on 1 column at the moment".to_string(),
@@ -295,5 +296,14 @@ impl<'a> CreateIndexBuilder<'a> {
             .await?;
 
         Ok(())
+    }
+}
+
+impl<'a> IntoFuture for CreateIndexBuilder<'a> {
+    type Output = Result<()>;
+    type IntoFuture = BoxFuture<'a, Result<()>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.execute())
     }
 }

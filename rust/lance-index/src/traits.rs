@@ -63,9 +63,12 @@ pub trait DatasetIndexExt {
     where
         Self: 'a;
 
-    /// Create an index on columns.
+    /// Create a builder for creating an index on columns.
     ///
-    /// Parameters:
+    /// This returns a builder that can be configured with additional options
+    /// like `name()`, `replace()`, and `train()` before awaiting to execute.
+    ///
+    /// # Parameters
     /// - `columns`: the columns to build the indices on.
     /// - `index_type`: specify [`IndexType`].
     /// - `params`: index parameters.
