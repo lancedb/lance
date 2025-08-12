@@ -64,7 +64,6 @@ use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
 pub(crate) mod append;
-pub(crate) mod cache;
 mod create;
 pub mod frag_reuse;
 pub mod mem_wal;
@@ -545,7 +544,7 @@ impl DatasetIndexExt for Dataset {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
                     if index_matches_criteria(idx, &criteria, field, has_multiple)? {
-                        let non_empty = idx.fragment_bitmap.as_ref().map_or(false, |bitmap| {
+                        let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                             bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
                         });
                         let is_fts_index = if let Some(_details) = &idx.index_details {
@@ -692,7 +691,7 @@ impl DatasetIndexExt for Dataset {
 
         let index_type = indices[0].index_type().to_string();
 
-        let indexed_fragments_per_delta = dbg!(self.indexed_fragments(index_name).await?);
+        let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
 
         let res = indexed_fragments_per_delta
             .iter()
@@ -2611,7 +2610,7 @@ mod tests {
         use lance_datagen::{array, BatchCount, ByteCount, RowCount};
 
         // Create dataset with scalar and text columns (no vector column needed)
-        let reader = lance_datagen::gen()
+        let reader = lance_datagen::gen_batch()
             .col("i", array::step::<Int32Type>())
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
@@ -2635,7 +2634,7 @@ mod tests {
         );
 
         // Append new data using lance_datagen
-        let append_reader = lance_datagen::gen()
+        let append_reader = lance_datagen::gen_batch()
             .col("i", array::step::<Int32Type>())
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
@@ -2723,7 +2722,7 @@ mod tests {
         use lance_datagen::{array, BatchCount, ByteCount, RowCount};
 
         // Create dataset with initial data
-        let reader = lance_datagen::gen()
+        let reader = lance_datagen::gen_batch()
             .col("i", array::step::<Int32Type>())
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
@@ -2864,7 +2863,7 @@ mod tests {
         }
 
         // Test that we can append new data and the index is still there
-        let append_reader = lance_datagen::gen()
+        let append_reader = lance_datagen::gen_batch()
             .col("i", array::step::<Int32Type>())
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
@@ -2927,7 +2926,7 @@ mod tests {
         use lance_datagen::{array, BatchCount, ByteCount, RowCount};
 
         // Create dataset with initial data
-        let reader = lance_datagen::gen()
+        let reader = lance_datagen::gen_batch()
             .col("i", array::step::<Int32Type>())
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));

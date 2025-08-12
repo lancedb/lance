@@ -6,7 +6,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
-use roaring::RoaringBitmap;
 use snafu::location;
 
 use crate::{optimize::OptimizeOptions, scalar::ScalarIndexType, IndexParams, IndexType};

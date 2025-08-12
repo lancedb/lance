@@ -56,8 +56,8 @@ use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::is_system_index;
 use lance_index::mem_wal::MemWal;
+use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use lance_table::{

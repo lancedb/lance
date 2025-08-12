@@ -69,6 +69,7 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
+    // TODO: move execute() into a IntoFuture trait implementation.
     #[instrument(skip_all)]
     pub async fn execute(self) -> Result<()> {
         if self.columns.len() != 1 {
@@ -277,6 +278,7 @@ impl<'a> CreateIndexBuilder<'a> {
             },
             index_details: Some(index_details),
             index_version: self.index_type.version(),
+            created_at: Some(chrono::Utc::now()),
         };
         let transaction = Transaction::new(
             self.dataset.manifest.version,
