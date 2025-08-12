@@ -553,8 +553,11 @@ impl DatasetIndexExt for Dataset {
                         } else {
                             false
                         };
+                        // FTS indices must always be returned even if empty, because FTS queries
+                        // require an index to exist. The query execution will handle the empty
+                        // bitmap appropriately and fall back to scanning unindexed data.
+                        // Other index types can be skipped if empty since they're optional optimizations.
                         if non_empty || is_fts_index {
-                            // If the index is non-empty or an FTS index, return it.
                             return Ok(Some(idx.clone()));
                         }
                     }
@@ -2684,7 +2687,7 @@ mod tests {
             plan.contains("MatchQuery")
         } else {
             // For btree/bitmap, look for MaterializeIndex which indicates scalar index usage
-            plan.contains("MaterializeIndex")
+            plan.contains("ScalarIndexQuery")
         };
 
         if should_use_index {
@@ -3022,11 +3025,13 @@ mod tests {
             "Index statistics should be zero after update, as it is not re-trained"
         );
 
-        // Verify index is NOT being used in queries after update (empty bitmap)
+        // Verify index behavior in queries after update (empty bitmap)
         if column_name == "text" {
-            // Inverted indexes will still appear to be used in FTS queries.
+            // Inverted indexes will still appear to be used in FTS queries even with empty bitmaps.
+            // This is because FTS queries require an index to exist, and the query execution
+            // will handle the empty bitmap appropriately by falling back to scanning unindexed data.
             // TODO: once metrics are working on FTS queries, we can check the
-            // analyze plan output instead for index usage.
+            // analyze plan output instead for actual index usage statistics.
             let _plan_after_update = dataset
                 .scan()
                 .project(&[column_name])
@@ -3039,7 +3044,7 @@ mod tests {
             assert_index_usage(
                 &_plan_after_update,
                 column_name,
-                true,
+                true,  // FTS indices always appear in the plan, even with empty bitmaps
                 "after update (empty bitmap)",
             );
         } else {
@@ -3056,7 +3061,7 @@ mod tests {
             assert_index_usage(
                 &_plan_after_update,
                 column_name,
-                true,
+                false,
                 "after update (empty effective bitmap)",
             );
         }
