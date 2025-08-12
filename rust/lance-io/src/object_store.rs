@@ -335,7 +335,7 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             };
-            let path = Path::from(path.path());
+            let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
         }
         let url = uri_to_url(uri)?;
