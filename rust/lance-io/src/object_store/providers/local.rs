@@ -66,9 +66,9 @@ mod tests {
             ("file-object-store:///path/to/file", "path/to/file"),
             ("file:///path/to/foo/../bar", "path/to/bar"),
             // for no ASCII string tests
-            ("file:///path/to/foo测试/bar", "file:///path/to/foo测试/bar"),
-            ("file:///path/to/foo~2/bar", "file:///path/to/foo~2/bar"),
-            ("file:///path/to/foo%2/bar", "file:///path/to/foo%2/bar"),
+            ("file:///path/to/foo测试/bar", "path/to/foo测试/bar"),
+            ("file:///path/to/foo~2/bar", "path/to/foo~2/bar"),
+            ("file:///path/to/foo%2/bar", "path/to/foo%2/bar"),
         ];
 
         for (uri, expected_path) in cases {
