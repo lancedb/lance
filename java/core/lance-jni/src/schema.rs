@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use crate::error::{Error, Result};
 use crate::traits::IntoJava;
 use crate::utils::to_java_map;
