@@ -52,7 +52,7 @@ impl<'a> CreateIndexBuilder<'a> {
             params,
             name: None,
             replace: false,
-            train: true,
+            train: dataset.count_rows(None).await? > 0,
         }
     }
 
