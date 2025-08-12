@@ -1017,6 +1017,10 @@ impl DeepSizeOf for MiniBlockRepIndex {
 }
 
 impl MiniBlockRepIndex {
+    /// Decode repetition index from chunk metadata using default values.
+    /// 
+    /// This creates a repetition index where each chunk has no partial values
+    /// and no trailers, suitable for simple sequential data layouts.
     pub fn default_from_chunks(chunks: &[ChunkMeta]) -> Self {
         let mut blocks = Vec::with_capacity(chunks.len());
         let mut chunk_has_preamble = false;
@@ -1042,6 +1046,11 @@ impl MiniBlockRepIndex {
         Self { blocks }
     }
 
+    /// Decode repetition index from raw bytes in little-endian format.
+    /// 
+    /// The bytes should contain u64 values arranged in groups of `stride` elements,
+    /// where the first two values of each group represent ends_count and partial_count.
+    /// Returns an empty index if no bytes are provided.
     pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
         let u64_size = std::mem::size_of::<u64>();
         let n64 = rep_bytes.len() / u64_size;
@@ -1081,37 +1090,6 @@ impl MiniBlockRepIndex {
             });
 
             chunk_has_preamble = has_trailer;
-            offset += starts_including_trailer;
-        }
-
-        Self { blocks }
-    }
-
-    fn decode(rep_index: &[Vec<u64>]) -> Self {
-        let mut chunk_has_preamble = false;
-        let mut offset = 0;
-        let mut blocks = Vec::with_capacity(rep_index.len());
-        for chunk_rep in rep_index {
-            let ends_count = chunk_rep[0];
-            let partial_count = chunk_rep[1];
-
-            let chunk_has_trailer = partial_count > 0;
-            let mut starts_including_trailer = ends_count;
-            if chunk_has_trailer {
-                starts_including_trailer += 1;
-            }
-            if chunk_has_preamble {
-                starts_including_trailer -= 1;
-            }
-
-            blocks.push(MiniBlockRepIndexBlock {
-                first_row: offset,
-                starts_including_trailer,
-                has_preamble: chunk_has_preamble,
-                has_trailer: chunk_has_trailer,
-            });
-
-            chunk_has_preamble = chunk_has_trailer;
             offset += starts_including_trailer;
         }
 
@@ -4698,8 +4676,10 @@ mod tests {
 
     #[test]
     fn test_schedule_instructions() {
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
 
         let check = |user_ranges, expected_instructions| {
             let instructions =
@@ -4852,8 +4832,10 @@ mod tests {
             drain_instructions
         }
 
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![1..7, 10..14];
 
         // First, schedule the ranges
@@ -4936,8 +4918,9 @@ mod tests {
         );
 
         // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
-        let repetition_index = vec![vec![5, 2], vec![3, 3], vec![20, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        let rep_data: Vec<u64> = vec![5, 2, 3, 3, 20, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![0..28];
 
         // First, schedule the ranges
