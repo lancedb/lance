@@ -1045,8 +1045,9 @@ impl MiniBlockRepIndex {
     /// where the first two values of each group represent ends_count and partial_count.
     /// Returns an empty index if no bytes are provided.
     pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
-        // Convert bytes to u64 slice using bytemuck for zero-copy conversion
-        let u64_slice: &[u64] = bytemuck::cast_slice(rep_bytes);
+        // Convert bytes to u64 slice, handling alignment automatically
+        let mut buffer = crate::buffer::LanceBuffer::from(rep_bytes.to_vec());
+        let u64_slice = buffer.borrow_to_typed_slice::<u64>();
         let n = u64_slice.len() / stride;
 
         let mut blocks = Vec::with_capacity(n);
