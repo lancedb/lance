@@ -52,7 +52,7 @@ impl<'a> CreateIndexBuilder<'a> {
             params,
             name: None,
             replace: false,
-            train: dataset.count_rows(None).await? > 0,
+            train: true,
         }
     }
 
@@ -85,6 +85,13 @@ impl<'a> CreateIndexBuilder<'a> {
                 message: format!("CreateIndex: column '{column}' does not exist"),
                 location: location!(),
             });
+        };
+
+        // If train is true but dataset is empty, automatically set train to false
+        let train = if self.train {
+            self.dataset.count_rows(None).await? > 0
+        } else {
+            false
         };
 
         // Load indices from the disk.
@@ -126,14 +133,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(self.index_type.try_into()?);
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    &params,
-                    self.train,
-                )
-                .await?
+                build_scalar_index(self.dataset, column, &index_id.to_string(), &params, train)
+                    .await?
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -145,14 +146,8 @@ impl<'a> CreateIndexBuilder<'a> {
                         message: "Scalar index type must take a ScalarIndexParams".to_string(),
                         location: location!(),
                     })?;
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    params,
-                    self.train,
-                )
-                .await?
+                build_scalar_index(self.dataset, column, &index_id.to_string(), params, train)
+                    .await?
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
@@ -170,7 +165,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     column,
                     &index_id.to_string(),
                     inverted_params,
-                    self.train,
+                    train,
                 )
                 .await?;
                 inverted_index_details()
@@ -186,7 +181,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         location: location!(),
                     })?;
 
-                if self.train {
+                if train {
                     // this is a large future so move it to heap
                     Box::pin(build_vector_index(
                         self.dataset,
@@ -234,7 +229,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         location: location!(),
                     })?;
 
-                if self.train {
+                if train {
                     ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
                         .await?;
                 } else {
@@ -264,7 +259,7 @@ impl<'a> CreateIndexBuilder<'a> {
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: if self.train {
+            fragment_bitmap: if train {
                 // Include all fragments if training occurred
                 Some(
                     self.dataset
