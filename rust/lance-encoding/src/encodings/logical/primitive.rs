@@ -1023,24 +1023,17 @@ impl MiniBlockRepIndex {
     /// and no trailers, suitable for simple sequential data layouts.
     pub fn default_from_chunks(chunks: &[ChunkMeta]) -> Self {
         let mut blocks = Vec::with_capacity(chunks.len());
-        let mut chunk_has_preamble = false;
         let mut offset: u64 = 0;
 
         for c in chunks {
-            let ends = c.num_values;
-            let has_trailer = false;
-            let starts_including_trailer =
-                ends + (has_trailer as u64) - (chunk_has_preamble as u64);
-
             blocks.push(MiniBlockRepIndexBlock {
                 first_row: offset,
-                starts_including_trailer,
-                has_preamble: chunk_has_preamble,
-                has_trailer,
+                starts_including_trailer: c.num_values,
+                has_preamble: false,
+                has_trailer: false,
             });
 
-            chunk_has_preamble = has_trailer;
-            offset += starts_including_trailer;
+            offset += c.num_values;
         }
 
         Self { blocks }
