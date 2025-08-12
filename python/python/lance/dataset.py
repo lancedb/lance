@@ -3256,13 +3256,17 @@ class ExecuteResult(TypedDict):
     num_deleted_rows: int
 
 
-class Index(TypedDict):
-    name: str
-    type: str
+@dataclass
+class Index:
+    """Represents an index in the dataset."""
+
     uuid: str
-    fields: List[str]
-    version: int
+    name: str
+    fields: List[int]
+    dataset_version: int
     fragment_ids: Set[int]
+    index_version: int
+    created_at: Optional[datetime] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -3612,13 +3616,8 @@ class LanceOperation:
         Operation that creates an index on the dataset.
         """
 
-        uuid: str
-        name: str
-        fields: List[int]
-        dataset_version: int
-        fragment_ids: Set[int]
-        index_version: int
-        created_at: Optional[datetime] = None
+        new_indices: List[Index]
+        removed_indices: List[Index]
 
     @dataclass
     class DataReplacementGroup:
