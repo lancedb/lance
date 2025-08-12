@@ -2963,7 +2963,7 @@ mod tests {
             let effective_bitmap = other_value_index
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
                 .unwrap();
-            
+
             // The effective bitmap is the intersection of the index's original bitmap
             // and the current dataset fragments. Since other_value is not modified by
             // partial merges, it retains its validity for fragments it was originally trained on
