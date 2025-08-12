@@ -202,7 +202,7 @@ impl<'a> RabitDistCalculator<'a> {
         let dim = query_codes.len();
         let sq_sum = query_codes.iter().map(|&v| v as u32).sum::<u32>() as f32;
 
-        let dist_table = Self::build_dist_table(query_codes);
+        let dist_table = build_dist_table(query_codes);
         Self {
             dim,
             num_bits: 1,
@@ -218,28 +218,28 @@ impl<'a> RabitDistCalculator<'a> {
             sqrt_d: (dim as f32).sqrt(),
         }
     }
+}
 
-    fn build_dist_table(query_codes: Vec<u8>) -> Vec<u32> {
-        // divide query codes into segments of 4 bytes,
-        // and calculate the distance between the segment and binary vector (4 bits),
-        // dist_table[i][j] is the distance between the i-th query code segment and the code j
-        query_codes
-            .chunks_exact(SEGMENT_LENGTH)
-            .flat_map(|sub_vec| {
-                debug_assert_eq!(sub_vec.len(), SEGMENT_LENGTH);
-                (0..SEGMENT_NUM_CODES).map(|j| {
-                    let mut dist = 0;
-                    for (b, &v) in sub_vec.iter().enumerate() {
-                        if (j >> b) & 0x1 != 0 {
-                            dist += v as u32;
-                        }
+pub fn build_dist_table(query_codes: Vec<u8>) -> Vec<u32> {
+    // divide query codes into segments of 4 bytes,
+    // and calculate the distance between the segment and binary vector (4 bits),
+    // dist_table[i][j] is the distance between the i-th query code segment and the code j
+    query_codes
+        .chunks_exact(SEGMENT_LENGTH)
+        .flat_map(|sub_vec| {
+            debug_assert_eq!(sub_vec.len(), SEGMENT_LENGTH);
+            (0..SEGMENT_NUM_CODES).map(|j| {
+                let mut dist = 0;
+                for (b, &v) in sub_vec.iter().enumerate() {
+                    if (j >> b) & 0x1 != 0 {
+                        dist += v as u32;
                     }
-                    dist
-                })
+                }
+                dist
             })
-            .exact_size(query_codes.len() / SEGMENT_LENGTH * SEGMENT_NUM_CODES)
-            .collect()
-    }
+        })
+        .exact_size(query_codes.len() / SEGMENT_LENGTH * SEGMENT_NUM_CODES)
+        .collect()
 }
 
 impl DistCalculator for RabitDistCalculator<'_> {

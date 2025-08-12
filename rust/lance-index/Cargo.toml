@@ -133,5 +133,9 @@ harness = false
 name = "compute_partition"
 harness = false
 
+[[bench]]
+name = "rq"
+harness = false
+
 [lints]
 workspace = true
