@@ -84,7 +84,7 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
+use self::transaction::{Operation, Transaction, UpdateMapEntry};
 use self::write::write_fragments_internal;
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
@@ -1903,16 +1903,6 @@ impl Dataset {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
     }
-
-    async fn update_op(&mut self, op: Operation) -> Result<()> {
-        let transaction =
-            Transaction::new(self.manifest.version, op, /*blobs_op=*/ None, None);
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
-    }
 }
 
 /// # Dataset metadata APIs
@@ -1944,14 +1934,15 @@ impl Dataset {
     )]
     pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
         let updates = delete_keys.iter().map(|key| (*key, None));
-        self.update_config(updates, false).await?;
+        self.update_config(updates).await?;
         Ok(())
     }
 
     /// Update table metadata.
     ///
     /// Pass `None` for a value to remove that key.
-    /// Pass `replace=true` to replace the entire metadata map.
+    ///
+    /// Use `.replace()` to replace the entire metadata map instead of merging.
     ///
     /// Returns the updated metadata map after the operation.
     ///
@@ -1960,43 +1951,31 @@ impl Dataset {
     /// # use lance::dataset::transaction::UpdateMapEntry;
     /// # async fn test_update_metadata(dataset: &mut Dataset) -> Result<()> {
     /// // Update single key
-    /// dataset.update_metadata([("key", "value")], false).await?;
+    /// dataset.update_metadata([("key", "value")]).await?;
     ///
     /// // Remove a key
-    /// dataset.update_metadata([("to_delete", None)], false).await?;
+    /// dataset.update_metadata([("to_delete", None)]).await?;
     ///
     /// // Clear all metadata
-    /// dataset.update_metadata([] as [UpdateMapEntry; 0], true).await?;
+    /// dataset.update_metadata([] as [UpdateMapEntry; 0]).replace().await?;
     ///
     /// // Replace full metadata
-    /// dataset.update_metadata([("k1", "v1"), ("k2", "v2")], true).await?;
+    /// dataset.update_metadata([("k1", "v1"), ("k2", "v2")]).replace().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn update_metadata(
+    pub fn update_metadata(
         &mut self,
         values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
-        replace: bool,
-    ) -> Result<HashMap<String, String>> {
-        let table_metadata_update_map = UpdateMap {
-            update_entries: values.into_iter().map(Into::into).collect(),
-            replace,
-        };
-        self.update_op(Operation::UpdateConfig {
-            config_updates: None,
-            table_metadata_updates: Some(table_metadata_update_map),
-            schema_metadata_updates: None,
-            field_metadata_updates: HashMap::new(),
-        })
-        .await?;
-
-        Ok(self.manifest.table_metadata.clone())
+    ) -> metadata::UpdateMetadataBuilder<'_> {
+        metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::TableMetadata)
     }
 
     /// Update config.
     ///
     /// Pass `None` for a value to remove that key.
-    /// Pass `replace=true` to replace the entire config map.
+    ///
+    /// Use `.replace()` to replace the entire config map instead of merging.
     ///
     /// Returns the updated config map after the operation.
     ///
@@ -2005,43 +1984,31 @@ impl Dataset {
     /// # use lance::dataset::transaction::UpdateMapEntry;
     /// # async fn test_update_config(dataset: &mut Dataset) -> Result<()> {
     /// // Update single key
-    /// dataset.update_config([("key", "value")], false).await?;
+    /// dataset.update_config([("key", "value")]).await?;
     ///
     /// // Remove a key
-    /// dataset.update_config([("to_delete", None)], false).await?;
+    /// dataset.update_config([("to_delete", None)]).await?;
     ///
     /// // Clear all config
-    /// dataset.update_config([] as [UpdateMapEntry; 0], true).await?;
+    /// dataset.update_config([] as [UpdateMapEntry; 0]).replace().await?;
     ///
     /// // Replace full config
-    /// dataset.update_config([("k1", "v1"), ("k2", "v2")], true).await?;
+    /// dataset.update_config([("k1", "v1"), ("k2", "v2")]).replace().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn update_config(
+    pub fn update_config(
         &mut self,
         values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
-        replace: bool,
-    ) -> Result<HashMap<String, String>> {
-        let config_update_map = UpdateMap {
-            update_entries: values.into_iter().map(Into::into).collect(),
-            replace,
-        };
-        self.update_op(Operation::UpdateConfig {
-            config_updates: Some(config_update_map),
-            table_metadata_updates: None,
-            schema_metadata_updates: None,
-            field_metadata_updates: HashMap::new(),
-        })
-        .await?;
-
-        Ok(self.manifest.config.clone())
+    ) -> metadata::UpdateMetadataBuilder<'_> {
+        metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::Config)
     }
 
     /// Update schema metadata.
     ///
     /// Pass `None` for a value to remove that key.
-    /// Pass `replace=true` to replace the entire schema metadata map.
+    ///
+    /// Use `.replace()` to replace the entire schema metadata map instead of merging.
     ///
     /// Returns the updated schema metadata map after the operation.
     ///
@@ -2050,42 +2017,28 @@ impl Dataset {
     /// # use lance::dataset::transaction::UpdateMapEntry;
     /// # async fn test_update_schema_metadata(dataset: &mut Dataset) -> Result<()> {
     /// // Update single key
-    /// dataset.update_schema_metadata([("key", "value")], false).await?;
+    /// dataset.update_schema_metadata([("key", "value")]).await?;
     ///
     /// // Remove a key
-    /// dataset.update_schema_metadata([("to_delete", None)], false).await?;
+    /// dataset.update_schema_metadata([("to_delete", None)]).await?;
     ///
     /// // Clear all schema metadata
-    /// dataset.update_schema_metadata([] as [UpdateMapEntry; 0], true).await?;
+    /// dataset.update_schema_metadata([] as [UpdateMapEntry; 0]).replace().await?;
     ///
     /// // Replace full schema metadata
-    /// dataset.update_schema_metadata([("k1", "v1"), ("k2", "v2")], true).await?;
+    /// dataset.update_schema_metadata([("k1", "v1"), ("k2", "v2")]).replace().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn update_schema_metadata(
+    pub fn update_schema_metadata(
         &mut self,
         values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
-        replace: bool,
-    ) -> Result<HashMap<String, String>> {
-        let schema_metadata_update_map = UpdateMap {
-            update_entries: values.into_iter().map(Into::into).collect(),
-            replace,
-        };
-        self.update_op(Operation::UpdateConfig {
-            config_updates: None,
-            table_metadata_updates: None,
-            schema_metadata_updates: Some(schema_metadata_update_map),
-            field_metadata_updates: HashMap::new(),
-        })
-        .await?;
-        Ok(self.manifest.schema.metadata.clone())
+    ) -> metadata::UpdateMetadataBuilder<'_> {
+        metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::SchemaMetadata)
     }
 
     /// Update schema metadata
-    #[deprecated(
-        note = "Use the new update_schema_metadata(values, replace) method with unified signature"
-    )]
+    #[deprecated(note = "Use the new update_schema_metadata(values).replace() instead")]
     pub async fn replace_schema_metadata(
         &mut self,
         new_values: impl IntoIterator<Item = (String, String)>,
@@ -2094,7 +2047,7 @@ impl Dataset {
             .into_iter()
             .map(|(k, v)| (k, Some(v)))
             .collect::<HashMap<_, _>>();
-        self.update_schema_metadata(new_values, true).await?;
+        self.update_schema_metadata(new_values).replace().await?;
         Ok(())
     }
 
@@ -2146,12 +2099,15 @@ impl Dataset {
                 )
             })
             .collect();
-        self.update_op(Operation::UpdateConfig {
-            config_updates: None,
-            table_metadata_updates: None,
-            schema_metadata_updates: None,
-            field_metadata_updates,
-        })
+        metadata::execute_metadata_update(
+            self,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates,
+            },
+        )
         .await
     }
 }

@@ -875,13 +875,11 @@ mod tests {
         config.insert("lance.test".to_string(), "value".to_string());
         config.insert("other-key".to_string(), "other-value".to_string());
 
-        #[allow(deprecated)]
-        manifest.update_config(config.clone());
+        manifest.config_mut().extend(config.clone());
         assert_eq!(manifest.config, config.clone());
 
         config.remove("other-key");
-        #[allow(deprecated)]
-        manifest.delete_config_keys(&["other-key"]);
+        manifest.config_mut().remove("other-key");
         assert_eq!(manifest.config, config);
     }
 }

@@ -1090,7 +1090,7 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k, Some(v)))
             .collect::<HashMap<String, Option<String>>>();
-        dataset.update_config(config_updates, false).await.unwrap();
+        dataset.update_config(config_updates).await.unwrap();
 
         // Fast forward so we are outside of the new "older_than" window.
         fixture
