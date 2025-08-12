@@ -498,12 +498,12 @@ pub(crate) async fn build_empty_vector_index(
 ) -> Result<()> {
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed
-    Err(Error::Index {
-        message: format!(
+    Err(Error::NotSupported {
+        source: format!(
             "Creating empty vector indices with train=False is not yet implemented. \
             Index '{}' for column '{}' cannot be created without training.",
             name, column
-        ),
+        ).into(),
         location: location!(),
     })
 }

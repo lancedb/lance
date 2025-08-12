@@ -31,12 +31,14 @@ def test_create_empty_vector_index():
     data = pa.table({"vector": vectors})
     dataset = lance.write_dataset(data, "memory://")
 
-    # Currently, vector indices with train=False may fall back to train=True
+    # Currently, vector indices with train=False are not supported
     try:
         dataset.create_index(
             "vector", "IVF_PQ", num_partitions=10, num_sub_vectors=8, train=False
         )
-    except ValueError as e:
-        # If it fails, it should be with the "not implemented" message
+        # If we get here, the implementation has been added (unexpected for now)
+        assert False, "Expected NotImplementedError for train=False on vector index, but succeeded"
+    except NotImplementedError as e:
+        # Expected error for unimplemented functionality
         error_msg = str(e).lower()
         assert "not yet implemented" in error_msg or "not implemented" in error_msg

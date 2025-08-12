@@ -1551,8 +1551,9 @@ impl Dataset {
         if let Some(name) = name {
             builder = builder.name(name);
         }
-        RT.block_on(None, builder.execute())?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        use std::future::IntoFuture;
+        RT.block_on(None, builder.into_future())?
+            .infer_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
