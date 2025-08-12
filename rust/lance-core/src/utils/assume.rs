@@ -27,28 +27,15 @@ macro_rules! assume {
     };
 }
 
-/// A macro that combines debug_assert_eq and std::hint::assert_unchecked for optimized equality assertions
-///
-/// In debug builds, this will perform a normal equality assertion check.
-/// In release builds, this will use hint::assert_unchecked which tells the compiler to assume
-/// the values are equal without actually checking them.
-///
-/// # Safety
-///
-/// This macro is unsafe in release builds since it uses hint::assert_unchecked.
-/// The caller must ensure the values will always be equal.
+/// Helper macro for equality assumptions.
 #[macro_export]
 macro_rules! assume_eq {
     ($left:expr, $right:expr) => {
         debug_assert_eq!($left, $right);
-        // SAFETY: The debug_assert ensures this is true in debug builds.
-        // In release builds, caller must ensure the values are equal.
         unsafe { std::hint::assert_unchecked($left == $right); }
     };
     ($left:expr, $right:expr, $($arg:tt)+) => {
         debug_assert_eq!($left, $right, $($arg)+);
-        // SAFETY: The debug_assert ensures this is true in debug builds.
-        // In release builds, caller must ensure the values are equal.
         unsafe { std::hint::assert_unchecked($left == $right); }
     };
 }
