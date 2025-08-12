@@ -27,8 +27,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     },
     format::{
-        pb::{self},
-        ProtobufUtils,
+        pb21::{self, CompressiveEncoding},
+        ProtobufUtils21,
     },
 };
 
@@ -132,10 +132,7 @@ impl FsstCompressed {
 pub struct FsstMiniBlockEncoder {}
 
 impl MiniBlockCompressor for FsstMiniBlockEncoder {
-    fn compress(
-        &self,
-        data: DataBlock,
-    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let compressed = FsstCompressed::fsst_compress(data)?;
 
         let data_block = DataBlock::VariableWidth(compressed.data);
@@ -149,7 +146,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
 
         Ok((
             binary_miniblock_compressed,
-            ProtobufUtils::fsst(binary_array_encoding, compressed.symbol_table),
+            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -166,7 +163,7 @@ impl FsstPerValueEncoder {
 }
 
 impl PerValueCompressor for FsstPerValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let compressed = FsstCompressed::fsst_compress(data)?;
 
         let data_block = DataBlock::VariableWidth(compressed.data);
@@ -175,7 +172,7 @@ impl PerValueCompressor for FsstPerValueEncoder {
 
         Ok((
             binary_compressed,
-            ProtobufUtils::fsst(binary_array_encoding, compressed.symbol_table),
+            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -287,7 +284,10 @@ pub struct FsstMiniBlockDecompressor {
 }
 
 impl FsstMiniBlockDecompressor {
-    pub fn new(description: &pb::Fsst, inner_decompressor: Box<dyn MiniBlockDecompressor>) -> Self {
+    pub fn new(
+        description: &pb21::Fsst,
+        inner_decompressor: Box<dyn MiniBlockDecompressor>,
+    ) -> Self {
         Self {
             symbol_table: LanceBuffer::from_bytes(description.symbol_table.clone(), 1),
             inner_decompressor,

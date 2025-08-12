@@ -8,7 +8,8 @@ package lance.encodings;
 import "google/protobuf/empty.proto";
 
 // This file contains a specification for encodings that can be used
-// to store and load Arrow data into a Lance file.
+// to store and load Arrow data into a Lance file for the 2.0 format.  It
+// has been superseded by encodings21.proto which is used for the 2.1 format.
 //
 // # Types
 //
