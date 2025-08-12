@@ -1008,6 +1008,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.metadata()
 
+    @property
     def schema_metadata(self) -> Dict[str, str]:
         """
         Get the schema metadata of the dataset.
@@ -3105,30 +3106,6 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
-    def update_config_legacy(self, upsert_values: Dict[str, str]) -> None:
-        """
-        Update the dataset configuration.
-
-        .. deprecated:: 0.32.1
-            Use :func:`update_config` instead for more flexible metadata updates.
-            This method will be removed in a future version.
-
-        This method inserts or updates configuration key-value pairs for the dataset.
-
-        Parameters
-        ----------
-        upsert_values : dict of str to str
-            The configuration items to insert or update.
-            Both keys and values should be strings.
-        """
-        warnings.warn(
-            "update_config(dict) is deprecated. "
-            "Use update_config(dict, replace=False) instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._ds.update_config(upsert_values)
-
     def delete_config_keys(self, keys: list[str]) -> None:
         """Delete specified configuration keys from the dataset.
 
@@ -3864,6 +3841,51 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+
+    @dataclass
+    class UpdateMap:
+        """
+        Represents updates to a metadata map.
+
+        Attributes
+        ----------
+        updates : Dict[str, Optional[str]]
+            Dictionary of key-value pairs to update. None values mean delete the key.
+        replace : bool
+            If True, replace the entire map with the new entries.
+            If False, merge the new entries with the existing map.
+        """
+
+        updates: Dict[str, Optional[str]]
+        replace: bool = False
+
+    @dataclass
+    class UpdateConfig(BaseOperation):
+        """
+        Operation that updates dataset metadata.
+
+        This operation can update various metadata levels:
+        - Dataset configuration
+        - Table metadata
+        - Schema metadata
+        - Field-specific metadata
+
+        Attributes
+        ----------
+        config_updates : Optional[UpdateMap]
+            Updates to the dataset configuration.
+        table_metadata_updates : Optional[UpdateMap]
+            Updates to the table metadata.
+        schema_metadata_updates : Optional[UpdateMap]
+            Updates to the schema metadata.
+        field_metadata_updates : Optional[Dict[int, UpdateMap]]
+            Updates to field metadata, keyed by field ID.
+        """
+
+        config_updates: Optional[LanceOperation.UpdateMap] = None
+        table_metadata_updates: Optional[LanceOperation.UpdateMap] = None
+        schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
+        field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
 
 
 @dataclass
