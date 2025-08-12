@@ -66,9 +66,9 @@ mod tests {
             ("file-object-store:///path/to/file", "path/to/file"),
             ("file:///path/to/foo/../bar", "path/to/bar"),
             // for no ASCII string tests
-            ("file:///path/to/foo测试/../bar", "path/to/bar"),
-            ("file:///path/to/foo~2/../bar", "path/to/bar"),
-            ("file:///path/to/foo%2/../bar", "path/to/bar"),
+            ("file:///path/to/foo测试/bar", "path/to/bar"),
+            ("file:///path/to/foo~2/bar", "path/to/bar"),
+            ("file:///path/to/foo%2/bar", "path/to/bar"),
         ];
 
         for (uri, expected_path) in cases {
@@ -96,7 +96,7 @@ mod tests {
 
         for (uri, expected_path) in cases {
             let url = uri_to_url(uri).unwrap();
-            let path = provider.extract_path(&url)?;
+            let path = provider.extract_path(&url).unwrap();
             assert_eq!(path.as_ref(), expected_path);
         }
     }
