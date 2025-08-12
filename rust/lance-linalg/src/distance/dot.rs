@@ -13,6 +13,7 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::assume_eq;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
@@ -218,8 +219,8 @@ pub fn dot_distance_batch<'a, T: Dot>(
     to: &'a [T],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+    assume_eq!(from.len(), dimension);
+    assume_eq!(to.len() % dimension, 0);
     Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
 }
 

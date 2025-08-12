@@ -1017,31 +1017,62 @@ impl DeepSizeOf for MiniBlockRepIndex {
 }
 
 impl MiniBlockRepIndex {
-    fn decode(rep_index: &[Vec<u64>]) -> Self {
-        let mut chunk_has_preamble = false;
-        let mut offset = 0;
-        let mut blocks = Vec::with_capacity(rep_index.len());
-        for chunk_rep in rep_index {
-            let ends_count = chunk_rep[0];
-            let partial_count = chunk_rep[1];
+    /// Decode repetition index from chunk metadata using default values.
+    ///
+    /// This creates a repetition index where each chunk has no partial values
+    /// and no trailers, suitable for simple sequential data layouts.
+    pub fn default_from_chunks(chunks: &[ChunkMeta]) -> Self {
+        let mut blocks = Vec::with_capacity(chunks.len());
+        let mut offset: u64 = 0;
 
-            let chunk_has_trailer = partial_count > 0;
-            let mut starts_including_trailer = ends_count;
-            if chunk_has_trailer {
-                starts_including_trailer += 1;
-            }
-            if chunk_has_preamble {
-                starts_including_trailer -= 1;
-            }
+        for c in chunks {
+            blocks.push(MiniBlockRepIndexBlock {
+                first_row: offset,
+                starts_including_trailer: c.num_values,
+                has_preamble: false,
+                has_trailer: false,
+            });
+
+            offset += c.num_values;
+        }
+
+        Self { blocks }
+    }
+
+    /// Decode repetition index from raw bytes in little-endian format.
+    ///
+    /// The bytes should contain u64 values arranged in groups of `stride` elements,
+    /// where the first two values of each group represent ends_count and partial_count.
+    /// Returns an empty index if no bytes are provided.
+    pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
+        // Convert bytes to u64 slice, handling alignment automatically
+        let mut buffer = crate::buffer::LanceBuffer::from(rep_bytes.to_vec());
+        let u64_slice = buffer.borrow_to_typed_slice::<u64>();
+        let n = u64_slice.len() / stride;
+
+        let mut blocks = Vec::with_capacity(n);
+        let mut chunk_has_preamble = false;
+        let mut offset: u64 = 0;
+
+        // Extract first two values from each block: ends_count and partial_count
+        for i in 0..n {
+            let base_idx = i * stride;
+            let ends = u64_slice[base_idx];
+            let partial = u64_slice[base_idx + 1];
+
+            let has_trailer = partial > 0;
+            // Convert branches to arithmetic for better compiler optimization
+            let starts_including_trailer =
+                ends + (has_trailer as u64) - (chunk_has_preamble as u64);
 
             blocks.push(MiniBlockRepIndexBlock {
                 first_row: offset,
                 starts_including_trailer,
                 has_preamble: chunk_has_preamble,
-                has_trailer: chunk_has_trailer,
+                has_trailer,
             });
 
-            chunk_has_preamble = chunk_has_trailer;
+            chunk_has_preamble = has_trailer;
             offset += starts_including_trailer;
         }
 
@@ -1524,29 +1555,16 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
             // Build the repetition index
             let rep_index = if let Some(rep_index_data) = rep_index_bytes {
-                // If we have a repetition index then we use that
-                // TODO: Compress the repetition index :)
                 assert!(rep_index_data.len() % 8 == 0);
-                let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
-                let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
-                // Unflatten
-                repetition_index_vals
-                    .as_ref()
-                    .chunks_exact(self.repetition_index_depth as usize + 1)
-                    .map(|c| c.to_vec())
-                    .collect::<Vec<_>>()
+                let stride = self.repetition_index_depth as usize + 1;
+                MiniBlockRepIndex::decode_from_bytes(&rep_index_data, stride)
             } else {
-                // Default rep index is just the number of items in each chunk
-                // with 0 partials/leftovers
-                chunk_meta
-                    .iter()
-                    .map(|c| vec![c.num_values, 0])
-                    .collect::<Vec<_>>()
+                MiniBlockRepIndex::default_from_chunks(&chunk_meta)
             };
 
             let mut page_meta = MiniBlockCacheableState {
                 chunk_meta,
-                rep_index: MiniBlockRepIndex::decode(&rep_index),
+                rep_index,
                 dictionary: None,
             };
 
@@ -4641,8 +4659,10 @@ mod tests {
 
     #[test]
     fn test_schedule_instructions() {
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
 
         let check = |user_ranges, expected_instructions| {
             let instructions =
@@ -4795,8 +4815,10 @@ mod tests {
             drain_instructions
         }
 
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![1..7, 10..14];
 
         // First, schedule the ranges
@@ -4879,8 +4901,9 @@ mod tests {
         );
 
         // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
-        let repetition_index = vec![vec![5, 2], vec![3, 3], vec![20, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        let rep_data: Vec<u64> = vec![5, 2, 3, 3, 20, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![0..28];
 
         // First, schedule the ranges
