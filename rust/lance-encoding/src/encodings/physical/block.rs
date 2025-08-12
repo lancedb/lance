@@ -73,8 +73,8 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
 
     fn try_from(scheme: CompressionScheme) -> Result<Self> {
         match scheme {
-            CompressionScheme::Lz4 => Ok(pb21::CompressionScheme::CompressionAlgorithmLz4),
-            CompressionScheme::Zstd => Ok(pb21::CompressionScheme::CompressionAlgorithmZstd),
+            CompressionScheme::Lz4 => Ok(Self::CompressionAlgorithmLz4),
+            CompressionScheme::Zstd => Ok(Self::CompressionAlgorithmZstd),
             _ => Err(Error::invalid_input(
                 format!("Unsupported compression scheme: {:?}", scheme),
                 location!(),
