@@ -506,9 +506,9 @@ impl ValueDecompressor {
         loop {
             layers.push(ValueFslDesc {
                 has_validity: description.has_validity,
-                dimension: description.items_per_value as u64,
+                dimension: description.items_per_value,
             });
-            cum_dim *= description.items_per_value as u64;
+            cum_dim *= description.items_per_value;
             if description.has_validity {
                 bytes_per_value += cum_dim.div_ceil(8);
             }

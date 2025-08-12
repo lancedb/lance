@@ -52,10 +52,7 @@ fn struct_data_block_to_fixed_width_data_block(
     }
 
     DataBlock::FixedWidth(FixedWidthDataBlock {
-        bits_per_value: bits_per_values
-            .iter()
-            .map(|bits_per_value| *bits_per_value as u64)
-            .sum(),
+        bits_per_value: bits_per_values.iter().copied().sum(),
         data: LanceBuffer::Owned(output),
         num_values,
         block_info: BlockInfo::default(),
@@ -155,7 +152,7 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
 
             let child = DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: LanceBuffer::Owned(child_buf),
-                bits_per_value: self.bits_per_values[i] as u64,
+                bits_per_value: self.bits_per_values[i],
                 num_values,
                 block_info: BlockInfo::default(),
             });
