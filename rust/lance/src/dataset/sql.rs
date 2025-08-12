@@ -111,7 +111,7 @@ impl SqlQuery {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{assert_string_matches, DatagenExt, FragmentCount, FragmentRowCount};
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
@@ -208,5 +208,77 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 1);
         pretty_assertions::assert_eq!(results.num_rows(), 1);
         pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 50);
+    }
+
+    #[tokio::test]
+    async fn test_explain() {
+        let mut ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                "memory://test_sql_dataset",
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        let results = ds
+            .sql("EXPLAIN SELECT * FROM foo where y >= 100")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let results = results.into_iter().next().unwrap();
+
+        let plan = format!("{:?}", results);
+        let expected_pattern = r#"...columns: [StringArray
+[
+  "logical_plan",
+  "physical_plan",
+], StringArray
+[
+  "TableScan: foo projection=[x, y], full_filters=[foo.y >= Int32(100)]",
+  "ProjectionExec: expr=[x@0 as x, y@1 as y]\n  LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=10, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100)\n",
+]], row_count: 2 }"#;
+        assert_string_matches(&plan, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_analyze() {
+        let mut ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                "memory://test_sql_dataset",
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        let results = ds
+            .sql("EXPLAIN ANALYZE SELECT * FROM foo where y >= 100")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let results = results.into_iter().next().unwrap();
+
+        let plan = format!("{:?}", results);
+        let expected_pattern = r#"...columns: [StringArray
+[
+  "Plan with Metrics",
+], StringArray
+[
+  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., bytes_read=..., fragments_scanned=..., iops=..., ranges_scanned=..., requests=..., rows_scanned=..., task_wait_time=...]\n",
+]], row_count: 1 }"#;
+        assert_string_matches(&plan, expected_pattern).unwrap();
     }
 }
