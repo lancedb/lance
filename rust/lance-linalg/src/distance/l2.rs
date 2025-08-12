@@ -17,6 +17,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::assume_eq;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
@@ -195,8 +196,8 @@ pub fn l2_distance_batch<'a, T: L2>(
     to: &'a [T],
     dimension: usize,
 ) -> impl Iterator<Item = f32> + 'a {
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+    assume_eq!(from.len(), dimension);
+    assume_eq!(to.len() % dimension, 0);
 
     T::l2_batch(from, to, dimension)
 }
