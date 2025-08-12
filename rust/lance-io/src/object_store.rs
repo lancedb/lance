@@ -342,7 +342,7 @@ impl ObjectStore {
         let store = registry.get_store(url.clone(), params).await?;
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url)?;
 
         Ok((store, path))
     }
