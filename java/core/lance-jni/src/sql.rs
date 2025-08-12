@@ -77,67 +77,6 @@ fn inner_into_batch_records(
     Ok(())
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_SqlQuery_intoExplainPlan<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass,
-    java_dataset: JObject,
-    sql: JString,
-    table_name: JObject,
-    with_row_id: jboolean,
-    with_row_addr: jboolean,
-    verbose: jboolean,
-    analyze: jboolean,
-) -> JString<'local> {
-    ok_or_throw_with_return!(
-        env,
-        inner_into_explain_plan(
-            &mut env,
-            java_dataset,
-            sql,
-            table_name,
-            with_row_id,
-            with_row_addr,
-            verbose,
-            analyze
-        )
-        .map_err(|e| Error::io_error(e.to_string())),
-        JString::default()
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn inner_into_explain_plan<'local>(
-    env: &mut JNIEnv<'local>,
-    java_dataset: JObject,
-    sql: JString,
-    table_name: JObject,
-    with_row_id: jboolean,
-    with_row_addr: jboolean,
-    verbose: jboolean,
-    analyze: jboolean,
-) -> Result<JString<'local>> {
-    let builder = sql_builder(
-        env,
-        java_dataset,
-        sql,
-        table_name,
-        with_row_id,
-        with_row_addr,
-    )?;
-
-    let explain = RT.block_on(async move {
-        builder
-            .build()
-            .await
-            .unwrap()
-            .into_explain_plan(verbose == JNI_TRUE, analyze == JNI_TRUE)
-            .await
-    })?;
-
-    Ok(env.new_string(explain)?)
-}
-
 fn sql_builder(
     env: &mut JNIEnv,
     java_dataset: JObject,
