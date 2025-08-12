@@ -1,8 +1,9 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString, IntoJava};
+use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString, IntoJava, JLance};
 use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
+use crate::JNIEnvExt;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
@@ -12,7 +13,7 @@ use jni::JNIEnv;
 use lance::dataset::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
-use lance::table::format::Index;
+use lance::table::format::{Fragment, Index};
 use lance_core::datatypes::Schema as LanceSchema;
 use prost::Message;
 use prost_types::Any;
@@ -394,6 +395,31 @@ fn convert_to_java_operation_inner<'local>(
                     JValue::Object(&java_fragments),
                     JValue::Object(&java_schema),
                     JValue::Object(&java_config),
+                ],
+            )?)
+        }
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            fields_modified: _,
+            mem_wal_to_flush: _,
+        } => {
+            let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
+                .iter()
+                .map(|x| JLance(*x as i64))
+                .collect();
+            let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
+            let updated_fragments_obj = export_vec(env, &updated_fragments)?;
+            let new_fragments_obj = export_vec(env, &new_fragments)?;
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/Update",
+                "(Ljava/util/List;Ljava/util/List;Ljava/util/List;)V",
+                &[
+                    JValue::Object(&removed_fragment_ids_obj),
+                    JValue::Object(&updated_fragments_obj),
+                    JValue::Object(&new_fragments_obj),
                 ],
             )?)
         }
@@ -807,6 +833,53 @@ fn convert_to_rust_operation(
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
+            }
+        }
+        "Update" => {
+            let removed_fragment_ids_objs = env
+                .call_method(
+                    &java_operation,
+                    "removedFragmentIds",
+                    "()Ljava/util/List;",
+                    &[],
+                )?
+                .l()?;
+            let removed_fragment_ids: Vec<u64> = env
+                .get_longs(&removed_fragment_ids_objs)?
+                .into_iter()
+                .map(|x| x.try_into().unwrap())
+                .collect();
+
+            let updated_fragments_objs = env
+                .call_method(
+                    &java_operation,
+                    "updatedFragments",
+                    "()Ljava/util/List;",
+                    &[],
+                )?
+                .l()?;
+            let updated_fragments_objs = import_vec(env, &updated_fragments_objs)?;
+            let mut updated_fragments: Vec<Fragment> =
+                Vec::with_capacity(updated_fragments_objs.len());
+            for f in updated_fragments_objs {
+                updated_fragments.push(f.extract_object(env)?);
+            }
+
+            let new_fragments_objs = env
+                .call_method(&java_operation, "newFragments", "()Ljava/util/List;", &[])?
+                .l()?;
+            let new_fragments_objs = import_vec(env, &new_fragments_objs)?;
+            let mut new_fragments: Vec<Fragment> = Vec::with_capacity(new_fragments_objs.len());
+            for f in new_fragments_objs {
+                new_fragments.push(f.extract_object(env)?);
+            }
+
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified: vec![],
+                mem_wal_to_flush: None,
             }
         }
         "Merge" => {
