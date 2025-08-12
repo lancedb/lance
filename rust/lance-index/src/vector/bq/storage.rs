@@ -280,20 +280,49 @@ impl DistCalculator for RabitDistCalculator<'_> {
         }
 
         let mut dists = vec![0; n];
-        for (sub_vec_idx, code) in self.codes.chunks_exact(n).enumerate() {
-            debug_assert_eq!(code.len(), n);
-            let current_dist_table = &self.dist_table
-                [sub_vec_idx * 2 * SEGMENT_NUM_CODES..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
-            let next_dist_table = &self.dist_table[(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES
-                ..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
 
-            code.iter()
-                .zip(dists.iter_mut())
-                .for_each(|(code_byte, dist)| {
-                    let current_code = (code_byte & 0x0F) as usize;
-                    let next_code = (code_byte >> 4) as usize;
-                    *dist += current_dist_table[current_code] + next_dist_table[next_code];
-                });
+        let remainder = n % SEGMENT_NUM_CODES;
+        for i in (0..n - remainder).step_by(SEGMENT_NUM_CODES) {
+            let mut block_distances = [0; SEGMENT_NUM_CODES];
+            for (sub_vec_idx, codes) in self.codes.chunks_exact(n).enumerate() {
+                let dist_table = &self.dist_table[sub_vec_idx * 2 * SEGMENT_NUM_CODES
+                    ..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
+                let next_dist_table = &self.dist_table[(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES
+                    ..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
+
+                let codes = &codes[i..i + SEGMENT_NUM_CODES];
+                for (offset, code) in codes.iter().enumerate() {
+                    let current_code = (code & 0x0F) as usize;
+                    let next_code = (code >> 4) as usize;
+
+                    block_distances[offset] +=
+                        dist_table[current_code] + next_dist_table[next_code];
+                }
+            }
+            for (offset, dist) in block_distances.into_iter().enumerate() {
+                dists[i + offset] = dist;
+            }
+        }
+
+        if remainder > 0 {
+            let offset = n - remainder;
+            for (sub_vec_idx, codes) in self.codes.chunks_exact(n).enumerate() {
+                debug_assert_eq!(codes.len(), n);
+                let current_dist_table = &self.dist_table[sub_vec_idx * 2 * SEGMENT_NUM_CODES
+                    ..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
+                let next_dist_table = &self.dist_table[(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES
+                    ..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
+
+                codes
+                    .iter()
+                    .skip(offset)
+                    .zip(dists.iter_mut().skip(offset))
+                    .for_each(|(code_byte, dist)| {
+                        let current_code = (code_byte & 0x0F) as usize;
+                        let next_code = (code_byte >> 4) as usize;
+                        *dist += current_dist_table[current_code] + next_dist_table[next_code];
+                    });
+            }
         }
 
         dists
