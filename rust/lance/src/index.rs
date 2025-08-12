@@ -3077,7 +3077,7 @@ mod tests {
             assert_index_usage(
                 &_plan_after_update,
                 column_name,
-                true,  // FTS indices always appear in the plan, even with empty bitmaps
+                true, // FTS indices always appear in the plan, even with empty bitmaps
                 "after update (empty bitmap)",
             );
         } else {

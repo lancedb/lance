@@ -362,7 +362,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
             .and_then(|cls| cls.getattr(intern!(py, "ColumnOrdering")))
             .expect("Failed to get RewrittenIndex class");
 
-        let column_name = self.0.column_name.to_string();
+        let column_name = self.0.column_name.clone();
         let ascending = self.0.ascending;
         let nulls_first = self.0.nulls_first;
         cls.call1((column_name, ascending, nulls_first))
@@ -1552,8 +1552,7 @@ impl Dataset {
             builder = builder.name(name);
         }
         use std::future::IntoFuture;
-        RT.block_on(None, builder.into_future())?
-            .infer_error()?;
+        RT.block_on(None, builder.into_future())?.infer_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())

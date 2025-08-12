@@ -37,7 +37,10 @@ def test_create_empty_vector_index():
             "vector", "IVF_PQ", num_partitions=10, num_sub_vectors=8, train=False
         )
         # If we get here, the implementation has been added (unexpected for now)
-        assert False, "Expected NotImplementedError for train=False on vector index, but succeeded"
+        assert False, (
+            "Expected NotImplementedError for train=False on vector index, "
+            "but succeeded"
+        )
     except NotImplementedError as e:
         # Expected error for unimplemented functionality
         error_msg = str(e).lower()

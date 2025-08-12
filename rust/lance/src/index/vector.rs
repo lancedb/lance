@@ -503,7 +503,8 @@ pub(crate) async fn build_empty_vector_index(
             "Creating empty vector indices with train=False is not yet implemented. \
             Index '{}' for column '{}' cannot be created without training.",
             name, column
-        ).into(),
+        )
+        .into(),
         location: location!(),
     })
 }
