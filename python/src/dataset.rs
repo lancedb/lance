@@ -511,10 +511,12 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let metadata_options: HashMap<String, Option<String>> =
             metadata.into_iter().map(|(k, v)| (k, Some(v))).collect();
-        RT.block_on(
-            None,
-            new_self.update_schema_metadata(metadata_options, true),
-        )?
+        RT.block_on(None, async {
+            new_self
+                .update_schema_metadata(metadata_options)
+                .replace()
+                .await
+        })?
         .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -534,7 +536,8 @@ impl Dataset {
             Ok(new_self)
         };
 
-        let new_self = RT.block_on(None, future)?
+        let new_self = RT
+            .block_on(None, future)?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1917,7 +1920,7 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let delete_updates: HashMap<String, Option<String>> =
             keys.into_iter().map(|k| (k, None)).collect();
-        RT.block_on(None, new_self.update_config(delete_updates, false))?
+        RT.block_on(None, async { new_self.update_config(delete_updates).await })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1959,9 +1962,14 @@ impl Dataset {
         replace: bool,
     ) -> PyResult<HashMap<String, String>> {
         let mut new_self = self.ds.as_ref().clone();
-        let result = RT
-            .block_on(None, new_self.update_metadata(values, replace))?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let result = if replace {
+            RT.block_on(None, async {
+                new_self.update_metadata(values).replace().await
+            })?
+        } else {
+            RT.block_on(None, async { new_self.update_metadata(values).await })?
+        }
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(result)
     }
@@ -1973,8 +1981,14 @@ impl Dataset {
         replace: bool,
     ) -> PyResult<HashMap<String, String>> {
         let mut new_self = self.ds.as_ref().clone();
-        let new_config = RT.block_on(None, new_self.update_config(values, replace))?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let new_config = if replace {
+            RT.block_on(None, async {
+                new_self.update_config(values).replace().await
+            })?
+        } else {
+            RT.block_on(None, async { new_self.update_config(values).await })?
+        }
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(new_config)
     }
@@ -1986,8 +2000,16 @@ impl Dataset {
         replace: bool,
     ) -> PyResult<HashMap<String, String>> {
         let mut new_self = self.ds.as_ref().clone();
-        let result = RT.block_on(None, new_self.update_schema_metadata(values, replace))?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let result = if replace {
+            RT.block_on(None, async {
+                new_self.update_schema_metadata(values).replace().await
+            })?
+        } else {
+            RT.block_on(None, async {
+                new_self.update_schema_metadata(values).await
+            })?
+        }
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(result)
     }
@@ -2003,21 +2025,23 @@ impl Dataset {
         replace: bool,
     ) -> PyResult<()> {
         let ds_clone = self.ds.as_ref().clone();
-        let new_self = RT.block_on(None, async move {
-            let mut new_self = ds_clone;
-            let mut builder = new_self.update_field_metadata();
-            for (field_id, metadata_updates) in field_updates {
-                let converted_updates: Vec<(String, Option<String>)> = metadata_updates.into_iter().collect();
-                if replace {
-                    builder = builder.replace(field_id as i32, converted_updates)?;
-                } else {
-                    builder = builder.update(field_id as i32, converted_updates)?;
+        let new_self = RT
+            .block_on(None, async move {
+                let mut new_self = ds_clone;
+                let mut builder = new_self.update_field_metadata();
+                for (field_id, metadata_updates) in field_updates {
+                    let converted_updates: Vec<(String, Option<String>)> =
+                        metadata_updates.into_iter().collect();
+                    if replace {
+                        builder = builder.replace(field_id as i32, converted_updates)?;
+                    } else {
+                        builder = builder.update(field_id as i32, converted_updates)?;
+                    }
                 }
-            }
-            builder.await?;
-            Ok(new_self)
-        })?
-        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+                builder.await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -2029,21 +2053,23 @@ impl Dataset {
         replace: bool,
     ) -> PyResult<()> {
         let ds_clone = self.ds.as_ref().clone();
-        let new_self = RT.block_on(None, async move {
-            let mut new_self = ds_clone;
-            let mut builder = new_self.update_field_metadata();
-            for (field_path, metadata_updates) in field_updates {
-                let converted_updates: Vec<(String, Option<String>)> = metadata_updates.into_iter().collect();
-                if replace {
-                    builder = builder.replace(field_path.as_str(), converted_updates)?;
-                } else {
-                    builder = builder.update(field_path.as_str(), converted_updates)?;
+        let new_self = RT
+            .block_on(None, async move {
+                let mut new_self = ds_clone;
+                let mut builder = new_self.update_field_metadata();
+                for (field_path, metadata_updates) in field_updates {
+                    let converted_updates: Vec<(String, Option<String>)> =
+                        metadata_updates.into_iter().collect();
+                    if replace {
+                        builder = builder.replace(field_path.as_str(), converted_updates)?;
+                    } else {
+                        builder = builder.update(field_path.as_str(), converted_updates)?;
+                    }
                 }
-            }
-            builder.await?;
-            Ok(new_self)
-        })?
-        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+                builder.await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }

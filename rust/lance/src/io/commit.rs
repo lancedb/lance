@@ -1283,10 +1283,10 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .update_config(
-                            HashMap::from([(key.to_string(), Some("value".to_string()))]),
-                            false,
-                        )
+                        .update_config(HashMap::from([(
+                            key.to_string(),
+                            Some("value".to_string()),
+                        )]))
                         .await
                 })
             })
@@ -1311,7 +1311,7 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .update_config(HashMap::from([(key.to_string(), None)]), false)
+                        .update_config(HashMap::from([(key.to_string(), None)]))
                         .await
                 })
             })
@@ -1343,10 +1343,10 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .update_config(
-                            HashMap::from([(key.to_string(), Some("value".to_string()))]),
-                            false,
-                        )
+                        .update_config(HashMap::from([(
+                            key.to_string(),
+                            Some("value".to_string()),
+                        )]))
                         .await
                 })
             })

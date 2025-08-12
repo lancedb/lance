@@ -3,12 +3,116 @@
 
 use std::collections::HashMap;
 
-use crate::dataset::transaction::{Operation, UpdateMap, UpdateMapEntry};
+use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
 
 use super::Dataset;
+use crate::datatypes::FieldRef;
 use crate::Result;
 use futures::future::BoxFuture;
-use lance_core::datatypes::{FieldRef, Schema};
+use lance_core::datatypes::Schema;
+
+/// Execute a metadata update operation on a dataset.
+/// This is moved from Dataset::update_op to keep metadata logic in this module.
+pub async fn execute_metadata_update(dataset: &mut Dataset, operation: Operation) -> Result<()> {
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        operation,
+        /*blobs_op=*/ None,
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
+    Ok(())
+}
+
+/// Builder for metadata update operations that supports optional replace semantics.
+/// This provides backward compatibility while adding new functionality.
+pub struct UpdateMetadataBuilder<'a> {
+    dataset: &'a mut Dataset,
+    values: Vec<UpdateMapEntry>,
+    replace: bool,
+    metadata_type: MetadataType,
+}
+
+/// Type of metadata being updated
+pub enum MetadataType {
+    Config,
+    TableMetadata,
+    SchemaMetadata,
+}
+
+impl<'a> UpdateMetadataBuilder<'a> {
+    pub fn new(
+        dataset: &'a mut Dataset,
+        values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
+        metadata_type: MetadataType,
+    ) -> Self {
+        Self {
+            dataset,
+            values: values.into_iter().map(Into::into).collect(),
+            replace: false,
+            metadata_type,
+        }
+    }
+
+    /// Set the replace flag to true, causing the entire metadata map to be replaced
+    /// instead of merged.
+    pub fn replace(mut self) -> Self {
+        self.replace = true;
+        self
+    }
+
+    fn create_update_map(values: Vec<UpdateMapEntry>, replace: bool) -> UpdateMap {
+        UpdateMap {
+            update_entries: values,
+            replace,
+        }
+    }
+}
+
+impl<'a> std::future::IntoFuture for UpdateMetadataBuilder<'a> {
+    type Output = Result<HashMap<String, String>>;
+    type IntoFuture = BoxFuture<'a, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let update_map = Self::create_update_map(self.values, self.replace);
+
+            let operation = match self.metadata_type {
+                MetadataType::Config => Operation::UpdateConfig {
+                    config_updates: Some(update_map),
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                MetadataType::TableMetadata => Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: Some(update_map),
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                MetadataType::SchemaMetadata => Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: None,
+                    schema_metadata_updates: Some(update_map),
+                    field_metadata_updates: HashMap::new(),
+                },
+            };
+
+            execute_metadata_update(self.dataset, operation).await?;
+
+            // Get result after the update
+            let result = match self.metadata_type {
+                MetadataType::Config => self.dataset.manifest.config.clone(),
+                MetadataType::TableMetadata => self.dataset.manifest.table_metadata.clone(),
+                MetadataType::SchemaMetadata => self.dataset.manifest.schema.metadata.clone(),
+            };
+
+            Ok(result)
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct UpdateFieldMetadataBuilder<'a> {
@@ -61,14 +165,16 @@ impl<'a> std::future::IntoFuture for UpdateFieldMetadataBuilder<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            self.dataset
-                .update_op(Operation::UpdateConfig {
+            execute_metadata_update(
+                self.dataset,
+                Operation::UpdateConfig {
                     config_updates: None,
                     table_metadata_updates: None,
                     schema_metadata_updates: None,
                     field_metadata_updates: self.field_metadata_updates,
-                })
-                .await?;
+                },
+            )
+            .await?;
             Ok(self.dataset.schema())
         })
     }
@@ -102,10 +208,7 @@ mod tests {
         desired_config.insert("other-key".to_string(), "other-value".to_string());
 
         dataset
-            .update_config(
-                [("lance.test", "value"), ("other-key", "other-value")],
-                false,
-            )
+            .update_config([("lance.test", "value"), ("other-key", "other-value")])
             .await
             .unwrap();
         assert_eq!(dataset.manifest.config, desired_config);
@@ -117,10 +220,7 @@ mod tests {
         desired_config.remove("lance.test");
 
         dataset
-            .update_config(
-                [("other-key", Some("new-value")), ("lance.test", None)],
-                false,
-            )
+            .update_config([("other-key", Some("new-value")), ("lance.test", None)])
             .await
             .unwrap();
 
@@ -130,14 +230,16 @@ mod tests {
             ("k2".to_string(), "v2".to_string()),
         ]);
         dataset
-            .update_config([("k1", "v1"), ("k2", "v2")], true)
+            .update_config([("k1", "v1"), ("k2", "v2")])
+            .replace()
             .await
             .unwrap();
         assert_eq!(dataset.config(), &desired_config);
 
         // Clear
         dataset
-            .update_config([] as [UpdateMapEntry; 0], true)
+            .update_config([] as [UpdateMapEntry; 0])
+            .replace()
             .await
             .unwrap();
         assert!(dataset.config().is_empty());
@@ -159,13 +261,10 @@ mod tests {
         );
 
         dataset
-            .update_metadata(
-                [
-                    ("lance.table", "value"),
-                    ("other-table-key", "other-table-value"),
-                ],
-                false,
-            )
+            .update_metadata([
+                ("lance.table", "value"),
+                ("other-table-key", "other-table-value"),
+            ])
             .await
             .unwrap();
         assert_eq!(dataset.manifest.table_metadata, desired_table_meta);
@@ -176,13 +275,10 @@ mod tests {
         desired_table_meta.remove("lance.table");
 
         dataset
-            .update_metadata(
-                [
-                    ("other-table-key", Some("new-table-value")),
-                    ("lance.table", None),
-                ],
-                false,
-            )
+            .update_metadata([
+                ("other-table-key", Some("new-table-value")),
+                ("lance.table", None),
+            ])
             .await
             .unwrap();
 
@@ -192,14 +288,16 @@ mod tests {
             ("k2".to_string(), "v2".to_string()),
         ]);
         dataset
-            .update_metadata([("k1", "v1"), ("k2", "v2")], true)
+            .update_metadata([("k1", "v1"), ("k2", "v2")])
+            .replace()
             .await
             .unwrap();
         assert_eq!(dataset.manifest.table_metadata, desired_table_meta);
 
         // Clear
         dataset
-            .update_metadata([] as [UpdateMapEntry; 0], true)
+            .update_metadata([] as [UpdateMapEntry; 0])
+            .replace()
             .await
             .unwrap();
         assert!(dataset.manifest.table_metadata.is_empty());

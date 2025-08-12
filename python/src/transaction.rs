@@ -365,13 +365,14 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 }
             }
             Operation::UpdateConfig {
-                ref upsert_values,
-                ref delete_keys,
-                ref schema_metadata,
-                ref field_metadata,
+                config_updates: _,
+                table_metadata_updates: _,
+                schema_metadata_updates: _,
+                field_metadata_updates: _,
             } => {
                 if let Ok(cls) = namespace.getattr("UpdateConfig") {
-                    cls.call1((upsert_values, delete_keys, schema_metadata, field_metadata))
+                    // Pass None for all parameters since UpdateMap doesn't have Python bindings yet
+                    cls.call1((py.None(), py.None(), py.None(), py.None()))
                 } else {
                     let base_op = namespace.getattr("BaseOperation")?;
                     base_op.call0()
