@@ -8,9 +8,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_MAX_IOP_SIZE,
 };
 use lance_core::error::Result;
-use lance_core::Error;
 use object_store::{memory::InMemory, path::Path};
-use snafu::location;
 use url::Url;
 
 /// Provides a fresh in-memory object store for each call to `new_store`.
@@ -41,9 +39,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             output.push_str(domain);
         }
         output.push_str(url.path());
-        Path::parse(&output).map_err(|_| {
-            Error::invalid_input(format!("Invalid path in URL: {}", &output), location!())
-        })
+        Ok(Path::from(output))
     }
 }
 
