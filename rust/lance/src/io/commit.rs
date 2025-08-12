@@ -121,7 +121,7 @@ async fn do_commit_new_dataset(
     {
         let source_manifest_location = commit_handler
             .resolve_version_location(
-                &Path::from(source_path.as_str()),
+                &Path::parse(source_path.as_str())?,
                 ref_version,
                 &object_store.inner,
             )

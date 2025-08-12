@@ -1142,7 +1142,8 @@ impl Dataset {
                 let reference_paths = &self.manifest.reference_paths;
                 reference_paths
                     .get(*path_index as usize)
-                    .map(|base_path| Path::from(base_path.as_str()).child(DATA_DIR))
+                    .map(|base_path| Path::parse(base_path.as_str()).map(|p| p.child(DATA_DIR)))
+                    .transpose()?
                     .ok_or_else(|| {
                         Error::invalid_input(
                             format!(
@@ -1165,7 +1166,8 @@ impl Dataset {
                 let reference_paths = &self.manifest.reference_paths;
                 reference_paths
                     .get(*path_index as usize)
-                    .map(|base_path| Path::from(base_path.as_str()))
+                    .map(|base_path| Path::parse(base_path.as_str()))
+                    .transpose()?
                     .ok_or_else(|| {
                         Error::invalid_input(
                             format!(
