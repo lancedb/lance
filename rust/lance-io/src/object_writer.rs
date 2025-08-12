@@ -22,6 +22,7 @@ use tracing::Instrument;
 
 use crate::traits::Writer;
 use snafu::location;
+use tokio::runtime::Handle;
 
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
@@ -317,6 +318,13 @@ impl ObjectWriter {
             unreachable!()
         }
     }
+
+    pub async fn abort(&mut self) {
+        let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
+        if let UploadState::InProgress { mut upload, .. } = state {
+            let _ = upload.abort().await;
+        }
+    }
 }
 
 impl Drop for ObjectWriter {
@@ -327,9 +335,11 @@ impl Drop for ObjectWriter {
             let state =
                 std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
             if let UploadState::InProgress { mut upload, .. } = state {
-                tokio::task::spawn(async move {
-                    let _ = upload.abort().await;
-                });
+                if let Ok(handle) = Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = upload.abort().await;
+                    });
+                }
             }
         }
     }
@@ -538,5 +548,17 @@ mod tests {
         }
         let res = object_writer.shutdown().await.unwrap();
         assert_eq!(res.size, buf.len() * 5);
+    }
+
+    #[tokio::test]
+    async fn test_abort_write() {
+        let store = LanceObjectStore::memory();
+
+        let mut object_writer = futures::executor::block_on(async move {
+            ObjectWriter::new(&store, &Path::from("/foo"))
+                .await
+                .unwrap()
+        });
+        object_writer.abort().await;
     }
 }
