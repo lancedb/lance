@@ -2080,7 +2080,7 @@ mod tests {
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
-        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+        DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
@@ -2098,8 +2098,11 @@ mod tests {
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
+    use crate::datafusion::LanceTableProvider;
     use all_asserts::assert_true;
+    use datafusion::prelude::SessionContext;
     use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion::udf::register_functions;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -7268,5 +7271,111 @@ mod tests {
 
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sql_contains_tokens() {
+        let text_col = Arc::new(StringArray::from(vec![
+            "a cat",
+            "lovely cat",
+            "white cat",
+            "catch up",
+            "fish",
+        ]));
+
+        // Prepare dataset
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        // Test without fts index
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat", "lovely cat", "white cat", "catch up"]),
+        );
+
+        // Test with fts index
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        // FTS index introduces false negatives, so "catch up" will miss.
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat", "lovely cat", "white cat"]),
+        );
+
+        // Test multiple tokens
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'lovely cat')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(results, &StringArray::from(vec!["lovely cat"]));
+    }
+
+    async fn execute_sql(
+        sql: &str,
+        table: String,
+        dataset: Arc<Dataset>,
+    ) -> Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            table,
+            Arc::new(LanceTableProvider::new(dataset, false, false)),
+        )?;
+        register_functions(&ctx);
+
+        let df = ctx.sql(sql).await?;
+        Ok(df
+            .execute_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await?)
+    }
+
+    fn assert_results<T: Array + PartialEq + 'static>(results: Vec<RecordBatch>, values: &T) {
+        assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        assert_eq!(results.num_columns(), 1);
+
+        assert_eq!(
+            results.column(0).as_any().downcast_ref::<T>().unwrap(),
+            values
+        )
     }
 }

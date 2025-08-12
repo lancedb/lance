@@ -478,9 +478,6 @@ impl ScalarQueryParser for FtsQueryParser {
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            // TODO(https://github.com/lancedb/lance/issues/3855):
-            //
-            // Create the contains_tokens UDF
             if func.name() == "contains_tokens" {
                 let query = TextQuery::StringContains(scalar_str);
                 Some(IndexedExpression::index_query(
