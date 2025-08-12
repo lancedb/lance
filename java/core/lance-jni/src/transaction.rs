@@ -13,7 +13,7 @@ use jni::JNIEnv;
 use lance::dataset::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
-use lance::table::format::Index;
+use lance::table::format::{Fragment, Index};
 use lance_core::datatypes::Schema as LanceSchema;
 use prost::Message;
 use prost_types::Any;
