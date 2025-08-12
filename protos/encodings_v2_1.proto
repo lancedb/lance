@@ -398,7 +398,7 @@ message PackedStruct {
 //
 // The input is a single data block of any kind.
 // The output is a single data block of the same kind as the input.
-message WrappedGeneral {
+message General {
   // The compression to apply to the values
   BufferCompression compression = 1;
   // The compression used to store the output data block
@@ -436,7 +436,7 @@ message CompressiveEncoding {
         Dictionary dictionary = 7;
         Rle rle = 8;
         ByteStreamSplit byte_stream_split = 9;
-        WrappedGeneral wrapped = 10;
+        General general = 10;
         FixedSizeList fixed_size_list = 11;
         PackedStruct packed_struct = 12;
     }

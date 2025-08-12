@@ -386,7 +386,7 @@ impl ProtobufUtils21 {
         values: CompressiveEncoding,
     ) -> CompressiveEncoding {
         CompressiveEncoding {
-            compression: Some(Compression::Wrapped(Box::new(pb21::WrappedGeneral {
+            compression: Some(Compression::General(Box::new(pb21::General {
                 compression: Some(Self::buffer_compression(compression)),
                 values: Some(Box::new(values)),
             }))),

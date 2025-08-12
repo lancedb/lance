@@ -30,7 +30,7 @@ use crate::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
                 VariableDecoder, VariableEncoder,
             },
-            bitpack::InlineBitpacking,
+            bitpacking::InlineBitpacking,
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
             byte_stream_split::{
                 should_use_bss, ByteStreamSplitDecompressor, ByteStreamSplitEncoder,
@@ -569,7 +569,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     values.bits_per_value as usize,
                 )))
             }
-            Compression::Wrapped(general) => {
+            Compression::General(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
                     general.values.as_ref().ok_or_else(|| {
@@ -633,9 +633,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                 Box::new(VariableDecoder::default()),
             ))),
-            Compression::Wrapped(ref wrapped) => {
+            Compression::General(ref general) => {
                 Ok(Box::new(CompressedBufferEncoder::from_scheme(
-                    &wrapped.compression.as_ref().expect_ok()?.scheme,
+                    &general.compression.as_ref().expect_ok()?.scheme,
                 )?))
             }
             _ => todo!("variable-per-value decompressor for {:?}", description),

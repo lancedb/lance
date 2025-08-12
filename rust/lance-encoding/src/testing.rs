@@ -452,7 +452,7 @@ fn tag(e: &Compression) -> &'static str {
         Dictionary(_) => "dictionary",
         Rle(_) => "rle",
         ByteStreamSplit(_) => "byte_stream_split",
-        Wrapped(_) => "wrapped",
+        General(_) => "general",
         FixedSizeList(_) => "fixed_size_list",
         PackedStruct(_) => "packed_struct",
     }
@@ -466,7 +466,7 @@ fn buffer(c: &Compression) -> Option<Vec<&BufferCompression>> {
         Flat(f) => f.data.as_ref().map(|b| vec![b]),
         Variable(v) => v.values.as_ref().map(|b| vec![b]),
         InlineBitpacking(i) => i.values.as_ref().map(|b| vec![b]),
-        Wrapped(w) => w.compression.as_ref().map(|c| vec![c]),
+        General(g) => g.compression.as_ref().map(|c| vec![c]),
         _ => None,
     }
 }
@@ -480,7 +480,7 @@ fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
         OutOfLineBitpacking(o) => o.values.as_ref().map(|b| vec![b.as_ref()]),
         Fsst(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
         ByteStreamSplit(b) => b.values.as_ref().map(|b| vec![b.as_ref()]),
-        Wrapped(w) => w.values.as_ref().map(|b| vec![b.as_ref()]),
+        General(g) => g.values.as_ref().map(|b| vec![b.as_ref()]),
         Dictionary(d) => {
             let mut children = Vec::new();
             if let Some(values) = d.items.as_ref() {

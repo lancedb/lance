@@ -252,7 +252,7 @@ mod tests {
 
         // Check if compression was applied as expected
         match &encoding.compression {
-            Some(Compression::Wrapped(cm)) => {
+            Some(Compression::General(cm)) => {
                 assert!(
                     test_case.expected_compressed,
                     "{}: Expected compression to be applied",
@@ -464,7 +464,7 @@ mod tests {
 
         // Should get GeneralMiniBlock encoding since buffer is 4KB
         match &encoding.compression {
-            Some(Compression::Wrapped(cm)) => {
+            Some(Compression::General(cm)) => {
                 assert!(cm.values.is_some());
                 assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
                 assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
@@ -539,7 +539,7 @@ mod tests {
 
         // Verify the encoding structure
         match &encoding.compression {
-            Some(Compression::Wrapped(cm)) => {
+            Some(Compression::General(cm)) => {
                 // Check inner encoding is RLE
                 match &cm.values.as_ref().unwrap().compression {
                     Some(Compression::Rle(rle)) => {
@@ -593,7 +593,7 @@ mod tests {
 
         // Verify the encoding structure for 64-bit
         match &encoding_64.compression {
-            Some(Compression::Wrapped(cm)) => {
+            Some(Compression::General(cm)) => {
                 // Check inner encoding is RLE
                 match &cm.values.as_ref().unwrap().compression {
                     Some(Compression::Rle(rle)) => {
