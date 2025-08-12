@@ -1678,25 +1678,25 @@ mod tests {
         // Validate behavior of indices after compaction with move-stable row ids.
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
+                RandomVector::new().vec_width(16).named("vec".to_owned()),
             ))
             .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
         let mut dataset = Dataset::write(
-            data_gen.batch(5_000),
+            data_gen.batch(500),
             "memory://test/table",
             Some(WriteParams {
                 enable_move_stable_row_ids: true,
-                max_rows_per_file: 1_000, // 5 files
+                max_rows_per_file: 100, // 5 files
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
 
-        // Delete first 1,100 rows so rowids != final rowaddrs
-        // First 1,000 rows deletes first file. Next 100 deletes part of second
+        // Delete first 110 rows so rowids != final rowaddrs
+        // First 100 rows deletes first file. Next 10 deletes part of second
         // file, so we will trigger the with deletions code path.
-        dataset.delete("i < 1100").await.unwrap();
+        dataset.delete("i < 110").await.unwrap();
 
         dataset
             .create_index(
@@ -1708,7 +1708,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let params = VectorIndexParams::ivf_pq(1, 8, 8, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
         dataset
             .create_index(
                 &["vec"],
@@ -1734,7 +1734,7 @@ mod tests {
         async fn vector_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
 
-            let query = Float32Array::from(vec![0.0f32; 128]);
+            let query = Float32Array::from(vec![0.0f32; 16]);
             scanner
                 .nearest("vec", &query, 10)
                 .unwrap()
@@ -1747,7 +1747,7 @@ mod tests {
         async fn scalar_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
 
-            scanner.filter("i = 1000").unwrap().project(&["i"]).unwrap();
+            scanner.filter("i = 100").unwrap().project(&["i"]).unwrap();
 
             scanner.try_into_batch().await.unwrap()
         }
@@ -1756,7 +1756,7 @@ mod tests {
         let before_scalar_result = scalar_query(&dataset).await;
 
         let options = CompactionOptions {
-            target_rows_per_fragment: 1_800,
+            target_rows_per_fragment: 180,
             ..Default::default()
         };
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();

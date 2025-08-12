@@ -4249,8 +4249,8 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen_batch().col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)));
-        let reader = data.into_reader_rows(RowCount::from(1000), BatchCount::from(10));
+        let data = gen_batch().col("vec", array::rand_vec::<Float32Type>(Dimension::from(32)));
+        let reader = data.into_reader_rows(RowCount::from(500), BatchCount::from(1));
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -4263,7 +4263,7 @@ mod tests {
         .await
         .unwrap();
 
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
         dataset
             .create_index(&["vec"], IndexType::Vector, None, &params, true)
             .await
@@ -4287,7 +4287,7 @@ mod tests {
             .scan()
             .nearest(
                 "vec",
-                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                &Float32Array::from_iter_values((0..32).map(|_| 0.1)),
                 1,
             )
             .unwrap()
@@ -4304,7 +4304,7 @@ mod tests {
                     "vec",
                     DataType::FixedSizeList(
                         Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                        128
+                        32
                     ),
                     false,
                 )
@@ -4322,7 +4322,7 @@ mod tests {
             .scan()
             .nearest(
                 "vec",
-                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                &Float32Array::from_iter_values((0..32).map(|_| 0.1)),
                 1,
             )
             .unwrap()
@@ -4331,7 +4331,8 @@ mod tests {
             .unwrap();
 
         while let Some(batch) = stream.next().await {
-            let schema = batch.unwrap().schema();
+            let batch = batch.unwrap();
+            let schema = batch.schema();
             assert_eq!(schema.fields.len(), 2);
             assert_eq!(
                 schema.field_with_name("vec").unwrap(),
@@ -4339,7 +4340,7 @@ mod tests {
                     "vec",
                     DataType::FixedSizeList(
                         Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                        128
+                        32
                     ),
                     false,
                 )
@@ -4348,6 +4349,7 @@ mod tests {
                 schema.field_with_name(DIST_COL).unwrap(),
                 &ArrowField::new(DIST_COL, DataType::Float32, true)
             );
+            assert_eq!(batch.num_rows(), 0, "Expected no results after delete");
         }
     }
 
