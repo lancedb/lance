@@ -127,8 +127,8 @@ fn try_bss_for_mini_block(
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     // BSS requires general compression to be effective
-    // If compression is explicitly disabled, skip BSS
-    if params.compression.as_deref() == Some("none") {
+    // If compression is not set or explicitly disabled, skip BSS
+    if params.compression.is_none() || params.compression.as_deref() == Some("none") {
         return None;
     }
 
@@ -992,9 +992,10 @@ mod tests {
         let params = CompressionParams::new();
         let strategy = DefaultCompressionStrategy::with_params(params);
 
-        // Test BSS "on" mode
+        // Test BSS "on" mode with compression enabled (BSS requires compression to be effective)
         let mut metadata = HashMap::new();
         metadata.insert(BSS_META_KEY.to_string(), "on".to_string());
+        metadata.insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
         let arrow_field =
             ArrowField::new("temperature", DataType::Float32, false).with_metadata(metadata);
         let field = Field::try_from(&arrow_field).unwrap();
