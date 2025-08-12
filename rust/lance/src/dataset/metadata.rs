@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
 
 use super::Dataset;
-use crate::datatypes::FieldRef;
 use crate::Result;
 use futures::future::BoxFuture;
+use lance_core::datatypes::FieldRef;
 use lance_core::datatypes::Schema;
 
 /// Execute a metadata update operation on a dataset.

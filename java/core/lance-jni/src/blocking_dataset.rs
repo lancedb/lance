@@ -212,20 +212,27 @@ impl BlockingDataset {
         Ok(indexes)
     }
 
-    pub fn update_config_old(
+    pub fn update_config(
         &mut self,
-        upsert_values: impl Iterator<Item = (String, String)>,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
     ) -> Result<()> {
-        // Convert iterator to HashMap for new API
-        let values: HashMap<String, Option<String>> = upsert_values
-            .map(|(k, v)| (k, Some(v)))
-            .collect();
-        RT.block_on(self.inner.update_config(values, false))?;
+        RT.block_on(async {
+            if replace {
+                self.inner.update_config(values).replace().await
+            } else {
+                self.inner.update_config(values).await
+            }
+        })?;
         Ok(())
     }
 
     pub fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
-        RT.block_on(self.inner.delete_config_keys(delete_keys))?;
+        let delete_values: HashMap<String, Option<String>> = delete_keys
+            .iter()
+            .map(|key| (key.to_string(), None))
+            .collect();
+        RT.block_on(async { self.inner.update_config(delete_values).await })?;
         Ok(())
     }
 
@@ -251,7 +258,9 @@ impl BlockingDataset {
     }
 
     pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
-        RT.block_on(self.inner.replace_schema_metadata(metadata))?;
+        let values: HashMap<String, Option<String>> =
+            metadata.into_iter().map(|(k, v)| (k, Some(v))).collect();
+        RT.block_on(async { self.inner.update_schema_metadata(values).replace().await })?;
         Ok(())
     }
 
@@ -276,16 +285,13 @@ impl BlockingDataset {
         values: HashMap<String, Option<String>>,
         replace: bool,
     ) -> Result<()> {
-        RT.block_on(self.inner.update_metadata(values, replace))?;
-        Ok(())
-    }
-
-    pub fn update_config(
-        &mut self,
-        values: HashMap<String, Option<String>>,
-        replace: bool,
-    ) -> Result<()> {
-        RT.block_on(self.inner.update_config(values, replace))?;
+        RT.block_on(async {
+            if replace {
+                self.inner.update_metadata(values).replace().await
+            } else {
+                self.inner.update_metadata(values).await
+            }
+        })?;
         Ok(())
     }
 
@@ -294,7 +300,13 @@ impl BlockingDataset {
         values: HashMap<String, Option<String>>,
         replace: bool,
     ) -> Result<()> {
-        RT.block_on(self.inner.update_schema_metadata(values, replace))?;
+        RT.block_on(async {
+            if replace {
+                self.inner.update_schema_metadata(values).replace().await
+            } else {
+                self.inner.update_schema_metadata(values).await
+            }
+        })?;
         Ok(())
     }
 
@@ -306,7 +318,8 @@ impl BlockingDataset {
         RT.block_on(async {
             let mut builder = self.inner.update_field_metadata();
             for (field_id, metadata_updates) in field_updates {
-                let converted_updates: Vec<(String, Option<String>)> = metadata_updates.into_iter().collect();
+                let converted_updates: Vec<(String, Option<String>)> =
+                    metadata_updates.into_iter().collect();
                 if replace {
                     builder = builder.replace(field_id as i32, converted_updates)?;
                 } else {
@@ -1814,7 +1827,9 @@ fn inner_update_field_metadata_by_path(
             let field_path = env.get_string(&key_jstring)?;
             let field_path_str = field_path
                 .to_str()
-                .map_err(|e| Error::input_error(format!("Failed to convert field path to string: {}", e)))?
+                .map_err(|e| {
+                    Error::input_error(format!("Failed to convert field path to string: {}", e))
+                })?
                 .to_string();
             let inner_map = JMap::from_env(env, &value)?;
             let field_metadata = to_rust_optional_map(env, &inner_map)?;
@@ -1825,12 +1840,13 @@ fn inner_update_field_metadata_by_path(
 
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    
+
     // Use the builder API with field paths directly
     RT.block_on(async {
         let mut builder = dataset_guard.inner.update_field_metadata();
         for (field_path, metadata_updates) in field_path_updates {
-            let converted_updates: Vec<(String, Option<String>)> = metadata_updates.into_iter().collect();
+            let converted_updates: Vec<(String, Option<String>)> =
+                metadata_updates.into_iter().collect();
             if replace != 0 {
                 builder = builder.replace(field_path.as_str(), converted_updates)?;
             } else {
@@ -1839,7 +1855,7 @@ fn inner_update_field_metadata_by_path(
         }
         builder.await
     })?;
-    
+
     Ok(())
 }
 
