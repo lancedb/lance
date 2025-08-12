@@ -1017,6 +1017,81 @@ impl DeepSizeOf for MiniBlockRepIndex {
 }
 
 impl MiniBlockRepIndex {
+    #[inline(never)]
+    pub fn decode_default_from_chunk_meta(chunks: &[ChunkMeta]) -> Self {
+        let mut blocks = Vec::with_capacity(chunks.len());
+        let mut chunk_has_preamble = false;
+        let mut offset: u64 = 0;
+
+        for c in chunks {
+            let ends = c.num_values as u64;
+            let has_trailer = false;
+            let starts_including_trailer =
+                ends + (has_trailer as u64) - (chunk_has_preamble as u64);
+
+            blocks.push(MiniBlockRepIndexBlock {
+                first_row: offset,
+                starts_including_trailer,
+                has_preamble: chunk_has_preamble,
+                has_trailer: has_trailer,
+            });
+
+            chunk_has_preamble = has_trailer;
+            offset += starts_including_trailer;
+        }
+
+        Self { blocks }
+    }
+
+    #[inline(never)]
+    pub fn decode_from_bytes_le(rep_bytes: &[u8], stride: usize, chunk_meta: &[ChunkMeta]) -> Self {
+        // 没有 repetition index 的情况，走默认路径
+        if rep_bytes.is_empty() {
+            return Self::decode_default_from_chunk_meta(chunk_meta);
+        }
+
+        assert!(stride >= 2, "rep stride must be >= 2 (ends, partial, ...)");
+        assert!(rep_bytes.len() % 8 == 0, "rep bytes must be multiples of 8");
+
+        let n64 = rep_bytes.len() / 8;
+        assert!(n64 % stride == 0, "rep length must be divisible by stride");
+        let n = n64 / stride;
+
+        let mut blocks = Vec::with_capacity(n);
+        let mut chunk_has_preamble = false;
+        let mut offset: u64 = 0;
+
+        // 只取每个块的前两个值：ends_count 和 partial_count（小端）
+        for i in 0..n {
+            let base_u64 = i * stride;
+            let a = base_u64 * 8;
+            let b = a + 8;
+            let c = b + 8;
+
+            // 小端解释；多数存储格式（包括我们之前的实现）都是 LE。
+            // 若未来格式变了，只需把 from_le_bytes 换成 from_be_bytes。
+            let ends = u64::from_le_bytes(rep_bytes[a..b].try_into().unwrap());
+            let partial = u64::from_le_bytes(rep_bytes[b..c].try_into().unwrap());
+
+            let has_trailer = partial > 0;
+            // 分支转算术，便于编译器优化
+            let starts_including_trailer =
+                ends + (has_trailer as u64) - (chunk_has_preamble as u64);
+
+            blocks.push(MiniBlockRepIndexBlock {
+                first_row: offset,
+                starts_including_trailer,
+                has_preamble: chunk_has_preamble,
+                has_trailer: has_trailer,
+            });
+
+            chunk_has_preamble = has_trailer;
+            offset += starts_including_trailer;
+        }
+
+        Self { blocks }
+    }
+
     fn decode(rep_index: &[Vec<u64>]) -> Self {
         let mut chunk_has_preamble = false;
         let mut offset = 0;
@@ -1523,30 +1598,37 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             }
 
             // Build the repetition index
+            // let rep_index = if let Some(rep_index_data) = rep_index_bytes {
+            //     // If we have a repetition index then we use that
+            //     // TODO: Compress the repetition index :)
+            //     assert!(rep_index_data.len() % 8 == 0);
+            //     let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
+            //     let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
+            //     // Unflatten
+            //     repetition_index_vals
+            //         .as_ref()
+            //         .chunks_exact(self.repetition_index_depth as usize + 1)
+            //         .map(|c| c.to_vec())
+            //         .collect::<Vec<_>>()
+            // } else {
+            //     // Default rep index is just the number of items in each chunk
+            //     // with 0 partials/leftovers
+            //     chunk_meta
+            //         .iter()
+            //         .map(|c| vec![c.num_values, 0])
+            //         .collect::<Vec<_>>()
+            // };
+
             let rep_index = if let Some(rep_index_data) = rep_index_bytes {
-                // If we have a repetition index then we use that
-                // TODO: Compress the repetition index :)
-                assert!(rep_index_data.len() % 8 == 0);
-                let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
-                let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
-                // Unflatten
-                repetition_index_vals
-                    .as_ref()
-                    .chunks_exact(self.repetition_index_depth as usize + 1)
-                    .map(|c| c.to_vec())
-                    .collect::<Vec<_>>()
+                let stride = self.repetition_index_depth as usize + 1;
+                MiniBlockRepIndex::decode_from_bytes_le(&rep_index_data, stride, &chunk_meta)
             } else {
-                // Default rep index is just the number of items in each chunk
-                // with 0 partials/leftovers
-                chunk_meta
-                    .iter()
-                    .map(|c| vec![c.num_values, 0])
-                    .collect::<Vec<_>>()
+                MiniBlockRepIndex::decode_default_from_chunk_meta(&chunk_meta)
             };
 
             let mut page_meta = MiniBlockCacheableState {
                 chunk_meta,
-                rep_index: MiniBlockRepIndex::decode(&rep_index),
+                rep_index,
                 dictionary: None,
             };
 
