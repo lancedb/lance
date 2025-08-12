@@ -57,7 +57,6 @@ use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_BYTES,
-    MAX_MINIBLOCK_VALUES,
 };
 use crate::format::{pb, ProtobufUtils};
 
@@ -199,7 +198,12 @@ impl RleMiniBlockEncoder {
         let data_slice = data.as_ref();
 
         let chunk_start = offset * type_size;
-        let max_by_count = MAX_MINIBLOCK_VALUES as usize;
+        // FIXME(xuanwo): we don't allow 4096 values as a workaround for https://github.com/lancedb/lance/issues/4429
+        // Since while rep/def takes 4B, 4Ki values will lead to the
+        // generated chunk buffer too large.MAX_MINIBLOCK_VALUES
+        //
+        // let max_by_count =  as usize;
+        let max_by_count = 2048usize;
         let max_values = values_remaining.min(max_by_count);
         let chunk_end = chunk_start + max_values * type_size;
 
@@ -526,6 +530,7 @@ impl MiniBlockDecompressor for RleMiniBlockDecompressor {
 mod tests {
     use super::*;
     use crate::data::DataBlock;
+    use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
     use arrow_array::Int32Array;
 
     // ========== Core Functionality Tests ==========
