@@ -302,3 +302,19 @@ pub fn to_java_map<'local>(
     }
     Ok(java_map)
 }
+
+pub fn to_java_list<'local>(
+    env: &mut JNIEnv<'local>,
+    list: &Vec<JObject>,
+) -> Result<JObject<'local>> {
+    let java_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for item in list {
+        env.call_method(
+            &java_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(item)],
+        )?;
+    }
+    Ok(java_list)
+}

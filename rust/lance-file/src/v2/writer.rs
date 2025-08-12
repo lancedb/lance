@@ -1049,6 +1049,7 @@ mod tests {
                 rle_threshold: Some(0.5), // Lower threshold to trigger RLE more easily
                 compression: None,        // Will use default compression if any
                 compression_level: None,
+                bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
             },
         );
 
@@ -1292,6 +1293,11 @@ mod tests {
         metadata.insert(
             lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
             "lz4".to_string(),
+        );
+        // Explicitly disable BSS to ensure RLE is tested
+        metadata.insert(
+            lance_encoding::constants::BSS_META_KEY.to_string(),
+            "off".to_string(),
         );
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

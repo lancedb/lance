@@ -137,6 +137,9 @@ where
 }
 
 pub fn import_vec<'local>(env: &mut JNIEnv<'local>, obj: &JObject) -> Result<Vec<JObject<'local>>> {
+    if obj.is_null() {
+        return Ok(Vec::new());
+    }
     let size = env.call_method(obj, "size", "()I", &[])?.i()?;
     let mut ret = Vec::with_capacity(size as usize);
     for i in 0..size {
@@ -163,6 +166,12 @@ impl IntoJava for JLance<usize> {
 }
 
 impl IntoJava for JLance<i64> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        Ok(env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(self.0)])?)
+    }
+}
+
+impl IntoJava for &JLance<i64> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(self.0)])?)
     }
