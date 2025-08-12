@@ -1018,7 +1018,7 @@ impl DeepSizeOf for MiniBlockRepIndex {
 
 impl MiniBlockRepIndex {
     /// Decode repetition index from chunk metadata using default values.
-    /// 
+    ///
     /// This creates a repetition index where each chunk has no partial values
     /// and no trailers, suitable for simple sequential data layouts.
     pub fn default_from_chunks(chunks: &[ChunkMeta]) -> Self {
@@ -1027,7 +1027,7 @@ impl MiniBlockRepIndex {
         let mut offset: u64 = 0;
 
         for c in chunks {
-            let ends = c.num_values as u64;
+            let ends = c.num_values;
             let has_trailer = false;
             let starts_including_trailer =
                 ends + (has_trailer as u64) - (chunk_has_preamble as u64);
@@ -1047,14 +1047,14 @@ impl MiniBlockRepIndex {
     }
 
     /// Decode repetition index from raw bytes in little-endian format.
-    /// 
+    ///
     /// The bytes should contain u64 values arranged in groups of `stride` elements,
     /// where the first two values of each group represent ends_count and partial_count.
     /// Returns an empty index if no bytes are provided.
     pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
-        let u64_size = std::mem::size_of::<u64>();
-        let n64 = rep_bytes.len() / u64_size;
-        let n = n64 / stride;
+        // Convert bytes to u64 slice using bytemuck for zero-copy conversion
+        let u64_slice: &[u64] = bytemuck::cast_slice(rep_bytes);
+        let n = u64_slice.len() / stride;
 
         let mut blocks = Vec::with_capacity(n);
         let mut chunk_has_preamble = false;
@@ -1062,20 +1062,9 @@ impl MiniBlockRepIndex {
 
         // Extract first two values from each block: ends_count and partial_count
         for i in 0..n {
-            let base_offset = i * stride * u64_size;
-            let ends = {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&rep_bytes[base_offset..base_offset + u64_size]);
-                u64::from_le_bytes(bytes)
-            };
-
-            let partial = {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(
-                    &rep_bytes[base_offset + u64_size..base_offset + 2 * u64_size],
-                );
-                u64::from_le_bytes(bytes)
-            };
+            let base_idx = i * stride;
+            let ends = u64_slice[base_idx];
+            let partial = u64_slice[base_idx + 1];
 
             let has_trailer = partial > 0;
             // Convert branches to arithmetic for better compiler optimization
