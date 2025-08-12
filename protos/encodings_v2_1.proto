@@ -184,6 +184,12 @@ message PageLayout {
 // In addition, leaf encodings may output "buffers".  These are fully compressed buffers of data that
 // are stored in the page and no longer compressed.
 
+enum CompressionScheme {
+  COMPRESSION_ALGORITHM_UNSPECIFIED = 0;
+  COMPRESSION_ALGORITHM_LZ4 = 1;
+  COMPRESSION_ALGORITHM_ZSTD = 2;
+}
+
 // Compression applied to a single buffer of data
 //
 // A buffer is the leaf of the compression tree.  Unlike data blocks, which can
@@ -197,7 +203,7 @@ message PageLayout {
 // This is a leaf, no further compression is applied to the data.
 message BufferCompression {
   // A general compression scheme to apply to the buffer
-  string scheme = 1;
+  CompressionScheme scheme = 1;
   // The compression level
   //
   // Optional, if not present a scheme-specific default value will be used.

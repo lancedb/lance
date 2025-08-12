@@ -30,7 +30,7 @@ use std::{io::Write, str::FromStr};
 use zstd::bulk::decompress_to_buffer;
 use zstd::stream::copy_decode;
 
-use crate::format::pb21::CompressiveEncoding;
+use crate::format::pb21::{self, CompressiveEncoding};
 use crate::format::ProtobufUtils21;
 use crate::{
     buffer::LanceBuffer,
@@ -66,6 +66,36 @@ pub enum CompressionScheme {
     Fsst,
     Zstd,
     Lz4,
+}
+
+impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
+    type Error = Error;
+
+    fn try_from(scheme: CompressionScheme) -> Result<Self> {
+        match scheme {
+            CompressionScheme::Lz4 => Ok(pb21::CompressionScheme::CompressionAlgorithmLz4),
+            CompressionScheme::Zstd => Ok(pb21::CompressionScheme::CompressionAlgorithmZstd),
+            _ => Err(Error::invalid_input(
+                format!("Unsupported compression scheme: {:?}", scheme),
+                location!(),
+            )),
+        }
+    }
+}
+
+impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
+    type Error = Error;
+
+    fn try_from(scheme: pb21::CompressionScheme) -> Result<Self> {
+        match scheme {
+            pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
+            pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
+            _ => Err(Error::invalid_input(
+                format!("Unsupported compression scheme: {:?}", scheme),
+                location!(),
+            )),
+        }
+    }
 }
 
 impl std::fmt::Display for CompressionScheme {
@@ -333,8 +363,8 @@ impl CompressedBufferEncoder {
         Self { compressor }
     }
 
-    pub fn from_scheme(scheme: &str) -> Result<Self> {
-        let scheme = CompressionScheme::from_str(scheme)?;
+    pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
+        let scheme = CompressionScheme::try_from(scheme)?;
         Ok(Self {
             compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
                 scheme,
@@ -429,7 +459,7 @@ impl PerValueCompressor for CompressedBufferEncoder {
                 ProtobufUtils21::flat(data.bits_per_offset as u64, None),
                 None,
             ),
-        );
+        )?;
 
         Ok((compressed, encoding))
     }

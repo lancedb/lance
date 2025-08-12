@@ -583,7 +583,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     Error::invalid_input("GeneralMiniBlock missing compression config", location!())
                 })?;
 
-                let scheme = compression.scheme.parse()?;
+                let scheme = compression.scheme().try_into()?;
 
                 let compression_config = crate::encodings::physical::block::CompressionConfig::new(
                     scheme,
@@ -635,7 +635,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             ))),
             Compression::General(ref general) => {
                 Ok(Box::new(CompressedBufferEncoder::from_scheme(
-                    &general.compression.as_ref().expect_ok()?.scheme,
+                    general.compression.as_ref().expect_ok()?.scheme(),
                 )?))
             }
             _ => todo!("variable-per-value decompressor for {:?}", description),

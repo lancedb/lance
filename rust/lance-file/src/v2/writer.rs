@@ -1266,7 +1266,7 @@ mod tests {
         let text_encoding = describe_encoding(&column_metadatas[1].pages[0]);
         // For string columns, we expect Binary encoding with zstd compression
         assert!(
-            text_encoding.contains("zstd"),
+            text_encoding.contains("Zstd"),
             "text column should use zstd compression from field metadata, but got: {}",
             text_encoding
         );

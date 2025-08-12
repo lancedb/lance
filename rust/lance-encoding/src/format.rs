@@ -48,6 +48,7 @@ use crate::{
 };
 
 use self::pb::Constant;
+use lance_core::Result;
 
 // Utility functions for creating complex protobuf objects
 pub struct ProtobufUtils {}
@@ -374,23 +375,23 @@ impl ProtobufUtils21 {
         }
     }
 
-    pub fn buffer_compression(compression: CompressionConfig) -> pb21::BufferCompression {
-        pb21::BufferCompression {
-            scheme: compression.scheme.to_string(),
+    pub fn buffer_compression(compression: CompressionConfig) -> Result<pb21::BufferCompression> {
+        Ok(pb21::BufferCompression {
+            scheme: pb21::CompressionScheme::try_from(compression.scheme)? as i32,
             level: compression.level,
-        }
+        })
     }
 
     pub fn wrapped(
         compression: CompressionConfig,
         values: CompressiveEncoding,
-    ) -> CompressiveEncoding {
-        CompressiveEncoding {
+    ) -> Result<CompressiveEncoding> {
+        Ok(CompressiveEncoding {
             compression: Some(Compression::General(Box::new(pb21::General {
-                compression: Some(Self::buffer_compression(compression)),
+                compression: Some(Self::buffer_compression(compression)?),
                 values: Some(Box::new(values)),
             }))),
-        }
+        })
     }
 
     pub fn rle(

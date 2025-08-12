@@ -103,7 +103,7 @@ impl MiniBlockCompressor for GeneralMiniBlockCompressor {
         };
 
         // Return compressed encoding
-        let encoding = ProtobufUtils21::wrapped(self.compression, inner_encoding);
+        let encoding = ProtobufUtils21::wrapped(self.compression, inner_encoding)?;
         Ok((compressed_result, encoding))
     }
 }
@@ -142,6 +142,7 @@ mod tests {
     use crate::encodings::physical::block::CompressionScheme;
     use crate::encodings::physical::rle::RleMiniBlockEncoder;
     use crate::encodings::physical::value::ValueEncoder;
+    use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
     use arrow_array::{Float64Array, Int32Array};
 
@@ -259,8 +260,8 @@ mod tests {
                     test_case.name
                 );
                 assert_eq!(
-                    cm.compression.as_ref().unwrap().scheme,
-                    test_case.compression.scheme.to_string()
+                    CompressionScheme::try_from(cm.compression.as_ref().unwrap().scheme()).unwrap(),
+                    test_case.compression.scheme
                 );
             }
             _ => {
@@ -466,7 +467,10 @@ mod tests {
         match &encoding.compression {
             Some(Compression::General(cm)) => {
                 assert!(cm.values.is_some());
-                assert_eq!(cm.compression.as_ref().unwrap().scheme, "zstd");
+                assert_eq!(
+                    cm.compression.as_ref().unwrap().scheme(),
+                    pb21::CompressionScheme::CompressionAlgorithmZstd
+                );
                 assert_eq!(cm.compression.as_ref().unwrap().level, Some(3));
 
                 // Verify inner encoding is Flat (from ValueEncoder)
@@ -564,7 +568,10 @@ mod tests {
                     _ => panic!("Expected RLE as inner encoding"),
                 }
                 // Check compression is LZ4
-                assert_eq!(cm.compression.as_ref().unwrap().scheme, "lz4");
+                assert_eq!(
+                    cm.compression.as_ref().unwrap().scheme(),
+                    pb21::CompressionScheme::CompressionAlgorithmLz4
+                );
             }
             Some(Compression::Rle(_)) => {
                 // Also acceptable if compression didn't help
@@ -618,7 +625,10 @@ mod tests {
                     _ => panic!("Expected RLE as inner encoding for 64-bit"),
                 }
                 // Check compression is LZ4
-                assert_eq!(cm.compression.as_ref().unwrap().scheme, "lz4");
+                assert_eq!(
+                    cm.compression.as_ref().unwrap().scheme(),
+                    pb21::CompressionScheme::CompressionAlgorithmLz4
+                );
             }
             Some(Compression::Rle(_)) => {
                 // Also acceptable if compression didn't help

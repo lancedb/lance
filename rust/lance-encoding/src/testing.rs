@@ -5,6 +5,7 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
 use crate::{
     decoder::DecoderConfig,
+    encodings::physical::block::CompressionScheme,
     format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
 };
 
@@ -519,7 +520,10 @@ pub fn extract_array_encoding_chain(enc: &CompressiveEncoding) -> Vec<String> {
 
             // 2. Extract any buffer output
             if let Some(buffer) = buffer(inner) {
-                chain.extend(buffer.into_iter().map(|b| b.scheme.clone()));
+                chain.extend(buffer.into_iter().map(|b| {
+                    let scheme = CompressionScheme::try_from(b.scheme()).unwrap();
+                    scheme.to_string()
+                }));
             }
 
             // 3. Process child encoding if exists
