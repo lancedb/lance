@@ -4,7 +4,7 @@
 use arrow_array::{
     cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray, PrimitiveArray,
 };
-use lance_core::{Error, Result};
+use lance_core::{assume, Error, Result};
 use snafu::location;
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
@@ -62,7 +62,7 @@ pub fn get_sub_vector_centroids<const NUM_BITS: u32, T>(
     num_sub_vectors: usize,
     sub_vector_idx: usize,
 ) -> &[T] {
-    debug_assert!(
+    assume!(
         sub_vector_idx < num_sub_vectors,
         "sub_vector idx: {}, num_sub_vectors: {}",
         sub_vector_idx,
