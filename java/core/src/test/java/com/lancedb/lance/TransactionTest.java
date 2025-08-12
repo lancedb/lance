@@ -176,7 +176,7 @@ public class TransactionTest {
       try (Dataset dataset = delete.commit()) {
         Transaction txn = dataset.readTransaction().get();
         Delete execDelete = (Delete) txn.operation();
-        assertEquals(deletedFragmentIds, execDelete.deletedFragmentIds());
+        assertEquals(delete.operation(), execDelete);
         assertEquals(0, dataset.countRows());
       }
     }
