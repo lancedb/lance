@@ -4275,7 +4275,7 @@ mod tests {
         // With the new retention behavior, indices are kept even when all fragments are deleted
         // This allows the index configuration to persist through data changes
         assert_eq!(indices.len(), 1);
-        
+
         // Verify the index has an empty effective fragment bitmap
         let index = &indices[0];
         let effective_bitmap = index

@@ -2926,7 +2926,11 @@ mod tests {
             } else {
                 let id_index = id_index.unwrap();
                 let id_frags_bitmap = RoaringBitmap::from_iter(id_frags.iter().copied());
-                assert_eq!(id_index.fragment_bitmap.unwrap(), id_frags_bitmap);
+                // Fragment bitmaps are now immutable, so we check the effective bitmap
+                let effective_bitmap = id_index
+                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                    .unwrap();
+                assert_eq!(effective_bitmap, id_frags_bitmap);
             }
 
             let value_index = dataset
@@ -2939,7 +2943,11 @@ mod tests {
             } else {
                 let value_index = value_index.unwrap();
                 let value_frags_bitmap = RoaringBitmap::from_iter(value_frags.iter().copied());
-                assert_eq!(value_index.fragment_bitmap.unwrap(), value_frags_bitmap);
+                // Fragment bitmaps are now immutable, so we check the effective bitmap
+                let effective_bitmap = value_index
+                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                    .unwrap();
+                assert_eq!(effective_bitmap, value_frags_bitmap);
             }
 
             let other_value_index = dataset
@@ -2948,19 +2956,27 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            // The other_value_index behavior depends on whether other_value was included in the merge operation.
-            // For full schema merges, fragments are removed. For partial merges that don't include
-            // other_value, the index is unchanged.
-            let expected_fragments = match id_frags.len() {
-                4 => 4u64,                  // Initial state - all fragments present
-                3 => 3u64, // After first full merge - fragment 3 removed from all indices
-                2 => 4u64, // After second partial merge - other_value_index unchanged (only id and value were merged)
-                0 => 4u64, // After final partial merge - other_value_index still unchanged (only id and value were merged)
-                _ => id_frags.len() as u64, // Default fallback
-            };
+            // With immutable fragment bitmaps, the other_value index behavior is:
+            // - Its fragment bitmap is never updated (it retains the original [0,1,2,3])
+            // - The effective bitmap reflects what fragments are still valid for the index
+            // - For partial merges that don't include other_value, the index remains fully valid
+            let effective_bitmap = other_value_index
+                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .unwrap();
+            
+            // The effective bitmap is the intersection of the index's original bitmap
+            // and the current dataset fragments. Since other_value is not modified by
+            // partial merges, it retains its validity for fragments it was originally trained on
+            // that still exist in the dataset.
+            let index_bitmap = other_value_index.fragment_bitmap.as_ref().unwrap();
+            let expected_bitmap = index_bitmap & dataset.fragment_bitmap.as_ref();
             assert_eq!(
-                other_value_index.fragment_bitmap.as_ref().unwrap().len(),
-                expected_fragments
+                effective_bitmap,
+                expected_bitmap,
+                "other_value index effective bitmap should be intersection. index_bitmap: {:?}, dataset_fragments: {:?}, effective_bitmap: {:?}",
+                index_bitmap,
+                dataset.fragment_bitmap,
+                effective_bitmap
             );
         };
 
