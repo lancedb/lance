@@ -366,6 +366,31 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&java_fragments)],
             )?)
         }
+        Operation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate,
+        } => {
+            let updated_fragments_obj = export_vec(env, &updated_fragments)?;
+
+            let deleted_ids: Vec<JLance<i64>> = deleted_fragment_ids
+                .iter()
+                .map(|x| JLance(*x as i64))
+                .collect();
+            let removed_fragment_ids_obj = export_vec(env, &deleted_ids)?;
+
+            let predicate_obj = env.new_string(&predicate)?;
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/Delete",
+                "(Ljava/util/List;Ljava/util/List;Ljava/lang/String;)V",
+                &[
+                    JValue::Object(&updated_fragments_obj),
+                    JValue::Object(&removed_fragment_ids_obj),
+                    JValue::Object(&predicate_obj),
+                ],
+            )?)
+        }
         Operation::Overwrite {
             fragments: rust_fragments,
             schema,
@@ -761,6 +786,49 @@ fn convert_to_rust_operation(
                 fragments.push(f.extract_object(env)?);
             }
             Operation::Append { fragments }
+        }
+        "Delete" => {
+            let updated_fragments_objs = env
+                .call_method(
+                    &java_operation,
+                    "updatedFragments",
+                    "()Ljava/util/List;",
+                    &[],
+                )?
+                .l()?;
+            let updated_fragments_objs = import_vec(env, &updated_fragments_objs)?;
+            let mut updated_fragments: Vec<Fragment> =
+                Vec::with_capacity(updated_fragments_objs.len());
+            for f in updated_fragments_objs {
+                updated_fragments.push(f.extract_object(env)?);
+            }
+
+            let deleted_fragment_ids_objs = env
+                .call_method(
+                    &java_operation,
+                    "deletedFragmentIds",
+                    "()Ljava/util/List;",
+                    &[],
+                )?
+                .l()?;
+            let deleted_fragment_ids: Vec<u64> = env
+                .get_longs(&deleted_fragment_ids_objs)?
+                .into_iter()
+                .map(|x| x.try_into().unwrap())
+                .collect();
+
+            let predicate_obj = env
+                .call_method(&java_operation, "predicate", "()Ljava/util/Optional;", &[])?
+                .l()?;
+            let predicate = env
+                .get_string_opt(&predicate_obj)?
+                .unwrap_or("".to_string());
+
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate,
+            }
         }
         "Overwrite" => {
             let fragment_objs = env
