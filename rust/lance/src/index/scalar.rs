@@ -88,6 +88,14 @@ impl TrainingSource for TrainingRequest {
     }
 }
 
+enum OrderMode {
+    Unordered,
+    // ordered by the user specified column
+    Ordered,
+    // row_address column is added to the scan and it's order by row_address
+    Aligned,
+}
+
 impl TrainingRequest {
     pub fn new(dataset: Arc<Dataset>, column: String, train: bool) -> Self {
         Self {
@@ -124,9 +132,7 @@ impl TrainingRequest {
     async fn scan_chunks(
         self: Box<Self>,
         chunk_size: u32,
-        sort: bool,
-        // based on aligned, we can add a row_address column to the scan and it's order by row_address
-        aligned: bool,
+        order_mode: OrderMode,
     ) -> Result<SendableRecordBatchStream> {
         let num_rows = self.dataset.count_all_rows().await?;
 
@@ -150,20 +156,20 @@ impl TrainingRequest {
             DataType::Utf8 | DataType::LargeUtf8
         );
 
-        let scan = if aligned {
-            // Since Lance will return data in the order of the row_address, no need to sort.
-            scan.with_row_id()
-                .with_row_address()
-                .project(&[&self.column])?
-        } else {
-            let ordering = match sort {
-                true => Some(vec![ColumnOrdering::asc_nulls_first(self.column.clone())]),
-                false => None,
-            };
-
-            scan.with_row_id()
-                .order_by(ordering)?
-                .project(&[&self.column])?
+        let scan = match order_mode {
+            OrderMode::Aligned => {
+                // Since Lance will return data in the order of the row_address, no need to sort.
+                scan.with_row_id()
+                    .with_row_address()
+                    .project(&[&self.column])?
+            }
+            OrderMode::Ordered => scan
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                    self.column.clone(),
+                )]))?
+                .project(&[&self.column])?,
+            OrderMode::Unordered => scan.with_row_id().project(&[&self.column])?,
         };
 
         let batches = scan

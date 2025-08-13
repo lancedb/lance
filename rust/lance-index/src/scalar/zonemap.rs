@@ -38,7 +38,7 @@ use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use roaring::RoaringBitmap;
 use snafu::location;
-const ZONEMAP_DEFAULT_SIZE: usize = 8192; // 1 zone every two batches
+const ZONEMAP_DEFAULT_SIZE: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "zonemap_size";
@@ -49,36 +49,22 @@ struct ZoneMapStatistics {
     min: ScalarValue,
     max: ScalarValue,
     null_count: u32,
+    // only apply to float type
+    nan_count: u32,
     fragment_id: u64,
+    // zone_start is the start row of the zone in the fragment, also known
+    // as local row offset
+    zone_start: u64,
     zone_size: usize,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         // Estimate sizes for ScalarValue
-        let min_size = match &self.min {
-            ScalarValue::Int32(_) => 4,
-            ScalarValue::Int64(_) => 8,
-            ScalarValue::Float32(_) => 4,
-            ScalarValue::Float64(_) => 8,
-            ScalarValue::Utf8(Some(s)) => s.len(),
-            ScalarValue::Utf8(None) => 0,
-            ScalarValue::LargeUtf8(None) => 0,
-            _ => 16, // Default estimate
-        };
+        let min_size = self.min.size() - std::mem::size_of::<ScalarValue>();
+        let max_size = self.max.size() - std::mem::size_of::<ScalarValue>();
 
-        let max_size = match &self.max {
-            ScalarValue::Int32(_) => 4,
-            ScalarValue::Int64(_) => 8,
-            ScalarValue::Float32(_) => 4,
-            ScalarValue::Float64(_) => 8,
-            ScalarValue::Utf8(Some(s)) => s.len(),
-            ScalarValue::Utf8(None) => 0,
-            ScalarValue::LargeUtf8(None) => 0,
-            _ => 16, // Default estimate
-        };
-
-        min_size + max_size + 4 + 8 + 8
+        min_size + max_size
     }
 }
 
@@ -93,7 +79,7 @@ pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
     // The maximum size of a zone provided by user
-    max_zonemap_size: usize,
+    max_zonemap_size: u64,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
     index_cache: LanceCache,
@@ -120,6 +106,8 @@ impl DeepSizeOf for ZoneMapIndex {
 
 impl ZoneMapIndex {
     /// Evaluates whether a zone could potentially contain values matching the query
+    /// For NaN, total order is used here
+    /// reference: https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp
     fn evaluate_zone_against_query(
         &self,
         zone: &ZoneMapStatistics,
@@ -139,8 +127,28 @@ impl ZoneMapIndex {
                     return Ok(zone.null_count > 0);
                 }
 
+                // Handle NaN values - if target is NaN, check nan_count
+                let is_nan = match target {
+                    ScalarValue::Float16(Some(f)) => f.is_nan(),
+                    ScalarValue::Float32(Some(f)) => f.is_nan(),
+                    ScalarValue::Float64(Some(f)) => f.is_nan(),
+                    _ => false,
+                };
+
+                if is_nan {
+                    return Ok(zone.nan_count > 0);
+                }
+
                 // Check if target is within the zone's range
-                Ok(target >= &zone.min && target <= &zone.max)
+                // Handle the case where zone.max is NaN (zone contains both finite values and NaN)
+                let min_check = target >= &zone.min;
+                let max_check = match &zone.max {
+                    ScalarValue::Float16(Some(f)) if f.is_nan() => true,
+                    ScalarValue::Float32(Some(f)) if f.is_nan() => true,
+                    ScalarValue::Float64(Some(f)) if f.is_nan() => true,
+                    _ => target <= &zone.max,
+                };
+                Ok(min_check && max_check)
             }
             SargableQuery::Range(start, end) => {
                 // Zone overlaps with query range if there's any intersection between
@@ -150,14 +158,108 @@ impl ZoneMapIndex {
 
                 let start_check = match start {
                     Bound::Unbounded => true,
-                    Bound::Included(s) => zone_max >= s,
-                    Bound::Excluded(s) => zone_max > s,
+                    Bound::Included(s) => {
+                        // Handle NaN in range bounds - NaN is greater than all finite values
+                        match s {
+                            ScalarValue::Float16(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(zone.nan_count > 0);
+                                }
+                            }
+                            ScalarValue::Float32(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(zone.nan_count > 0);
+                                }
+                            }
+                            ScalarValue::Float64(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(zone.nan_count > 0);
+                                }
+                            }
+                            _ => {}
+                        }
+                        // Handle the case where zone_max is NaN
+                        // If zone_max is NaN, the zone contains both finite values and NaN
+                        // Since we don't know the actual max, we'll be conservative and include the zone
+                        match zone_max {
+                            ScalarValue::Float16(Some(f)) if f.is_nan() => true,
+                            ScalarValue::Float32(Some(f)) if f.is_nan() => true,
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => true,
+                            _ => zone_max >= s,
+                        }
+                    }
+                    Bound::Excluded(s) => {
+                        // Handle NaN in range bounds
+                        match s {
+                            ScalarValue::Float16(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(false); // Nothing is greater than NaN
+                                }
+                            }
+                            ScalarValue::Float32(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(false); // Nothing is greater than NaN
+                                }
+                            }
+                            ScalarValue::Float64(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(false); // Nothing is greater than NaN
+                                }
+                            }
+                            _ => {}
+                        }
+                        zone_max > s
+                    }
                 };
 
                 let end_check = match end {
                     Bound::Unbounded => true,
-                    Bound::Included(e) => zone_min <= e,
-                    Bound::Excluded(e) => zone_min < e,
+                    Bound::Included(e) => {
+                        // Handle NaN in range bounds
+                        match e {
+                            ScalarValue::Float16(Some(f)) => {
+                                if f.is_nan() {
+                                    // NaN is included, so check if zone has NaN values or finite values
+                                    return Ok(zone.nan_count > 0 || zone_min <= e);
+                                }
+                            }
+                            ScalarValue::Float32(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(zone.nan_count > 0 || zone_min <= e);
+                                }
+                            }
+                            ScalarValue::Float64(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(zone.nan_count > 0 || zone_min <= e);
+                                }
+                            }
+                            _ => {}
+                        }
+                        zone_min <= e
+                    }
+                    Bound::Excluded(e) => {
+                        // Handle NaN in range bounds
+                        match e {
+                            ScalarValue::Float16(Some(f)) => {
+                                if f.is_nan() {
+                                    // Everything is less than NaN, so include all finite values
+                                    return Ok(true);
+                                }
+                            }
+                            ScalarValue::Float32(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(true);
+                                }
+                            }
+                            ScalarValue::Float64(Some(f)) => {
+                                if f.is_nan() {
+                                    return Ok(true);
+                                }
+                            }
+                            _ => {}
+                        }
+                        zone_min < e
+                    }
                 };
 
                 Ok(start_check && end_check)
@@ -168,7 +270,30 @@ impl ZoneMapIndex {
                     if value.is_null() {
                         zone.null_count > 0
                     } else {
-                        value >= &zone.min && value <= &zone.max
+                        match value {
+                            ScalarValue::Float16(Some(f)) => {
+                                if f.is_nan() {
+                                    zone.nan_count > 0
+                                } else {
+                                    value >= &zone.min && value <= &zone.max
+                                }
+                            }
+                            ScalarValue::Float32(Some(f)) => {
+                                if f.is_nan() {
+                                    zone.nan_count > 0
+                                } else {
+                                    value >= &zone.min && value <= &zone.max
+                                }
+                            }
+                            ScalarValue::Float64(Some(f)) => {
+                                if f.is_nan() {
+                                    zone.nan_count > 0
+                                } else {
+                                    value >= &zone.min && value <= &zone.max
+                                }
+                            }
+                            _ => value >= &zone.min && value <= &zone.max,
+                        }
                     }
                 }))
             }
@@ -184,7 +309,7 @@ impl ZoneMapIndex {
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
-        max_zonemap_size: usize,
+        max_zonemap_size: u64,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
         let min_col = data.column_by_name("min").ok_or_else(|| {
@@ -203,6 +328,19 @@ impl ZoneMapIndex {
             .ok_or_else(|| {
                 Error::invalid_input(
                     "ZoneMapIndex: 'null_count' column is not UInt32",
+                    location!(),
+                )
+            })?;
+        let nan_count_col = data
+            .column_by_name("nan_count")
+            .ok_or_else(|| {
+                Error::invalid_input("ZoneMapIndex: missing 'nan_count' column", location!())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "ZoneMapIndex: 'nan_count' column is not UInt32",
                     location!(),
                 )
             })?;
@@ -234,6 +372,20 @@ impl ZoneMapIndex {
                 )
             })?;
 
+        let zone_start_col = data
+            .column_by_name("zone_start")
+            .ok_or_else(|| {
+                Error::invalid_input("ZoneMapIndex: missing 'zone_start' column", location!())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "ZoneMapIndex: 'zone_start' column is not UInt64",
+                    location!(),
+                )
+            })?;
+
         let data_type = min_col.data_type().clone();
 
         if data.num_rows() == 0 {
@@ -254,11 +406,14 @@ impl ZoneMapIndex {
             let min = ScalarValue::try_from_array(min_col, i)?;
             let max = ScalarValue::try_from_array(max_col, i)?;
             let null_count = null_count_col.value(i);
+            let nan_count = nan_count_col.value(i);
             zones.push(ZoneMapStatistics {
                 min,
                 max,
                 null_count,
+                nan_count,
                 fragment_id: fragment_id_col.value(i),
+                zone_start: zone_start_col.value(i),
                 zone_size: zone_size.value(i) as usize,
             });
         }
@@ -331,38 +486,18 @@ impl ScalarIndex for ZoneMapIndex {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
         let mut row_id_tree_map = RowIdTreeMap::new();
-        let mut current_fragment_id = None;
-        let mut cumulative_offset = 0;
 
-        // Loop through zones sequentially to calculate offsets efficiently
+        // Loop through zones and check each one
         for zone in self.zones.iter() {
-            // Check if we need to reset cumulative_offset for a new fragment
-            if let Some(frag_id) = current_fragment_id {
-                if zone.fragment_id != frag_id {
-                    // New fragment, reset offset to 0
-                    cumulative_offset = 0;
-                    current_fragment_id = Some(zone.fragment_id);
-                }
-            } else {
-                // First zone
-                current_fragment_id = Some(zone.fragment_id);
-            }
-
             // Check if this zone matches the query
             if self.evaluate_zone_against_query(zone, query)? {
                 // Calculate the range of row addresses for this zone
-                // Row addresses are: (fragment_id << 32) + cumulative_offset
-                let zone_start = (zone.fragment_id << 32) + cumulative_offset as u64;
-                let zone_end = zone_start + (zone.zone_size as u64);
+                // Row addresses are: (fragment_id << 32) + zone_start
+                let zone_start_addr = (zone.fragment_id << 32) + zone.zone_start;
+                let zone_end_addr = zone_start_addr + (zone.zone_size as u64);
 
                 // Add all row addresses in this zone to the result
-                row_id_tree_map.insert_range(zone_start..zone_end);
-            }
-
-            // Update cumulative offset for the next zone
-            if zone.fragment_id == current_fragment_id.unwrap() {
-                // Same fragment, accumulate the offset for next zone
-                cumulative_offset += zone.zone_size;
+                row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
             }
         }
 
@@ -387,8 +522,8 @@ impl ScalarIndex for ZoneMapIndex {
             .read_range(0..index_file.num_rows(), None)
             .await?;
         let file_schema = index_file.schema();
-        // zonemap_size is expected to be a usize (or possibly u64), parsed from a string in the metadata
-        let max_zonemap_size: usize = file_schema
+
+        let max_zonemap_size: u64 = file_schema
             .metadata
             .get(ZONEMAP_SIZE_META_KEY)
             .and_then(|bs| bs.parse().ok())
@@ -455,10 +590,10 @@ impl ScalarIndex for ZoneMapIndex {
 
 #[derive(Debug, Clone)]
 pub struct ZoneMapIndexBuilderOptions {
-    rows_per_zone: usize,
+    rows_per_zone: u64,
 }
 
-static DEFAULT_ROWS_PER_ZONE: LazyLock<usize> = LazyLock::new(|| {
+static DEFAULT_ROWS_PER_ZONE: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
         .unwrap_or_else(|_| (ZONEMAP_DEFAULT_SIZE).to_string())
         .parse()
@@ -474,7 +609,7 @@ impl Default for ZoneMapIndexBuilderOptions {
 }
 
 impl ZoneMapIndexBuilderOptions {
-    fn new(rows_per_zone: usize) -> Self {
+    fn new(rows_per_zone: u64) -> Self {
         Self { rows_per_zone }
     }
 }
@@ -485,13 +620,14 @@ pub struct ZoneMapIndexBuilder {
 
     items_type: DataType,
     maps: Vec<ZoneMapStatistics>,
-    // TODO: check with weston on usize or u32
+    // The local offset within the current zone
     cur_zone_offset: usize,
     cur_fragment_id: u64,
 
     min: MinAccumulator,
     max: MaxAccumulator,
     null_count: u32,
+    nan_count: u32,
 }
 
 impl ZoneMapIndexBuilder {
@@ -507,25 +643,62 @@ impl ZoneMapIndexBuilder {
             min,
             max,
             null_count: 0,
+            nan_count: 0,
         })
+    }
+
+    fn count_nans(array: &ArrayRef) -> u32 {
+        match array.data_type() {
+            DataType::Float16 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float16Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            DataType::Float32 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            DataType::Float64 => {
+                let array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap();
+                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
+            }
+            _ => 0, // Non-float types don't have NaNs
+        }
     }
 
     fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
         self.null_count += array.null_count() as u32;
+        self.nan_count += Self::count_nans(array);
         self.min.update_batch(&[array.clone()])?;
         self.max.update_batch(&[array.clone()])?;
         Ok(())
     }
 
     fn new_map(&mut self, fragment_id: u64) -> Result<()> {
+        // Calculate zone_start based on existing zones in the same fragment
+        let zone_start = self
+            .maps
+            .iter()
+            .filter(|zone| zone.fragment_id == fragment_id)
+            .map(|zone| zone.zone_size as u64)
+            .sum::<u64>();
         let new_map = ZoneMapStatistics {
             min: self.min.evaluate()?,
             max: self.max.evaluate()?,
             null_count: self.null_count,
+            nan_count: self.nan_count,
             fragment_id,
+            zone_start,
             zone_size: self.cur_zone_offset,
         };
-        // new_map = {:?}", new_map);
 
         self.maps.push(new_map);
 
@@ -533,6 +706,7 @@ impl ZoneMapIndexBuilder {
         self.min = MinAccumulator::try_new(&self.items_type)?;
         self.max = MaxAccumulator::try_new(&self.items_type)?;
         self.null_count = 0;
+        self.nan_count = 0;
         Ok(())
     }
 
@@ -569,11 +743,11 @@ impl ZoneMapIndexBuilder {
                     fragment_id == self.cur_fragment_id + 1
                 });
                 let empty_rows_left_in_cur_zone: usize =
-                    self.options.rows_per_zone - self.cur_zone_offset;
+                    (self.options.rows_per_zone - self.cur_zone_offset as u64) as usize;
 
                 // Check if there is enough data from the current fragment to fill the current zone
                 let desired = if let Some(idx) = next_fragment_index {
-                    // We found a fragment boundary, update cur_fragment_id
+                    // We found a fragment boundary, update cur_fragment_id and reset zone start
                     let next_fragment_id = row_addrs_array.value(idx) >> 32;
                     self.cur_fragment_id = next_fragment_id;
                     // Don't create an empty zone, just process the data up to the boundary
@@ -581,8 +755,6 @@ impl ZoneMapIndexBuilder {
                 } else {
                     empty_rows_left_in_cur_zone
                 };
-                // desired = {}, next_fragment_index = {:?}, remaining = {}",
-                // desired, next_fragment_index, remaining
 
                 if desired > remaining {
                     // Not enough data to fill a map, just increment counts
@@ -605,7 +777,6 @@ impl ZoneMapIndexBuilder {
                 }
                 array_offset += desired;
                 remaining = remaining.saturating_sub(desired);
-                // array_offset = {}, remaining = {}", array_offset, remaining
             }
         }
         // Create the final map
@@ -613,7 +784,6 @@ impl ZoneMapIndexBuilder {
             self.new_map(self.cur_fragment_id)?;
         }
 
-        // TODO return anything here???
         Ok(())
     }
 
@@ -632,18 +802,25 @@ impl ZoneMapIndexBuilder {
         let null_counts =
             UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.null_count));
 
+        let nan_counts = UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.nan_count));
+
         let fragment_ids =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.fragment_id));
 
         let zone_sizes =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_size as u64));
 
+        let zone_starts =
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_start));
+
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             // min and max can be null if the entire batch is null values
             Field::new("min", self.items_type.clone(), true),
             Field::new("max", self.items_type.clone(), true),
             Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
             Field::new("zone_size", DataType::UInt64, false),
         ]));
 
@@ -651,7 +828,9 @@ impl ZoneMapIndexBuilder {
             mins,
             maxs,
             Arc::new(null_counts) as ArrayRef,
+            Arc::new(nan_counts) as ArrayRef,
             Arc::new(fragment_ids) as ArrayRef,
+            Arc::new(zone_starts) as ArrayRef,
             Arc::new(zone_sizes) as ArrayRef,
         ];
         Ok(RecordBatch::try_new(schema, columns)?)
@@ -813,8 +992,8 @@ mod tests {
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 10);
         for (i, zone) in index.zones.iter().enumerate() {
-            // zone = {:?} i= {}", zone, i
             assert_eq!(zone.null_count, 1000);
+            assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
             assert_eq!(zone.zone_size, 5000);
             assert_eq!(zone.fragment_id, i as u64);
         }
@@ -872,6 +1051,7 @@ mod tests {
         assert_eq!(new_zone.fragment_id, 10); // New fragment ID
         assert_eq!(new_zone.zone_size, 5000);
         assert_eq!(new_zone.null_count, 0); // New data has no nulls
+        assert_eq!(new_zone.nan_count, 0); // New data has no NaN values
 
         // Test search on updated index - search for null values should still work
         let query = SargableQuery::Equals(ScalarValue::Float32(None));
@@ -901,6 +1081,197 @@ mod tests {
         let start = 10u64 << 32;
         let end = start + 5000;
         expected.insert_range(start..end);
+        assert_eq!(result, SearchResult::AtMost(expected));
+    }
+
+    #[tokio::test]
+    async fn test_nan_zonemap_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create deterministic data with NaN values
+        // Pattern: [1.0, 2.0, NaN, 3.0, 4.0, 5.0, NaN, 6.0, 7.0, 8.0, ...]
+        let mut values = Vec::new();
+        for i in 0..500 {
+            if i % 5 == 2 {
+                values.push(f32::NAN);
+            } else {
+                // Other values are sequential numbers
+                values.push(i as f32);
+            }
+        }
+
+        let float_data = arrow_array::Float32Array::from(values);
+        let row_ids = UInt64Array::from_iter_values((0..float_data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Float32, true),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(float_data.clone()), Arc::new(row_ids)],
+        )
+        .unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let data_source = Box::new(MockTrainingSource::from(data_stream));
+        train_zonemap_index(
+            data_source,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderOptions::new(100)),
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load ZoneMapIndex");
+
+        // Should have 5 zones since we have 500 rows and zone size is 100
+        assert_eq!(index.zones.len(), 5);
+
+        // Check that each zone has the expected NaN count
+        // Each zone has 100 values, and every 5th value (indices 2, 7, 12, ...) is NaN
+        // So each zone should have 20 NaN values (100/5 = 20)
+        for (i, zone) in index.zones.iter().enumerate() {
+            assert_eq!(zone.nan_count, 20, "Zone {} should have 20 NaN values", i);
+            assert_eq!(zone.zone_size, 100, "Zone {} should have zone_size 100", i);
+            assert_eq!(zone.fragment_id, 0, "Zone {} should have fragment_id 0", i);
+        }
+
+        // Test search for NaN values using Equals with NaN
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match all zones since they all contain NaN values
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500); // All rows since NaN is in every zone
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a specific finite value that exists in the data
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(5.0)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match only the first zone since 5.0 only exists in rows 0-99
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..100);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value that doesn't exist
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(1000.0)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Since zones contain NaN values, their max will be NaN, so they will be included
+        // as potential matches for any finite target (false positive, but acceptable for zone maps)
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test range query that should include finite values
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Float32(Some(0.0))),
+            Bound::Included(ScalarValue::Float32(Some(250.0))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match the first three zones since they contain values in the range [0, 250]
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..300);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test IsIn query with NaN and finite values
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Float32(Some(f32::NAN)),
+            ScalarValue::Float32(Some(5.0)),
+            ScalarValue::Float32(Some(150.0)), // This value exists in the second zone
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match all zones since they all contain NaN values
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test range query that excludes all values
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Float32(Some(1000.0))),
+            Bound::Included(ScalarValue::Float32(Some(2000.0))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Since zones contain NaN values, their max will be NaN, so they will be included
+        // as potential matches for any range query (false positive, but acceptable for zone maps)
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test IsNull query (should match nothing since there are no null values)
+        let query = SargableQuery::IsNull();
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+
+        // Test range queries with NaN bounds
+        // Range with NaN as start bound (included)
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Float32(Some(f32::NAN))),
+            Bound::Unbounded,
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        // Should match all zones since they all contain NaN values
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Range with NaN as end bound (included)
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Included(ScalarValue::Float32(Some(f32::NAN))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        // Should match all zones since they all contain NaN values
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Range with NaN as end bound (excluded)
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float32(Some(f32::NAN))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        // Should match all zones since everything is less than NaN
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Range with NaN as start bound (excluded)
+        let query = SargableQuery::Range(
+            Bound::Excluded(ScalarValue::Float32(Some(f32::NAN))),
+            Bound::Unbounded,
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        // Should match nothing since nothing is greater than NaN
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+
+        // Test IsIn query with mixed float types (Float16, Float32, Float64)
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Float16(Some(half::f16::NAN)),
+            ScalarValue::Float32(Some(f32::NAN)),
+            ScalarValue::Float64(Some(f64::NAN)),
+            ScalarValue::Float32(Some(5.0)),
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        // Should match all zones since they all contain NaN values
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
         assert_eq!(result, SearchResult::AtMost(expected));
     }
 
@@ -988,18 +1359,27 @@ mod tests {
                     min: ScalarValue::Int32(Some(0)),
                     max: ScalarValue::Int32(Some(99)),
                     null_count: 0,
+                    nan_count: 0,
                     fragment_id: 0,
+                    zone_start: 0,
                     zone_size: 100,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int32(Some(100)),
                     max: ScalarValue::Int32(Some(100)),
                     null_count: 0,
+                    nan_count: 0,
                     fragment_id: 0,
+                    zone_start: 100,
                     zone_size: 1,
                 }
             ]
         );
+        // Verify nan_count is 0 for all zones (no NaN values in integer data)
+        for (i, zone) in index.zones.iter().enumerate() {
+            assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
+        }
+
         assert_eq!(index.data_type, DataType::Int32);
         assert_eq!(index.max_zonemap_size, 100);
         assert_eq!(
@@ -1158,25 +1538,36 @@ mod tests {
                     min: ScalarValue::Int64(Some(0)),
                     max: ScalarValue::Int64(Some(8191)),
                     null_count: 0,
+                    nan_count: 0,
                     fragment_id: 0,
+                    zone_start: 0,
                     zone_size: 8192,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(8192)),
                     max: ScalarValue::Int64(Some(16383)),
                     null_count: 0,
+                    nan_count: 0,
                     fragment_id: 0,
+                    zone_start: 8192,
                     zone_size: 8192,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(16384)),
                     max: ScalarValue::Int64(Some(16425)),
                     null_count: 0,
+                    nan_count: 0,
                     fragment_id: 0,
+                    zone_start: 16384,
                     zone_size: 42,
                 }
             ]
         );
+        // Verify nan_count is 0 for all zones (no NaN values in integer data)
+        for (i, zone) in index.zones.iter().enumerate() {
+            assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
+        }
+
         assert_eq!(index.data_type, DataType::Int64);
         assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE);
         assert_eq!(
@@ -1300,39 +1691,54 @@ mod tests {
                         min: ScalarValue::Int64(Some(0)),
                         max: ScalarValue::Int64(Some(4999)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 0,
+                        zone_start: 0,
                         zone_size: 5000,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(5000)),
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 0,
+                        zone_start: 5000,
                         zone_size: 3192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
                         max: ScalarValue::Int64(Some(13191)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 1,
+                        zone_start: 0,
                         zone_size: 5000,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(13192)),
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 1,
+                        zone_start: 5000,
                         zone_size: 3192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 2,
+                        zone_start: 0,
                         zone_size: 42,
                     }
                 ]
             );
+            // Verify nan_count is 0 for all zones (no NaN values in integer data)
+            for (i, zone) in index.zones.iter().enumerate() {
+                assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
+            }
+
             assert_eq!(index.data_type, DataType::Int64);
             assert_eq!(index.max_zonemap_size, 5000);
             assert_eq!(
@@ -1362,7 +1768,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
-            assert_eq!(fragment0_rowaddrs.values().len(), ZONEMAP_DEFAULT_SIZE);
+            assert_eq!(
+                fragment0_rowaddrs.values().len(),
+                ZONEMAP_DEFAULT_SIZE as usize
+            );
             assert_eq!(fragment0_rowaddrs.values()[0], 0);
             assert_eq!(
                 fragment0_rowaddrs.values()[fragment0_rowaddrs.values().len() - 1],
@@ -1375,7 +1784,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
-            assert_eq!(fragment1_rowaddrs.values().len(), ZONEMAP_DEFAULT_SIZE);
+            assert_eq!(
+                fragment1_rowaddrs.values().len(),
+                ZONEMAP_DEFAULT_SIZE as usize
+            );
             assert_eq!(fragment1_rowaddrs.values()[0], 1u64 << 32); // fragment_id=1, local_offset=0
             assert_eq!(
                 fragment1_rowaddrs.values()[fragment1_rowaddrs.values().len() - 1],
@@ -1480,25 +1892,36 @@ mod tests {
                         min: ScalarValue::Int64(Some(0)),
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 0,
+                        zone_start: 0,
                         zone_size: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 1,
+                        zone_start: 0,
                         zone_size: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 2,
+                        zone_start: 0,
                         zone_size: 42,
                     }
                 ]
             );
+            // Verify nan_count is 0 for all zones (no NaN values in integer data)
+            for (i, zone) in index.zones.iter().enumerate() {
+                assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
+            }
+
             assert_eq!(index.data_type, DataType::Int64);
             assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE);
             assert_eq!(
@@ -1539,25 +1962,36 @@ mod tests {
                         min: ScalarValue::Int64(Some(0)),
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 0,
+                        zone_start: 0,
                         zone_size: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 1,
+                        zone_start: 0,
                         zone_size: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
+                        nan_count: 0,
                         fragment_id: 2,
+                        zone_start: 0,
                         zone_size: 42,
                     }
                 ]
             );
+            // Verify nan_count is 0 for all zones (no NaN values in integer data)
+            for (i, zone) in index.zones.iter().enumerate() {
+                assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
+            }
+
             assert_eq!(index.data_type, DataType::Int64);
             assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE * 3);
         }

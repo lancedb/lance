@@ -96,7 +96,7 @@ pub enum IndexType {
 
     MemWal = 7,
 
-    ZoneMap = 8, // ZoneMap, Sargable filter
+    ZoneMap = 8, // ZoneMap
 
     // 100+ and up for vector index.
     /// Flat vector index.

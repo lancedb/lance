@@ -1894,14 +1894,14 @@ class LanceDataset(pa.dataset.Dataset):
           contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
           with a ``LABEL_LIST`` index.  This index can only speedup queries with
           ``array_has_any`` or ``array_has_all`` filters.
-        * ``NGRAM``. A special index that is used to index string columns.  This index
+        * ``NGRAM``. A special index that is used to index string columns. This index
           creates a bitmap for each ngram in the string.  By default we use trigrams.
           This index can currently speed up queries using the ``contains`` function
           in filters.
-        * ``ZONEMAP``. This index breaks the column into fixed-size chunks called zones
-          and store summary statistics for each zone(min, max, null_count, fragment_id).
-          It's inexact but enables efficient filtering by eliminating zones that do not
-          contain matching values.
+        * ``ZONEMAP``. This inexact index breaks the column into fixed-size chunks called
+          zones and stores summary statistics for each zone(min, max, null_count, fragment_id).
+          It's very small but only effective if the column is at least approximately in sorted
+          order.
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
