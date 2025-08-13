@@ -1369,12 +1369,14 @@ class LanceDataset(pa.dataset.Dataset):
 
     def add_columns(
         self,
-        transforms: Dict[str, str]
-        | BatchUDF
-        | ReaderLike
-        | pyarrow.Field
-        | List[pyarrow.Field]
-        | pyarrow.Schema,
+        transforms: (
+            Dict[str, str]
+            | BatchUDF
+            | ReaderLike
+            | pyarrow.Field
+            | List[pyarrow.Field]
+            | pyarrow.Schema
+        ),
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
@@ -1898,10 +1900,10 @@ class LanceDataset(pa.dataset.Dataset):
           creates a bitmap for each ngram in the string.  By default we use trigrams.
           This index can currently speed up queries using the ``contains`` function
           in filters.
-        * ``ZONEMAP``. This inexact index breaks the column into fixed-size chunks called
-          zones and stores summary statistics for each zone(min, max, null_count, fragment_id).
-          It's very small but only effective if the column is at least approximately in sorted
-          order.
+        * ``ZONEMAP``. This inexact index breaks the column into fixed-size chunks
+          called zones and stores summary statistics for each zone (min, max,
+          null_count, nan_count, fragment_id, local_row_offset). It's very small but
+          only effective if the column is at least approximately in sorted order.
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.

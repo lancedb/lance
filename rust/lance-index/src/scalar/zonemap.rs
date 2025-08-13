@@ -70,7 +70,8 @@ impl DeepSizeOf for ZoneMapStatistics {
 
 /// ZoneMap index
 /// At high level it's a columnar database technique for predicate push down and scan pruning.
-/// It breaks data into fixed-size chunks called `zones` and store summary statistics(min, max, null_count) for each zone. It enables efficient filtering by skipping zones that do not contain matching values
+/// It breaks data into fixed-size chunks called `zones` and store summary statistics(min, max, null_count,
+/// nan_count, fragment_id, local_row_offset) for each zone. It enables efficient filtering by skipping zones that do not contain matching values
 ///
 /// This is an inexact filter, similar to a bloom filter. It can return false positives that require rechecking.
 ///
@@ -482,6 +483,7 @@ impl ScalarIndex for ZoneMapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        println!("ZoneMapIndex::search!!!!!");
         metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
@@ -1630,7 +1632,7 @@ mod tests {
         // Fragment 0: values 0-8191 (first zone)
         let fragment0_data =
             arrow_array::Int64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as i64);
-        let fragment0_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as u64);
+        let fragment0_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE);
         let fragment0_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment0_data), Arc::new(fragment0_row_ids)],
@@ -1641,7 +1643,7 @@ mod tests {
         let fragment1_data = arrow_array::Int64Array::from_iter_values(
             (ZONEMAP_DEFAULT_SIZE as i64)..((ZONEMAP_DEFAULT_SIZE * 2) as i64),
         );
-        let fragment1_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as u64);
+        let fragment1_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE);
         let fragment1_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],

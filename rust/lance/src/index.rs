@@ -203,7 +203,7 @@ pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &HashMap<u64, Option<u64>>,
-) -> Result<Uuid> {
+) -> Result<Option<Uuid>> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
     let matched = indices
@@ -233,7 +233,7 @@ pub(crate) async fn remap_index(
             // This can happen if there is a bug where the index is covering empty
             // fragment that haven't been cleaned up. They should be cleaned up
             // outside of this function.
-            return Ok(*index_id);
+            return Ok(Some(*index_id));
         }
     }
 
@@ -258,8 +258,7 @@ pub(crate) async fn remap_index(
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
             if !scalar_index.can_remap() {
-                // If the index cannot be remapped, we just return the same index ID.
-                return Ok(*index_id);
+                return Ok(None);
             }
 
             match scalar_index.index_type() {
@@ -314,7 +313,7 @@ pub(crate) async fn remap_index(
         }
     }
 
-    Ok(new_id)
+    Ok(Some(new_id))
 }
 
 #[derive(Debug)]
@@ -2330,7 +2329,7 @@ mod tests {
         let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
             .await
             .unwrap();
-        assert_eq!(new_uuid, index_uuid);
+        assert_eq!(new_uuid, Some(index_uuid));
     }
 
     #[tokio::test]
