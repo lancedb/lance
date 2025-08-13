@@ -92,7 +92,7 @@ mod tests {
         let provider = AzureBlobStoreProvider;
 
         let url = Url::parse("az://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url).unwrap();
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
     }
