@@ -64,8 +64,8 @@ use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::pb;
-use crate::format::ProtobufUtils;
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::ProtobufUtils21;
 use crate::statistics::{GetStat, Stat};
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
@@ -109,7 +109,7 @@ impl ByteStreamSplitEncoder {
 }
 
 impl MiniBlockCompressor for ByteStreamSplitEncoder {
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
+    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match page {
             DataBlock::FixedWidth(data) => {
                 let num_values = data.num_values;
@@ -122,7 +122,10 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                             chunks: vec![],
                             num_values: 0,
                         },
-                        ProtobufUtils::byte_stream_split(self.bits_per_value as u64),
+                        ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
+                            self.bits_per_value as u64,
+                            None,
+                        )),
                     ));
                 }
 
@@ -165,7 +168,11 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
 
                 let data_buffers = vec![LanceBuffer::from(global_buffer)];
 
-                let encoding = ProtobufUtils::byte_stream_split(self.bits_per_value as u64);
+                // TODO: Should support underlying compression
+                let encoding = ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
+                    self.bits_per_value as u64,
+                    None,
+                ));
 
                 Ok((
                     MiniBlockCompressed {

@@ -25,7 +25,9 @@ use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValue
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::{pb, ProtobufUtils};
+use crate::format::pb21::compressive_encoding::Compression;
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::{pb21, ProtobufUtils21};
 
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
@@ -170,7 +172,9 @@ impl BinaryMiniBlockEncoder {
     fn chunk_data(
         &self,
         mut data: VariableWidthBlock,
-    ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
+    ) -> (MiniBlockCompressed, CompressiveEncoding) {
+        // TODO: Support compression of offsets
+        // TODO: Support general compression of data
         match data.bits_per_offset {
             32 => {
                 let offsets = data.offsets.borrow_to_typed_slice::<i32>();
@@ -181,7 +185,7 @@ impl BinaryMiniBlockEncoder {
                         chunks,
                         num_values: data.num_values,
                     },
-                    ProtobufUtils::variable(32),
+                    ProtobufUtils21::variable(ProtobufUtils21::flat(32, None), None),
                 )
             }
             64 => {
@@ -193,7 +197,7 @@ impl BinaryMiniBlockEncoder {
                         chunks,
                         num_values: data.num_values,
                     },
-                    ProtobufUtils::variable(64),
+                    ProtobufUtils21::variable(ProtobufUtils21::flat(64, None), None),
                 )
             }
             _ => panic!("Unsupported bits_per_offset={}", data.bits_per_offset),
@@ -202,7 +206,7 @@ impl BinaryMiniBlockEncoder {
 }
 
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
             _ => Err(Error::InvalidInput {
@@ -228,9 +232,20 @@ impl BinaryMiniBlockDecompressor {
         Self { bits_per_offset }
     }
 
-    pub fn from_variable(variable: &pb::Variable) -> Self {
-        Self {
-            bits_per_offset: variable.bits_per_offset as u8,
+    pub fn from_variable(variable: &pb21::Variable) -> Self {
+        if let Compression::Flat(flat) = variable
+            .offsets
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap()
+        {
+            Self {
+                bits_per_offset: flat.bits_per_value as u8,
+            }
+        } else {
+            panic!("Unsupported offsets compression: {:?}", variable.offsets);
         }
     }
 }
@@ -383,12 +398,15 @@ impl BlockCompressor for VariableEncoder {
 }
 
 impl PerValueCompressor for VariableEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let DataBlock::VariableWidth(variable) = data else {
             panic!("BinaryPerValueCompressor can only work with Variable Width DataBlock.");
         };
 
-        let encoding = ProtobufUtils::variable(variable.bits_per_offset);
+        let encoding = ProtobufUtils21::variable(
+            ProtobufUtils21::flat(variable.bits_per_offset as u64, None),
+            None,
+        );
         Ok((PerValueDataBlock::Variable(variable), encoding))
     }
 }

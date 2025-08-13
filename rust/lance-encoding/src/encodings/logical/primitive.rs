@@ -12,9 +12,15 @@ use std::{
     vec,
 };
 
-use crate::constants::{
-    DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-    STRUCTURAL_ENCODING_MINIBLOCK,
+use crate::{
+    constants::{
+        DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        STRUCTURAL_ENCODING_MINIBLOCK,
+    },
+    format::{
+        pb21::{self, compressive_encoding::Compression, CompressiveEncoding},
+        ProtobufUtils21,
+    },
 };
 use arrow::array::AsArray;
 use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
@@ -70,7 +76,6 @@ use crate::{
     encoder::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
     },
-    format::{pb, ProtobufUtils},
     repdef::{LevelBuffer, RepDefBuilder, RepDefUnraveler},
     EncodingsIo,
 };
@@ -1156,7 +1161,7 @@ impl MiniBlockScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
-        layout: &pb::MiniBlockLayout,
+        layout: &pb21::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let rep_decompressor = layout
@@ -1180,7 +1185,7 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
@@ -1189,18 +1194,16 @@ impl MiniBlockScheduler {
 
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             let num_dictionary_items = layout.num_dictionary_items;
-            match dictionary_encoding.array_encoding.as_ref().unwrap() {
-                pb::array_encoding::ArrayEncoding::Variable(_) => {
-                    Some(MiniBlockSchedulerDictionary {
-                        dictionary_decompressor: decompressors
-                            .create_block_decompressor(dictionary_encoding)?
-                            .into(),
-                        dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                        dictionary_data_alignment: 4,
-                        num_dictionary_items,
-                    })
-                }
-                pb::array_encoding::ArrayEncoding::Flat(_) => Some(MiniBlockSchedulerDictionary {
+            match dictionary_encoding.compression.as_ref().unwrap() {
+                Compression::Variable(_) => Some(MiniBlockSchedulerDictionary {
+                    dictionary_decompressor: decompressors
+                        .create_block_decompressor(dictionary_encoding)?
+                        .into(),
+                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                    dictionary_data_alignment: 4,
+                    num_dictionary_items,
+                }),
+                Compression::Flat(_) => Some(MiniBlockSchedulerDictionary {
                     dictionary_decompressor: decompressors
                         .create_block_decompressor(dictionary_encoding)?
                         .into(),
@@ -1716,7 +1719,7 @@ impl FullZipScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         rows_in_page: u64,
-        layout: &pb::FullZipLayout,
+        layout: &pb21::FullZipLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         // We don't need the data_buf_size because either the data type is
@@ -1740,13 +1743,13 @@ impl FullZipScheduler {
         });
 
         let value_decompressor = match layout.details {
-            Some(pb::full_zip_layout::Details::BitsPerValue(_)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => {
                 let decompressor = decompressors.create_fixed_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
                 PerValueDecompressor::Fixed(decompressor.into())
             }
-            Some(pb::full_zip_layout::Details::BitsPerOffset(_)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerOffset(_)) => {
                 let decompressor = decompressors.create_variable_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
@@ -1763,7 +1766,7 @@ impl FullZipScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
@@ -1774,8 +1777,8 @@ impl FullZipScheduler {
             .sum();
 
         let bits_per_offset = match layout.details {
-            Some(pb::full_zip_layout::Details::BitsPerValue(_)) => 32,
-            Some(pb::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => 32,
+            Some(pb21::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
                 bits_per_offset as u8
             }
             None => panic!("Full-zip layout must have a `details` field"),
@@ -2808,7 +2811,7 @@ impl StructuralPrimitiveFieldScheduler {
     ) -> Result<PageInfoAndScheduler> {
         let scheduler: Box<dyn StructuralPageScheduler> =
             match page_info.encoding.as_structural().layout.as_ref() {
-                Some(pb::page_layout::Layout::MiniBlockLayout(mini_block)) => {
+                Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) => {
                     Box::new(MiniBlockScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
@@ -2817,7 +2820,7 @@ impl StructuralPrimitiveFieldScheduler {
                         decompressors,
                     )?)
                 }
-                Some(pb::page_layout::Layout::FullZipLayout(full_zip)) => {
+                Some(pb21::page_layout::Layout::FullZipLayout(full_zip)) => {
                     let mut scheduler = FullZipScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
@@ -2828,11 +2831,11 @@ impl StructuralPrimitiveFieldScheduler {
                     scheduler.enable_cache = cache_repetition_index;
                     Box::new(scheduler)
                 }
-                Some(pb::page_layout::Layout::AllNullLayout(all_null)) => {
+                Some(pb21::page_layout::Layout::AllNullLayout(all_null)) => {
                     let def_meaning = all_null
                         .layers
                         .iter()
-                        .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+                        .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
                         .collect::<Vec<_>>();
                     if def_meaning.len() == 1
                         && def_meaning[0] == DefinitionInterpretation::NullableItem
@@ -3139,7 +3142,7 @@ struct CompressedLevelsChunk {
 
 struct CompressedLevels {
     data: Vec<CompressedLevelsChunk>,
-    compression: pb::ArrayEncoding,
+    compression: CompressiveEncoding,
     rep_index: Option<LanceBuffer>,
 }
 
@@ -3494,7 +3497,7 @@ impl PrimitiveStructuralEncoder {
         num_rows: u64,
         row_number: u64,
     ) -> Result<EncodedPage> {
-        let description = ProtobufUtils::simple_all_null_layout();
+        let description = ProtobufUtils21::simple_all_null_layout();
         Ok(EncodedPage {
             column_idx,
             data: vec![],
@@ -3528,7 +3531,7 @@ impl PrimitiveStructuralEncoder {
             LanceBuffer::empty()
         };
 
-        let description = ProtobufUtils::all_null_layout(&repdef.def_meaning);
+        let description = ProtobufUtils21::all_null_layout(&repdef.def_meaning);
         Ok(EncodedPage {
             column_idx,
             data: vec![rep_bytes, def_bytes],
@@ -3629,7 +3632,7 @@ impl PrimitiveStructuralEncoder {
                 data.push(rep_index);
             }
 
-            let description = ProtobufUtils::miniblock_layout(
+            let description = ProtobufUtils21::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -3647,7 +3650,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
             })
         } else {
-            let description = ProtobufUtils::miniblock_layout(
+            let description = ProtobufUtils21::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -3899,7 +3902,7 @@ impl PrimitiveStructuralEncoder {
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
         let description = match &compressed_data {
-            PerValueDataBlock::Fixed(fixed) => ProtobufUtils::fixed_full_zip_layout(
+            PerValueDataBlock::Fixed(fixed) => ProtobufUtils21::fixed_full_zip_layout(
                 bits_rep,
                 bits_def,
                 fixed.bits_per_value as u32,
@@ -3908,7 +3911,7 @@ impl PrimitiveStructuralEncoder {
                 num_items as u32,
                 num_visible_items as u32,
             ),
-            PerValueDataBlock::Variable(variable) => ProtobufUtils::variable_full_zip_layout(
+            PerValueDataBlock::Variable(variable) => ProtobufUtils21::variable_full_zip_layout(
                 bits_rep,
                 bits_def,
                 variable.bits_per_offset as u32,

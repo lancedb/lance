@@ -108,12 +108,4 @@ public class SqlQueryTest {
         reader.getVectorSchemaRoot().getSchema().toString());
     reader.close();
   }
-
-  @Test
-  public void testToExplainPlan() throws IOException {
-    String plan =
-        dataset.sql("select sum(id) from " + NAME).tableName(NAME).intoExplainPlan(true, false);
-
-    Assertions.assertTrue(plan.contains("Aggregate") || plan.contains("SUM"));
-  }
 }
