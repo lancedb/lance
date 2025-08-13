@@ -834,6 +834,7 @@ mod tests {
         let training_request = Box::new(TrainingRequest::new(
             Arc::new(dataset),
             "values".to_string(),
+            true,
         ));
 
         // Test scan_aligned_chunks with different chunk sizes
