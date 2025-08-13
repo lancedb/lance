@@ -126,18 +126,6 @@ pub fn get_index_params(
     env: &mut JNIEnv,
     index_params_obj: JObject,
 ) -> Result<Box<dyn IndexParams>> {
-    let distance_type_obj: JString = env
-        .call_method(
-            &index_params_obj,
-            "getDistanceType",
-            "()Ljava/lang/String;",
-            &[],
-        )?
-        .l()?
-        .into();
-    let distance_type_str: String = env.get_string(&distance_type_obj)?.into();
-    let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
-
     let vector_index_params_option_object = env
         .call_method(
             index_params_obj,
@@ -159,6 +147,18 @@ pub fn get_index_params(
                 &[],
             )?
             .l()?;
+
+        let distance_type_obj: JString = env
+            .call_method(
+                &vector_index_params_obj,
+                "getDistanceType",
+                "()Ljava/lang/String;",
+                &[],
+            )?
+            .l()?
+            .into();
+        let distance_type_str: String = env.get_string(&distance_type_obj)?.into();
+        let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
 
         let ivf_params_obj = env
             .call_method(
