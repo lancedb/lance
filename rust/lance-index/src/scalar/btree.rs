@@ -822,7 +822,7 @@ impl BTreeIndex {
         let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
+        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
         // to search for X IN [5, 3]
         match subindex.search(query, metrics).await? {
             SearchResult::Exact(map) => Ok(map),

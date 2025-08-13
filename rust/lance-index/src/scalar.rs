@@ -36,6 +36,7 @@ pub mod inverted;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
+pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
@@ -48,6 +49,7 @@ pub enum ScalarIndexType {
     Bitmap,
     LabelList,
     NGram,
+    ZoneMap,
     Inverted,
 }
 
@@ -60,6 +62,7 @@ impl TryFrom<IndexType> for ScalarIndexType {
             IndexType::Bitmap => Ok(Self::Bitmap),
             IndexType::LabelList => Ok(Self::LabelList),
             IndexType::NGram => Ok(Self::NGram),
+            IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
             _ => Err(Error::InvalidInput {
                 source: format!("Index type {:?} is not a scalar index", value).into(),
@@ -76,6 +79,7 @@ impl From<ScalarIndexType> for IndexType {
             ScalarIndexType::Bitmap => Self::Bitmap,
             ScalarIndexType::LabelList => Self::LabelList,
             ScalarIndexType::NGram => Self::NGram,
+            ScalarIndexType::ZoneMap => Self::ZoneMap,
             ScalarIndexType::Inverted => Self::Inverted,
         }
     }
@@ -107,6 +111,7 @@ impl IndexParams for ScalarIndexParams {
             Some(ScalarIndexType::LabelList) => IndexType::LabelList,
             Some(ScalarIndexType::Inverted) => IndexType::Inverted,
             Some(ScalarIndexType::NGram) => IndexType::NGram,
+            Some(ScalarIndexType::ZoneMap) => IndexType::ZoneMap,
         }
     }
 
