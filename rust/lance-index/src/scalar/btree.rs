@@ -15,6 +15,7 @@ use super::{
     SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::frag_reuse::FragReuseIndex;
+use crate::metrics::NoOpMetricsCollector;
 use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
@@ -954,33 +955,21 @@ impl Index for BTreeIndex {
         let reader = LazyIndexReader::new(self.store.clone());
         let reader = reader.get().await?;
         let num_rows = reader.num_rows();
-        let all_pages = reader.read_range(0..reader.num_rows(), None).await?;
-
         let batch_size = self.batch_size as usize;
         let num_pages = num_rows.div_ceil(batch_size);
-        let mut pages = stream::iter(0..num_pages)
+        stream::iter(0..num_pages)
             .map(|page_idx| {
-                let sub_index = self.sub_index.clone();
-                let offset = page_idx * batch_size;
-                let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
-                let page = all_pages.slice(offset, end - offset);
+                let index_reader = LazyIndexReader::new(self.store.clone());
                 async move {
-                    let sub_idx = sub_index.load_subindex(page).await?;
-                    Result::Ok((page_idx as u32, sub_idx))
+                    self.lookup_page(page_idx as u32, index_reader, &NoOpMetricsCollector)
+                        .await?;
+                    Result::Ok(())
                 }
             })
-            .buffer_unordered(get_num_compute_intensive_cpus());
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        while let Some((page_idx, sub_idx)) = pages.try_next().await? {
-            self.index_cache
-                .insert_with_key(
-                    &BTreePageKey {
-                        page_number: page_idx,
-                    },
-                    Arc::new(CachedScalarIndex::new(sub_idx)),
-                )
-                .await;
-        }
         Ok(())
     }
 
