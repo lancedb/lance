@@ -2056,26 +2056,26 @@ impl Dataset {
     /// ```
     /// # use lance::{Dataset, Result};
     /// # use lance::dataset::transaction::UpdateMapEntry;
-    /// # async fn test_update_schema_metadata(dataset: &mut Dataset) -> Result<()> {
+    /// # async fn test_update_field_metadata(dataset: &mut Dataset) -> Result<()> {
     /// // Update metadata by field path
     /// dataset.update_field_metadata()
-    ///     .update("path.to_field", [("key", "value")])
+    ///     .update("path.to_field", [("key", "value")])?
     ///     .await?;
     ///
     /// // Update metadata by field id
     /// dataset.update_field_metadata()
-    ///     .update(12, [("key", "value")])
+    ///     .update(12, [("key", "value")])?
     ///     .await?;
     ///
     /// // Clear field metadata
     /// dataset.update_field_metadata()
-    ///     .replace("path.to_field", [] as [UpdateMapEntry; 0])
-    ///     .replace(12, [] as [UpdateMapEntry; 0])
+    ///     .replace("path.to_field", [] as [UpdateMapEntry; 0])?
+    ///     .replace(12, [] as [UpdateMapEntry; 0])?
     ///     .await?;
     ///
     /// // Replace field metadata
     /// dataset.update_field_metadata()
-    ///     .replace("field_name", [("k1", "v1"), ("k2", "v2")])
+    ///     .replace("field_name", [("k1", "v1"), ("k2", "v2")])?
     ///     .await?;
     /// # Ok(())
     /// # }
