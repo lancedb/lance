@@ -1045,16 +1045,14 @@ class LanceDataset(pa.dataset.Dataset):
         >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
         >>> dataset = lance.write_dataset(data, "memory://test_metadata")
         >>> # Incremental update (add/update specific keys)
-        >>> result = dataset.update_metadata(
+        >>> dataset.update_metadata(
         ...     {"author": "John", "version": "1.2"}) # doctest: +ELLIPSIS
         {...}
-        >>>
         >>> # Remove a key (incremental mode only)
         >>> dataset.update_metadata({"old_key": None}) # doctest: +ELLIPSIS
         {...}
-        >>>
         >>> # Full replacement (replaces all metadata)
-        >>> result = dataset.update_metadata(
+        >>> dataset.update_metadata(
         ...     {"author": "John"}, replace=True) # doctest: +ELLIPSIS
         {...}
         """
@@ -1085,16 +1083,14 @@ class LanceDataset(pa.dataset.Dataset):
         >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
         >>> dataset = lance.write_dataset(data, "memory://test_config")
         >>> # Incremental update (add/update specific keys)
-        >>> result = dataset.update_config(
+        >>> dataset.update_config(
         ...     {"batch_size": "1000", "compression": "zstd"}) # doctest: +ELLIPSIS
         {...}
-        >>>
         >>> # Remove a key (incremental mode only)
-        >>> dataset.update_config({"old_setting": None}) # doctest: +ELLIPSIS
+        >>> dataset.update_config({"batch_size": None}) # doctest: +ELLIPSIS
         {...}
-        >>>
         >>> # Full replacement (replaces all config)
-        >>> result = dataset.update_config(
+        >>> dataset.update_config(
         ...     {"batch_size": "1000"}, replace=True) # doctest: +ELLIPSIS
         {...}
         """
@@ -1125,16 +1121,14 @@ class LanceDataset(pa.dataset.Dataset):
         >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
         >>> dataset = lance.write_dataset(data, "memory://test_schema")
         >>> # Incremental update (add/update specific keys)
-        >>> result = dataset.update_schema_metadata(
+        >>> dataset.update_schema_metadata(
         ...     {"encoding": "utf-8", "created_by": "lance"}) # doctest: +ELLIPSIS
         {...}
-        >>>
         >>> # Remove a key (incremental mode only)
-        >>> dataset.update_schema_metadata({"temp_key": None}) # doctest: +ELLIPSIS
+        >>> dataset.update_schema_metadata({"encoding": None}) # doctest: +ELLIPSIS
         {...}
-        >>>
         >>> # Full replacement (replaces all schema metadata)
-        >>> result = dataset.update_schema_metadata(
+        >>> dataset.update_schema_metadata(
         ...     {"encoding": "utf-8"}, replace=True) # doctest: +ELLIPSIS
         {...}
         """
