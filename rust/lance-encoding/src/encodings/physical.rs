@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod binary;
-pub mod bitpack;
+pub mod bitpacking;
 pub mod block;
 pub mod byte_stream_split;
 pub mod constant;
