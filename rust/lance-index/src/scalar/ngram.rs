@@ -1604,7 +1604,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_ngram_index_with_spill() {
-        let (data, schema) = lance_datagen::gen()
+        let (data, schema) = lance_datagen::gen_batch()
             .col(
                 "values",
                 lance_datagen::array::rand_utf8(ByteCount::from(50), false),

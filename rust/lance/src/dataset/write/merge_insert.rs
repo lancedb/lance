@@ -2257,7 +2257,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -2272,7 +2272,7 @@ mod tests {
             .unwrap();
 
         // Create some new (unindexed) data
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(2))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -2298,7 +2298,7 @@ mod tests {
             .await
             .unwrap();
         let some_indices = some_indices.column(0).clone();
-        let some_vals = lance_datagen::gen()
+        let some_vals = lance_datagen::gen_batch()
             .anon_col(array::fill::<UInt32Type>(9999999))
             .into_batch_rows(RowCount::from(2048))
             .unwrap();
@@ -2384,7 +2384,7 @@ mod tests {
         }
 
         async fn setup(scalar_index: bool) -> Fixtures {
-            let data = lance_datagen::gen()
+            let data = lance_datagen::gen_batch()
                 .with_seed(Seed::from(1))
                 .col("other", array::rand_utf8(4.into(), false))
                 .col("value", array::step::<UInt32Type>())
@@ -2874,7 +2874,7 @@ mod tests {
     #[tokio::test]
     async fn test_merge_insert_updates_indices() {
         let test_dataset = async || {
-            let mut dataset = lance_datagen::gen()
+            let mut dataset = lance_datagen::gen_batch()
                 .col("id", array::step::<UInt32Type>())
                 .col("value", array::step::<UInt32Type>())
                 .col("other_value", array::step::<UInt32Type>())
@@ -2969,7 +2969,7 @@ mod tests {
 
         let (dataset, _) = merge_insert
             .execute_reader(
-                lance_datagen::gen()
+                lance_datagen::gen_batch()
                     .col("id", array::step_custom::<UInt32Type>(50, 1))
                     .col("value", array::step_custom::<UInt32Type>(50, 1))
                     .col("other_value", array::step_custom::<UInt32Type>(50, 1))
@@ -2997,7 +2997,7 @@ mod tests {
 
         let (dataset, _) = merge_insert
             .execute_reader(
-                lance_datagen::gen()
+                lance_datagen::gen_batch()
                     .col("id", array::step_custom::<UInt32Type>(50, 1))
                     .col("value", array::step_custom::<UInt32Type>(50, 1))
                     .into_df_stream(RowCount::from(40), BatchCount::from(1)),
@@ -3029,7 +3029,7 @@ mod tests {
 
         let (dataset, _) = merge_insert
             .execute_reader(
-                lance_datagen::gen()
+                lance_datagen::gen_batch()
                     .col("id", array::step_custom::<UInt32Type>(10, 1))
                     .col("value", array::step_custom::<UInt32Type>(10, 1))
                     .into_df_stream(RowCount::from(80), BatchCount::from(1)),
@@ -3132,7 +3132,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_upsert() {
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -3151,7 +3151,7 @@ mod tests {
                 .unwrap();
 
         // Create new data for upsert
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .with_seed(Seed::from(2))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -3184,7 +3184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fast_path_update_only() {
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -3203,7 +3203,7 @@ mod tests {
                 .unwrap();
 
         // Create new data for update
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .with_seed(Seed::from(2))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -3230,7 +3230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fast_path_conditional_update() {
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -3251,7 +3251,7 @@ mod tests {
         .unwrap();
 
         // Create new data for conditional update
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .with_seed(Seed::from(2))
             .col("value", array::step::<UInt32Type>())
             .col("key", array::rand_pseudo_uuid_hex());
@@ -3283,7 +3283,7 @@ mod tests {
         let dataset_path = dataset_uri.to_str().unwrap();
 
         // Create initial dataset with auto cleanup interval of 1 version
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
             .col("id", array::step::<UInt32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
@@ -3316,7 +3316,7 @@ mod tests {
         clock.set_system_time(chrono::Duration::seconds(2));
 
         // First merge insert WITHOUT skip_auto_cleanup - should trigger cleanup
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .with_seed(Seed::from(2))
             .col("id", array::step::<UInt32Type>())
             .into_df_stream(RowCount::from(50), BatchCount::from(1));
@@ -3337,7 +3337,7 @@ mod tests {
         clock.set_system_time(chrono::Duration::seconds(3));
 
         // Need to do another merge insert for cleanup to take effect since cleanup runs on the old dataset
-        let new_data_extra = lance_datagen::gen()
+        let new_data_extra = lance_datagen::gen_batch()
             .with_seed(Seed::from(4))
             .col("id", array::step::<UInt32Type>())
             .into_df_stream(RowCount::from(10), BatchCount::from(1));
@@ -3373,7 +3373,7 @@ mod tests {
         clock.set_system_time(chrono::Duration::seconds(4));
 
         // Second merge insert WITH skip_auto_cleanup - should NOT trigger cleanup
-        let new_data2 = lance_datagen::gen()
+        let new_data2 = lance_datagen::gen_batch()
             .with_seed(Seed::from(3))
             .col("id", array::step::<UInt32Type>())
             .into_df_stream(RowCount::from(30), BatchCount::from(1));
@@ -3409,7 +3409,7 @@ mod tests {
     #[tokio::test]
     async fn test_explain_plan() {
         // Set up test data using lance_datagen
-        let dataset = lance_datagen::gen()
+        let dataset = lance_datagen::gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .col("name", array::cycle_utf8_literals(&["a", "b", "c"]))
             .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
@@ -3455,7 +3455,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_analyze_plan() {
         // Set up test data using lance_datagen
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .col("name", array::cycle_utf8_literals(&["a", "b", "c"]))
             .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))

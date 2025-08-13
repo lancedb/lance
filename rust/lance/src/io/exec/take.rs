@@ -928,7 +928,7 @@ mod tests {
         let fixture = NoContextTestFixture::new();
         let arc_dasaset = Arc::new(fixture.dataset);
 
-        let input = lance_datagen::gen()
+        let input = lance_datagen::gen_batch()
             .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(50), BatchCount::from(2));
 

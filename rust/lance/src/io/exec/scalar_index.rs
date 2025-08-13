@@ -9,9 +9,8 @@ use crate::{
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
 };
-use arrow::array::BinaryBuilder;
-use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
@@ -42,7 +41,10 @@ use lance_datafusion::{
 use lance_index::{
     metrics::MetricsCollector,
     scalar::{
-        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
+        expression::{
+            IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch,
+            INDEX_EXPR_RESULT_SCHEMA,
+        },
         SargableQuery, ScalarIndex,
     },
     DatasetIndexExt, ScalarIndexCriteria,
@@ -51,19 +53,6 @@ use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{debug_span, instrument};
-
-/// When we evaluate a scalar index query we return a batch with three columns and two rows
-///
-/// The first column has the block list and allow list
-/// The second column tells if the result is least/exact/more (we repeat the discriminant twice)
-/// The third column has the fragments covered bitmap in the first row and null in the second row
-pub static SCALAR_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new("result".to_string(), DataType::Binary, true),
-        Field::new("discriminant".to_string(), DataType::UInt32, true),
-        Field::new("fragments_covered".to_string(), DataType::Binary, true),
-    ]))
-});
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
@@ -116,7 +105,7 @@ impl DisplayAs for ScalarIndexExec {
 impl ScalarIndexExec {
     pub fn new(dataset: Arc<Dataset>, expr: ScalarIndexExpr) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(SCALAR_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(INDEX_EXPR_RESULT_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -160,33 +149,6 @@ impl ScalarIndexExec {
         }
     }
 
-    #[instrument(skip_all)]
-    fn serialize_to_arrow(
-        query_result: IndexExprResult,
-        fragments_covered_by_result: RoaringBitmap,
-    ) -> Result<RecordBatch> {
-        let row_id_mask = query_result.row_id_mask();
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
-        let discriminant = query_result.discriminant();
-        let discriminant_arr =
-            Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
-        let mut fragments_covered_builder = BinaryBuilder::new();
-        let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
-        let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
-        fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
-        fragments_covered_builder.append_value(fragments_covered_bytes);
-        fragments_covered_builder.append_null();
-        let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
-        Ok(RecordBatch::try_new(
-            SCALAR_INDEX_SCHEMA.clone(),
-            vec![
-                Arc::new(row_id_mask_arr),
-                Arc::new(discriminant_arr),
-                Arc::new(fragments_covered_arr),
-            ],
-        )?)
-    }
-
     async fn do_execute(
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
@@ -203,7 +165,7 @@ impl ScalarIndexExec {
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
-            Self::serialize_to_arrow(query_result, fragments_covered_by_result)
+            query_result.serialize_to_arrow(&fragments_covered_by_result)
         }
     }
 }
@@ -218,7 +180,7 @@ impl ExecutionPlan for ScalarIndexExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        SCALAR_INDEX_SCHEMA.clone()
+        INDEX_EXPR_RESULT_SCHEMA.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -253,7 +215,7 @@ impl ExecutionPlan for ScalarIndexExec {
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            SCALAR_INDEX_SCHEMA.clone(),
+            INDEX_EXPR_RESULT_SCHEMA.clone(),
             stream,
             partition,
             &self.metrics,
@@ -263,7 +225,7 @@ impl ExecutionPlan for ScalarIndexExec {
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
             num_rows: Precision::Exact(2),
-            ..Statistics::new_unknown(&SCALAR_INDEX_SCHEMA)
+            ..Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
         })
     }
 
@@ -805,7 +767,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_datagen::gen;
+    use lance_datagen::gen_batch;
     use lance_index::{
         scalar::{
             expression::{ScalarIndexExpr, ScalarIndexSearch},
@@ -832,7 +794,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut dataset = gen()
+        let mut dataset = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())
             .into_dataset(
                 test_uri,

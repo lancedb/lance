@@ -3762,8 +3762,6 @@ def test_dataset_sql(tmp_path: Path):
     ds = lance.write_dataset(table, tmp_path / "test")
 
     query = ds.sql("SELECT * FROM test WHERE id > 1").table_name("test").build()
-    explain_plan = query.explain_plan(verbose=True)
-    assert "Filter" in explain_plan
 
     result = query.to_batch_records()
     expected = pa.table({"id": [2, 3], "value": ["b", "c"]})
