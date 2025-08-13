@@ -365,7 +365,7 @@ impl StructuralEncodingStrategy {
         root_field_metadata: &HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>> {
         let data_type = field.data_type();
-        
+
         // Check if field is marked as blob
         if field.is_blob() {
             match data_type {
@@ -382,13 +382,14 @@ impl StructuralEncodingStrategy {
                         source: format!(
                             "Blob encoding only supports Binary/LargeBinary, got {}",
                             data_type
-                        ).into(),
+                        )
+                        .into(),
                         location: location!(),
                     });
                 }
             }
         }
-        
+
         if Self::is_primitive_type(&data_type) {
             Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                 options,
