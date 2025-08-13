@@ -29,17 +29,19 @@ pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
 
 impl RowIdIndex {
     /// Create a new index from a list of fragment ids and their corresponding row id sequences.
-    pub fn new(fragment_indices: &[(u32, Arc<RowIdSequence>)]) -> Result<Self> {
+    pub fn new(
+        fragment_indices: &[(u32, Arc<RowIdSequence>)],
+        uses_stable_row_ids: bool,
+    ) -> Result<Self> {
         let mut pieces = fragment_indices
             .iter()
             .flat_map(|(fragment_id, sequence)| decompose_sequence(*fragment_id, sequence))
             .collect::<Vec<_>>();
         pieces.sort_by_key(|(range, _)| *range.start());
 
-        // Check for overlapping ranges and if found, return a NotImplementedError.
-        // We don't expect this pattern yet until we make row ids stable after
-        // updates.
-        if pieces.windows(2).any(|w| w[0].0.end() >= w[1].0.start()) {
+        // If users stable row ids, check for overlapping ranges and if found,
+        // return a NotImplementedError.
+        if !uses_stable_row_ids && pieces.windows(2).any(|w| w[0].0.end() >= w[1].0.start()) {
             return Err(Error::NotSupported {
                 source: "Overlapping ranges are not yet supported".into(),
                 location: location!(),
@@ -124,7 +126,7 @@ mod tests {
             ),
         ];
 
-        let index = RowIdIndex::new(&fragment_indices).unwrap();
+        let index = RowIdIndex::new(&fragment_indices, false).unwrap();
 
         // Check various queries.
         assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
