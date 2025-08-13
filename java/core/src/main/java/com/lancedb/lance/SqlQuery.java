@@ -65,19 +65,4 @@ public class SqlQuery {
       boolean withRowAddr,
       long streamAddress)
       throws IOException;
-
-  public String intoExplainPlan(boolean verbose, boolean analyze) throws IOException {
-    return intoExplainPlan(
-        dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, verbose, analyze);
-  }
-
-  private static native String intoExplainPlan(
-      Dataset dataset,
-      String sql,
-      Optional<String> tableName,
-      boolean withRowId,
-      boolean withRowAddr,
-      boolean verbose,
-      boolean analyze)
-      throws IOException;
 }

@@ -17,6 +17,8 @@ pub use error::{ArrowResult, Error, Result};
 pub const ROW_ID: &str = "_rowid";
 /// Column name for the meta row address.
 pub const ROW_ADDR: &str = "_rowaddr";
+/// Column name for the meta row offset.
+pub const ROW_OFFSET: &str = "_rowoffset";
 
 /// Row ID field. This is nullable because its validity bitmap is sometimes used
 /// as a selection vector.
@@ -26,3 +28,7 @@ pub static ROW_ID_FIELD: LazyLock<ArrowField> =
 /// as a selection vector.
 pub static ROW_ADDR_FIELD: LazyLock<ArrowField> =
     LazyLock::new(|| ArrowField::new(ROW_ADDR, DataType::UInt64, true));
+/// Row offset field. This is nullable merely for compatibility with the other
+/// fields.
+pub static ROW_OFFSET_FIELD: LazyLock<ArrowField> =
+    LazyLock::new(|| ArrowField::new(ROW_OFFSET, DataType::UInt64, true));

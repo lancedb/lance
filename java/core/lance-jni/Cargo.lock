@@ -3248,6 +3248,7 @@ version = "0.33.0"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "chrono",
  "env_logger",
  "jni",
  "lance",
@@ -3260,8 +3261,12 @@ dependencies = [
  "lance-linalg",
  "log",
  "object_store",
+ "prost",
+ "prost-types",
+ "roaring",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

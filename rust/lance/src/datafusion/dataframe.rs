@@ -261,7 +261,7 @@ pub mod tests {
     pub async fn test_table_provider() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(

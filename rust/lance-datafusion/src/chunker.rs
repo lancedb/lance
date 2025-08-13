@@ -314,7 +314,7 @@ mod tests {
         ]));
 
         let make_batch = |num_rows: u32| {
-            lance_datagen::gen()
+            lance_datagen::gen_batch()
                 .anon_col(lance_datagen::array::step::<Int32Type>())
                 .into_batch_rows(RowCount::from(num_rows as u64))
                 .unwrap()
@@ -371,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_strict_batch_size_stream() {
-        let batches = lance_datagen::gen()
+        let batches = lance_datagen::gen_batch()
             .anon_col(array::step::<Int32Type>())
             .anon_col(array::step::<Int64Type>())
             .into_df_stream(RowCount::from(7), BatchCount::from(10));

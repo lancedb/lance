@@ -960,7 +960,7 @@ mod tests {
         // Write 1MiB of data
         const DATA_SIZE: u64 = 1024 * 1024;
         let mut some_data = vec![0; DATA_SIZE as usize];
-        rand::thread_rng().fill_bytes(&mut some_data);
+        rand::rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
         let config = SchedulerConfig::default_for_testing();
@@ -1010,7 +1010,7 @@ mod tests {
         // Write 75MiB of data
         const DATA_SIZE: u64 = 75 * 1024 * 1024;
         let mut some_data = vec![0; DATA_SIZE as usize];
-        rand::thread_rng().fill_bytes(&mut some_data);
+        rand::rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
         let config = SchedulerConfig::default_for_testing();

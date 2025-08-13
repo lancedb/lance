@@ -60,7 +60,7 @@ pub async fn write_deletion_file(
     let deletion_file = match removed_rows {
         DeletionVector::NoDeletions => None,
         DeletionVector::Set(set) => {
-            let id = rand::thread_rng().gen::<u64>();
+            let id = rand::rng().random::<u64>();
             let deletion_file = DeletionFile {
                 read_version,
                 id,
@@ -97,7 +97,7 @@ pub async fn write_deletion_file(
             Some(deletion_file)
         }
         DeletionVector::Bitmap(bitmap) => {
-            let id = rand::thread_rng().gen::<u64>();
+            let id = rand::rng().random::<u64>();
             let deletion_file = DeletionFile {
                 read_version,
                 id,

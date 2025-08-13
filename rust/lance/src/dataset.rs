@@ -48,15 +48,17 @@ use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use take::row_indices_to_row_addresses;
+use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
 pub mod builder;
 pub mod cleanup;
+mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
@@ -81,6 +83,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -622,6 +625,48 @@ impl Dataset {
         &self.manifest_location
     }
 
+    async fn validate_compared_version(&self, compared_version: u64) -> Result<()> {
+        if compared_version < 1 {
+            return Err(Error::invalid_input(
+                format!("Compared version must be > 0 (got {})", compared_version),
+                Default::default(),
+            ));
+        }
+
+        let current = self.version().version;
+        if current == compared_version {
+            return Err(Error::invalid_input(
+                "Compared version cannot equal to the current version",
+                Default::default(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn build_dataset_delta(&self, compared_version: u64) -> Result<DatasetDelta> {
+        let current_version = self.version().version;
+
+        let (begin_version, end_version) = if current_version > compared_version {
+            (compared_version, current_version)
+        } else {
+            (current_version, compared_version)
+        };
+
+        Ok(DatasetDelta {
+            begin_version,
+            end_version,
+            base_dataset: self.clone(),
+        })
+    }
+
+    /// Diff with a specified version and return a list of transactions between (begin_version, end_version].
+    pub async fn diff_meta(&self, compared_version: u64) -> Result<Vec<Transaction>> {
+        self.validate_compared_version(compared_version).await?;
+        let ds_delta = self.build_dataset_delta(compared_version).await?;
+        ds_delta.list_transactions().await
+    }
+
     // TODO: Cache this
     pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
         if let Some(blobs_version) = self.manifest.blob_dataset_version {
@@ -1090,7 +1135,7 @@ impl Dataset {
         row_indices: &[u64],
         column: impl AsRef<str>,
     ) -> Result<Vec<BlobFile>> {
-        let row_addrs = row_indices_to_row_addresses(self, row_indices).await?;
+        let row_addrs = row_offsets_to_row_addresses(self, row_indices).await?;
         blob::take_blobs(self, &row_addrs, column.as_ref()).await
     }
 
@@ -1110,7 +1155,7 @@ impl Dataset {
     pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows(None).await?;
-        let ids = (0..num_rows as u64).choose_multiple(&mut rand::thread_rng(), n);
+        let ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
         self.take(&ids, projection.clone()).await
     }
 
@@ -1574,7 +1619,7 @@ impl Dataset {
     /// # use lance_table::io::commit::ManifestNamingScheme;
     /// # use lance_datagen::{array, RowCount, BatchCount};
     /// # use arrow_array::types::Int32Type;
-    /// # let data = lance_datagen::gen()
+    /// # let data = lance_datagen::gen_batch()
     /// #  .col("key", array::step::<Int32Type>())
     /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     /// # let fut = async {
@@ -2087,7 +2132,7 @@ mod tests {
         cast::as_string_array,
         types::{Float32Type, Int32Type},
         ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
-        Int8DictionaryArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
+        Int8DictionaryArray, ListArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
     use arrow_array::{
         Array, FixedSizeListArray, GenericStringArray, Int16Array, Int16DictionaryArray,
@@ -2099,7 +2144,7 @@ mod tests {
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
-    use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::{
@@ -3253,7 +3298,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen().col("int", array::step::<Int32Type>());
+        let data = gen_batch().col("int", array::step::<Int32Type>());
         // Write 64Ki rows.  We should get 16 4Ki pages
         let mut dataset = Dataset::write(
             data.into_reader_rows(RowCount::from(16 * 1024), BatchCount::from(4)),
@@ -3545,7 +3590,7 @@ mod tests {
     #[tokio::test]
     async fn test_v2_manifest_path_create() {
         // Can create a dataset, using V2 paths
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
             .into_batch_rows(RowCount::from(10))
             .unwrap();
@@ -3793,7 +3838,7 @@ mod tests {
         // This test also tests "null filling" when merging (e.g. when keys do not match
         // we need to insert nulls)
 
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
             .col("value", array::fill_utf8("value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
@@ -3817,7 +3862,7 @@ mod tests {
         assert_eq!(dataset.fragments().len(), 10);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(9));
 
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .col("key2", array::step_custom::<Int32Type>(500, 1))
             .col("new_value", array::fill_utf8("new_value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
@@ -3834,7 +3879,7 @@ mod tests {
     ) {
         // Tests a merge on _rowid
 
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
             .col("value", array::fill_utf8("value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
@@ -3868,7 +3913,7 @@ mod tests {
         let len = new_value.len() as u32;
         let new_batch = RecordBatch::try_new(new_schema.clone(), vec![row_ids, new_value]).unwrap();
         // shuffle new_batch
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut indices: Vec<u32> = (0..len).collect();
         indices.shuffle(&mut rng);
         let indices = arrow_array::UInt32Array::from_iter_values(indices);
@@ -3896,7 +3941,7 @@ mod tests {
     ) {
         // Tests a merge on _rowaddr
 
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
             .col("value", array::fill_utf8("value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
@@ -3937,7 +3982,7 @@ mod tests {
         let new_batch =
             RecordBatch::try_new(new_schema.clone(), vec![row_addrs, new_value]).unwrap();
         // shuffle new_batch
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut indices: Vec<u32> = (0..len).collect();
         indices.shuffle(&mut rng);
         let indices = arrow_array::UInt32Array::from_iter_values(indices);
@@ -4352,7 +4397,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen().col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)));
+        let data = gen_batch().col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)));
         let reader = data.into_reader_rows(RowCount::from(1000), BatchCount::from(10));
         let mut dataset = Dataset::write(
             reader,
@@ -5844,10 +5889,10 @@ mod tests {
         let mut full_text_count = 0;
         let mut doc_array = (0..4096)
             .map(|_| {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut text = String::with_capacity(4);
-                for _ in 0..rng.gen_range(127..512) {
-                    text.push_str(words[rng.gen_range(0..words.len())]);
+                for _ in 0..rng.random_range(127..512) {
+                    text.push_str(words[rng.random_range(0..words.len())]);
                 }
                 if text.contains("lance search") {
                     lance_search_count += 1;
@@ -6766,7 +6811,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .into_batch_rows(RowCount::from(20))
             .unwrap();
@@ -6871,7 +6916,7 @@ mod tests {
         let tmp_dir = tempdir().unwrap();
         let test_uri = tmp_dir.path().to_str().unwrap();
 
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("key", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(10), BatchCount::from(1));
         let mut dataset = Dataset::write(data, test_uri, None).await.unwrap();
@@ -7029,7 +7074,7 @@ mod tests {
         let test_uri_str = test_uri.to_str().unwrap();
 
         // Create initial dataset with aggressive auto cleanup (interval=1, older_than=1ms)
-        let data = gen()
+        let data = gen_batch()
             .col("id", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
 
@@ -7054,7 +7099,7 @@ mod tests {
         clock.set_system_time(chrono::Duration::seconds(2));
 
         // First append WITHOUT skip_auto_cleanup - should trigger cleanup
-        let data1 = gen()
+        let data1 = gen_batch()
             .col("id", array::step::<Int32Type>())
             .into_df_stream(RowCount::from(50), BatchCount::from(1));
 
@@ -7076,7 +7121,7 @@ mod tests {
         clock.set_system_time(chrono::Duration::seconds(3));
 
         // Need to do another commit for cleanup to take effect since cleanup runs on the old dataset
-        let data1_extra = gen()
+        let data1_extra = gen_batch()
             .col("id", array::step::<Int32Type>())
             .into_df_stream(RowCount::from(10), BatchCount::from(1));
 
@@ -7103,7 +7148,7 @@ mod tests {
         clock.set_system_time(chrono::Duration::seconds(4));
 
         // Second append WITH skip_auto_cleanup - should NOT trigger cleanup
-        let data2 = gen()
+        let data2 = gen_batch()
             .col("id", array::step::<Int32Type>())
             .into_df_stream(RowCount::from(30), BatchCount::from(1));
 
@@ -7220,5 +7265,154 @@ mod tests {
             read_inner_struct.null_count(),
             "Null count should be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn test_issue_4429_nested_struct_encoding_v2_1_with_over_65k_structs() {
+        // Regression test for miniblock 16KB limit with nested struct patterns
+        // Tests encoding behavior when a nested struct<list<struct>> contains
+        // large amounts of data that exceeds miniblock encoding limits
+
+        let test_dir = tempdir().unwrap();
+
+        // Create a struct with multiple fields that will trigger miniblock encoding
+        // Each field is 4 bytes, making the struct narrow enough for miniblock
+        let measurement_fields = vec![
+            ArrowField::new("val_a", DataType::Float32, true),
+            ArrowField::new("val_b", DataType::Float32, true),
+            ArrowField::new("val_c", DataType::Float32, true),
+            ArrowField::new("val_d", DataType::Float32, true),
+            ArrowField::new("seq_high", DataType::Int32, true),
+            ArrowField::new("seq_low", DataType::Int32, true),
+        ];
+        let measurement_type = DataType::Struct(measurement_fields.clone().into());
+
+        // Create nested schema: struct<measurements: list<struct>>
+        // This pattern can trigger encoding issues with large data volumes
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            DataType::Struct(
+                vec![ArrowField::new(
+                    "measurements",
+                    DataType::List(Arc::new(ArrowField::new(
+                        "item",
+                        measurement_type.clone(),
+                        true,
+                    ))),
+                    true,
+                )]
+                .into(),
+            ),
+            true,
+        )]));
+
+        // Create large number of measurements that will exceed encoding limits
+        // Using 70,520 to match the exact problematic size
+        const NUM_MEASUREMENTS: usize = 70_520;
+
+        // Generate data for two full sets (rows 0 and 2 will have data, row 1 empty)
+        const TOTAL_MEASUREMENTS: usize = NUM_MEASUREMENTS * 2;
+
+        // Create arrays with realistic values
+        let val_a_array = Float32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(16.66 + (i as f32 * 0.0001))),
+        );
+        let val_b_array = Float32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(-3.54 + (i as f32 * 0.0002))),
+        );
+        let val_c_array = Float32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(2.94 + (i as f32 * 0.0001))),
+        );
+        let val_d_array =
+            Float32Array::from_iter((0..TOTAL_MEASUREMENTS).map(|i| Some(((i % 50) + 10) as f32)));
+        let seq_high_array =
+            Int32Array::from_iter((0..TOTAL_MEASUREMENTS).map(|_| Some(1736962329)));
+        let seq_low_array = Int32Array::from_iter(
+            (0..TOTAL_MEASUREMENTS).map(|i| Some(304403000 + (i * 1000) as i32)),
+        );
+
+        // Create the struct array with all measurements
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("val_a", DataType::Float32, true)),
+                Arc::new(val_a_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("val_b", DataType::Float32, true)),
+                Arc::new(val_b_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("val_c", DataType::Float32, true)),
+                Arc::new(val_c_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("val_d", DataType::Float32, true)),
+                Arc::new(val_d_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("seq_high", DataType::Int32, true)),
+                Arc::new(seq_high_array) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("seq_low", DataType::Int32, true)),
+                Arc::new(seq_low_array) as ArrayRef,
+            ),
+        ]);
+
+        // Create list array with pattern: [70520 items, 0 items, 70520 items]
+        // This pattern triggers the issue with V2.1 encoding
+        let offsets = vec![
+            0i32,
+            NUM_MEASUREMENTS as i32,       // End of row 0
+            NUM_MEASUREMENTS as i32,       // End of row 1 (empty)
+            (NUM_MEASUREMENTS * 2) as i32, // End of row 2
+        ];
+        let list_array = ListArray::try_new(
+            Arc::new(ArrowField::new("item", measurement_type, true)),
+            arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(offsets)),
+            Arc::new(struct_array) as ArrayRef,
+            None,
+        )
+        .unwrap();
+
+        // Create the outer struct wrapping the list
+        let data_struct = StructArray::from(vec![(
+            Arc::new(ArrowField::new(
+                "measurements",
+                DataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(measurement_fields.into()),
+                    true,
+                ))),
+                true,
+            )),
+            Arc::new(list_array) as ArrayRef,
+        )]);
+
+        // Create the final record batch with 3 rows
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data_struct) as ArrayRef]).unwrap();
+
+        assert_eq!(batch.num_rows(), 3, "Should have exactly 3 rows");
+
+        let test_uri = test_dir.path().to_str().unwrap().to_string();
+
+        // Test with V2.1 format which has different encoding behavior
+        let batches = vec![batch];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        // V2.1 format triggers miniblock encoding for narrow structs
+        let write_params = WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+
+        // Write dataset - this will panic with miniblock 16KB assertion
+        let dataset = Dataset::write(reader, &test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
     }
 }

@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use jni::objects::{JIntArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::JNIEnv;
@@ -148,6 +137,9 @@ where
 }
 
 pub fn import_vec<'local>(env: &mut JNIEnv<'local>, obj: &JObject) -> Result<Vec<JObject<'local>>> {
+    if obj.is_null() {
+        return Ok(Vec::new());
+    }
     let size = env.call_method(obj, "size", "()I", &[])?.i()?;
     let mut ret = Vec::with_capacity(size as usize);
     for i in 0..size {
@@ -174,6 +166,12 @@ impl IntoJava for JLance<usize> {
 }
 
 impl IntoJava for JLance<i64> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        Ok(env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(self.0)])?)
+    }
+}
+
+impl IntoJava for &JLance<i64> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(self.0)])?)
     }

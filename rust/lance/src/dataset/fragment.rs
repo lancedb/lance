@@ -2381,7 +2381,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen, RowCount};
+    use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams};
     use pretty_assertions::assert_eq;
@@ -3426,7 +3426,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let make_gen = || {
-            gen()
+            gen_batch()
                 .col("str", array::rand_type(&DataType::Utf8))
                 .col("int", array::rand_type(&DataType::Int32))
         };

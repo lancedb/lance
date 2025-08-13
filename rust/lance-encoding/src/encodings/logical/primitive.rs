@@ -12,9 +12,15 @@ use std::{
     vec,
 };
 
-use crate::constants::{
-    DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-    STRUCTURAL_ENCODING_MINIBLOCK,
+use crate::{
+    constants::{
+        DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        STRUCTURAL_ENCODING_MINIBLOCK,
+    },
+    format::{
+        pb21::{self, compressive_encoding::Compression, CompressiveEncoding},
+        ProtobufUtils21,
+    },
 };
 use arrow::array::AsArray;
 use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
@@ -70,7 +76,6 @@ use crate::{
     encoder::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
     },
-    format::{pb, ProtobufUtils},
     repdef::{LevelBuffer, RepDefBuilder, RepDefUnraveler},
     EncodingsIo,
 };
@@ -1017,31 +1022,62 @@ impl DeepSizeOf for MiniBlockRepIndex {
 }
 
 impl MiniBlockRepIndex {
-    fn decode(rep_index: &[Vec<u64>]) -> Self {
-        let mut chunk_has_preamble = false;
-        let mut offset = 0;
-        let mut blocks = Vec::with_capacity(rep_index.len());
-        for chunk_rep in rep_index {
-            let ends_count = chunk_rep[0];
-            let partial_count = chunk_rep[1];
+    /// Decode repetition index from chunk metadata using default values.
+    ///
+    /// This creates a repetition index where each chunk has no partial values
+    /// and no trailers, suitable for simple sequential data layouts.
+    pub fn default_from_chunks(chunks: &[ChunkMeta]) -> Self {
+        let mut blocks = Vec::with_capacity(chunks.len());
+        let mut offset: u64 = 0;
 
-            let chunk_has_trailer = partial_count > 0;
-            let mut starts_including_trailer = ends_count;
-            if chunk_has_trailer {
-                starts_including_trailer += 1;
-            }
-            if chunk_has_preamble {
-                starts_including_trailer -= 1;
-            }
+        for c in chunks {
+            blocks.push(MiniBlockRepIndexBlock {
+                first_row: offset,
+                starts_including_trailer: c.num_values,
+                has_preamble: false,
+                has_trailer: false,
+            });
+
+            offset += c.num_values;
+        }
+
+        Self { blocks }
+    }
+
+    /// Decode repetition index from raw bytes in little-endian format.
+    ///
+    /// The bytes should contain u64 values arranged in groups of `stride` elements,
+    /// where the first two values of each group represent ends_count and partial_count.
+    /// Returns an empty index if no bytes are provided.
+    pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
+        // Convert bytes to u64 slice, handling alignment automatically
+        let mut buffer = crate::buffer::LanceBuffer::from(rep_bytes.to_vec());
+        let u64_slice = buffer.borrow_to_typed_slice::<u64>();
+        let n = u64_slice.len() / stride;
+
+        let mut blocks = Vec::with_capacity(n);
+        let mut chunk_has_preamble = false;
+        let mut offset: u64 = 0;
+
+        // Extract first two values from each block: ends_count and partial_count
+        for i in 0..n {
+            let base_idx = i * stride;
+            let ends = u64_slice[base_idx];
+            let partial = u64_slice[base_idx + 1];
+
+            let has_trailer = partial > 0;
+            // Convert branches to arithmetic for better compiler optimization
+            let starts_including_trailer =
+                ends + (has_trailer as u64) - (chunk_has_preamble as u64);
 
             blocks.push(MiniBlockRepIndexBlock {
                 first_row: offset,
                 starts_including_trailer,
                 has_preamble: chunk_has_preamble,
-                has_trailer: chunk_has_trailer,
+                has_trailer,
             });
 
-            chunk_has_preamble = chunk_has_trailer;
+            chunk_has_preamble = has_trailer;
             offset += starts_including_trailer;
         }
 
@@ -1125,7 +1161,7 @@ impl MiniBlockScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
-        layout: &pb::MiniBlockLayout,
+        layout: &pb21::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let rep_decompressor = layout
@@ -1149,7 +1185,7 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
@@ -1158,18 +1194,16 @@ impl MiniBlockScheduler {
 
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             let num_dictionary_items = layout.num_dictionary_items;
-            match dictionary_encoding.array_encoding.as_ref().unwrap() {
-                pb::array_encoding::ArrayEncoding::Variable(_) => {
-                    Some(MiniBlockSchedulerDictionary {
-                        dictionary_decompressor: decompressors
-                            .create_block_decompressor(dictionary_encoding)?
-                            .into(),
-                        dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                        dictionary_data_alignment: 4,
-                        num_dictionary_items,
-                    })
-                }
-                pb::array_encoding::ArrayEncoding::Flat(_) => Some(MiniBlockSchedulerDictionary {
+            match dictionary_encoding.compression.as_ref().unwrap() {
+                Compression::Variable(_) => Some(MiniBlockSchedulerDictionary {
+                    dictionary_decompressor: decompressors
+                        .create_block_decompressor(dictionary_encoding)?
+                        .into(),
+                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                    dictionary_data_alignment: 4,
+                    num_dictionary_items,
+                }),
+                Compression::Flat(_) => Some(MiniBlockSchedulerDictionary {
                     dictionary_decompressor: decompressors
                         .create_block_decompressor(dictionary_encoding)?
                         .into(),
@@ -1524,29 +1558,16 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
             // Build the repetition index
             let rep_index = if let Some(rep_index_data) = rep_index_bytes {
-                // If we have a repetition index then we use that
-                // TODO: Compress the repetition index :)
                 assert!(rep_index_data.len() % 8 == 0);
-                let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
-                let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
-                // Unflatten
-                repetition_index_vals
-                    .as_ref()
-                    .chunks_exact(self.repetition_index_depth as usize + 1)
-                    .map(|c| c.to_vec())
-                    .collect::<Vec<_>>()
+                let stride = self.repetition_index_depth as usize + 1;
+                MiniBlockRepIndex::decode_from_bytes(&rep_index_data, stride)
             } else {
-                // Default rep index is just the number of items in each chunk
-                // with 0 partials/leftovers
-                chunk_meta
-                    .iter()
-                    .map(|c| vec![c.num_values, 0])
-                    .collect::<Vec<_>>()
+                MiniBlockRepIndex::default_from_chunks(&chunk_meta)
             };
 
             let mut page_meta = MiniBlockCacheableState {
                 chunk_meta,
-                rep_index: MiniBlockRepIndex::decode(&rep_index),
+                rep_index,
                 dictionary: None,
             };
 
@@ -1698,7 +1719,7 @@ impl FullZipScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         rows_in_page: u64,
-        layout: &pb::FullZipLayout,
+        layout: &pb21::FullZipLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         // We don't need the data_buf_size because either the data type is
@@ -1722,13 +1743,13 @@ impl FullZipScheduler {
         });
 
         let value_decompressor = match layout.details {
-            Some(pb::full_zip_layout::Details::BitsPerValue(_)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => {
                 let decompressor = decompressors.create_fixed_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
                 PerValueDecompressor::Fixed(decompressor.into())
             }
-            Some(pb::full_zip_layout::Details::BitsPerOffset(_)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerOffset(_)) => {
                 let decompressor = decompressors.create_variable_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
@@ -1745,7 +1766,7 @@ impl FullZipScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
@@ -1756,8 +1777,8 @@ impl FullZipScheduler {
             .sum();
 
         let bits_per_offset = match layout.details {
-            Some(pb::full_zip_layout::Details::BitsPerValue(_)) => 32,
-            Some(pb::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => 32,
+            Some(pb21::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
                 bits_per_offset as u8
             }
             None => panic!("Full-zip layout must have a `details` field"),
@@ -2790,7 +2811,7 @@ impl StructuralPrimitiveFieldScheduler {
     ) -> Result<PageInfoAndScheduler> {
         let scheduler: Box<dyn StructuralPageScheduler> =
             match page_info.encoding.as_structural().layout.as_ref() {
-                Some(pb::page_layout::Layout::MiniBlockLayout(mini_block)) => {
+                Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) => {
                     Box::new(MiniBlockScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
@@ -2799,7 +2820,7 @@ impl StructuralPrimitiveFieldScheduler {
                         decompressors,
                     )?)
                 }
-                Some(pb::page_layout::Layout::FullZipLayout(full_zip)) => {
+                Some(pb21::page_layout::Layout::FullZipLayout(full_zip)) => {
                     let mut scheduler = FullZipScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
@@ -2810,11 +2831,11 @@ impl StructuralPrimitiveFieldScheduler {
                     scheduler.enable_cache = cache_repetition_index;
                     Box::new(scheduler)
                 }
-                Some(pb::page_layout::Layout::AllNullLayout(all_null)) => {
+                Some(pb21::page_layout::Layout::AllNullLayout(all_null)) => {
                     let def_meaning = all_null
                         .layers
                         .iter()
-                        .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+                        .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
                         .collect::<Vec<_>>();
                     if def_meaning.len() == 1
                         && def_meaning[0] == DefinitionInterpretation::NullableItem
@@ -3121,7 +3142,7 @@ struct CompressedLevelsChunk {
 
 struct CompressedLevels {
     data: Vec<CompressedLevelsChunk>,
-    compression: pb::ArrayEncoding,
+    compression: CompressiveEncoding,
     rep_index: Option<LanceBuffer>,
 }
 
@@ -3476,7 +3497,7 @@ impl PrimitiveStructuralEncoder {
         num_rows: u64,
         row_number: u64,
     ) -> Result<EncodedPage> {
-        let description = ProtobufUtils::simple_all_null_layout();
+        let description = ProtobufUtils21::simple_all_null_layout();
         Ok(EncodedPage {
             column_idx,
             data: vec![],
@@ -3510,7 +3531,7 @@ impl PrimitiveStructuralEncoder {
             LanceBuffer::empty()
         };
 
-        let description = ProtobufUtils::all_null_layout(&repdef.def_meaning);
+        let description = ProtobufUtils21::all_null_layout(&repdef.def_meaning);
         Ok(EncodedPage {
             column_idx,
             data: vec![rep_bytes, def_bytes],
@@ -3611,7 +3632,7 @@ impl PrimitiveStructuralEncoder {
                 data.push(rep_index);
             }
 
-            let description = ProtobufUtils::miniblock_layout(
+            let description = ProtobufUtils21::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -3629,7 +3650,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
             })
         } else {
-            let description = ProtobufUtils::miniblock_layout(
+            let description = ProtobufUtils21::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -3881,7 +3902,7 @@ impl PrimitiveStructuralEncoder {
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
         let description = match &compressed_data {
-            PerValueDataBlock::Fixed(fixed) => ProtobufUtils::fixed_full_zip_layout(
+            PerValueDataBlock::Fixed(fixed) => ProtobufUtils21::fixed_full_zip_layout(
                 bits_rep,
                 bits_def,
                 fixed.bits_per_value as u32,
@@ -3890,7 +3911,7 @@ impl PrimitiveStructuralEncoder {
                 num_items as u32,
                 num_visible_items as u32,
             ),
-            PerValueDataBlock::Variable(variable) => ProtobufUtils::variable_full_zip_layout(
+            PerValueDataBlock::Variable(variable) => ProtobufUtils21::variable_full_zip_layout(
                 bits_rep,
                 bits_def,
                 variable.bits_per_offset as u32,
@@ -4641,8 +4662,10 @@ mod tests {
 
     #[test]
     fn test_schedule_instructions() {
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
 
         let check = |user_ranges, expected_instructions| {
             let instructions =
@@ -4795,8 +4818,10 @@ mod tests {
             drain_instructions
         }
 
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![1..7, 10..14];
 
         // First, schedule the ranges
@@ -4879,8 +4904,9 @@ mod tests {
         );
 
         // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
-        let repetition_index = vec![vec![5, 2], vec![3, 3], vec![20, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        let rep_data: Vec<u64> = vec![5, 2, 3, 3, 20, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![0..28];
 
         // First, schedule the ranges
