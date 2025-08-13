@@ -28,6 +28,8 @@ pub struct Index {
 
     /// The fragment ids this index covers.
     ///
+    /// This may contain fragment ids that no longer exist in the dataset.
+    ///
     /// If this is None, then this is unknown.
     pub fragment_bitmap: Option<RoaringBitmap>,
 
@@ -45,6 +47,16 @@ pub struct Index {
     /// This field is optional for backward compatibility. For existing indices created before
     /// this field was added, this will be None.
     pub created_at: Option<DateTime<Utc>>,
+}
+
+impl Index {
+    pub fn effective_fragment_bitmap(
+        &self,
+        existing_fragments: &RoaringBitmap,
+    ) -> Option<RoaringBitmap> {
+        let fragment_bitmap = self.fragment_bitmap.as_ref()?;
+        Some(fragment_bitmap & existing_fragments)
+    }
 }
 
 impl DeepSizeOf for Index {

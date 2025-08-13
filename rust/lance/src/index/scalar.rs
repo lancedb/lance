@@ -51,6 +51,7 @@ const TRAINING_UPDATE_FREQ: usize = 1000000;
 pub(crate) struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
+    train: bool,
 }
 
 #[async_trait]
@@ -59,6 +60,9 @@ impl TrainingSource for TrainingRequest {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
+        if !self.train {
+            return self.create_empty_stream().await;
+        }
         self.scan_chunks(chunk_size, true).await
     }
 
@@ -66,13 +70,44 @@ impl TrainingSource for TrainingRequest {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
+        if !self.train {
+            return self.create_empty_stream().await;
+        }
         self.scan_chunks(chunk_size, false).await
     }
 }
 
 impl TrainingRequest {
-    pub fn new(dataset: Arc<Dataset>, column: String) -> Self {
-        Self { dataset, column }
+    pub fn new(dataset: Arc<Dataset>, column: String, train: bool) -> Self {
+        Self {
+            dataset,
+            column,
+            train,
+        }
+    }
+
+    async fn create_empty_stream(&self) -> Result<SendableRecordBatchStream> {
+        let column_field =
+            self.dataset
+                .schema()
+                .field(&self.column)
+                .ok_or(Error::InvalidInput {
+                    source: format!("No column with name {}", self.column).into(),
+                    location: location!(),
+                })?;
+
+        // Create schema with the column and row_id field (matching scan_chunks behavior)
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(&self.column, column_field.data_type(), true),
+            arrow_schema::Field::new("_rowid", arrow_schema::DataType::UInt64, false),
+        ]));
+
+        // Create empty stream
+        let empty_stream = futures::stream::empty();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            empty_stream,
+        )))
     }
 
     async fn scan_chunks(
@@ -257,10 +292,12 @@ pub(super) async fn build_scalar_index(
     column: &str,
     uuid: &str,
     params: &ScalarIndexParams,
+    train: bool,
 ) -> Result<prost_types::Any> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
+        train,
     });
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -345,10 +382,12 @@ pub(super) async fn build_inverted_index(
     column: &str,
     uuid: &str,
     params: &InvertedIndexParams,
+    train: bool,
 ) -> Result<()> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
+        train,
     });
     let index_store = LanceIndexStore::from_dataset(dataset, uuid);
     train_inverted_index(training_request, &index_store, params.clone()).await
