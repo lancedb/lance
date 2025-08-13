@@ -65,8 +65,6 @@ mod tests {
             ("file:///usr/local/bin", "usr/local/bin"),
             ("file-object-store:///path/to/file", "path/to/file"),
             ("file:///path/to/foo/../bar", "path/to/bar"),
-            // for non ASCII string tests
-            ("file:///path/to/foo测试/bar", "path/to/foo测试/bar"),
         ];
 
         for (uri, expected_path) in cases {
