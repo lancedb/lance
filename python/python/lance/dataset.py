@@ -1040,14 +1040,23 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_metadata")
         >>> # Incremental update (add/update specific keys)
-        >>> dataset.update_metadata({"author": "John", "version": "1.2"})
+        >>> result = dataset.update_metadata(
+        ...     {"author": "John", "version": "1.2"}) # doctest: +ELLIPSIS
+        {...}
         >>>
         >>> # Remove a key (incremental mode only)
-        >>> dataset.update_metadata({"old_key": None})
+        >>> dataset.update_metadata({"old_key": None}) # doctest: +ELLIPSIS
+        {...}
         >>>
         >>> # Full replacement (replaces all metadata)
-        >>> dataset.update_metadata({"author": "John"}, replace=True)
+        >>> result = dataset.update_metadata(
+        ...     {"author": "John"}, replace=True) # doctest: +ELLIPSIS
+        {...}
         """
         return self._ds.update_metadata(values, replace=replace)
 
@@ -1071,14 +1080,23 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_config")
         >>> # Incremental update (add/update specific keys)
-        >>> dataset.update_config({"batch_size": "1000", "compression": "zstd"})
+        >>> result = dataset.update_config(
+        ...     {"batch_size": "1000", "compression": "zstd"}) # doctest: +ELLIPSIS
+        {...}
         >>>
         >>> # Remove a key (incremental mode only)
-        >>> dataset.update_config({"old_setting": None})
+        >>> dataset.update_config({"old_setting": None}) # doctest: +ELLIPSIS
+        {...}
         >>>
         >>> # Full replacement (replaces all config)
-        >>> dataset.update_config({"batch_size": "1000"}, replace=True)
+        >>> result = dataset.update_config(
+        ...     {"batch_size": "1000"}, replace=True) # doctest: +ELLIPSIS
+        {...}
         """
         return self._ds.update_config(values, replace=replace)
 
@@ -1102,14 +1120,23 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_schema")
         >>> # Incremental update (add/update specific keys)
-        >>> dataset.update_schema_metadata({"encoding": "utf-8", "created_by": "lance"})
+        >>> result = dataset.update_schema_metadata(
+        ...     {"encoding": "utf-8", "created_by": "lance"}) # doctest: +ELLIPSIS
+        {...}
         >>>
         >>> # Remove a key (incremental mode only)
-        >>> dataset.update_schema_metadata({"temp_key": None})
+        >>> dataset.update_schema_metadata({"temp_key": None}) # doctest: +ELLIPSIS
+        {...}
         >>>
         >>> # Full replacement (replaces all schema metadata)
-        >>> dataset.update_schema_metadata({"encoding": "utf-8"}, replace=True)
+        >>> result = dataset.update_schema_metadata(
+        ...     {"encoding": "utf-8"}, replace=True) # doctest: +ELLIPSIS
+        {...}
         """
         return self._ds.update_schema_metadata(values, replace=replace)
 
@@ -1138,6 +1165,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3]), pa.array(['a', 'b', 'c'])],
+        ...                names=['user_id', 'user_name'])
+        >>> dataset = lance.write_dataset(data, "memory://test_field")
         >>> # Incremental update for multiple fields
         >>> dataset.update_field_metadata({
         ...     "user_id": {"description": "User ID", "nullable": "false"},

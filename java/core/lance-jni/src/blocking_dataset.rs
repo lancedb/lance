@@ -257,21 +257,6 @@ impl BlockingDataset {
         Ok(transaction)
     }
 
-    pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
-        let values: HashMap<String, Option<String>> =
-            metadata.into_iter().map(|(k, v)| (k, Some(v))).collect();
-        RT.block_on(async { self.inner.update_schema_metadata(values).replace().await })?;
-        Ok(())
-    }
-
-    pub fn replace_field_metadata(
-        &mut self,
-        metadata_map: HashMap<u32, HashMap<String, String>>,
-    ) -> Result<()> {
-        RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
-        Ok(())
-    }
-
     // Unified metadata APIs
 
     pub fn get_table_metadata(&self) -> Result<HashMap<String, String>> {
