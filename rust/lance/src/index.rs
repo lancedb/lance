@@ -1353,8 +1353,7 @@ impl DatasetIndexInternalExt for Dataset {
                 ),
                 location: location!(),
             })?;
-            let index_type =
-                detect_scalar_index_type(self, index, &field.name, self.session.as_ref()).await?;
+            let index_type = detect_scalar_index_type(self, index, &field.name).await?;
 
             let query_parser = match field.data_type() {
                 DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))

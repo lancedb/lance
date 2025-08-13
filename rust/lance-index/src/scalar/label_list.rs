@@ -328,6 +328,14 @@ impl TrainingSource for UnnestTrainingSource {
         let source = self.source.scan_unordered_chunks(chunk_size).await?;
         unnest_chunks(source)
     }
+
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        let source = self.source.scan_aligned_chunks(chunk_size).await?;
+        unnest_chunks(source)
+    }
 }
 
 fn unnest_chunks(

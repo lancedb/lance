@@ -1288,6 +1288,19 @@ pub trait TrainingSource: Send {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream>;
+
+    /// Returns a stream of batches, ordered by the row_address (in ascending order)
+    ///
+    /// Each batch should have chunk_size rows
+    ///
+    /// The schema for the batch is slightly flexible.
+    /// The first column may have any name or type, these are the values to index
+    /// The second column must be the fragment id which must be UInt32Type
+    /// The third column must be the row address which must be UInt64Type
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
@@ -1400,6 +1413,14 @@ impl TrainingSource for BTreeUpdater {
         _chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
         // BTree indices will never use unordered scans
+        unimplemented!()
+    }
+
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        // BTree indices will never use aligned scans
         unimplemented!()
     }
 }
