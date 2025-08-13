@@ -59,6 +59,26 @@ impl<'a> ScalarIndexCriteria<'a> {
 // Extends Lance Dataset with secondary index.
 #[async_trait]
 pub trait DatasetIndexExt {
+    type IndexBuilder<'a>
+    where
+        Self: 'a;
+
+    /// Create a builder for creating an index on columns.
+    ///
+    /// This returns a builder that can be configured with additional options
+    /// like `name()`, `replace()`, and `train()` before awaiting to execute.
+    ///
+    /// # Parameters
+    /// - `columns`: the columns to build the indices on.
+    /// - `index_type`: specify [`IndexType`].
+    /// - `params`: index parameters.
+    fn create_index_builder<'a>(
+        &'a mut self,
+        columns: &'a [&'a str],
+        index_type: IndexType,
+        params: &'a dyn IndexParams,
+    ) -> Self::IndexBuilder<'a>;
+
     /// Create indices on columns.
     ///
     /// Upon finish, a new dataset version is generated.
