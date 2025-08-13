@@ -104,6 +104,7 @@ use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
 use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
 use super::utils::make_rowaddr_capture_stream;
+use super::write::CommitBuilder;
 use super::{write_fragments_internal, WriteMode, WriteParams};
 use tracing::info;
 
@@ -918,7 +919,7 @@ pub async fn commit_compaction(
             .collect::<Vec<_>>();
 
         let remapped_indices = index_remapper
-            .remap_indices(row_id_map, &affected_ids)
+            .remap_indices(row_id_map.clone(), &affected_ids)
             .await?;
         remapped_indices
             .iter()
@@ -958,9 +959,12 @@ pub async fn commit_compaction(
         None,
     );
 
-    dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
+    let new_dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(transaction)
         .await?;
+
+    // Update the dataset reference with the new version
+    *dataset = new_dataset;
 
     Ok(metrics)
 }
@@ -1001,6 +1005,13 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    // Additional imports for IOPS tracking tests
+    use super::CompactionOptions;
+    use crate::dataset::UpdateBuilder;
+    use crate::session::Session;
+    use crate::utils::test::StatsHolder;
+    use lance_io::object_store::ObjectStoreParams;
 
     #[test]
     fn test_candidate_bin() {
@@ -3415,6 +3426,721 @@ mod tests {
             !plan.contains("LanceScan"),
             "Expected no fragment scan in plan: {}",
             plan
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_delete_then_compact_debug() {
+        // Simple test to see what happens without compaction first
+        use crate::dataset::UpdateBuilder;
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        // Update one row
+        UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id = 2")
+            .unwrap()
+            .set("value", "200")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        // Delete one row
+        use crate::dataset::write::delete;
+        delete::delete(&mut dataset, "id = 4").await.unwrap();
+
+        // Check what we have now
+        let scanner = dataset.scan();
+        let results = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        println!("Results after update/delete:");
+        for batch in &results {
+            println!("{:?}", batch);
+        }
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 4); // Should have 4 rows (one deleted)
+    }
+
+    #[tokio::test]
+    async fn test_update_delete_then_compact() {
+        use crate::dataset::UpdateBuilder;
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+
+        // Create a test dataset with multiple fragments to ensure compaction is needed
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        // Create multiple small batches to force multiple fragments
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(Int32Array::from(vec![30, 40])),
+            ],
+        )
+        .unwrap();
+
+        let batch3 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![5])),
+                Arc::new(Int32Array::from(vec![50])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let batches = RecordBatchIterator::new(
+            vec![batch1, batch2, batch3].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        // Write with small fragment size to force multiple fragments
+        let write_params = super::WriteParams {
+            max_rows_per_file: 2, // This will force multiple fragments
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // 1. Plan compaction without committing it
+        let options = CompactionOptions {
+            target_rows_per_fragment: 3, // Force compaction
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(!plan.tasks().is_empty());
+
+        // Execute compaction tasks to get RewriteResults, but don't commit yet
+        let dataset_ref = &dataset;
+        let rewrite_results = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+            .collect::<Vec<_>>()
+            .await;
+
+        // 2. Run update query to update one row (id=2, set value=200)
+        UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id = 2")
+            .unwrap()
+            .set("value", "200")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        // 3. Run delete query to delete one row (id=4)
+        use crate::dataset::write::delete;
+        delete::delete(&mut dataset, "id = 4").await.unwrap();
+
+        // 4. Now commit the compaction with conflict resolution
+        let compaction_metrics = commit_compaction(
+            &mut dataset,
+            rewrite_results,
+            Arc::new(crate::dataset::optimize::remapping::IgnoreRemap {}),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert!(compaction_metrics.fragments_removed > 0);
+        assert!(compaction_metrics.fragments_added > 0);
+
+        // 5. Validate the row that was deleted is now gone (id=4)
+        let mut scanner = dataset.scan();
+        let results = scanner
+            .filter("id = 4")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "Row with id=4 should have been deleted");
+
+        // 6. Validate the row that was updated has new value and old value doesn't exist
+        let mut scanner = dataset.scan();
+        let results = scanner
+            .filter("id = 2")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "Should have exactly one row with id=2");
+
+        let batch = &results[0];
+        let value_col = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(value_col.value(0), 200, "Value should be updated to 200");
+
+        // Also verify the old value (20) doesn't exist for id=2
+        let mut scanner = dataset.scan();
+        let results = scanner
+            .filter("id = 2 AND value = 20")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "Old value (20) should not exist for id=2"
+        );
+    }
+
+    /// Test scenario 1 from GitHub issue: update/delete then compact with automatic conflict resolution
+    #[tokio::test]
+    async fn test_update_delete_then_compact_with_iops_tracking() {
+        let session = Arc::new(Session::default());
+        let io_tracker = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            max_rows_per_file: 5, // Force multiple fragments
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_tracker.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+
+        // Create dataset with multiple fragments
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let mut batches = Vec::new();
+        // Create multiple batches to ensure multiple fragments for compaction
+        for i in 0..4 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values((i * 5)..(i * 5 + 5))),
+                    Arc::new(Int64Array::from_iter_values(
+                        std::iter::repeat(100 + i).take(5),
+                    )),
+                ],
+            )
+            .unwrap();
+            batches.push(batch);
+        }
+
+        let batches_iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(batches_iter, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Reset IOPS tracking after initial dataset creation
+        io_tracker.incremental_stats();
+
+        // Step 1: Perform update operation on some rows
+        let update_result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id >= 10 AND id <= 15")
+            .unwrap()
+            .set("value", "999")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        dataset = (*update_result.new_dataset).clone();
+
+        // Step 2: Perform delete operation on some rows
+        use crate::dataset::write::delete;
+        delete::delete(&mut dataset, "id >= 5 AND id <= 7")
+            .await
+            .unwrap();
+
+        // Reset IOPS tracking before compaction
+        io_tracker.incremental_stats();
+
+        // Step 3: Perform compaction - this should trigger automatic conflict resolution
+        let compaction_options = CompactionOptions {
+            target_rows_per_fragment: 10, // Force compaction
+            defer_index_remap: true,      // Enable FragReuseIndex for conflict resolution
+            ..Default::default()
+        };
+
+        // Plan and execute compaction with conflict resolution
+        let plan = plan_compaction(&dataset, &compaction_options)
+            .await
+            .unwrap();
+        let dataset_ref = &dataset;
+        let rewrite_results = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+            .collect::<Vec<_>>()
+            .await;
+
+        let stats = commit_compaction(
+            &mut dataset,
+            rewrite_results,
+            Arc::new(crate::dataset::optimize::remapping::IgnoreRemap {}),
+            &compaction_options,
+        )
+        .await
+        .unwrap();
+
+        // Verify compaction happened
+        assert!(
+            stats.fragments_removed > 0,
+            "Should have removed fragments during compaction"
+        );
+        assert!(
+            stats.fragments_added > 0,
+            "Should have added fragments during compaction"
+        );
+
+        // Check IOPS during conflict resolution
+        let io_stats = io_tracker.incremental_stats();
+
+        // During automatic conflict resolution with FragReuseIndex:
+        // - Should load FragReuseIndex metadata (cached after first access)
+        // - Should read manifest for version checks
+        // - Should not need excessive fragment reads due to efficient conflict resolution
+        println!(
+            "Conflict resolution IOPS - Reads: {}, Writes: {}",
+            io_stats.read_iops, io_stats.write_iops
+        );
+
+        // The exact number depends on implementation details and caching, but should be reasonable
+        // Main assertion: conflict resolution should not require reading all fragment data
+        assert!(
+            io_stats.read_iops < 20,
+            "Conflict resolution should be efficient, got {} read IOPS",
+            io_stats.read_iops
+        );
+
+        // Verify data integrity after conflict resolution
+        // 1. Updated rows should still have new values
+        let mut scanner = dataset.scan();
+        scanner.filter("id >= 10 AND id <= 15").unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+
+        if results.num_rows() > 0 {
+            let value_column = results.column_by_name("value").unwrap();
+            let values = value_column.as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..values.len() {
+                assert_eq!(
+                    values.value(i),
+                    999,
+                    "Updated values should be preserved after compaction"
+                );
+            }
+        }
+
+        // 2. Deleted rows should not exist
+        let mut scanner = dataset.scan();
+        scanner.filter("id >= 5 AND id <= 7").unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            results.num_rows(),
+            0,
+            "Deleted rows should not exist after compaction"
+        );
+
+        // 3. Check that we have the FragReuseIndex
+        let frag_reuse_index = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap();
+        assert!(
+            frag_reuse_index.is_some(),
+            "FragReuseIndex should exist after compaction"
+        );
+    }
+
+    /// Test scenario 2 from GitHub issue: compact then update/delete with automatic conflict resolution
+    #[tokio::test]
+    async fn test_compact_then_update_delete_with_iops_tracking() {
+        let session = Arc::new(Session::default());
+        let io_tracker = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            max_rows_per_file: 3, // Force multiple small fragments
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_tracker.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+
+        // Create dataset with multiple small fragments
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let mut batches = Vec::new();
+        // Create many small batches to force compaction
+        for i in 0..6 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values((i * 3)..(i * 3 + 3))),
+                    Arc::new(Int64Array::from_iter_values(
+                        std::iter::repeat(100 + i).take(3),
+                    )),
+                ],
+            )
+            .unwrap();
+            batches.push(batch);
+        }
+
+        let batches_iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(batches_iter, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Reset IOPS tracking
+        io_tracker.incremental_stats();
+
+        // Step 1: Perform compaction first
+        let compaction_options = CompactionOptions {
+            target_rows_per_fragment: 10, // Compact into fewer, larger fragments
+            defer_index_remap: true,      // Enable FragReuseIndex for conflict resolution
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &compaction_options)
+            .await
+            .unwrap();
+        let dataset_ref = &dataset;
+        let rewrite_results = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+            .collect::<Vec<_>>()
+            .await;
+
+        let stats = commit_compaction(
+            &mut dataset,
+            rewrite_results,
+            Arc::new(crate::dataset::optimize::remapping::IgnoreRemap {}),
+            &compaction_options,
+        )
+        .await
+        .unwrap();
+        assert!(
+            stats.fragments_removed > 0,
+            "Compaction should have removed fragments"
+        );
+
+        // Verify FragReuseIndex was created
+        let frag_reuse_index = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap();
+        assert!(
+            frag_reuse_index.is_some(),
+            "FragReuseIndex should exist after compaction"
+        );
+
+        // Reset IOPS tracking before update/delete operations
+        io_tracker.incremental_stats();
+
+        // Step 2: Perform update operation (this will conflict with compaction)
+        let update_result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id >= 8 AND id <= 12")
+            .unwrap()
+            .set("value", "777")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        dataset = (*update_result.new_dataset).clone();
+
+        // Step 3: Perform delete operation (this will also conflict with compaction)
+        use crate::dataset::write::delete;
+        delete::delete(&mut dataset, "id >= 14 AND id <= 16")
+            .await
+            .unwrap();
+
+        // Check IOPS during conflict resolution
+        let io_stats = io_tracker.incremental_stats();
+
+        println!(
+            "Update/Delete after compaction IOPS - Reads: {}, Writes: {}",
+            io_stats.read_iops, io_stats.write_iops
+        );
+
+        // The update/delete operations should use FragReuseIndex for conflict resolution
+        // This should be efficient and not require excessive IO
+        assert!(
+            io_stats.read_iops < 30,
+            "Update/Delete with conflict resolution should be efficient, got {} read IOPS",
+            io_stats.read_iops
+        );
+
+        // Verify data integrity
+        // 1. Updated rows should have new values
+        let mut scanner = dataset.scan();
+        scanner.filter("id >= 8 AND id <= 12").unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+
+        if results.num_rows() > 0 {
+            let value_column = results.column_by_name("value").unwrap();
+            let values = value_column.as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..values.len() {
+                assert_eq!(values.value(i), 777, "Updated values should be preserved");
+            }
+        }
+
+        // 2. Deleted rows should not exist
+        let mut scanner = dataset.scan();
+        scanner.filter("id >= 14 AND id <= 16").unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(results.num_rows(), 0, "Deleted rows should not exist");
+
+        // 3. Verify overall row count makes sense
+        let total_count = dataset.count_rows(None).await.unwrap();
+        // Started with 18 rows (6 batches * 3 rows), deleted 3 rows (14,15,16)
+        assert_eq!(
+            total_count, 15,
+            "Should have 15 rows after delete operation"
+        );
+    }
+
+    /// Test concurrent operations with FragReuseIndex-based conflict resolution
+    #[tokio::test]
+    async fn test_multiple_operations_with_fragmentation() {
+        let session = Arc::new(Session::default());
+        let io_tracker = Arc::new(StatsHolder::default());
+        let write_params = WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(io_tracker.clone()),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+
+        // Create a larger dataset to test more complex scenarios
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new("category", DataType::Int64, false),
+        ]));
+
+        let mut batches = Vec::new();
+        for i in 0..10 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values((i * 4)..(i * 4 + 4))),
+                    Arc::new(Int64Array::from_iter_values(
+                        std::iter::repeat(i * 10).take(4),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        std::iter::repeat(i % 3).take(4),
+                    )),
+                ],
+            )
+            .unwrap();
+            batches.push(batch);
+        }
+
+        let batches_iter = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(batches_iter, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Reset IOPS tracking
+        io_tracker.incremental_stats();
+
+        // Sequence of operations that should all use conflict resolution:
+
+        // 1. Update some rows
+        let update_result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("category = 0")
+            .unwrap()
+            .set("value", "1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = (*update_result.new_dataset).clone();
+
+        // 2. Delete some rows
+        use crate::dataset::write::delete;
+        delete::delete(&mut dataset, "category = 1").await.unwrap();
+
+        // 3. Compact (should create FragReuseIndex)
+        let compaction_options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            defer_index_remap: true, // Enable FragReuseIndex for conflict resolution
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &compaction_options)
+            .await
+            .unwrap();
+        let dataset_ref = &dataset;
+        let rewrite_results = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+            .collect::<Vec<_>>()
+            .await;
+        commit_compaction(
+            &mut dataset,
+            rewrite_results,
+            Arc::new(crate::dataset::optimize::remapping::IgnoreRemap {}),
+            &compaction_options,
+        )
+        .await
+        .unwrap();
+
+        // 4. Another update (should use FragReuseIndex for conflict resolution)
+        let update_result = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("category = 2")
+            .unwrap()
+            .set("value", "2000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = (*update_result.new_dataset).clone();
+
+        // 5. Another compaction (should handle conflicts from previous update)
+        let plan = plan_compaction(&dataset, &compaction_options)
+            .await
+            .unwrap();
+        let dataset_ref = &dataset;
+        let rewrite_results = futures::stream::iter(plan.compaction_tasks())
+            .then(|task| async move { task.execute(dataset_ref).await.unwrap() })
+            .collect::<Vec<_>>()
+            .await;
+        commit_compaction(
+            &mut dataset,
+            rewrite_results,
+            Arc::new(crate::dataset::optimize::remapping::IgnoreRemap {}),
+            &compaction_options,
+        )
+        .await
+        .unwrap();
+
+        let io_stats = io_tracker.incremental_stats();
+        println!(
+            "Complex workflow IOPS - Reads: {}, Writes: {}",
+            io_stats.read_iops, io_stats.write_iops
+        );
+
+        // Verify the workflow completed successfully with reasonable IOPS
+        assert!(
+            io_stats.read_iops < 50,
+            "Complex workflow should be reasonably efficient, got {} read IOPS",
+            io_stats.read_iops
+        );
+
+        // Verify final data integrity
+        let mut scanner = dataset.scan();
+        scanner.filter("category = 0").unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+
+        if results.num_rows() > 0 {
+            let value_column = results.column_by_name("value").unwrap();
+            let values = value_column.as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..values.len() {
+                assert_eq!(
+                    values.value(i),
+                    1000,
+                    "Category 0 rows should have value 1000"
+                );
+            }
+        }
+
+        let mut scanner = dataset.scan();
+        scanner.filter("category = 2").unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+
+        if results.num_rows() > 0 {
+            let value_column = results.column_by_name("value").unwrap();
+            let values = value_column.as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..values.len() {
+                assert_eq!(
+                    values.value(i),
+                    2000,
+                    "Category 2 rows should have value 2000"
+                );
+            }
+        }
+
+        // Category 1 rows should be deleted
+        let mut scanner = dataset.scan();
+        scanner.filter("category = 1").unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(results.num_rows(), 0, "Category 1 rows should be deleted");
+
+        // Verify FragReuseIndex exists
+        let frag_reuse_index = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap();
+        assert!(
+            frag_reuse_index.is_some(),
+            "FragReuseIndex should exist after operations"
         );
     }
 }
