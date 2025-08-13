@@ -185,7 +185,7 @@ mod tests {
     use std::sync::Arc;
 
     use lance_core::Error;
-    use lance_datagen::{array, r#gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use rstest::rstest;
 
     use super::*;
@@ -197,7 +197,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_update_config() {
-        let data = gen()
+        let data = gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
         let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
@@ -247,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_table_metadata() {
-        let data = gen()
+        let data = gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
         let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
