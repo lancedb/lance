@@ -20,6 +20,7 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{stream, StreamExt};
 use roaring::RoaringTreemap;
 
+use crate::dataset::utils::CapturedRowIds;
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
@@ -32,23 +33,30 @@ use crate::{
     },
     Dataset, Result,
 };
-use lance_core::ROW_ADDR;
-use lance_table::format::Fragment;
+use lance_core::{Error, ROW_ADDR};
+use lance_table::format::{Fragment, RowIdMeta};
+use snafu::location;
 use std::collections::BTreeMap;
 
 /// Shared state for merge insert operations to simplify lock management
 struct MergeState {
     /// Row addresses that need to be deleted, due to a row update or delete action
     delete_row_addrs: RoaringTreemap,
+    /// A channel to receive row ids that should be updated(marked deleted) from the target table.
+    updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     /// Merge operation metrics
     metrics: MergeInsertMetrics,
+    /// Whether to enable move stable row ids
+    enable_stable_row_ids: bool,
 }
 
 impl MergeState {
-    fn new(metrics: MergeInsertMetrics) -> Self {
+    fn new(metrics: MergeInsertMetrics, enable_move_stable_row_ids: bool) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
+            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_move_stable_row_ids))),
             metrics,
+            enable_stable_row_ids: enable_move_stable_row_ids,
         }
     }
 
@@ -74,6 +82,11 @@ impl MergeState {
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
                     self.delete_row_addrs.insert(row_addr);
+
+                    // Capture the row id for updating outside the lock
+                    if self.enable_stable_row_ids {
+                        self.updating_row_ids.lock().unwrap().capture(&[row_addr])?;
+                    }
                     // Don't count as actual delete - this is an update
                 }
 
@@ -486,10 +499,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let input_stream = self.input.execute(partition, context)?;
 
         // Step 1: Create shared state and streaming processor for row addresses and write data
-        let merge_state = Arc::new(Mutex::new(MergeState::new(MergeInsertMetrics::new(
-            &self.metrics,
-            partition,
-        ))));
+        let merge_state = Arc::new(Mutex::new(MergeState::new(
+            MergeInsertMetrics::new(&self.metrics, partition),
+            self.dataset.manifest.uses_move_stable_row_ids(),
+        )));
         let write_data_stream =
             self.create_filtered_write_stream(input_stream, merge_state.clone())?;
 
@@ -499,6 +512,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
         let mem_wal_to_flush = self.params.mem_wal_to_flush.clone();
+        let updating_row_ids = {
+            let state = merge_state.lock().unwrap();
+            state.updating_row_ids.clone()
+        };
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
@@ -512,7 +529,30 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             )
             .await?;
 
-            let new_fragments = write_result.default.0;
+            let mut new_fragments = write_result.default.0;
+
+            if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
+                let fragment_sizes = new_fragments
+                    .iter()
+                    .map(|f| f.physical_rows.unwrap() as u64);
+
+                let sequences = lance_table::rowids::rechunk_sequences_for_merge_insert(
+                    [row_id_sequence.clone()],
+                    fragment_sizes,
+                )
+                .map_err(|e| Error::Internal {
+                    message: format!(
+                        "Captured row ids not equal to number of rows written: {}",
+                        e
+                    ),
+                    location: location!(),
+                })?;
+
+                for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                    let serialized = lance_table::rowids::write_row_ids(&sequence);
+                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                }
+            }
 
             // Step 2.5: Calculate write metrics from new fragments
             let (total_bytes_written, total_files_written) =

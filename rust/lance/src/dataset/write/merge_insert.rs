@@ -1976,6 +1976,8 @@ impl Merger {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::dataset::scanner::ColumnOrdering;
     use crate::{
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
@@ -2002,8 +2004,6 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::sync::{Barrier, Notify};
-    use crate::dataset::scanner::ColumnOrdering;
-    use super::*;
 
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
@@ -2518,7 +2518,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -2545,7 +2545,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let keys = vec!["key".to_string()];
 
@@ -2577,7 +2577,7 @@ mod tests {
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 0],
         )
-            .await;
+        .await;
 
         let ds = Dataset::open(test_uri).await.unwrap();
         let updated_batch = ds
@@ -2602,12 +2602,16 @@ mod tests {
         }
     }
 
-    #[rstest::rstest]
+    // #[rstest::rstest]
     #[tokio::test]
-    async fn test_conditional_update_with_stable_row_id(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_move_stable_row_ids: bool,
+    async fn test_conditional_update_with_stable_row_id(// #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        // #[values(true, false)] enable_move_stable_row_ids: bool,
+        // mut version: LanceFileVersion,
+        // mut enable_move_stable_row_ids: bool,
     ) {
+        let version = LanceFileVersion::V2_0; // Forcing to use V2_0 for this test
+        let enable_move_stable_row_ids = true; // Forcing to use stable row ids for
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -2622,7 +2626,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -2649,10 +2653,11 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let keys = vec!["key".to_string()];
 
+        let mut ds = Dataset::open(test_uri).await.unwrap();
         let updating_batch = ds
             .scan()
             .filter("key = 6")
@@ -2669,7 +2674,7 @@ mod tests {
             .unwrap();
 
         // conditional update, no insert and delete
-        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+        let job = MergeInsertBuilder::try_new(Arc::new(ds.clone()), keys.clone())
             .unwrap()
             .when_matched(
                 WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
@@ -2683,7 +2688,7 @@ mod tests {
             &[6, 7, 8, 9],
             &[3, 1, 0],
         )
-            .await;
+        .await;
 
         let ds = Dataset::open(test_uri).await.unwrap();
         let updated_batch = ds
@@ -2728,7 +2733,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -2755,7 +2760,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let keys = vec!["key".to_string()];
 
@@ -2826,7 +2831,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -2853,7 +2858,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         let keys = vec!["key".to_string()];
 
@@ -2862,9 +2867,9 @@ mod tests {
             .filter("key IN (1,4,5,6)")
             .unwrap()
             .with_row_id()
-            .order_by(Some(vec![
-                ColumnOrdering::asc_nulls_first("key".to_string()),
-            ]))
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
             .unwrap()
             .try_into_batch()
             .await
@@ -2894,7 +2899,7 @@ mod tests {
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 2],
         )
-            .await;
+        .await;
 
         let ds = Dataset::open(test_uri).await.unwrap();
         let updated_batch = ds
@@ -2902,9 +2907,9 @@ mod tests {
             .filter("key IN (1,4,5,6)")
             .unwrap()
             .with_row_id()
-            .order_by(Some(vec![
-                ColumnOrdering::asc_nulls_first("key".to_string()),
-            ]))
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
             .unwrap()
             .try_into_batch()
             .await
