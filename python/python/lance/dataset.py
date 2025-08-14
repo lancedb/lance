@@ -557,6 +557,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
+        with_row_offset: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
         io_buffer_size: Optional[int] = None,
@@ -729,6 +730,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.late_materialization, late_materialization)
         setopt(builder.with_row_id, with_row_id)
         setopt(builder.with_row_address, with_row_address)
+        setopt(builder.with_row_offset, with_row_offset)
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
@@ -809,6 +811,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
+        with_row_offset: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
@@ -874,6 +877,8 @@ class LanceDataset(pa.dataset.Dataset):
             Return row ID.
         with_row_address: bool, optional, default False
             Return row address
+        with_row_offset: bool, optional, default False
+            Return row offset
         use_stats: bool, optional, default True
             Use stats pushdown during filters.
         fast_search: bool, optional, default False
@@ -924,6 +929,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
+            with_row_offset=with_row_offset,
             use_stats=use_stats,
             fast_search=fast_search,
             full_text_query=full_text_query,
@@ -1008,6 +1014,7 @@ class LanceDataset(pa.dataset.Dataset):
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
+        with_row_offset: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
@@ -1044,6 +1051,7 @@ class LanceDataset(pa.dataset.Dataset):
             prefilter=prefilter,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
+            with_row_offset=with_row_offset,
             use_stats=use_stats,
             full_text_query=full_text_query,
             strict_batch_size=strict_batch_size,
@@ -3200,6 +3208,22 @@ class SqlQueryBuilder:
         self._builder = self._builder.with_row_addr(with_row_addr)
         return self
 
+    def with_row_offset(self, with_row_offset: bool = True) -> "SqlQueryBuilder":
+        """
+        Include the row offset in the query result.
+
+        The row offset is the number of rows between the current row and the first row
+        in the dataset.  The row offset is highly unstable and can change as rows are
+        deleted or during compaction.
+
+        Parameters
+        ----------
+        with_row_offset: bool, default True
+            Whether to include the row offset column (`_rowoffset`).
+        """
+        self._builder = self._builder.with_row_offset(with_row_offset)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
@@ -3709,6 +3733,7 @@ class ScannerBuilder:
         self._fragments = None
         self._with_row_id = False
         self._with_row_address = False
+        self._with_row_offset = False
         self._use_stats = True
         self._fast_search = False
         self._full_text_query = None
@@ -3880,6 +3905,17 @@ class ScannerBuilder:
         row addresses may be useful in some advanced use cases.
         """
         self._with_row_address = with_row_address
+        return self
+
+    def with_row_offset(self, with_row_offset: bool = True) -> ScannerBuilder:
+        """
+        Include the row offset in the query result.
+
+        The row offset is the number of rows between the current row and the first row
+        in the dataset.  The row offset is highly unstable and can change as rows are
+        deleted or during compaction.
+        """
+        self._with_row_offset = with_row_offset
         return self
 
     def late_materialization(
@@ -4110,6 +4146,7 @@ class ScannerBuilder:
             self._fragments,
             self._with_row_id,
             self._with_row_address,
+            self._with_row_offset,
             self._use_stats,
             self._substrait_filter,
             self._fast_search,

@@ -48,6 +48,11 @@ pub struct ProjectionPlan {
     /// However, it is possible to have deisres_row_addr=false and with_row_addr=true (e.g. during
     /// a count query)
     pub desires_row_addr: bool,
+    /// True if the user wants the row offset in the final output
+    ///
+    /// Note: there is no corresponding field in the physical projection.  The row offset is
+    /// calculated from the row address and dataset metadata.
+    pub desires_row_offset: bool,
 
     /// If present, expressions that represent the output columns.  These expressions
     /// run on the output of the physical projection.
@@ -68,6 +73,7 @@ impl ProjectionPlan {
             requested_output_expr: None,
             desires_row_addr: false,
             desires_row_id: false,
+            desires_row_offset: false,
         }
     }
 
@@ -166,7 +172,7 @@ impl ProjectionPlan {
                 })
                 .collect::<Result<Vec<_>>>()
         } else {
-            let projection_schema = self.physical_projection.to_schema();
+            let projection_schema = self.physical_projection.to_bare_schema();
             projection_schema
                 .fields
                 .iter()
@@ -192,12 +198,18 @@ impl ProjectionPlan {
         self.desires_row_addr = true;
     }
 
+    pub fn include_row_offset(&mut self) {
+        // Need row addr to get row offset
+        self.physical_projection.with_row_addr = true;
+        self.desires_row_offset = true;
+    }
+
     /// Check if the projection has any output columns
     ///
     /// This doesn't mean there is a physical projection.  For example, we may someday support
     /// something like `SELECT 1 AS foo` which would have an output column (foo) but no physical projection
     pub fn has_output_cols(&self) -> bool {
-        if self.desires_row_id || self.desires_row_addr {
+        if self.desires_row_id || self.desires_row_addr || self.desires_row_offset {
             return true;
         }
         if let Some(exprs) = &self.requested_output_expr {

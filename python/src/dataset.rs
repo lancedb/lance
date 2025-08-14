@@ -624,7 +624,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, with_row_offset=None,use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -642,6 +642,7 @@ impl Dataset {
         fragments: Option<Vec<FileFragment>>,
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
+        with_row_offset: Option<bool>,
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
@@ -661,6 +662,10 @@ impl Dataset {
 
         if with_row_address.unwrap_or(false) {
             scanner.with_row_address();
+        }
+
+        if with_row_offset.unwrap_or(false) {
+            scanner.with_row_offset();
         }
 
         match (columns, columns_with_transform) {
@@ -2117,6 +2122,13 @@ impl SqlQueryBuilder {
     fn with_row_addr(&self, with_row_addr: bool) -> Self {
         Self {
             builder: self.builder.clone().with_row_addr(with_row_addr),
+        }
+    }
+
+    #[pyo3(signature = (with_row_offset))]
+    fn with_row_offset(&self, with_row_offset: bool) -> Self {
+        Self {
+            builder: self.builder.clone().with_row_offset(with_row_offset),
         }
     }
 

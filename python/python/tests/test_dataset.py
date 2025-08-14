@@ -2858,6 +2858,16 @@ def test_scan_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter=pa_ds.field("a") < 20) == 20
 
 
+def test_with_row_offset(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100)})
+    dataset = lance.write_dataset(df, base_dir, max_rows_per_file=25)
+
+    tbl = dataset.scanner(columns=[], with_row_offset=True).to_table()
+    tbl = tbl.combine_chunks()
+    assert tbl == pa.table({"_rowoffset": pa.array(range(100), pa.uint64())})
+
+
 def test_scanner_schemas(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(50), "s": [f"s-{i}" for i in range(50)]})
