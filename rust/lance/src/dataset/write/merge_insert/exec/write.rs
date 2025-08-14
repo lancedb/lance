@@ -173,13 +173,203 @@ impl FullSchemaMergeInsertExec {
 
     /// Creates a filtered stream that captures row addresses for deletion and returns
     /// a stream with only the source data columns (no _rowaddr or action columns)
+    /// If enabled stable row id, we would buffer all the batches and make all the
+    /// update record batches before all the insert batches.
     fn create_filtered_write_stream(
         &self,
         input_stream: SendableRecordBatchStream,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let input_schema = input_stream.schema();
+        let enable_stable_row_ids = {
+            let state = merge_state.lock().map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Failed to lock merge state: {}",
+                    e
+                ))
+            })?;
+            state.enable_stable_row_ids
+        };
 
+        if enable_stable_row_ids {
+            self.create_two_phase_streaming_write_stream(input_stream, merge_state)
+        } else {
+            self.create_streaming_write_stream(input_stream, merge_state)
+        }
+    }
+
+    /// High-performance streaming implementation for non-stable row ID scenarios
+    ///
+    /// It processes batches one at a time as they arrive from the input stream,
+    /// immediately filtering and transforming each batch without buffering.
+    fn create_streaming_write_stream(
+        &self,
+        input_stream: SendableRecordBatchStream,
+        merge_state: Arc<Mutex<MergeState>>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let (_, rowaddr_idx, action_idx, data_column_indices, output_schema) =
+            self.prepare_stream_schema(input_stream.schema())?;
+
+        let output_schema_clone = output_schema.clone();
+        let stream = input_stream.map(move |batch_result| -> DFResult<RecordBatch> {
+            let batch = batch_result?;
+            let (row_addr_array, action_array) =
+                Self::extract_control_arrays(&batch, rowaddr_idx, action_idx)?;
+
+            // Process each row using the shared state
+            let mut keep_rows = Vec::new();
+
+            let mut merge_state = merge_state.lock().map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Failed to lock merge state: {}",
+                    e
+                ))
+            })?;
+
+            for row_idx in 0..batch.num_rows() {
+                let action_code = action_array.value(row_idx);
+                let action = Action::try_from(action_code).map_err(|e| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "Invalid action code {}: {}",
+                        action_code, e
+                    ))
+                })?;
+
+                if merge_state
+                    .process_row_action(action, row_idx, row_addr_array)?
+                    .is_some()
+                {
+                    keep_rows.push(row_idx);
+                }
+            }
+
+            Self::create_filtered_batch(
+                &batch,
+                keep_rows,
+                &data_column_indices,
+                output_schema_clone.clone(),
+            )
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
+    }
+
+    /// Two-phase streaming implementation for stable row ID scenarios
+    ///
+    /// This method ensures that all update operations are processed before insert operations
+    /// while avoiding full buffering in memory. It works in two phases:
+    /// 1. Process all input batches and separate update vs insert operations
+    /// 2. Return batches in order: updates first, then inserts
+    fn create_two_phase_streaming_write_stream(
+        &self,
+        input_stream: SendableRecordBatchStream,
+        merge_state: Arc<Mutex<MergeState>>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let (_, rowaddr_idx, action_idx, data_column_indices, output_schema) =
+            self.prepare_stream_schema(input_stream.schema())?;
+
+        let output_schema_clone = output_schema.clone();
+        let merge_state_clone = merge_state;
+
+        // Phase 1: Collect all batches and separate update and insert operations
+        let future = async move {
+            let mut update_batches = Vec::new();
+            let mut insert_batches = Vec::new();
+            let mut input_stream = input_stream;
+
+            // Scan all input batches and separate update and insert operations
+            while let Some(batch_result) = input_stream.next().await {
+                let batch = batch_result?;
+                let (row_addr_array, action_array) =
+                    Self::extract_control_arrays(&batch, rowaddr_idx, action_idx)?;
+
+                let mut update_indices = Vec::new();
+                let mut insert_indices = Vec::new();
+
+                // Process each row, but only collect the indices
+                {
+                    let mut merge_state = merge_state_clone.lock().map_err(|e| {
+                        datafusion::error::DataFusionError::Internal(format!(
+                            "Failed to lock merge state: {}",
+                            e
+                        ))
+                    })?;
+
+                    for row_idx in 0..batch.num_rows() {
+                        let action_code = action_array.value(row_idx);
+                        let action = Action::try_from(action_code).map_err(|e| {
+                            datafusion::error::DataFusionError::Internal(format!(
+                                "Invalid action code {}: {}",
+                                action_code, e
+                            ))
+                        })?;
+
+                        if merge_state
+                            .process_row_action(action, row_idx, row_addr_array)?
+                            .is_some()
+                        {
+                            match action {
+                                Action::UpdateAll => update_indices.push(row_idx),
+                                Action::Insert => insert_indices.push(row_idx),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                // create update batch
+                if !update_indices.is_empty() {
+                    let update_batch = Self::create_filtered_batch(
+                        &batch,
+                        update_indices,
+                        &data_column_indices,
+                        output_schema_clone.clone(),
+                    )?;
+                    update_batches.push(update_batch);
+                }
+
+                // create insertion batch
+                if !insert_indices.is_empty() {
+                    let insert_batch = Self::create_filtered_batch(
+                        &batch,
+                        insert_indices,
+                        &data_column_indices,
+                        output_schema_clone.clone(),
+                    )?;
+                    insert_batches.push(insert_batch);
+                }
+            }
+
+            // Phase 2: Return batches in sequence - update first, then insert
+            let mut all_batches = update_batches;
+            all_batches.extend(insert_batches);
+
+            Ok::<_, datafusion::error::DataFusionError>(stream::iter(
+                all_batches.into_iter().map(Ok),
+            ))
+        };
+
+        let stream = stream::once(future).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
+    }
+
+    /// Common schema preparation logic
+    #[allow(clippy::type_complexity)]
+    fn prepare_stream_schema(
+        &self,
+        input_schema: arrow_schema::SchemaRef,
+    ) -> DFResult<(
+        arrow_schema::SchemaRef,
+        usize,
+        usize,
+        Vec<usize>,
+        Arc<Schema>,
+    )> {
         // Find column indices
         let (rowaddr_idx, _) = input_schema.column_with_name(ROW_ADDR).ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(
@@ -220,7 +410,6 @@ impl FullSchemaMergeInsertExec {
             .iter()
             .map(|&idx| {
                 let field = input_schema.field(idx);
-                // Column names don't have prefixes, they have qualifiers in the DFSchema
                 Arc::new(arrow_schema::Field::new(
                     field.name(),
                     field.data_type().clone(),
@@ -230,130 +419,78 @@ impl FullSchemaMergeInsertExec {
             .collect();
         let output_schema = Arc::new(Schema::new(output_fields));
 
-        // Create streaming transformation
-        let output_schema_clone = output_schema.clone();
-
-        let future = Self::process_input_stream(
-            input_stream,
-            merge_state,
+        Ok((
+            input_schema,
             rowaddr_idx,
             action_idx,
             data_column_indices,
-            output_schema_clone,
-        );
-
-        let stream = stream::once(future).try_flatten();
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            stream,
-        )))
+        ))
     }
 
-    async fn process_input_stream(
-        mut input_stream: SendableRecordBatchStream,
-        merge_state: Arc<Mutex<MergeState>>,
+    /// Extract control arrays from batch
+    fn extract_control_arrays(
+        batch: &RecordBatch,
         rowaddr_idx: usize,
         action_idx: usize,
-        data_column_indices: Vec<usize>,
+    ) -> DFResult<(&UInt64Array, &UInt8Array)> {
+        // Get row address and action arrays
+        let row_addr_array = batch
+            .column(rowaddr_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "Expected UInt64Array for _rowaddr column".to_string(),
+                )
+            })?;
+
+        let action_array = batch
+            .column(action_idx)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "Expected UInt8Array for action column".to_string(),
+                )
+            })?;
+
+        Ok((row_addr_array, action_array))
+    }
+
+    /// Create filtered batch from selected rows
+    fn create_filtered_batch(
+        batch: &RecordBatch,
+        keep_rows: Vec<usize>,
+        data_column_indices: &[usize],
         output_schema: Arc<Schema>,
-    ) -> DFResult<impl futures::Stream<Item = DFResult<RecordBatch>>> {
-        let mut all_batches = Vec::new();
-
-        while let Some(batch_result) = input_stream.next().await {
-            all_batches.push(batch_result?);
+    ) -> DFResult<RecordBatch> {
+        // If no rows to keep, return empty batch
+        if keep_rows.is_empty() {
+            let empty_columns: Vec<_> = output_schema
+                .fields()
+                .iter()
+                .map(|field| arrow_array::new_empty_array(field.data_type()))
+                .collect();
+            return RecordBatch::try_new(output_schema, empty_columns)
+                .map_err(datafusion::error::DataFusionError::from);
         }
 
-        let mut all_update_batches = Vec::new();
-        let mut all_insert_batches = Vec::new();
+        // Create indices for rows to keep
+        let indices =
+            arrow_array::UInt32Array::from(keep_rows.iter().map(|&i| i as u32).collect::<Vec<_>>());
 
-        for batch in all_batches {
-            let row_addr_array = batch
-                .column(rowaddr_idx)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(
-                        "Expected UInt64Array for _rowaddr column".to_string(),
-                    )
-                })?;
+        // Take only the rows we want to keep
+        let filtered_batch = arrow_select::take::take_record_batch(batch, &indices)?;
 
-            let action_array = batch
-                .column(action_idx)
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(
-                        "Expected UInt8Array for action column".to_string(),
-                    )
-                })?;
+        // Project only the data columns
+        let output_columns: Vec<_> = data_column_indices
+            .iter()
+            .map(|&idx| filtered_batch.column(idx).clone())
+            .collect();
 
-            let mut update_rows = Vec::new();
-            let mut insert_rows = Vec::new();
-
-            {
-                let mut merge_state = merge_state.lock().map_err(|e| {
-                    datafusion::error::DataFusionError::Internal(format!(
-                        "Failed to lock merge state: {}",
-                        e
-                    ))
-                })?;
-
-                for row_idx in 0..batch.num_rows() {
-                    let action_code = action_array.value(row_idx);
-                    let action = Action::try_from(action_code).map_err(|e| {
-                        datafusion::error::DataFusionError::Internal(format!(
-                            "Invalid action code {}: {}",
-                            action_code, e
-                        ))
-                    })?;
-
-                    if merge_state
-                        .process_row_action(action, row_idx, row_addr_array)?
-                        .is_some()
-                    {
-                        match action {
-                            Action::UpdateAll => update_rows.push(row_idx),
-                            Action::Insert => insert_rows.push(row_idx),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            if !update_rows.is_empty() {
-                let indices = arrow_array::UInt32Array::from(
-                    update_rows.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-                );
-                let filtered_batch = arrow_select::take::take_record_batch(&batch, &indices)?;
-                let output_columns: Vec<_> = data_column_indices
-                    .iter()
-                    .map(|&idx| filtered_batch.column(idx).clone())
-                    .collect();
-                let update_batch = RecordBatch::try_new(output_schema.clone(), output_columns)
-                    .map_err(datafusion::error::DataFusionError::from)?;
-                all_update_batches.push(update_batch);
-            }
-
-            if !insert_rows.is_empty() {
-                let indices = arrow_array::UInt32Array::from(
-                    insert_rows.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-                );
-                let filtered_batch = arrow_select::take::take_record_batch(&batch, &indices)?;
-                let output_columns: Vec<_> = data_column_indices
-                    .iter()
-                    .map(|&idx| filtered_batch.column(idx).clone())
-                    .collect();
-                let insert_batch = RecordBatch::try_new(output_schema.clone(), output_columns)
-                    .map_err(datafusion::error::DataFusionError::from)?;
-                all_insert_batches.push(insert_batch);
-            }
-        }
-
-        let mut final_batches = all_update_batches;
-        final_batches.extend(all_insert_batches);
-
-        Ok(stream::iter(final_batches.into_iter().map(Ok)))
+        RecordBatch::try_new(output_schema, output_columns)
+            .map_err(datafusion::error::DataFusionError::from)
     }
 
     /// Calculate write metrics from new fragments
