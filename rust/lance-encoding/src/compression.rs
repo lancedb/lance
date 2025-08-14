@@ -16,6 +16,8 @@
 //! Fullzip compression is a per-value approach where we require that values are transparently
 //! compressed so that we can locate them later.
 
+#[cfg(feature = "bitpacking")]
+use crate::encodings::physical::bitpacking::InlineBitpacking;
 use crate::{
     buffer::LanceBuffer,
     compression_config::{BssMode, CompressionFieldParams, CompressionParams},
@@ -30,7 +32,6 @@ use crate::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
                 VariableDecoder, VariableEncoder,
             },
-            bitpacking::InlineBitpacking,
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
             byte_stream_split::{
                 should_use_bss, ByteStreamSplitDecompressor, ByteStreamSplitEncoder,
@@ -54,7 +55,8 @@ use crate::{
     },
     statistics::{GetStat, Stat},
 };
-use arrow::{array::AsArray, datatypes::UInt64Type};
+
+use arrow_array::types::UInt64Type;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
@@ -165,22 +167,32 @@ fn try_rle_for_mini_block(
     None
 }
 
-fn try_bitpack_for_mini_block(data: &FixedWidthDataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
-    let bits = data.bits_per_value;
-    if !matches!(bits, 8 | 16 | 32 | 64) {
-        return None;
-    }
+fn try_bitpack_for_mini_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
+    #[cfg(feature = "bitpacking")]
+    {
+        use arrow_array::cast::AsArray;
 
-    let bit_widths = data.expect_stat(Stat::BitWidth);
-    let widths = bit_widths.as_primitive::<UInt64Type>();
-    let has_all_zeros = widths.values().contains(&0);
-    let too_small =
-        widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
+        let bit_widths = _data.expect_stat(Stat::BitWidth);
+        let widths = bit_widths.as_primitive::<UInt64Type>();
+        let has_all_zeros = widths.values().contains(&0);
+        let too_small = widths.len() == 1
+            && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
 
-    if !has_all_zeros && !too_small {
-        return Some(Box::new(InlineBitpacking::new(bits)));
+        let bit_widths = _data.expect_stat(Stat::BitWidth);
+        let widths = bit_widths.as_primitive::<UInt64Type>();
+        let has_all_zeros = widths.values().iter().any(|&w| w == 0);
+        let too_small = widths.len() == 1
+            && InlineBitpacking::min_size_bytes(widths.value(0)) >= _data.data_size();
+
+        if !has_all_zeros && !too_small {
+            return Some(Box::new(InlineBitpacking::new(bits)));
+        }
+        None
     }
-    None
+    #[cfg(not(feature = "bitpacking"))]
+    {
+        None
+    }
 }
 
 fn maybe_wrap_general_for_mini_block(
@@ -499,9 +511,15 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
     ) -> Result<Box<dyn MiniBlockDecompressor>> {
         match description.compression.as_ref().unwrap() {
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
+            #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(description) => {
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
+            #[cfg(not(feature = "bitpacking"))]
+            Compression::InlineBitpacking(_) => Err(Error::NotSupported {
+                source: "this runtime was not built with bitpacking support".into(),
+                location: location!(),
+            }),
             Compression::Variable(variable) => {
                 let Compression::Flat(offsets) = variable
                     .offsets
@@ -663,7 +681,7 @@ mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
     use crate::data::{BlockInfo, DataBlock};
-    use arrow::datatypes::{DataType, Field as ArrowField};
+    use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
 
     fn create_test_field(name: &str, data_type: DataType) -> Field {

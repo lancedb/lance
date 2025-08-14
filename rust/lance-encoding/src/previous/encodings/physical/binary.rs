@@ -349,16 +349,18 @@ pub struct BinaryEncoder {
 }
 
 impl BinaryEncoder {
-    pub fn new(
+    pub fn try_new(
         indices_encoder: Box<dyn ArrayEncoder>,
         compression_config: Option<CompressionConfig>,
-    ) -> Self {
-        let buffer_compressor = compression_config.map(GeneralBufferCompressor::get_compressor);
-        Self {
+    ) -> Result<Self> {
+        let buffer_compressor = compression_config
+            .map(GeneralBufferCompressor::get_compressor)
+            .transpose()?;
+        Ok(Self {
             indices_encoder,
             compression_config,
             buffer_compressor,
-        }
+        })
     }
 
     // In 2.1 we will materialize nulls higher up (in the primitive encoder).  Unfortunately,
