@@ -441,7 +441,10 @@ impl Dataset {
                 cache_repetition_index,
                 validate_on_decode,
             };
-            let file_reader_options = FileReaderOptions { decoder_config };
+            let file_reader_options = FileReaderOptions {
+                decoder_config,
+                ..Default::default()
+            };
             params.file_reader_options = Some(file_reader_options);
         }
 
