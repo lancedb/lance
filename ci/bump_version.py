@@ -146,7 +146,7 @@ def main():
     
     # Use bump-my-version to update all files
     print("\nUpdating version in all files...")
-    run_command(["bump-my-version", "bump", "--new-version", new_version])
+    run_command(["bump-my-version", "bump", "--current-version", current_version, "--new-version", new_version, "--ignore-missing-version", "--ignore-missing-files"])
     
     # Update Cargo.lock files
     print("\nUpdating Cargo.lock files...")
