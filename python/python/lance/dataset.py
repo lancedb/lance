@@ -3166,7 +3166,15 @@ class SqlQueryBuilder:
 
     def table_name(self, table_name: str) -> "SqlQueryBuilder":
         """
-        Set the table name for the query.
+        Set table name for the dataset, so that you can run SQL queries
+        against it. In most cases, we should not directly set the table_name.
+        Instead, use {{DATASET}} as a placeholder for the table name.
+
+        Example
+        >>> sql = 'SELECT * FROM {{DATASET}} WHERE age > 20'
+
+        If you must set a table name, try to use a name that is unlikely to
+        conflict, otherwise we may encounter a 'table already exists' error.
 
         Parameters
         ----------

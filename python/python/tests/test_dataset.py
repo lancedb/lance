@@ -3761,17 +3761,14 @@ def test_dataset_sql(tmp_path: Path):
     table = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
     ds = lance.write_dataset(table, tmp_path / "test")
 
-    query = ds.sql("SELECT * FROM test WHERE id > 1").table_name("test").build()
+    query = ds.sql("SELECT * FROM {{DATASET}} WHERE id > 1").build()
 
     result = query.to_batch_records()
     expected = pa.table({"id": [2, 3], "value": ["b", "c"]})
     assert pa.Table.from_batches(result) == expected
 
     stream_result = (
-        ds.sql("SELECT value FROM test WHERE id = 1")
-        .table_name("test")
-        .build()
-        .to_stream_reader()
+        ds.sql("SELECT value FROM {{DATASET}} WHERE id = 1").build().to_stream_reader()
     )
     batches = list(stream_result)
     assert len(batches) == 1
@@ -3779,7 +3776,7 @@ def test_dataset_sql(tmp_path: Path):
 
     complex_query = ds.sql("""
                            SELECT id as user_id, UPPER(value) as val
-                           FROM dataset
+                           FROM {{DATASET}}
                            WHERE id BETWEEN 1 AND 3
                            """).build()
     complex_result = complex_query.to_batch_records()
