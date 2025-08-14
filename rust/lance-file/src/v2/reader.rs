@@ -320,7 +320,7 @@ impl ReaderProjection {
 #[derive(Clone, Debug)]
 pub struct FileReaderOptions {
     pub decoder_config: DecoderConfig,
-    /// Size of chunks when reading large pages. Pages larger than this 
+    /// Size of chunks when reading large pages. Pages larger than this
     /// will be read in multiple chunks to control memory usage.
     /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
     pub read_chunk_size: u64,
@@ -777,11 +777,11 @@ impl FileReader {
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         let path = scheduler.reader().path().clone();
-        
+
         // Create LanceEncodingsIo with read chunk size from options
-        let encodings_io = LanceEncodingsIo::new(scheduler)
-            .with_read_chunk_size(options.read_chunk_size);
-        
+        let encodings_io =
+            LanceEncodingsIo::new(scheduler).with_read_chunk_size(options.read_chunk_size);
+
         Self::try_open_with_file_metadata(
             Arc::new(encodings_io),
             path,

@@ -1390,9 +1390,9 @@ mod tests {
         use futures::TryStreamExt;
         use lance_encoding::decoder::FilterExpression;
         use lance_io::ReadBatchParams;
-        
+
         // Test that large pages written with relaxed limits can be split during read
-        
+
         let arrow_field = ArrowField::new("data", DataType::Binary, false);
         let arrow_schema = ArrowSchema::new(vec![arrow_field]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -1403,10 +1403,7 @@ mod tests {
             Some(large_value.as_slice()),
             Some(b"small value"),
         ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![Arc::new(array)],
-        ).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
 
         // Write with relaxed page size limit (128MB)
         let options = FileWriterOptions {
@@ -1422,21 +1419,23 @@ mod tests {
             fs.object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
             options,
-        ).unwrap();
+        )
+        .unwrap();
 
         writer.write_batch(&batch).await.unwrap();
         let num_rows = writer.finish().await.unwrap();
         assert_eq!(num_rows, 2);
 
         // Read back with split configuration
-        let file_scheduler = fs.scheduler
+        let file_scheduler = fs
+            .scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await
             .unwrap();
 
         // Configure reader to split pages larger than 10MB into chunks
         let reader_options = FileReaderOptions {
-            read_chunk_size: 10 * 1024 * 1024,  // 10MB chunks
+            read_chunk_size: 10 * 1024 * 1024, // 10MB chunks
             ..Default::default()
         };
 
@@ -1455,25 +1454,25 @@ mod tests {
             .read_stream(
                 ReadBatchParams::RangeFull,
                 1024,
-                10,  // batch_readahead
+                10, // batch_readahead
                 FilterExpression::no_filter(),
             )
             .unwrap();
 
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
         assert_eq!(batches.len(), 1);
-        
+
         // Verify the data is correctly read despite splitting
         let read_array = batches[0].column(0);
         let read_binary = read_array
             .as_any()
             .downcast_ref::<arrow_array::BinaryArray>()
             .unwrap();
-        
+
         assert_eq!(read_binary.len(), 2);
         assert_eq!(read_binary.value(0).len(), 40 * 1024 * 1024);
         assert_eq!(read_binary.value(1), b"small value");
-        
+
         // Verify first value matches what we wrote
         assert!(read_binary.value(0).iter().all(|&b| b == 42u8));
     }
