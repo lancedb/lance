@@ -2351,6 +2351,10 @@ mod tests {
             .filter("key IN (4, 5, 6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2383,6 +2387,10 @@ mod tests {
             .filter("key IN (4, 5, 6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2454,6 +2462,10 @@ mod tests {
             .filter("key IN (4,5,6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2480,6 +2492,10 @@ mod tests {
             .filter("key IN (4,5,6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2554,6 +2570,10 @@ mod tests {
             .filter("key IN (4,5,6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2585,6 +2605,10 @@ mod tests {
             .filter("key IN (4,5,6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2602,16 +2626,12 @@ mod tests {
         }
     }
 
-    // #[rstest::rstest]
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_conditional_update_with_stable_row_id(// #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        // #[values(true, false)] enable_move_stable_row_ids: bool,
-        // mut version: LanceFileVersion,
-        // mut enable_move_stable_row_ids: bool,
+    async fn test_conditional_update_with_stable_row_id(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(true, false)] enable_move_stable_row_ids: bool,
     ) {
-        let version = LanceFileVersion::V2_0; // Forcing to use V2_0 for this test
-        let enable_move_stable_row_ids = true; // Forcing to use stable row ids for
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -2639,11 +2659,9 @@ mod tests {
         };
 
         let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
-                .await
-                .unwrap(),
-        );
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
 
         let new_batch = RecordBatch::try_new(
             schema.clone(),
@@ -2657,12 +2675,16 @@ mod tests {
 
         let keys = vec!["key".to_string()];
 
-        let mut ds = Dataset::open(test_uri).await.unwrap();
+        let ds = Dataset::open(test_uri).await.unwrap();
         let updating_batch = ds
             .scan()
             .filter("key = 6")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2696,6 +2718,10 @@ mod tests {
             .filter("key = 6")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2769,6 +2795,10 @@ mod tests {
             .filter("key IN (4,5,6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
@@ -2794,6 +2824,10 @@ mod tests {
             .filter("key IN (4,5,6)")
             .unwrap()
             .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
