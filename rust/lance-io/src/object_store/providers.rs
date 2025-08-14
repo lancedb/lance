@@ -35,8 +35,10 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     ///
     /// Meanwhile, for a file store, the path is relative to the filesystem root.
     /// So a URL of `file:///path/to/file` would return `/path/to/file`.
-    fn extract_path(&self, url: &Url) -> Path {
-        Path::from(url.path())
+    fn extract_path(&self, url: &Url) -> Result<Path> {
+        Path::parse(url.path()).map_err(|_| {
+            Error::invalid_input(format!("Invalid path in URL: {}", url.path()), location!())
+        })
     }
 }
 

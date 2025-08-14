@@ -335,14 +335,14 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             };
-            let path = Path::from(path.path());
+            let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
         }
         let url = uri_to_url(uri)?;
         let store = registry.get_store(url.clone(), params).await?;
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url)?;
 
         Ok((store, path))
     }

@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.operation.Append;
+import com.lancedb.lance.operation.Delete;
 import com.lancedb.lance.operation.Merge;
 import com.lancedb.lance.operation.Overwrite;
 import com.lancedb.lance.operation.Project;
@@ -41,6 +42,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -132,6 +134,50 @@ public class TransactionTest {
                     .commit()
                     .close());
         assertEquals(transaction, dataset.readTransaction().orElse(null));
+      }
+    }
+  }
+
+  @Test
+  void testDelete(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testDelete").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      // Commit fragment
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta0 = testDataset.createNewFragment(rowCount);
+      FragmentMetadata fragmentMeta1 = testDataset.createNewFragment(rowCount);
+      Transaction transaction =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Append.builder().fragments(Arrays.asList(fragmentMeta0, fragmentMeta1)).build())
+              .build();
+      try (Dataset dataset = transaction.commit()) {
+        assertEquals(2, dataset.version());
+        assertEquals(2, dataset.latestVersion());
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+
+      List<Long> deletedFragmentIds =
+          dataset.getFragments().stream()
+              .map(t -> Long.valueOf(t.getId()))
+              .collect(Collectors.toList());
+
+      Transaction delete =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  Delete.builder().deletedFragmentIds(deletedFragmentIds).predicate("1=1").build())
+              .build();
+      try (Dataset dataset = delete.commit()) {
+        Transaction txn = dataset.readTransaction().get();
+        Delete execDelete = (Delete) txn.operation();
+        assertEquals(delete.operation(), execDelete);
+        assertEquals(0, dataset.countRows());
       }
     }
   }

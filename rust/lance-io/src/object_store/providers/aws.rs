@@ -420,6 +420,10 @@ mod tests {
 
         let cases = [
             ("s3://bucket/path/to/file", "path/to/file"),
+            // for non ASCII string tests
+            ("s3://bucket/测试path/to/file", "测试path/to/file"),
+            ("s3://bucket/path/&to/file", "path/&to/file"),
+            ("s3://bucket/path/=to/file", "path/=to/file"),
             (
                 "s3+ddb://bucket/path/to/file?ddbTableName=test",
                 "path/to/file",
@@ -428,9 +432,9 @@ mod tests {
 
         for (uri, expected_path) in cases {
             let url = Url::parse(uri).unwrap();
-            let path = provider.extract_path(&url);
+            let path = provider.extract_path(&url).unwrap();
             let expected_path = Path::from(expected_path);
-            assert_eq!(path, expected_path);
+            assert_eq!(path, expected_path)
         }
     }
 
