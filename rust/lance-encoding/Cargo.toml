@@ -62,7 +62,7 @@ protobuf-src = { version = "2.1", optional = true }
 pprof = { workspace = true }
 
 [features]
-default = ["lz4", "zstd"]
+default = ["lz4", "zstd", "bitpacking"]
 protoc = ["dep:protobuf-src"]
 bitpacking = ["dep:lance-bitpacking"]
 lz4 = ["dep:lz4"]
