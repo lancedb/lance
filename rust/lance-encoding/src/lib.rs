@@ -10,7 +10,6 @@ use lance_core::Result;
 
 pub mod buffer;
 pub mod compression;
-pub mod compression_algo;
 pub mod compression_config;
 pub mod constants;
 pub mod data;

@@ -9,7 +9,7 @@
 //! This encoding can be transparent or opaque.  In order to be transparent we must use transparent
 //! compression on all children.  Then we can zip together the compressed children.
 
-use arrow::datatypes::UInt64Type;
+use arrow_array::types::UInt64Type;
 
 use lance_core::{Error, Result};
 use snafu::location;

@@ -7,8 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow::{array::AsArray, datatypes::UInt64Type};
-use arrow_array::{Array, ArrowPrimitiveType, UInt64Array};
+use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrowPrimitiveType, UInt64Array};
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
@@ -573,12 +572,12 @@ mod tests {
 
     use super::DataBlock;
 
-    use arrow::{
-        array::AsArray,
-        compute::concat,
-        datatypes::{Int32Type, UInt64Type},
+    use arrow_array::{
+        cast::AsArray,
+        types::{Int32Type, UInt64Type},
+        Array,
     };
-    use arrow_array::Array;
+    use arrow_select::concat::concat;
     #[test]
     fn test_data_size_stat() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
@@ -1005,7 +1004,7 @@ mod tests {
             let array2 = arrow_cast::cast(&array2, &data_type).unwrap();
             let array3 = arrow_cast::cast(&array3, &data_type).unwrap();
 
-            let arrays: Vec<&dyn arrow::array::Array> =
+            let arrays: Vec<&dyn arrow_array::Array> =
                 vec![array1.as_ref(), array2.as_ref(), array3.as_ref()];
             let concatenated = concat(&arrays).unwrap();
             let block = DataBlock::from_array(concatenated.clone());

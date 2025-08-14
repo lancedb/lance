@@ -15,10 +15,11 @@
 //! The encoding is transparent because the output has a fixed width (just like the input) and
 //! we can easily jump to the correct value.
 
-use arrow::datatypes::UInt64Type;
+use arrow_array::types::UInt64Type;
 use arrow_array::{Array, PrimitiveArray};
 use arrow_buffer::ArrowNativeType;
 use byteorder::{ByteOrder, LittleEndian};
+use lance_bitpacking::BitPacking;
 use snafu::location;
 
 use lance_core::{Error, Result};
@@ -27,7 +28,6 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{
     BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
 };
-use crate::compression_algo::fastlanes::BitPacking;
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};

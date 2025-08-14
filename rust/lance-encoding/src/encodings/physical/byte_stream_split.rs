@@ -67,8 +67,7 @@ use crate::encodings::logical::primitive::miniblock::{
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::ProtobufUtils21;
 use crate::statistics::{GetStat, Stat};
-use arrow::array::AsArray;
-use arrow::datatypes::UInt64Type;
+use arrow_array::{cast::AsArray, types::UInt64Type};
 use lance_core::Result;
 use snafu::location;
 
