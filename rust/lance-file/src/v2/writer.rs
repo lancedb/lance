@@ -42,7 +42,9 @@ use crate::format::MAGIC;
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
-const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+// In 2.1+, we allow larger pages and split them on read instead of write
+// This avoids empty pages and small pages issues from write-time splitting
+const MAX_PAGE_BYTES: usize = 128 * 1024 * 1024; // 128MB default, was 32MB
 const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
 
 #[derive(Debug, Clone, Default)]
@@ -1380,5 +1382,99 @@ mod tests {
             "status column should use RLE encoding due to metadata threshold, but got: {}",
             status_encoding
         );
+    }
+
+    #[tokio::test]
+    async fn test_large_page_split_on_read() {
+        use arrow_array::Array;
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+        
+        // Test that large pages written with relaxed limits can be split during read
+        
+        let arrow_field = ArrowField::new("data", DataType::Binary, false);
+        let arrow_schema = ArrowSchema::new(vec![arrow_field]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // Create a large binary value (40MB) to trigger large page creation
+        let large_value = vec![42u8; 40 * 1024 * 1024];
+        let array = arrow_array::BinaryArray::from(vec![
+            Some(large_value.as_slice()),
+            Some(b"small value"),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![Arc::new(array)],
+        ).unwrap();
+
+        // Write with relaxed page size limit (128MB)
+        let options = FileWriterOptions {
+            max_page_bytes: Some(128 * 1024 * 1024),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+
+        let fs = FsFixture::default();
+        let path = fs.tmp_path.child("large_page_test.lance");
+
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        ).unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        let num_rows = writer.finish().await.unwrap();
+        assert_eq!(num_rows, 2);
+
+        // Read back with split configuration
+        let file_scheduler = fs.scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        // Configure reader to split pages larger than 10MB into chunks
+        let reader_options = FileReaderOptions {
+            read_chunk_size: 10 * 1024 * 1024,  // 10MB chunks
+            ..Default::default()
+        };
+
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            reader_options,
+        )
+        .await
+        .unwrap();
+
+        // Read the data back
+        let stream = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                10,  // batch_readahead
+                FilterExpression::no_filter(),
+            )
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        
+        // Verify the data is correctly read despite splitting
+        let read_array = batches[0].column(0);
+        let read_binary = read_array
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+        
+        assert_eq!(read_binary.len(), 2);
+        assert_eq!(read_binary.value(0).len(), 40 * 1024 * 1024);
+        assert_eq!(read_binary.value(1), b"small value");
+        
+        // Verify first value matches what we wrote
+        assert!(read_binary.value(0).iter().all(|&b| b == 42u8));
     }
 }

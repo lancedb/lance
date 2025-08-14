@@ -51,6 +51,10 @@ use crate::{
 
 use super::io::LanceEncodingsIo;
 
+/// Default chunk size for reading large pages (8MiB)
+/// Pages larger than this will be split into multiple chunks during read
+pub const DEFAULT_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
 // For now, we don't use global buffers for anything other than schema.  If we
 // use these later we should make them lazily loaded and then cached once loaded.
 //
@@ -313,9 +317,22 @@ impl ReaderProjection {
 }
 
 /// File Reader Options that can control reading behaviors, such as whether to enable caching on repetition indices
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FileReaderOptions {
     pub decoder_config: DecoderConfig,
+    /// Size of chunks when reading large pages. Pages larger than this 
+    /// will be read in multiple chunks to control memory usage.
+    /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
+    pub read_chunk_size: u64,
+}
+
+impl Default for FileReaderOptions {
+    fn default() -> Self {
+        Self {
+            decoder_config: DecoderConfig::default(),
+            read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -760,8 +777,13 @@ impl FileReader {
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         let path = scheduler.reader().path().clone();
+        
+        // Create LanceEncodingsIo with read chunk size from options
+        let encodings_io = LanceEncodingsIo::new(scheduler)
+            .with_read_chunk_size(options.read_chunk_size);
+        
         Self::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(scheduler)),
+            Arc::new(encodings_io),
             path,
             base_projection,
             decoder_plugins,
