@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Tuple, Optional
 
 
-def run_command(cmd: list[str], capture_output: bool = True) -> subprocess.CompletedProcess:
+def run_command(cmd: list[str], capture_output: bool = True, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     """Run a command and return the result."""
     print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=capture_output, text=True)
+    result = subprocess.run(cmd, capture_output=capture_output, text=True, cwd=cwd)
     if result.returncode != 0:
         print(f"Error running command: {' '.join(cmd)}")
         if capture_output:
