@@ -296,7 +296,7 @@ impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.offsets.len() - 1) as u64;
         DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::Owned(self.bytes),
+            data: LanceBuffer::from(self.bytes),
             offsets: LanceBuffer::reinterpret_vec(self.offsets),
             bits_per_offset: T::get_byte_width() as u8 * 8,
             num_values,
@@ -370,7 +370,7 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.values.len() / self.bytes_per_value as usize) as u64;
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::Owned(self.values),
+            data: LanceBuffer::from(self.values),
             bits_per_value: self.bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
@@ -594,7 +594,7 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
         let inner_block = self.inner.finish();
         DataBlock::Nullable(NullableDataBlock {
             data: Box::new(inner_block),
-            nulls: LanceBuffer::Borrowed(self.validity.finish().into_inner()),
+            nulls: LanceBuffer::from(self.validity.finish().into_inner()),
             block_info: BlockInfo::new(),
         })
     }
@@ -1278,7 +1278,7 @@ fn arrow_binary_to_data_block(
     let offsets = data_vec
         .iter()
         .map(|d| {
-            LanceBuffer::Borrowed(
+            LanceBuffer::from(
                 d.buffers()[0].slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset),
             )
         })
@@ -1292,7 +1292,7 @@ fn arrow_binary_to_data_block(
         .iter()
         .zip(data_ranges)
         .map(|(d, byte_range)| {
-            LanceBuffer::Borrowed(
+            LanceBuffer::from(
                 d.buffers()[1]
                     .slice_with_length(byte_range.start, byte_range.end - byte_range.start),
             )
@@ -1315,7 +1315,7 @@ fn encode_flat_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
         let data = arr.to_data();
         buffer.extend_from_slice(data.buffers()[0].as_slice());
     }
-    LanceBuffer::Owned(buffer)
+    LanceBuffer::from(buffer)
 }
 
 fn do_encode_bitmap_data(bitmaps: &[BooleanBuffer], num_values: u64) -> LanceBuffer {
@@ -1326,7 +1326,7 @@ fn do_encode_bitmap_data(bitmaps: &[BooleanBuffer], num_values: u64) -> LanceBuf
     }
 
     let buffer = builder.finish().into_inner();
-    LanceBuffer::Borrowed(buffer)
+    LanceBuffer::from(buffer)
 }
 
 fn encode_bitmap_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
@@ -1466,14 +1466,14 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
                 .copy_from_slice(null_index_bytes.as_slice());
         }
         FixedWidthDataBlock {
-            data: LanceBuffer::Owned(indices_bytes),
+            data: LanceBuffer::from(indices_bytes),
             bits_per_value: bits_per_index,
             num_values,
             block_info: BlockInfo::new(),
         }
     } else {
         FixedWidthDataBlock {
-            data: LanceBuffer::Borrowed(indices.to_data().buffers()[0].clone()),
+            data: LanceBuffer::from(indices.to_data().buffers()[0].clone()),
             bits_per_value: indices.data_type().byte_width() as u64 * 8,
             num_values,
             block_info: BlockInfo::new(),
@@ -1650,7 +1650,7 @@ impl DataBlock {
                 Nullability::None => encoded,
                 Nullability::Some(nulls) => Self::Nullable(NullableDataBlock {
                     data: Box::new(encoded),
-                    nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
+                    nulls: LanceBuffer::from(nulls.into_inner().into_inner()),
                     block_info: BlockInfo::new(),
                 }),
                 _ => unreachable!(),
@@ -1748,7 +1748,7 @@ mod tests {
         let data = DataBlock::from_array(nullable_ints);
 
         let nullable = data.as_nullable().unwrap();
-        assert_eq!(nullable.nulls, LanceBuffer::Owned(vec![0b00000010]));
+        assert_eq!(nullable.nulls, LanceBuffer::from(vec![0b00000010]));
     }
 
     #[test]
@@ -1768,7 +1768,7 @@ mod tests {
         assert_eq!(block.num_values(), 7);
         let block = block.as_nullable().unwrap();
 
-        assert_eq!(block.nulls, LanceBuffer::Owned(vec![0b00011101]));
+        assert_eq!(block.nulls, LanceBuffer::from(vec![0b00011101]));
 
         let data = block.data.as_variable_width().unwrap();
         assert_eq!(
@@ -1891,7 +1891,7 @@ mod tests {
             let dict = data.as_dictionary().unwrap();
 
             let nullable_items = dict.dictionary.as_nullable().unwrap();
-            assert_eq!(nullable_items.nulls, LanceBuffer::Owned(vec![0b00000111]));
+            assert_eq!(nullable_items.nulls, LanceBuffer::from(vec![0b00000111]));
             assert_eq!(nullable_items.data.num_values(), 4);
 
             let items = nullable_items.data.as_variable_width().unwrap();

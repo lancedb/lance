@@ -251,7 +251,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                 DictionaryDataBlock {
                     indices: FixedWidthDataBlock {
                         bits_per_value: key_type.byte_width() as u64 * 8,
-                        data: LanceBuffer::Borrowed(indices.buffers()[0].clone()),
+                        data: LanceBuffer::from(indices.buffers()[0].clone()),
                         num_values: all_null.num_values,
                         block_info: BlockInfo::new(),
                     },

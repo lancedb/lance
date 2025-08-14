@@ -729,7 +729,7 @@ impl ArrayEncoder for BitpackedArrayEncoder {
 
         let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: self.num_bits,
-            data: LanceBuffer::Owned(dst_buffer),
+            data: LanceBuffer::from(dst_buffer),
             num_values: unpacked.num_values,
             block_info: BlockInfo::new(),
         });

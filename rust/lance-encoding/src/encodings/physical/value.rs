@@ -248,7 +248,7 @@ impl ValueEncoder {
         // Finally, add the data buffer
         let buffers = validity_buffers
             .into_iter()
-            .map(LanceBuffer::Owned)
+            .map(LanceBuffer::from)
             .chain(std::iter::once(data.data))
             .collect::<Vec<_>>();
 
@@ -415,7 +415,7 @@ impl ValueEncoder {
             zipped.extend_from_slice(&data_slice[start..end]);
         }
 
-        let zipped = LanceBuffer::Owned(zipped);
+        let zipped = LanceBuffer::from(zipped);
         let data = PerValueDataBlock::Fixed(FixedWidthDataBlock {
             bits_per_value: bytes_per_row as u64 * 8,
             num_values,
@@ -671,14 +671,14 @@ impl ValueDecompressor {
         let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: self.bits_per_value,
             num_values: num_items as u64,
-            data: LanceBuffer::Owned(data_buffer),
+            data: LanceBuffer::from(data_buffer),
             block_info: BlockInfo::new(),
         });
 
         let mut validity_bufs = buffer_builders
             .into_iter()
             .rev()
-            .map(|mut b| LanceBuffer::Borrowed(b.buffer.finish().into_inner()));
+            .map(|mut b| LanceBuffer::from(b.buffer.finish().into_inner()));
         for layer in self.layers.iter().rev() {
             if layer.has_validity {
                 let nullable = NullableDataBlock {

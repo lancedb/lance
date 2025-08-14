@@ -272,7 +272,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .collect::<Vec<u64>>();
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
+                data: LanceBuffer::from(
                     data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
                 ),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
@@ -293,7 +293,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .collect::<Vec<u32>>();
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
+                data: LanceBuffer::from(
                     data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
                 ),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
@@ -353,7 +353,7 @@ impl BlockCompressor for VariableEncoder {
 
                         // store bytes
                         output.extend_from_slice(&variable_width_data.data);
-                        Ok(LanceBuffer::Owned(output))
+                        Ok(LanceBuffer::from(output))
                     }
                     64 => {
                         let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u64>();
@@ -382,7 +382,7 @@ impl BlockCompressor for VariableEncoder {
 
                         // store bytes
                         output.extend_from_slice(&variable_width_data.data);
-                        Ok(LanceBuffer::Owned(output))
+                        Ok(LanceBuffer::from(output))
                     }
                     _ => {
                         panic!("BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",

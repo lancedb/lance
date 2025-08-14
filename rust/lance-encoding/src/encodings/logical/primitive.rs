@@ -2439,8 +2439,8 @@ impl VariableFullZipDecoder {
         };
         self.rep = ScalarBuffer::from(rep);
         self.def = ScalarBuffer::from(def);
-        self.data = LanceBuffer::Owned(unzipped_data);
-        self.offsets = LanceBuffer::Owned(offsets_data);
+        self.data = LanceBuffer::from(unzipped_data);
+        self.offsets = LanceBuffer::from(offsets_data);
     }
 }
 
@@ -2622,7 +2622,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 }
 
                 // Finally, we decompress the values and add them to our output buffer
-                let values_buf = LanceBuffer::Owned(values);
+                let values_buf = LanceBuffer::from(values);
                 let fixed_data = FixedWidthDataBlock {
                     bits_per_value: self.bytes_per_value as u64 * 8,
                     block_info: BlockInfo::new(),
@@ -3367,8 +3367,8 @@ impl PrimitiveStructuralEncoder {
             meta_buffer.extend_from_slice(&metadata.to_le_bytes());
         }
 
-        let data_buffer = LanceBuffer::Owned(data_buffer);
-        let metadata_buffer = LanceBuffer::Owned(meta_buffer);
+        let data_buffer = LanceBuffer::from(data_buffer);
+        let metadata_buffer = LanceBuffer::from(meta_buffer);
 
         SerializedMiniBlockPage {
             num_buffers: miniblocks.data.len() as u64,
@@ -3730,12 +3730,12 @@ impl PrimitiveStructuralEncoder {
             rep_index_builder.append(zipped_data.len() as u64);
         }
 
-        let zipped_data = LanceBuffer::Owned(zipped_data);
+        let zipped_data = LanceBuffer::from(zipped_data);
         let rep_index = rep_index_builder.into_data();
         let rep_index = if rep_index.is_empty() {
             None
         } else {
-            Some(LanceBuffer::Owned(rep_index))
+            Some(LanceBuffer::from(rep_index))
         };
         SerializedFullZip {
             values: zipped_data,
@@ -3826,10 +3826,10 @@ impl PrimitiveStructuralEncoder {
             rep_index_builder.append(buf.len() as u64);
         }
 
-        let zipped_data = LanceBuffer::Owned(buf);
+        let zipped_data = LanceBuffer::from(buf);
         let rep_index = rep_index_builder.into_data();
         debug_assert!(!rep_index.is_empty());
-        let rep_index = Some(LanceBuffer::Owned(rep_index));
+        let rep_index = Some(LanceBuffer::from(rep_index));
         SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,

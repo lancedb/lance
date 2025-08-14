@@ -165,7 +165,7 @@ impl ArrayEncoder for FsstArrayEncoder {
         )?;
 
         let dest_offset = LanceBuffer::reinterpret_vec(dest_offsets);
-        let dest_values = LanceBuffer::Owned(dest_values);
+        let dest_values = LanceBuffer::from(dest_values);
         let dest_data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: 32,
             data: dest_values,

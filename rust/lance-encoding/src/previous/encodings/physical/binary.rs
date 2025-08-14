@@ -491,7 +491,7 @@ impl ArrayEncoder for BinaryEncoder {
         if let Some(buffer_compressor) = &self.buffer_compressor {
             let mut compressed_data = Vec::with_capacity(data.data.len());
             buffer_compressor.compress(&data.data, &mut compressed_data)?;
-            data.data = LanceBuffer::Owned(compressed_data);
+            data.data = LanceBuffer::from(compressed_data);
         }
 
         let data = DataBlock::VariableWidth(VariableWidthBlock {

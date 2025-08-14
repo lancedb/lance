@@ -232,7 +232,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data: LanceBuffer::Owned(decompress_bytes_buf),
+                    data: LanceBuffer::from(decompress_bytes_buf),
                     offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
                     bits_per_offset: 32,
                     num_values,
@@ -262,7 +262,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data: LanceBuffer::Owned(decompress_bytes_buf),
+                    data: LanceBuffer::from(decompress_bytes_buf),
                     offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
                     bits_per_offset: 64,
                     num_values,
@@ -356,7 +356,7 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
             };
 
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::Owned(decompress_bytes_buf),
+            data: LanceBuffer::from(decompress_bytes_buf),
             offsets: decompress_offset_buf,
             bits_per_offset: compressed_data_block.bits_per_offset,
             num_values,
