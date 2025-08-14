@@ -77,21 +77,8 @@ def validate_version_consistency():
     version = get_current_version()
     errors = []
     
-    # Check all Rust crates
+    # Check all creates with explicit versioning
     rust_crates = [
-        "rust/lance/Cargo.toml",
-        "rust/lance-arrow/Cargo.toml",
-        "rust/lance-core/Cargo.toml",
-        "rust/lance-datafusion/Cargo.toml",
-        "rust/lance-datagen/Cargo.toml",
-        "rust/lance-encoding/Cargo.toml",
-        "rust/lance-file/Cargo.toml",
-        "rust/lance-index/Cargo.toml",
-        "rust/lance-io/Cargo.toml",
-        "rust/lance-linalg/Cargo.toml",
-        "rust/lance-table/Cargo.toml",
-        "rust/lance-test-macros/Cargo.toml",
-        "rust/lance-testing/Cargo.toml",
         "python/Cargo.toml",
         "java/core/lance-jni/Cargo.toml",
     ]
