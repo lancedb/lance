@@ -1,7 +1,7 @@
 ifeq ($(CI), true)
-    PYTEST_ARGS = -vvv -s --durations=30 -m "not weekly"
+    PYTEST_ARGS = -vvv -s --durations=30 -m "not recurring"
 else
-    PYTEST_ARGS = -vvv -s -m "not weekly"
+    PYTEST_ARGS = -vvv -s -m "not recurring"
 endif
 
 test:

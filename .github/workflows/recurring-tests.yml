@@ -44,9 +44,9 @@ jobs:
           matrix="{\"pylance-version\": $json_array}"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
-  # This job is used to test the weekly tests on the latest 2 stable versions of Lance,
-  # and the back-compat of the weekly tests.
-  weekly-linux:
+  # This job is used to test the recurring tests on the latest 2 stable versions of Lance,
+  # and the back-compat of the recurring tests.
+  recurring-linux:
     needs: get-pylance-versions
     name: "Recurring: Linux (Pylance ${{ matrix.pylance-version }})"
     runs-on: ubuntu-24.04
@@ -82,16 +82,16 @@ jobs:
       - name: Install Pylance
         run: |
           pip install pylance==${{ matrix.pylance-version }}
-      - name: Run weekly tests
-        id: run_weekly_tests
-        run: pytest -vvv -s python/tests/weekly/test_recurring.py
+      - name: Run recurring tests
+        id: run_recurring_tests
+        run: pytest -vvv -s python/tests/recurring/test_recurring.py
       - name: Upgrade Pylance
         run: pip install -e ".[tests]"
-      - name: Run weekly tests again
-        run: pytest -vvv -s python/tests/weekly/test_recurring.py
+      - name: Run recurring tests again
+        run: pytest -vvv -s python/tests/recurring/test_recurring.py
 
-  # This job is used to test the weekly tests on the main branch.
-  weekly-linux-fresh-main:
+  # This job is used to test the recurring tests on the main branch.
+  recurring-linux-fresh-main:
     name: "Recurring: Linux (main)"
     runs-on: ubuntu-24.04
     timeout-minutes: 7200
@@ -117,5 +117,5 @@ jobs:
           workspaces: python
       - name: Install Lance
         run: pip install -e ".[tests]"
-      - name: Run weekly tests
-        run: pytest -vvv -s python/tests/weekly/test_recurring.py
+      - name: Run recurring tests
+        run: pytest -vvv -s python/tests/recurring/test_recurring.py
