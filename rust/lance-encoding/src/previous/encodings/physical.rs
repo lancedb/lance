@@ -20,6 +20,7 @@ use crate::{
 pub mod basic;
 pub mod binary;
 pub mod bitmap;
+#[cfg(feature = "bitpacking")]
 pub mod bitpack;
 pub mod block;
 pub mod dictionary;
@@ -74,6 +75,7 @@ fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn Pag
     }
 }
 
+#[cfg(feature = "bitpacking")]
 fn get_bitpacked_buffer_decoder(
     encoding: &pb::Bitpacked,
     buffers: &PageBuffers,
@@ -88,6 +90,7 @@ fn get_bitpacked_buffer_decoder(
     ))
 }
 
+#[cfg(feature = "bitpacking")]
 fn get_bitpacked_for_non_neg_buffer_decoder(
     encoding: &pb::BitpackedForNonNeg,
     buffers: &PageBuffers,
@@ -171,8 +174,13 @@ pub fn decoder_from_array_encoding(
                 }
             }
         }
+        #[cfg(feature = "bitpacking")]
         pb::array_encoding::ArrayEncoding::Bitpacked(bitpacked) => {
             get_bitpacked_buffer_decoder(bitpacked, buffers)
+        }
+        #[cfg(not(feature = "bitpacking"))]
+        pb::array_encoding::ArrayEncoding::Bitpacked(_) => {
+            panic!("Runtime built without bitpacking support")
         }
         pb::array_encoding::ArrayEncoding::Flat(flat) => get_buffer_decoder(flat, buffers),
         pb::array_encoding::ArrayEncoding::FixedSizeList(fixed_size_list) => {
@@ -267,8 +275,13 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {
             decoder_from_packed_struct(packed_struct, buffers, data_type)
         }
+        #[cfg(feature = "bitpacking")]
         pb::array_encoding::ArrayEncoding::BitpackedForNonNeg(bitpacked) => {
             get_bitpacked_for_non_neg_buffer_decoder(bitpacked, buffers)
+        }
+        #[cfg(not(feature = "bitpacking"))]
+        pb::array_encoding::ArrayEncoding::BitpackedForNonNeg(_) => {
+            panic!("Runtime built without bitpacking support")
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column
         // (that has no data).  We never actually decode that column and so this branch is never actually encountered.

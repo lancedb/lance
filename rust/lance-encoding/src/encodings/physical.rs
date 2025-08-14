@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod binary;
+#[cfg(feature = "bitpacking")]
 pub mod bitpacking;
 pub mod block;
 pub mod byte_stream_split;

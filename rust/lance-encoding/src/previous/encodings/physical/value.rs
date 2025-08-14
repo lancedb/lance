@@ -131,7 +131,7 @@ impl ValuePageDecoder {
     fn decompress(&self) -> Result<Vec<Bytes>> {
         // for compressed page, it is guaranteed that only one range is passed
         let bytes_u8: Vec<u8> = self.data[0].to_vec();
-        let buffer_compressor = GeneralBufferCompressor::get_compressor(self.compression_config);
+        let buffer_compressor = GeneralBufferCompressor::get_compressor(self.compression_config)?;
         let mut uncompressed_bytes: Vec<u8> = Vec::new();
         buffer_compressor.decompress(&bytes_u8, &mut uncompressed_bytes)?;
 

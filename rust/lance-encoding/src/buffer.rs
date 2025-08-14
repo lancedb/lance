@@ -69,13 +69,13 @@ impl std::fmt::Debug for LanceBuffer {
 }
 
 impl LanceBuffer {
-    /// Convert into a mutable buffer.  If this is a borrowed buffer, the data will be copied.
-    pub fn into_owned(self) -> Vec<u8> {
-        match self {
-            Self::Borrowed(buffer) => buffer.to_vec(),
-            Self::Owned(buffer) => buffer,
-        }
-    }
+    // /// Convert into a mutable buffer.  If this is a borrowed buffer, the data will be copied.
+    // pub fn into_owned(self) -> Vec<u8> {
+    //     match self {
+    //         Self::Borrowed(buffer) => buffer.to_vec(),
+    //         Self::Owned(buffer) => buffer,
+    //     }
+    // }
 
     /// Convert into an Arrow buffer.  Never copies data.
     pub fn into_buffer(self) -> Buffer {

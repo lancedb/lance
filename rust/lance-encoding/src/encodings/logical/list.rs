@@ -230,12 +230,12 @@ mod tests {
     use crate::constants::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
-    use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
+        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
         Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
         UInt64Array, UInt8Array,
     };
+
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
     use rstest::rstest;
@@ -552,6 +552,7 @@ mod tests {
     ) {
         // This is a simple pre-defined list that spans two pages.  This test is useful for
         // debugging the repetition index
+
         let items_builder = Int64Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         for i in 0..512 {

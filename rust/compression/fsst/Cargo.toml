@@ -5,8 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "README.md"
-description = "FSST string compression"
+description = "FSST string compression for Lance"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -15,7 +14,6 @@ rust-version.workspace = true
 arrow-array.workspace = true
 rand.workspace = true
 
-# this should be put in dev-dependencies, TODO: remove it from here
 [dev-dependencies]
 arrow-array.workspace = true
 test-log.workspace = true

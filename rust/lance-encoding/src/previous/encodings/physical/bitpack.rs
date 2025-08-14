@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{
+use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{cast::AsArray, Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::bit_util::ceil;
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
@@ -17,16 +17,15 @@ use num_traits::{AsPrimitive, PrimInt};
 use snafu::location;
 
 use lance_arrow::DataTypeExt;
+use lance_bitpacking::BitPacking;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::compression_algo::fastlanes::BitPacking;
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
 use crate::format::ProtobufUtils;
 use crate::previous::encoder::{ArrayEncoder, EncodedArray};
-use arrow::array::{ArrayRef, AsArray};
 use bytemuck::cast_slice;
 
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
@@ -48,7 +47,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt8Type>>()
                     .unwrap();
-                let array_max = arrow::compute::bit_or(primitive_array);
+                let array_max = arrow_arith::aggregate::bit_or(primitive_array);
                 global_max = global_max.max(array_max.unwrap_or(0));
             }
             let num_bits =
@@ -68,7 +67,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int8Type>>()
                     .unwrap();
-                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                let array_max_width = arrow_arith::aggregate::bit_or(primitive_array).unwrap_or(0);
                 global_max_width = global_max_width.max(8 - array_max_width.leading_zeros() as u64);
             }
             if global_max_width == 0 {
@@ -85,7 +84,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt16Type>>()
                     .unwrap();
-                let array_max = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                let array_max = arrow_arith::aggregate::bit_or(primitive_array).unwrap_or(0);
                 global_max = global_max.max(array_max);
             }
             let num_bits =
@@ -104,7 +103,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int16Type>>()
                     .unwrap();
-                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                let array_max_width = arrow_arith::aggregate::bit_or(primitive_array).unwrap_or(0);
                 global_max_width =
                     global_max_width.max(16 - array_max_width.leading_zeros() as u64);
             }
@@ -122,7 +121,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt32Type>>()
                     .unwrap();
-                let array_max = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                let array_max = arrow_arith::aggregate::bit_or(primitive_array).unwrap_or(0);
                 global_max = global_max.max(array_max);
             }
             let num_bits =
@@ -141,7 +140,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int32Type>>()
                     .unwrap();
-                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                let array_max_width = arrow_arith::aggregate::bit_or(primitive_array).unwrap_or(0);
                 global_max_width =
                     global_max_width.max(32 - array_max_width.leading_zeros() as u64);
             }
@@ -159,7 +158,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt64Type>>()
                     .unwrap();
-                let array_max = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                let array_max = arrow_arith::aggregate::bit_or(primitive_array).unwrap_or(0);
                 global_max = global_max.max(array_max);
             }
             let num_bits =
@@ -178,7 +177,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<Int64Type>>()
                     .unwrap();
-                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                let array_max_width = arrow_arith::aggregate::bit_or(primitive_array).unwrap_or(0);
                 global_max_width =
                     global_max_width.max(64 - array_max_width.leading_zeros() as u64);
             }
@@ -629,7 +628,7 @@ where
     T: ArrowPrimitiveType,
     T::Native: PrimInt + AsPrimitive<u64>,
 {
-    let max = arrow::compute::bit_or(arr);
+    let max = arrow_arith::aggregate::bit_or(arr);
     let num_bits =
         max.map(|max| arr.data_type().byte_width() as u64 * 8 - max.leading_zeros() as u64);
 
