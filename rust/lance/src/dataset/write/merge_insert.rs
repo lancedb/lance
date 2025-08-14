@@ -1695,7 +1695,7 @@ pub struct UncommittedMergeInsert {
 struct Merger {
     // As the merger runs it will update the list of deleted rows
     deleted_rows: Arc<Mutex<RoaringTreemap>>,
-    // A channel to receive row ids that should be updated(marked deleted) from the target table.
+    // Shared collection to capture row ids that need to be updated
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,

@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 struct MergeState {
     /// Row addresses that need to be deleted, due to a row update or delete action
     delete_row_addrs: RoaringTreemap,
-    /// A channel to receive row ids that should be updated(marked deleted) from the target table.
+    /// Shared collection to capture row ids that need to be updated
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     /// Merge operation metrics
     metrics: MergeInsertMetrics,
@@ -83,7 +83,6 @@ impl MergeState {
                     let row_addr = row_addr_array.value(row_idx);
                     self.delete_row_addrs.insert(row_addr);
 
-                    // Capture the row id for updating outside the lock
                     if self.enable_stable_row_ids {
                         self.updating_row_ids.lock().unwrap().capture(&[row_addr])?;
                     }
