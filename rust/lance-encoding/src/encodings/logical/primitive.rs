@@ -1358,8 +1358,27 @@ impl ChunkInstructions {
 
             while rows_needed > 0 || need_preamble {
                 let chunk = &rep_index.blocks[block_index];
-                let rows_avail = chunk.starts_including_trailer - to_skip;
-                debug_assert!(rows_avail > 0);
+                let rows_avail = chunk.starts_including_trailer.saturating_sub(to_skip);
+
+                // Handle blocks that are entirely preamble (rows_avail = 0)
+                // These blocks have no rows to take but may have a preamble we need
+                if rows_avail == 0 {
+                    // Only process if this chunk has a preamble we need
+                    if chunk.has_preamble && need_preamble {
+                        chunk_instructions.push(Self {
+                            chunk_idx: block_index,
+                            preamble: PreambleAction::Take,
+                            rows_to_skip: 0,
+                            rows_to_take: 0,
+                            take_trailer: false,
+                        });
+                        need_preamble = false;
+                    }
+                    // Move to next block
+                    block_index += 1;
+                    to_skip = 0;
+                    continue;
+                }
 
                 let rows_to_take = rows_avail.min(rows_needed);
                 rows_needed -= rows_to_take;
