@@ -6,6 +6,7 @@ This script is used during the release process to ensure we don't accidentally
 release breaking changes as a patch version.
 """
 
+import argparse
 import sys
 import os
 from github import Github
@@ -74,7 +75,18 @@ def check_github_pr_labels() -> bool:
 
 def main():
     """Main function to check for breaking changes."""
-    print("Checking for breaking changes via GitHub PR labels...")
+    parser = argparse.ArgumentParser(
+        description="Check for breaking changes and validate release type"
+    )
+    parser.add_argument(
+        "--release-type",
+        choices=["patch", "minor", "major"],
+        required=True,
+        help="Type of release being performed"
+    )
+    args = parser.parse_args()
+    
+    print(f"Checking for breaking changes (Release type: {args.release_type})...")
     print("-" * 50)
     
     has_breaking_changes = check_github_pr_labels()
@@ -82,11 +94,17 @@ def main():
     print("-" * 50)
     
     if has_breaking_changes:
-        print("✗ Breaking changes detected!")
-        print("Please use 'minor' or 'major' version bump for the release.")
-        sys.exit(1)
+        if args.release_type == "patch":
+            print("✗ Breaking changes detected but patch release requested!")
+            print("Please use 'minor' or 'major' version bump for the release.")
+            sys.exit(1)
+        else:
+            print(f"⚠️ Breaking changes detected, proceeding with {args.release_type} release")
+            print("This is allowed since you're using a minor or major version bump.")
+            sys.exit(0)
     else:
         print("✓ No breaking changes detected")
+        print(f"Proceeding with {args.release_type} release")
         sys.exit(0)
 
 
