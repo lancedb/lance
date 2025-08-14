@@ -16,6 +16,8 @@ package com.lancedb.lance;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.operation.Append;
 import com.lancedb.lance.operation.Overwrite;
+import com.lancedb.lance.operation.UpdateConfig;
+import com.lancedb.lance.operation.UpdateMap;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceField;
 import com.lancedb.lance.schema.SqlExpressions;
@@ -789,7 +791,15 @@ public class DatasetTest {
       Map<String, String> updateConfig = new HashMap<>();
       updateConfig.put("key1", "value1");
       updateConfig.put("key2", "value2");
-      dataset.updateConfig(updateConfig, false);
+
+      UpdateMap configUpdate = UpdateMap.builder().updates(updateConfig).replace(false).build();
+
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().configUpdates(configUpdate).build())
+              .build()
+              .commit();
       originalConfig.putAll(updateConfig);
       assertEquals(2, dataset.version());
       Map<String, String> currentConfig = dataset.getConfig();
@@ -800,7 +810,15 @@ public class DatasetTest {
 
       Map<String, String> updateConfig2 = new HashMap<>();
       updateConfig2.put("key1", "value3");
-      dataset.updateConfig(updateConfig2, false);
+
+      UpdateMap configUpdate2 = UpdateMap.builder().updates(updateConfig2).replace(false).build();
+
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().configUpdates(configUpdate2).build())
+              .build()
+              .commit();
       currentConfig = dataset.getConfig();
       originalConfig.putAll(updateConfig2);
       assertEquals(3, dataset.version());
@@ -824,7 +842,15 @@ public class DatasetTest {
       Map<String, String> config = new HashMap<>();
       config.put("key1", "value1");
       config.put("key2", "value2");
-      dataset.updateConfig(config, false);
+
+      UpdateMap configUpdate = UpdateMap.builder().updates(config).replace(false).build();
+
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().configUpdates(configUpdate).build())
+              .build()
+              .commit();
       assertEquals(2, dataset.version());
       Map<String, String> currentConfig = dataset.getConfig();
       assertTrue(currentConfig.keySet().containsAll(config.keySet()));
