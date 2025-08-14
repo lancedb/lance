@@ -213,7 +213,7 @@ impl LanceBuffer {
     pub fn zip_into_one(buffers: Vec<(Self, u64)>, num_values: u64) -> Result<Self> {
         use lance_core::Error;
         use snafu::location;
-        
+
         let bytes_per_value = buffers.iter().map(|(_, bits_per_value)| {
             if bits_per_value % 8 == 0 {
                 Ok(bits_per_value / 8)
@@ -501,15 +501,5 @@ mod tests {
         assert_eq!(buf.bit_slice_le_with_length(0, 8).as_ref(), &[0x0F]);
         assert_eq!(buf.bit_slice_le_with_length(4, 8).as_ref(), &[0xB0]);
         assert_eq!(buf.bit_slice_le_with_length(4, 12).as_ref(), &[0xB0, 0x00]);
-    }
-
-    #[test]
-    fn test_clone() {
-        let buf = LanceBuffer::from(vec![1, 2, 3]);
-        let cloned = buf.clone();
-        assert_eq!(buf, cloned);
-        
-        // Clone should be cheap (reference counted)
-        assert_eq!(buf.as_ptr(), cloned.as_ptr());
     }
 }

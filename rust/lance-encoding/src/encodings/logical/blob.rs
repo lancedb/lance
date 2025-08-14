@@ -99,7 +99,8 @@ impl FieldEncoder for BlobStructuralEncoder {
                     sizes.push(0);
                 } else {
                     // Add data to external buffers
-                    let position = external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
+                    let position =
+                        external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
                     positions.push(position);
                     sizes.push(value.len() as u64);
                 }
