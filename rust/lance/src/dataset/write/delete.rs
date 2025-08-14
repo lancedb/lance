@@ -10,7 +10,7 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_core::Result;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::location;
