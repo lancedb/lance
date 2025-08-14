@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -18,6 +19,8 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatch
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::simd::u8::u8x16;
+use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
@@ -242,6 +245,44 @@ pub fn build_dist_table(query_codes: Vec<u8>) -> Vec<u32> {
         .collect()
 }
 
+#[inline]
+fn quantize_dist_table(dist_table: &[u32], qmax: u32) -> (u32, Vec<u8>) {
+    let qmin = dist_table.iter().cloned().min().unwrap();
+    let factor = 255.0 / (qmax - qmin) as f32;
+    let quantized_dist_table = dist_table
+        .iter()
+        .map(|&d| ((d - qmin) as f32 * factor).round() as u8)
+        .collect();
+
+    (qmin, quantized_dist_table)
+}
+
+#[inline]
+fn compute_rq_distance_flat(
+    dist_table: &[u32],
+    n: usize,
+    codes: &[u8],
+    offset: usize,
+    length: usize,
+    dists: &mut [u32],
+) {
+    for (sub_vec_idx, codes) in codes.chunks_exact(n).enumerate() {
+        let codes = &codes[offset..offset + length];
+        let dists = &mut dists[offset..offset + length];
+        debug_assert_eq!(codes.len(), n);
+        let current_dist_table = &dist_table
+            [sub_vec_idx * 2 * SEGMENT_NUM_CODES..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
+        let next_dist_table = &dist_table
+            [(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
+
+        codes.iter().zip(dists.iter_mut()).for_each(|(code, dist)| {
+            let current_code = (code & 0x0F) as usize;
+            let next_code = (code >> 4) as usize;
+            *dist += current_dist_table[current_code] + next_dist_table[next_code];
+        });
+    }
+}
+
 impl DistCalculator for RabitDistCalculator<'_> {
     #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
@@ -272,7 +313,8 @@ impl DistCalculator for RabitDistCalculator<'_> {
         dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
     }
 
-    fn distance_all(&self, _: usize) -> Vec<f32> {
+    #[inline(never)]
+    fn distance_all(&self, k_hint: usize) -> Vec<f32> {
         let code_len = self.dim * (self.num_bits as usize) / 8;
         let n = self.codes.len() / code_len;
         if n == 0 {
@@ -281,49 +323,72 @@ impl DistCalculator for RabitDistCalculator<'_> {
 
         let mut dists = vec![0; n];
 
+        const FLAT_NUM_RQ: usize = 200;
+        let k_hint = min(k_hint, n);
+        let flat_num = max(FLAT_NUM_RQ, k_hint).min(n);
+        compute_rq_distance_flat(&self.dist_table, n, self.codes, 0, flat_num, &mut dists);
+
+        let qmax = dists.iter().take(flat_num).copied().max().unwrap();
+        let (qmin, quantized_dists_table) = quantize_dist_table(&self.dist_table, qmax);
+
+        let mut quantized_dists = vec![0_u8; n];
+
         let remainder = n % SEGMENT_NUM_CODES;
         for i in (0..n - remainder).step_by(SEGMENT_NUM_CODES) {
-            let mut block_distances = [0; SEGMENT_NUM_CODES];
+            let mut block_distances = u8x16::zeros();
             for (sub_vec_idx, codes) in self.codes.chunks_exact(n).enumerate() {
-                let dist_table = &self.dist_table[sub_vec_idx * 2 * SEGMENT_NUM_CODES
-                    ..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
-                let next_dist_table = &self.dist_table[(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES
-                    ..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
+                let dist_table = unsafe {
+                    u8x16::load_unaligned(
+                        quantized_dists_table
+                            .as_ptr()
+                            .add(sub_vec_idx * 2 * SEGMENT_NUM_CODES),
+                    )
+                };
+                let next_dist_table = unsafe {
+                    u8x16::load_unaligned(
+                        quantized_dists_table
+                            .as_ptr()
+                            .add((sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES),
+                    )
+                };
 
-                let codes = &codes[i..i + SEGMENT_NUM_CODES];
-                for (offset, code) in codes.iter().enumerate() {
-                    let current_code = (code & 0x0F) as usize;
-                    let next_code = (code >> 4) as usize;
-
-                    block_distances[offset] +=
-                        dist_table[current_code] + next_dist_table[next_code];
-                }
+                let codes = unsafe { u8x16::load_unaligned(codes.as_ptr().add(i)) };
+                let current_indices = codes.bit_and(0x0F);
+                block_distances += dist_table.shuffle(current_indices);
+                let next_indices = codes.right_shift::<4>();
+                block_distances += next_dist_table.shuffle(next_indices);
             }
-            for (offset, dist) in block_distances.into_iter().enumerate() {
-                dists[i + offset] = dist;
+            unsafe {
+                block_distances.store_unaligned(quantized_dists.as_mut_ptr().add(i));
             }
         }
 
         if remainder > 0 {
-            let offset = n - remainder;
-            for (sub_vec_idx, codes) in self.codes.chunks_exact(n).enumerate() {
-                debug_assert_eq!(codes.len(), n);
-                let current_dist_table = &self.dist_table[sub_vec_idx * 2 * SEGMENT_NUM_CODES
-                    ..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
-                let next_dist_table = &self.dist_table[(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES
-                    ..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
-
-                codes
-                    .iter()
-                    .skip(offset)
-                    .zip(dists.iter_mut().skip(offset))
-                    .for_each(|(code_byte, dist)| {
-                        let current_code = (code_byte & 0x0F) as usize;
-                        let next_code = (code_byte >> 4) as usize;
-                        *dist += current_dist_table[current_code] + next_dist_table[next_code];
-                    });
-            }
+            let offset = max(n - remainder, flat_num);
+            compute_rq_distance_flat(
+                &self.dist_table,
+                n,
+                self.codes,
+                offset,
+                n - offset,
+                &mut dists,
+            );
         }
+
+        let range = qmax - qmin;
+        dists
+            .iter_mut()
+            .take(n - remainder)
+            .skip(flat_num)
+            .zip(
+                quantized_dists
+                    .into_iter()
+                    .take(n - remainder)
+                    .skip(flat_num),
+            )
+            .for_each(|(dist, q_dist)| {
+                *dist = (q_dist as u32) * range / 255 + qmin;
+            });
 
         dists
             .into_iter()
