@@ -61,25 +61,13 @@ jobs:
         toolchain: stable
         override: true
     
-    - name: Check for breaking changes
-      id: breaking_changes
+    - name: Validate release type against breaking changes
       env:
         GITHUB_REPOSITORY: ${{ github.repository }}
         GITHUB_SHA: ${{ github.sha }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        python ci/check_breaking_changes.py
-        echo "has_breaking=$?" >> $GITHUB_OUTPUT
-    
-    - name: Validate release type
-      run: |
-        if [ "${{ steps.breaking_changes.outputs.has_breaking }}" == "1" ]; then
-          if [ "${{ inputs.release_type }}" == "patch" ]; then
-            echo "Error: Breaking changes detected but patch release requested"
-            echo "Please use minor or major release type"
-            exit 1
-          fi
-        fi
+        python ci/check_breaking_changes.py --release-type ${{ inputs.release_type }}
     
     - name: Get current version
       id: current_version
