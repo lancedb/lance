@@ -173,8 +173,6 @@ impl FullSchemaMergeInsertExec {
 
     /// Creates a filtered stream that captures row addresses for deletion and returns
     /// a stream with only the source data columns (no _rowaddr or action columns)
-    /// If enabled stable row id, we would buffer all the batches and make all the
-    /// update record batches before all the insert batches.
     fn create_filtered_write_stream(
         &self,
         input_stream: SendableRecordBatchStream,
