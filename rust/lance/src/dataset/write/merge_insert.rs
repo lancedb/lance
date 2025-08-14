@@ -2071,50 +2071,152 @@ mod tests {
         assert_eq!(merge_stats.num_deleted_rows, stats[2]);
     }
 
-    #[rstest::rstest]
-    #[tokio::test]
-    async fn test_basic_merge(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-    ) {
-        let schema = Arc::new(Schema::new(vec![
+    fn create_test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
             Field::new("filterme", DataType::Utf8, false),
-        ]));
+        ]))
+    }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+    fn create_initial_batch(schema: Arc<Schema>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
                 Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
                 Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
             ],
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(
-            Dataset::write(
-                batches,
-                test_uri,
-                Some(WriteParams::with_storage_version(version)),
-            )
-            .await
-            .unwrap(),
-        );
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
+    fn create_new_batch(schema: Arc<Schema>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
                 Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
                 Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
             ],
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn create_test_dataset(
+        schema: Arc<Schema>,
+        batch: RecordBatch,
+        test_uri: &str,
+        version: LanceFileVersion,
+        enable_move_stable_row_ids: bool,
+    ) -> Arc<Dataset> {
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            data_storage_version: Some(version),
+            enable_move_stable_row_ids,
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        Arc::new(
+            Dataset::write(batches, test_uri, Some(write_params))
+                .await
+                .unwrap(),
+        )
+    }
+
+    async fn get_row_ids_for_keys(dataset: &Dataset, keys: &[u32]) -> UInt64Array {
+        let filter = format!(
+            "key IN ({})",
+            keys.iter()
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let batch = dataset
+            .scan()
+            .filter(&filter)
+            .unwrap()
+            .with_row_id()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .clone()
+    }
+
+    async fn test_stable_row_ids_helper(
+        version: LanceFileVersion,
+        enable_move_stable_row_ids: bool,
+        test_keys: &[u32],
+        expected_left_keys: &[u32],
+        expected_right_keys: &[u32],
+        expected_stats: &[u64],
+        job_builder: impl FnOnce(Arc<Dataset>) -> MergeInsertJob,
+    ) {
+        let schema = create_test_schema();
+        let batch = create_initial_batch(schema.clone());
+        let new_batch = create_new_batch(schema.clone());
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let ds =
+            create_test_dataset(schema, batch, test_uri, version, enable_move_stable_row_ids).await;
+
+        let row_ids_before = get_row_ids_for_keys(&ds, test_keys).await;
+
+        let job = job_builder(ds);
+        check(
+            new_batch,
+            job,
+            expected_left_keys,
+            expected_right_keys,
+            expected_stats,
+        )
+        .await;
+
+        let ds = Dataset::open(test_uri).await.unwrap();
+        let row_ids_after = get_row_ids_for_keys(&ds, test_keys).await;
+
+        if enable_move_stable_row_ids {
+            assert_eq!(row_ids_before, row_ids_after);
+        } else {
+            assert_ne!(row_ids_before, row_ids_after);
+        }
+    }
+
+    fn create_delete_condition() -> Expr {
+        Expr::gt(
+            Expr::Column(Column::new_unqualified("key")),
+            Expr::Literal(ScalarValue::UInt32(Some(1)), None),
+        )
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_basic_merge(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+    ) {
+        let schema = create_test_schema();
+        let batch = create_initial_batch(schema.clone());
+        let new_batch = create_new_batch(schema.clone());
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let ds = create_test_dataset(schema, batch, test_uri, version, false).await;
 
         // Quick test that no on-keys is not valid and fails
         assert!(MergeInsertBuilder::try_new(ds.clone(), vec![]).is_err());
@@ -2239,10 +2341,7 @@ mod tests {
         check(new_batch.clone(), job, &[4, 5, 6], &[], &[0, 0, 3]).await;
 
         // For the "delete some" tests we use key > 1
-        let condition = Expr::gt(
-            Expr::Column(Column::new_unqualified("key")),
-            Expr::Literal(ScalarValue::UInt32(Some(1)), None),
-        );
+        let condition = create_delete_condition();
         // find-or-create, with delete some
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
             .unwrap()
@@ -2296,222 +2395,28 @@ mod tests {
 
     #[rstest::rstest]
     #[tokio::test]
-    async fn test_merge_with_fast_path(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_move_stable_row_ids: bool,
-    ) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
-            Field::new("filterme", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
-            ],
-        )
-        .unwrap();
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
-            data_storage_version: Some(version),
-            enable_move_stable_row_ids,
-            ..Default::default()
-        };
-
-        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
-                .await
-                .unwrap(),
-        );
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
-                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
-                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
-            ],
-        )
-        .unwrap();
-
-        let keys = vec!["key".to_string()];
-
-        // row ids before merge insert (fetch rowid for key 4,5,6)
-        let updating_batch = ds
-            .scan()
-            .filter("key IN (4, 5, 6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_before = updating_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // upsert, no delete, it matches fast path, so the row ids are not been affected
-        // and the row ids are stable.
-        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .try_build()
-            .unwrap();
-        check(
-            new_batch.clone(),
-            job,
-            &[1, 2, 3],
-            &[4, 5, 6, 7, 8, 9],
-            &[3, 3, 0],
-        )
-        .await;
-
-        // row ids after merge insert (fetch rowid for key 4,5,6)
-        let updated_batch = ds
-            .scan()
-            .filter("key IN (4, 5, 6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_after = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // verify row ids for key 4,5,6 are unchanged
-        assert_eq!(row_ids_before, row_ids_after);
-    }
-
-    #[rstest::rstest]
-    #[tokio::test]
     async fn test_upsert_and_delete_all_with_stable_row_id(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_move_stable_row_ids: bool,
     ) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
-            Field::new("filterme", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
-            ],
-        )
-        .unwrap();
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
+        test_stable_row_ids_helper(
+            version,
             enable_move_stable_row_ids,
-            data_storage_version: Some(version),
-            ..Default::default()
-        };
-
-        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
-                .await
-                .unwrap(),
-        );
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
-                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
-                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
-            ],
+            &[4, 5, 6],
+            &[],
+            &[4, 5, 6, 7, 8, 9],
+            &[3, 3, 3],
+            |ds| {
+                let keys = vec!["key".to_string()];
+                MergeInsertBuilder::try_new(ds, keys)
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                    .try_build()
+                    .unwrap()
+            },
         )
-        .unwrap();
-
-        let keys = vec!["key".to_string()];
-
-        // row ids before merge insert (fetch rowid for keys in 4,5,6)
-        let updating_batch = ds
-            .scan()
-            .filter("key IN (4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_before = updating_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // upsert, with delete all
-        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
-            .try_build()
-            .unwrap();
-        check(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3]).await;
-
-        // row ids after merge insert (fetch rowid for key = 4,5,6)
-        let ds = Dataset::open(test_uri).await.unwrap();
-        let updated_batch = ds
-            .scan()
-            .filter("key IN (4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_after = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // verify row ids for key 4,5,6 is unchanged
-        if enable_move_stable_row_ids {
-            assert_eq!(row_ids_before, row_ids_after);
-        } else {
-            assert_ne!(row_ids_before, row_ids_after);
-        }
+        .await;
     }
 
     #[rstest::rstest]
@@ -2520,110 +2425,23 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_move_stable_row_ids: bool,
     ) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
-            Field::new("filterme", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
-            ],
-        )
-        .unwrap();
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
+        test_stable_row_ids_helper(
+            version,
             enable_move_stable_row_ids,
-            data_storage_version: Some(version),
-            ..Default::default()
-        };
-
-        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
-                .await
-                .unwrap(),
-        );
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
-                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
-                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
-            ],
-        )
-        .unwrap();
-
-        let keys = vec!["key".to_string()];
-
-        let updating_batch = ds
-            .scan()
-            .filter("key IN (4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_before = updating_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // upsert, no delete
-        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .try_build()
-            .unwrap();
-        check(
-            new_batch.clone(),
-            job,
+            &[4, 5, 6],
             &[1, 2, 3],
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 0],
+            |ds| {
+                let keys = vec!["key".to_string()];
+                MergeInsertBuilder::try_new(ds, keys)
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .try_build()
+                    .unwrap()
+            },
         )
         .await;
-
-        let ds = Dataset::open(test_uri).await.unwrap();
-        let updated_batch = ds
-            .scan()
-            .filter("key IN (4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_after = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        if enable_move_stable_row_ids {
-            assert_eq!(row_ids_before, row_ids_after);
-        } else {
-            assert_ne!(row_ids_before, row_ids_after);
-        }
     }
 
     #[rstest::rstest]
@@ -2632,111 +2450,25 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_move_stable_row_ids: bool,
     ) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
-            Field::new("filterme", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
-            ],
-        )
-        .unwrap();
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
+        test_stable_row_ids_helper(
+            version,
             enable_move_stable_row_ids,
-            data_storage_version: Some(version),
-            ..Default::default()
-        };
-
-        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
-            .await
-            .unwrap();
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
-                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
-                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
-            ],
-        )
-        .unwrap();
-
-        let keys = vec!["key".to_string()];
-
-        let ds = Dataset::open(test_uri).await.unwrap();
-        let updating_batch = ds
-            .scan()
-            .filter("key = 6")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_before = updating_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // conditional update, no insert and delete
-        let job = MergeInsertBuilder::try_new(Arc::new(ds.clone()), keys.clone())
-            .unwrap()
-            .when_matched(
-                WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
-            )
-            .try_build()
-            .unwrap();
-        check(
-            new_batch.clone(),
-            job,
+            &[6],
             &[1, 2, 3, 4, 5],
             &[6, 7, 8, 9],
             &[3, 1, 0],
+            |ds| {
+                let keys = vec!["key".to_string()];
+                MergeInsertBuilder::try_new(ds.clone(), keys)
+                    .unwrap()
+                    .when_matched(
+                        WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
+                    )
+                    .try_build()
+                    .unwrap()
+            },
         )
         .await;
-
-        let ds = Dataset::open(test_uri).await.unwrap();
-        let updated_batch = ds
-            .scan()
-            .filter("key = 6")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_after = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        if enable_move_stable_row_ids {
-            assert_eq!(row_ids_before, row_ids_after);
-        } else {
-            assert_ne!(row_ids_before, row_ids_after);
-        }
     }
 
     #[rstest::rstest]
@@ -2745,104 +2477,24 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_move_stable_row_ids: bool,
     ) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
-            Field::new("filterme", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
-            ],
-        )
-        .unwrap();
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
+        test_stable_row_ids_helper(
+            version,
             enable_move_stable_row_ids,
-            data_storage_version: Some(version),
-            ..Default::default()
-        };
-
-        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
-                .await
-                .unwrap(),
-        );
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
-                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
-                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
-            ],
+            &[4, 5, 6],
+            &[1, 2, 3],
+            &[4, 5, 6],
+            &[0, 3, 0],
+            |ds| {
+                let keys = vec!["key".to_string()];
+                MergeInsertBuilder::try_new(ds, keys)
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .try_build()
+                    .unwrap()
+            },
         )
-        .unwrap();
-
-        let keys = vec!["key".to_string()];
-
-        let updating_batch = ds
-            .scan()
-            .filter("key IN (4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_before = updating_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // only update, no insert and delete
-        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::DoNothing)
-            .try_build()
-            .unwrap();
-        check(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6], &[0, 3, 0]).await;
-
-        let ds = Dataset::open(test_uri).await.unwrap();
-        let updated_batch = ds
-            .scan()
-            .filter("key IN (4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_after = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        if enable_move_stable_row_ids {
-            assert_eq!(row_ids_before, row_ids_after);
-        } else {
-            assert_ne!(row_ids_before, row_ids_after);
-        }
+        .await;
     }
 
     #[rstest::rstest]
@@ -2851,125 +2503,25 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_move_stable_row_ids: bool,
     ) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
-            Field::new("filterme", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
-            ],
-        )
-        .unwrap();
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
+        test_stable_row_ids_helper(
+            version,
             enable_move_stable_row_ids,
-            data_storage_version: Some(version),
-            ..Default::default()
-        };
-
-        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
-                .await
-                .unwrap(),
-        );
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
-                Arc::new(UInt32Array::from(vec![2, 2, 2, 2, 2, 2])),
-                Arc::new(StringArray::from(vec!["A", "B", "C", "A", "B", "C"])),
-            ],
-        )
-        .unwrap();
-
-        let keys = vec!["key".to_string()];
-
-        let updating_batch = ds
-            .scan()
-            .filter("key IN (1,4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_before = updating_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        // upsert, conditional delete the records key > 1 in not matched by source
-        let condition = Expr::gt(
-            Expr::Column(Column::new_unqualified("key")),
-            Expr::Literal(ScalarValue::UInt32(Some(1)), None),
-        );
-        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
-            .try_build()
-            .unwrap();
-        check(
-            new_batch.clone(),
-            job,
+            &[1, 4, 5, 6],
             &[1],
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 2],
+            |ds| {
+                let keys = vec!["key".to_string()];
+                let condition = create_delete_condition();
+                MergeInsertBuilder::try_new(ds, keys)
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
+                    .try_build()
+                    .unwrap()
+            },
         )
         .await;
-
-        let ds = Dataset::open(test_uri).await.unwrap();
-        let updated_batch = ds
-            .scan()
-            .filter("key IN (1,4,5,6)")
-            .unwrap()
-            .with_row_id()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let row_ids_after = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-
-        if enable_move_stable_row_ids {
-            // key=1应该保持原row id，key=4,5,6更新后也应该保持原row id
-            assert_eq!(row_ids_before, row_ids_after);
-        } else {
-            // 非stable模式下，被更新的行的row ids会发生变化
-            // key=1可能保持不变，key=4,5,6会变化
-            let key_1_before = row_ids_before.value(0);
-            let key_1_after = row_ids_after.value(0);
-            assert_eq!(key_1_before, key_1_after); // key=1未更新，row id应保持不变
-
-            // key=4,5,6的row ids在非stable模式下应该变化
-            for i in 1..4 {
-                assert_ne!(row_ids_before.value(i), row_ids_after.value(i));
-            }
-        }
     }
 
     #[tokio::test]
