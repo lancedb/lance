@@ -18,6 +18,8 @@ import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import com.lancedb.lance.operation.UpdateConfig;
+import com.lancedb.lance.operation.UpdateMap;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceSchema;
 import com.lancedb.lance.schema.SqlExpressions;
@@ -769,21 +771,20 @@ public class Dataset implements Closeable {
    * existing config.
    *
    * @param tableConfig the config to update
+   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
    */
+  @Deprecated
   public void updateConfig(Map<String, String> tableConfig) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeUpdateConfig(tableConfig);
-    }
+    updateConfig(tableConfig, false);
   }
-
-  private native void nativeUpdateConfig(Map<String, String> config);
 
   /**
    * Delete the config keys of the dataset.
    *
    * @param deleteKeys the config keys to delete
+   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
    */
+  @Deprecated
   public void deleteConfigKeys(Set<String> deleteKeys) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -846,36 +847,75 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Replace the schema metadata of the dataset.
+   * Get the table metadata of the dataset.
    *
-   * @param metadata the new table metadata
+   * @return the table metadata as a map of key-value pairs
    */
-  public void replaceSchemaMetadata(Map<String, String> metadata) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+  public Map<String, String> getTableMetadata() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeReplaceSchemaMetadata(metadata);
+      return nativeGetTableMetadata();
     }
   }
 
-  private native void nativeReplaceSchemaMetadata(Map<String, String> metadata);
+  private native Map<String, String> nativeGetTableMetadata();
+
+  /**
+   * Update the configuration of the dataset.
+   *
+   * <p>This method supports both incremental updates (default) and full replacement.
+   *
+   * @param values configuration updates where keys are config keys and values are: - String: Set
+   *     the config key to this value - null: Remove the config key (ignored in replace mode)
+   * @param replace if true, completely replace all configuration with the provided values. If
+   *     false, incrementally update only the specified keys.
+   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
+   */
+  @Deprecated
+  public void updateConfig(Map<String, String> values, boolean replace) {
+    // Route through the transaction builder API as recommended
+    UpdateMap configUpdate = UpdateMap.builder().updates(values).replace(replace).build();
+
+    UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
+
+    newTransactionBuilder().operation(operation).build().commit();
+  }
+
+  private native void nativeUpdateConfig(Map<String, String> values, boolean replace);
+
+  /**
+   * Replace the schema metadata of the dataset.
+   *
+   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
+   * @param metadata the new schema metadata
+   */
+  @Deprecated
+  public void replaceSchemaMetadata(Map<String, String> metadata) {
+    UpdateMap schemaUpdate = UpdateMap.builder().updates(metadata).replace(true).build();
+
+    UpdateConfig operation = UpdateConfig.builder().schemaMetadataUpdates(schemaUpdate).build();
+
+    newTransactionBuilder().operation(operation).build().commit();
+  }
 
   /**
    * Replace target field metadata of the dataset. This method won't affect fields not in the map
    *
+   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
    * @param fieldMetadataMap field id to metadata map
    */
+  @Deprecated
   public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      for (Integer fieldId : fieldMetadataMap.keySet()) {
-        Preconditions.checkArgument(fieldId >= 0, "Field id must be greater than 0");
-      }
-      nativeReplaceFieldMetadata(fieldMetadataMap);
+    Map<Integer, UpdateMap> fieldUpdates = new HashMap<>();
+    for (Map.Entry<Integer, Map<String, String>> entry : fieldMetadataMap.entrySet()) {
+      UpdateMap fieldUpdate = UpdateMap.builder().updates(entry.getValue()).replace(true).build();
+      fieldUpdates.put(entry.getKey(), fieldUpdate);
     }
-  }
 
-  private native void nativeReplaceFieldMetadata(
-      Map<Integer, Map<String, String>> fieldMetadataMap);
+    UpdateConfig operation = UpdateConfig.builder().fieldMetadataUpdates(fieldUpdates).build();
+
+    newTransactionBuilder().operation(operation).build().commit();
+  }
 
   /** Tag operations of the dataset. */
   public class Tags {

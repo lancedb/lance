@@ -13,45 +13,44 @@
  */
 package com.lancedb.lance.operation;
 
-import java.util.List;
 import java.util.Map;
 
 /**
- * Update the dataset configuration. This operation allows updating configuration values, deleting
- * configuration keys, and modifying schema and field metadata.
+ * Update the dataset configuration. This operation allows updating configuration values, schema
+ * metadata, table metadata, and field metadata using the UpdateMap pattern.
  */
 public class UpdateConfig implements Operation {
 
-  private final Map<String, String> upsertValues;
-  private final List<String> deleteKeys;
-  private final Map<String, String> schemaMetadata;
-  private final Map<Integer, Map<String, String>> fieldMetadata;
+  private final UpdateMap configUpdates;
+  private final UpdateMap tableMetadataUpdates;
+  private final UpdateMap schemaMetadataUpdates;
+  private final Map<Integer, UpdateMap> fieldMetadataUpdates;
 
   private UpdateConfig(
-      Map<String, String> upsertValues,
-      List<String> deleteKeys,
-      Map<String, String> schemaMetadata,
-      Map<Integer, Map<String, String>> fieldMetadata) {
-    this.upsertValues = upsertValues;
-    this.deleteKeys = deleteKeys;
-    this.schemaMetadata = schemaMetadata;
-    this.fieldMetadata = fieldMetadata;
+      UpdateMap configUpdates,
+      UpdateMap tableMetadataUpdates,
+      UpdateMap schemaMetadataUpdates,
+      Map<Integer, UpdateMap> fieldMetadataUpdates) {
+    this.configUpdates = configUpdates;
+    this.tableMetadataUpdates = tableMetadataUpdates;
+    this.schemaMetadataUpdates = schemaMetadataUpdates;
+    this.fieldMetadataUpdates = fieldMetadataUpdates;
   }
 
-  public Map<String, String> upsertValues() {
-    return upsertValues;
+  public UpdateMap configUpdates() {
+    return configUpdates;
   }
 
-  public List<String> deleteKeys() {
-    return deleteKeys;
+  public UpdateMap tableMetadataUpdates() {
+    return tableMetadataUpdates;
   }
 
-  public Map<String, String> schemaMetadata() {
-    return schemaMetadata;
+  public UpdateMap schemaMetadataUpdates() {
+    return schemaMetadataUpdates;
   }
 
-  public Map<Integer, Map<String, String>> fieldMetadata() {
-    return fieldMetadata;
+  public Map<Integer, UpdateMap> fieldMetadataUpdates() {
+    return fieldMetadataUpdates;
   }
 
   @Override
@@ -62,14 +61,14 @@ public class UpdateConfig implements Operation {
   @Override
   public String toString() {
     return "UpdateConfig{"
-        + "upsertValues="
-        + upsertValues
-        + ", deleteKeys="
-        + deleteKeys
-        + ", schemaMetadata="
-        + schemaMetadata
-        + ", fieldMetadata="
-        + fieldMetadata
+        + "configUpdates="
+        + configUpdates
+        + ", tableMetadataUpdates="
+        + tableMetadataUpdates
+        + ", schemaMetadataUpdates="
+        + schemaMetadataUpdates
+        + ", fieldMetadataUpdates="
+        + fieldMetadataUpdates
         + '}';
   }
 
@@ -78,35 +77,36 @@ public class UpdateConfig implements Operation {
   }
 
   public static class Builder {
-    private Map<String, String> upsertValues;
-    private List<String> deleteKeys;
-    private Map<String, String> schemaMetadata;
-    private Map<Integer, Map<String, String>> fieldMetadata;
+    private UpdateMap configUpdates;
+    private UpdateMap tableMetadataUpdates;
+    private UpdateMap schemaMetadataUpdates;
+    private Map<Integer, UpdateMap> fieldMetadataUpdates;
 
     public Builder() {}
 
-    public Builder upsertValues(Map<String, String> upsertValues) {
-      this.upsertValues = upsertValues;
+    public Builder configUpdates(UpdateMap configUpdates) {
+      this.configUpdates = configUpdates;
       return this;
     }
 
-    public Builder deleteKeys(List<String> deleteKeys) {
-      this.deleteKeys = deleteKeys;
+    public Builder tableMetadataUpdates(UpdateMap tableMetadataUpdates) {
+      this.tableMetadataUpdates = tableMetadataUpdates;
       return this;
     }
 
-    public Builder schemaMetadata(Map<String, String> schemaMetadata) {
-      this.schemaMetadata = schemaMetadata;
+    public Builder schemaMetadataUpdates(UpdateMap schemaMetadataUpdates) {
+      this.schemaMetadataUpdates = schemaMetadataUpdates;
       return this;
     }
 
-    public Builder fieldMetadata(Map<Integer, Map<String, String>> fieldMetadata) {
-      this.fieldMetadata = fieldMetadata;
+    public Builder fieldMetadataUpdates(Map<Integer, UpdateMap> fieldMetadataUpdates) {
+      this.fieldMetadataUpdates = fieldMetadataUpdates;
       return this;
     }
 
     public UpdateConfig build() {
-      return new UpdateConfig(upsertValues, deleteKeys, schemaMetadata, fieldMetadata);
+      return new UpdateConfig(
+          configUpdates, tableMetadataUpdates, schemaMetadataUpdates, fieldMetadataUpdates);
     }
   }
 }
