@@ -10,7 +10,7 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, ROW_ID};
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::location;
@@ -158,7 +158,10 @@ impl RetryExecutor for DeleteJob {
     async fn execute_impl(&self) -> Result<Self::Data> {
         // Create a single scanner for the entire dataset
         let mut scanner = self.dataset.scan();
-        scanner.with_row_id().filter(&self.predicate)?;
+        scanner
+            .with_row_id()
+            .project(&[ROW_ID])?
+            .filter(&self.predicate)?;
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
         let (updated_fragments, deleted_fragment_ids) =
@@ -252,19 +255,21 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::InsertBuilder;
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
     use arrow::datatypes::UInt32Type;
     use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use arrow_select::concat::concat_batches;
+    use futures::TryStreamExt;
     use lance_file::version::LanceFileVersion;
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
     use rstest::rstest;
     use std::collections::HashSet;
     use std::ops::Range;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[rstest]
     #[tokio::test]
@@ -273,111 +278,279 @@ mod tests {
         data_storage_version: LanceFileVersion,
         #[values(false, true)] with_scalar_index: bool,
     ) {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::UInt32, false),
+                ArrowField::new("x", DataType::UInt32, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from_iter_values(range.clone())),
+                    Arc::new(UInt32Array::from_iter_values(range.map(|v| v * 2))),
+                ],
+            )
+            .unwrap()
+        }
+        // Write a dataset
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::UInt32, false),
-            ArrowField::new("x", DataType::UInt32, false),
-        ]));
-
-        let batches: Vec<RecordBatch> = (0..20)
-            .map(|i| {
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![
-                        Arc::new(UInt32Array::from_iter_values(i * 10..(i + 1) * 10)),
-                        Arc::new(UInt32Array::from_iter_values(i * 10..(i + 1) * 10)),
-                    ],
-                )
-                .unwrap()
-            })
-            .collect();
-
-        let mut write_params = WriteParams {
-            max_rows_per_file: 40,
-            max_rows_per_group: 10,
-            ..Default::default()
-        };
-        write_params.data_storage_version = Some(data_storage_version);
-
-        let batches = concat_batches(&schema, &batches).unwrap();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batches)], schema.clone()),
-            &tmp_path,
-            Some(write_params.clone()),
-        )
-        .await
-        .unwrap();
+        let data = sequence_data(0..100);
+        // Split over two files.
+        let batches = vec![data.slice(0, 50), data.slice(50, 50)];
+        let mut dataset = TestDatasetGenerator::new(batches, data_storage_version)
+            .make_hostile(&tmp_path)
+            .await;
 
         if with_scalar_index {
             dataset
                 .create_index(
                     &["i"],
                     IndexType::Scalar,
-                    None,
+                    Some("scalar_index".to_string()),
                     &ScalarIndexParams::default(),
-                    true,
+                    false,
                 )
                 .await
                 .unwrap();
         }
 
-        let original_len = dataset.count_rows(None).await.unwrap();
-        assert_eq!(original_len, 200);
-
-        let _original_fragments = dataset.get_fragments().to_vec();
-
-        // Test false predicate
-        delete(&mut dataset, "false").await.unwrap();
-        dataset.validate().await.unwrap();
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
-
-        // Delete some data
-        delete(&mut dataset, "i >= 100").await.unwrap();
+        // Delete nothing
+        dataset.delete("i < 0").await.unwrap();
         dataset.validate().await.unwrap();
 
-        let new_len = dataset.count_rows(None).await.unwrap();
-        assert_eq!(new_len, 100);
+        // We should not have any deletion file still
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(dataset.count_fragments(), 2);
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 0);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(1));
+        assert!(fragments[0].metadata.deletion_file.is_none());
+        assert!(fragments[1].metadata.deletion_file.is_none());
 
-        // Test that we can delete more data
-        delete(&mut dataset, "i >= 50").await.unwrap();
+        // Delete rows
+        dataset.delete("i < 10 OR i >= 90").await.unwrap();
         dataset.validate().await.unwrap();
 
-        let newest_len = dataset.count_rows(None).await.unwrap();
-        assert_eq!(newest_len, 50);
-
-        // Double-check with a scan
-        let values = dataset
-            .scan()
-            .try_into_batch()
-            .await
-            .unwrap()
-            .column(0)
-            .as_primitive::<UInt32Type>()
-            .values()
-            .to_vec();
-        assert_eq!(values, (0..50).collect::<Vec<_>>());
-
-        // Double check there are no duplicates
+        // Verify result:
+        // There should be a deletion file in the metadata
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(dataset.count_fragments(), 2);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+        assert!(fragments[1].metadata.deletion_file.is_some());
         assert_eq!(
-            values.len(),
-            values.into_iter().collect::<HashSet<_>>().len()
+            fragments[0]
+                .metadata
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows,
+            Some(10)
+        );
+        assert_eq!(
+            fragments[1]
+                .metadata
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows,
+            Some(10)
         );
 
-        if !with_scalar_index {
-            // After deletes, we should have 2 fragments: fragments 2, 3, 4 were fully deleted
-            let current_fragments = dataset.get_fragments();
-            assert_eq!(current_fragments.len(), 2);
+        // The deletion file should contain 20 rows
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
+        // First fragment has 0..10 deleted
+        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(deletion_vector.len(), 10);
+        assert_eq!(
+            deletion_vector.iter().collect::<HashSet<_>>(),
+            (0..10).collect::<HashSet<_>>()
+        );
+        // Second fragment has 90..100 deleted
+        let deletion_vector = fragments[1].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(deletion_vector.len(), 10);
+        // The second fragment starts at 50, so 90..100 becomes 40..50 in local row ids.
+        assert_eq!(
+            deletion_vector.iter().collect::<HashSet<_>>(),
+            (40..50).collect::<HashSet<_>>()
+        );
+        let second_deletion_file = fragments[1].metadata.deletion_file.clone().unwrap();
 
-            // Fragment 0 should be untouched (rows 0-39)
-            assert_eq!(current_fragments[0].id(), 0);
-            assert!(current_fragments[0].metadata.deletion_file.is_none());
+        // Delete more rows
+        dataset.delete("i < 20").await.unwrap();
+        dataset.validate().await.unwrap();
 
-            // Fragment 1 should have a deletion vector (rows 40-79, with 50-79 deleted)
-            assert_eq!(current_fragments[1].id(), 1);
-            assert!(current_fragments[1].metadata.deletion_file.is_some());
+        // Verify result
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 30);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+        let deletion_vector = fragments[0].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(deletion_vector.len(), 20);
+        assert_eq!(
+            deletion_vector.iter().collect::<HashSet<_>>(),
+            (0..20).collect::<HashSet<_>>()
+        );
+        // Second deletion vector was not rewritten
+        assert_eq!(
+            fragments[1].metadata.deletion_file.as_ref().unwrap(),
+            &second_deletion_file
+        );
+
+        // Delete full fragment
+        dataset.delete("i >= 50").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Verify second fragment is fully gone
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(dataset.count_fragments(), 1);
+        assert_eq!(fragments[0].id(), 0);
+
+        // Verify the count_deleted_rows only contains the rows from the first fragment
+        // i.e. - deleted_rows from the fragment that has been deleted are not counted
+        assert_eq!(dataset.count_deleted_rows().await.unwrap(), 20);
+
+        // Append after delete
+        let data = sequence_data(0..100);
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&write_params)
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        dataset.validate().await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(dataset.count_fragments(), 2);
+        // Fragment id picks up where we left off
+        assert_eq!(fragments[0].id(), 0);
+        assert_eq!(fragments[1].id(), 2);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_single_scanner() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::UInt32, false),
+                ArrowField::new("x", DataType::UInt32, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(UInt32Array::from_iter_values(range.clone())),
+                    Arc::new(UInt32Array::from_iter_values(range.map(|v| v * 2))),
+                ],
+            )
+            .unwrap()
         }
+
+        // Create dataset with multiple fragments
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+
+        // Create 5 fragments with 100 rows each
+        let mut batches = Vec::new();
+        for i in 0..5 {
+            let start = i * 100;
+            let end = (i + 1) * 100;
+            let data = sequence_data(start..end);
+            batches.push(data);
+        }
+
+        let mut dataset = TestDatasetGenerator::new(batches, LanceFileVersion::Stable)
+            .make_hostile(&tmp_path)
+            .await;
+
+        // Delete rows across multiple fragments using the new scanner-based implementation
+        let predicate = "i >= 50 AND i < 150";
+        dataset.delete(predicate).await.unwrap();
+
+        // Verify the deletion worked correctly
+        let mut scanner = dataset.scan();
+        scanner.filter(predicate).unwrap();
+        let count = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(0, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count, 0,
+            "All rows matching the predicate should be deleted"
+        );
+
+        // Verify that rows outside the predicate still exist
+        let mut remaining_scanner = dataset.scan();
+        remaining_scanner.filter("i < 50 OR i >= 150").unwrap();
+        let remaining_count = remaining_scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(0, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            remaining_count, 400,
+            "400 rows should remain after deletion"
+        );
+
+        // Check that fragments were handled correctly
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() == 5, "All fragments should still exist");
+
+        // Fragment 0 (rows 0-99) should have 50 deletions (50-99)
+        let frag0_dv = fragments[0].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(frag0_dv.len(), 50);
+
+        // Fragment 1 (rows 100-199) should be fully deleted or have 50 deletions (100-149)
+        let frag1_dv = fragments[1].get_deletion_vector().await.unwrap().unwrap();
+        assert_eq!(frag1_dv.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_delete_false_predicate_still_commits() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::UInt32,
+                false,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
+                .unwrap()
+        }
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
+
+        let data = sequence_data(0..100);
+        let mut dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
+            .make_hostile(&tmp_path)
+            .await;
+
+        let initial_version = dataset.version().version;
+
+        // Delete with false predicate - should still commit but not delete anything
+        dataset.delete("false").await.unwrap();
+
+        // Verify version incremented (commit happened)
+        assert_eq!(dataset.version().version, initial_version + 1);
+
+        // Verify no rows were deleted
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 100);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_none());
     }
 
     #[rstest]
@@ -433,7 +606,7 @@ mod tests {
         assert_eq!(original_len, 200);
 
         // Delete some data using predicate that's fully covered by scalar index
-        delete(&mut dataset, "i >= 100 AND i <= 149").await.unwrap();
+        dataset.delete("i >= 100 AND i <= 149").await.unwrap();
         dataset.validate().await.unwrap();
 
         let new_len = dataset.count_rows(None).await.unwrap();
@@ -591,38 +764,5 @@ mod tests {
             // Might succeed if the operation is very fast
             assert!(result.is_ok());
         }
-    }
-
-    #[tokio::test]
-    async fn test_delete_false_predicate_still_commits() {
-        fn sequence_data(range: Range<u32>) -> RecordBatch {
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "i",
-                DataType::UInt32,
-                false,
-            )]));
-            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
-                .unwrap()
-        }
-
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
-
-        let data = sequence_data(0..100);
-        let dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
-            .make_hostile(&tmp_path)
-            .await;
-
-        let dataset = Arc::new(dataset);
-        let original_version = dataset.version().version;
-
-        // Delete with false predicate should still create a new version
-        let new_dataset = DeleteBuilder::new(dataset.clone(), "false")
-            .execute()
-            .await
-            .unwrap();
-
-        assert_eq!(new_dataset.version().version, original_version + 1);
-        assert_eq!(new_dataset.count_rows(None).await.unwrap(), 100);
     }
 }
