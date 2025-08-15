@@ -389,7 +389,7 @@ impl BinaryEncoder {
 // Zero offset is removed from the start of the offsets array
 // The indices array is computed across all arrays in the vector
 fn get_indices_from_string_arrays(
-    mut offsets: LanceBuffer,
+    offsets: LanceBuffer,
     bits_per_offset: u8,
     nulls: Option<LanceBuffer>,
     num_rows: usize,

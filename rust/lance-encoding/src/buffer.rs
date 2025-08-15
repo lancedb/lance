@@ -6,8 +6,8 @@
 use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
-
-use lance_core::{utils::bit::is_pwr_two, Result};
+use lance_core::{utils::bit::is_pwr_two, Error, Result};
+use snafu::location;
 
 /// A copy-on-write byte buffer backed by Arrow Buffer
 ///
@@ -91,6 +91,8 @@ impl LanceBuffer {
     /// If `bytes_per_value` is not a power of two, then we assume the buffer is
     /// never going to be reinterpret into another type and we can safely
     /// ignore the alignment.
+    ///
+    /// This is a zero-copy operation when the buffer is properly aligned.
     pub fn from_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self {
         if is_pwr_two(bytes_per_value) && bytes.as_ptr().align_offset(bytes_per_value as usize) != 0
         {
@@ -116,28 +118,9 @@ impl LanceBuffer {
         self.0.into_vec::<u8>().unwrap().into()
     }
 
-    /// Convert into a borrowed buffer, this is now a no-op since all buffers are borrowed
-    pub fn into_borrowed(self) -> Self {
-        self
-    }
-
     /// Creates an owned copy of the buffer, will always involve a full copy of the bytes
     pub fn to_owned(&self) -> Self {
         Self(Buffer::from_vec(self.0.to_vec()))
-    }
-
-    /// Creates a clone of the buffer (cheap, reference counted)
-    ///
-    /// This method exists for backwards compatibility but now just calls clone()
-    pub fn borrow_and_clone(&mut self) -> Self {
-        self.clone()
-    }
-
-    /// Clones the buffer (always cheap, reference counted)
-    ///
-    /// This method exists for backwards compatibility
-    pub fn try_clone(&self) -> Result<Self> {
-        Ok(self.clone())
     }
 
     /// Make an owned copy of the buffer (always does a copy of the data)
@@ -146,11 +129,24 @@ impl LanceBuffer {
     }
 
     /// Reinterprets a Vec<T> as a LanceBuffer
+    ///
+    /// This is a zero-copy operation. We can safely reinterpret Vec<T> into &[u8] which is what happens here.
+    /// However, we cannot safely reinterpret a Vec<T> into a Vec<u8> in rust due to alignment constraints
+    /// from [`Vec::from_raw_parts`]:
+    ///
+    /// > `T` needs to have the same alignment as what `ptr` was allocated with.
+    /// > (`T` having a less strict alignment is not sufficient, the alignment really
+    /// > needs to be equal to satisfy the [`dealloc`] requirement that memory must be
+    /// > allocated and deallocated with the same layout.)
     pub fn reinterpret_vec<T: ArrowNativeType>(vec: Vec<T>) -> Self {
         Self(Buffer::from_vec(vec))
     }
 
     /// Reinterprets Arc<[T]> as a LanceBuffer
+    ///
+    /// This is similar to [`Self::reinterpret_vec`] but for Arc<[T]> instead of Vec<T>
+    ///
+    /// The same alignment constraints apply
     pub fn reinterpret_slice<T: ArrowNativeType + RefUnwindSafe>(arc: Arc<[T]>) -> Self {
         let slice = arc.as_ref();
         let data = NonNull::new(slice.as_ptr() as _).unwrap_or(NonNull::dangling());
@@ -168,7 +164,7 @@ impl LanceBuffer {
     /// of the data.  Lance does not support big-endian machines so this is safe.  However, if we end
     /// up supporting big-endian machines in the future, then any use of this method will need to be
     /// carefully reviewed.
-    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> ScalarBuffer<T> {
+    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&self) -> ScalarBuffer<T> {
         let align = std::mem::align_of::<T>();
         let is_aligned = self.as_ptr().align_offset(align) == 0;
         if self.len() % std::mem::size_of::<T>() != 0 {
@@ -211,9 +207,6 @@ impl LanceBuffer {
     ///
     /// Unlike concat_into_one this "zips" the buffers, interleaving the values
     pub fn zip_into_one(buffers: Vec<(Self, u64)>, num_values: u64) -> Result<Self> {
-        use lance_core::Error;
-        use snafu::location;
-
         let bytes_per_value = buffers.iter().map(|(_, bits_per_value)| {
             if bits_per_value % 8 == 0 {
                 Ok(bits_per_value / 8)
@@ -281,19 +274,6 @@ impl LanceBuffer {
         Self(self.0.slice_with_length(offset, length))
     }
 
-    // Backport of https://github.com/apache/arrow-rs/pull/6707
-    fn arrow_bit_slice(
-        buf: &arrow_buffer::Buffer,
-        offset: usize,
-        len: usize,
-    ) -> arrow_buffer::Buffer {
-        if offset % 8 == 0 {
-            return buf.slice_with_length(offset / 8, len.div_ceil(8));
-        }
-
-        arrow_buffer::bitwise_unary_op_helper(buf, offset, len, |a| a)
-    }
-
     /// Returns a new [LanceBuffer] that is a slice of this buffer starting at bit `offset`
     /// with `length` bits.
     ///
@@ -304,10 +284,8 @@ impl LanceBuffer {
     ///
     /// This means, given the bit buffer 0bABCDEFGH_HIJKLMNOP and the slice starting at bit 3 and
     /// with length 8, the result will be 0bNOPABCDE
-    pub fn bit_slice_le_with_length(&mut self, offset: usize, length: usize) -> Self {
-        // Use this and remove backport once we upgrade to arrow-rs 54
-        // let sliced = self.0.bit_slice(offset, length);
-        let sliced = Self::arrow_bit_slice(&self.0, offset, length);
+    pub fn bit_slice_le_with_length(&self, offset: usize, length: usize) -> Self {
+        let sliced = self.0.bit_slice(offset, length);
         Self(sliced)
     }
 
@@ -395,7 +373,7 @@ mod tests {
     #[test]
     fn test_reinterpret_vec() {
         let vec = vec![1_u32, 2, 3];
-        let mut buf = LanceBuffer::reinterpret_vec(vec);
+        let buf = LanceBuffer::reinterpret_vec(vec);
 
         let mut expected = Vec::with_capacity(12);
         expected.extend_from_slice(&1_u32.to_ne_bytes());
@@ -462,7 +440,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_to_typed_slice_invalid() {
-        let mut buf = LanceBuffer::from(vec![0, 1, 2]);
+        let buf = LanceBuffer::from(vec![0, 1, 2]);
         buf.borrow_to_typed_slice::<u16>();
     }
 
@@ -470,7 +448,7 @@ mod tests {
     fn test_to_typed_slice() {
         // Buffer is aligned, no copy will be made, both calls
         // should get same ptr
-        let mut buf = LanceBuffer::from(vec![0, 1]);
+        let buf = LanceBuffer::from(vec![0, 1]);
         let borrow = buf.borrow_to_typed_slice::<u16>();
         let view_ptr = borrow.as_ref().as_ptr();
         let borrow2 = buf.borrow_to_typed_slice::<u16>();
@@ -481,7 +459,7 @@ mod tests {
         let bytes = bytes::Bytes::from(vec![0, 1, 2]);
         let sliced = bytes.slice(1..3);
         // Intentionally LYING about alignment here to trigger test
-        let mut buf = LanceBuffer::from_bytes(sliced, 1);
+        let buf = LanceBuffer::from_bytes(sliced, 1);
         let borrow = buf.borrow_to_typed_slice::<u16>();
         let view_ptr = borrow.as_ref().as_ptr();
         let borrow2 = buf.borrow_to_typed_slice::<u16>();
@@ -492,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_bit_slice_le() {
-        let mut buf = LanceBuffer::from(vec![0x0F, 0x0B]);
+        let buf = LanceBuffer::from(vec![0x0F, 0x0B]);
 
         // Keep in mind that validity buffers are *bitwise* little-endian
         assert_eq!(buf.bit_slice_le_with_length(0, 4).as_ref(), &[0x0F]);

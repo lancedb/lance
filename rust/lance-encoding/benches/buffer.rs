@@ -27,7 +27,7 @@ fn bench_zip(c: &mut Criterion) {
             b.iter(move || {
                 let buffers = buffers
                     .iter_mut()
-                    .map(|(buf, bits_per_value)| (buf.borrow_and_clone(), *bits_per_value))
+                    .map(|(buf, bits_per_value)| (buf.clone(), *bits_per_value))
                     .collect::<Vec<_>>();
                 black_box(LanceBuffer::zip_into_one(buffers, num_values as u64).unwrap());
             })
@@ -51,7 +51,7 @@ fn bench_zip(c: &mut Criterion) {
             b.iter(move || {
                 let buffers = buffers
                     .iter_mut()
-                    .map(|(buf, bits_per_value)| (buf.borrow_and_clone(), *bits_per_value))
+                    .map(|(buf, bits_per_value)| (buf.clone(), *bits_per_value))
                     .collect::<Vec<_>>();
                 black_box(LanceBuffer::zip_into_one(buffers, num_values as u64).unwrap());
             })

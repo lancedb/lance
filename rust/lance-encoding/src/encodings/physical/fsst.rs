@@ -42,7 +42,7 @@ struct FsstCompressed {
 impl FsstCompressed {
     fn fsst_compress(data: DataBlock) -> Result<Self> {
         match data {
-            DataBlock::VariableWidth(mut variable_width) => {
+            DataBlock::VariableWidth(variable_width) => {
                 match variable_width.bits_per_offset {
                     32 => {
                         let offsets = variable_width.offsets.borrow_to_typed_slice::<i32>();
@@ -198,7 +198,7 @@ impl FsstPerValueDecompressor {
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         // Step 1. Run inner decompressor
-        let mut compressed_variable_data = self
+        let compressed_variable_data = self
             .inner_decompressor
             .decompress(data)?
             .as_variable_width()
@@ -300,12 +300,12 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding
         let compressed_data_block = self.inner_decompressor.decompress(data, num_values)?;
-        let DataBlock::VariableWidth(mut compressed_data_block) = compressed_data_block else {
+        let DataBlock::VariableWidth(compressed_data_block) = compressed_data_block else {
             panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
         };
 
         // Step 2. FSST decompress
-        let bytes = compressed_data_block.data.borrow_and_clone();
+        let bytes = &compressed_data_block.data;
         let (decompress_bytes_buf, decompress_offset_buf) =
             if compressed_data_block.bits_per_offset == 64 {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i64>();

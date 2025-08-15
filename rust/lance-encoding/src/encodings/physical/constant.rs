@@ -19,16 +19,14 @@ pub struct ConstantDecompressor {
 
 impl ConstantDecompressor {
     pub fn new(scalar: LanceBuffer) -> Self {
-        Self {
-            scalar: scalar.into_borrowed(),
-        }
+        Self { scalar }
     }
 }
 
 impl BlockDecompressor for ConstantDecompressor {
     fn decompress(&self, _data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         Ok(DataBlock::Constant(ConstantDataBlock {
-            data: self.scalar.try_clone().unwrap(),
+            data: self.scalar.clone(),
             num_values,
         }))
     }

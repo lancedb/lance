@@ -121,7 +121,7 @@ impl PageScheduler for DictionaryPageScheduler {
 
                 let decoded_dict = items_decoder
                     .decode(0, num_dictionary_items as u64)?
-                    .borrow_and_clone();
+                    .clone();
 
                 let indices_decoder = indices_page_decoder.await?;
 
@@ -148,7 +148,7 @@ impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
             .decode(rows_to_skip, num_rows)?
             .as_fixed_width()
             .unwrap();
-        let dict = self.decoded_dict.try_clone()?;
+        let dict = self.decoded_dict.clone();
         Ok(DataBlock::Dictionary(DictionaryDataBlock {
             indices,
             dictionary: Box::new(dict),

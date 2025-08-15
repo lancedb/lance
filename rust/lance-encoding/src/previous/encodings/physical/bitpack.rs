@@ -298,7 +298,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 let encoding = ProtobufUtils::basic_all_null_encoding();
                 Ok(EncodedArray { data, encoding })
             }
-            DataBlock::FixedWidth(mut unpacked) => {
+            DataBlock::FixedWidth(unpacked) => {
                 match data_type {
                     DataType::UInt8 | DataType::Int8 => encode_fixed_width!(self, unpacked, u8, buffer_index),
                     DataType::UInt16 | DataType::Int16 => encode_fixed_width!(self, unpacked, u16, buffer_index),
@@ -318,7 +318,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 );
                 let encoded_values: EncodedArray;
                 match *nullable.data {
-                    DataBlock::FixedWidth(mut unpacked) => {
+                    DataBlock::FixedWidth(unpacked) => {
                         match data_type {
                             DataType::UInt8 | DataType::Int8 => encoded_values = encode_fixed_width!(self, unpacked, u8, buffer_index)?,
                             DataType::UInt16 | DataType::Int16 => encoded_values = encode_fixed_width!(self, unpacked, u16, buffer_index)?,

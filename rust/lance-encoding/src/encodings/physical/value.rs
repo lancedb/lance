@@ -150,8 +150,7 @@ impl ValueEncoder {
             num_values *= layer.dimension as usize;
             if let Some(validity) = &layer.validity {
                 let validity_slice = validity
-                    .try_clone()
-                    .unwrap()
+                    .clone()
                     .bit_slice_le_with_length(row_offset, num_values);
                 validity_buffers[buffer_counter].extend_from_slice(&validity_slice);
                 buffer_sizes.push(validity_slice.len() as u16);
