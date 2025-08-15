@@ -19,7 +19,8 @@ pub fn sum_4bit_dist_table(
     unsafe {
         debug_assert!(n % BATCH_SIZE == 0);
 
-        if cfg!(target_feature = "avx2") {
+        #[cfg(all(target_arch = "x86_64"))]
+        {
             for i in (0..n).step_by(BATCH_SIZE) {
                 sum_dist_table_32bytes_batch_avx2(
                     &codes[i * code_len..(i + BATCH_SIZE) * code_len],
@@ -27,9 +28,11 @@ pub fn sum_4bit_dist_table(
                     &mut dists[i..i + BATCH_SIZE],
                 )
             }
-        } else {
-            sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists);
+            return;
         }
+
+        #[cfg(not(all(target_arch = "x86_64")))]
+        sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists);
     }
 }
 
