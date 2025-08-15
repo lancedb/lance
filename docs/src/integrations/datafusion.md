@@ -72,11 +72,12 @@ The following example demonstrates how to register and use ```contains_tokens```
 ```rust
 use datafusion::prelude::SessionContext;
 use lance::datafusion::LanceTableProvider;
-use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
+use lance_datafusion::udf::register_functions;
 
 let ctx = SessionContext::new();
 
-ctx.register_udf(CONTAINS_TOKENS_UDF.clone());
+// Register built-in UDFs
+register_functions(&ctx);
 
 ctx.register_table("dataset",
     Arc::new(LanceTableProvider::new(

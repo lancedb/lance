@@ -21,6 +21,7 @@ pub fn register_functions(ctx: &SessionContext) {
 /// If the query string is a whole word, or if you prioritize better performance, `contains_tokens`
 /// is the better choice. Otherwise, you can use the `contains` method to obtain accurate results.
 ///
+///
 /// Usage
 /// * Use `contains_tokens` in sql.
 /// ```rust,ignore
@@ -62,7 +63,7 @@ fn contains_tokens() -> ScalarUDF {
     )
 }
 
-pub static CONTAINS_TOKENS_UDF: LazyLock<ScalarUDF> = LazyLock::new(contains_tokens);
+static CONTAINS_TOKENS_UDF: LazyLock<ScalarUDF> = LazyLock::new(contains_tokens);
 
 #[cfg(test)]
 mod tests {
