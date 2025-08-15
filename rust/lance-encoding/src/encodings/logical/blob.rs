@@ -4,6 +4,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray, UInt64Array};
+use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use futures::future::BoxFuture;
 use lance_core::{datatypes::Field, Error, Result};
@@ -98,7 +99,8 @@ impl FieldEncoder for BlobStructuralEncoder {
                     sizes.push(0);
                 } else {
                     // Add data to external buffers
-                    let position = external_buffers.add_buffer(LanceBuffer::Borrowed(value.into()));
+                    let position =
+                        external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
                     positions.push(position);
                     sizes.push(value.len() as u64);
                 }

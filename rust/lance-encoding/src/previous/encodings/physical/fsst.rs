@@ -43,7 +43,7 @@ impl PageScheduler for FsstPageScheduler {
         let inner_decoder = self
             .inner_scheduler
             .schedule_ranges(ranges, scheduler, top_level_row);
-        let symbol_table = self.symbol_table.try_clone().unwrap();
+        let symbol_table = self.symbol_table.clone();
 
         async move {
             let inner_decoder = inner_decoder.await?;
@@ -138,7 +138,7 @@ impl ArrayEncoder for FsstArrayEncoder {
         data_type: &DataType,
         buffer_index: &mut u32,
     ) -> lance_core::Result<EncodedArray> {
-        let (mut data, nulls) = match data {
+        let (data, nulls) = match data {
             DataBlock::Nullable(nullable) => {
                 let data = nullable.data.as_variable_width().unwrap();
                 (data, Some(nullable.nulls))
@@ -165,7 +165,7 @@ impl ArrayEncoder for FsstArrayEncoder {
         )?;
 
         let dest_offset = LanceBuffer::reinterpret_vec(dest_offsets);
-        let dest_values = LanceBuffer::Owned(dest_values);
+        let dest_values = LanceBuffer::from(dest_values);
         let dest_data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: 32,
             data: dest_values,

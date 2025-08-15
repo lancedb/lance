@@ -161,8 +161,8 @@ impl RleMiniBlockEncoder {
         // Return exactly two buffers: values and lengths
         Ok((
             vec![
-                LanceBuffer::Owned(all_values),
-                LanceBuffer::Owned(all_lengths),
+                LanceBuffer::from(all_values),
+                LanceBuffer::from(all_lengths),
             ],
             chunks,
         ))
@@ -398,7 +398,7 @@ impl RleMiniBlockDecompressor {
         if num_values == 0 {
             return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
                 bits_per_value: self.bits_per_value,
-                data: LanceBuffer::Owned(vec![]),
+                data: LanceBuffer::from(vec![]),
                 num_values: 0,
                 block_info: BlockInfo::default(),
             }));
@@ -424,7 +424,7 @@ impl RleMiniBlockDecompressor {
 
         Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: self.bits_per_value,
-            data: LanceBuffer::Owned(decoded_data),
+            data: LanceBuffer::from(decoded_data),
             num_values,
             block_info: BlockInfo::default(),
         }))
@@ -605,7 +605,7 @@ mod tests {
 
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value,
-            data: LanceBuffer::Owned(bytes),
+            data: LanceBuffer::from(bytes),
             num_values: data.len() as u64,
             block_info: BlockInfo::default(),
         });
@@ -662,15 +662,15 @@ mod tests {
     #[should_panic(expected = "RLE decompressor expects exactly 2 buffers")]
     fn test_invalid_buffer_count() {
         let decompressor = RleMiniBlockDecompressor::new(32);
-        let _ = decompressor.decompress(vec![LanceBuffer::Owned(vec![1, 2, 3, 4])], 10);
+        let _ = decompressor.decompress(vec![LanceBuffer::from(vec![1, 2, 3, 4])], 10);
     }
 
     #[test]
     #[should_panic(expected = "Inconsistent RLE buffers")]
     fn test_buffer_consistency() {
         let decompressor = RleMiniBlockDecompressor::new(32);
-        let values = LanceBuffer::Owned(vec![1, 0, 0, 0]); // 1 i32 value
-        let lengths = LanceBuffer::Owned(vec![5, 10]); // 2 lengths - mismatch!
+        let values = LanceBuffer::from(vec![1, 0, 0, 0]); // 1 i32 value
+        let lengths = LanceBuffer::from(vec![5, 10]); // 2 lengths - mismatch!
         let _ = decompressor.decompress(vec![values, lengths], 15);
     }
 
@@ -681,7 +681,7 @@ mod tests {
         // Test empty block
         let empty_block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 32,
-            data: LanceBuffer::Owned(vec![]),
+            data: LanceBuffer::from(vec![]),
             num_values: 0,
             block_info: BlockInfo::default(),
         });
@@ -893,7 +893,7 @@ mod tests {
 
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 32,
-            data: LanceBuffer::Owned(bytes),
+            data: LanceBuffer::from(bytes),
             num_values: num_values as u64,
             block_info: BlockInfo::default(),
         });
