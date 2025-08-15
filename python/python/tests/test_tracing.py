@@ -83,7 +83,7 @@ capture_trace_events(callback)
 
 ds = lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
 ds.create_scalar_index("x", "BTREE")
-ds.sql("SELECT * FROM ds").table_name("ds").build().to_batch_records()
+ds.sql("SELECT * FROM ds WHERE x = 7").table_name("ds").build().to_batch_records()
 
 wait_until(lambda: len(events) == 11)
 
