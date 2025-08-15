@@ -9,7 +9,7 @@ use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
 use snafu::location;
 
-/// A copy-on-write byte buffer
+/// A copy-on-write byte buffer.
 ///
 /// It wraps arrow_buffer::Buffer which provides:
 /// - Cheap cloning (reference counted)
