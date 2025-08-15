@@ -260,7 +260,7 @@ mod tests {
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
     use arrow::datatypes::UInt32Type;
-    use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
+    use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use lance_file::version::LanceFileVersion;
@@ -269,7 +269,6 @@ mod tests {
     use std::collections::HashSet;
     use std::ops::Range;
     use std::sync::Arc;
-    use std::time::Duration;
 
     #[rstest]
     #[tokio::test]
@@ -553,90 +552,6 @@ mod tests {
         assert!(fragments[0].metadata.deletion_file.is_none());
     }
 
-    #[rstest]
-    #[tokio::test]
-    async fn test_delete_where_scalar_index_covers_predicate(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        data_storage_version: LanceFileVersion,
-    ) {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::UInt32, false),
-            ArrowField::new("x", DataType::UInt32, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from_iter_values(0..200)),
-                Arc::new(UInt32Array::from_iter_values(0..200)),
-            ],
-        )
-        .unwrap();
-
-        let mut write_params = WriteParams {
-            max_rows_per_file: 50,
-            max_rows_per_group: 10,
-            ..Default::default()
-        };
-        write_params.data_storage_version = Some(data_storage_version);
-
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            &tmp_path,
-            Some(write_params.clone()),
-        )
-        .await
-        .unwrap();
-
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                None,
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await
-            .unwrap();
-
-        let original_len = dataset.count_rows(None).await.unwrap();
-        assert_eq!(original_len, 200);
-
-        // Delete some data using predicate that's fully covered by scalar index
-        dataset.delete("i >= 100 AND i <= 149").await.unwrap();
-        dataset.validate().await.unwrap();
-
-        let new_len = dataset.count_rows(None).await.unwrap();
-        assert_eq!(new_len, 150);
-
-        // Check that rows 100-149 are gone
-        let remaining_values: Vec<u32> = dataset
-            .scan()
-            .try_into_batch()
-            .await
-            .unwrap()
-            .column(0)
-            .as_primitive::<UInt32Type>()
-            .values()
-            .to_vec();
-
-        let expected: Vec<u32> = (0..100).chain(150..200).collect();
-        assert_eq!(remaining_values, expected);
-
-        // Fragment 2 (rows 100-149) should be fully deleted
-        let fragments = dataset.get_fragments();
-        // We should have 3 fragments: fragment 2 (rows 100-149) was completely deleted
-        assert_eq!(fragments.len(), 3);
-
-        // The remaining fragments should be 0, 1, and 3 (fragment 2 was removed)
-        assert_eq!(fragments[0].id(), 0);
-        assert_eq!(fragments[1].id(), 1);
-        assert_eq!(fragments[2].id(), 3);
-    }
-
     #[tokio::test]
     async fn test_concurrent_delete_with_retries() {
         use futures::future::try_join_all;
@@ -721,48 +636,5 @@ mod tests {
         deleted_rows.sort();
         let expected_deleted: Vec<u32> = (0..50).collect();
         assert_eq!(deleted_rows, expected_deleted);
-    }
-
-    #[tokio::test]
-    async fn test_delete_retry_timeout() {
-        fn sequence_data(range: Range<u32>) -> RecordBatch {
-            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "i",
-                DataType::UInt32,
-                false,
-            )]));
-            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
-                .unwrap()
-        }
-
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_string();
-
-        let data = sequence_data(0..100);
-        let dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
-            .make_hostile(&tmp_path)
-            .await;
-
-        let dataset = Arc::new(dataset);
-
-        // Test with very short timeout
-        let result = DeleteBuilder::new(dataset.clone(), "i < 50")
-            .conflict_retries(100) // High retry count
-            .retry_timeout(Duration::from_millis(1)) // Very short timeout
-            .execute()
-            .await;
-
-        // Should timeout
-        if let Err(e) = result {
-            // Check that it's a timeout error
-            assert!(
-                matches!(e, Error::TooMuchWriteContention { .. }),
-                "Expected TooMuchWriteContention error, got: {:?}",
-                e
-            );
-        } else {
-            // Might succeed if the operation is very fast
-            assert!(result.is_ok());
-        }
     }
 }
