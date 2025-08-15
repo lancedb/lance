@@ -301,7 +301,7 @@ mod test {
             "memory://test",
             Some(WriteParams {
                 max_rows_per_file: 3,
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )

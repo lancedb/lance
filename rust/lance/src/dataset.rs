@@ -3157,7 +3157,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )
@@ -3590,7 +3590,7 @@ mod tests {
         let write_params = WriteParams {
             mode: WriteMode::Append,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
 
@@ -3703,7 +3703,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         Dataset::write(data, test_uri, Some(write_params.clone()))
@@ -3741,7 +3741,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(data, "memory://", Some(write_params.clone()))
@@ -3803,7 +3803,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(data, "memory://", Some(write_params.clone()))
@@ -4256,7 +4256,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )
@@ -6247,7 +6247,7 @@ mod tests {
         ]));
         let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
         let options = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             enable_v2_manifest_paths: true,
             ..Default::default()
         };

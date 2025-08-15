@@ -724,7 +724,7 @@ async fn rewrite_files(
     }
 
     if dataset.manifest.uses_move_stable_row_ids() {
-        params.enable_move_stable_row_ids = true;
+        params.enable_stable_row_ids = true;
     }
 
     let new_fragments = write_fragments_internal(
@@ -1597,7 +1597,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 1000,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1688,7 +1688,7 @@ mod tests {
             data_gen.batch(500),
             "memory://test/table",
             Some(WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 max_rows_per_file: 100, // 5 files
                 ..Default::default()
             }),

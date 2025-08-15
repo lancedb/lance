@@ -191,7 +191,7 @@ pub struct WriteParams {
     /// These row ids are stable after compaction operations, but not after updates.
     /// This makes compaction more efficient, since with stable row ids no
     /// secondary indices need to be updated to point to new row ids.
-    pub enable_move_stable_row_ids: bool,
+    pub enable_stable_row_ids: bool,
 
     /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
     /// These allow constant-time lookups for the latest manifest on object storage.
@@ -235,7 +235,7 @@ impl Default for WriteParams {
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
             data_storage_version: None,
-            enable_move_stable_row_ids: false,
+            enable_stable_row_ids: false,
             enable_v2_manifest_paths: false,
             session: None,
             auto_cleanup: Some(AutoCleanupParams::default()),
@@ -448,7 +448,7 @@ pub async fn write_fragments_internal(
         store_params: params.store_params.clone(),
         commit_handler: params.commit_handler.clone(),
         data_storage_version: params.data_storage_version,
-        enable_move_stable_row_ids: true,
+        enable_stable_row_ids: true,
         // This shouldn't really matter since all commits are detached
         enable_v2_manifest_paths: true,
         max_bytes_per_file: params.max_bytes_per_file,
@@ -456,7 +456,7 @@ pub async fn write_fragments_internal(
         ..Default::default()
     };
 
-    if blob_data.is_some() && !params.enable_move_stable_row_ids {
+    if blob_data.is_some() && !params.enable_stable_row_ids {
         return Err(Error::invalid_input(
             "The blob storage class requires move stable row ids",
             location!(),
