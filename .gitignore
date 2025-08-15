@@ -92,7 +92,9 @@ target
 .ccls-cache/
 
 python/venv
+python/.venv
 test_data/venv
+test_data/.venv
 
 **/*.profraw
 *.lance
