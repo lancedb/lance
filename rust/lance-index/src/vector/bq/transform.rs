@@ -5,7 +5,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::AsArray;
-use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type, UInt8Type};
+use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
@@ -21,15 +21,11 @@ use crate::vector::residual::RESIDUAL_COLUMN;
 use crate::vector::transform::Transformer;
 use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
-pub const CODE_BITCOUNT_COLUMN: &str = "__code_bitcount";
 // the inner product of quantized vector and the residual vector.
 pub const ADD_FACTORS_COLUMN: &str = "__add_factors";
 // the inner product of quantized vector and the centroid vector.
 pub const SCALE_FACTORS_COLUMN: &str = "__scale_factors";
 
-pub static CODE_BITCOUNT_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
-    arrow_schema::Field::new(CODE_BITCOUNT_COLUMN, arrow_schema::DataType::Float32, true)
-});
 pub static ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(ADD_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
 });
@@ -124,17 +120,6 @@ impl Transformer for RQTransformer {
         let rq_codes = self.rq.quantize(&residual_vectors)?;
         let codes_fsl = rq_codes.as_fixed_size_list();
 
-        let code_bitcount = Float32Array::from_iter_values(codes_fsl.iter().map(|v| {
-            v.map(|v| {
-                v.as_primitive::<UInt8Type>()
-                    .values()
-                    .iter()
-                    .map(|v| v.count_ones())
-                    .sum::<u32>() as f32
-            })
-            .unwrap_or_default()
-        }));
-
         let ip_rq_res = match residual_vectors.value_type() {
             DataType::Float16 => Float32Array::from(
                 self.rq
@@ -220,7 +205,6 @@ impl Transformer for RQTransformer {
         };
 
         let batch = batch.try_with_column(self.rq.field(), Arc::new(rq_codes))?;
-        let batch = batch.try_with_column(CODE_BITCOUNT_FIELD.clone(), Arc::new(code_bitcount))?;
         let batch = batch
             .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?
             .drop_column(CENTROID_DIST_COLUMN)?;

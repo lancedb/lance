@@ -13,9 +13,7 @@ use lance_datagen::array::rand_type;
 use lance_datagen::{BatchGeneratorBuilder, RowCount};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::storage::*;
-use lance_index::vector::bq::transform::{
-    ADD_FACTORS_COLUMN, CODE_BITCOUNT_COLUMN, SCALE_FACTORS_COLUMN,
-};
+use lance_index::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
 use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
@@ -35,7 +33,6 @@ fn mock_rq_storage() -> RabitQuantizationStorage {
             RABIT_CODE_COLUMN,
             rand_type(&fixed_size_list_type((DIM / 8) as i32, DataType::UInt8)),
         )
-        .col(CODE_BITCOUNT_COLUMN, rand_type(&DataType::Float32))
         .col(ADD_FACTORS_COLUMN, rand_type(&DataType::Float32))
         .col(SCALE_FACTORS_COLUMN, rand_type(&DataType::Float32));
     RabitQuantizationStorage::try_from_batch(

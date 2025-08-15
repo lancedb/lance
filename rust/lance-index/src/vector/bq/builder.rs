@@ -19,7 +19,7 @@ use snafu::location;
 use crate::vector::bq::storage::{
     RabitQuantizationMetadata, RabitQuantizationStorage, RABIT_CODE_COLUMN, RABIT_METADATA_KEY,
 };
-use crate::vector::bq::transform::{ADD_FACTORS_FIELD, CODE_BITCOUNT_FIELD, SCALE_FACTORS_FIELD};
+use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
 use crate::vector::bq::RQBuildParams;
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
 
@@ -342,11 +342,7 @@ impl Quantization for RabitQuantizer {
     }
 
     fn extra_fields(&self) -> Vec<Field> {
-        vec![
-            CODE_BITCOUNT_FIELD.clone(),
-            ADD_FACTORS_FIELD.clone(),
-            SCALE_FACTORS_FIELD.clone(),
-        ]
+        vec![ADD_FACTORS_FIELD.clone(), SCALE_FACTORS_FIELD.clone()]
     }
 }
 
