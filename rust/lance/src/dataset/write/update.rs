@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
@@ -29,6 +29,8 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
+
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 
 /// Build an update operation.
 ///

@@ -10,7 +10,7 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use snafu::location;
@@ -161,49 +161,55 @@ impl RetryExecutor for DeleteJob {
         scanner.with_row_id().filter(&self.predicate)?;
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
-        let (updated_fragments, deleted_fragment_ids) = if let Some(filter_expr) =
-            scanner.get_filter()?
-        {
-            if matches!(
-                filter_expr,
-                Expr::Literal(ScalarValue::Boolean(Some(false)), _)
-            ) {
-                // Predicate evaluated to false - no deletions
-                (Vec::new(), Vec::new())
-            } else if matches!(
-                filter_expr,
-                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
-            ) {
-                // Predicate evaluated to true - delete all fragments
-                let deleted_fragment_ids = self.dataset.get_fragments().iter().map(|f| f.id() as u64).collect();
-                (Vec::new(), deleted_fragment_ids)
-            } else {
-                // Regular predicate - scan and collect row addresses to delete
-                let stream = scanner.try_into_stream().await?.into();
-                let (stream, row_id_rx) =
-                    make_rowid_capture_stream(stream, self.dataset.manifest.uses_move_stable_row_ids())?;
+        let (updated_fragments, deleted_fragment_ids) =
+            if let Some(filter_expr) = scanner.get_filter()? {
+                if matches!(
+                    filter_expr,
+                    Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+                ) {
+                    // Predicate evaluated to false - no deletions
+                    (Vec::new(), Vec::new())
+                } else if matches!(
+                    filter_expr,
+                    Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+                ) {
+                    // Predicate evaluated to true - delete all fragments
+                    let deleted_fragment_ids = self
+                        .dataset
+                        .get_fragments()
+                        .iter()
+                        .map(|f| f.id() as u64)
+                        .collect();
+                    (Vec::new(), deleted_fragment_ids)
+                } else {
+                    // Regular predicate - scan and collect row addresses to delete
+                    let stream = scanner.try_into_stream().await?.into();
+                    let (stream, row_id_rx) = make_rowid_capture_stream(
+                        stream,
+                        self.dataset.manifest.uses_move_stable_row_ids(),
+                    )?;
 
-                // Process the stream to capture row addresses
-                // We need to consume the stream to trigger the capture
-                futures::pin_mut!(stream);
-                while let Some(_batch) = stream.try_next().await? {
-                    // The row addresses are captured automatically by make_rowid_capture_stream
+                    // Process the stream to capture row addresses
+                    // We need to consume the stream to trigger the capture
+                    futures::pin_mut!(stream);
+                    while let Some(_batch) = stream.try_next().await? {
+                        // The row addresses are captured automatically by make_rowid_capture_stream
+                    }
+
+                    // Extract the row addresses from the receiver
+                    let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
+                        message: format!("Failed to receive row ids: {}", err),
+                        location: location!(),
+                    })?;
+                    let row_id_index = get_row_id_index(&self.dataset).await?;
+                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+
+                    apply_deletions(&self.dataset, &removed_row_addrs).await?
                 }
-
-                // Extract the row addresses from the receiver
-                let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
-                    message: format!("Failed to receive row ids: {}", err),
-                    location: location!(),
-                })?;
-                let row_id_index = get_row_id_index(&self.dataset).await?;
-                let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-
-                apply_deletions(&self.dataset, &removed_row_addrs).await?
-            }
-        } else {
-            // No filter was applied - this shouldn't happen but treat as delete nothing
-            (Vec::new(), Vec::new())
-        };
+            } else {
+                // No filter was applied - this shouldn't happen but treat as delete nothing
+                (Vec::new(), Vec::new())
+            };
 
         Ok(DeleteData {
             updated_fragments,
@@ -251,7 +257,7 @@ mod tests {
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
     use arrow::datatypes::UInt32Type;
-    use arrow_array::{RecordBatch, UInt32Array};
+    use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use lance_file::version::LanceFileVersion;
@@ -298,7 +304,7 @@ mod tests {
 
         let batches = RecordBatch::concat(&batches).unwrap();
         let mut dataset = Dataset::write(
-            vec![batches].into_iter(),
+            RecordBatchIterator::new(vec![Ok(batches)], schema.clone()),
             &tmp_path,
             Some(write_params.clone()),
         )
@@ -307,7 +313,13 @@ mod tests {
 
         if with_scalar_index {
             dataset
-                .create_index(&["i"], IndexType::Scalar, None, &ScalarIndexParams::default(), true)
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
                 .await
                 .unwrap();
         }
@@ -349,7 +361,10 @@ mod tests {
         assert_eq!(values, (0..50).collect::<Vec<_>>());
 
         // Double check there are no duplicates
-        assert_eq!(values.len(), values.into_iter().collect::<HashSet<_>>().len());
+        assert_eq!(
+            values.len(),
+            values.into_iter().collect::<HashSet<_>>().len()
+        );
 
         if !with_scalar_index {
             // We should have the same fragments, but two should have deletion vectors
@@ -405,13 +420,22 @@ mod tests {
         };
         write_params.data_storage_version = Some(data_storage_version);
 
-        let mut dataset =
-            Dataset::write(vec![batch].into_iter(), &tmp_path, Some(write_params.clone()))
-                .await
-                .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &tmp_path,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
 
         dataset
-            .create_index(&["i"], IndexType::Scalar, None, &ScalarIndexParams::default(), true)
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
             .await
             .unwrap();
 
