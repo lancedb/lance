@@ -461,11 +461,11 @@ fn get_column(
     code_len: usize,
     row: usize,
     col_idx: usize,
-    col: &mut [u8; 32],
+    codes: &mut [u8; 32],
 ) {
-    for i in 0..32 {
+    for (i, code) in codes.iter_mut().enumerate() {
         let vec_idx = row + i;
-        col[i] = quantization_code[vec_idx * code_len + col_idx];
+        *code = quantization_code[vec_idx * code_len + col_idx];
     }
 }
 
