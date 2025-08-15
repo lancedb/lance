@@ -1226,7 +1226,6 @@ fn visit_node(
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
-    log::info!("visit_node: depth={}", depth);
     if depth >= MAX_DEPTH {
         return Err(Error::invalid_input(
             format!(
