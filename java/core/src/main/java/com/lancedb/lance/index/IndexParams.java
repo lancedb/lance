@@ -21,16 +21,23 @@ import java.util.Optional;
 
 /** Parameters for creating an index. */
 public class IndexParams {
-  private final DistanceType distanceType;
   private final Optional<VectorIndexParams> vectorIndexParams;
 
   private IndexParams(Builder builder) {
-    this.distanceType = builder.distanceType;
     this.vectorIndexParams = builder.vectorIndexParams;
   }
 
+  /**
+   * Creates an empty IndexParams instance with default values. This is useful for non-vector index
+   * types where IndexParams can be empty.
+   *
+   * @return an empty IndexParams instance
+   */
+  public static IndexParams empty() {
+    return new Builder().build();
+  }
+
   public static class Builder {
-    private DistanceType distanceType = DistanceType.L2;
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
 
     public Builder() {}
@@ -42,7 +49,6 @@ public class IndexParams {
      * @return this builder
      */
     public Builder setDistanceType(DistanceType distanceType) {
-      this.distanceType = distanceType;
       return this;
     }
 
@@ -62,10 +68,6 @@ public class IndexParams {
     }
   }
 
-  public String getDistanceType() {
-    return distanceType.toString();
-  }
-
   public Optional<VectorIndexParams> getVectorIndexParams() {
     return vectorIndexParams;
   }
@@ -73,7 +75,6 @@ public class IndexParams {
   @Override
   public String toString() {
     return new ToStringBuilder(this)
-        .append("distanceType", distanceType)
         .append("vectorIndexParams", vectorIndexParams.orElse(null))
         .toString();
   }
