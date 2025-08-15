@@ -22,11 +22,6 @@ use snafu::location;
 pub struct LanceBuffer(Buffer);
 
 impl LanceBuffer {
-    /// Convert into a Vec<u8>, will copy the data
-    pub fn into_owned(self) -> Vec<u8> {
-        self.0.to_vec()
-    }
-
     /// Convert into an Arrow buffer. Never copies data.
     pub fn into_buffer(self) -> Buffer {
         self.0
@@ -114,6 +109,8 @@ impl LanceBuffer {
     }
 
     /// Convert a buffer into a bytes::Bytes object
+    ///
+    /// This convert is zero cost.
     pub fn into_bytes(self) -> bytes::Bytes {
         self.0.into_vec::<u8>().unwrap().into()
     }
