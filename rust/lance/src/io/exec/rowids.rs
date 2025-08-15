@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::u64;
 
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
@@ -378,8 +377,8 @@ impl AddRowOffsetExec {
             input.schema().metadata().clone(),
         ));
 
-        let new_eq_props = EquivalenceProperties::new(schema.clone())
-            .extend(input.properties().eq_properties.clone());
+        let new_eq_props =
+            EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone());
         let properties = input.properties().clone().with_eq_properties(new_eq_props);
 
         Ok(Self {
