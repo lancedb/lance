@@ -1357,11 +1357,6 @@ impl ChunkInstructions {
             let mut to_skip = user_range.start - rep_index.blocks[block_index].first_row;
 
             while rows_needed > 0 || need_preamble {
-                // Check if we've gone past the last block
-                if block_index >= rep_index.blocks.len() {
-                    break;
-                }
-
                 let chunk = &rep_index.blocks[block_index];
                 let rows_avail = chunk.starts_including_trailer.saturating_sub(to_skip);
 
@@ -1378,9 +1373,12 @@ impl ChunkInstructions {
                             rows_to_take: 0,
                             take_trailer: false,
                         });
-                        // Only set need_preamble = false if the chunk has at least one row
+                        // Only set need_preamble = false if the chunk has at least one row,
+                        // Or we are reaching the last block,
                         // Otherwise, the chunk is entirely preamble and we need the next chunk's preamble too
-                        if chunk.starts_including_trailer > 0 {
+                        if chunk.starts_including_trailer > 0
+                            || block_index == rep_index.blocks.len() - 1
+                        {
                             need_preamble = false;
                         }
                     }
