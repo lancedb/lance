@@ -145,7 +145,7 @@ impl DecodeMiniBlockTask {
         num_levels: u16,
     ) -> Result<ScalarBuffer<u16>> {
         let rep = rep_decompressor.decompress(levels, num_levels as u64)?;
-        let mut rep = rep.as_fixed_width().unwrap();
+        let rep = rep.as_fixed_width().unwrap();
         debug_assert_eq!(rep.num_values, num_levels as u64);
         debug_assert_eq!(rep.bits_per_value, 16);
         Ok(rep.data.borrow_to_typed_slice::<u16>())
@@ -555,7 +555,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
             // if dictionary encoding is applied, decode indices based on their actual bit width
-            if let DataBlock::FixedWidth(mut fixed_width_data_block) = data {
+            if let DataBlock::FixedWidth(fixed_width_data_block) = data {
                 match fixed_width_data_block.bits_per_value {
                     32 => {
                         let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i32>();
@@ -613,7 +613,7 @@ impl Clone for LoadedChunk {
     fn clone(&self) -> Self {
         Self {
             // Safe as we always create borrowed buffers here
-            data: self.data.try_clone().unwrap(),
+            data: self.data.clone(),
             items_in_chunk: self.items_in_chunk,
             byte_range: self.byte_range.clone(),
             chunk_idx: self.chunk_idx,
@@ -765,7 +765,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
 
             let rep = if has_rep {
                 let rep = data_iter.next().unwrap();
-                let mut rep = LanceBuffer::from_bytes(rep, 2);
+                let rep = LanceBuffer::from_bytes(rep, 2);
                 let rep = rep.borrow_to_typed_slice::<u16>();
                 Some(rep)
             } else {
@@ -774,7 +774,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
 
             let def = if has_def {
                 let def = data_iter.next().unwrap();
-                let mut def = LanceBuffer::from_bytes(def, 2);
+                let def = LanceBuffer::from_bytes(def, 2);
                 let def = def.borrow_to_typed_slice::<u16>();
                 Some(def)
             } else {
@@ -1051,7 +1051,7 @@ impl MiniBlockRepIndex {
     /// Returns an empty index if no bytes are provided.
     pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
         // Convert bytes to u64 slice, handling alignment automatically
-        let mut buffer = crate::buffer::LanceBuffer::from(rep_bytes.to_vec());
+        let buffer = crate::buffer::LanceBuffer::from(rep_bytes.to_vec());
         let u64_slice = buffer.borrow_to_typed_slice::<u64>();
         let n = u64_slice.len() / stride;
 
@@ -1523,7 +1523,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
             // Parse the metadata and build the chunk meta
             assert!(meta_bytes.len() % 2 == 0);
-            let mut bytes = LanceBuffer::from_bytes(meta_bytes, 2);
+            let bytes = LanceBuffer::from_bytes(meta_bytes, 2);
             let words = bytes.borrow_to_typed_slice::<u16>();
             let words = words.as_ref();
 
@@ -2439,8 +2439,8 @@ impl VariableFullZipDecoder {
         };
         self.rep = ScalarBuffer::from(rep);
         self.def = ScalarBuffer::from(def);
-        self.data = LanceBuffer::Owned(unzipped_data);
-        self.offsets = LanceBuffer::Owned(offsets_data);
+        self.data = LanceBuffer::from(unzipped_data);
+        self.offsets = LanceBuffer::from(offsets_data);
     }
 }
 
@@ -2456,7 +2456,7 @@ impl StructuralPageDecoder for VariableFullZipDecoder {
         //
         // So either we pay for a copy to normalize the offsets or we just return the entire data buffer
         // which is slightly cheaper.
-        let data = self.data.borrow_and_clone();
+        let data = self.data.clone();
 
         let offset_start = self.offset_starts[start];
         let offset_end = self.offset_starts[end] + (self.bits_per_offset as usize / 8);
@@ -2622,7 +2622,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 }
 
                 // Finally, we decompress the values and add them to our output buffer
-                let values_buf = LanceBuffer::Owned(values);
+                let values_buf = LanceBuffer::from(values);
                 let fixed_data = FixedWidthDataBlock {
                     bits_per_value: self.bytes_per_value as u64 * 8,
                     block_info: BlockInfo::new(),
@@ -3367,8 +3367,8 @@ impl PrimitiveStructuralEncoder {
             meta_buffer.extend_from_slice(&metadata.to_le_bytes());
         }
 
-        let data_buffer = LanceBuffer::Owned(data_buffer);
-        let metadata_buffer = LanceBuffer::Owned(meta_buffer);
+        let data_buffer = LanceBuffer::from(data_buffer);
+        let metadata_buffer = LanceBuffer::from(meta_buffer);
 
         SerializedMiniBlockPage {
             num_buffers: miniblocks.data.len() as u64,
@@ -3396,9 +3396,9 @@ impl PrimitiveStructuralEncoder {
         };
         // Make the levels into a FixedWidth data block
         let num_levels = levels.num_levels() as u64;
-        let mut levels_buf = levels.all_levels().try_clone().unwrap();
+        let levels_buf = levels.all_levels().clone();
         let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: levels_buf.borrow_and_clone(),
+            data: levels_buf,
             bits_per_value: 16,
             num_values: num_levels,
             block_info: BlockInfo::new(),
@@ -3413,7 +3413,7 @@ impl PrimitiveStructuralEncoder {
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let chunk_num_values = chunk.num_values(values_counter, num_elements);
             values_counter += chunk_num_values;
-            let mut chunk_levels = if chunk_idx < chunks.len() - 1 {
+            let chunk_levels = if chunk_idx < chunks.len() - 1 {
                 levels.slice_next(chunk_num_values as usize)
             } else {
                 levels.slice_rest()
@@ -3582,7 +3582,7 @@ impl PrimitiveStructuralEncoder {
 
         let (rep_index, rep_index_depth) =
             match compressed_rep.as_mut().and_then(|cr| cr.rep_index.as_mut()) {
-                Some(rep_index) => (Some(rep_index.borrow_and_clone()), 1),
+                Some(rep_index) => (Some(rep_index.clone()), 1),
                 None => (None, 0),
             };
 
@@ -3661,7 +3661,7 @@ impl PrimitiveStructuralEncoder {
                 num_items,
             );
 
-            if let Some(mut rep_index) = rep_index {
+            if let Some(rep_index) = rep_index {
                 let view = rep_index.borrow_to_typed_slice::<u64>();
                 let total = view.chunks_exact(2).map(|c| c[0]).sum::<u64>();
                 debug_assert_eq!(total, num_rows);
@@ -3730,12 +3730,12 @@ impl PrimitiveStructuralEncoder {
             rep_index_builder.append(zipped_data.len() as u64);
         }
 
-        let zipped_data = LanceBuffer::Owned(zipped_data);
+        let zipped_data = LanceBuffer::from(zipped_data);
         let rep_index = rep_index_builder.into_data();
         let rep_index = if rep_index.is_empty() {
             None
         } else {
-            Some(LanceBuffer::Owned(rep_index))
+            Some(LanceBuffer::from(rep_index))
         };
         SerializedFullZip {
             values: zipped_data,
@@ -3747,7 +3747,7 @@ impl PrimitiveStructuralEncoder {
     //
     // In addition, we create a second buffer, the repetition index
     fn serialize_full_zip_variable(
-        mut variable: VariableWidthBlock,
+        variable: VariableWidthBlock,
         mut repdef: ControlWordIterator,
         num_items: u64,
     ) -> SerializedFullZip {
@@ -3826,10 +3826,10 @@ impl PrimitiveStructuralEncoder {
             rep_index_builder.append(buf.len() as u64);
         }
 
-        let zipped_data = LanceBuffer::Owned(buf);
+        let zipped_data = LanceBuffer::from(buf);
         let rep_index = rep_index_builder.into_data();
         debug_assert!(!rep_index.is_empty());
-        let rep_index = Some(LanceBuffer::Owned(rep_index));
+        let rep_index = Some(LanceBuffer::from(rep_index));
         SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
