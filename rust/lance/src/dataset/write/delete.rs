@@ -326,7 +326,7 @@ mod tests {
         let original_len = dataset.count_rows(None).await.unwrap();
         assert_eq!(original_len, 200);
 
-        let original_fragments = dataset.get_fragments().to_vec();
+        let _original_fragments = dataset.get_fragments().to_vec();
 
         // Test false predicate
         delete(&mut dataset, "false").await.unwrap();
@@ -366,28 +366,17 @@ mod tests {
         );
 
         if !with_scalar_index {
-            // We should have the same fragments, but two should have deletion vectors
+            // After deletes, we should have 2 fragments: fragments 2, 3, 4 were fully deleted
             let current_fragments = dataset.get_fragments();
-            assert_eq!(original_fragments.len(), current_fragments.len());
-            for (original, current) in original_fragments.iter().zip(current_fragments.iter()) {
-                if original.id() == 0 {
-                    // Fragment was not touched
-                    let original_rows = original.physical_rows().await.unwrap();
-                    let current_rows = current.physical_rows().await.unwrap();
-                    assert_eq!(
-                        original_rows,
-                        current_rows,
-                        "Fragment {}: expected {} rows but was {}",
-                        original.id(),
-                        original_rows,
-                        current_rows,
-                    );
-                    assert!(current.metadata.deletion_file.is_none());
-                } else {
-                    // Fragment should have deletion vector
-                    assert!(current.metadata.deletion_file.is_some());
-                }
-            }
+            assert_eq!(current_fragments.len(), 2);
+
+            // Fragment 0 should be untouched (rows 0-39)
+            assert_eq!(current_fragments[0].id(), 0);
+            assert!(current_fragments[0].metadata.deletion_file.is_none());
+
+            // Fragment 1 should have a deletion vector (rows 40-79, with 50-79 deleted)
+            assert_eq!(current_fragments[1].id(), 1);
+            assert!(current_fragments[1].metadata.deletion_file.is_some());
         }
     }
 
@@ -464,13 +453,15 @@ mod tests {
         let expected: Vec<u32> = (0..100).chain(150..200).collect();
         assert_eq!(remaining_values, expected);
 
-        // Fragments 2 (rows 100-149) should be fully deleted or have deletion vector
+        // Fragment 2 (rows 100-149) should be fully deleted
         let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 4);
+        // We should have 3 fragments: fragment 2 (rows 100-149) was completely deleted
+        assert_eq!(fragments.len(), 3);
 
-        // Fragment 2 (rows 100-149) should be fully deleted or have 50 deletions (100-149)
-        let frag2_dv = fragments[2].get_deletion_vector().await.unwrap().unwrap();
-        assert_eq!(frag2_dv.len(), 50);
+        // The remaining fragments should be 0, 1, and 3 (fragment 2 was removed)
+        assert_eq!(fragments[0].id(), 0);
+        assert_eq!(fragments[1].id(), 1);
+        assert_eq!(fragments[2].id(), 3);
     }
 
     #[tokio::test]
