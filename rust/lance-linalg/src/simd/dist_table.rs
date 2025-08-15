@@ -19,7 +19,7 @@ pub fn sum_4bit_dist_table(
     unsafe {
         debug_assert!(n % BATCH_SIZE == 0);
 
-        #[cfg(all(target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         {
             for i in (0..n).step_by(BATCH_SIZE) {
                 sum_dist_table_32bytes_batch_avx2(
@@ -28,15 +28,15 @@ pub fn sum_4bit_dist_table(
                     &mut dists[i..i + BATCH_SIZE],
                 )
             }
-            return;
         }
 
-        #[cfg(not(all(target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists);
     }
 }
 
 #[inline]
+#[allow(unused)]
 fn sum_4bit_dist_table_scalar(code_len: usize, codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
         for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
@@ -63,6 +63,7 @@ fn sum_4bit_dist_table_scalar(code_len: usize, codes: &[u8], dist_table: &[u8], 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
+#[allow(unused)]
 unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
     let mut accu0 = _mm256_setzero_si256();
     let mut accu1 = _mm256_setzero_si256();
