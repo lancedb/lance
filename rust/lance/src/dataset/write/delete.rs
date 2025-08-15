@@ -252,14 +252,13 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::InsertBuilder;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::WriteParams;
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
     use arrow::datatypes::UInt32Type;
     use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use futures::TryStreamExt;
+    use arrow_select::concat::concat_batches;
     use lance_file::version::LanceFileVersion;
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
     use rstest::rstest;
@@ -302,7 +301,7 @@ mod tests {
         };
         write_params.data_storage_version = Some(data_storage_version);
 
-        let batches = RecordBatch::concat(&batches).unwrap();
+        let batches = concat_batches(&schema, &batches).unwrap();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batches)], schema.clone()),
             &tmp_path,
@@ -373,18 +372,20 @@ mod tests {
             for (original, current) in original_fragments.iter().zip(current_fragments.iter()) {
                 if original.id() == 0 {
                     // Fragment was not touched
+                    let original_rows = original.physical_rows().await.unwrap();
+                    let current_rows = current.physical_rows().await.unwrap();
                     assert_eq!(
-                        original.physical_rows,
-                        current.physical_rows,
+                        original_rows,
+                        current_rows,
                         "Fragment {}: expected {} rows but was {}",
                         original.id(),
-                        original.physical_rows.unwrap(),
-                        current.physical_rows.unwrap(),
+                        original_rows,
+                        current_rows,
                     );
-                    assert!(current.deletion_file.is_none());
+                    assert!(current.metadata.deletion_file.is_none());
                 } else {
                     // Fragment should have deletion vector
-                    assert!(current.deletion_file.is_some());
+                    assert!(current.metadata.deletion_file.is_some());
                 }
             }
         }

@@ -1197,7 +1197,7 @@ impl Dataset {
         conflict_retries: Option<u32>,
         retry_timeout: Option<std::time::Duration>,
     ) -> PyResult<()> {
-        let mut builder = DeleteBuilder::new(self.ds.clone()).predicate(predicate);
+        let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
 
         if let Some(retries) = conflict_retries {
             builder = builder.conflict_retries(retries);
