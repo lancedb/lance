@@ -79,6 +79,17 @@ fn compute_distances(c: &mut Criterion) {
             })
         },
     );
+
+    c.bench_function(
+        format!("compute_distances_single: {},DIM={}", TOTAL, DIM).as_str(),
+        |b| {
+            b.iter(|| {
+                for i in 0..TOTAL {
+                    black_box(dist_calc.distance(i as u32));
+                }
+            })
+        },
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -16,6 +16,7 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 pub mod f32;
 pub mod i32;
+pub mod dist_table;
 pub mod u8;
 
 use num_traits::{Float, Num};

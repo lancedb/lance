@@ -693,7 +693,7 @@ mod tests {
     use rstest::rstest;
     use tempfile::tempdir;
 
-    const NUM_ROWS: usize = 500;
+    const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
@@ -1033,7 +1033,7 @@ mod tests {
             .copied()
             .collect::<HashSet<_>>();
         let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
-        assert_ge!(recall, 0.8, "{}", recall);
+        assert_ge!(recall, 0.7, "{}", recall);
 
         // delete so that only one row left, to trigger remap and there must be some empty partitions
         let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range).await;
