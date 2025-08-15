@@ -1357,12 +1357,18 @@ impl ChunkInstructions {
             let mut to_skip = user_range.start - rep_index.blocks[block_index].first_row;
 
             while rows_needed > 0 || need_preamble {
+                // Check if we've gone past the last block
+                if block_index >= rep_index.blocks.len() {
+                    break;
+                }
+
                 let chunk = &rep_index.blocks[block_index];
                 let rows_avail = chunk.starts_including_trailer.saturating_sub(to_skip);
 
                 // Handle blocks that are entirely preamble (rows_avail = 0)
                 // These blocks have no rows to take but may have a preamble we need
-                if rows_avail == 0 {
+                // We only look for preamble if to_skip == 0 (we're not skipping rows)
+                if rows_avail == 0 && to_skip == 0 {
                     // Only process if this chunk has a preamble we need
                     if chunk.has_preamble && need_preamble {
                         chunk_instructions.push(Self {
@@ -1372,11 +1378,26 @@ impl ChunkInstructions {
                             rows_to_take: 0,
                             take_trailer: false,
                         });
-                        need_preamble = false;
+                        // Only set need_preamble = false if the chunk has at least one row
+                        // Otherwise, the chunk is entirely preamble and we need the next chunk's preamble too
+                        if chunk.starts_including_trailer > 0 {
+                            need_preamble = false;
+                        }
                     }
                     // Move to next block
                     block_index += 1;
                     to_skip = 0;
+                    continue;
+                }
+
+                // Edge case: if rows_avail == 0 but to_skip > 0
+                // This theoretically shouldn't happen (binary search should avoid it)
+                // but handle it for safety
+                if rows_avail == 0 && to_skip > 0 {
+                    // This block doesn't have enough rows to skip, move to next block
+                    // Adjust to_skip by the number of rows in this block
+                    to_skip -= chunk.starts_including_trailer;
+                    block_index += 1;
                     continue;
                 }
 
