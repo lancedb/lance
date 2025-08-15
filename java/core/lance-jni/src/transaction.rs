@@ -14,7 +14,7 @@ use jni::objects::{JByteArray, JMap, JObject, JString, JValue};
 use jni::sys::jbyte;
 use jni::JNIEnv;
 use lance::dataset::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use lance::table::format::{Fragment, Index};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -561,6 +561,32 @@ fn convert_to_java_operation_inner<'local>(
             )?;
             Ok(java_operation)
         }
+        Operation::DataReplacement { replacements } => {
+            let java_replacements = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for replacement in replacements {
+                let fragment_id = replacement.0;
+                let new_file = replacement.1.into_java(env)?;
+
+                let java_replacement = env.new_object(
+                    "com/lancedb/lance/operation/DataReplacement$DataReplacementGroup",
+                    "(JLcom/lancedb/lance/fragment/DataFile;)V",
+                    &[JValue::Long(fragment_id as i64), JValue::Object(&new_file)],
+                )?;
+
+                env.call_method(
+                    &java_replacements,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&java_replacement)],
+                )?;
+            }
+
+            Ok(env.new_object(
+                "com/lancedb/lance/operation/DataReplacement",
+                "(Ljava/util/List;)V",
+                &[JValue::Object(&java_replacements)],
+            )?)
+        }
         Operation::Merge {
             fragments: rust_fragments,
             schema,
@@ -952,6 +978,32 @@ fn convert_to_rust_operation(
                 fields_modified: vec![],
                 mem_wal_to_flush: None,
             }
+        }
+        "DataReplacement" => {
+            let replacement_objs = env
+                .call_method(&java_operation, "replacements", "()Ljava/util/List;", &[])?
+                .l()?;
+            let replacement_objs = import_vec(env, &replacement_objs)?;
+            let mut replacements = Vec::with_capacity(replacement_objs.len());
+
+            for replacement in replacement_objs {
+                let fragment_id = env
+                    .call_method(&replacement, "fragmentId", "()J", &[])?
+                    .j()? as u64;
+                let new_file_obj = env
+                    .call_method(
+                        &replacement,
+                        "replacedFile",
+                        "()Lcom/lancedb/lance/fragment/DataFile;",
+                        &[],
+                    )?
+                    .l()?;
+                let new_file = new_file_obj.extract_object(env)?;
+
+                replacements.push(DataReplacementGroup(fragment_id, new_file));
+            }
+
+            Operation::DataReplacement { replacements }
         }
         "Merge" => {
             let fragment_objs = env
