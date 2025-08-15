@@ -1386,7 +1386,6 @@ impl ChunkInstructions {
                     }
                     // Move to next block
                     block_index += 1;
-                    to_skip = 0;
                     continue;
                 }
 
