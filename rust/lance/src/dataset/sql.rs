@@ -4,11 +4,9 @@
 use crate::datafusion::LanceTableProvider;
 use crate::Dataset;
 use arrow_array::RecordBatch;
-use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::prelude::SQLOptions;
-use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+use lance_datafusion::exec::{new_session_context, LanceExecutionOptions};
 use std::sync::Arc;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
@@ -65,24 +63,19 @@ impl SqlQueryBuilder {
     }
 
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
-        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let ctx = new_session_context(&LanceExecutionOptions::default());
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
-        let state = ctx.state();
-        let table_ref: TableReference = self.table_name.clone().into();
-        let table = table_ref.table().to_owned();
-        state.schema_for_ref(table_ref)?.register_table(
-            table,
+        ctx.register_table(
+            self.table_name.clone(),
             Arc::new(LanceTableProvider::new(
                 self.dataset.clone(),
                 row_id,
                 row_addr,
             )),
         )?;
-        let plan = state.create_logical_plan(&self.sql).await?;
-        SQLOptions::new().verify_plan(&plan)?;
+        let df = ctx.sql(&self.sql).await?;
 
-        let df = DataFrame::new(state, plan);
         Ok(SqlQuery::new(df))
     }
 }
