@@ -1357,6 +1357,12 @@ impl ChunkInstructions {
             let mut to_skip = user_range.start - rep_index.blocks[block_index].first_row;
 
             while rows_needed > 0 || need_preamble {
+                // Check if we've gone past the last block (should not happen)
+                if block_index >= rep_index.blocks.len() {
+                    log::warn!("schedule_instructions inconsistency: block_index >= rep_index.blocks.len(), exiting early");
+                    break;
+                }
+
                 let chunk = &rep_index.blocks[block_index];
                 let rows_avail = chunk.starts_including_trailer.saturating_sub(to_skip);
 
