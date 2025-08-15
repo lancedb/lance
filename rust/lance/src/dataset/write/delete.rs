@@ -194,7 +194,7 @@ impl RetryExecutor for DeleteJob {
                     let stream = scanner.try_into_stream().await?.into();
                     let (stream, row_id_rx) = make_rowid_capture_stream(
                         stream,
-                        self.dataset.manifest.uses_move_stable_row_ids(),
+                        self.dataset.manifest.uses_stable_row_ids(),
                     )?;
 
                     // Process the stream to capture row addresses

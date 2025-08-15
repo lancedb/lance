@@ -59,7 +59,7 @@ use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MemWal;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
+use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -1169,9 +1169,9 @@ impl Transaction {
         config: &ManifestWriteConfig,
         new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
-        if config.use_move_stable_row_ids
+        if config.use_stable_row_ids
             && current_manifest
-                .map(|m| !m.uses_move_stable_row_ids())
+                .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
             return Err(Error::NotSupported {
@@ -1210,10 +1210,8 @@ impl Transaction {
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
-            match (current_manifest, config.use_move_stable_row_ids) {
-                (Some(manifest), _)
-                    if manifest.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0 =>
-                {
+            match (current_manifest, config.use_stable_row_ids) {
+                (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
                 }
                 (None, true) => Some(0),
@@ -1571,7 +1569,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest, config.use_move_stable_row_ids)?;
+            apply_feature_flags(&mut manifest, config.use_stable_row_ids)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 

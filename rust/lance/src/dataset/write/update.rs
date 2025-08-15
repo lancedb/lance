@@ -291,7 +291,7 @@ impl UpdateJob {
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
         let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_move_stable_row_ids())?;
+            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
 
         let schema = stream.schema();
 
@@ -526,7 +526,7 @@ mod tests {
     /// deleted.
     async fn make_test_dataset(
         version: LanceFileVersion,
-        enable_move_stable_row_ids: bool,
+        enable_stable_row_ids: bool,
     ) -> (Arc<Dataset>, TempDir) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -546,7 +546,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 10,
             data_storage_version: Some(version),
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             ..Default::default()
         };
 
@@ -601,9 +601,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_all(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(false, true)] enable_move_stable_row_ids: bool,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
-        let (dataset, _test_dir) = make_test_dataset(version, enable_move_stable_row_ids).await;
+        let (dataset, _test_dir) = make_test_dataset(version, enable_stable_row_ids).await;
 
         let update_result = UpdateBuilder::new(dataset)
             .set("name", "'bar' || cast(id as string)")
@@ -645,9 +645,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_conditional(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(false, true)] enable_move_stable_row_ids: bool,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
-        let (dataset, _test_dir) = make_test_dataset(version, enable_move_stable_row_ids).await;
+        let (dataset, _test_dir) = make_test_dataset(version, enable_stable_row_ids).await;
 
         let original_fragments = dataset.get_fragments();
 
@@ -712,7 +712,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_update_concurrency(#[values(false, true)] enable_move_stable_row_ids: bool) {
+    async fn test_update_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -747,7 +747,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
-                enable_move_stable_row_ids,
+                enable_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])
@@ -808,9 +808,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_update_same_row_concurrency(
-        #[values(false, true)] enable_move_stable_row_ids: bool,
-    ) {
+    async fn test_update_same_row_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -843,7 +841,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
-                enable_move_stable_row_ids,
+                enable_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])
