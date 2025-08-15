@@ -123,7 +123,7 @@ impl<'a> InsertBuilder<'a> {
 
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
-            .use_move_stable_row_ids(context.params.enable_stable_row_ids)
+            .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())

@@ -1986,7 +1986,7 @@ impl DatasetTakeRows for Dataset {
 pub(crate) struct ManifestWriteConfig {
     auto_set_feature_flags: bool,              // default true
     timestamp: Option<SystemTime>,             // default None
-    use_move_stable_row_ids: bool,             // default false
+    use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
 }
@@ -1996,7 +1996,7 @@ impl Default for ManifestWriteConfig {
         Self {
             auto_set_feature_flags: true,
             timestamp: None,
-            use_move_stable_row_ids: false,
+            use_stable_row_ids: false,
             use_legacy_format: None,
             storage_format: None,
         }
@@ -2014,7 +2014,7 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest, config.use_move_stable_row_ids)?;
+        apply_feature_flags(manifest, config.use_stable_row_ids)?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -2554,7 +2554,7 @@ mod tests {
             &ManifestWriteConfig {
                 auto_set_feature_flags: false,
                 timestamp: None,
-                use_move_stable_row_ids: false,
+                use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
             },
