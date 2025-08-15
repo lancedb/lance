@@ -169,10 +169,7 @@ impl BinaryMiniBlockEncoder {
     // put binary data into chunks, every chunk is less than or equal to `AIM_MINICHUNK_SIZE`.
     // In each chunk, offsets are put first then followed by binary bytes data, each chunk is padded to 8 bytes.
     // the offsets in the chunk points to the bytes offset in this chunk.
-    fn chunk_data(
-        &self,
-        mut data: VariableWidthBlock,
-    ) -> (MiniBlockCompressed, CompressiveEncoding) {
+    fn chunk_data(&self, data: VariableWidthBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
         // TODO: Support compression of offsets
         // TODO: Support general compression of data
         match data.bits_per_offset {
@@ -257,7 +254,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // `num_values` <= number of values in the chunk.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
-        let mut data = data.into_iter().next().unwrap();
+        let data = data.into_iter().next().unwrap();
 
         if self.bits_per_offset == 64 {
             // offset and at least one value
@@ -272,7 +269,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .collect::<Vec<u64>>();
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
+                data: LanceBuffer::from(
                     data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
                 ),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
@@ -293,7 +290,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 .collect::<Vec<u32>>();
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::Owned(
+                data: LanceBuffer::from(
                     data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
                 ),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
@@ -353,7 +350,7 @@ impl BlockCompressor for VariableEncoder {
 
                         // store bytes
                         output.extend_from_slice(&variable_width_data.data);
-                        Ok(LanceBuffer::Owned(output))
+                        Ok(LanceBuffer::from(output))
                     }
                     64 => {
                         let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u64>();
@@ -382,7 +379,7 @@ impl BlockCompressor for VariableEncoder {
 
                         // store bytes
                         output.extend_from_slice(&variable_width_data.data);
-                        Ok(LanceBuffer::Owned(output))
+                        Ok(LanceBuffer::from(output))
                     }
                     _ => {
                         panic!("BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",

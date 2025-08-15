@@ -18,7 +18,7 @@ Users can register a Lance dataset as a table in DataFusion and run SQL with it:
 
 ```rust
 use datafusion::prelude::SessionContext;
-use crate::datafusion::LanceTableProvider;
+use lance::datafusion::LanceTableProvider;
 
 let ctx = SessionContext::new();
 
@@ -37,7 +37,7 @@ let result = df.collect().await?;
 
 ```rust
 use datafusion::prelude::SessionContext;
-use crate::datafusion::LanceTableProvider;
+use lance::datafusion::LanceTableProvider;
 
 let ctx = SessionContext::new();
 
@@ -62,6 +62,31 @@ let df = ctx.sql("
     LIMIT 10
 ").await?;
 
+let result = df.collect().await?;
+```
+
+### Register UDF
+Lance provides some built-in UDFs, which users can manually register and use in queries.
+The following example demonstrates how to register and use ```contains_tokens```.
+
+```rust
+use datafusion::prelude::SessionContext;
+use lance::datafusion::LanceTableProvider;
+use lance_datafusion::udf::register_functions;
+
+let ctx = SessionContext::new();
+
+// Register built-in UDFs
+register_functions(&ctx);
+
+ctx.register_table("dataset",
+    Arc::new(LanceTableProvider::new(
+    Arc::new(dataset.clone()),
+    /* with_row_id */ false,
+    /* with_row_addr */ false,
+    )))?;
+
+let df = ctx.sql("SELECT * FROM dataset WHERE contains_tokens(text, 'cat')").await?;
 let result = df.collect().await?;
 ```
 

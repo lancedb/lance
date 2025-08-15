@@ -45,6 +45,7 @@ use log::{debug, info, warn};
 use snafu::location;
 use tracing::Span;
 
+use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
@@ -346,7 +347,11 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
-    SessionContext::new_with_config_rt(session_config, runtime_env)
+
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
+    register_functions(&ctx);
+
+    ctx
 }
 
 static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
