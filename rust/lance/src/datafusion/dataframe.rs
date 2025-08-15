@@ -18,7 +18,7 @@ use datafusion::{
     physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream},
 };
 use lance_arrow::SchemaExt;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
@@ -28,31 +28,23 @@ pub struct LanceTableProvider {
     full_schema: Arc<Schema>,
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
-    row_offset_idx: Option<usize>,
     ordered: bool,
 }
 
 impl LanceTableProvider {
-    pub fn new(
-        dataset: Arc<Dataset>,
-        with_row_id: bool,
-        with_row_addr: bool,
-        with_row_offset: bool,
-    ) -> Self {
-        Self::new_with_ordering(dataset, with_row_id, with_row_addr, with_row_offset, true)
+    pub fn new(dataset: Arc<Dataset>, with_row_id: bool, with_row_addr: bool) -> Self {
+        Self::new_with_ordering(dataset, with_row_id, with_row_addr, true)
     }
 
     pub fn new_with_ordering(
         dataset: Arc<Dataset>,
         with_row_id: bool,
         with_row_addr: bool,
-        with_row_offset: bool,
         ordered: bool,
     ) -> Self {
         let mut full_schema = Schema::from(dataset.schema());
         let mut row_id_idx = None;
         let mut row_addr_idx = None;
-        let mut row_offset_idx = None;
         if with_row_id {
             full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
             row_id_idx = Some(full_schema.fields.len() - 1);
@@ -61,18 +53,11 @@ impl LanceTableProvider {
             full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
             row_addr_idx = Some(full_schema.fields.len() - 1);
         }
-        if with_row_offset {
-            full_schema = full_schema
-                .try_with_column(ROW_OFFSET_FIELD.clone())
-                .unwrap();
-            row_offset_idx = Some(full_schema.fields.len() - 1);
-        }
         Self {
             dataset,
             full_schema: Arc::new(full_schema),
             row_id_idx,
             row_addr_idx,
-            row_offset_idx,
             ordered,
         }
     }
@@ -111,8 +96,6 @@ impl TableProvider for LanceTableProvider {
                         scan.with_row_id();
                     } else if Some(*field_idx) == self.row_addr_idx {
                         scan.with_row_address();
-                    } else if Some(*field_idx) == self.row_offset_idx {
-                        scan.with_row_offset();
                     } else {
                         columns.push(self.full_schema.field(*field_idx).name());
                     }
@@ -165,7 +148,6 @@ pub trait SessionContextExt {
         dataset: Arc<Dataset>,
         with_row_id: bool,
         with_row_addr: bool,
-        with_row_offset: bool,
     ) -> datafusion::common::Result<DataFrame>;
     /// Creates a DataFrame for reading a Lance dataset without ordering
     fn read_lance_unordered(
@@ -173,7 +155,6 @@ pub trait SessionContextExt {
         dataset: Arc<Dataset>,
         with_row_id: bool,
         with_row_addr: bool,
-        with_row_offset: bool,
     ) -> datafusion::common::Result<DataFrame>;
     /// Creates a DataFrame for reading a stream of data
     ///
@@ -226,13 +207,11 @@ impl SessionContextExt for SessionContext {
         dataset: Arc<Dataset>,
         with_row_id: bool,
         with_row_addr: bool,
-        with_row_offset: bool,
     ) -> datafusion::common::Result<DataFrame> {
         self.read_table(Arc::new(LanceTableProvider::new(
             dataset,
             with_row_id,
             with_row_addr,
-            with_row_offset,
         )))
     }
 
@@ -241,13 +220,11 @@ impl SessionContextExt for SessionContext {
         dataset: Arc<Dataset>,
         with_row_id: bool,
         with_row_addr: bool,
-        with_row_offset: bool,
     ) -> datafusion::common::Result<DataFrame> {
         self.read_table(Arc::new(LanceTableProvider::new_with_ordering(
             dataset,
             with_row_id,
             with_row_addr,
-            with_row_offset,
             false,
         )))
     }
@@ -299,7 +276,7 @@ pub mod tests {
 
         ctx.register_table(
             "foo",
-            Arc::new(LanceTableProvider::new(Arc::new(data), true, true, true)),
+            Arc::new(LanceTableProvider::new(Arc::new(data), true, true)),
         )
         .unwrap();
 

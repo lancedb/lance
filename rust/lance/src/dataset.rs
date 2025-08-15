@@ -336,7 +336,6 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
-        let mut projection_plan = ProjectionPlan::new(dataset.clone());
         match self {
             Self::Schema(schema) => {
                 let projection = dataset.schema().project_by_schema(
@@ -344,13 +343,9 @@ impl ProjectionRequest {
                     OnMissing::Error,
                     OnTypeMismatch::Error,
                 )?;
-                projection_plan.project_from_schema(&projection);
-                Ok(projection_plan)
+                ProjectionPlan::from_schema(dataset.clone(), &projection)
             }
-            Self::Sql(columns) => {
-                projection_plan.project_from_expressions(&columns)?;
-                Ok(projection_plan)
-            }
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset.clone(), &columns),
         }
     }
 }

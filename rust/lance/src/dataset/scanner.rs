@@ -400,6 +400,35 @@ pub struct Scanner {
 
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
+
+    // Legacy fields to help migrate some old projection behavior to new behavior
+    //
+    // There are two behaviors we are moving away from:
+    //
+    // First, the old behavior used methods like with_row_id and with_row_addr to add
+    // "system" columns.  The new behavior is to specify them in the projection like any
+    // other column.  The only difference between a system column and a regular column is
+    // that system columns are not returned in the schema and are not returned by default
+    // (i.e. "SELECT *")
+    //
+    // Second, the old behavior would _always_ add the _score or _distance columns to the
+    // output and there was no way for the user to opt out.  The new behavior treats the
+    // _score and _distance as regular output columns of the "search table function".  If
+    // the user does not specify a projection (i.e. "SELECT *") then we will add the _score
+    // and _distance columns to the end.  If the user does specify a projection then they
+    // must request those columns for them to show up.
+    //
+    // --------------------------------------------------------------------------
+    /// Whether the user wants the row id on top of the projection, will always come last
+    /// except possibly before _rowaddr
+    legacy_with_row_id: bool,
+    /// Whether the user wants the row address on top of the projection, will always come last
+    legacy_with_row_addr: bool,
+    /// Whether the user explicitly requested a projection.  If they did then we will warn them
+    /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
+    explicit_projection: bool,
+    /// Whether the user wants to use the legacy projection behavior.
+    autoproject_scoring_columns: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -569,8 +598,7 @@ impl TakeOperation {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        // By default, we only scan the local schema
-        let projection_plan = ProjectionPlan::new(dataset.clone());
+        let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
         Self {
             dataset,
@@ -596,6 +624,10 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
+            legacy_with_row_addr: false,
+            legacy_with_row_id: false,
+            explicit_projection: false,
+            autoproject_scoring_columns: true,
         }
     }
 
@@ -661,27 +693,6 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
             .collect();
 
-        let with_row_id = self.projection_plan.desires_row_id;
-        let with_row_addr = self.projection_plan.desires_row_addr;
-
-        for (col, _) in &transformed_columns {
-            if *col == ROW_ID && !with_row_id {
-                return Err(Error::invalid_input(
-                    format!("Cannot project {} without enabling with_row_id", ROW_ID),
-                    location!(),
-                ));
-            }
-            if *col == ROW_ADDR && !with_row_addr {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Cannot project {} without enabling with_row_address",
-                        ROW_ADDR
-                    ),
-                    location!(),
-                ));
-            }
-        }
-
         self.project_with_transform(&transformed_columns)
     }
 
@@ -692,19 +703,14 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let filtered_columns: Vec<_> = columns
-            .iter()
-            .filter(|(col, _)| {
-                let col_name = col.as_ref();
-                !(col_name == ROW_ID
-                    || col_name == ROW_ADDR
-                    || col_name == DIST_COL
-                    || col_name == SCORE_COL)
-            })
-            .map(|(c, t)| (c.as_ref(), t.as_ref()))
-            .collect();
-        self.projection_plan
-            .project_from_expressions(&filtered_columns)?;
+        self.explicit_projection = true;
+        self.projection_plan = ProjectionPlan::from_expressions(self.dataset.clone(), columns)?;
+        if self.legacy_with_row_id {
+            self.projection_plan.include_row_id();
+        }
+        if self.legacy_with_row_addr {
+            self.projection_plan.include_row_addr();
+        }
         Ok(self)
     }
 
@@ -1198,19 +1204,35 @@ impl Scanner {
 
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
+        self.legacy_with_row_id = true;
         self.projection_plan.include_row_id();
         self
     }
 
     /// Instruct the scanner to return the `_rowaddr` meta column from the dataset.
     pub fn with_row_address(&mut self) -> &mut Self {
+        self.legacy_with_row_addr = true;
         self.projection_plan.include_row_addr();
         self
     }
 
-    /// Instruct the scanner to return the `_rowoffset` meta column from the dataset.
-    pub fn with_row_offset(&mut self) -> &mut Self {
-        self.projection_plan.include_row_offset();
+    /// Instruct the scanner to disable automatic projection of scoring columns
+    ///
+    /// In the future, this will be the default behavior.  This method is useful for
+    /// opting in to the new behavior early to avoid breaking changes (and a warning
+    /// message)
+    ///
+    /// Once the default switches, the old autoprojection behavior will be removed.
+    ///
+    /// The autoprojection behavior (current default) includes the _score or _distance
+    /// column even if a projection is manually specified with `[project]` or
+    /// `[project_with_transform]`.
+    ///
+    /// The new behavior will only include the _score or _distance column if no projection
+    /// is specified or if the user explicitly includes the _score or _distance column
+    /// in the projection.
+    pub fn disable_scoring_autoprojection(&mut self) -> &mut Self {
+        self.autoproject_scoring_columns = false;
         self
     }
 
@@ -1279,44 +1301,68 @@ impl Scanner {
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
-    pub(crate) fn output_expr(
+    /// This takes the current output, and the user's requested projection, and calculates the
+    /// final projection expression.
+    ///
+    /// This final expression may reorder columns, drop columns, or calculate new columns
+    pub(crate) fn calculate_final_projection(
         &self,
         current_schema: &ArrowSchema,
     ) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        // Append the extra columns
+        // Select the columns from the output schema based on the user's projection (or the list
+        // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
 
-        // distance goes before the row_id column
-        if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
-            let vector_expr = expressions::col(DIST_COL, current_schema)?;
-            output_expr.push((vector_expr, DIST_COL.to_string()));
+        // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
+        // projection behavior
+        if self.autoproject_scoring_columns {
+            if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to to adopt the future behavior and avoid this warning");
+                }
+                let vector_expr = expressions::col(DIST_COL, current_schema)?;
+                output_expr.push((vector_expr, DIST_COL.to_string()));
+            }
+            if self.full_text_query.is_some()
+                && output_expr.iter().all(|(_, name)| name != SCORE_COL)
+            {
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
+                }
+                let score_expr = expressions::col(SCORE_COL, current_schema)?;
+                output_expr.push((score_expr, SCORE_COL.to_string()));
+            }
         }
 
-        if self.full_text_query.is_some() && output_expr.iter().all(|(_, name)| name != SCORE_COL) {
-            let score_expr = expressions::col(SCORE_COL, current_schema)?;
-            output_expr.push((score_expr, SCORE_COL.to_string()));
+        if self.legacy_with_row_id {
+            let row_id_pos = output_expr
+                .iter()
+                .position(|(_, name)| name == ROW_ID)
+                .ok_or_else(|| Error::Internal {
+                    message:
+                        "user specified with_row_id but the _rowid column was not in the output"
+                            .to_string(),
+                    location: location!(),
+                })?;
+            if row_id_pos != output_expr.len() - 1 {
+                // Row id is not last column.  Need to rotate it to the last spot.
+                let row_id_expr = output_expr.remove(row_id_pos);
+                output_expr.push(row_id_expr);
+            }
         }
 
-        // TODO: These output_expr.iter().all() checks seem redundant.  We should never have ROW_ID
-        // or ROW_ADDR in the output exprs.
-        if self.projection_plan.desires_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID)
-        {
-            let row_id_expr = expressions::col(ROW_ID, current_schema)?;
-            output_expr.push((row_id_expr, ROW_ID.to_string()));
-        }
-
-        if self.projection_plan.desires_row_addr
-            && output_expr.iter().all(|(_, name)| name != ROW_ADDR)
-        {
-            let row_addr_expr = expressions::col(ROW_ADDR, current_schema)?;
-            output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
-        }
-
-        if self.projection_plan.desires_row_offset
-            && output_expr.iter().all(|(_, name)| name != ROW_OFFSET)
-        {
-            let row_offset_expr = expressions::col(ROW_OFFSET, current_schema)?;
-            output_expr.push((row_offset_expr, ROW_OFFSET.to_string()));
+        if self.legacy_with_row_addr {
+            let row_addr_pos = output_expr.iter().position(|(_, name)| name == ROW_ADDR).ok_or_else(|| {
+                Error::Internal {
+                    message: "user specified with_row_address but the _rowaddr column was not in the output".to_string(),
+                    location: location!(),
+                }
+            })?;
+            if row_addr_pos != output_expr.len() - 1 {
+                // Row addr is not last column.  Need to rotate it to the last spot.
+                let row_addr_expr = output_expr.remove(row_addr_pos);
+                output_expr.push(row_addr_expr);
+            }
         }
 
         Ok(output_expr)
@@ -1529,7 +1575,7 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
-        if self.include_deleted_rows && !self.projection_plan.desires_row_id {
+        if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::InvalidInput {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
                 location: location!(),
@@ -1673,11 +1719,11 @@ impl Scanner {
                     // It's also possible we get here from `SELECT does_not_exist`
 
                     // Note: even though we are just going to return an error we still want to calculate the
-                    // output_expr here.  This lets us distinguish between a user doing something like:
+                    // final projection here.  This lets us distinguish between a user doing something like:
                     //
                     // SELECT 1 FROM t (not supported error)
                     // SELECT non_existent_column FROM t (column not found error)
-                    let output_expr = self.output_expr(&ArrowSchema::empty())?;
+                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
                     return Err(Error::NotSupported {
                         source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
                         location: location!(),
@@ -1779,14 +1825,14 @@ impl Scanner {
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
         // Stage 6: if requested, add the row offset column
-        if self.projection_plan.desires_row_offset {
+        if self.projection_plan.needs_row_offset {
             plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
         }
 
         // Stage 7: final projection
-        let output_expr = self.output_expr(plan.schema().as_ref())?;
+        let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
 
-        plan = Arc::new(DFProjectionExec::try_new(output_expr, plan)?);
+        plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
@@ -2656,11 +2702,14 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
-            let vector_scan_projection = self
+            let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
                 .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
+
+            vector_scan_projection.with_row_addr =
+                self.projection_plan.physical_projection.with_row_addr;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(
@@ -7025,7 +7074,7 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 32)?
                     .fast_search()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
@@ -7040,7 +7089,7 @@ mod test {
                 scan.nearest("vec", &q, 33)?
                     .fast_search()
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
@@ -7055,7 +7104,7 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 34)?
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
   FilterExec: _distance@2 IS NOT NULL
@@ -7325,12 +7374,18 @@ mod test {
 
         // Test error case
         let mut scanner = dataset.scan();
-        let result = if with_row_id {
-            scanner.project(&[ROW_ID])
+        if with_row_id {
+            scanner.project(&[ROW_ID]).unwrap();
         } else {
-            scanner.project(&[ROW_ADDR])
+            scanner.project(&[ROW_ADDR]).unwrap();
         };
-        assert!(result.is_err());
+        let stream = scanner.try_into_stream().await.unwrap();
+        assert_eq!(stream.schema().fields().len(), 1);
+        if with_row_id {
+            assert!(stream.schema().field_with_name(ROW_ID).is_ok());
+        } else {
+            assert!(stream.schema().field_with_name(ROW_ADDR).is_ok());
+        }
     }
 
     async fn limit_offset_equivalency_test(scanner: &Scanner) {
@@ -7478,7 +7533,7 @@ mod test {
         // Normal read, all columns plus row offset
         test_row_offset_read_helper(
             &ds,
-            |scanner| scanner.with_row_offset(),
+            |scanner| scanner.project(&["idx", ROW_OFFSET]).unwrap(),
             &["idx", ROW_OFFSET],
             &[0, 1, 2, 3],
         )
@@ -7487,17 +7542,23 @@ mod test {
         // Read with row offset only
         test_row_offset_read_helper(
             &ds,
-            |scanner| scanner.with_row_offset().project::<String>(&[]).unwrap(),
+            |scanner| scanner.project(&[ROW_OFFSET]).unwrap(),
             &[ROW_OFFSET],
             &[0, 1, 2, 3],
         )
         .await;
 
-        // Filtered read
+        // Filtered read of row offset
         test_row_offset_read_helper(
             &ds,
-            |scanner| scanner.with_row_offset().filter("idx > 1").unwrap(),
-            &["idx", ROW_OFFSET],
+            |scanner| {
+                scanner
+                    .filter("idx > 1")
+                    .unwrap()
+                    .project(&[ROW_OFFSET])
+                    .unwrap()
+            },
+            &[ROW_OFFSET],
             &[2, 3],
         )
         .await;

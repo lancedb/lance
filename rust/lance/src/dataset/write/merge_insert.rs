@@ -697,7 +697,7 @@ impl MergeInsertJob {
 
         match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => {
-                let existing = session_ctx.read_lance(self.dataset.clone(), true, false, false)?;
+                let existing = session_ctx.read_lance(self.dataset.clone(), true, false)?;
                 // We need to rename the columns from the target table so that they don't conflict with the source table
                 let existing = Self::prefix_columns(existing, "target_");
                 let joined =
@@ -705,7 +705,7 @@ impl MergeInsertJob {
                 Ok(joined.execute_stream().await?)
             }
             SchemaComparison::Subschema => {
-                let existing = session_ctx.read_lance(self.dataset.clone(), true, true, false)?;
+                let existing = session_ctx.read_lance(self.dataset.clone(), true, true)?;
                 let columns = schema
                     .field_names()
                     .iter()
@@ -1231,7 +1231,7 @@ impl MergeInsertJob {
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
-        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), false, true, false)?;
+        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), false, true)?;
         let on_cols = self
             .params
             .on
