@@ -78,7 +78,7 @@ use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, LanceFilterExec, LanceScanConfig};
+use crate::io::exec::{get_physical_optimizer, AddRowOffsetExec, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -1208,6 +1208,12 @@ impl Scanner {
         self
     }
 
+    /// Instruct the scanner to return the `_rowoffset` meta column from the dataset.
+    pub fn with_row_offset(&mut self) -> &mut Self {
+        self.projection_plan.include_row_offset();
+        self
+    }
+
     /// Set the file reader options to use when reading data files.
     pub fn with_file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
         self.file_reader_options = Some(options);
@@ -1304,6 +1310,13 @@ impl Scanner {
         {
             let row_addr_expr = expressions::col(ROW_ADDR, current_schema)?;
             output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
+        }
+
+        if self.projection_plan.desires_row_offset
+            && output_expr.iter().all(|(_, name)| name != ROW_OFFSET)
+        {
+            let row_offset_expr = expressions::col(ROW_OFFSET, current_schema)?;
+            output_expr.push((row_offset_expr, ROW_OFFSET.to_string()));
         }
 
         Ok(output_expr)
@@ -1764,6 +1777,11 @@ impl Scanner {
 
         // Stage 5: take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
+
+        // Stage 6: if requested, add the row offset column
+        if self.projection_plan.desires_row_offset {
+            plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
+        }
 
         // Stage 7: final projection
         let output_expr = self.output_expr(plan.schema().as_ref())?;
@@ -7414,6 +7432,75 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    async fn test_row_offset_read_helper(
+        ds: &Dataset,
+        scan_builder: impl FnOnce(&mut Scanner) -> &mut Scanner,
+        expected_cols: &[&str],
+        expected_row_offsets: &[u64],
+    ) {
+        let mut scanner = ds.scan();
+        let scanner = scan_builder(&mut scanner);
+        let stream = scanner.try_into_stream().await.unwrap();
+
+        let schema = stream.schema();
+        let actual_cols = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(&actual_cols, expected_cols);
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
+
+        let row_offsets = batch
+            .column_by_name(ROW_OFFSET)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        assert_eq!(row_offsets.as_ref(), expected_row_offsets);
+    }
+
+    #[tokio::test]
+    async fn test_row_offset_read() {
+        let mut ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+        // [0, 1, 2], [3, 4, 5], [6, 7, 8]
+
+        // Delete [2, 3, 4, 5, 6]
+        ds.delete("idx >= 2 AND idx <= 6").await.unwrap();
+
+        // Normal read, all columns plus row offset
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| scanner.with_row_offset(),
+            &["idx", ROW_OFFSET],
+            &[0, 1, 2, 3],
+        )
+        .await;
+
+        // Read with row offset only
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| scanner.with_row_offset().project::<String>(&[]).unwrap(),
+            &[ROW_OFFSET],
+            &[0, 1, 2, 3],
+        )
+        .await;
+
+        // Filtered read
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| scanner.with_row_offset().filter("idx > 1").unwrap(),
+            &["idx", ROW_OFFSET],
+            &[2, 3],
+        )
+        .await;
     }
 
     #[tokio::test]

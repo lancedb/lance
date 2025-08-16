@@ -26,6 +26,9 @@ pub struct SqlQueryBuilder {
 
     /// If true, the query result will include the internal row address
     pub(crate) with_row_addr: bool,
+
+    /// If true, the query result will include the internal row offset
+    pub(crate) with_row_offset: bool,
 }
 
 impl SqlQueryBuilder {
@@ -36,6 +39,7 @@ impl SqlQueryBuilder {
             table_name: "dataset".to_string(),
             with_row_id: false,
             with_row_addr: false,
+            with_row_offset: false,
         }
     }
 
@@ -62,16 +66,25 @@ impl SqlQueryBuilder {
         self
     }
 
+    /// Specify if the query result should include the internal row offset.
+    /// If true, the query result will include an additional column named "_rowoffset".
+    pub fn with_row_offset(mut self, row_offset: bool) -> Self {
+        self.with_row_offset = row_offset;
+        self
+    }
+
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
         let ctx = SessionContext::new();
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
+        let row_offset = self.with_row_offset;
         ctx.register_table(
             self.table_name,
             Arc::new(LanceTableProvider::new(
                 self.dataset.clone(),
                 row_id,
                 row_addr,
+                row_offset,
             )),
         )?;
         let df = ctx.sql(&self.sql).await?;

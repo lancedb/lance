@@ -376,13 +376,19 @@ struct FFILanceTableProvider {
     dataset: Arc<::lance::Dataset>,
     with_row_id: bool,
     with_row_addr: bool,
+    with_row_offset: bool,
 }
 
 #[pymethods]
 impl FFILanceTableProvider {
     #[new]
-    #[pyo3(signature = (dataset, *, with_row_id = false, with_row_addr = false))]
-    fn new(dataset: &Bound<'_, PyAny>, with_row_id: bool, with_row_addr: bool) -> PyResult<Self> {
+    #[pyo3(signature = (dataset, *, with_row_id = false, with_row_addr = false, with_row_offset = false))]
+    fn new(
+        dataset: &Bound<'_, PyAny>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        with_row_offset: bool,
+    ) -> PyResult<Self> {
         let py = dataset.py();
         let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
         let dataset_ref = &dataset.bind(py).borrow().ds;
@@ -392,6 +398,7 @@ impl FFILanceTableProvider {
             dataset: dataset_ref.clone(),
             with_row_id,
             with_row_addr,
+            with_row_offset,
         })
     }
 
@@ -404,6 +411,7 @@ impl FFILanceTableProvider {
             self.dataset.clone(),
             self.with_row_id,
             self.with_row_addr,
+            self.with_row_offset,
         ));
 
         let ffi_provider =
