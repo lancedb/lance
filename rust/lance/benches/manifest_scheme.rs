@@ -30,13 +30,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::types::{Float32Type, Int32Type};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance::dataset::{Dataset, InsertBuilder, WriteDestination, WriteMode, WriteParams};
-use lance_datafusion::datagen::DatafusionDatagenExt;
-use lance_datagen::{BatchCount, RowCount};
+use lance::dataset::{load_and_sort_new_transactions_v3, Dataset, WriteParams};
+use lance::io::commit::load_and_sort_new_transactions;
 use lance_table::io::commit::ManifestNamingScheme;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -63,7 +61,7 @@ fn get_storage_type() -> String {
     } else if prefix.starts_with("az://") {
         "azure".to_string()
     } else {
-        "file".to_string()
+        "local".to_string()
     }
 }
 
@@ -124,8 +122,7 @@ async fn create_test_dataset(
     dataset
 }
 
-/// Benchmark checkout_latest performance: V2 vs V3
-fn bench_checkout_latest_v2_vs_v3(c: &mut Criterion) {
+fn bench_checkout_latest(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let storage_prefix = get_storage_prefix();
     let storage_type = get_storage_type();
@@ -155,7 +152,7 @@ fn bench_checkout_latest_v2_vs_v3(c: &mut Criterion) {
 
             c.bench_function(
                 &format!(
-                    "Checkout Latest {} ({} versions, {})",
+                    "checkout_latest_{} ({} versions, {})",
                     scheme_name, num_versions, storage_type
                 ),
                 |b| {
@@ -172,74 +169,77 @@ fn bench_checkout_latest_v2_vs_v3(c: &mut Criterion) {
     }
 }
 
-/// Benchmark concurrent commit performance: V2 vs V3
-fn bench_concurrent_commits_v2_vs_v3(c: &mut Criterion) {
+fn bench_load_new_transactions_during_commit(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let storage_prefix = get_storage_prefix();
     let storage_type = get_storage_type();
 
-    for num_versions in [10, 50, 100] {
-        for commits_behind in [5, 10, 20] {
-            for scheme in [ManifestNamingScheme::V2, ManifestNamingScheme::V3] {
-                let scheme_name = match scheme {
-                    ManifestNamingScheme::V2 => "V2",
-                    ManifestNamingScheme::V3 => "V3",
-                    _ => unreachable!(),
-                };
+    // Test different combinations of commits_behind and head_manifests_batch_size
+    let test_configs = [(3, 4), (5, 8)];
 
-                // Skip if we don't have enough versions
-                if commits_behind >= num_versions {
-                    continue;
-                }
+    for num_versions in [50, 100, 200] {
+        for (commits_behind, head_manifests_batch_size) in test_configs {
+            // Skip if we don't have enough versions
+            if commits_behind >= num_versions {
+                continue;
+            }
 
-                let dataset_uri = format!(
-                    "{}bench_concurrent_{}_{}.lance",
-                    storage_prefix,
-                    scheme_name.to_lowercase(),
-                    num_versions
-                );
+            // Test V2 scheme
+            {
+                let scheme = ManifestNamingScheme::V2;
+                let dataset_uri = format!("{}bench_load_v2_{}.lance", storage_prefix, num_versions);
                 let dataset = rt.block_on(create_test_dataset(&dataset_uri, num_versions, scheme));
                 let latest_version = dataset.version().version;
                 let target_version = latest_version - commits_behind;
 
                 c.bench_function(
                     &format!(
-                        "Concurrent Commit {} ({} versions, {} behind, {})",
-                        scheme_name, num_versions, commits_behind, storage_type
+                        "load_new_transactions_during_commit_V2 ({} versions, {} behind, {})",
+                        num_versions, commits_behind, storage_type
                     ),
                     |b| {
                         b.to_async(&rt).iter(|| async {
+                            // Checkout an older version to simulate being behind
+                            let old_dataset = dataset.checkout_version(target_version).await.unwrap();
+
+                            // Measure only the load_and_sort_new_transactions function
+                            let (_new_dataset, transactions) =
+                                load_and_sort_new_transactions(&old_dataset).await.unwrap();
+
+                            // Verify we loaded the expected number of transactions
+                            assert_eq!(transactions.len(), commits_behind as usize);
+                        })
+                    },
+                );
+            }
+
+            // Test V3 scheme
+            {
+                let scheme = ManifestNamingScheme::V3;
+                let dataset_uri = format!("{}bench_load_v3_{}.lance", storage_prefix, num_versions);
+                let dataset = rt.block_on(create_test_dataset(&dataset_uri, num_versions, scheme));
+                let latest_version = dataset.version().version;
+                let target_version = latest_version - commits_behind;
+
+                c.bench_function(
+                    &format!(
+                        "load_new_transactions_during_commit_V3 ({} versions, {} behind, head batch size {}, {})",
+                        num_versions, commits_behind, head_manifests_batch_size, storage_type
+                    ),
+                    |b| {
+                        b.to_async(&rt).iter(|| async {
+                            // Checkout an older version to simulate being behind
                             let old_dataset =
                                 dataset.checkout_version(target_version).await.unwrap();
 
-                            // Create small append data for concurrent write
-                            let append_data = lance_datagen::gen_batch()
-                                .col(
-                                    "id",
-                                    lance_datagen::array::step_custom::<Int32Type>(1000, 1),
-                                )
-                                .col("value", lance_datagen::array::rand::<Float32Type>())
-                                .into_df_stream(RowCount::from(10), BatchCount::from(1));
+                            // Measure only the load_and_sort_new_transactions_v3 function
+                            let (_new_dataset, transactions) =
+                                load_and_sort_new_transactions_v3(&old_dataset, head_manifests_batch_size)
+                                    .await
+                                    .unwrap();
 
-                            // Perform concurrent commit with conflict resolution
-                            let write_params = WriteParams {
-                                mode: WriteMode::Append,
-                                head_manifests_batch_size: if matches!(
-                                    scheme,
-                                    ManifestNamingScheme::V3
-                                ) {
-                                    8
-                                } else {
-                                    1
-                                },
-                                ..Default::default()
-                            };
-
-                            InsertBuilder::new(WriteDestination::Dataset(Arc::new(old_dataset)))
-                                .with_params(&write_params)
-                                .execute_stream(append_data)
-                                .await
-                                .unwrap();
+                            // Verify we loaded the expected number of transactions
+                            assert_eq!(transactions.len(), commits_behind as usize);
                         })
                     },
                 );
@@ -256,7 +256,7 @@ criterion_group!(
         .sample_size(50)
         .warm_up_time(std::time::Duration::from_secs(5))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_checkout_latest_v2_vs_v3, bench_concurrent_commits_v2_vs_v3
+    targets = bench_checkout_latest, bench_load_new_transactions_during_commit
 );
 
 #[cfg(not(target_os = "linux"))]
@@ -266,7 +266,7 @@ criterion_group!(
         .significance_level(0.01)
         .sample_size(50)
         .warm_up_time(std::time::Duration::from_secs(5));
-    targets = bench_checkout_latest_v2_vs_v3, bench_concurrent_commits_v2_vs_v3
+    targets = bench_checkout_latest, bench_load_new_transactions_during_commit
 );
 
 criterion_main!(benches);

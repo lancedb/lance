@@ -1760,7 +1760,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     }
 }
 
-pub(crate) async fn load_and_sort_new_transactions_v3(
+pub async fn load_and_sort_new_transactions_v3(
     dataset: &Dataset,
     head_manifests_batch_size: usize,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
