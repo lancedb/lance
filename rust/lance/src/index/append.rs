@@ -115,18 +115,25 @@ pub async fn merge_indices<'a>(
                             })?;
                     index.is_legacy()
                 }
+
                 _ => false,
             };
 
             let mut scanner = dataset.scan();
-            let orodering = match index.index_type() {
+            let ordering = match index.index_type() {
                 IndexType::Inverted => None,
                 _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
             };
+            // ZoneMap filter replies on row_address to do categorization
+            if index.index_type() == IndexType::ZoneMap {
+                scanner.with_row_address();
+            }
+
             scanner
                 .with_row_id()
-                .order_by(orodering)?
+                .order_by(ordering)?
                 .project(&[&column.name])?;
+
             if !need_full_data {
                 scanner.with_fragments(unindexed);
             }

@@ -26,6 +26,7 @@ use lance_index::scalar::{
 use lance_index::scalar::{
     inverted::METADATA_FILE,
     ngram::{train_ngram_index, NGramIndex},
+    zonemap::{train_zonemap_index, ZoneMapIndex},
 };
 use lance_index::ScalarIndexCriteria;
 use lance_index::{
@@ -63,7 +64,7 @@ impl TrainingSource for TrainingRequest {
         if !self.train {
             return self.create_empty_stream().await;
         }
-        self.scan_chunks(chunk_size, true).await
+        self.scan_chunks(chunk_size, OrderMode::Ordered).await
     }
 
     async fn scan_unordered_chunks(
@@ -73,8 +74,26 @@ impl TrainingSource for TrainingRequest {
         if !self.train {
             return self.create_empty_stream().await;
         }
-        self.scan_chunks(chunk_size, false).await
+        self.scan_chunks(chunk_size, OrderMode::Unordered).await
     }
+
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        if !self.train {
+            return self.create_empty_stream().await;
+        }
+        self.scan_chunks(chunk_size, OrderMode::Aligned).await
+    }
+}
+
+enum OrderMode {
+    Unordered,
+    // ordered by the user specified column
+    Ordered,
+    // row_address column is added to the scan and it's order by row_address
+    Aligned,
 }
 
 impl TrainingRequest {
@@ -113,7 +132,7 @@ impl TrainingRequest {
     async fn scan_chunks(
         self: Box<Self>,
         chunk_size: u32,
-        sort: bool,
+        order_mode: OrderMode,
     ) -> Result<SendableRecordBatchStream> {
         let num_rows = self.dataset.count_all_rows().await?;
 
@@ -137,15 +156,21 @@ impl TrainingRequest {
             DataType::Utf8 | DataType::LargeUtf8
         );
 
-        let ordering = match sort {
-            true => Some(vec![ColumnOrdering::asc_nulls_first(self.column.clone())]),
-            false => None,
+        let scan = match order_mode {
+            OrderMode::Aligned => {
+                // Since Lance will return data in the order of the row_address, no need to sort.
+                scan.with_row_id()
+                    .with_row_address()
+                    .project(&[&self.column])?
+            }
+            OrderMode::Ordered => scan
+                .with_row_id()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                    self.column.clone(),
+                )]))?
+                .project(&[&self.column])?,
+            OrderMode::Unordered => scan.with_row_id().project(&[&self.column])?,
         };
-
-        let scan = scan
-            .with_row_id()
-            .order_by(ordering)?
-            .project(&[&self.column])?;
 
         let batches = scan
             .try_into_dfstream(LanceExecutionOptions {
@@ -210,6 +235,11 @@ fn ngram_index_details() -> prost_types::Any {
     prost_types::Any::from_msg(&details).unwrap()
 }
 
+fn zonemap_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::ZoneMapIndexDetails {};
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
 pub(super) fn inverted_index_details() -> prost_types::Any {
     let details = lance_table::format::pb::InvertedIndexDetails::default();
     prost_types::Any::from_msg(&details).unwrap()
@@ -245,6 +275,12 @@ impl ScalarIndexDetails for lance_table::format::pb::NGramIndexDetails {
     }
 }
 
+impl ScalarIndexDetails for lance_table::format::pb::ZoneMapIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::ZoneMap
+    }
+}
+
 fn get_scalar_index_details(
     details: &prost_types::Any,
 ) -> Result<Option<Box<dyn ScalarIndexDetails>>> {
@@ -267,6 +303,10 @@ fn get_scalar_index_details(
     } else if details.type_url.ends_with("NGramIndexDetails") {
         Ok(Some(Box::new(
             details.to_msg::<lance_table::format::pb::NGramIndexDetails>()?,
+        )))
+    } else if details.type_url.ends_with("ZoneMapIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::ZoneMapIndexDetails>()?,
         )))
     } else {
         Ok(None)
@@ -361,6 +401,11 @@ pub(super) async fn build_scalar_index(
             train_ngram_index(training_request, &index_store).await?;
             Ok(ngram_index_details())
         }
+        Some(ScalarIndexType::ZoneMap) => {
+            // TODO: Add type check for zone map index
+            train_zonemap_index(training_request, &index_store, None).await?;
+            Ok(zonemap_index_details())
+        }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
             train_btree_index(
@@ -426,6 +471,11 @@ pub async fn open_scalar_index(
         ScalarIndexType::NGram => {
             let ngram_index = NGramIndex::load(index_store, frag_reuse_index, index_cache).await?;
             Ok(ngram_index as Arc<dyn ScalarIndex>)
+        }
+        ScalarIndexType::ZoneMap => {
+            let zone_map_index =
+                ZoneMapIndex::load(index_store, frag_reuse_index, index_cache).await?;
+            Ok(zone_map_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::BTree => {
             let btree_index = BTreeIndex::load(index_store, frag_reuse_index, index_cache).await?;
@@ -514,6 +564,9 @@ pub async fn detect_scalar_index_type(
 /// This returns IndexType::Vector for all vector index types.
 pub fn infer_index_type(index: &Index) -> Option<IndexType> {
     if let Some(details) = &index.index_details {
+        // "index details" is a serialized protobuf message (prost_types::Any) stored in the Index struct.
+        // It contains type-specific metadata for the index, such as which kind of index it is (scalar, vector, etc).
+        // Here, we try to parse it as a scalar index details proto, and if that fails, as a vector index details proto.
         if let Ok(Some(details)) = get_scalar_index_details(details) {
             return Some(details.get_type().into());
         } else if let Ok(Some(_)) = get_vector_index_details(details) {
@@ -603,6 +656,12 @@ pub fn index_matches_criteria(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::Int32Type;
+    use arrow_array::RecordBatch;
+    use arrow_schema::DataType;
+    use futures::TryStreamExt;
+    use lance_core::datatypes::Field;
+    use lance_datagen::{array, BatchCount, RowCount};
     use lance_table::format::pb::{
         BTreeIndexDetails, InvertedIndexDetails, NGramIndexDetails, VectorIndexDetails,
     };
@@ -743,5 +802,171 @@ mod tests {
         criteria.has_type = Some(ScalarIndexType::NGram);
         let result = index_matches_criteria(&ngram_index, &criteria, &field, true).unwrap();
         assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_scan_aligned_chunks() {
+        // Create test data using lance_datagen
+        let data = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        // Create a dataset for testing
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dataset_path = temp_dir.path().join("test_dataset");
+
+        // Create a dataset with multiple fragments by writing them separately
+        let mut dataset = Dataset::write(data, dataset_path.to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        // Append additional fragments using lance_datagen
+        for i in 1..3 {
+            let start = i * 10;
+            let additional_data = lance_datagen::gen_batch()
+                .col("values", array::step_custom::<Int32Type>(start, 1))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+
+            dataset.append(additional_data, None).await.unwrap();
+        }
+
+        // Create a TrainingRequest
+        let training_request = Box::new(TrainingRequest::new(
+            Arc::new(dataset),
+            "values".to_string(),
+            true,
+        ));
+
+        // Test scan_aligned_chunks with different chunk sizes
+        log::info!("Testing with chunk_size=10:");
+        let stream = training_request.scan_aligned_chunks(10).await.unwrap();
+
+        // Collect all batches
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        // Print information about the chunks and verify _rowaddr format
+        log::info!("Total number of chunks: {}", batches.len());
+
+        // Collect all _rowaddr values to analyze fragment distribution
+        let mut all_rowaddrs = Vec::new();
+        let mut fragment_ids = std::collections::HashSet::new();
+
+        for (i, batch) in batches.iter().enumerate() {
+            let rowaddr_array = batch
+                .column_by_name("_rowaddr")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap();
+
+            let first_rowaddr = rowaddr_array.value(0);
+            let last_rowaddr = rowaddr_array.value(batch.num_rows() - 1);
+
+            // Extract fragment ID (upper 32 bits) and local offset (lower 32 bits)
+            let first_fragment_id = (first_rowaddr >> 32) as u32;
+            let first_local_offset = (first_rowaddr & 0xFFFFFFFF) as u32;
+            let last_fragment_id = (last_rowaddr >> 32) as u32;
+            let last_local_offset = (last_rowaddr & 0xFFFFFFFF) as u32;
+
+            log::info!(
+                "Chunk {}: {} rows, _rowaddr range: {} to {}",
+                i,
+                batch.num_rows(),
+                first_rowaddr,
+                last_rowaddr
+            );
+            log::info!(
+                "  Fragment ID range: {} to {}, Local offset range: {} to {}",
+                first_fragment_id,
+                last_fragment_id,
+                first_local_offset,
+                last_local_offset
+            );
+
+            // Verify each _rowaddr value in this chunk
+            for j in 0..batch.num_rows() {
+                let rowaddr = rowaddr_array.value(j);
+                let fragment_id = (rowaddr >> 32) as u32;
+                let local_offset = (rowaddr & 0xFFFFFFFF) as u32;
+
+                // Verify the expected pattern based on chunk index
+                if i < 10 {
+                    // Chunks 0-9: Fragment 0, local offset 0-99
+                    assert_eq!(
+                        fragment_id, 0,
+                        "Chunk {}: Expected fragment ID 0, got {}",
+                        i, fragment_id
+                    );
+                    let expected_offset = (i * 10 + j) as u32;
+                    assert_eq!(
+                        local_offset, expected_offset,
+                        "Chunk {} row {}: Expected local offset {}, got {}",
+                        i, j, expected_offset, local_offset
+                    );
+                } else if i == 10 {
+                    // Chunk 10: Fragment 1, local offset 0-9
+                    assert_eq!(
+                        fragment_id, 1,
+                        "Chunk {}: Expected fragment ID 1, got {}",
+                        i, fragment_id
+                    );
+                    assert_eq!(
+                        local_offset, j as u32,
+                        "Chunk {} row {}: Expected local offset {}, got {}",
+                        i, j, j, local_offset
+                    );
+                } else if i == 11 {
+                    // Chunk 11: Fragment 2, local offset 0-9
+                    assert_eq!(
+                        fragment_id, 2,
+                        "Chunk {}: Expected fragment ID 2, got {}",
+                        i, fragment_id
+                    );
+                    assert_eq!(
+                        local_offset, j as u32,
+                        "Chunk {} row {}: Expected local offset {}, got {}",
+                        i, j, j, local_offset
+                    );
+                }
+
+                all_rowaddrs.push(rowaddr);
+                fragment_ids.insert(fragment_id);
+            }
+        }
+
+        // Verify we have multiple fragments
+        log::info!("Unique fragment IDs: {:?}", fragment_ids);
+        assert_eq!(fragment_ids, std::collections::HashSet::from([0, 1, 2]));
+
+        // Verify _rowaddr values are properly ordered
+        assert!(
+            all_rowaddrs.windows(2).all(|w| w[0] <= w[1]),
+            "_rowaddr values are not properly ordered"
+        );
+
+        log::info!(
+            "Total _rowaddr values: {}, Unique fragments: {}",
+            all_rowaddrs.len(),
+            fragment_ids.len()
+        );
+
+        // Check that the schema includes the expected columns
+        let output_schema = batches[0].schema();
+        let field_names: Vec<String> = output_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+
+        // Should have the original column
+        assert!(field_names.contains(&"values".to_string()));
+
+        // The _rowaddr column should be present when aligned is true
+        // (This is what we're testing - that scan_aligned_chunks adds the _rowaddr column)
+        assert!(
+            field_names.contains(&"_rowaddr".to_string()),
+            "Expected _rowaddr column in aligned scan, got fields: {:?}",
+            field_names
+        );
     }
 }

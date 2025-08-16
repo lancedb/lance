@@ -305,6 +305,7 @@ impl MapIndexExec {
             column: column_name,
             index_name,
             query: Arc::new(SargableQuery::IsIn(index_vals)),
+            needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         let IndexExprResult::Exact(mut row_id_mask) = query_result else {
@@ -835,6 +836,7 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
+            needs_recheck: false,
         });
 
         let fragments = dataset.fragments().clone();
@@ -872,6 +874,7 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
+            needs_recheck: false,
         });
 
         // These plans aren't even valid but it appears we defer all work (even validation) until

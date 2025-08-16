@@ -41,9 +41,12 @@ impl DatasetIndexRemapper {
         &self,
         index: &Index,
         mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<RemappedIndex> {
+    ) -> Result<Option<RemappedIndex>> {
         let new_uuid = remap_index(&self.dataset, &index.uuid, mapping).await?;
-        Ok(RemappedIndex::new(index.uuid, new_uuid))
+        match new_uuid {
+            Some(uuid) => Ok(Some(RemappedIndex::new(index.uuid, uuid))),
+            None => Ok(None), // No remapping occurred
+        }
     }
 }
 
@@ -66,7 +69,9 @@ impl IndexRemapper for DatasetIndexRemapper {
                         .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
                 };
             if needs_remapped {
-                remapped.push(self.remap_index(index, &mapping).await?);
+                if let Some(remapped_index) = self.remap_index(index, &mapping).await? {
+                    remapped.push(remapped_index);
+                }
             }
         }
         Ok(remapped)

@@ -4248,6 +4248,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "half",
  "hex",
  "pprof",
  "rand 0.9.1",
