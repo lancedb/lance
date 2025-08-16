@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
@@ -20,17 +20,17 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use futures::{future::Either, FutureExt, StreamExt, TryFutureExt};
+use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
-use lance_core::utils::backoff::SlotBackoff;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
-use std::future::Future;
+
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 
 /// Build an update operation.
 ///
@@ -39,13 +39,19 @@ use std::future::Future;
 ///
 /// Use the [UpdateBuilder] to construct an update job. For example:
 ///
-/// ```ignore
-/// let dataset = UpdateBuilder::new(dataset.clone())
-///     .update_where("region_id = 10")
-///     .set("region_name", "New York")
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::UpdateBuilder;
+/// # use std::sync::Arc;
+/// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+/// let result = UpdateBuilder::new(dataset)
+///     .update_where("region_id = 10")?
+///     .set("region_name", "New York")?
 ///     .build()?
 ///     .execute()
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 #[derive(Debug, Clone)]
@@ -244,7 +250,7 @@ pub struct UpdateResult {
 }
 
 #[derive(Debug)]
-struct UpdateData {
+pub struct UpdateData {
     removed_fragment_ids: Vec<u64>,
     old_fragments: Vec<Fragment>,
     new_fragments: Vec<Fragment>,
@@ -263,85 +269,13 @@ pub struct UpdateJob {
 
 impl UpdateJob {
     pub async fn execute(self) -> Result<UpdateResult> {
-        let start = Instant::now();
-        let mut dataset_ref = self.dataset.clone();
-        let max_retries = self.conflict_retries;
-        let mut backoff = SlotBackoff::default();
+        let dataset = self.dataset.clone();
+        let config = RetryConfig {
+            max_retries: self.conflict_retries,
+            retry_timeout: self.retry_timeout,
+        };
 
-        fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
-            Error::TooMuchWriteContention {
-                message: format!(
-                    "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
-                    attempts,
-                    retry_timeout.as_secs_f32()
-                ),
-                location: location!(),
-            }
-        }
-
-        fn maybe_timeout<T>(
-            backoff: &SlotBackoff,
-            start: Instant,
-            retry_timeout: Duration,
-            future: impl Future<Output = T>,
-        ) -> impl Future<Output = Result<T>> {
-            let attempt = backoff.attempt();
-            if attempt == 0 {
-                // No timeout on first attempt
-                Either::Left(future.map(|res| Ok(res)))
-            } else {
-                let remaining = retry_timeout.saturating_sub(start.elapsed());
-                Either::Right(
-                    tokio::time::timeout(remaining, future)
-                        .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
-                )
-            }
-        }
-
-        while backoff.attempt() <= max_retries {
-            let mut job_with_updated_dataset = self.clone();
-            job_with_updated_dataset.dataset = dataset_ref.clone();
-            let execute_fut = job_with_updated_dataset.execute_impl();
-            let execute_fut = maybe_timeout(&backoff, start, self.retry_timeout, execute_fut);
-            let update_data = execute_fut.await??;
-
-            let commit_future = self.commit_impl(dataset_ref.clone(), update_data);
-            let commit_future = maybe_timeout(&backoff, start, self.retry_timeout, commit_future);
-            match commit_future.await? {
-                Ok(result) => return Ok(result),
-                Err(Error::RetryableCommitConflict { .. }) => {
-                    // Check whether we have exhausted our retries *before*
-                    // we sleep.
-                    if backoff.attempt() >= max_retries {
-                        break;
-                    }
-                    if start.elapsed() > self.retry_timeout {
-                        return Err(timeout_error(self.retry_timeout, backoff.attempt() + 1));
-                    }
-                    if backoff.attempt() == 0 {
-                        // We add 10% buffer here, to allow concurrent writes to complete.
-                        // We pass the first attempt's time to the backoff so it's used
-                        // as the unit for backoff time slots.
-                        // See SlotBackoff implementation for more details on how this works.
-                        backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
-                    }
-
-                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
-                    let sleep_fut = maybe_timeout(&backoff, start, self.retry_timeout, sleep_fut);
-                    sleep_fut.await?;
-
-                    let mut ds = dataset_ref.as_ref().clone();
-                    ds.checkout_latest().await?;
-                    dataset_ref = Arc::new(ds);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-        }
-        Err(Error::TooMuchWriteContention {
-            message: format!("Attempted {} retries.", max_retries),
-            location: location!(),
-        })
+        execute_with_retry(self, dataset, config).await
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
@@ -540,6 +474,23 @@ impl UpdateJob {
         }
 
         Ok((updated_fragments, removed_fragments))
+    }
+}
+
+impl RetryExecutor for UpdateJob {
+    type Data = UpdateData;
+    type Result = UpdateResult;
+
+    async fn execute_impl(&self) -> Result<Self::Data> {
+        self.clone().execute_impl().await
+    }
+
+    async fn commit(&self, dataset: Arc<Dataset>, data: Self::Data) -> Result<Self::Result> {
+        self.commit_impl(dataset, data).await
+    }
+
+    fn update_dataset(&mut self, dataset: Arc<Dataset>) {
+        self.dataset = dataset;
     }
 }
 
