@@ -6,8 +6,12 @@ use crate::Dataset;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::prelude::SessionContext;
+use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+use log::debug;
 use std::sync::Arc;
+use uuid::Uuid;
+
+static TABLE_PATTERN: &str = "{{DATASET}}";
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
 #[derive(Clone, Debug)]
@@ -19,7 +23,7 @@ pub struct SqlQueryBuilder {
     pub(crate) sql: String,
 
     /// the name of the table to register in the datafusion context
-    pub(crate) table_name: String,
+    pub(crate) table_name: Option<String>,
 
     /// If true, the query result will include the internal row id
     pub(crate) with_row_id: bool,
@@ -33,18 +37,25 @@ impl SqlQueryBuilder {
         Self {
             dataset: Arc::new(dataset),
             sql: sql.to_string(),
-            table_name: "dataset".to_string(),
+            table_name: None,
             with_row_id: false,
             with_row_addr: false,
         }
     }
 
-    /// The table name to register in the datafusion context.
-    /// This is used to specify a "table name" for the dataset.
-    /// So that you can run SQL queries against it.
-    /// If not set, the default table name is "dataset".
-    pub fn table_name(mut self, table_name: &str) -> Self {
-        self.table_name = table_name.to_string();
+    /// Specify a "table name" for the dataset, so that you can run SQL queries against it. In most
+    /// cases, we should not directly set the table_name. Instead, use {{DATASET}} as a placeholder
+    /// for the table name.
+    ///
+    /// Example
+    /// ```rust ignore
+    /// SELECT * FROM {{DATASET}} WHERE age > 20
+    /// ```
+    ///
+    /// If you must set a table name, try to use a name that is unlikely to conflict, otherwise we
+    /// may encounter a 'table already exists' error.
+    pub fn table_name(mut self, table_name: impl Into<String>) -> Self {
+        self.table_name = Some(table_name.into());
         self
     }
 
@@ -63,18 +74,34 @@ impl SqlQueryBuilder {
     }
 
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
-        let ctx = SessionContext::new();
+        let (table_name, sql) = match self.table_name {
+            Some(table_name) => (table_name, self.sql),
+            None => {
+                let table_name = format!("table_{}", Uuid::new_v4().simple());
+                let sql = self.sql.replace(TABLE_PATTERN, &table_name);
+
+                debug!("original sql=\"{}\", execute sql = \"{}\"", self.sql, sql);
+
+                (table_name, sql)
+            }
+        };
+
+        let ctx = get_session_context(&LanceExecutionOptions::default());
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
+
         ctx.register_table(
-            self.table_name,
+            table_name.clone(),
             Arc::new(LanceTableProvider::new(
                 self.dataset.clone(),
                 row_id,
                 row_addr,
             )),
         )?;
-        let df = ctx.sql(&self.sql).await?;
+        let df = ctx.sql(&sql).await?;
+
+        ctx.deregister_table(table_name)?;
+
         Ok(SqlQuery::new(df))
     }
 }
@@ -116,6 +143,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
     use lance_datagen::{array, gen_batch};
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -131,8 +159,7 @@ mod tests {
             .unwrap();
 
         let results = ds
-            .sql("SELECT SUM(x) FROM foo WHERE y > 100")
-            .table_name("foo")
+            .sql("SELECT SUM(x) FROM {{DATASET}} WHERE y > 100")
             .build()
             .await
             .unwrap()
@@ -147,8 +174,7 @@ mod tests {
         pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
 
         let results = ds
-            .sql("SELECT x, y, _rowid, _rowaddr FROM foo where y > 100")
-            .table_name("foo")
+            .sql("SELECT x, y, _rowid, _rowaddr FROM {{DATASET}} where y > 100")
             .with_row_id(true)
             .with_row_addr(true)
             .build()
@@ -180,8 +206,7 @@ mod tests {
             .unwrap();
 
         let results = ds
-            .sql("SELECT COUNT(*) FROM foo")
-            .table_name("foo")
+            .sql("SELECT COUNT(*) FROM {{DATASET}}")
             .build()
             .await
             .unwrap()
@@ -195,8 +220,7 @@ mod tests {
         pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 100);
 
         let results = ds
-            .sql("SELECT COUNT(*) FROM foo where y >= 100")
-            .table_name("foo")
+            .sql("SELECT COUNT(*) FROM {{DATASET}} where y >= 100")
             .build()
             .await
             .unwrap()
@@ -224,8 +248,7 @@ mod tests {
             .unwrap();
 
         let results = ds
-            .sql("EXPLAIN SELECT * FROM foo where y >= 100")
-            .table_name("foo")
+            .sql("EXPLAIN SELECT * FROM {{DATASET}} where y >= 100")
             .build()
             .await
             .unwrap()
@@ -241,7 +264,7 @@ mod tests {
   "physical_plan",
 ], StringArray
 [
-  "TableScan: foo projection=[x, y], full_filters=[foo.y >= Int32(100)]",
+  "TableScan: ... projection=[x, y], full_filters=[...y >= Int32(100)]",
   "ProjectionExec: expr=[x@0 as x, y@1 as y]\n  LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=10, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100)\n",
 ]], row_count: 2 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
@@ -261,8 +284,7 @@ mod tests {
             .unwrap();
 
         let results = ds
-            .sql("EXPLAIN ANALYZE SELECT * FROM foo where y >= 100")
-            .table_name("foo")
+            .sql("EXPLAIN ANALYZE SELECT * FROM {{DATASET}} where y >= 100")
             .build()
             .await
             .unwrap()
@@ -280,5 +302,62 @@ mod tests {
   "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., bytes_read=..., fragments_scanned=..., iops=..., ranges_scanned=..., requests=..., rows_scanned=..., task_wait_time=...]\n",
 ]], row_count: 1 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multiple_sqls() {
+        let mut ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                "memory://test_sql_dataset",
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        for i in 0..5 {
+            let _ = ds
+                .sql(format!("SELECT * FROM {{{{DATASET}}}} WHERE y > {}", i).as_str())
+                .build()
+                .await
+                .unwrap()
+                .into_batch_records()
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_with_table_name() {
+        let mut ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                "memory://test_sql_dataset",
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        let table_name = format!("foo_{}", Uuid::new_v4().simple());
+
+        let results = ds
+            .sql(format!("SELECT SUM(x) FROM {} WHERE y > 100", &table_name).as_str())
+            .table_name(table_name)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(results.num_columns(), 1);
+        pretty_assertions::assert_eq!(results.num_rows(), 1);
+        // SUM(0..100) - SUM(0..50) = 3675
+        pretty_assertions::assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
     }
 }
