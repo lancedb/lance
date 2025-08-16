@@ -129,14 +129,17 @@ fn encoding_config_strategy() -> impl Strategy<Value = EncodingTestConfig> {
         ],
         any::<bool>(), // nullable
     )
-        .prop_filter("Skip unsupported combinations", |(_, structure, width, _)| {
-            // FSL with Variable width types is not supported
-            // This combination causes compute_stat to be called twice
-            match (structure, width) {
-                (DataStructure::FixedSizeList(_), DataWidth::Variable(_)) => false,
-                _ => true,
-            }
-        })
+        .prop_filter(
+            "Skip unsupported combinations",
+            |(_, structure, width, _)| {
+                // FSL with Variable width types is not supported
+                // This combination causes compute_stat to be called twice
+                !matches!(
+                    (structure, width),
+                    (DataStructure::FixedSizeList(_), DataWidth::Variable(_))
+                )
+            },
+        )
         .prop_map(
             |(encoding, structure, width, nullable)| EncodingTestConfig {
                 encoding_type: encoding,
