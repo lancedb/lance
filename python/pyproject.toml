@@ -55,7 +55,10 @@ tests = [
     "pandas",
     "polars[pyarrow,pandas]",
     "pytest",
-    "tensorflow",
+    # Workardound for https://github.com/lancedb/lance/issues/4472
+    #
+    # tensorflow is broken on 2.20.0 with macOS ARM.
+    "tensorflow<=2.19.0",
     "tqdm",
     "datafusion",
 ]
@@ -97,6 +100,7 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
+    "recurring: marks tests as recurring tests",
 ]
 filterwarnings = [
     'error::FutureWarning',

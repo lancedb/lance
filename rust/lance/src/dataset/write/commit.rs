@@ -363,11 +363,14 @@ impl<'a> CommitBuilder<'a> {
             base_path.clone(),
         );
 
+        let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
+
         match &self.dest {
             WriteDestination::Dataset(dataset) => Ok(Dataset {
                 manifest: Arc::new(manifest),
                 manifest_location,
                 session,
+                fragment_bitmap,
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => Ok(Dataset {
@@ -380,6 +383,7 @@ impl<'a> CommitBuilder<'a> {
                 commit_handler,
                 tags,
                 index_cache,
+                fragment_bitmap,
                 metadata_cache,
                 file_reader_options: None,
             }),

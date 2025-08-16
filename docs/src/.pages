@@ -1,0 +1,9 @@
+nav:
+  - Home: index.md
+  - Getting Started: quickstart
+  - User Guide: guide
+  - Specification: format
+  - Examples: examples
+  - Integrations: integrations
+  - Community: community
+  - SDK Docs: sdk_docs.md

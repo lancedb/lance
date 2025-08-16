@@ -323,9 +323,6 @@ def test_checkout(tmp_path: Path):
     assert ds1.version == 2
     assert ds1.to_table() == pa.table({"a": [0, 2]})
 
-    with pytest.raises(IOError):
-        ds2.delete("a = 2")
-
     ds1.delete("a = 2")
     assert ds1.count_rows() == 1
 
@@ -3762,8 +3759,6 @@ def test_dataset_sql(tmp_path: Path):
     ds = lance.write_dataset(table, tmp_path / "test")
 
     query = ds.sql("SELECT * FROM test WHERE id > 1").table_name("test").build()
-    explain_plan = query.explain_plan(verbose=True)
-    assert "Filter" in explain_plan
 
     result = query.to_batch_records()
     expected = pa.table({"id": [2, 3], "value": ["b", "c"]})

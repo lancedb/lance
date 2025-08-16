@@ -577,7 +577,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/introduction/read_and_write.html#filter-push-down>`_
+            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -828,7 +828,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/introduction/read_and_write.html#filter-push-down>`_
+            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -1501,7 +1501,13 @@ class LanceDataset(pa.dataset.Dataset):
         # Indices might have changed
         self._list_indices_res = None
 
-    def delete(self, predicate: Union[str, pa.compute.Expression]):
+    def delete(
+        self,
+        predicate: Union[str, pa.compute.Expression],
+        *,
+        conflict_retries: int = 10,
+        retry_timeout: timedelta = timedelta(seconds=30),
+    ):
         """
         Delete rows from the dataset.
 
@@ -1513,6 +1519,14 @@ class LanceDataset(pa.dataset.Dataset):
         predicate : str or pa.compute.Expression
             The predicate to use to select rows to delete. May either be a SQL
             string or a pyarrow Expression.
+        conflict_retries : int, optional
+            Number of times to retry the operation if there is contention.
+            Default is 10.
+        retry_timeout : timedelta, optional
+            The timeout used to limit retries. This is the maximum time to spend on
+            the operation before giving up. At least one attempt will be made,
+            regardless of how long it takes to complete. Subsequent attempts will be
+            cancelled once this timeout is reached. Default is 30 seconds.
 
         Examples
         --------
@@ -1531,7 +1545,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
-        self._ds.delete(predicate)
+        self._ds.delete(predicate, conflict_retries, retry_timeout)
 
     def insert(
         self,
@@ -1843,6 +1857,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         *,
         replace: bool = True,
+        train: bool = True,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1919,6 +1934,10 @@ class LanceDataset(pa.dataset.Dataset):
             column name.
         replace : bool, default True
             Replace the existing index if it exists.
+        train : bool, default True
+            If True, the index will be trained on the data to determine optimal
+            structure. If False, an empty index will be created that can be
+            populated later.
 
         with_position: bool, default True
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2051,7 +2070,7 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} cannot currently be a duration"
             )
 
-        self._ds.create_index([column], index_type, name, replace, None, kwargs)
+        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def create_index(
         self,
@@ -2078,6 +2097,7 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
+        train: bool = True,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -2144,6 +2164,10 @@ class LanceDataset(pa.dataset.Dataset):
             for nullable columns. Obtains a small speed boost.
         one_pass_ivfpq: bool
             Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
+        train : bool, default True
+            If True, the index will be trained on the data (e.g., compute IVF
+            centroids, PQ codebooks). If False, an empty index structure will be
+            created without training, which can be populated later.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2580,7 +2604,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         timers["final_create_index:start"] = time.time()
         self._ds.create_index(
-            column, index_type, name, replace, storage_options, kwargs
+            column, index_type, name, replace, train, storage_options, kwargs
         )
         timers["final_create_index:end"] = time.time()
         final_create_index_time = (
@@ -3247,13 +3271,17 @@ class ExecuteResult(TypedDict):
     num_deleted_rows: int
 
 
-class Index(TypedDict):
-    name: str
-    type: str
+@dataclass
+class Index:
+    """Represents an index in the dataset."""
+
     uuid: str
-    fields: List[str]
-    version: int
+    name: str
+    fields: List[int]
+    dataset_version: int
     fragment_ids: Set[int]
+    index_version: int
+    created_at: Optional[datetime] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -3603,13 +3631,8 @@ class LanceOperation:
         Operation that creates an index on the dataset.
         """
 
-        uuid: str
-        name: str
-        fields: List[int]
-        dataset_version: int
-        fragment_ids: Set[int]
-        index_version: int
-        created_at: Optional[datetime] = None
+        new_indices: List[Index]
+        removed_indices: List[Index]
 
     @dataclass
     class DataReplacementGroup:

@@ -389,7 +389,7 @@ impl BinaryEncoder {
 // Zero offset is removed from the start of the offsets array
 // The indices array is computed across all arrays in the vector
 fn get_indices_from_string_arrays(
-    mut offsets: LanceBuffer,
+    offsets: LanceBuffer,
     bits_per_offset: u8,
     nulls: Option<LanceBuffer>,
     num_rows: usize,
@@ -491,7 +491,7 @@ impl ArrayEncoder for BinaryEncoder {
         if let Some(buffer_compressor) = &self.buffer_compressor {
             let mut compressed_data = Vec::with_capacity(data.data.len());
             buffer_compressor.compress(&data.data, &mut compressed_data)?;
-            data.data = LanceBuffer::Owned(compressed_data);
+            data.data = LanceBuffer::from(compressed_data);
         }
 
         let data = DataBlock::VariableWidth(VariableWidthBlock {

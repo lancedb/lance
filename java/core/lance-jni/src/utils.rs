@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
 
@@ -313,4 +302,20 @@ pub fn to_java_map<'local>(
         )?;
     }
     Ok(java_map)
+}
+
+pub fn to_java_list<'local>(
+    env: &mut JNIEnv<'local>,
+    list: &Vec<JObject>,
+) -> Result<JObject<'local>> {
+    let java_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for item in list {
+        env.call_method(
+            &java_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(item)],
+        )?;
+    }
+    Ok(java_list)
 }

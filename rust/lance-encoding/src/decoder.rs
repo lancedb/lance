@@ -241,6 +241,7 @@ use crate::encodings::logical::list::StructuralListScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{StructuralStructDecoder, StructuralStructScheduler};
 use crate::format::pb::{self, column_encoding};
+use crate::format::pb21;
 use crate::previous::decoder::LogicalPageDecoder;
 use crate::previous::encodings::logical::list::OffsetPageInfo;
 use crate::previous::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
@@ -264,7 +265,7 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 #[derive(Debug)]
 pub enum PageEncoding {
     Legacy(pb::ArrayEncoding),
-    Structural(pb::PageLayout),
+    Structural(pb21::PageLayout),
 }
 
 impl PageEncoding {
@@ -275,7 +276,7 @@ impl PageEncoding {
         }
     }
 
-    pub fn as_structural(&self) -> &pb::PageLayout {
+    pub fn as_structural(&self) -> &pb21::PageLayout {
         match self {
             Self::Structural(enc) => enc,
             Self::Legacy(_) => panic!("Expected a structural encoding"),

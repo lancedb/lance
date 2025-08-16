@@ -34,6 +34,7 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
@@ -42,14 +43,17 @@ use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR, ROW_ID};
+use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
-    analyze_plan, execute_plan, LanceExecutionOptions, StrictBatchSizeExec,
+    analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
 };
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_index::scalar::expression::PlannerIndexExt;
+use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
 };
@@ -66,6 +70,7 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
+use crate::dataset::row_offsets_to_row_addresses;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
@@ -402,6 +407,164 @@ fn escape_column_name(name: &str) -> String {
         .map(|s| format!("`{}`", s))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Represents a user-requested take operation
+#[derive(Debug, Clone)]
+pub enum TakeOperation {
+    /// Take rows by row id
+    RowIds(Vec<u64>),
+    /// Take rows by row address
+    RowAddrs(Vec<u64>),
+    /// Take rows by row offset
+    ///
+    /// The row offset is the offset of the row in the dataset.  This can
+    /// be converted to row addresses using the fragment sizes.
+    RowOffsets(Vec<u64>),
+}
+
+impl TakeOperation {
+    fn extract_u64_list(list: &[Expr]) -> Option<Vec<u64>> {
+        let mut u64s = Vec::with_capacity(list.len());
+        for expr in list {
+            if let Expr::Literal(lit, _) = expr {
+                if let Some(ScalarValue::UInt64(Some(val))) =
+                    safe_coerce_scalar(lit, &DataType::UInt64)
+                {
+                    u64s.push(val);
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(u64s)
+    }
+
+    fn merge(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::RowIds(mut left), Self::RowIds(right)) => {
+                left.extend(right);
+                Some(Self::RowIds(left))
+            }
+            (Self::RowAddrs(mut left), Self::RowAddrs(right)) => {
+                left.extend(right);
+                Some(Self::RowAddrs(left))
+            }
+            (Self::RowOffsets(mut left), Self::RowOffsets(right)) => {
+                left.extend(right);
+                Some(Self::RowOffsets(left))
+            }
+            _ => None,
+        }
+    }
+
+    /// Attempts to create a take operation from an expression.  This will succeed if the expression
+    /// has one of the following forms:
+    ///  - `_rowid = 10`
+    ///  - `_rowid = 10 OR _rowid = 20 OR _rowid = 30`
+    ///  - `_rowid IN (10, 20, 30)`
+    ///  - `_rowaddr = 10`
+    ///  - `_rowaddr = 10 OR _rowaddr = 20 OR _rowaddr = 30`
+    ///  - `_rowaddr IN (10, 20, 30)`
+    ///  - `_rowoffset = 10`
+    ///  - `_rowoffset = 10 OR _rowoffset = 20 OR _rowoffset = 30`
+    ///  - `_rowoffset IN (10, 20, 30)`
+    ///
+    /// The _rowid / _rowaddr / _rowoffset determine if we are taking by row id, address, or offset.
+    ///
+    /// If a take expression is combined with some other filter via an AND then the remainder will be
+    /// returned as well.  For example, `_rowid = 10` will return (take_op, None) and
+    /// `_rowid = 10 AND x > 70` will return (take_op, Some(x > 70)).
+    fn try_from_expr(expr: &Expr) -> Option<(Self, Option<Expr>)> {
+        if let Expr::BinaryExpr(binary) = expr {
+            match binary.op {
+                datafusion_expr::Operator::And => {
+                    let left_take = Self::try_from_expr(&binary.left);
+                    let right_take = Self::try_from_expr(&binary.right);
+                    match (left_take, right_take) {
+                        (Some(_), Some(_)) => {
+                            // This is something like...
+                            //
+                            // _rowid = 10 AND _rowid = 20
+                            //
+                            // ...which is kind of nonsensical.  Better to just return None.
+                            return None;
+                        }
+                        (Some((left_op, left_rem)), None) => {
+                            let remainder = match left_rem {
+                                // If there is a remainder on the left side we combine it.  This _should_
+                                // be something like converting (_rowid = 10 AND x > 70) AND y > 80
+                                // to (_rowid = 10) AND (x > 70 AND y > 80) which should be valid
+                                Some(expr) => Expr::and(expr, binary.right.as_ref().clone()),
+                                None => binary.right.as_ref().clone(),
+                            };
+                            return Some((left_op, Some(remainder)));
+                        }
+                        (None, Some((right_op, right_rem))) => {
+                            let remainder = match right_rem {
+                                Some(expr) => Expr::and(expr, binary.left.as_ref().clone()),
+                                None => binary.left.as_ref().clone(),
+                            };
+                            return Some((right_op, Some(remainder)));
+                        }
+                        (None, None) => {
+                            return None;
+                        }
+                    }
+                }
+                datafusion_expr::Operator::Eq => {
+                    // Check for _rowid = literal
+                    if let (Expr::Column(col), Expr::Literal(lit, _)) =
+                        (binary.left.as_ref(), binary.right.as_ref())
+                    {
+                        if let Some(ScalarValue::UInt64(Some(val))) =
+                            safe_coerce_scalar(lit, &DataType::UInt64)
+                        {
+                            if col.name == ROW_ID {
+                                return Some((Self::RowIds(vec![val]), None));
+                            } else if col.name == ROW_ADDR {
+                                return Some((Self::RowAddrs(vec![val]), None));
+                            } else if col.name == ROW_OFFSET {
+                                return Some((Self::RowOffsets(vec![val]), None));
+                            }
+                        }
+                    }
+                }
+                datafusion_expr::Operator::Or => {
+                    let left_take = Self::try_from_expr(&binary.left);
+                    let right_take = Self::try_from_expr(&binary.right);
+                    if let (Some(left), Some(right)) = (left_take, right_take) {
+                        if left.1.is_some() || right.1.is_some() {
+                            // This would be something like...
+                            //
+                            // (_rowid = 10 AND x > 70) OR _rowid = 20
+                            //
+                            // I don't think it's correct to convert this into a take operation
+                            // which would give us (_rowid = 10 OR _rowid = 20) AND x > 70
+                            return None;
+                        }
+                        return left.0.merge(right.0).map(|op| (op, None));
+                    }
+                }
+                _ => {}
+            }
+        } else if let Expr::InList(in_expr) = expr {
+            if let Expr::Column(col) = in_expr.expr.as_ref() {
+                if let Some(u64s) = Self::extract_u64_list(&in_expr.list) {
+                    if col.name == ROW_ID {
+                        return Some((Self::RowIds(u64s), None));
+                    } else if col.name == ROW_ADDR {
+                        return Some((Self::RowAddrs(u64s), None));
+                    } else if col.name == ROW_OFFSET {
+                        return Some((Self::RowOffsets(u64s), None));
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 impl Scanner {
@@ -1085,7 +1248,7 @@ impl Scanner {
     }
 
     fn add_extra_columns(&self, schema: Schema) -> Result<Schema> {
-        let mut extra_columns = vec![];
+        let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
 
         if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
@@ -1095,11 +1258,7 @@ impl Scanner {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
         }
 
-        if extra_columns.is_empty() {
-            Ok(schema)
-        } else {
-            schema.merge(&ArrowSchema::new(extra_columns))
-        }
+        schema.merge(&ArrowSchema::new(extra_columns))
     }
 
     /// The full schema available to filters
@@ -1111,6 +1270,7 @@ impl Scanner {
             .with_row_id()
             .with_row_addr()
             .to_schema();
+
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
@@ -1512,14 +1672,27 @@ impl Scanner {
                     });
                 }
 
-                let planned_read = self.filtered_read_source(&mut filter_plan).await?;
-                if planned_read.limit_pushed_down {
-                    use_limit_node = false;
+                let take_op = filter_plan
+                    .full_expr
+                    .as_ref()
+                    .and_then(TakeOperation::try_from_expr);
+                if let Some((take_op, remainder)) = take_op {
+                    // If there is any remainder use it as the filter (we don't even try and combine an indexed
+                    // search on the filter with a take as that seems excessive)
+                    filter_plan = remainder
+                        .map(FilterPlan::new_refine_only)
+                        .unwrap_or(FilterPlan::default());
+                    self.take_source(take_op).await?
+                } else {
+                    let planned_read = self.filtered_read_source(&mut filter_plan).await?;
+                    if planned_read.limit_pushed_down {
+                        use_limit_node = false;
+                    }
+                    if planned_read.filter_pushed_down {
+                        filter_plan = FilterPlan::default();
+                    }
+                    planned_read.plan
                 }
-                if planned_read.filter_pushed_down {
-                    filter_plan = FilterPlan::default();
-                }
-                planned_read.plan
             }
             _ => {
                 return Err(Error::InvalidInput {
@@ -1783,6 +1956,44 @@ impl Scanner {
                 plan,
             })
         }
+    }
+
+    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_ids = RowIdTreeMap::from_iter(u64s);
+        let row_id_mask = RowIdMask::from_allowed(row_ids);
+        let index_result = IndexExprResult::Exact(row_id_mask);
+        let fragments_covered =
+            RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32));
+        let batch = index_result.serialize_to_arrow(&fragments_covered)?;
+        let stream = futures::stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            INDEX_EXPR_RESULT_SCHEMA.clone(),
+            stream,
+        ));
+        Ok(Arc::new(OneShotExec::new(stream)))
+    }
+
+    async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
+        // We generally assume that late materialization does not make sense for take operations
+        // so we can just use the physical projection
+        let projection = self.projection_plan.physical_projection.clone();
+
+        let input = match take_op {
+            TakeOperation::RowIds(ids) => self.u64s_as_take_input(ids),
+            TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
+            TakeOperation::RowOffsets(offsets) => {
+                let mut addrs =
+                    row_offsets_to_row_addresses(self.dataset.as_ref(), &offsets).await?;
+                addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
+                self.u64s_as_take_input(addrs)
+            }
+        }?;
+
+        Ok(Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            FilteredReadOptions::new(projection),
+            Some(input),
+        )?))
     }
 
     async fn filtered_read_source(
@@ -7204,5 +7415,158 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_filter_to_take() {
+        let mut ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let row_ids = ds
+            .scan()
+            .project(&Vec::<&str>::default())
+            .unwrap()
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = row_ids[0].schema();
+        let row_ids = concat_batches(&schema, row_ids.iter()).unwrap();
+        let row_ids = row_ids.column(0).as_primitive::<UInt64Type>().clone();
+
+        let row_addrs = ds
+            .scan()
+            .project(&Vec::<&str>::default())
+            .unwrap()
+            .with_row_address()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = row_addrs[0].schema();
+        let row_addrs = concat_batches(&schema, row_addrs.iter()).unwrap();
+        let row_addrs = row_addrs.column(0).as_primitive::<UInt64Type>().clone();
+
+        ds.delete("idx >= 190 AND idx < 210").await.unwrap();
+
+        let ds_copy = ds.clone();
+        let do_check = async move |filt: &str, expected_idx: &[i32], applies_optimization: bool| {
+            let mut scanner = ds_copy.scan();
+            scanner.filter(filt).unwrap();
+            // Verify the optimization is applied
+            let plan = scanner.explain_plan(true).await.unwrap();
+            if applies_optimization {
+                assert!(
+                    plan.contains("OneShotStream"),
+                    "expected take optimization to be applied. Filter: '{}'.  Plan:\n{}",
+                    filt,
+                    plan
+                );
+            } else {
+                assert!(
+                    !plan.contains("OneShotStream"),
+                    "expected take optimization to not be applied. Filter: '{}'.  Plan:\n{}",
+                    filt,
+                    plan
+                );
+            }
+
+            // Verify the results
+            let stream = scanner.try_into_stream().await.unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let idx = batches
+                .iter()
+                .map(|b| b.column_by_name("idx").unwrap().as_ref())
+                .collect::<Vec<_>>();
+
+            if idx.is_empty() {
+                assert!(expected_idx.is_empty());
+                return;
+            }
+
+            let idx = arrow::compute::concat(&idx).unwrap();
+            assert_eq!(idx.as_primitive::<Int32Type>().values(), expected_idx);
+        };
+        let check =
+            async |filt: &str, expected_idx: &[i32]| do_check(filt, expected_idx, true).await;
+        let check_no_opt = async |filt: &str, expected_idx: &[i32]| {
+            do_check(filt, expected_idx, false).await;
+        };
+
+        // Simple case, no deletions yet
+        check("_rowid = 50", &[50]).await;
+        check("_rowaddr = 50", &[50]).await;
+        check("_rowoffset = 50", &[50]).await;
+
+        check(
+            "_rowid = 50 OR _rowid = 51 OR _rowid = 52 OR _rowid = 49",
+            &[49, 50, 51, 52],
+        )
+        .await;
+        check(
+            "_rowaddr = 50 OR _rowaddr = 51 OR _rowaddr = 52 OR _rowaddr = 49",
+            &[49, 50, 51, 52],
+        )
+        .await;
+        check(
+            "_rowoffset = 50 OR _rowoffset = 51 OR _rowoffset = 52 OR _rowoffset = 49",
+            &[49, 50, 51, 52],
+        )
+        .await;
+
+        check("_rowid IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
+        check("_rowaddr IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
+        check("_rowoffset IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
+
+        // Taking _rowid / _rowaddr of deleted row
+
+        // When using rowid / rowaddr we get an empty
+        check(&format!("_rowid = {}", row_ids.value(190)), &[]).await;
+        check(&format!("_rowaddr = {}", row_addrs.value(190)), &[]).await;
+        // When using rowoffset it just skips the deleted rows (impossible to create an offset
+        // into a deleted row)
+        check("_rowoffset = 190", &[210]).await;
+
+        // Grabbing after the deleted rows
+        check(&format!("_rowid = {}", row_ids.value(250)), &[250]).await;
+        check(&format!("_rowaddr = {}", row_addrs.value(250)), &[250]).await;
+        check("_rowoffset = 250", &[270]).await;
+
+        // Grabbing past the end
+        check("_rowoffset = 1000", &[]).await;
+
+        // Combine take and filter
+        check("_rowid IN (5, 10, 15) AND idx > 10", &[15]).await;
+        check("_rowaddr IN (5, 10, 15) AND idx > 10", &[15]).await;
+        check("_rowoffset IN (5, 10, 15) AND idx > 10", &[15]).await;
+        check("idx > 10 AND _rowid IN (5, 10, 15)", &[15]).await;
+        check("idx > 10 AND _rowaddr IN (5, 10, 15)", &[15]).await;
+        check("idx > 10 AND _rowoffset IN (5, 10, 15)", &[15]).await;
+        // Get's simplified into _rowid = 50 and so we catch it
+        check("_rowid = 50 AND _rowid = 50", &[50]).await;
+
+        // Filters that cannot be converted into a take
+        check_no_opt("_rowid = 50 AND _rowid = 51", &[]).await;
+        check_no_opt("(_rowid = 50 AND idx < 100) OR _rowid = 51", &[50, 51]).await;
+
+        // Dynamic projection
+        let mut scanner = ds.scan();
+        scanner.filter("_rowoffset = 77").unwrap();
+        scanner
+            .project_with_transform(&[("foo", "idx * 2")])
+            .unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "foo");
+        let val = batches[0].column(0).as_primitive::<Int32Type>().values()[0];
+        assert_eq!(val, 154);
     }
 }

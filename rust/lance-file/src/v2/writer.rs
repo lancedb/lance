@@ -617,6 +617,10 @@ impl FileWriter {
         Ok(self.rows_written)
     }
 
+    pub async fn abort(&mut self) {
+        self.writer.abort().await;
+    }
+
     pub async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await? as u64)
     }
@@ -1049,6 +1053,7 @@ mod tests {
                 rle_threshold: Some(0.5), // Lower threshold to trigger RLE more easily
                 compression: None,        // Will use default compression if any
                 compression_level: None,
+                bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
             },
         );
 
@@ -1265,7 +1270,7 @@ mod tests {
         let text_encoding = describe_encoding(&column_metadatas[1].pages[0]);
         // For string columns, we expect Binary encoding with zstd compression
         assert!(
-            text_encoding.contains("zstd"),
+            text_encoding.contains("Zstd"),
             "text column should use zstd compression from field metadata, but got: {}",
             text_encoding
         );
@@ -1292,6 +1297,11 @@ mod tests {
         metadata.insert(
             lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
             "lz4".to_string(),
+        );
+        // Explicitly disable BSS to ensure RLE is tested
+        metadata.insert(
+            lance_encoding::constants::BSS_META_KEY.to_string(),
+            "off".to_string(),
         );
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

@@ -44,8 +44,8 @@ use lance::dataset::{
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
-    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
-    UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
+    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
     WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::dataset::{
@@ -363,7 +363,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
             .and_then(|cls| cls.getattr(intern!(py, "ColumnOrdering")))
             .expect("Failed to get RewrittenIndex class");
 
-        let column_name = self.0.column_name.to_string();
+        let column_name = self.0.column_name.clone();
         let ascending = self.0.ascending;
         let nulls_first = self.0.nulls_first;
         cls.call1((column_name, ascending, nulls_first))
@@ -1191,11 +1191,27 @@ impl Dataset {
         Ok(())
     }
 
-    fn delete(&mut self, predicate: String) -> PyResult<()> {
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.delete(&predicate))?
+    #[pyo3(signature=(predicate, conflict_retries=None, retry_timeout=None))]
+    fn delete(
+        &mut self,
+        predicate: String,
+        conflict_retries: Option<u32>,
+        retry_timeout: Option<std::time::Duration>,
+    ) -> PyResult<()> {
+        let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
+
+        if let Some(retries) = conflict_retries {
+            builder = builder.conflict_retries(retries);
+        }
+
+        if let Some(timeout) = retry_timeout {
+            builder = builder.retry_timeout(timeout);
+        }
+
+        let new_dataset = RT
+            .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = Arc::new(new_self);
+        self.ds = new_dataset;
         Ok(())
     }
 
@@ -1441,13 +1457,15 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, kwargs = None))]
+    #[allow(clippy::too_many_arguments)]
     fn create_index(
         &mut self,
         columns: Vec<PyBackedStr>,
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
+        train: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
@@ -1539,13 +1557,18 @@ impl Dataset {
         };
 
         let replace = replace.unwrap_or(true);
+        let train = train.unwrap_or(true); // Default to true for backward compatibility
 
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(
-            None,
-            new_self.create_index(&columns, idx_type, name, params.as_ref(), replace),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let mut builder = new_self
+            .create_index_builder(&columns, idx_type, params.as_ref())
+            .replace(replace)
+            .train(train);
+        if let Some(name) = name {
+            builder = builder.name(name);
+        }
+        use std::future::IntoFuture;
+        RT.block_on(None, builder.into_future())?.infer_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -2081,19 +2104,6 @@ impl SqlQuery {
         let reader: Box<dyn RecordBatchReader + Send> =
             Box::new(LanceReader::from_stream(dataset_stream));
         Python::with_gil(|py| reader.into_pyarrow(py))
-    }
-
-    #[pyo3(signature = (verbose=false, analyze=false))]
-    fn explain_plan(&self, verbose: bool, analyze: bool) -> PyResult<String> {
-        let builder = self.builder.clone();
-        let plan = RT
-            .block_on(None, async move {
-                let query = builder.build().await?;
-                query.into_explain_plan(verbose, analyze).await
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(plan)
     }
 }
 

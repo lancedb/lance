@@ -45,6 +45,7 @@ use log::{debug, info, warn};
 use snafu::location;
 use tracing::Span;
 
+use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
@@ -158,9 +159,15 @@ impl ExecutionPlan for OneShotExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        // OneShotExec has no children, so this should only be called with an empty vector
+        if !children.is_empty() {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "OneShotExec does not support children".to_string(),
+            ));
+        }
+        Ok(self)
     }
 
     fn execute(
@@ -340,7 +347,11 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
-    SessionContext::new_with_config_rt(session_config, runtime_env)
+
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
+    register_functions(&ctx);
+
+    ctx
 }
 
 static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =

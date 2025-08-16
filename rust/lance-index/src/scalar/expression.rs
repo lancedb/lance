@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Bound, sync::Arc};
+use std::{
+    ops::Bound,
+    sync::{Arc, LazyLock},
+};
 
-use arrow_array::Array;
-use arrow_schema::{DataType, Field};
+use arrow::array::BinaryBuilder;
+use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
@@ -16,6 +20,7 @@ use datafusion_expr::{
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
@@ -676,6 +681,19 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
+/// When we evaluate a scalar index query we return a batch with three columns and two rows
+///
+/// The first column has the block list and allow list
+/// The second column tells if the result is least/exact/more (we repeat the discriminant twice)
+/// The third column has the fragments covered bitmap in the first row and null in the second row
+pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("result".to_string(), DataType::Binary, true),
+        Field::new("discriminant".to_string(), DataType::UInt32, true),
+        Field::new("fragments_covered".to_string(), DataType::Binary, true),
+    ]))
+});
+
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
     Exact(RowIdMask),
@@ -716,6 +734,33 @@ impl IndexExprResult {
                 location: location!(),
             }),
         }
+    }
+
+    #[instrument(skip_all)]
+    pub fn serialize_to_arrow(
+        &self,
+        fragments_covered_by_result: &RoaringBitmap,
+    ) -> Result<RecordBatch> {
+        let row_id_mask = self.row_id_mask();
+        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let discriminant = self.discriminant();
+        let discriminant_arr =
+            Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
+        let mut fragments_covered_builder = BinaryBuilder::new();
+        let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
+        let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
+        fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
+        fragments_covered_builder.append_value(fragments_covered_bytes);
+        fragments_covered_builder.append_null();
+        let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
+        Ok(RecordBatch::try_new(
+            INDEX_EXPR_RESULT_SCHEMA.clone(),
+            vec![
+                Arc::new(row_id_mask_arr),
+                Arc::new(discriminant_arr),
+                Arc::new(fragments_covered_arr),
+            ],
+        )?)
     }
 }
 
@@ -1181,7 +1226,6 @@ fn visit_node(
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
-    log::info!("visit_node: depth={}", depth);
     if depth >= MAX_DEPTH {
         return Err(Error::invalid_input(
             format!(
@@ -1238,6 +1282,15 @@ impl FilterPlan {
             skip_recheck: true,
             refine_expr: None,
             full_expr: None,
+        }
+    }
+
+    pub fn new_refine_only(expr: Expr) -> Self {
+        Self {
+            index_query: None,
+            skip_recheck: true,
+            refine_expr: Some(expr.clone()),
+            full_expr: Some(expr),
         }
     }
 

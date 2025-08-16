@@ -57,9 +57,9 @@ use crate::data::DataBlock;
 use crate::data::{BlockInfo, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_BYTES,
-    MAX_MINIBLOCK_VALUES,
 };
-use crate::format::{pb, ProtobufUtils};
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::ProtobufUtils21;
 
 use lance_core::{Error, Result};
 
@@ -161,8 +161,8 @@ impl RleMiniBlockEncoder {
         // Return exactly two buffers: values and lengths
         Ok((
             vec![
-                LanceBuffer::Owned(all_values),
-                LanceBuffer::Owned(all_lengths),
+                LanceBuffer::from(all_values),
+                LanceBuffer::from(all_lengths),
             ],
             chunks,
         ))
@@ -199,7 +199,12 @@ impl RleMiniBlockEncoder {
         let data_slice = data.as_ref();
 
         let chunk_start = offset * type_size;
-        let max_by_count = MAX_MINIBLOCK_VALUES as usize;
+        // FIXME(xuanwo): we don't allow 4096 values as a workaround for https://github.com/lancedb/lance/issues/4429
+        // Since while rep/def takes 4B, 4Ki values will lead to the
+        // generated chunk buffer too large.MAX_MINIBLOCK_VALUES
+        //
+        // let max_by_count =  as usize;
+        let max_by_count = 2048usize;
         let max_values = values_remaining.min(max_by_count);
         let chunk_end = chunk_start + max_values * type_size;
 
@@ -348,7 +353,7 @@ impl RleMiniBlockEncoder {
 }
 
 impl MiniBlockCompressor for RleMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let num_values = fixed_width.num_values;
@@ -363,7 +368,10 @@ impl MiniBlockCompressor for RleMiniBlockEncoder {
                     num_values,
                 };
 
-                let encoding = ProtobufUtils::rle(bits_per_value);
+                let encoding = ProtobufUtils21::rle(
+                    ProtobufUtils21::flat(bits_per_value, None),
+                    ProtobufUtils21::flat(/*bits_per_value=*/ 8, None),
+                );
 
                 Ok((compressed, encoding))
             }
@@ -390,7 +398,7 @@ impl RleMiniBlockDecompressor {
         if num_values == 0 {
             return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
                 bits_per_value: self.bits_per_value,
-                data: LanceBuffer::Owned(vec![]),
+                data: LanceBuffer::from(vec![]),
                 num_values: 0,
                 block_info: BlockInfo::default(),
             }));
@@ -416,7 +424,7 @@ impl RleMiniBlockDecompressor {
 
         Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: self.bits_per_value,
-            data: LanceBuffer::Owned(decoded_data),
+            data: LanceBuffer::from(decoded_data),
             num_values,
             block_info: BlockInfo::default(),
         }))
@@ -525,10 +533,9 @@ impl MiniBlockDecompressor for RleMiniBlockDecompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
     use crate::data::DataBlock;
+    use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
     use arrow_array::Int32Array;
-    use lance_core::datatypes::Field;
 
     // ========== Core Functionality Tests ==========
 
@@ -568,30 +575,6 @@ mod tests {
         assert_eq!(lengths_buffer.len(), 6);
     }
 
-    #[test]
-    fn test_compression_strategy_selection() {
-        let strategy = DefaultCompressionStrategy::new();
-        let field = Field::new_arrow("test", arrow_schema::DataType::Int32, false).unwrap();
-
-        // High repetition - should select RLE
-        let repetitive_array = Int32Array::from(vec![1; 1000]);
-        let repetitive_block = DataBlock::from_array(repetitive_array);
-
-        let compressor = strategy
-            .create_miniblock_compressor(&field, &repetitive_block)
-            .unwrap();
-        assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
-
-        // No repetition - should NOT select RLE
-        let unique_array = Int32Array::from((0..1000).collect::<Vec<i32>>());
-        let unique_block = DataBlock::from_array(unique_array);
-
-        let compressor = strategy
-            .create_miniblock_compressor(&field, &unique_block)
-            .unwrap();
-        assert!(!format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
-    }
-
     // ========== Round-trip Tests for Different Types ==========
 
     #[test]
@@ -622,7 +605,7 @@ mod tests {
 
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value,
-            data: LanceBuffer::Owned(bytes),
+            data: LanceBuffer::from(bytes),
             num_values: data.len() as u64,
             block_info: BlockInfo::default(),
         });
@@ -679,15 +662,15 @@ mod tests {
     #[should_panic(expected = "RLE decompressor expects exactly 2 buffers")]
     fn test_invalid_buffer_count() {
         let decompressor = RleMiniBlockDecompressor::new(32);
-        let _ = decompressor.decompress(vec![LanceBuffer::Owned(vec![1, 2, 3, 4])], 10);
+        let _ = decompressor.decompress(vec![LanceBuffer::from(vec![1, 2, 3, 4])], 10);
     }
 
     #[test]
     #[should_panic(expected = "Inconsistent RLE buffers")]
     fn test_buffer_consistency() {
         let decompressor = RleMiniBlockDecompressor::new(32);
-        let values = LanceBuffer::Owned(vec![1, 0, 0, 0]); // 1 i32 value
-        let lengths = LanceBuffer::Owned(vec![5, 10]); // 2 lengths - mismatch!
+        let values = LanceBuffer::from(vec![1, 0, 0, 0]); // 1 i32 value
+        let lengths = LanceBuffer::from(vec![5, 10]); // 2 lengths - mismatch!
         let _ = decompressor.decompress(vec![values, lengths], 15);
     }
 
@@ -698,7 +681,7 @@ mod tests {
         // Test empty block
         let empty_block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 32,
-            data: LanceBuffer::Owned(vec![]),
+            data: LanceBuffer::from(vec![]),
             num_values: 0,
             block_info: BlockInfo::default(),
         });
@@ -910,7 +893,7 @@ mod tests {
 
         let block = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 32,
-            data: LanceBuffer::Owned(bytes),
+            data: LanceBuffer::from(bytes),
             num_values: num_values as u64,
             block_info: BlockInfo::default(),
         });
@@ -972,11 +955,14 @@ mod tests {
             .with_file_version(LanceFileVersion::V2_1);
 
         // Test both explicit metadata and automatic selection
-        // 1. Test with explicit RLE threshold metadata
-        let metadata_explicit = HashMap::from([(
+        // 1. Test with explicit RLE threshold metadata (also disable BSS)
+        let mut metadata_explicit = HashMap::new();
+        metadata_explicit.insert(
             "lance-encoding:rle-threshold".to_string(),
             "0.8".to_string(),
-        )]);
+        );
+        metadata_explicit.insert("lance-encoding:bss".to_string(), "off".to_string());
+
         let mut generator = RleDataGenerator::new(vec![1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]);
         let data_explicit = generator.generate_default(RowCount::from(10000)).unwrap();
         check_round_trip_encoding_of_data(vec![data_explicit], &test_cases, metadata_explicit)
@@ -984,10 +970,14 @@ mod tests {
 
         // 2. Test automatic RLE selection based on data characteristics
         // 80% repetition should trigger RLE (> default 50% threshold)
+        // Explicitly disable BSS to ensure RLE is tested
+        let mut metadata = HashMap::new();
+        metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+
         let mut values = vec![42i32; 8000]; // 80% repetition
         values.extend([1i32, 2i32, 3i32, 4i32, 5i32].repeat(400)); // 20% variety
         let arr = Arc::new(Int32Array::from(values)) as Arc<dyn Array>;
-        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
     }
 
     /// Generator that produces repetitive patterns suitable for RLE

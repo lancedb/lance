@@ -311,7 +311,7 @@ impl BlobFieldEncoder {
                 let size = end - start;
                 if size > 0 {
                     let val = data.slice_with_length(start as usize, size as usize);
-                    let position = external_buffers.add_buffer(LanceBuffer::Borrowed(val));
+                    let position = external_buffers.add_buffer(LanceBuffer::from(val));
                     positions.push(position);
                     sizes.push(size);
                 } else {
