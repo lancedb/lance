@@ -8,6 +8,7 @@ use arrow_array::RecordBatch;
 use lance_core::datatypes::Schema;
 use lance_core::Result;
 use std::borrow::Cow;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// A [`FragmentSession`] manages a short-lived session of [`FileFragment`], allowing us to maintain
@@ -64,6 +65,10 @@ impl FragmentSession {
         } else {
             self.reader.take_as_batch(row_offsets, None).await
         }
+    }
+
+    pub(crate) async fn take_range(&self, range: Range<usize>) -> Result<RecordBatch> {
+        self.reader.legacy_read_range_as_batch(range).await
     }
 }
 
@@ -200,6 +205,60 @@ mod tests {
         pretty_assertions::assert_eq!(
             batch.column_by_name(ROW_ADDR).unwrap().as_ref(),
             &UInt64Array::from(vec![(3 << 32) + 1, (3 << 32) + 5, (3 << 32) + 8])
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fragment_session_take_range(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = create_dataset(test_uri, data_storage_version).await;
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
+
+        // Take range.
+        let take_session = fragment
+            .open_session(dataset.schema(), false)
+            .await
+            .unwrap();
+        let batch = take_session.take_range(1..6).await.unwrap();
+        pretty_assertions::assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 122, 123, 124, 125])
+        );
+
+        dataset.delete("i in (122, 123, 125)").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Deleted rows are skipped
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
+        let take_session = fragment
+            .open_session(dataset.schema(), false)
+            .await
+            .unwrap();
+        assert!(fragment.metadata().deletion_file.is_some());
+        let batch = take_session.take_range(1..6).await.unwrap();
+        pretty_assertions::assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 124])
+        );
+
+        // Empty indices gives empty result
+        let batch = take_session.take_range(1..1).await.unwrap();
+        pretty_assertions::assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(Vec::<i32>::new())
         );
     }
 
