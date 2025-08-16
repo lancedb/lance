@@ -366,14 +366,12 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
-def test_enable_move_stable_row_ids(tmp_path: Path):
+def test_enable_stable_row_ids(tmp_path: Path):
     table = pa.Table.from_pylist(
         [{"name": "Alice", "age": 20}, {"name": "Bob", "age": 30}]
     )
-    lance.write_dataset(table, tmp_path, enable_move_stable_row_ids=True)
-    ds = lance.write_dataset(
-        table, tmp_path, enable_move_stable_row_ids=True, mode="append"
-    )
+    lance.write_dataset(table, tmp_path, enable_stable_row_ids=True)
+    ds = lance.write_dataset(table, tmp_path, enable_stable_row_ids=True, mode="append")
     table_before = ds.scanner(with_row_id=True, with_row_address=True).to_table()
     assert len(table_before) == 4
     assert table_before["_rowid"][0].as_py() == 0

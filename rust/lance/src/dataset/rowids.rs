@@ -137,7 +137,7 @@ mod test {
         let schema = sequence_batch(0..0).schema();
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
@@ -161,7 +161,7 @@ mod test {
         let reader =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: false,
+            enable_stable_row_ids: false,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
@@ -172,7 +172,7 @@ mod test {
         // Trying to append without stable row ids should pass (a warning is emitted) but should not
         // affect the move_stable_row_ids setting.
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -190,7 +190,7 @@ mod test {
         let batch = sequence_batch(0..num_rows as i32);
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 10,
             ..Default::default()
         };
@@ -222,7 +222,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let temp_dir = tempfile::tempdir().unwrap();
@@ -258,7 +258,7 @@ mod test {
             *start += 10;
             let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
             let write_params = WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 mode: WriteMode::Append,
                 ..Default::default()
             };
@@ -296,7 +296,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -358,7 +358,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -409,7 +409,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
@@ -493,7 +493,7 @@ mod test {
                 FragmentRowCount::from(10),
                 Some(WriteParams {
                     max_rows_per_file: 10,
-                    enable_move_stable_row_ids: true,
+                    enable_stable_row_ids: true,
                     enable_v2_manifest_paths: true,
                     ..Default::default()
                 }),
@@ -586,7 +586,7 @@ mod test {
                 FragmentRowCount::from(10),
                 Some(WriteParams {
                     max_rows_per_file: 10,
-                    enable_move_stable_row_ids: true,
+                    enable_stable_row_ids: true,
                     enable_v2_manifest_paths: true,
                     ..Default::default()
                 }),

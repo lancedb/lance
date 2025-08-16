@@ -35,7 +35,7 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
-    use_move_stable_row_ids: Option<bool>,
+    use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -52,7 +52,7 @@ impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
-            use_move_stable_row_ids: None,
+            use_stable_row_ids: None,
             enable_v2_manifest_paths: false,
             storage_format: None,
             commit_handler: None,
@@ -73,8 +73,8 @@ impl<'a> CommitBuilder<'a> {
     /// existing setting.
     ///
     /// **Default is false.**
-    pub fn use_move_stable_row_ids(mut self, use_move_stable_row_ids: bool) -> Self {
-        self.use_move_stable_row_ids = Some(use_move_stable_row_ids);
+    pub fn use_stable_row_ids(mut self, use_stable_row_ids: bool) -> Self {
+        self.use_stable_row_ids = Some(use_stable_row_ids);
         self
     }
 
@@ -267,10 +267,10 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_move_stable_row_ids = if let Some(ds) = dest.dataset() {
+        let use_stable_row_ids = if let Some(ds) = dest.dataset() {
             ds.manifest.uses_move_stable_row_ids()
         } else {
-            self.use_move_stable_row_ids.unwrap_or(false)
+            self.use_stable_row_ids.unwrap_or(false)
         };
 
         // Validate storage format matches existing dataset
@@ -293,7 +293,7 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let manifest_config = ManifestWriteConfig {
-            use_move_stable_row_ids,
+            use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             ..Default::default()
         };
