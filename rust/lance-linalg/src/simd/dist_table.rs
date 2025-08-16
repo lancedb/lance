@@ -3,6 +3,9 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::ops::Add;
+
+use arrow_array::ArrowNativeTypeOp;
 
 pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
 pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15];
@@ -16,23 +19,21 @@ pub fn sum_4bit_dist_table(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
+    debug_assert!(n % BATCH_SIZE == 0);
+
+    #[cfg(target_arch = "x86_64")]
     unsafe {
-        debug_assert!(n % BATCH_SIZE == 0);
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            for i in (0..n).step_by(BATCH_SIZE) {
-                sum_dist_table_32bytes_batch_avx2(
-                    &codes[i * code_len..(i + BATCH_SIZE) * code_len],
-                    dist_table,
-                    &mut dists[i..i + BATCH_SIZE],
-                )
-            }
+        for i in (0..n).step_by(BATCH_SIZE) {
+            sum_dist_table_32bytes_batch_avx2(
+                &codes[i * code_len..(i + BATCH_SIZE) * code_len],
+                dist_table,
+                &mut dists[i..i + BATCH_SIZE],
+            )
         }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists);
     }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists);
 }
 
 #[inline]
@@ -50,11 +51,14 @@ fn sum_4bit_dist_table_scalar(code_len: usize, codes: &[u8], dist_table: &[u8], 
                 let low_next_code = (block[j + 16] & 0x0F) as usize;
                 let high_next_code = (block[j + 16] >> 4) as usize;
 
-                dists[vec_block_idx * BATCH_SIZE + PERM0[j]] +=
-                    (current_dist_table[low_current_code] + next_dist_table[low_next_code]) as u16;
-                dists[vec_block_idx * BATCH_SIZE + PERM0[j] + 16] +=
-                    (current_dist_table[high_current_code] + next_dist_table[high_next_code])
-                        as u16;
+                let lower_id = vec_block_idx * BATCH_SIZE + PERM0[j];
+                let higher_id = vec_block_idx * BATCH_SIZE + PERM0[j] + 16;
+                dists[lower_id] = dists[lower_id]
+                    .saturating_add(current_dist_table[low_current_code] as u16)
+                    .saturating_add(next_dist_table[low_next_code] as u16);
+                dists[higher_id] = dists[higher_id]
+                    .saturating_add(current_dist_table[high_current_code] as u16)
+                    .saturating_add(next_dist_table[high_next_code] as u16);
             }
         }
     }
