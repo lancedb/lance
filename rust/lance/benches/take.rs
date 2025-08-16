@@ -238,7 +238,7 @@ async fn create_file_reader(dataset: &Dataset, file_path: &Path) -> FileReader {
     let file_metadata = FileReader::read_all_metadata(&file).await.unwrap();
 
     FileReader::try_open_with_file_metadata(
-        Arc::new(LanceEncodingsIo(file.clone())),
+        Arc::new(LanceEncodingsIo::new(file.clone())),
         file_path.clone(),
         None,
         Arc::<DecoderPlugins>::default(),
