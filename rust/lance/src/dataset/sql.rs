@@ -7,6 +7,9 @@ use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
+use lance_core::Result;
+use lance_datafusion::exec::execute_plan;
+use lance_datafusion::exec::LanceExecutionOptions;
 use std::sync::Arc;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
@@ -88,18 +91,17 @@ impl SqlQuery {
         Self { dataframe }
     }
 
-    pub async fn into_stream(self) -> SendableRecordBatchStream {
-        self.dataframe.execute_stream().await.unwrap()
+    pub async fn try_into_stream(self) -> Result<SendableRecordBatchStream> {
+        let plan = self.dataframe.create_physical_plan().await?;
+        execute_plan(plan, LanceExecutionOptions::default())
     }
 
     pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {
         use futures::TryStreamExt;
 
         Ok(self
-            .dataframe
-            .execute_stream()
-            .await
-            .unwrap()
+            .try_into_stream()
+            .await?
             .try_collect::<Vec<_>>()
             .await?)
     }

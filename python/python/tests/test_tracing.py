@@ -81,8 +81,11 @@ def callback(evt):
 
 capture_trace_events(callback)
 
-lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
-wait_until(lambda: len(events) == 6)
+ds = lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
+ds.create_scalar_index("x", "BTREE")
+ds.sql("SELECT * FROM ds WHERE x = 7").table_name("ds").build().to_batch_records()
+
+wait_until(lambda: len(events) == 11)
 
 assert events[0].target == "lance::dataset_events"
 assert events[0].args["event"] == "loading"
@@ -112,6 +115,19 @@ assert events[5].args["read_version"] == "0"
 assert events[5].args["committed_version"] == "1"
 assert events[5].args["detached"] == "false"
 assert events[5].args["operation"] == "Overwrite"
+
+assert events[6].target == "lance::execution"
+assert events[6].args["type"] == "plan_run"
+assert events[6].args["output_rows"] == "100"
+assert events[6].args["iops"] == "2"
+
+assert events[8].target == "lance::io_events"
+assert events[8].args["type"] == "open_scalar_index"
+assert events[8].args["index_type"] == "BTree"
+
+assert events[9].target == "lance::io_events"
+assert events[9].args["type"] == "load_scalar_part"
+assert events[9].args["part_id"] == "0"
 
 for e in events:
     assert e.args["timestamp"] is not None
