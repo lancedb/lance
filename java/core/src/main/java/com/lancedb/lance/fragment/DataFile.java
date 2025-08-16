@@ -18,6 +18,7 @@ import org.apache.commons.lang3.builder.ToStringBuilder;
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.Optional;
 
 public class DataFile implements Serializable {
   private static final long serialVersionUID = -2827710928026343591L;
@@ -27,6 +28,7 @@ public class DataFile implements Serializable {
   private final int fileMajorVersion;
   private final int fileMinorVersion;
   private final Long fileSizeBytes;
+  private final Integer pathBaseIndex;
 
   public DataFile(
       String path,
@@ -34,13 +36,15 @@ public class DataFile implements Serializable {
       int[] columnIndices,
       int fileMajorVersion,
       int fileMinorVersion,
-      Long fileSizeBytes) {
+      Long fileSizeBytes,
+      Integer pathBaseIndex) {
     this.path = path;
     this.fields = fields;
     this.columnIndices = columnIndices;
     this.fileMajorVersion = fileMajorVersion;
     this.fileMinorVersion = fileMinorVersion;
     this.fileSizeBytes = fileSizeBytes;
+    this.pathBaseIndex = pathBaseIndex;
   }
 
   public String getPath() {
@@ -67,6 +71,10 @@ public class DataFile implements Serializable {
     return fileSizeBytes;
   }
 
+  public Optional<Integer> getPathBaseIndex() {
+    return Optional.ofNullable(pathBaseIndex);
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -88,6 +96,8 @@ public class DataFile implements Serializable {
         .append("columnIndices", columnIndices)
         .append("fileMajorVersion", fileMajorVersion)
         .append("fileMinorVersion", fileMinorVersion)
+        .append("fileSizeBytes", fileSizeBytes)
+        .append("pathBaseIndex", pathBaseIndex)
         .toString();
   }
 }

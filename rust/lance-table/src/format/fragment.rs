@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::fmt::Display;
 use std::num::NonZero;
 
 use deepsize::DeepSizeOf;
@@ -41,9 +42,24 @@ pub struct DataFile {
 
     /// The size of the file in bytes, if known.
     pub file_size_bytes: CachedFileSize,
+
+    /// The base path of the datafile, when the datafile is a reference to another dataset.
+    pub path_base_index: Option<u32>,
 }
 
 impl DataFile {
+    pub fn refer(datafile: &Self, path_base_index: u32) -> Self {
+        Self {
+            path: datafile.path.clone(),
+            fields: datafile.fields.clone(),
+            column_indices: datafile.column_indices.clone(),
+            file_major_version: datafile.file_major_version,
+            file_minor_version: datafile.file_minor_version,
+            file_size_bytes: datafile.file_size_bytes.clone(),
+            path_base_index: Some(path_base_index),
+        }
+    }
+
     pub fn new(
         path: impl Into<String>,
         fields: Vec<i32>,
@@ -59,6 +75,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
+            path_base_index: None,
         }
     }
 
@@ -75,6 +92,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
+            path_base_index: None,
         }
     }
 
@@ -143,6 +161,7 @@ impl From<&DataFile> for pb::DataFile {
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
+            path_base_index: df.path_base_index,
         }
     }
 }
@@ -158,6 +177,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
+            path_base_index: proto.path_base_index,
         })
     }
 }
@@ -186,6 +206,21 @@ pub struct DeletionFile {
     pub file_type: DeletionFileType,
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
+    pub path_base_index: Option<u32>,
+}
+
+impl Display for DeletionFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DeletionFile {{ id: {}, read_version: {}, file_type: {:?}, num_deleted_rows: {:?}, path_base_index: {:?} }}",
+            self.id,
+            self.read_version,
+            self.file_type,
+            self.num_deleted_rows,
+            self.path_base_index
+        )
+    }
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -212,6 +247,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             id: value.id,
             file_type,
             num_deleted_rows,
+            path_base_index: value.path_base_index,
         })
     }
 }
@@ -453,6 +489,7 @@ impl From<&Fragment> for pb::DataFragment {
                 id: f.id,
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
+                path_base_index: f.path_base_index,
             }
         });
 
@@ -523,6 +560,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            path_base_index: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -545,6 +583,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            path_base_index: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();
@@ -557,10 +596,10 @@ mod tests {
                 "files":[
                     {"path": "foobar.lance", "fields": [0], "column_indices": [], 
                      "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null }
+                     "file_size_bytes": null, "path_base_index": null }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
-                                  "num_deleted_rows": 10},
+                                  "num_deleted_rows": 10, "path_base_index": null},
                 "physical_rows": None::<usize>}),
         );
 
