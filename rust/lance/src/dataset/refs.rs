@@ -132,7 +132,7 @@ impl Tags {
 
         let manifest_file = self
             .commit_handler
-            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .resolve_version_location(&self.base, version, &self.object_store.inner, None)
             .await?;
 
         if !self.object_store().exists(&manifest_file.path).await? {
@@ -188,7 +188,7 @@ impl Tags {
 
         let manifest_file = self
             .commit_handler
-            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .resolve_version_location(&self.base, version, &self.object_store.inner, None)
             .await?;
 
         if !self.object_store().exists(&manifest_file.path).await? {

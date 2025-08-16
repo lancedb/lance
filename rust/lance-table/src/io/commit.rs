@@ -22,12 +22,6 @@
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
 //! alternative to [CommitHandler].
 
-use std::io;
-use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::{fmt::Debug, fs::DirEntry};
-
 use futures::future::Either;
 use futures::Stream;
 use futures::{
@@ -40,6 +34,11 @@ use log::warn;
 use object_store::PutOptions;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::location;
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::{fmt::Debug, fs::DirEntry};
 use url::Url;
 
 #[cfg(feature = "dynamodb")]
@@ -66,63 +65,100 @@ use crate::format::{is_detached_version, Index, Manifest};
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
+const LATEST_MANIFEST_HINT_FILE: &str = "_latest_manifest_hint.json";
 
 /// How manifest files should be named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestNamingScheme {
     /// `_versions/{version}.manifest`
     V1,
-    /// `_manifests/{u64::MAX - version}.manifest`
+    /// `_versions/{u64::MAX - version}.manifest`
     ///
     /// Zero-padded and reversed for O(1) lookup of latest version on object stores.
     V2,
+    /// `_versions/{reversed_binary_version}.manifest` with `_latest_manifest_hint.json`
+    ///
+    /// Binary representation reversed for S3 throughput optimization.
+    /// E.g., version 5 becomes "1010000000000000000000000000000000000000000000000000000000000000.manifest"
+    V3,
 }
 
 impl ManifestNamingScheme {
+    pub fn latest_manifest_hint_path(&self, base: &Path) -> Option<Path> {
+        match self {
+            Self::V3 => Some(base.child(VERSIONS_DIR).child(LATEST_MANIFEST_HINT_FILE)),
+            _ => None,
+        }
+    }
+
     pub fn manifest_path(&self, base: &Path, version: u64) -> Path {
         let directory = base.child(VERSIONS_DIR);
-        if is_detached_version(version) {
-            // Detached versions should never show up first in a list operation which
-            // means it needs to come lexicographically after all attached manifest
-            // files and so we add the prefix `d`.  There is no need to invert the
-            // version number since detached versions are not part of the version
-            let directory = base.child(VERSIONS_DIR);
-            directory.child(format!(
-                "{DETACHED_VERSION_PREFIX}{version}.{MANIFEST_EXTENSION}"
-            ))
-        } else {
-            match self {
-                Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
-                Self::V2 => {
+        match self {
+            Self::V1 => {
+                if is_detached_version(version) {
+                    // V1 doesn't support detached versions - use V2 prefix format for compatibility
+                    directory.child(format!(
+                        "{DETACHED_VERSION_PREFIX}{version}.{MANIFEST_EXTENSION}"
+                    ))
+                } else {
+                    directory.child(format!("{version}.{MANIFEST_EXTENSION}"))
+                }
+            }
+            Self::V2 => {
+                if is_detached_version(version) {
+                    // Detached versions for V2 use prefix to ensure lexicographic ordering
+                    directory.child(format!(
+                        "{DETACHED_VERSION_PREFIX}{version}.{MANIFEST_EXTENSION}"
+                    ))
+                } else {
                     let inverted_version = u64::MAX - version;
                     directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
                 }
+            }
+            Self::V3 => {
+                // V3 uses normal binary format for both regular and detached versions
+                // Detached versions naturally end with "1" due to DETACHED_VERSION_MASK
+                let binary_str = format!("{:064b}", version);
+                let reversed_binary: String = binary_str.chars().rev().collect();
+                directory.child(format!("{reversed_binary}.{MANIFEST_EXTENSION}"))
             }
         }
     }
 
     pub fn parse_version(&self, filename: &str) -> Option<u64> {
-        let file_number = filename
-            .split_once('.')
-            // Detached versions will fail the `parse` step, which is ok.
-            .and_then(|(version_str, _)| version_str.parse::<u64>().ok());
         match self {
-            Self::V1 => file_number,
-            Self::V2 => file_number.map(|v| u64::MAX - v),
+            Self::V1 => filename
+                .split_once('.')
+                .and_then(|(version_str, _)| version_str.parse::<u64>().ok()),
+            Self::V2 => filename
+                .split_once('.')
+                .and_then(|(version_str, _)| version_str.parse::<u64>().ok())
+                .map(|v| u64::MAX - v),
+            Self::V3 => filename.split_once('.').and_then(|(binary_str, _)| {
+                if binary_str.len() == 64 && binary_str.chars().all(|c| c == '0' || c == '1') {
+                    // Reverse the binary string and parse it
+                    let reversed: String = binary_str.chars().rev().collect();
+                    u64::from_str_radix(&reversed, 2).ok()
+                } else {
+                    None
+                }
+            }),
         }
     }
 
     pub fn detect_scheme(filename: &str) -> Option<Self> {
         if filename.starts_with(DETACHED_VERSION_PREFIX) {
-            // Currently, detached versions must imply V2
+            // Detached versions with "d" prefix are V1 or V2 format
             return Some(Self::V2);
         }
         if filename.ends_with(MANIFEST_EXTENSION) {
             const V2_LEN: usize = 20 + 1 + MANIFEST_EXTENSION.len();
-            if filename.len() == V2_LEN {
-                Some(Self::V2)
-            } else {
-                Some(Self::V1)
+            const V3_LEN: usize = 64 + 1 + MANIFEST_EXTENSION.len();
+
+            match filename.len() {
+                V3_LEN => Some(Self::V3),
+                V2_LEN => Some(Self::V2),
+                _ => Some(Self::V1),
             }
         } else {
             None
@@ -132,12 +168,147 @@ impl ManifestNamingScheme {
     pub fn detect_scheme_staging(filename: &str) -> Self {
         // We shouldn't have to worry about detached versions here since there is no
         // such thing as "detached" and "staged" at the same time.
-        if filename.chars().nth(20) == Some('.') {
+        if filename.chars().nth(64) == Some('.') {
+            Self::V3
+        } else if filename.chars().nth(20) == Some('.') {
             Self::V2
         } else {
             Self::V1
         }
     }
+}
+
+/// Write the latest manifest hint JSON file for V3 naming scheme.
+/// This is a best-effort operation.
+/// If it fails, it's not critical and the commit is still considered succeeded.
+pub async fn write_latest_manifest_hint_best_effort(
+    object_store: &ObjectStore,
+    base: &Path,
+    manifest_location: &ManifestLocation,
+) -> Result<()> {
+    let json_content = serde_json::to_string(&LatestManifestHint {
+        version: manifest_location.version,
+        size: manifest_location.size,
+        e_tag: manifest_location.e_tag.clone(),
+    })?;
+    let path = base.child(VERSIONS_DIR).child(LATEST_MANIFEST_HINT_FILE);
+    if let Err(e) = object_store.put(&path, json_content.as_bytes()).await {
+        warn!("Failed to write latest manifest hint: {:?}", e);
+    }
+
+    Ok(())
+}
+
+/// Read the latest manifest hint JSON file for V3 naming scheme.
+/// This is a best-effort operation.
+/// If it fails, the caller needs to determine the current latest version through listing.
+pub async fn read_latest_manifest_hint_best_effort(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Result<Option<LatestManifestHint>> {
+    let path = base.child(VERSIONS_DIR).child(LATEST_MANIFEST_HINT_FILE);
+
+    // Optimize for local file system
+    if object_store.is_local() {
+        let local_path = lance_io::local::to_local_path(&path);
+        match std::fs::read(&local_path) {
+            Ok(bytes) => match serde_json::from_slice::<LatestManifestHint>(&bytes) {
+                Ok(hint) => Ok(Some(hint)),
+                Err(e) => {
+                    warn!("Failed to parse latest manifest hint: {:?}", e);
+                    Ok(None)
+                }
+            },
+            Err(e) => {
+                warn!("Failed to read latest manifest hint: {:?}", e);
+                Ok(None)
+            }
+        }
+    } else {
+        // Use object store for cloud storage
+        match object_store.read_one_all(&path).await {
+            Ok(data) => {
+                match serde_json::from_slice::<LatestManifestHint>(data.iter().as_slice()) {
+                    Ok(hint) => Ok(Some(hint)),
+                    Err(e) => {
+                        warn!("Failed to parse latest manifest hint: {:?}", e);
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read latest manifest hint: {:?}", e);
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Perform batched existence check for manifest files, starting with `known_latest_version` + 1.
+/// Each batch checks `batch_size` number of manifests concurrently.
+/// Returns a stream of all found manifest locations.
+/// If there is no new manifest after the `known_latest_version`, it returns an empty stream.
+pub fn batch_head_manifests<'a>(
+    object_store: &'a ObjectStore,
+    base: &'a Path,
+    known_latest_version: u64,
+    batch_size: usize,
+) -> BoxStream<'a, Result<ManifestLocation>> {
+    futures::stream::try_unfold(
+        (known_latest_version + 1, false),
+        move |(current_version, finished)| async move {
+            if finished {
+                return Ok::<Option<(BoxStream<'a, Result<ManifestLocation>>, (u64, bool))>, Error>(
+                    None,
+                );
+            }
+
+            // Check existence for all paths in parallel using buffered concurrency
+            let results = futures::stream::iter(0..batch_size)
+                .map(|i| async move {
+                    let version = current_version + i as u64;
+                    let path = ManifestNamingScheme::V3.manifest_path(base, version);
+                    match object_store.inner.head(&path).await {
+                        Ok(meta) => Ok(Some(ManifestLocation {
+                            version,
+                            path,
+                            e_tag: meta.e_tag,
+                            size: Some(meta.size),
+                            naming_scheme: ManifestNamingScheme::V3,
+                        })),
+                        Err(object_store::Error::NotFound { path: _, source: _ }) => Ok(None),
+                        Err(e) => Err(Error::from(e)),
+                    }
+                })
+                .buffered(object_store.io_parallelism())
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            let mut any_version_not_exist = false;
+            let mut found_locations = Vec::new();
+
+            for result in results {
+                match result {
+                    Some(location) => found_locations.push(location),
+                    None => any_version_not_exist = true,
+                }
+            }
+
+            if any_version_not_exist || found_locations.is_empty() {
+                Ok(Some((
+                    futures::stream::iter(found_locations.into_iter().map(Ok)).boxed(),
+                    (0, true),
+                )))
+            } else {
+                Ok(Some((
+                    futures::stream::iter(found_locations.into_iter().map(Ok)).boxed(),
+                    (current_version + batch_size as u64, false),
+                )))
+            }
+        },
+    )
+    .try_flatten()
+    .boxed()
 }
 
 /// Migrate all V1 manifests to V2 naming scheme.
@@ -199,6 +370,13 @@ pub struct ManifestLocation {
     pub e_tag: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct LatestManifestHint {
+    pub version: u64,
+    pub size: Option<u64>,
+    pub e_tag: Option<String>,
+}
+
 impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     type Error = Error;
 
@@ -233,6 +411,44 @@ async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
+    // Try to use V3 hint file if available
+    if let Some(latest_hint) = read_latest_manifest_hint_best_effort(object_store, base).await? {
+        // Use batch head manifests to check for newer versions
+        let known_latest_version = latest_hint.version;
+        // TODO: make batch size configurable.
+        //   For performance sensitive use case, can even skip checking for newer version.
+        let mut manifest_stream = batch_head_manifests(object_store, base, known_latest_version, 2);
+        let mut latest_found: Option<ManifestLocation> = None;
+
+        while let Some(location_result) = manifest_stream.next().await {
+            match location_result {
+                Ok(location) => {
+                    if latest_found.is_none()
+                        || location.version > latest_found.as_ref().unwrap().version
+                    {
+                        latest_found = Some(location);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if let Some(location) = latest_found {
+            return Ok(location);
+        } else {
+            // If no newer manifests found, use the hint version
+            let naming_scheme = ManifestNamingScheme::V3;
+            let path = naming_scheme.manifest_path(base, known_latest_version);
+            return Ok(ManifestLocation {
+                version: known_latest_version,
+                path,
+                size: latest_hint.size,
+                naming_scheme,
+                e_tag: latest_hint.e_tag,
+            });
+        }
+    }
+
     if object_store.is_local() {
         if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
@@ -300,14 +516,17 @@ async fn current_manifest_path(
                 .unwrap();
             let mut current_meta = meta;
 
-            while let Some((scheme, meta)) = valid_manifests.next().await.transpose()? {
-                if matches!(scheme, ManifestNamingScheme::V2) {
+            while let Some((manifest_scheme, meta)) = valid_manifests.next().await.transpose()? {
+                if manifest_scheme != scheme {
                     return Err(Error::Internal {
-                        message: "Found V2 manifest in a V1 manifest directory".to_string(),
+                        message: format!(
+                            "Found {:?} manifest in a {:?} manifest directory: {:?}",
+                            manifest_scheme, scheme, meta
+                        ),
                         location: location!(),
                     });
                 }
-                let version = scheme
+                let version = manifest_scheme
                     .parse_version(meta.location.filename().unwrap())
                     .unwrap();
                 if version > current_version {
@@ -475,8 +694,9 @@ pub trait CommitHandler: Debug + Send + Sync {
         base_path: &Path,
         version: u64,
         object_store: &dyn OSObjectStore,
+        hint_scheme: Option<ManifestNamingScheme>,
     ) -> Result<ManifestLocation> {
-        default_resolve_version(base_path, version, object_store).await
+        default_resolve_version(base_path, version, object_store, hint_scheme).await
     }
 
     /// If `sorted_descending` is `true`, the stream will yield manifests in descending
@@ -560,49 +780,83 @@ pub trait CommitHandler: Debug + Send + Sync {
     }
 }
 
-async fn default_resolve_version(
+async fn try_resolve_version_with_scheme(
+    scheme: ManifestNamingScheme,
     base_path: &Path,
     version: u64,
     object_store: &dyn OSObjectStore,
-) -> Result<ManifestLocation> {
-    if is_detached_version(version) {
-        return Ok(ManifestLocation {
-            version,
-            // Detached versions are not supported with V1 naming scheme.  If we need
-            // to support in the future we could use a different prefix (e.g. 'x' or something)
-            naming_scheme: ManifestNamingScheme::V2,
-            // Both V1 and V2 should give the same path for detached versions
-            path: ManifestNamingScheme::V2.manifest_path(base_path, version),
-            size: None,
-            e_tag: None,
-        });
-    }
-
-    // try V2, fallback to V1.
-    let scheme = ManifestNamingScheme::V2;
+) -> Result<Option<ManifestLocation>> {
     let path = scheme.manifest_path(base_path, version);
     match object_store.head(&path).await {
-        Ok(meta) => Ok(ManifestLocation {
+        Ok(meta) => Ok(Some(ManifestLocation {
             version,
             path,
             size: Some(meta.size),
             naming_scheme: scheme,
             e_tag: meta.e_tag,
-        }),
-        Err(ObjectStoreError::NotFound { .. }) => {
-            // fallback to V1
-            let scheme = ManifestNamingScheme::V1;
-            Ok(ManifestLocation {
-                version,
-                path: scheme.manifest_path(base_path, version),
-                size: None,
-                naming_scheme: scheme,
-                e_tag: None,
-            })
-        }
+        })),
+        Err(ObjectStoreError::NotFound { .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
+
+async fn default_resolve_version(
+    base_path: &Path,
+    version: u64,
+    object_store: &dyn OSObjectStore,
+    hint_scheme: Option<ManifestNamingScheme>,
+) -> Result<ManifestLocation> {
+    // Create the list of schemes to try, with hint scheme first if provided
+    let schemes_to_try = if let Some(hint) = hint_scheme {
+        // Try hint first, then remaining schemes in fallback order
+        match hint {
+            ManifestNamingScheme::V3 => vec![
+                ManifestNamingScheme::V3,
+                ManifestNamingScheme::V2,
+                ManifestNamingScheme::V1,
+            ],
+            ManifestNamingScheme::V2 => vec![
+                ManifestNamingScheme::V2,
+                ManifestNamingScheme::V3,
+                ManifestNamingScheme::V1,
+            ],
+            ManifestNamingScheme::V1 => vec![
+                ManifestNamingScheme::V1,
+                ManifestNamingScheme::V2,
+                ManifestNamingScheme::V3,
+            ],
+        }
+    } else {
+        // Default order: V3 -> V2 -> V1
+        vec![
+            ManifestNamingScheme::V3,
+            ManifestNamingScheme::V2,
+            ManifestNamingScheme::V1,
+        ]
+    };
+
+    // Try each scheme in order
+    for scheme in schemes_to_try {
+        if let Some(mut result) =
+            try_resolve_version_with_scheme(scheme, base_path, version, object_store).await?
+        {
+            if is_detached_version(version) && scheme == ManifestNamingScheme::V1 {
+                // use V2 as the detached version scheme
+                result.naming_scheme = ManifestNamingScheme::V2;
+                return Ok(result);
+            } else {
+                return Ok(result);
+            }
+        }
+    }
+
+    // If we reach here, no scheme worked
+    Err(Error::Internal {
+        message: format!("Version {version} not found in any supported naming scheme"),
+        location: location!(),
+    })
+}
+
 /// Adapt an object_store credentials into AWS SDK creds
 #[cfg(feature = "dynamodb")]
 #[derive(Debug)]
@@ -1063,6 +1317,7 @@ impl Debug for ConditionalPutCommitHandler {
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
+    pub head_manifests_batch_size: usize,
     // TODO: add isolation_level
 }
 
@@ -1071,6 +1326,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            head_manifests_batch_size: 8,
         }
     }
 }
@@ -1078,6 +1334,7 @@ impl Default for CommitConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::{MultipartUpload, ObjectMeta, PutMultipartOpts};
 
     #[test]
     fn test_manifest_naming_scheme() {
@@ -1122,6 +1379,75 @@ mod tests {
             Some(v2)
         );
         assert_eq!(ManifestNamingScheme::detect_scheme("something else"), None);
+    }
+
+    #[test]
+    fn test_v3_manifest_naming_scheme_file_names() {
+        let v3 = ManifestNamingScheme::V3;
+
+        // Test manifest path generation for V3
+        assert_eq!(
+            v3.manifest_path(&Path::from("base"), 0),
+            Path::from("base/_versions/0000000000000000000000000000000000000000000000000000000000000000.manifest")
+        );
+        assert_eq!(
+            v3.manifest_path(&Path::from("base"), 5),
+            Path::from("base/_versions/1010000000000000000000000000000000000000000000000000000000000000.manifest")
+        );
+        assert_eq!(
+            v3.manifest_path(&Path::from("base"), 1),
+            Path::from("base/_versions/1000000000000000000000000000000000000000000000000000000000000000.manifest")
+        );
+
+        // Test parse_version for V3
+        assert_eq!(
+            v3.parse_version(
+                "0000000000000000000000000000000000000000000000000000000000000000.manifest"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            v3.parse_version(
+                "1010000000000000000000000000000000000000000000000000000000000000.manifest"
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            v3.parse_version(
+                "1000000000000000000000000000000000000000000000000000000000000000.manifest"
+            ),
+            Some(1)
+        );
+
+        // Test detect_scheme for V3
+        assert_eq!(
+            ManifestNamingScheme::detect_scheme(
+                "0000000000000000000000000000000000000000000000000000000000000000.manifest"
+            ),
+            Some(v3)
+        );
+        assert_eq!(
+            ManifestNamingScheme::detect_scheme(
+                "1010000000000000000000000000000000000000000000000000000000000000.manifest"
+            ),
+            Some(v3)
+        );
+
+        // Test latest manifest hint path
+        assert_eq!(
+            v3.latest_manifest_hint_path(&Path::from("base")),
+            Some(Path::from("base/_versions/_latest_manifest_hint.json"))
+        );
+
+        // Test that non-V3 schemes return None for latest manifest path
+        assert_eq!(
+            ManifestNamingScheme::V1.latest_manifest_hint_path(&Path::from("base")),
+            None
+        );
+        assert_eq!(
+            ManifestNamingScheme::V2.latest_manifest_hint_path(&Path::from("base")),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1192,5 +1518,296 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_latest_manifest_hint() {
+        // Test with memory store
+        let object_store = ObjectStore::memory();
+        let base = Path::from("test_base");
+
+        // Create a manifest location
+        let manifest_location = ManifestLocation {
+            version: 42,
+            path: ManifestNamingScheme::V3.manifest_path(&base, 42),
+            size: Some(1024),
+            naming_scheme: ManifestNamingScheme::V3,
+            e_tag: Some("test-etag".to_string()),
+        };
+
+        // Write the hint
+        write_latest_manifest_hint_best_effort(&object_store, &base, &manifest_location)
+            .await
+            .unwrap();
+
+        // Read the hint back
+        let hint = read_latest_manifest_hint_best_effort(&object_store, &base)
+            .await
+            .unwrap()
+            .expect("Should read hint successfully");
+
+        assert_eq!(hint.version, 42);
+        assert_eq!(hint.size, Some(1024));
+        assert_eq!(hint.e_tag, Some("test-etag".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_manifest_hint_not_found() {
+        let object_store = ObjectStore::memory();
+        let base = Path::from("test_base");
+
+        // Try to read non-existent hint
+        let hint = read_latest_manifest_hint_best_effort(&object_store, &base)
+            .await
+            .unwrap();
+
+        assert!(hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_manifest_hint_invalid_json() {
+        let object_store = ObjectStore::memory();
+        let base = Path::from("test_base");
+        let path = base.child(VERSIONS_DIR).child(LATEST_MANIFEST_HINT_FILE);
+
+        // Write invalid JSON
+        object_store
+            .put(&path, b"invalid json".as_slice())
+            .await
+            .unwrap();
+
+        // Should return None for invalid JSON
+        let hint = read_latest_manifest_hint_best_effort(&object_store, &base)
+            .await
+            .unwrap();
+
+        assert!(hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_latest_manifest_hint_local() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let base = Path::from_absolute_path(tempdir.path().to_str().unwrap()).unwrap();
+        let object_store = ObjectStore::local();
+
+        // Create versions directory
+        let versions_dir = tempdir.path().join("_versions");
+        std::fs::create_dir(&versions_dir).unwrap();
+
+        // Create a manifest location
+        let manifest_location = ManifestLocation {
+            version: 99,
+            path: ManifestNamingScheme::V3.manifest_path(&base, 99),
+            size: Some(2048),
+            naming_scheme: ManifestNamingScheme::V3,
+            e_tag: Some("local-etag".to_string()),
+        };
+
+        // Write the hint
+        write_latest_manifest_hint_best_effort(&object_store, &base, &manifest_location)
+            .await
+            .unwrap();
+
+        // Read the hint back
+        let hint = read_latest_manifest_hint_best_effort(&object_store, &base)
+            .await
+            .unwrap()
+            .expect("Should read hint successfully");
+
+        assert_eq!(hint.version, 99);
+        assert_eq!(hint.size, Some(2048));
+        assert_eq!(hint.e_tag, Some("local-etag".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_latest_manifest_hint_with_null_fields() {
+        let object_store = ObjectStore::memory();
+        let base = Path::from("test_base");
+
+        // Create a manifest location with None size and e_tag
+        let manifest_location = ManifestLocation {
+            version: 7,
+            path: ManifestNamingScheme::V3.manifest_path(&base, 7),
+            size: None,
+            naming_scheme: ManifestNamingScheme::V3,
+            e_tag: None,
+        };
+
+        // Write the hint
+        write_latest_manifest_hint_best_effort(&object_store, &base, &manifest_location)
+            .await
+            .unwrap();
+
+        // Read the hint back
+        let hint = read_latest_manifest_hint_best_effort(&object_store, &base)
+            .await
+            .unwrap()
+            .expect("Should read hint successfully");
+
+        assert_eq!(hint.version, 7);
+        assert_eq!(hint.size, None);
+        assert_eq!(hint.e_tag, None);
+    }
+
+    #[tokio::test]
+    async fn test_write_latest_manifest_hint_failure() {
+        use lance_io::object_store::WrappingObjectStore;
+        use std::sync::Arc;
+
+        // Create a wrapper that fails on put operations
+        #[derive(Debug)]
+        struct FailingWrapper;
+
+        impl WrappingObjectStore for FailingWrapper {
+            fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+                Arc::new(FailingStore { inner: original })
+            }
+        }
+
+        #[derive(Debug)]
+        struct FailingStore {
+            inner: Arc<dyn OSObjectStore>,
+        }
+
+        impl std::fmt::Display for FailingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "FailingStore")
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl OSObjectStore for FailingStore {
+            async fn put(
+                &self,
+                _location: &Path,
+                _bytes: object_store::PutPayload,
+            ) -> object_store::Result<object_store::PutResult> {
+                Err(object_store::Error::Generic {
+                    store: "failing",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Simulated failure",
+                    )),
+                })
+            }
+
+            async fn put_opts(
+                &self,
+                _location: &Path,
+                _bytes: object_store::PutPayload,
+                _opts: PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                Err(object_store::Error::Generic {
+                    store: "failing",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Simulated failure",
+                    )),
+                })
+            }
+
+            // Delegate other methods to inner store
+            async fn get(&self, location: &Path) -> object_store::Result<object_store::GetResult> {
+                self.inner.get(location).await
+            }
+
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+
+            async fn head(
+                &self,
+                location: &Path,
+            ) -> object_store::Result<object_store::ObjectMeta> {
+                self.inner.head(location).await
+            }
+
+            async fn delete(&self, location: &Path) -> object_store::Result<()> {
+                self.inner.delete(location).await
+            }
+
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+                self.inner.copy(from, to).await
+            }
+
+            async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+                self.inner.copy_if_not_exists(from, to).await
+            }
+
+            async fn rename_if_not_exists(
+                &self,
+                from: &Path,
+                to: &Path,
+            ) -> object_store::Result<()> {
+                self.inner.rename_if_not_exists(from, to).await
+            }
+
+            async fn put_multipart(
+                &self,
+                location: &Path,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart(location).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: PutMultipartOpts,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+        }
+
+        let base_store = ObjectStore::memory();
+        let wrapper = Arc::new(FailingWrapper);
+        let wrapped_inner = wrapper.wrap(base_store.inner.clone());
+        let object_store = ObjectStore::new(
+            wrapped_inner,
+            Url::parse("memory://test").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            16,
+            3,
+        );
+
+        let base = Path::from("test_base");
+        let manifest_location = ManifestLocation {
+            version: 100,
+            path: ManifestNamingScheme::V3.manifest_path(&base, 100),
+            size: Some(4096),
+            naming_scheme: ManifestNamingScheme::V3,
+            e_tag: Some("fail-test".to_string()),
+        };
+
+        // Write should succeed (best-effort, doesn't propagate errors)
+        let result =
+            write_latest_manifest_hint_best_effort(&object_store, &base, &manifest_location).await;
+        assert!(result.is_ok()); // Should not propagate the error
+
+        // Verify the hint was not written
+        let hint = read_latest_manifest_hint_best_effort(&base_store, &base)
+            .await
+            .unwrap();
+        assert!(hint.is_none());
     }
 }

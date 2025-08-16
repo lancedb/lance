@@ -151,5 +151,9 @@ harness = false
 name = "take"
 harness = false
 
+[[bench]]
+name = "manifest_scheme"
+harness = false
+
 [lints]
 workspace = true

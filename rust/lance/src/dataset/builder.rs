@@ -326,7 +326,7 @@ impl DatasetBuilder {
 
         let (manifest, location) = if let Some(mut manifest) = manifest {
             let location = commit_handler
-                .resolve_version_location(&base_path, manifest.version, &object_store.inner)
+                .resolve_version_location(&base_path, manifest.version, &object_store.inner, None)
                 .await?;
             if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
                 let reader = object_store.open(&location.path).await?;
@@ -337,7 +337,7 @@ impl DatasetBuilder {
             let manifest_location = match version {
                 Some(version) => {
                     commit_handler
-                        .resolve_version_location(&base_path, version, &object_store.inner)
+                        .resolve_version_location(&base_path, version, &object_store.inner, None)
                         .await?
                 }
                 None => commit_handler
