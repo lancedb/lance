@@ -126,9 +126,12 @@ impl<'a> InsertBuilder<'a> {
             .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
             .with_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
+            .enable_v3_manifest_paths(context.params.enable_v3_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone())
-            .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
+            .with_skip_auto_cleanup(context.params.skip_auto_cleanup)
+            .with_detached(context.params.detached)
+            .with_head_manifests_batch_size(context.params.head_manifests_batch_size);
 
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());

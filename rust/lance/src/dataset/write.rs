@@ -202,6 +202,13 @@ pub struct WriteParams {
     /// Default is False.
     pub enable_v2_manifest_paths: bool,
 
+    /// If set to true, and this is a new dataset, uses the new v3 manifest paths.
+    /// These use reversed binary representation for S3 throughput optimization
+    /// and include a _latest_manifest.json file for best-effort latest version tracking.
+    /// This parameter has no effect on existing datasets.
+    /// Default is False.
+    pub enable_v3_manifest_paths: bool,
+
     pub session: Option<Arc<Session>>,
 
     /// If Some and this is a new dataset, old dataset versions will be
@@ -211,6 +218,12 @@ pub struct WriteParams {
     /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
     /// Both parameters must be set to invoke autocleaning.
     pub auto_cleanup: Option<AutoCleanupParams>,
+
+    /// Batch size for loading head manifests when checking for concurrent writes
+    /// in V3 manifest naming scheme. Smaller values can help reduce memory usage
+    /// but may increase the number of object store requests.
+    /// Default is 8.
+    pub head_manifests_batch_size: usize,
 
     /// If true, skip auto cleanup during commits. This should be set to true
     /// for high frequency writes to improve performance. This is also useful
@@ -222,6 +235,12 @@ pub struct WriteParams {
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+
+    /// If true, create a detached commit that is not part of the mainline history.
+    /// Detached commits will never show up in the dataset's history.
+    /// This can be used to stage changes or to handle "secondary" datasets
+    /// whose lineage is tracked elsewhere. Default is false.
+    pub detached: bool,
 }
 
 impl Default for WriteParams {
@@ -239,10 +258,13 @@ impl Default for WriteParams {
             data_storage_version: None,
             enable_move_stable_row_ids: false,
             enable_v2_manifest_paths: false,
+            enable_v3_manifest_paths: false,
             session: None,
             auto_cleanup: Some(AutoCleanupParams::default()),
+            head_manifests_batch_size: 8,
             skip_auto_cleanup: false,
             transaction_properties: None,
+            detached: false,
         }
     }
 }
@@ -796,13 +818,18 @@ impl Iterator for SpillStreamIter {
 mod tests {
     use super::*;
 
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
+    use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_file::reader::FileReader;
     use lance_io::traits::Reader;
+    use lance_table::format::is_detached_version;
+    use lance_table::io::commit::{read_latest_manifest_hint_best_effort, ManifestNamingScheme};
 
     #[tokio::test]
     async fn test_chunking_large_batches() {
@@ -1094,5 +1121,769 @@ mod tests {
         assert_eq!(reader.num_batches(), 1);
         let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
+    }
+
+    #[tokio::test]
+    async fn test_v3_manifest_naming_scheme_write_and_read() {
+        let write_params = WriteParams {
+            enable_v3_manifest_paths: true,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(50),
+                Some(write_params.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Verify V3 naming scheme is used
+        assert_eq!(
+            dataset.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+        assert_eq!(dataset.manifest.version, 1);
+
+        // Verify manifest file exists with correct naming
+        let expected_manifest_path = dataset
+            .base
+            .child("_versions")
+            .child("1000000000000000000000000000000000000000000000000000000000000000.manifest");
+        let manifest_exists = dataset
+            .object_store
+            .exists(&expected_manifest_path)
+            .await
+            .unwrap();
+        assert!(
+            manifest_exists,
+            "V3 manifest file should exist at {:?}",
+            expected_manifest_path
+        );
+
+        // Verify _latest_manifest_hint.json exists and contains correct version
+        let latest_version =
+            read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                .await
+                .unwrap();
+        assert_eq!(latest_version.unwrap().version, 1);
+
+        // Create version 2
+        let append_data1 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(100, 1))
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(25), BatchCount::from(1));
+
+        dataset.append(append_data1, None).await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        // Verify the second manifest file exists with correct naming
+        let expected_manifest_path_v2 = dataset
+            .base
+            .child("_versions")
+            .child("0100000000000000000000000000000000000000000000000000000000000000.manifest");
+        let manifest_v2_exists = dataset
+            .object_store
+            .exists(&expected_manifest_path_v2)
+            .await
+            .unwrap();
+        assert!(
+            manifest_v2_exists,
+            "V3 manifest file for version 2 should exist at {:?}",
+            expected_manifest_path_v2
+        );
+
+        // Verify _latest_manifest_hint.json is updated to version 2
+        let latest_version =
+            read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                .await
+                .unwrap();
+        assert_eq!(latest_version.map(|v| v.version), Some(2));
+
+        // Create version 3
+        let append_data2 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(125, 1))
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(25), BatchCount::from(1));
+
+        dataset.append(append_data2, None).await.unwrap();
+        assert_eq!(dataset.manifest.version, 3);
+
+        // Verify third manifest file exists correct naming
+        let expected_manifest_path_v3 = dataset
+            .base
+            .child("_versions")
+            .child("1100000000000000000000000000000000000000000000000000000000000000.manifest");
+        let manifest_v3_exists = dataset
+            .object_store
+            .exists(&expected_manifest_path_v3)
+            .await
+            .unwrap();
+        assert!(
+            manifest_v3_exists,
+            "V3 manifest file for version 3 should exist at {:?}",
+            expected_manifest_path_v3
+        );
+
+        // Verify _latest_manifest.json is updated to version 3
+        let latest_version =
+            read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                .await
+                .unwrap();
+        assert_eq!(latest_version.map(|v| v.version), Some(3));
+
+        // Verify final dataset state and data integrity
+        let scan = dataset.scan();
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // The initial data creates 50 rows
+        // Then we append 25 rows twice
+        assert_eq!(total_rows, 100); // After two append operations (50 + 25 + 25)
+    }
+
+    #[tokio::test]
+    async fn test_v3_manifest_naming_scheme_concurrent_write() {
+        let write_params = WriteParams {
+            enable_v3_manifest_paths: true,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+
+        // Create initial dataset with V3 naming scheme using in-memory storage
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(50),
+                Some(write_params.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Verify V3 naming scheme is used
+        assert_eq!(
+            dataset.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+        assert_eq!(dataset.manifest.version, 1);
+
+        // Check that _latest_manifest_hint.json exists
+        let latest_manifest_path = dataset
+            .base
+            .child("_versions")
+            .child("_latest_manifest_hint.json");
+        assert!(dataset
+            .object_store
+            .exists(&latest_manifest_path)
+            .await
+            .unwrap());
+
+        // Add 4 new versions using lightweight UpdateConfig transactions (simulating intermediate commits)
+        for i in 1..=4 {
+            dataset
+                .update_config([(format!("test_key_{}", i), format!("test_value_{}", i))])
+                .await
+                .unwrap();
+        }
+
+        // Verify _latest_manifest_hint.json is updated to version 5
+        let latest_version =
+            read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                .await
+                .unwrap();
+        assert_eq!(latest_version.map(|v| v.version), Some(5));
+
+        // Test Case 1: Concurrent write with default batch size
+        let concurrent_dataset_1 = dataset.checkout_version(1).await.unwrap();
+        assert_eq!(concurrent_dataset_1.manifest.version, 1);
+
+        let concurrent_data_1 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(200, 1))
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_df_stream(RowCount::from(25), BatchCount::from(1));
+
+        let rebased_dataset_1 =
+            InsertBuilder::new(WriteDestination::Dataset(Arc::new(concurrent_dataset_1)))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    ..write_params.clone()
+                })
+                .execute_stream(concurrent_data_1)
+                .await
+                .unwrap();
+
+        // This should succeed and create version 6 (after rebasing over versions 2-5)
+        assert_eq!(rebased_dataset_1.manifest.version, 6);
+
+        // Verify read after write for test case 1
+        let scan_1 = rebased_dataset_1.scan();
+        let batches_1: Vec<RecordBatch> = scan_1
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows_1: usize = batches_1.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_1, 75); // 50 (initial) + 25 (concurrent append 1)
+
+        // Test Case 2: Concurrent write with small batch size (1)
+        let concurrent_dataset_2 = dataset.checkout_version(2).await.unwrap();
+        assert_eq!(concurrent_dataset_2.manifest.version, 2);
+
+        let concurrent_data_2 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(300, 1))
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_df_stream(RowCount::from(30), BatchCount::from(1));
+
+        let rebased_dataset_2 =
+            InsertBuilder::new(WriteDestination::Dataset(Arc::new(concurrent_dataset_2)))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    head_manifests_batch_size: 1, // Small batch size - forces multiple batches
+                    ..write_params.clone()
+                })
+                .execute_stream(concurrent_data_2)
+                .await
+                .unwrap();
+
+        // This should succeed and create version 7 (after rebasing over versions 3-6)
+        assert_eq!(rebased_dataset_2.manifest.version, 7);
+
+        // Verify read after write for test case 2
+        let scan_2 = rebased_dataset_2.scan();
+        let batches_2: Vec<RecordBatch> = scan_2
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows_2: usize = batches_2.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_2, 105); // 50 (initial) + 25 (concurrent append 1) + 30 (concurrent append 2)
+
+        // Test Case 3: Concurrent write with large batch size (20)
+        let concurrent_dataset_3 = dataset.checkout_version(3).await.unwrap();
+        assert_eq!(concurrent_dataset_3.manifest.version, 3);
+
+        let concurrent_data_3 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(400, 1))
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_df_stream(RowCount::from(20), BatchCount::from(1));
+
+        let rebased_dataset_3 =
+            InsertBuilder::new(WriteDestination::Dataset(Arc::new(concurrent_dataset_3)))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    head_manifests_batch_size: 20, // Large batch size - single batch
+                    ..write_params.clone()
+                })
+                .execute_stream(concurrent_data_3)
+                .await
+                .unwrap();
+
+        // This should succeed and create version 8 (after rebasing over versions 4-7)
+        assert_eq!(rebased_dataset_3.manifest.version, 8);
+
+        // Verify read after write for test case 3
+        let scan_3 = rebased_dataset_3.scan();
+        let batches_3: Vec<RecordBatch> = scan_3
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows_3: usize = batches_3.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_3, 125); // 50 (initial) + 25 (concurrent append 1) + 30 (concurrent append 2) + 20 (concurrent append 3)
+
+        // Verify _latest_manifest.json is updated to version 8
+        let latest_version = read_latest_manifest_hint_best_effort(
+            &rebased_dataset_3.object_store,
+            &rebased_dataset_3.base,
+        )
+        .await
+        .unwrap();
+        assert_eq!(latest_version.map(|v| v.version), Some(8));
+
+        // Use the latest dataset to verify final state
+        let final_dataset = &rebased_dataset_3;
+        assert_eq!(final_dataset.version().version, 8);
+
+        // Verify all versions exist
+        for version in 1..=8 {
+            let version_dataset = final_dataset.checkout_version(version).await.unwrap();
+            assert_eq!(version_dataset.manifest.version, version);
+        }
+
+        // Verify final dataset has all the data (read after write)
+        let scan = final_dataset.scan();
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // Initial: 50, Concurrent append 1: 25, Concurrent append 2: 30, Concurrent append 3: 20
+        assert_eq!(total_rows, 125); // 50 + 25 + 30 + 20
+
+        // Test that the V3 batched existence checking works correctly
+        // by verifying the latest version
+        let latest_version_id = final_dataset.latest_version_id().await.unwrap();
+        let fresh_dataset = final_dataset
+            .checkout_version(latest_version_id)
+            .await
+            .unwrap();
+        assert_eq!(fresh_dataset.manifest.version, 8);
+
+        // Verify read after write works correctly
+        let fresh_scan = fresh_dataset.scan();
+        let fresh_batches: Vec<RecordBatch> = fresh_scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let fresh_total_rows: usize = fresh_batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(fresh_total_rows, 125);
+    }
+
+    #[tokio::test]
+    async fn test_v3_manifest_naming_scheme_checkout_latest() {
+        let write_params = WriteParams {
+            enable_v3_manifest_paths: true,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+
+        // Create initial dataset with V3 naming scheme using in-memory storage
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(50),
+                Some(write_params.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Verify V3 naming scheme is used
+        assert_eq!(
+            dataset.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+        assert_eq!(dataset.manifest.version, 1);
+
+        // Add several more versions to test checkout_latest
+        for i in 2..=5 {
+            dataset
+                .update_config([(format!("version_{}", i), i.to_string())])
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, i);
+        }
+
+        // Test Case 1: Latest version hint is correctly pointing to the latest version
+        {
+            let latest_version =
+                read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                    .await
+                    .unwrap();
+            assert_eq!(latest_version.map(|v| v.version), Some(5));
+
+            // Checkout an older version and then checkout_latest
+            let mut old_dataset = dataset.checkout_version(3).await.unwrap();
+            assert_eq!(old_dataset.manifest.version, 3);
+
+            // checkout_latest should bring us to version 5
+            old_dataset.checkout_latest().await.unwrap();
+            assert_eq!(old_dataset.manifest.version, 5);
+        }
+
+        // Test Case 2: Latest version hint is pointing to an old version
+        {
+            // Manually corrupt the latest version hint to point to an older version
+            use lance_table::io::commit::LatestManifestHint;
+
+            let corrupted_hint = LatestManifestHint {
+                version: 3, // Point to older version instead of 5
+                size: None,
+                e_tag: None,
+            };
+
+            let hint_path = dataset
+                .base
+                .child("_versions")
+                .child("_latest_manifest_hint.json");
+            let hint_json = serde_json::to_vec(&corrupted_hint).unwrap();
+            dataset
+                .object_store
+                .put(&hint_path, hint_json.as_slice())
+                .await
+                .unwrap();
+
+            // Verify the hint now points to version 3
+            let latest_version =
+                read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                    .await
+                    .unwrap();
+            assert_eq!(latest_version.map(|v| v.version), Some(3));
+
+            // Checkout an older version and then checkout_latest
+            let mut old_dataset = dataset.checkout_version(2).await.unwrap();
+            assert_eq!(old_dataset.manifest.version, 2);
+
+            // checkout_latest should still find the actual latest version (5)
+            // even though the hint points to version 3
+            old_dataset.checkout_latest().await.unwrap();
+            assert_eq!(old_dataset.manifest.version, 5);
+        }
+
+        // Test Case 3: Latest version hint does not exist
+        {
+            // Delete the latest version hint file
+            let hint_path = dataset
+                .base
+                .child("_versions")
+                .child("_latest_manifest_hint.json");
+            dataset.object_store.delete(&hint_path).await.unwrap();
+
+            // Verify the hint no longer exists
+            let latest_version =
+                read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                    .await
+                    .unwrap();
+            assert!(latest_version.is_none());
+
+            // Checkout an older version and then checkout_latest
+            let mut old_dataset = dataset.checkout_version(1).await.unwrap();
+            assert_eq!(old_dataset.manifest.version, 1);
+
+            // checkout_latest should still find the actual latest version (5)
+            // by scanning all manifest files
+            old_dataset.checkout_latest().await.unwrap();
+            assert_eq!(old_dataset.manifest.version, 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v3_manifest_naming_scheme_checkout_version() {
+        let write_params = WriteParams {
+            enable_v3_manifest_paths: true,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+
+        // Create initial dataset with V3 naming scheme using in-memory storage
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(50),
+                Some(write_params.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Verify V3 naming scheme is used
+        assert_eq!(
+            dataset.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+        assert_eq!(dataset.manifest.version, 1);
+
+        // Test Case 1: Checkout the first version after the dataset is created
+        {
+            let version_1_dataset = dataset.checkout_version(1).await.unwrap();
+            assert_eq!(version_1_dataset.manifest.version, 1);
+
+            // Verify the dataset content is accessible
+            let scan = version_1_dataset.scan();
+            let batches: Vec<RecordBatch> = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 50); // Initial dataset has 50 rows
+        }
+
+        // Create a few more versions using append operations
+        for i in 2..=5 {
+            let append_data = lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step_custom::<Int32Type>(i * 100, 1),
+                )
+                .col("value", lance_datagen::array::rand::<Float32Type>())
+                .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+
+            dataset
+                .append(append_data, Some(write_params.clone()))
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, i as u64);
+        }
+
+        // Now we have versions 1, 2, 3, 4, 5
+        assert_eq!(dataset.manifest.version, 5);
+
+        // Test Case 2: Checkout the first version
+        {
+            let version_1_dataset = dataset.checkout_version(1).await.unwrap();
+            assert_eq!(version_1_dataset.manifest.version, 1);
+
+            // Verify the content is only the original data
+            let scan = version_1_dataset.scan();
+            let batches: Vec<RecordBatch> = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 50); // Only original 50 rows
+        }
+
+        // Test Case 3: Checkout a middle version
+        {
+            let version_3_dataset = dataset.checkout_version(3).await.unwrap();
+            assert_eq!(version_3_dataset.manifest.version, 3);
+
+            // Verify the content includes original + 2 appends
+            let scan = version_3_dataset.scan();
+            let batches: Vec<RecordBatch> = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 70); // 50 (original) + 10 (v2) + 10 (v3)
+        }
+
+        // Test Case 4: Explicitly checkout the latest version
+        {
+            let version_5_dataset = dataset.checkout_version(5).await.unwrap();
+            assert_eq!(version_5_dataset.manifest.version, 5);
+
+            // Verify the content includes all data
+            let scan = version_5_dataset.scan();
+            let batches: Vec<RecordBatch> = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 90); // 50 (original) + 10 (v2) + 10 (v3) + 10 (v4) + 10 (v5)
+        }
+
+        // Test Case 5: Verify that all versions can be checked out sequentially
+        for version in 1..=5 {
+            let version_dataset = dataset.checkout_version(version).await.unwrap();
+            assert_eq!(version_dataset.manifest.version, version);
+
+            // Each version should have the expected number of rows
+            let scan = version_dataset.scan();
+            let batches: Vec<RecordBatch> = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let expected_rows = 50 + (version - 1) * 10; // 50 initial + 10 per additional version
+            assert_eq!(total_rows, expected_rows as usize);
+        }
+
+        // Test Case 6: Verify checkout works from any version to any other version
+        {
+            let version_2_dataset = dataset.checkout_version(2).await.unwrap();
+            assert_eq!(version_2_dataset.manifest.version, 2);
+
+            // From version 2, checkout version 4
+            let version_4_dataset = version_2_dataset.checkout_version(4).await.unwrap();
+            assert_eq!(version_4_dataset.manifest.version, 4);
+
+            // Verify content is correct for version 4
+            let scan = version_4_dataset.scan();
+            let batches: Vec<RecordBatch> = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 80); // 50 + 10 + 10 + 10
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v3_manifest_naming_scheme_commit_checkout_detached() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create initial dataset with V3 manifest scheme
+        let write_params = WriteParams {
+            enable_v3_manifest_paths: true,
+            max_rows_per_file: 50,
+            max_rows_per_group: 25,
+            ..Default::default()
+        };
+
+        let initial_data = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(initial_data, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        // Add a few normal versions
+        for i in 1..=3 {
+            let append_data = lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step_custom::<Int32Type>(100 * i, 1),
+                )
+                .col("value", lance_datagen::array::rand::<Float32Type>())
+                .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+
+            dataset
+                .append(
+                    append_data,
+                    Some(WriteParams {
+                        mode: WriteMode::Append,
+                        ..write_params.clone()
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let current_version = dataset.version().version;
+        assert_eq!(current_version, 4);
+        assert_eq!(
+            dataset.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+
+        // Test committing a detached version
+        let detached_data = lance_datagen::gen_batch()
+            .col(
+                "id",
+                lance_datagen::array::step_custom::<Int32Type>(1000, 1),
+            )
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_df_stream(RowCount::from(10), BatchCount::from(1));
+
+        let detached_dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                detached: true,
+                ..write_params.clone()
+            })
+            .execute_stream(detached_data)
+            .await
+            .unwrap();
+
+        // Verify detached version properties
+        let detached_version = detached_dataset.version().version;
+        assert!(is_detached_version(detached_version));
+        assert_eq!(
+            detached_dataset.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+
+        // Verify V3 detached manifest file uses normal binary format (ends with "1" due to highest bit set)
+        let manifest_path =
+            ManifestNamingScheme::V3.manifest_path(&detached_dataset.base, detached_version);
+        let filename = manifest_path.filename().unwrap();
+        let stem = filename
+            .strip_suffix(".manifest")
+            .expect("filename should end with .manifest");
+        assert!(
+            stem.ends_with("1"),
+            "V3 detached version binary should end with '1' due to DETACHED_VERSION_MASK, got: {}",
+            stem
+        );
+        // Verify it's a 64-bit binary string
+        assert_eq!(
+            stem.len(),
+            64,
+            "V3 manifest filename should be 64-bit binary string, got length: {}",
+            stem.len()
+        );
+        // Verify it only contains '0' and '1'
+        assert!(
+            stem.chars().all(|c| c == '0' || c == '1'),
+            "V3 manifest filename should be binary, got: {}",
+            stem
+        );
+
+        // Test checkout detached version by version number
+        let checkout_detached = Dataset::open(test_uri)
+            .await
+            .unwrap()
+            .checkout_version(detached_version)
+            .await
+            .unwrap();
+
+        assert_eq!(checkout_detached.version().version, detached_version);
+        assert_eq!(
+            checkout_detached.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+        assert!(is_detached_version(checkout_detached.version().version));
+
+        // Verify data integrity in detached version
+        let detached_count = checkout_detached.count_rows(None).await.unwrap();
+        let expected_count = 100 + 20 * 3 + 10; // initial + 3 appends + detached append
+        assert_eq!(detached_count, expected_count);
+
+        // Test that we can still checkout the main branch
+        let main_dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(main_dataset.version().version, current_version);
+        assert!(!is_detached_version(main_dataset.version().version));
+
+        let main_count = main_dataset.count_rows(None).await.unwrap();
+        let expected_main_count = 100 + 20 * 3; // initial + 3 appends (no detached)
+        assert_eq!(main_count, expected_main_count);
+
+        // Test that checkout by version works for both detached and regular versions
+        let checkout_v1 = Dataset::open(test_uri)
+            .await
+            .unwrap()
+            .checkout_version(1)
+            .await
+            .unwrap();
+        assert_eq!(checkout_v1.version().version, 1);
+        let v1_count = checkout_v1.count_rows(None).await.unwrap();
+        assert_eq!(v1_count, 100);
     }
 }

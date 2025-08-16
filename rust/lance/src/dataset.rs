@@ -36,8 +36,8 @@ use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
-    ManifestNamingScheme,
+    batch_head_manifests, migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler,
+    CommitLock, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use object_store::path::Path;
@@ -417,7 +417,12 @@ impl Dataset {
         let base_path = self.base.clone();
         let manifest_location = self
             .commit_handler
-            .resolve_version_location(&base_path, version, &self.object_store.inner)
+            .resolve_version_location(
+                &base_path,
+                version,
+                &self.object_store.inner,
+                Some(self.manifest_location.naming_scheme),
+            )
             .await?;
 
         if self.already_checked_out(&manifest_location) {
@@ -685,7 +690,12 @@ impl Dataset {
             let blobs_path = self.base.child(BLOB_DIR);
             let blob_manifest_location = self
                 .commit_handler
-                .resolve_version_location(&blobs_path, blobs_version, &self.object_store.inner)
+                .resolve_version_location(
+                    &blobs_path,
+                    blobs_version,
+                    &self.object_store.inner,
+                    Some(self.manifest_location.naming_scheme),
+                )
                 .await?;
             let manifest = read_manifest(
                 &self.object_store,
@@ -1750,6 +1760,117 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     }
 }
 
+pub(crate) async fn load_and_sort_new_transactions_v3(
+    dataset: &Dataset,
+    head_manifests_batch_size: usize,
+) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
+    let io_parallelism = dataset.object_store().io_parallelism();
+    let latest_version = dataset.manifest.version;
+    let locations = batch_head_manifests(
+        &dataset.object_store,
+        &dataset.base,
+        latest_version,
+        head_manifests_batch_size,
+    );
+
+    let manifests = locations
+        .map_ok(move |location| async move {
+            let manifest_key = ManifestKey {
+                version: location.version,
+                e_tag: location.e_tag.as_deref(),
+            };
+            let manifest =
+                if let Some(cached) = dataset.metadata_cache.get_with_key(&manifest_key).await {
+                    cached
+                } else {
+                    let loaded = Arc::new(
+                        Dataset::load_manifest(
+                            dataset.object_store(),
+                            &location,
+                            &dataset.uri,
+                            dataset.session.as_ref(),
+                        )
+                        .await?,
+                    );
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&manifest_key, loaded.clone())
+                        .await;
+                    loaded
+                };
+            Ok((manifest, location))
+        })
+        .try_buffer_unordered(io_parallelism / 2);
+    let transactions = manifests
+        .map_ok(move |(manifest, location)| async move {
+            let manifest_copy = manifest.clone();
+            let tx_key = TransactionKey {
+                version: manifest.version,
+            };
+            let transaction =
+                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
+                    cached
+                } else {
+                    let dataset_version = Dataset::checkout_manifest(
+                        dataset.object_store.clone(),
+                        dataset.base.clone(),
+                        dataset.uri.clone(),
+                        manifest_copy.clone(),
+                        location.clone(),
+                        dataset.session(),
+                        dataset.commit_handler.clone(),
+                        dataset.file_reader_options.clone(),
+                    )?;
+                    let object_store = dataset_version.object_store();
+                    let path = dataset_version
+                        .manifest
+                        .transaction_file
+                        .as_ref()
+                        .ok_or_else(|| Error::Internal {
+                            message: format!(
+                                "Dataset version {} does not have a transaction file",
+                                manifest_copy.version
+                            ),
+                            location: location!(),
+                        })?;
+                    let loaded =
+                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                    dataset
+                        .metadata_cache
+                        .insert_with_key(&tx_key, loaded.clone())
+                        .await;
+                    loaded
+                };
+            Ok((manifest, location, transaction))
+        })
+        .try_buffer_unordered(io_parallelism / 2);
+
+    let mut new_transactions = transactions.boxed().try_collect::<Vec<_>>().await?;
+    new_transactions.sort_by_key(|(manifest, _, _)| manifest.version);
+    let latest_dataset = if let Some(last_transaction) = new_transactions.last() {
+        Dataset::checkout_manifest(
+            dataset.object_store.clone(),
+            dataset.base.clone(),
+            dataset.uri.clone(),
+            last_transaction.0.clone(),
+            last_transaction.1.clone(),
+            dataset.session(),
+            dataset.commit_handler.clone(),
+            dataset.file_reader_options.clone(),
+        )?
+    } else {
+        dataset.clone()
+    };
+
+    Ok((
+        latest_dataset,
+        new_transactions
+            .into_iter()
+            .map(|(manifest, _, transaction)| (manifest.version, transaction))
+            .collect(),
+    ))
+}
+
 /// # Schema Evolution
 ///
 /// Lance datasets support evolving the schema. Several operations are
@@ -2067,7 +2188,7 @@ mod tests {
     use crate::dataset::transaction::DataReplacementGroup;
     use crate::dataset::WriteMode::Overwrite;
     use crate::index::vector::VectorIndexParams;
-    use crate::utils::test::copy_test_data_to_tmp;
+    use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
 
     use arrow::array::{as_struct_array, AsArray, GenericListBuilder, GenericStringBuilder};
     use arrow::compute::concat_batches;
@@ -7273,5 +7394,118 @@ mod tests {
 
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_v3_naming_scheme_load_new_transactions() {
+        // Helper function to verify transaction versions and content
+        fn verify_transactions(
+            transactions: &[(u64, Arc<Transaction>)],
+            base_version: u64,
+            expected_count: usize,
+        ) {
+            assert_eq!(
+                transactions.len(),
+                expected_count,
+                "Should have {} transactions",
+                expected_count
+            );
+
+            if expected_count == 0 {
+                return;
+            }
+
+            let mut versions: Vec<u64> = transactions.iter().map(|(v, _)| *v).collect();
+            versions.sort();
+            let expected_versions: Vec<u64> = (1..=expected_count)
+                .map(|i| base_version + i as u64)
+                .collect();
+            assert_eq!(versions, expected_versions);
+
+            // Verify transaction content
+            for (i, (version, transaction)) in transactions.iter().enumerate() {
+                let expected_version = base_version + (i as u64) + 1;
+                assert_eq!(*version, expected_version);
+
+                // Check that transaction contains UpdateConfig operation
+                match &transaction.operation {
+                    crate::dataset::transaction::Operation::UpdateConfig {
+                        upsert_values, ..
+                    } => {
+                        if let Some(upsert_values) = upsert_values {
+                            let expected_key = format!("test_key_{}", i + 1);
+                            let expected_value = format!("test_value_{}", i + 1);
+                            assert_eq!(upsert_values.get(&expected_key), Some(&expected_value));
+                        } else {
+                            panic!("Expected upsert_values in UpdateConfig operation");
+                        }
+                    }
+                    _ => panic!(
+                        "Expected UpdateConfig operation, got {:?}",
+                        transaction.operation
+                    ),
+                }
+            }
+        }
+
+        // Create initial dataset with V3 naming scheme using memory store
+        let write_params = WriteParams {
+            enable_v3_manifest_paths: true,
+            ..Default::default()
+        };
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "id",
+                lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+
+        let base_version = dataset.version().version;
+
+        // Add 4 new versions using simple UpdateConfig transactions
+        for i in 1..=4 {
+            dataset
+                .update_config([(format!("test_key_{}", i), format!("test_value_{}", i))])
+                .await
+                .unwrap();
+        }
+
+        // Create an older dataset version to load new transactions from
+        let old_dataset = dataset.checkout_version(base_version).await.unwrap();
+
+        // Test Case 1: No new transactions when starting from latest version
+        let (new_dataset, transactions) = load_and_sort_new_transactions_v3(&dataset, 2)
+            .await
+            .unwrap();
+        assert_eq!(new_dataset.version().version, base_version + 4);
+        verify_transactions(&transactions, base_version + 4, 0);
+
+        // Test Case 2: New transactions within batch size (batch_size=10, actual=4)
+        let (new_dataset, transactions) = load_and_sort_new_transactions_v3(&old_dataset, 10)
+            .await
+            .unwrap();
+        assert_eq!(new_dataset.version().version, base_version + 4);
+        verify_transactions(&transactions, base_version, 4);
+
+        // Test Case 3: Exactly single batch size (batch_size=4, actual=4)
+        let (new_dataset, transactions) = load_and_sort_new_transactions_v3(&old_dataset, 4)
+            .await
+            .unwrap();
+        assert_eq!(new_dataset.version().version, base_version + 4);
+        verify_transactions(&transactions, base_version, 4);
+
+        // Test Case 4: Beyond single batch size (batch_size=3, actual=4 requires 2 batches: 3+1)
+        let (new_dataset, transactions) = load_and_sort_new_transactions_v3(&old_dataset, 3)
+            .await
+            .unwrap();
+        assert_eq!(new_dataset.version().version, base_version + 4);
+        verify_transactions(&transactions, base_version, 4);
     }
 }

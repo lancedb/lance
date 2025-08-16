@@ -37,6 +37,7 @@ pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
     use_move_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
+    enable_v3_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
@@ -54,6 +55,7 @@ impl<'a> CommitBuilder<'a> {
             dest: dest.into(),
             use_move_stable_row_ids: None,
             enable_v2_manifest_paths: false,
+            enable_v3_manifest_paths: false,
             storage_format: None,
             commit_handler: None,
             store_params: None,
@@ -128,12 +130,23 @@ impl<'a> CommitBuilder<'a> {
     ///  This parameter has no effect on existing datasets. To migrate an existing
     ///  dataset, use the [`Dataset::migrate_manifest_paths_v2`] method. **Default is False.**
     ///
-    /// <div class="warning">
-    ///  WARNING: turning this on will make the dataset unreadable for older
-    ///  versions of Lance (prior to 0.17.0).
-    /// </div>
+    /// WARNING: turning this on will make the dataset unreadable for older
+    /// versions of Lance (prior to 0.17.0).
     pub fn enable_v2_manifest_paths(mut self, enable: bool) -> Self {
         self.enable_v2_manifest_paths = enable;
+        self
+    }
+
+    /// If set to true, and this is a new dataset, uses the new v3 manifest paths.
+    /// These use reversed binary representation for S3 throughput optimization
+    /// and include a _latest_manifest.json file for best-effort latest version tracking.
+    /// This parameter has no effect on existing datasets.
+    /// **Default is False.**
+    ///
+    /// WARNING: turning this on will make the dataset unreadable for older
+    /// versions of Lance.
+    pub fn enable_v3_manifest_paths(mut self, enable: bool) -> Self {
+        self.enable_v3_manifest_paths = enable;
         self
     }
 
@@ -158,6 +171,13 @@ impl<'a> CommitBuilder<'a> {
 
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
+        self
+    }
+
+    /// Set the batch size for loading head manifests when checking for concurrent writes
+    /// in V3 manifest naming scheme.
+    pub fn with_head_manifests_batch_size(mut self, batch_size: usize) -> Self {
+        self.commit_config.head_manifests_batch_size = batch_size;
         self
     }
 
@@ -261,6 +281,8 @@ impl<'a> CommitBuilder<'a> {
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
             ds.manifest_location.naming_scheme
+        } else if self.enable_v3_manifest_paths {
+            ManifestNamingScheme::V3
         } else if self.enable_v2_manifest_paths {
             ManifestNamingScheme::V2
         } else {

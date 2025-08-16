@@ -35,7 +35,8 @@ use lance_table::format::{
     WriterVersion, DETACHED_VERSION_MASK,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
+    write_latest_manifest_hint_best_effort, CommitConfig, CommitError, CommitHandler,
+    ManifestLocation, ManifestNamingScheme,
 };
 use rand::{rng, Rng};
 use snafu::location;
@@ -53,7 +54,8 @@ use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    load_new_transactions, write_manifest_file, ManifestWriteConfig, NewTransactionResult, BLOB_DIR,
+    load_and_sort_new_transactions_v3, load_new_transactions, write_manifest_file,
+    ManifestWriteConfig, NewTransactionResult, BLOB_DIR,
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -149,6 +151,12 @@ async fn do_commit_new_dataset(
             metadata_cache
                 .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
                 .await;
+
+            if matches!(manifest_naming_scheme, ManifestNamingScheme::V3) {
+                write_latest_manifest_hint_best_effort(object_store, base_path, &manifest_location)
+                    .await?;
+            }
+
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
@@ -606,7 +614,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 Some(indices.clone())
             },
             write_config,
-            ManifestNamingScheme::V2,
+            dataset.manifest_location.naming_scheme,
         )
         .await;
 
@@ -760,7 +768,13 @@ pub(crate) async fn commit_transaction(
         // slower performance for concurrent writes. But that makes the fast path
         // faster and the slow path slower, which makes performance less predictable
         // for users. So we always check for other transactions.
-        (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+        (dataset, other_transactions) =
+            if dataset.manifest_location.naming_scheme == ManifestNamingScheme::V3 {
+                load_and_sort_new_transactions_v3(&dataset, commit_config.head_manifests_batch_size)
+                    .await?
+            } else {
+                load_and_sort_new_transactions(&dataset).await?
+            };
 
         // See if we can retry the commit. Try to account for all
         // transactions that have been committed since the read_version.
@@ -865,6 +879,15 @@ pub(crate) async fn commit_transaction(
                         .index_cache
                         .insert_with_key(&key, Arc::new(indices))
                         .await;
+                }
+
+                if matches!(manifest_location.naming_scheme, ManifestNamingScheme::V3) {
+                    write_latest_manifest_hint_best_effort(
+                        object_store,
+                        &dataset.base,
+                        &manifest_location,
+                    )
+                    .await?;
                 }
 
                 if !commit_config.skip_auto_cleanup {

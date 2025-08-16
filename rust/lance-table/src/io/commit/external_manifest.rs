@@ -276,6 +276,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         base_path: &Path,
         version: u64,
         object_store: &dyn OSObjectStore,
+        hint_scheme: Option<ManifestNamingScheme>,
     ) -> std::result::Result<ManifestLocation, Error> {
         let location_res = self
             .external_manifest_store
@@ -286,7 +287,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Ok(p) => p,
             // not board external manifest yet, direct to object store
             Err(Error::NotFound { .. }) => {
-                let path = default_resolve_version(base_path, version, object_store)
+                let path = default_resolve_version(base_path, version, object_store, hint_scheme)
                     .await
                     .map_err(|_| Error::NotFound {
                         uri: format!("{}@{}", base_path, version),
