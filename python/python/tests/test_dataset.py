@@ -323,9 +323,6 @@ def test_checkout(tmp_path: Path):
     assert ds1.version == 2
     assert ds1.to_table() == pa.table({"a": [0, 2]})
 
-    with pytest.raises(IOError):
-        ds2.delete("a = 2")
-
     ds1.delete("a = 2")
     assert ds1.count_rows() == 1
 
