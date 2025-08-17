@@ -14,13 +14,12 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.operation.Operation;
-import com.lancedb.lance.operation.Project;
 
 import org.apache.arrow.util.Preconditions;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -32,6 +31,7 @@ public class Transaction {
   private final long readVersion;
   private final String uuid;
   private final Map<String, String> writeParams;
+  private final Map<String, String> transactionProperties;
   // Mainly for JNI usage
   private final Dataset dataset;
   private final Operation operation;
@@ -43,17 +43,16 @@ public class Transaction {
       String uuid,
       Operation operation,
       Operation blobOp,
-      Map<String, String> writeParams) {
+      Map<String, String> writeParams,
+      Map<String, String> transactionProperties) {
     this.dataset = dataset;
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
     this.blobOp = blobOp;
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
-  }
-
-  public Dataset dataset() {
-    return dataset;
+    this.transactionProperties =
+        transactionProperties != null ? transactionProperties : new HashMap<>();
   }
 
   public long readVersion() {
@@ -76,20 +75,47 @@ public class Transaction {
     return writeParams;
   }
 
+  public Map<String, String> transactionProperties() {
+    return transactionProperties;
+  }
+
   public Dataset commit() {
-    try {
-      Dataset committed = commitNative();
-      committed.allocator = dataset.allocator;
-      return committed;
-    } finally {
-      operation.release();
-      if (blobOp != null) {
-        blobOp.release();
-      }
+    if (dataset == null) {
+      throw new UnsupportedOperationException("Transaction doesn't support create new dataset yet");
+    }
+    return dataset.commitTransaction(this);
+  }
+
+  public void release() {
+    operation.release();
+    if (blobOp != null) {
+      blobOp.release();
     }
   }
 
-  private native Dataset commitNative();
+  @Override
+  public String toString() {
+    return String.format(
+        "Transaction{readVersion=%d, uuid='%s', operation=%s, blobOp=%s}",
+        readVersion, uuid, operation, blobOp);
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    Transaction that = (Transaction) o;
+    return readVersion == that.readVersion
+        && uuid.equals(that.uuid)
+        && Objects.equals(operation, that.operation)
+        && Objects.equals(blobOp, that.blobOp)
+        && Objects.equals(writeParams, that.writeParams)
+        && Objects.equals(transactionProperties, that.transactionProperties);
+  }
 
   public static class Builder {
     private final String uuid;
@@ -98,6 +124,7 @@ public class Transaction {
     private Operation operation;
     private Operation blobOp;
     private Map<String, String> writeParams;
+    private Map<String, String> transactionProperties;
 
     public Builder(Dataset dataset) {
       this.dataset = dataset;
@@ -109,24 +136,33 @@ public class Transaction {
       return this;
     }
 
+    public Builder transactionProperties(Map<String, String> properties) {
+      this.transactionProperties = properties;
+      return this;
+    }
+
     public Builder writeParams(Map<String, String> writeParams) {
       this.writeParams = writeParams;
       return this;
     }
 
-    public Builder project(Schema newSchema) {
+    public Builder operation(Operation operation) {
       validateState();
-      this.operation = new Project.Builder().schema(newSchema).allocator(dataset.allocator).build();
+      this.operation = operation;
       return this;
     }
 
     private void validateState() {
-      Preconditions.checkState(operation == null, "Operation " + operation + " already set");
+      if (operation != null) {
+        throw new IllegalStateException(
+            String.format("Operation %s has been set", operation.name()));
+      }
     }
 
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-      return new Transaction(dataset, readVersion, uuid, operation, blobOp, writeParams);
+      return new Transaction(
+          dataset, readVersion, uuid, operation, blobOp, writeParams, transactionProperties);
     }
   }
 }

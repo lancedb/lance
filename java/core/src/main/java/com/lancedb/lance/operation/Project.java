@@ -13,28 +13,17 @@
  */
 package com.lancedb.lance.operation;
 
-import org.apache.arrow.c.ArrowSchema;
-import org.apache.arrow.c.Data;
-import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
- * Project to a new schema. This only changes the schema, not the data. This operation could be used
- * to: 1. add/remove columns. The data will be removed after compaction. 2. modify column positions
+ * Project to a new schema. This Operation only changes the schema, not the data. Note: 1. For
+ * removing columns. The data will be removed after compaction. 2. Project will modify column
+ * positions, not ids(a.k.a. field id)
  */
-public class Project implements Operation {
+public class Project extends SchemaOperation {
 
-  private final Schema schema;
-  private final BufferAllocator allocator;
-  private ArrowSchema cSchema;
-
-  private Project(Schema schema, BufferAllocator allocator) {
-    this.schema = schema;
-    this.allocator = allocator;
-  }
-
-  public Schema getSchema() {
-    return schema;
+  private Project(Schema schema) {
+    super(schema);
   }
 
   @Override
@@ -43,29 +32,16 @@ public class Project implements Operation {
   }
 
   @Override
-  public void release() {
-    if (cSchema != null) {
-      cSchema.close();
-    }
-  }
-
-  @Override
   public String toString() {
-    return "Project{" + "schema=" + schema + '}';
+    return "Project{" + "schema=" + +'}';
   }
 
-  public long exportSchema() {
-    if (cSchema == null) {
-      this.cSchema = ArrowSchema.allocateNew(allocator);
-      Data.exportSchema(allocator, schema, null, cSchema);
-    }
-    return cSchema.memoryAddress();
+  public static Builder builder() {
+    return new Builder();
   }
 
-  // Builder class for Project
   public static class Builder {
     private Schema schema;
-    private BufferAllocator allocator;
 
     public Builder() {}
 
@@ -74,13 +50,8 @@ public class Project implements Operation {
       return this;
     }
 
-    public Builder allocator(BufferAllocator allocator) {
-      this.allocator = allocator;
-      return this;
-    }
-
     public Project build() {
-      return new Project(schema, allocator);
+      return new Project(schema);
     }
   }
 }

@@ -37,7 +37,7 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 use snafu::location;
 
 use futures::future::Either;
@@ -561,7 +561,7 @@ pub(crate) async fn do_commit_detached_transaction(
     let mut backoff = Backoff::default();
     while backoff.attempt() < commit_config.num_retries {
         // Pick a random u64 with the highest bit set to indicate it is detached
-        let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
+        let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
@@ -678,6 +678,20 @@ pub(crate) async fn commit_detached_transaction(
     .await
 }
 
+/// Load new transactions and sort them by version in ascending order (oldest to newest)
+async fn load_and_sort_new_transactions(
+    dataset: &Dataset,
+) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
+    let NewTransactionResult {
+        dataset: new_ds,
+        new_transactions,
+    } = load_new_transactions(dataset);
+    let new_transactions = new_transactions.try_collect::<Vec<_>>();
+    let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
+    txns.sort_by_key(|(version, _)| *version);
+    Ok((new_ds, txns))
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -749,15 +763,7 @@ pub(crate) async fn commit_transaction(
         // for users. So we always check for other transactions.
         // We skip this for strict overwrites, because strict overwrites can't be rebased.
         if !strict_overwrite {
-            (dataset, other_transactions) = {
-                // Load new dataset and other transactions concurrently
-                let NewTransactionResult {
-                    dataset: new_ds,
-                    new_transactions,
-                } = load_new_transactions(&dataset);
-                let new_transactions = new_transactions.try_collect::<Vec<_>>();
-                futures::future::try_join(new_ds, new_transactions).await?
-            };
+            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
@@ -767,8 +773,7 @@ pub(crate) async fn commit_transaction(
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
 
-            // Check against committed transactions from oldest to latest
-            for (other_version, other_transaction) in other_transactions.iter().rev() {
+            for (other_version, other_transaction) in other_transactions.iter() {
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
@@ -918,6 +923,7 @@ pub(crate) async fn commit_transaction(
 mod tests {
     use std::sync::Mutex;
 
+    use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::future::join_all;
@@ -935,6 +941,7 @@ mod tests {
 
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use crate::Dataset;
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
@@ -1181,6 +1188,45 @@ mod tests {
         let mut fields: Vec<i32> = indices.iter().flat_map(|i| i.fields.clone()).collect();
         fields.sort();
         assert_eq!(fields, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_load_and_sort_new_transactions() {
+        // Create a dataset
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        // Create 100 small UpdateConfig transactions
+        for i in 0..100 {
+            dataset
+                .update_config(vec![(format!("key_{}", i), format!("value_{}", i))])
+                .await
+                .unwrap();
+        }
+
+        // Now load the dataset at version 1 and check that load_and_sort_new_transactions
+        // returns transactions in order
+        let dataset_v1 = dataset.checkout_version(1).await.unwrap();
+        let (_, transactions) = load_and_sort_new_transactions(&dataset_v1).await.unwrap();
+
+        // Verify transactions are sorted by version
+        let versions: Vec<u64> = transactions.iter().map(|(v, _)| *v).collect();
+        for i in 1..versions.len() {
+            assert!(
+                versions[i] > versions[i - 1],
+                "Transactions not in order: version {} came after version {}",
+                versions[i],
+                versions[i - 1]
+            );
+        }
+
+        // Also verify we have exactly 100 transactions (versions 2-101)
+        assert_eq!(transactions.len(), 100);
+        assert_eq!(versions.first(), Some(&2));
+        assert_eq!(versions.last(), Some(&101));
     }
 
     #[tokio::test]

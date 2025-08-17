@@ -154,6 +154,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
         Ok(DataBlock::Struct(StructDataBlock {
             children,
             block_info: BlockInfo::default(),
+            validity: None,
         }))
     }
 }

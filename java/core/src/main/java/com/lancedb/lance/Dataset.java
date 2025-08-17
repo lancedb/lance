@@ -59,8 +59,8 @@ public class Dataset implements Closeable {
 
   private long nativeDatasetHandle;
 
-  BufferAllocator allocator;
-  boolean selfManagedAllocator = false;
+  private BufferAllocator allocator;
+  private boolean selfManagedAllocator = false;
 
   private final LockManager lockManager = new LockManager();
 
@@ -221,7 +221,7 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions);
 
   /**
-   * Create a new version of dataset.
+   * Create a new version of dataset. Use {@link Transaction} instead
    *
    * @param allocator the buffer allocator
    * @param path The file path of the dataset to open.
@@ -230,6 +230,7 @@ public class Dataset implements Closeable {
    *     is not needed for overwrite or restore operations.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
+  @Deprecated
   public static Dataset commit(
       BufferAllocator allocator,
       String path,
@@ -238,6 +239,7 @@ public class Dataset implements Closeable {
     return commit(allocator, path, operation, readVersion, new HashMap<>());
   }
 
+  @Deprecated
   public static Dataset commit(
       BufferAllocator allocator,
       String path,
@@ -253,18 +255,26 @@ public class Dataset implements Closeable {
     return dataset;
   }
 
+  /** Use {@link Transaction} instead */
+  @Deprecated
   public static native Dataset commitAppend(
       String path,
       Optional<Long> readVersion,
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  /** Use {@link Transaction} instead */
+  @Deprecated
   public static native Dataset commitOverwrite(
       String path,
       long arrowSchemaMemoryAddress,
       Optional<Long> readVersion,
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
+
+  public BufferAllocator allocator() {
+    return allocator;
+  }
 
   /**
    * Create a new transaction builder at current version for the dataset. The dataset itself will
@@ -275,6 +285,30 @@ public class Dataset implements Closeable {
   public Transaction.Builder newTransactionBuilder() {
     return new Transaction.Builder(this).readVersion(version());
   }
+
+  /**
+   * Commit a single transaction and return a new Dataset with the new version. Original dataset
+   * version will not be refreshed.
+   *
+   * @param transaction The transaction to commit
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(Transaction transaction) {
+    Preconditions.checkNotNull(transaction);
+    try {
+      Dataset dataset = nativeCommitTransaction(transaction);
+      if (selfManagedAllocator) {
+        dataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        dataset.allocator = allocator;
+      }
+      return dataset;
+    } finally {
+      transaction.release();
+    }
+  }
+
+  private native Dataset nativeCommitTransaction(Transaction transaction);
 
   /**
    * Drop a Dataset.
@@ -691,6 +725,20 @@ public class Dataset implements Closeable {
   }
 
   private native LanceSchema nativeGetLanceSchema();
+
+  /**
+   * Get the {@link com.lancedb.lance.Transaction} of the dataset at the current version.
+   *
+   * @return the Transaction
+   */
+  public Optional<Transaction> readTransaction() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeReadTransaction());
+    }
+  }
+
+  private native Transaction nativeReadTransaction();
 
   /** @return all the created indexes names */
   public List<String> listIndexes() {

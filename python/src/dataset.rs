@@ -43,8 +43,8 @@ use lance::dataset::{
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
-    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
-    UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
+    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
     WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::dataset::{
@@ -56,6 +56,9 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_datafusion::utils::reader_to_stream;
+use lance_encoding::decoder::DecoderConfig;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
@@ -248,6 +251,37 @@ impl MergeInsertBuilder {
 
         Ok((PyLance(transaction), stats))
     }
+
+    #[pyo3(signature=(schema = None, verbose = false))]
+    pub fn explain_plan(
+        &mut self,
+        schema: Option<PyArrowType<ArrowSchema>>,
+        verbose: Option<bool>,
+    ) -> PyResult<String> {
+        let verbose = verbose.unwrap_or(false);
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let schema_ref = schema.as_ref().map(|s| &s.0);
+        RT.block_on(None, job.explain_plan(schema_ref, verbose))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    pub fn analyze_plan(&mut self, new_data: &Bound<PyAny>) -> PyResult<String> {
+        let new_data_reader = convert_reader(new_data)?;
+        let new_data_stream = reader_to_stream(new_data_reader);
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        RT.block_on(None, job.analyze_plan(new_data_stream))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
 }
 
 impl MergeInsertBuilder {
@@ -328,7 +362,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
             .and_then(|cls| cls.getattr(intern!(py, "ColumnOrdering")))
             .expect("Failed to get RewrittenIndex class");
 
-        let column_name = self.0.column_name.to_string();
+        let column_name = self.0.column_name.clone();
         let ascending = self.0.ascending;
         let nulls_first = self.0.nulls_first;
         cls.call1((column_name, ascending, nulls_first))
@@ -348,7 +382,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None))]
     fn new(
         py: Python,
         uri: String,
@@ -361,6 +395,7 @@ impl Dataset {
         manifest: Option<&[u8]>,
         metadata_cache_size_bytes: Option<usize>,
         index_cache_size_bytes: Option<usize>,
+        read_params: Option<&Bound<PyDict>>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -386,6 +421,28 @@ impl Dataset {
         if let Some(commit_handler) = commit_handler {
             let py_commit_lock = PyCommitLock::new(commit_handler);
             params.set_commit_lock(Arc::new(py_commit_lock));
+        }
+
+        // Handle read_params dict
+        if let Some(read_params_dict) = read_params {
+            let cache_repetition_index = read_params_dict
+                .get_item("cache_repetition_index")
+                .unwrap_or(None)
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+
+            let validate_on_decode = read_params_dict
+                .get_item("validate_on_decode")
+                .unwrap_or(None)
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+
+            let decoder_config = DecoderConfig {
+                cache_repetition_index,
+                validate_on_decode,
+            };
+            let file_reader_options = FileReaderOptions { decoder_config };
+            params.file_reader_options = Some(file_reader_options);
         }
 
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
@@ -418,7 +475,7 @@ impl Dataset {
             builder = builder.with_serialized_manifest(manifest).infer_error()?;
         }
 
-        let dataset = RT.runtime.block_on(builder.load());
+        let dataset = RT.block_on(Some(py), builder.load())?;
 
         match dataset {
             Ok(ds) => Ok(Self {
@@ -483,8 +540,7 @@ impl Dataset {
 
     /// Get index statistics
     fn index_statistics(&self, index_name: String) -> PyResult<String> {
-        RT.runtime
-            .block_on(self.ds.index_statistics(&index_name))
+        RT.block_on(None, self.ds.index_statistics(&index_name))?
             .map_err(|err| match err {
                 lance::Error::IndexNotFound { .. } => {
                     PyKeyError::new_err(format!("Index \"{}\" not found", index_name))
@@ -924,8 +980,7 @@ impl Dataset {
 
     #[pyo3(signature=(filter=None))]
     fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
-        RT.runtime
-            .block_on(self.ds.count_rows(filter))
+        RT.block_on(None, self.ds.count_rows(filter))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
@@ -1135,11 +1190,27 @@ impl Dataset {
         Ok(())
     }
 
-    fn delete(&mut self, predicate: String) -> PyResult<()> {
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.delete(&predicate))?
+    #[pyo3(signature=(predicate, conflict_retries=None, retry_timeout=None))]
+    fn delete(
+        &mut self,
+        predicate: String,
+        conflict_retries: Option<u32>,
+        retry_timeout: Option<std::time::Duration>,
+    ) -> PyResult<()> {
+        let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
+
+        if let Some(retries) = conflict_retries {
+            builder = builder.conflict_retries(retries);
+        }
+
+        if let Some(timeout) = retry_timeout {
+            builder = builder.retry_timeout(timeout);
+        }
+
+        let new_dataset = RT
+            .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = Arc::new(new_self);
+        self.ds = new_dataset;
         Ok(())
     }
 
@@ -1196,9 +1267,7 @@ impl Dataset {
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
-        let versions = self_
-            .list_versions()
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let versions = self_.list_versions()?;
         Python::with_gil(|py| {
             let pyvers: Vec<PyObject> = versions
                 .iter()
@@ -1278,9 +1347,7 @@ impl Dataset {
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<PyObject> {
-        let tags = self_
-            .list_tags_ordered(order.as_deref())
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let tags = self_.list_tags_ordered(order.as_deref())?;
 
         Python::with_gil(|py| {
             let pylist = PyList::empty(py);
@@ -1298,9 +1365,7 @@ impl Dataset {
     }
 
     fn tags(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        let tags = self_
-            .list_tags()
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let tags = self_.list_tags()?;
 
         Python::with_gil(|py| {
             let pytags = PyDict::new(py);
@@ -1391,13 +1456,15 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, kwargs = None))]
+    #[allow(clippy::too_many_arguments)]
     fn create_index(
         &mut self,
         columns: Vec<PyBackedStr>,
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
+        train: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
@@ -1490,13 +1557,18 @@ impl Dataset {
         };
 
         let replace = replace.unwrap_or(true);
+        let train = train.unwrap_or(true); // Default to true for backward compatibility
 
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(
-            None,
-            new_self.create_index(&columns, idx_type, name, params.as_ref(), replace),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let mut builder = new_self
+            .create_index_builder(&columns, idx_type, params.as_ref())
+            .replace(replace)
+            .train(train);
+        if let Some(name) = name {
+            builder = builder.name(name);
+        }
+        use std::future::IntoFuture;
+        RT.block_on(None, builder.into_future())?.infer_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -2033,19 +2105,6 @@ impl SqlQuery {
             Box::new(LanceReader::from_stream(dataset_stream));
         Python::with_gil(|py| reader.into_pyarrow(py))
     }
-
-    #[pyo3(signature = (verbose=false, analyze=false))]
-    fn explain_plan(&self, verbose: bool, analyze: bool) -> PyResult<String> {
-        let builder = self.builder.clone();
-        let plan = RT
-            .block_on(None, async move {
-                let query = builder.build().await?;
-                query.into_explain_plan(verbose, analyze).await
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(plan)
-    }
 }
 
 #[pyclass(name = "SqlQueryBuilder", module = "_lib", subclass)]
@@ -2115,38 +2174,30 @@ impl Dataset {
         })
     }
 
-    fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
-        RT.runtime.block_on(self.ds.versions())
+    fn list_versions(&self) -> PyResult<Vec<Version>> {
+        RT.block_on(None, self.ds.versions())?.infer_error()
     }
 
-    fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
-        RT.runtime.block_on(self.ds.tags.list())
+    fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
+        RT.block_on(None, self.ds.tags.list())?.infer_error()
     }
 
-    fn list_tags_ordered(
-        &self,
-        order: Option<&str>,
-    ) -> ::lance::error::Result<Vec<(String, TagContents)>> {
+    fn list_tags_ordered(&self, order: Option<&str>) -> PyResult<Vec<(String, TagContents)>> {
         let ordering = match order {
             Some("asc") => Some(std::cmp::Ordering::Less),
             Some("desc") => Some(std::cmp::Ordering::Greater),
             Some(invalid_order) => {
-                let error_msg = format!(
+                return Err(PyValueError::new_err(format!(
                     "Invalid sort order '{}'. Valid values are: asc, desc",
                     invalid_order
-                );
-                return Err(::lance::error::Error::InvalidInput {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        error_msg,
-                    )),
-                    location: location!(),
-                });
+                )));
             }
             None => None,
         };
-        RT.runtime
-            .block_on(async { self.ds.tags.list_tags_ordered(ordering).await })
+        RT.block_on(None, async {
+            self.ds.tags.list_tags_ordered(ordering).await
+        })?
+        .infer_error()
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {

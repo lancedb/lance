@@ -14,6 +14,8 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.operation.Append;
+import com.lancedb.lance.operation.Overwrite;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceField;
 import com.lancedb.lance.schema.SqlExpressions;
@@ -41,14 +43,24 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.ZonedDateTime;
-import java.util.*;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 public class DatasetTest {
   private static Dataset dataset;
@@ -344,7 +356,7 @@ public class DatasetTest {
       assertThrows(
           IllegalArgumentException.class,
           () -> {
-            testDataset.createEmptyDataset();
+            testDataset.createEmptyDataset().close();
           });
     }
   }
@@ -916,6 +928,40 @@ public class DatasetTest {
       assertThrows(
           IllegalArgumentException.class,
           () -> dataset.replaceFieldMetadata(Collections.singletonMap(-1, replaceConfig2)));
+    }
+  }
+
+  @Test
+  void testReadTransaction(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("read_transaction").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      // version 1, empty dataset
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset.version());
+        assertEquals(1, dataset.latestVersion());
+        assertEquals(0, dataset.countRows());
+        Transaction readTransaction =
+            dataset
+                .readTransaction()
+                .orElseThrow(() -> new IllegalStateException("transaction is empty"));
+        assertEquals(0, readTransaction.readVersion());
+        assertNotNull(readTransaction.uuid());
+        assertInstanceOf(Overwrite.class, readTransaction.operation());
+        try (Dataset dataset2 = testDataset.write(1, 5)) {
+          assertEquals(2, dataset2.version());
+          assertEquals(2, dataset2.latestVersion());
+          assertEquals(5, dataset2.countRows());
+          readTransaction =
+              dataset2
+                  .readTransaction()
+                  .orElseThrow(() -> new IllegalStateException("transaction is empty"));
+          assertEquals(1, readTransaction.readVersion());
+          assertNotNull(readTransaction.uuid());
+          assertInstanceOf(Append.class, readTransaction.operation());
+        }
+      }
     }
   }
 }

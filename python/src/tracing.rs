@@ -256,7 +256,7 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
             event.record(&mut args);
 
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-            args.args.insert("timestamp".to_string(), now.to_string());
+            args.args.insert("timestamp".to_string(), now.clone());
             args.args
                 .insert("client_version".to_string(), CLIENT_VERSION.to_string());
 

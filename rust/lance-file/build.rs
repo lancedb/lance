@@ -17,7 +17,8 @@ fn main() -> Result<()> {
         &[
             "./protos/file.proto",
             "./protos/file2.proto",
-            "./protos/encodings.proto",
+            "./protos/encodings_v2_0.proto",
+            "./protos/encodings_v2_1.proto",
         ],
         &["./protos"],
     )?;

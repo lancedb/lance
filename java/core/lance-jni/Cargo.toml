@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "0.32.1"
+version = "0.33.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.80"
@@ -34,3 +34,8 @@ jni = "0.21.1"
 serde_json = { version = "1" }
 log = "0.4"
 env_logger = "0.11.7"
+uuid = { version = "1.17.0", features = ["v4"] }
+prost = "0.13.5"
+roaring = "0.10.1"
+prost-types = "0.13.5"
+chrono = "0.4.41"

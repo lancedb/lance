@@ -236,6 +236,11 @@ impl Eq for ObjectStoreParams {}
 impl PartialEq for ObjectStoreParams {
     #[allow(deprecated)]
     fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "aws")]
+        if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
+            return false;
+        }
+
         // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
         self.block_size == other.block_size
             && self
@@ -247,8 +252,6 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.aws_credentials.as_ref().map(Arc::as_ptr)
-                == other.aws_credentials.as_ref().map(Arc::as_ptr)
             && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
                 == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
             && self.storage_options == other.storage_options
@@ -332,14 +335,14 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             };
-            let path = Path::from(path.path());
+            let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
         }
         let url = uri_to_url(uri)?;
         let store = registry.get_store(url.clone(), params).await?;
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url)?;
 
         Ok((store, path))
     }

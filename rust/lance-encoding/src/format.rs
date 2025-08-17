@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 /// Protobuf definitions for encodings
+///
+/// These are the messages used for describing encoding in the 2.0 format
 pub mod pb {
     #![allow(clippy::all)]
     #![allow(non_upper_case_globals)]
@@ -14,21 +16,39 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.encodings.rs"));
 }
 
+/// Protobuf definitions for encodings21
+///
+/// These are the messages used for describing encoding in the 2.1 format
+/// and any newer formats.
+pub mod pb21 {
+    #![allow(clippy::all)]
+    #![allow(non_upper_case_globals)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_snake_case)]
+    #![allow(unused)]
+    #![allow(improper_ctypes)]
+    #![allow(clippy::upper_case_acronyms)]
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.encodings21.rs"));
+}
+
 use pb::{
     array_encoding::ArrayEncoding as ArrayEncodingEnum,
     buffer::BufferType,
-    full_zip_layout,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
-    page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Block, Dictionary,
-    FixedSizeBinary, FixedSizeList, Flat, Fsst, InlineBitpacking, MiniBlockLayout, Nullable,
-    OutOfLineBitpacking, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer,
-    Rle, Variable,
+    ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Block, Dictionary, FixedSizeBinary,
+    FixedSizeList, Flat, Fsst, InlineBitpacking, Nullable, OutOfLineBitpacking, PackedStruct,
+    PackedStructFixedWidthMiniBlock, Rle, Variable,
 };
 
-use crate::{encodings::physical::block::CompressionConfig, repdef::DefinitionInterpretation};
+use crate::{
+    encodings::physical::block::CompressionConfig,
+    format::pb21::{compressive_encoding::Compression, CompressiveEncoding},
+    repdef::DefinitionInterpretation,
+};
 
 use self::pb::Constant;
+use lance_core::Result;
 
 // Utility functions for creating complex protobuf objects
 pub struct ProtobufUtils {}
@@ -286,90 +306,226 @@ impl ProtobufUtils {
             ))),
         }
     }
+}
+
+pub struct ProtobufUtils21 {}
+
+impl ProtobufUtils21 {
+    pub fn flat(
+        bits_per_value: u64,
+        values_compression: Option<pb21::BufferCompression>,
+    ) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::Flat(pb21::Flat {
+                bits_per_value,
+                data: values_compression,
+            })),
+        }
+    }
+
+    pub fn fsl(
+        items_per_value: u64,
+        has_validity: bool,
+        values: CompressiveEncoding,
+    ) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::FixedSizeList(Box::new(pb21::FixedSizeList {
+                items_per_value,
+                has_validity,
+                values: Some(Box::new(values)),
+            }))),
+        }
+    }
+
+    pub fn variable(
+        offsets_desc: CompressiveEncoding,
+        values_compression: Option<pb21::BufferCompression>,
+    ) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::Variable(Box::new(pb21::Variable {
+                offsets: Some(Box::new(offsets_desc)),
+                values: values_compression,
+            }))),
+        }
+    }
+
+    pub fn inline_bitpacking(
+        uncompressed_bits_per_value: u64,
+        values_compression: Option<pb21::BufferCompression>,
+    ) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::InlineBitpacking(pb21::InlineBitpacking {
+                uncompressed_bits_per_value,
+                values: values_compression,
+            })),
+        }
+    }
+
+    pub fn out_of_line_bitpacking(
+        uncompressed_bits_per_value: u64,
+        values: CompressiveEncoding,
+    ) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::OutOfLineBitpacking(Box::new(
+                pb21::OutOfLineBitpacking {
+                    uncompressed_bits_per_value,
+                    values: Some(Box::new(values)),
+                },
+            ))),
+        }
+    }
+
+    pub fn buffer_compression(compression: CompressionConfig) -> Result<pb21::BufferCompression> {
+        Ok(pb21::BufferCompression {
+            scheme: pb21::CompressionScheme::try_from(compression.scheme)? as i32,
+            level: compression.level,
+        })
+    }
+
+    pub fn wrapped(
+        compression: CompressionConfig,
+        values: CompressiveEncoding,
+    ) -> Result<CompressiveEncoding> {
+        Ok(CompressiveEncoding {
+            compression: Some(Compression::General(Box::new(pb21::General {
+                compression: Some(Self::buffer_compression(compression)?),
+                values: Some(Box::new(values)),
+            }))),
+        })
+    }
+
+    pub fn rle(
+        values: CompressiveEncoding,
+        run_lengths: CompressiveEncoding,
+    ) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::Rle(Box::new(pb21::Rle {
+                values: Some(Box::new(values)),
+                run_lengths: Some(Box::new(run_lengths)),
+            }))),
+        }
+    }
+
+    pub fn byte_stream_split(values: CompressiveEncoding) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::ByteStreamSplit(Box::new(
+                pb21::ByteStreamSplit {
+                    values: Some(Box::new(values)),
+                },
+            ))),
+        }
+    }
+
+    pub fn fsst(data: CompressiveEncoding, symbol_table: Vec<u8>) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::Fsst(Box::new(pb21::Fsst {
+                symbol_table: symbol_table.into(),
+                values: Some(Box::new(data)),
+            }))),
+        }
+    }
+
+    pub fn packed_struct(
+        values: CompressiveEncoding,
+        bits_per_values: Vec<u64>,
+    ) -> CompressiveEncoding {
+        CompressiveEncoding {
+            compression: Some(Compression::PackedStruct(Box::new(pb21::PackedStruct {
+                values: Some(Box::new(values)),
+                bits_per_value: bits_per_values,
+            }))),
+        }
+    }
 
     fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
         match def {
-            DefinitionInterpretation::AllValidItem => RepDefLayer::RepdefAllValidItem as i32,
-            DefinitionInterpretation::AllValidList => RepDefLayer::RepdefAllValidList as i32,
-            DefinitionInterpretation::NullableItem => RepDefLayer::RepdefNullableItem as i32,
-            DefinitionInterpretation::NullableList => RepDefLayer::RepdefNullableList as i32,
-            DefinitionInterpretation::EmptyableList => RepDefLayer::RepdefEmptyableList as i32,
+            DefinitionInterpretation::AllValidItem => pb21::RepDefLayer::RepdefAllValidItem as i32,
+            DefinitionInterpretation::AllValidList => pb21::RepDefLayer::RepdefAllValidList as i32,
+            DefinitionInterpretation::NullableItem => pb21::RepDefLayer::RepdefNullableItem as i32,
+            DefinitionInterpretation::NullableList => pb21::RepDefLayer::RepdefNullableList as i32,
+            DefinitionInterpretation::EmptyableList => {
+                pb21::RepDefLayer::RepdefEmptyableList as i32
+            }
             DefinitionInterpretation::NullableAndEmptyableList => {
-                RepDefLayer::RepdefNullAndEmptyList as i32
+                pb21::RepDefLayer::RepdefNullAndEmptyList as i32
             }
         }
     }
 
     pub fn repdef_layer_to_def_interp(layer: i32) -> DefinitionInterpretation {
-        let layer = RepDefLayer::try_from(layer).unwrap();
+        let layer = pb21::RepDefLayer::try_from(layer).unwrap();
         match layer {
-            RepDefLayer::RepdefAllValidItem => DefinitionInterpretation::AllValidItem,
-            RepDefLayer::RepdefAllValidList => DefinitionInterpretation::AllValidList,
-            RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
-            RepDefLayer::RepdefNullableList => DefinitionInterpretation::NullableList,
-            RepDefLayer::RepdefEmptyableList => DefinitionInterpretation::EmptyableList,
-            RepDefLayer::RepdefNullAndEmptyList => {
+            pb21::RepDefLayer::RepdefAllValidItem => DefinitionInterpretation::AllValidItem,
+            pb21::RepDefLayer::RepdefAllValidList => DefinitionInterpretation::AllValidList,
+            pb21::RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
+            pb21::RepDefLayer::RepdefNullableList => DefinitionInterpretation::NullableList,
+            pb21::RepDefLayer::RepdefEmptyableList => DefinitionInterpretation::EmptyableList,
+            pb21::RepDefLayer::RepdefNullAndEmptyList => {
                 DefinitionInterpretation::NullableAndEmptyableList
             }
-            RepDefLayer::RepdefUnspecified => panic!("Unspecified repdef layer"),
+            pb21::RepDefLayer::RepdefUnspecified => panic!("Unspecified repdef layer"),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn miniblock_layout(
-        rep_encoding: Option<ArrayEncoding>,
-        def_encoding: Option<ArrayEncoding>,
-        value_encoding: ArrayEncoding,
+        rep_encoding: Option<CompressiveEncoding>,
+        def_encoding: Option<CompressiveEncoding>,
+        value_encoding: CompressiveEncoding,
         repetition_index_depth: u32,
         num_buffers: u64,
-        dictionary_encoding: Option<(ArrayEncoding, u64)>,
+        dictionary_encoding: Option<(CompressiveEncoding, u64)>,
         def_meaning: &[DefinitionInterpretation],
         num_items: u64,
-    ) -> PageLayout {
+    ) -> pb21::PageLayout {
         assert!(!def_meaning.is_empty());
         let (dictionary, num_dictionary_items) = dictionary_encoding
             .map(|(d, i)| (Some(d), i))
             .unwrap_or((None, 0));
-        PageLayout {
-            layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
-                def_compression: def_encoding,
-                rep_compression: rep_encoding,
-                value_compression: Some(value_encoding),
-                repetition_index_depth,
-                num_buffers,
-                dictionary,
-                num_dictionary_items,
-                layers: def_meaning
-                    .iter()
-                    .map(|&def| Self::def_inter_to_repdef_layer(def))
-                    .collect(),
-                num_items,
-            })),
+        pb21::PageLayout {
+            layout: Some(pb21::page_layout::Layout::MiniBlockLayout(
+                pb21::MiniBlockLayout {
+                    def_compression: def_encoding,
+                    rep_compression: rep_encoding,
+                    value_compression: Some(value_encoding),
+                    repetition_index_depth,
+                    num_buffers,
+                    dictionary,
+                    num_dictionary_items,
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                    num_items,
+                },
+            )),
         }
     }
 
     fn full_zip_layout(
         bits_rep: u8,
         bits_def: u8,
-        details: full_zip_layout::Details,
-        value_encoding: ArrayEncoding,
+        details: pb21::full_zip_layout::Details,
+        value_encoding: CompressiveEncoding,
         def_meaning: &[DefinitionInterpretation],
         num_items: u32,
         num_visible_items: u32,
-    ) -> PageLayout {
-        PageLayout {
-            layout: Some(Layout::FullZipLayout(pb::FullZipLayout {
-                bits_rep: bits_rep as u32,
-                bits_def: bits_def as u32,
-                details: Some(details),
-                value_compression: Some(value_encoding),
-                num_items,
-                num_visible_items,
-                layers: def_meaning
-                    .iter()
-                    .map(|&def| Self::def_inter_to_repdef_layer(def))
-                    .collect(),
-            })),
+    ) -> pb21::PageLayout {
+        pb21::PageLayout {
+            layout: Some(pb21::page_layout::Layout::FullZipLayout(
+                pb21::FullZipLayout {
+                    bits_rep: bits_rep as u32,
+                    bits_def: bits_def as u32,
+                    details: Some(details),
+                    value_compression: Some(value_encoding),
+                    num_items,
+                    num_visible_items,
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                },
+            )),
         }
     }
 
@@ -377,15 +533,15 @@ impl ProtobufUtils {
         bits_rep: u8,
         bits_def: u8,
         bits_per_value: u32,
-        value_encoding: ArrayEncoding,
+        value_encoding: CompressiveEncoding,
         def_meaning: &[DefinitionInterpretation],
         num_items: u32,
         num_visible_items: u32,
-    ) -> PageLayout {
+    ) -> pb21::PageLayout {
         Self::full_zip_layout(
             bits_rep,
             bits_def,
-            full_zip_layout::Details::BitsPerValue(bits_per_value),
+            pb21::full_zip_layout::Details::BitsPerValue(bits_per_value),
             value_encoding,
             def_meaning,
             num_items,
@@ -397,15 +553,15 @@ impl ProtobufUtils {
         bits_rep: u8,
         bits_def: u8,
         bits_per_offset: u32,
-        value_encoding: ArrayEncoding,
+        value_encoding: CompressiveEncoding,
         def_meaning: &[DefinitionInterpretation],
         num_items: u32,
         num_visible_items: u32,
-    ) -> PageLayout {
+    ) -> pb21::PageLayout {
         Self::full_zip_layout(
             bits_rep,
             bits_def,
-            full_zip_layout::Details::BitsPerOffset(bits_per_offset),
+            pb21::full_zip_layout::Details::BitsPerOffset(bits_per_offset),
             value_encoding,
             def_meaning,
             num_items,
@@ -413,18 +569,20 @@ impl ProtobufUtils {
         )
     }
 
-    pub fn all_null_layout(def_meaning: &[DefinitionInterpretation]) -> PageLayout {
-        PageLayout {
-            layout: Some(Layout::AllNullLayout(AllNullLayout {
-                layers: def_meaning
-                    .iter()
-                    .map(|&def| Self::def_inter_to_repdef_layer(def))
-                    .collect(),
-            })),
+    pub fn all_null_layout(def_meaning: &[DefinitionInterpretation]) -> pb21::PageLayout {
+        pb21::PageLayout {
+            layout: Some(pb21::page_layout::Layout::AllNullLayout(
+                pb21::AllNullLayout {
+                    layers: def_meaning
+                        .iter()
+                        .map(|&def| Self::def_inter_to_repdef_layer(def))
+                        .collect(),
+                },
+            )),
         }
     }
 
-    pub fn simple_all_null_layout() -> PageLayout {
+    pub fn simple_all_null_layout() -> pb21::PageLayout {
         Self::all_null_layout(&[DefinitionInterpretation::NullableItem])
     }
 }

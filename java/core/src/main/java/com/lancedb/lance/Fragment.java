@@ -38,19 +38,23 @@ public class Fragment {
   /** Pointer to the {@link Dataset} instance in Java. */
   private final Dataset dataset;
 
-  private final FragmentMetadata fragment;
+  private final FragmentMetadata fragmentMetadata;
 
   public Fragment(Dataset dataset, int fragmentId) {
     Preconditions.checkNotNull(dataset);
     this.dataset = dataset;
-    this.fragment = dataset.getFragment(fragmentId).fragment;
+    this.fragmentMetadata = dataset.getFragment(fragmentId).fragmentMetadata;
   }
 
-  public Fragment(Dataset dataset, FragmentMetadata fragment) {
+  public Fragment(Dataset dataset, FragmentMetadata fragmentMetadata) {
     Preconditions.checkNotNull(dataset);
-    Preconditions.checkNotNull(fragment);
+    Preconditions.checkNotNull(fragmentMetadata);
     this.dataset = dataset;
-    this.fragment = fragment;
+    this.fragmentMetadata = fragmentMetadata;
+  }
+
+  public FragmentMetadata metadata() {
+    return fragmentMetadata;
   }
 
   /**
@@ -61,8 +65,8 @@ public class Fragment {
   public LanceScanner newScan() {
     return LanceScanner.create(
         dataset,
-        new ScanOptions.Builder().fragmentIds(Arrays.asList(fragment.getId())).build(),
-        dataset.allocator);
+        new ScanOptions.Builder().fragmentIds(Arrays.asList(fragmentMetadata.getId())).build(),
+        dataset.allocator());
   }
 
   /**
@@ -75,10 +79,10 @@ public class Fragment {
     return LanceScanner.create(
         dataset,
         new ScanOptions.Builder()
-            .fragmentIds(Arrays.asList(fragment.getId()))
+            .fragmentIds(Arrays.asList(fragmentMetadata.getId()))
             .batchSize(batchSize)
             .build(),
-        dataset.allocator);
+        dataset.allocator());
   }
 
   /**
@@ -91,19 +95,21 @@ public class Fragment {
     Preconditions.checkNotNull(options);
     return LanceScanner.create(
         dataset,
-        new ScanOptions.Builder(options).fragmentIds(Arrays.asList(fragment.getId())).build(),
-        dataset.allocator);
+        new ScanOptions.Builder(options)
+            .fragmentIds(Arrays.asList(fragmentMetadata.getId()))
+            .build(),
+        dataset.allocator());
   }
 
   private native int countRowsNative(Dataset dataset, long fragmentId);
 
   public int getId() {
-    return fragment.getId();
+    return fragmentMetadata.getId();
   }
 
   /** @return row counts in this Fragment */
   public int countRows() {
-    return countRowsNative(dataset, fragment.getId());
+    return countRowsNative(dataset, fragmentMetadata.getId());
   }
 
   /**

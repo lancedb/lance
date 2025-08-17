@@ -298,7 +298,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 let encoding = ProtobufUtils::basic_all_null_encoding();
                 Ok(EncodedArray { data, encoding })
             }
-            DataBlock::FixedWidth(mut unpacked) => {
+            DataBlock::FixedWidth(unpacked) => {
                 match data_type {
                     DataType::UInt8 | DataType::Int8 => encode_fixed_width!(self, unpacked, u8, buffer_index),
                     DataType::UInt16 | DataType::Int16 => encode_fixed_width!(self, unpacked, u16, buffer_index),
@@ -318,7 +318,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 );
                 let encoded_values: EncodedArray;
                 match *nullable.data {
-                    DataBlock::FixedWidth(mut unpacked) => {
+                    DataBlock::FixedWidth(unpacked) => {
                         match data_type {
                             DataType::UInt8 | DataType::Int8 => encoded_values = encode_fixed_width!(self, unpacked, u8, buffer_index)?,
                             DataType::UInt16 | DataType::Int16 => encoded_values = encode_fixed_width!(self, unpacked, u16, buffer_index)?,
@@ -729,7 +729,7 @@ impl ArrayEncoder for BitpackedArrayEncoder {
 
         let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: self.num_bits,
-            data: LanceBuffer::Owned(dst_buffer),
+            data: LanceBuffer::from(dst_buffer),
             num_values: unpacked.num_values,
             block_info: BlockInfo::new(),
         });
@@ -1170,14 +1170,14 @@ pub mod test {
     use arrow_schema::Field;
     use lance_datagen::{
         array::{fill, rand_with_distribution},
-        gen, ArrayGenerator, ArrayGeneratorExt, RowCount,
+        gen_batch, ArrayGenerator, ArrayGeneratorExt, RowCount,
     };
-    use rand::distributions::Uniform;
+    use rand::distr::Uniform;
 
     #[test]
     fn test_bitpack_params() {
         fn gen_array(generator: Box<dyn ArrayGenerator>) -> ArrayRef {
-            let arr = gen()
+            let arr = gen_batch()
                 .anon_col(generator)
                 .into_batch_rows(RowCount::from(10000))
                 .unwrap()
@@ -1471,7 +1471,7 @@ pub mod test {
 
     struct DistributionArrayGeneratorProvider<
         DataType,
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
     >
     where
         DataType::Native: Copy + 'static,
@@ -1484,7 +1484,7 @@ pub mod test {
 
     impl<DataType, Dist> DistributionArrayGeneratorProvider<DataType, Dist>
     where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
@@ -1499,7 +1499,7 @@ pub mod test {
 
     impl<DataType, Dist> ArrayGeneratorProvider for DistributionArrayGeneratorProvider<DataType, Dist>
     where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        Dist: rand::distr::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
         DataType::Native: Copy + 'static,
         PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
         DataType: ArrowPrimitiveType,
@@ -1524,7 +1524,7 @@ pub mod test {
                 DataType::UInt32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(0, 19),
+                        Uniform::new(0, 19).unwrap(),
                     ),
                 ),
             ),
@@ -1533,7 +1533,7 @@ pub mod test {
                 DataType::UInt32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(5 << 7, 6 << 7),
+                        Uniform::new(5 << 7, 6 << 7).unwrap(),
                     ),
                 ),
             ),
@@ -1541,7 +1541,7 @@ pub mod test {
                 DataType::UInt64,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(5 << 42, 6 << 42),
+                        Uniform::new(5 << 42, 6 << 42).unwrap(),
                     ),
                 ),
             ),
@@ -1550,7 +1550,7 @@ pub mod test {
                 DataType::UInt8,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt8Type, Uniform<u8>>::new(
-                        Uniform::new(0, 19),
+                        Uniform::new(0, 19).unwrap(),
                     ),
                 ),
             ),
@@ -1559,7 +1559,7 @@ pub mod test {
                 DataType::UInt64,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(129, 259),
+                        Uniform::new(129, 259).unwrap(),
                     ),
                 ),
             ),
@@ -1569,7 +1569,7 @@ pub mod test {
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
                         // this range should always give 8 bits
-                        Uniform::new(200, 250),
+                        Uniform::new(200, 250).unwrap(),
                     ),
                 ),
             ),
@@ -1578,7 +1578,7 @@ pub mod test {
                 DataType::UInt64,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(1, 3), // 2 bits
+                        Uniform::new(1, 3).unwrap(), // 2 bits
                     ),
                 ),
             ),
@@ -1588,7 +1588,7 @@ pub mod test {
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
                         // this range should always always give 16 bits
-                        Uniform::new(200 << 8, 250 << 8),
+                        Uniform::new(200 << 8, 250 << 8).unwrap(),
                     ),
                 ),
             ),
@@ -1598,7 +1598,7 @@ pub mod test {
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
                         // this range should always give 24 hits
-                        Uniform::new(200 << 16, 250 << 16),
+                        Uniform::new(200 << 16, 250 << 16).unwrap(),
                     ),
                 ),
             ),
@@ -1607,7 +1607,7 @@ pub mod test {
                 DataType::UInt32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(0, 1),
+                        Uniform::new(0, 1).unwrap(),
                     ),
                 ),
             ),
@@ -1616,7 +1616,7 @@ pub mod test {
                 DataType::Int16,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int16Type, Uniform<i16>>::new(
-                        Uniform::new(-5, 5),
+                        Uniform::new(-5, 5).unwrap(),
                     ),
                 ),
             ),
@@ -1624,7 +1624,7 @@ pub mod test {
                 DataType::Int64,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int64Type, Uniform<i64>>::new(
-                        Uniform::new(-(5 << 42), 6 << 42),
+                        Uniform::new(-(5 << 42), 6 << 42).unwrap(),
                     ),
                 ),
             ),
@@ -1632,7 +1632,7 @@ pub mod test {
                 DataType::Int32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-(5 << 7), 6 << 7),
+                        Uniform::new(-(5 << 7), 6 << 7).unwrap(),
                     ),
                 ),
             ),
@@ -1641,7 +1641,7 @@ pub mod test {
                 DataType::Int32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-19, 19),
+                        Uniform::new(-19, 19).unwrap(),
                     ),
                 ),
             ),
@@ -1651,7 +1651,7 @@ pub mod test {
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
                         // this range should always give 8 bits
-                        Uniform::new(-120, 120),
+                        Uniform::new(-120, 120).unwrap(),
                     ),
                 ),
             ),
@@ -1661,7 +1661,7 @@ pub mod test {
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
                         // this range should always give 16 bits
-                        Uniform::new(-120 << 8, 120 << 8),
+                        Uniform::new(-120 << 8, 120 << 8).unwrap(),
                     ),
                 ),
             ),
@@ -1670,7 +1670,7 @@ pub mod test {
                 DataType::Int32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(10, 20),
+                        Uniform::new(10, 20).unwrap(),
                     ),
                 ),
             ),
@@ -1679,7 +1679,7 @@ pub mod test {
                 DataType::Int32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(0, 1),
+                        Uniform::new(0, 1).unwrap(),
                     ),
                 ),
             ),

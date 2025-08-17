@@ -3,16 +3,17 @@
 
 //! # Byte Stream Split (BSS) Miniblock Format
 //!
-//! Byte Stream Split is a data transformation technique optimized for floating-point
-//! data compression. It improves compression ratios by reorganizing data to group
-//! similar byte patterns together.
+//! Byte Stream Split is a data transformation technique that improves compression
+//! by reorganizing multi-byte values to group bytes from the same position together.
+//! This is particularly effective for data where some byte positions have low entropy.
 //!
 //! ## How It Works
 //!
-//! BSS splits floating-point values by byte position, creating separate streams
-//! for each byte position across all values. This transformation exploits the
-//! fact that floating-point data often has patterns in specific byte positions
-//! (e.g., similar exponents or mantissa patterns).
+//! BSS splits multi-byte values by byte position, creating separate streams
+//! for each byte position across all values. This transformation is most beneficial
+//! when certain byte positions have low entropy (e.g., high-order bytes that are
+//! mostly zeros, sign-extended bytes, or floating-point sign/exponent bytes that
+//! cluster around common values).
 //!
 //! ### Example
 //!
@@ -58,12 +59,16 @@ use std::fmt::Debug;
 
 use crate::buffer::LanceBuffer;
 use crate::compression::MiniBlockDecompressor;
+use crate::compression_config::BssMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
 };
-use crate::format::pb;
-use crate::format::ProtobufUtils;
+use crate::format::pb21::CompressiveEncoding;
+use crate::format::ProtobufUtils21;
+use crate::statistics::{GetStat, Stat};
+use arrow::array::AsArray;
+use arrow::datatypes::UInt64Type;
 use lance_core::Result;
 use snafu::location;
 
@@ -104,7 +109,7 @@ impl ByteStreamSplitEncoder {
 }
 
 impl MiniBlockCompressor for ByteStreamSplitEncoder {
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)> {
+    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match page {
             DataBlock::FixedWidth(data) => {
                 let num_values = data.num_values;
@@ -117,7 +122,10 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                             chunks: vec![],
                             num_values: 0,
                         },
-                        ProtobufUtils::byte_stream_split(self.bits_per_value as u64),
+                        ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
+                            self.bits_per_value as u64,
+                            None,
+                        )),
                     ));
                 }
 
@@ -160,7 +168,11 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
 
                 let data_buffers = vec![LanceBuffer::from(global_buffer)];
 
-                let encoding = ProtobufUtils::byte_stream_split(self.bits_per_value as u64);
+                // TODO: Should support underlying compression
+                let encoding = ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
+                    self.bits_per_value as u64,
+                    None,
+                ));
 
                 Ok((
                     MiniBlockCompressed {
@@ -255,6 +267,56 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
             block_info: BlockInfo::new(),
         }))
     }
+}
+
+/// Determine if BSS should be used based on mode and data characteristics
+pub fn should_use_bss(data: &FixedWidthDataBlock, mode: BssMode) -> bool {
+    // Only support 32-bit and 64-bit values
+    // BSS is most effective for these common types (floats, timestamps, etc.)
+    // 16-bit values have limited benefit with only 2 streams
+    if data.bits_per_value != 32 && data.bits_per_value != 64 {
+        return false;
+    }
+
+    let sensitivity = mode.to_sensitivity();
+
+    // Fast paths
+    if sensitivity <= 0.0 {
+        return false;
+    }
+    if sensitivity >= 1.0 {
+        return true;
+    }
+
+    // Auto mode: check byte position entropy
+    evaluate_entropy_for_bss(data, sensitivity)
+}
+
+/// Evaluate if BSS should be used based on byte position entropy
+fn evaluate_entropy_for_bss(data: &FixedWidthDataBlock, sensitivity: f32) -> bool {
+    // Get the precomputed entropy statistics
+    let Some(entropy_stat) = data.get_stat(Stat::BytePositionEntropy) else {
+        return false; // No entropy data available
+    };
+
+    let entropies = entropy_stat.as_primitive::<UInt64Type>();
+    if entropies.is_empty() {
+        return false;
+    }
+
+    // Calculate average entropy across all byte positions
+    let sum: u64 = entropies.values().iter().sum();
+    let avg_entropy = sum as f64 / entropies.len() as f64 / 1000.0; // Scale back from integer
+
+    // Entropy threshold based on sensitivity
+    // sensitivity = 0.5 (default auto) -> threshold = 4.0 bits
+    // sensitivity = 0.0 (off) -> threshold = 0.0 (never use)
+    // sensitivity = 1.0 (on) -> threshold = 8.0 (always use)
+    let entropy_threshold = sensitivity as f64 * 8.0;
+
+    // Use BSS if average entropy is below threshold
+    // Lower entropy means more repetitive byte patterns
+    avg_entropy < entropy_threshold
 }
 
 #[cfg(test)]

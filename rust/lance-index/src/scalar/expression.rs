@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Bound, sync::Arc};
+use std::{
+    ops::Bound,
+    sync::{Arc, LazyLock},
+};
 
-use arrow_array::Array;
-use arrow_schema::{DataType, Field};
+use arrow::array::BinaryBuilder;
+use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
@@ -16,12 +20,15 @@ use datafusion_expr::{
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
 use super::{
     AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery,
 };
+
+const MAX_DEPTH: usize = 500;
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -674,6 +681,19 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
+/// When we evaluate a scalar index query we return a batch with three columns and two rows
+///
+/// The first column has the block list and allow list
+/// The second column tells if the result is least/exact/more (we repeat the discriminant twice)
+/// The third column has the fragments covered bitmap in the first row and null in the second row
+pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("result".to_string(), DataType::Binary, true),
+        Field::new("discriminant".to_string(), DataType::UInt32, true),
+        Field::new("fragments_covered".to_string(), DataType::Binary, true),
+    ]))
+});
+
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
     Exact(RowIdMask),
@@ -714,6 +734,33 @@ impl IndexExprResult {
                 location: location!(),
             }),
         }
+    }
+
+    #[instrument(skip_all)]
+    pub fn serialize_to_arrow(
+        &self,
+        fragments_covered_by_result: &RoaringBitmap,
+    ) -> Result<RecordBatch> {
+        let row_id_mask = self.row_id_mask();
+        let row_id_mask_arr = row_id_mask.into_arrow()?;
+        let discriminant = self.discriminant();
+        let discriminant_arr =
+            Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
+        let mut fragments_covered_builder = BinaryBuilder::new();
+        let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
+        let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
+        fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
+        fragments_covered_builder.append_value(fragments_covered_bytes);
+        fragments_covered_builder.append_null();
+        let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
+        Ok(RecordBatch::try_new(
+            INDEX_EXPR_RESULT_SCHEMA.clone(),
+            vec![
+                Arc::new(row_id_mask_arr),
+                Arc::new(discriminant_arr),
+                Arc::new(fragments_covered_arr),
+            ],
+        )?)
     }
 }
 
@@ -1018,9 +1065,13 @@ fn visit_is_null(
     }
 }
 
-fn visit_not(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
-    let node = visit_node(expr, index_info)?;
-    node.maybe_not()
+fn visit_not(
+    expr: &Expr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let node = visit_node(expr, index_info, depth + 1)?;
+    Ok(node.and_then(|node| node.maybe_not()))
 }
 
 fn visit_comparison(
@@ -1099,7 +1150,8 @@ fn maybe_range(
 fn visit_and(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
     // Many scalar indices can efficiently handle a BETWEEN query as a single search and this
     // can be much more efficient than two separate range queries.  As an optimization we check
     // to see if this is a between query and, if so, we handle it as a single query
@@ -1108,26 +1160,27 @@ fn visit_and(
     //   * Some users won't realize it's an option or a good idea
     //   * Datafusion's simplifier will rewrite the BETWEEN operator into two separate range queries
     if let Some(range_expr) = maybe_range(expr, index_info) {
-        return Some(range_expr);
+        return Ok(Some(range_expr));
     }
 
-    let left = visit_node(&expr.left, index_info);
-    let right = visit_node(&expr.right, index_info);
-    match (left, right) {
+    let left = visit_node(&expr.left, index_info, depth + 1)?;
+    let right = visit_node(&expr.right, index_info, depth + 1)?;
+    Ok(match (left, right) {
         (Some(left), Some(right)) => Some(left.and(right)),
         (Some(left), None) => Some(left.refine((*expr.right).clone())),
         (None, Some(right)) => Some(right.refine((*expr.left).clone())),
         (None, None) => None,
-    }
+    })
 }
 
 fn visit_or(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
-    let left = visit_node(&expr.left, index_info);
-    let right = visit_node(&expr.right, index_info);
-    match (left, right) {
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let left = visit_node(&expr.left, index_info, depth + 1)?;
+    let right = visit_node(&expr.right, index_info, depth + 1)?;
+    Ok(match (left, right) {
         (Some(left), Some(right)) => left.maybe_or(right),
         // If one side can use an index and the other side cannot then
         // we must abandon the entire thing.  For example, consider the
@@ -1137,22 +1190,23 @@ fn visit_or(
         (Some(_), None) => None,
         (None, Some(_)) => None,
         (None, None) => None,
-    }
+    })
 }
 
 fn visit_binary_expr(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
-) -> Option<IndexedExpression> {
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
     match &expr.op {
         Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
-            visit_comparison(expr, index_info)
+            Ok(visit_comparison(expr, index_info))
         }
         // visit_comparison will maybe create an Eq query which we negate
-        Operator::NotEq => visit_comparison(expr, index_info).and_then(|node| node.maybe_not()),
-        Operator::And => visit_and(expr, index_info),
-        Operator::Or => visit_or(expr, index_info),
-        _ => None,
+        Operator::NotEq => Ok(visit_comparison(expr, index_info).and_then(|node| node.maybe_not())),
+        Operator::And => visit_and(expr, index_info, depth),
+        Operator::Or => visit_or(expr, index_info, depth),
+        _ => Ok(None),
     }
 }
 
@@ -1167,19 +1221,32 @@ fn visit_scalar_fn(
     query_parser.visit_scalar_function(col, data_type, &scalar_fn.func, &scalar_fn.args)
 }
 
-fn visit_node(expr: &Expr, index_info: &dyn IndexInformationProvider) -> Option<IndexedExpression> {
+fn visit_node(
+    expr: &Expr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    if depth >= MAX_DEPTH {
+        return Err(Error::invalid_input(
+            format!(
+                "the filter expression is too long, lance limit the max number of conditions to {}",
+                MAX_DEPTH
+            ),
+            location!(),
+        ));
+    }
     match expr {
-        Expr::Between(between) => visit_between(between, index_info),
-        Expr::Column(_) => visit_column(expr, index_info),
-        Expr::InList(in_list) => visit_in_list(in_list, index_info),
-        Expr::IsFalse(expr) => visit_is_bool(expr.as_ref(), index_info, false),
-        Expr::IsTrue(expr) => visit_is_bool(expr.as_ref(), index_info, true),
-        Expr::IsNull(expr) => visit_is_null(expr.as_ref(), index_info, false),
-        Expr::IsNotNull(expr) => visit_is_null(expr.as_ref(), index_info, true),
-        Expr::Not(expr) => visit_not(expr.as_ref(), index_info),
-        Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info),
-        Expr::ScalarFunction(scalar_fn) => visit_scalar_fn(scalar_fn, index_info),
-        _ => None,
+        Expr::Between(between) => Ok(visit_between(between, index_info)),
+        Expr::Column(_) => Ok(visit_column(expr, index_info)),
+        Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
+        Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
+        Expr::IsTrue(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, true)),
+        Expr::IsNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, false)),
+        Expr::IsNotNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, true)),
+        Expr::Not(expr) => visit_not(expr.as_ref(), index_info, depth),
+        Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info, depth),
+        Expr::ScalarFunction(scalar_fn) => Ok(visit_scalar_fn(scalar_fn, index_info)),
+        _ => Ok(None),
     }
 }
 
@@ -1195,8 +1262,8 @@ pub trait IndexInformationProvider {
 pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
-) -> IndexedExpression {
-    visit_node(&expr, index_info).unwrap_or(IndexedExpression::refine_only(expr))
+) -> Result<IndexedExpression> {
+    Ok(visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr)))
 }
 
 #[derive(Clone, Default, Debug)]
@@ -1215,6 +1282,15 @@ impl FilterPlan {
             skip_recheck: true,
             refine_expr: None,
             full_expr: None,
+        }
+    }
+
+    pub fn new_refine_only(expr: Expr) -> Self {
+        Self {
+            index_query: None,
+            skip_recheck: true,
+            refine_expr: Some(expr.clone()),
+            full_expr: Some(expr),
         }
     }
 
@@ -1285,7 +1361,7 @@ impl PlannerIndexExt for Planner {
     ) -> Result<FilterPlan> {
         let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
+            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info)?;
             let mut skip_recheck = false;
             if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
                 skip_recheck = !scalar_query.needs_recheck();
@@ -1380,7 +1456,7 @@ mod tests {
             expr = simplifier.simplify(expr).unwrap();
         }
 
-        let actual = apply_scalar_indices(expr.clone(), index_info);
+        let actual = apply_scalar_indices(expr.clone(), index_info).unwrap();
         if let Some(expected) = expected {
             assert_eq!(actual, expected);
         } else {

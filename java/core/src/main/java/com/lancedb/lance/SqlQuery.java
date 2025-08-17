@@ -50,10 +50,10 @@ public class SqlQuery {
   }
 
   public ArrowReader intoBatchRecords() throws IOException {
-    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator)) {
+    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
       intoBatchRecords(
           dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, s.memoryAddress());
-      return Data.importArrayStream(dataset.allocator, s);
+      return Data.importArrayStream(dataset.allocator(), s);
     }
   }
 
@@ -64,20 +64,5 @@ public class SqlQuery {
       boolean withRowId,
       boolean withRowAddr,
       long streamAddress)
-      throws IOException;
-
-  public String intoExplainPlan(boolean verbose, boolean analyze) throws IOException {
-    return intoExplainPlan(
-        dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, verbose, analyze);
-  }
-
-  private static native String intoExplainPlan(
-      Dataset dataset,
-      String sql,
-      Optional<String> tableName,
-      boolean withRowId,
-      boolean withRowAddr,
-      boolean verbose,
-      boolean analyze)
       throws IOException;
 }

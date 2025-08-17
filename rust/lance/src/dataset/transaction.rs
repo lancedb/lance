@@ -56,8 +56,8 @@ use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::is_system_index;
 use lance_index::mem_wal::MemWal;
+use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use lance_table::{
@@ -1653,11 +1653,21 @@ impl Transaction {
         }
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
+    fn is_vector_index(index: &Index) -> bool {
+        if let Some(details) = &index.index_details {
+            details.type_url.ends_with("VectorIndexDetails")
+        } else {
+            false
+        }
+    }
+
+    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, _fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
             .collect::<HashSet<_>>();
+
+        // Remove indices for fields no longer in schema
         indices.retain(|existing_index| {
             existing_index
                 .fields
@@ -1666,17 +1676,78 @@ impl Transaction {
                 || is_system_index(existing_index)
         });
 
-        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
+        // Fragment bitmaps are now immutable and always represent the fragments that
+        // the index contains row IDs for, regardless of whether those fragments still exist.
+        // This ensures consistent prefiltering behavior and clear semantics.
 
-        // We might have also removed all fragments that an index was covering, so
-        // we should remove those indices as well.
-        indices.retain(|existing_index| {
-            existing_index
-                .fragment_bitmap
-                .as_ref()
-                .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
-                .unwrap_or(true)
-                || is_system_index(existing_index)
+        // Apply retention logic for indices with empty bitmaps per index name
+        // (except for fragment reuse indices which are always kept)
+        let mut indices_by_name: std::collections::HashMap<String, Vec<&Index>> =
+            std::collections::HashMap::new();
+
+        // Group indices by name
+        for index in indices.iter() {
+            if index.name != FRAG_REUSE_INDEX_NAME {
+                indices_by_name
+                    .entry(index.name.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        // Build a set of UUIDs to keep based on retention rules
+        let mut uuids_to_keep = std::collections::HashSet::new();
+
+        // For each group of indices with the same name
+        for (_, same_name_indices) in indices_by_name {
+            if same_name_indices.len() > 1 {
+                // Separate empty and non-empty indices
+                let (empty_indices, non_empty_indices): (Vec<_>, Vec<_>) =
+                    same_name_indices.iter().partition(|index| {
+                        index
+                            .fragment_bitmap
+                            .as_ref()
+                            .is_none_or(|bitmap| bitmap.is_empty())
+                    });
+
+                if non_empty_indices.is_empty() {
+                    // All indices are empty - for scalar indices, keep only the first (oldest) one
+                    // For vector indices, remove all of them
+                    let mut sorted_indices = empty_indices;
+                    sorted_indices.sort_by_key(|index: &&Index| index.dataset_version); // Sort by ascending dataset_version
+
+                    // Keep only the first (oldest) if it's not a vector index
+                    if let Some(oldest) = sorted_indices.first() {
+                        if !Self::is_vector_index(oldest) {
+                            uuids_to_keep.insert(oldest.uuid);
+                        }
+                    }
+                } else {
+                    // At least one index has non-empty bitmap - keep all non-empty indices
+                    for index in non_empty_indices {
+                        uuids_to_keep.insert(index.uuid);
+                    }
+                }
+            } else {
+                // Single index - keep it unless it's an empty vector index
+                if let Some(index) = same_name_indices.first() {
+                    let is_empty = index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_none_or(|bitmap| bitmap.is_empty());
+                    let is_vector = Self::is_vector_index(index);
+
+                    // Keep the index unless it's an empty vector index
+                    if !is_empty || !is_vector {
+                        uuids_to_keep.insert(index.uuid);
+                    }
+                }
+            }
+        }
+
+        // Use Vec::retain to safely remove indices
+        indices.retain(|index| {
+            index.name == FRAG_REUSE_INDEX_NAME || uuids_to_keep.contains(&index.uuid)
         });
     }
 
@@ -1797,6 +1868,10 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
+            if fragment.row_id_meta.is_some() {
+                // Operation must have already assigned ids.
+                continue;
+            }
             let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
                 message: "Fragment does not have physical rows".into(),
                 location: location!(),

@@ -373,7 +373,7 @@ impl ScalarIndex for InvertedIndex {
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
                     let frag_reuse_index_clone = frag_reuse_index.clone();
-                    let index_cache = index_cache.clone();
+                    let index_cache = index_cache.with_key_prefix(format!("part-{}", id).as_str());
                     async move {
                         Result::Ok(Arc::new(
                             InvertedPartition::load(store, id, frag_reuse_index_clone, index_cache)
@@ -421,7 +421,7 @@ impl ScalarIndex for InvertedIndex {
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedPartition {
-    // None for legacy format
+    // 0 for legacy format
     id: u64,
     store: Arc<dyn IndexStore>,
     pub(crate) tokens: TokenSet,
@@ -980,7 +980,7 @@ impl PostingListReader {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
-               self.posting_list_from_batch(&batch, token_id)
+                self.posting_list_from_batch(&batch, token_id)
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))?
@@ -2069,7 +2069,11 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use tempfile::tempdir;
 
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::prefilter::NoFilter;
+    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
     use crate::scalar::inverted::encoding::decompress_posting_list;
+    use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
 
     use super::*;
@@ -2167,5 +2171,116 @@ mod tests {
         assert_eq!(builder.docs.len(), 0);
 
         builder.write(store.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_posting_cache_conflict_across_partitions() {
+        let tmpdir = tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create first partition with one token and posting list length 1
+        let mut builder1 = InnerBuilder::new(0, false);
+        builder1.tokens.add("test".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.docs.append(100, 1); // row_id=100, num_tokens=1
+        builder1.write(store.as_ref()).await.unwrap();
+
+        // Create second partition with one token and posting list length 4
+        let mut builder2 = InnerBuilder::new(1, false);
+        builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
+        builder2.posting_lists.push(PostingListBuilder::new(false));
+        builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
+        builder2.posting_lists[0].add(1, PositionRecorder::Count(1));
+        builder2.posting_lists[0].add(2, PositionRecorder::Count(3));
+        builder2.posting_lists[0].add(3, PositionRecorder::Count(1));
+        builder2.docs.append(200, 2); // row_id=200, num_tokens=2
+        builder2.docs.append(201, 1); // row_id=201, num_tokens=1
+        builder2.docs.append(202, 3); // row_id=202, num_tokens=3
+        builder2.docs.append(203, 1); // row_id=203, num_tokens=1
+        builder2.write(store.as_ref()).await.unwrap();
+
+        // Create metadata file with both partitions
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        // Load the inverted index
+        let index = InvertedIndex::load(store.clone(), None, LanceCache::with_capacity(4096))
+            .await
+            .unwrap();
+
+        // Verify the index structure
+        assert_eq!(index.partitions.len(), 2);
+        assert_eq!(index.partitions[0].tokens.len(), 1);
+        assert_eq!(index.partitions[1].tokens.len(), 1);
+
+        // Verify the partitions were loaded correctly
+
+        // Verify posting list lengths (note: partition order may differ from creation order)
+        // Verify based on actual loading order
+        if index.partitions[0].id() == 0 {
+            // If partition[0] is ID=0, then it should have 1 document
+            assert_eq!(index.partitions[0].inverted_list.posting_len(0), 1);
+            assert_eq!(index.partitions[1].inverted_list.posting_len(0), 4);
+            assert_eq!(index.partitions[0].docs.len(), 1);
+            assert_eq!(index.partitions[1].docs.len(), 4);
+        } else {
+            // If partition[0] is ID=1, then it should have 4 documents
+            assert_eq!(index.partitions[0].inverted_list.posting_len(0), 4);
+            assert_eq!(index.partitions[1].inverted_list.posting_len(0), 1);
+            assert_eq!(index.partitions[0].docs.len(), 4);
+            assert_eq!(index.partitions[1].docs.len(), 1);
+        }
+
+        // Prewarm the inverted index (this loads posting lists into cache)
+        index.prewarm().await.unwrap();
+
+        let tokens = Arc::new(vec!["test".to_string()]);
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .await
+            .unwrap();
+
+        // Verify that we got search results
+        // Expected to find 5 documents: 1 from first partition, 4 from second partition
+        assert_eq!(row_ids.len(), 5, "row_ids: {:?}", row_ids);
+        assert!(!row_ids.is_empty(), "Should find at least some documents");
+        assert_eq!(row_ids.len(), scores.len());
+
+        // All scores should be positive since all documents contain the search token
+        for &score in &scores {
+            assert!(score > 0.0, "All scores should be positive");
+        }
+
+        // Check that we got results from both partitions
+        assert!(
+            row_ids.contains(&100),
+            "Should contain row_id from partition 0"
+        );
+        assert!(
+            row_ids.iter().any(|&id| id >= 200),
+            "Should contain row_id from partition 1"
+        );
     }
 }

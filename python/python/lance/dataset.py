@@ -206,6 +206,161 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def explain_plan(
+        self, schema: Optional[pa.Schema] = None, verbose: bool = False
+    ) -> str:
+        """
+        Generate the execution plan for the merge insert operation.
+
+        This method creates the execution plan that would be used for the given
+        source schema and returns it as a formatted string for debugging and
+        analysis purposes.
+
+        Parameters
+        ----------
+        schema : Optional[pa.Schema], default None
+            The schema of the source data that would be merged into the dataset.
+            If None, defaults to the dataset's schema. This determines the columns
+            available and their types, which affects the generated execution plan.
+        verbose : bool, default False
+            If True, provides more detailed information in the plan output.
+
+        Returns
+        -------
+        str
+            A formatted string representation of the execution plan.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([
+        ...     pa.array([1, 2, 3]),
+        ...     pa.array(['alice', 'bob', 'charlie']),
+        ...     pa.array([100.0, 200.0, 300.0])
+        ... ], names=['id', 'name', 'score'])
+        >>> dataset = lance.write_dataset(data, "memory://test_dataset")
+
+        >>> # Using default dataset schema
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
+        >>> plan = builder.explain_plan()  # Uses dataset schema
+        >>> print(plan) # doctest: +ELLIPSIS
+        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
+          CoalescePartitionsExec
+            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
+              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+                CoalesceBatchesExec: target_batch_size=...
+                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                    LanceRead: uri=test_dataset/data, projection=[id], ...
+                    RepartitionExec: ...
+                      StreamingTableExec: partition_sizes=1, ...
+        <BLANKLINE>
+
+        >>> # Or with explicit schema
+        >>> source_schema = pa.schema([
+        ...     pa.field("id", pa.int64()),
+        ...     pa.field("name", pa.string()),
+        ...     pa.field("score", pa.float64())
+        ... ])
+        >>> plan = builder.explain_plan(source_schema, verbose=True)
+        >>> print(plan) # doctest: +ELLIPSIS
+        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
+          CoalescePartitionsExec
+            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
+              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+                CoalesceBatchesExec: target_batch_size=...
+                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                    ...
+        """
+        return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
+
+    def analyze_plan(
+        self,
+        data_obj: ReaderLike,
+        *,
+        schema: Optional[pa.Schema] = None,
+    ) -> str:
+        """
+        Generate the execution plan and analyze its performance with real data.
+
+        This method creates the execution plan using the provided source data,
+        executes it to collect performance metrics, and returns the analysis
+        as a formatted string. This is useful for understanding the actual
+        performance characteristics of the merge insert operation with your data.
+
+        .. warning::
+            This method executes the merge insert operation to collect metrics
+            but **does not commit the changes**. While data files may be written
+            to storage during execution, they will not be referenced by any dataset
+            version and the dataset remains unchanged. This is intended for
+            performance analysis only.
+
+        Parameters
+        ----------
+        data_obj : ReaderLike
+            The source data that would be merged into the dataset. This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema : Optional[pa.Schema], default None
+            The schema of the data. This only needs to be supplied whenever the data
+            source is some kind of generator.
+
+        Returns
+        -------
+        str
+            A formatted string representation of the plan analysis with metrics.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([
+        ...     pa.array([1, 2, 3]),
+        ...     pa.array(['alice', 'bob', 'charlie']),
+        ...     pa.array([100.0, 200.0, 300.0])
+        ... ], names=['id', 'name', 'score'])
+        >>> dataset = lance.write_dataset(data, "memory://analyze_dataset")
+        >>> new_data = pa.table([
+        ...     pa.array([1, 4]),
+        ...     pa.array(["updated_alice", "david"]),
+        ...     pa.array([150.0, 400.0])
+        ... ], names=["id", "name", "score"])
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
+        >>> analysis = builder.analyze_plan(new_data)
+        >>> print(analysis) # doctest: +ELLIPSIS
+            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...]
+              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...]
+                ProjectionExec: expr=[_rowaddr@1 as _rowaddr, ...], metrics=[...]
+                  ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...], ...
+                    CoalesceBatchesExec: ..., metrics=[...]
+                      HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                        LanceRead: ..., metrics=[..., bytes_read=..., ...]
+                        RepartitionExec: ...
+                          StreamingTableExec: ..., metrics=[]
+
+        The two key parts of the plan analysis are LanceRead and MergeInsert.
+        LanceRead scans join keys and columns in conditions. MergeInsert writes
+        data files to storage.
+
+        Key metrics in MergeInsert operations:
+        - bytes_written: total bytes written to storage
+        - num_files_written: number of new data files created
+        - num_inserted_rows: rows added that didn't match existing data
+        - num_updated_rows: existing rows that were updated
+        - num_deleted_rows: rows removed (when using delete conditions)
+
+        Key metrics in LanceRead operations:
+        - bytes_read: bytes read from storage
+        - fragments_scanned: number of data fragments accessed
+        - rows_scanned: total rows examined during the scan
+        - iops: number of I/O operations performed
+        - requests: number of storage requests made
+        """
+        reader = _coerce_reader(data_obj, schema)
+        return super(MergeInsertBuilder, self).analyze_plan(reader)
+
 
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
@@ -223,6 +378,7 @@ class LanceDataset(pa.dataset.Dataset):
         default_scan_options: Optional[Dict[str, Any]] = None,
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_size_bytes: Optional[int] = None,
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -251,8 +407,10 @@ class LanceDataset(pa.dataset.Dataset):
             serialized_manifest,
             metadata_cache_size_bytes=metadata_cache_size_bytes,
             index_cache_size_bytes=index_cache_size_bytes,
+            read_params=read_params,
         )
         self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     @classmethod
     def __deserialize__(
@@ -262,6 +420,7 @@ class LanceDataset(pa.dataset.Dataset):
         version: int,
         manifest: bytes,
         default_scan_options: Optional[Dict[str, Any]],
+        read_params: Optional[Dict[str, Any]] = None,
     ):
         return cls(
             uri,
@@ -269,6 +428,7 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options=storage_options,
             serialized_manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
 
     def __reduce__(self):
@@ -278,6 +438,7 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __getstate__(self):
@@ -287,23 +448,30 @@ class LanceDataset(pa.dataset.Dataset):
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
+            self._read_params,
         )
 
     def __setstate__(self, state):
+        # Handle backwards compatibility - state may not have read_params
         (
             self._uri,
             self._storage_options,
             version,
             manifest,
             default_scan_options,
+            *rest,  # Capture optional read_params
         ) = state
+        read_params = rest[0] if rest else None
         self._ds = _Dataset(
             self._uri,
             version,
             storage_options=self._storage_options,
             manifest=manifest,
             default_scan_options=default_scan_options,
+            read_params=read_params,
         )
+        self._default_scan_options = default_scan_options
+        self._read_params = read_params
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
@@ -311,6 +479,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._storage_options = self._storage_options
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
+        ds._read_params = self._read_params.copy() if self._read_params else None
         return ds
 
     def __len__(self):
@@ -408,7 +577,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/introduction/read_and_write.html#filter-push-down>`_
+            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -659,7 +828,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/introduction/read_and_write.html#filter-push-down>`_
+            `Lance filter pushdown <https://lancedb.github.io/lance/guide/read_and_write/#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -1332,7 +1501,13 @@ class LanceDataset(pa.dataset.Dataset):
         # Indices might have changed
         self._list_indices_res = None
 
-    def delete(self, predicate: Union[str, pa.compute.Expression]):
+    def delete(
+        self,
+        predicate: Union[str, pa.compute.Expression],
+        *,
+        conflict_retries: int = 10,
+        retry_timeout: timedelta = timedelta(seconds=30),
+    ):
         """
         Delete rows from the dataset.
 
@@ -1344,6 +1519,14 @@ class LanceDataset(pa.dataset.Dataset):
         predicate : str or pa.compute.Expression
             The predicate to use to select rows to delete. May either be a SQL
             string or a pyarrow Expression.
+        conflict_retries : int, optional
+            Number of times to retry the operation if there is contention.
+            Default is 10.
+        retry_timeout : timedelta, optional
+            The timeout used to limit retries. This is the maximum time to spend on
+            the operation before giving up. At least one attempt will be made,
+            regardless of how long it takes to complete. Subsequent attempts will be
+            cancelled once this timeout is reached. Default is 30 seconds.
 
         Examples
         --------
@@ -1362,7 +1545,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
-        self._ds.delete(predicate)
+        self._ds.delete(predicate, conflict_retries, retry_timeout)
 
     def insert(
         self,
@@ -1674,6 +1857,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         *,
         replace: bool = True,
+        train: bool = True,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1750,6 +1934,10 @@ class LanceDataset(pa.dataset.Dataset):
             column name.
         replace : bool, default True
             Replace the existing index if it exists.
+        train : bool, default True
+            If True, the index will be trained on the data to determine optimal
+            structure. If False, an empty index will be created that can be
+            populated later.
 
         with_position: bool, default True
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -1882,7 +2070,7 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} cannot currently be a duration"
             )
 
-        self._ds.create_index([column], index_type, name, replace, None, kwargs)
+        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def create_index(
         self,
@@ -1909,6 +2097,7 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
+        train: bool = True,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1975,6 +2164,10 @@ class LanceDataset(pa.dataset.Dataset):
             for nullable columns. Obtains a small speed boost.
         one_pass_ivfpq: bool
             Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
+        train : bool, default True
+            If True, the index will be trained on the data (e.g., compute IVF
+            centroids, PQ codebooks). If False, an empty index structure will be
+            created without training, which can be populated later.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2410,7 +2603,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         timers["final_create_index:start"] = time.time()
         self._ds.create_index(
-            column, index_type, name, replace, storage_options, kwargs
+            column, index_type, name, replace, train, storage_options, kwargs
         )
         timers["final_create_index:end"] = time.time()
         final_create_index_time = (
@@ -2625,6 +2818,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
+        ds._read_params = None
         return ds
 
     @staticmethod
@@ -2714,7 +2908,9 @@ class LanceDataset(pa.dataset.Dataset):
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
+        ds._storage_options = storage_options
         ds._default_scan_options = None
+        ds._read_params = None
         return BulkCommitResult(
             dataset=ds,
             merged=merged,
@@ -3074,13 +3270,17 @@ class ExecuteResult(TypedDict):
     num_deleted_rows: int
 
 
-class Index(TypedDict):
-    name: str
-    type: str
+@dataclass
+class Index:
+    """Represents an index in the dataset."""
+
     uuid: str
-    fields: List[str]
-    version: int
+    name: str
+    fields: List[int]
+    dataset_version: int
     fragment_ids: Set[int]
+    index_version: int
+    created_at: Optional[datetime] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -3430,13 +3630,8 @@ class LanceOperation:
         Operation that creates an index on the dataset.
         """
 
-        uuid: str
-        name: str
-        fields: List[int]
-        dataset_version: int
-        fragment_ids: Set[int]
-        index_version: int
-        created_at: Optional[datetime] = None
+        new_indices: List[Index]
+        removed_indices: List[Index]
 
     @dataclass
     class DataReplacementGroup:
@@ -4372,7 +4567,9 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: Optional[str] = None,
+    data_storage_version: Optional[
+        Literal["stable", "2.0", "2.1", "next", "legacy", "0.1"]
+    ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
     enable_move_stable_row_ids: bool = False,
@@ -4519,6 +4716,7 @@ def write_dataset(
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
+    ds._read_params = None
     return ds
 
 

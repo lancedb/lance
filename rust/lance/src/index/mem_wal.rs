@@ -549,7 +549,7 @@ pub(crate) fn new_mem_wal_index_meta(
 mod tests {
     use super::*;
     use crate::dataset::{WriteDestination, WriteMode, WriteParams};
-    use crate::index::VectorIndexParams;
+    use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Int32Type};
     use lance_datafusion::datagen::DatafusionDatagenExt;
@@ -562,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn test_advance_mem_wal_generation() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -707,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_new_entry_to_mem_wal() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -841,7 +841,7 @@ mod tests {
     #[tokio::test]
     async fn test_seal_mem_wal() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1010,7 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_mem_wal() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1118,7 +1118,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_mem_wal_owner() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1279,7 +1279,7 @@ mod tests {
     #[tokio::test]
     async fn test_trim_mem_wal_index_with_reindex() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1467,7 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn test_trim_mem_wal_index_with_delta_index() {
         // Create a dataset with enough data for vector index clustering
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1507,7 +1507,7 @@ mod tests {
             .unwrap();
 
         // Append new data files to the dataset (without rewriting existing files)
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1593,7 +1593,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_mem_wal_through_merge_insert() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1644,7 +1644,7 @@ mod tests {
         );
 
         // Create new data for merge insert
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1820,7 +1820,7 @@ mod tests {
         );
 
         // Create merge insert that flushes generation 1
-        let new_data_valid = lance_datagen::gen()
+        let new_data_valid = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -1870,7 +1870,7 @@ mod tests {
     #[tokio::test]
     async fn test_replay_mem_wal_with_split_brain_writer() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2018,7 +2018,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_mem_wal_replay_and_modifications() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2128,7 +2128,7 @@ mod tests {
             .unwrap();
 
         // Create some data for the merge insert
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2172,7 +2172,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_mem_wal_append_and_merge_insert_flush() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2252,7 +2252,7 @@ mod tests {
             .unwrap();
 
         // Create some data for the merge insert
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2322,7 +2322,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_mem_wal_advance_and_merge_insert_flush() {
         // Create a dataset with some data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2409,7 +2409,7 @@ mod tests {
             .unwrap();
 
         // Create some data for the merge insert
-        let new_data = lance_datagen::gen()
+        let new_data = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),

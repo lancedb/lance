@@ -3,3 +3,6 @@
 
 pub mod logical;
 pub mod physical;
+
+#[cfg(test)]
+pub mod fuzz_tests;

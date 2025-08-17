@@ -1,108 +1,188 @@
-name: Create release commit
+name: Create release
 
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Dry run (create the local commit/tags but do not push it)'
+      release_type:
+        description: 'Release type'
         required: true
-        default: false
-        type: boolean
-      type:
-        description: 'What kind of release is this?'
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      release_channel:
+        description: 'Release channel'
         required: true
         default: 'preview'
         type: choice
         options:
           - preview
           - stable
-      draft-release:
+      dry_run:
+        description: 'Dry run (simulate the release without pushing)'
+        required: true
+        default: true
+        type: boolean
+      draft_release:
         description: 'Create a draft release on GitHub'
         required: true
-        default: false
+        default: true
         type: boolean
 
 jobs:
-  bump-version:
+  validate-and-release:
     runs-on: ubuntu-latest
     steps:
     - name: Output Inputs
       run: echo "${{ toJSON(github.event.inputs) }}"
+    
     - name: Check out main
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.ref }}
-        persist-credentials: false
+        ref: main
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         fetch-depth: 0
         lfs: true
-    - name: Set up Python 3.10
+    
+    - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.10"
+        python-version: "3.11"
+    
+    - name: Install dependencies
+      run: |
+        pip install bump-my-version packaging PyGithub
+    
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: Validate release type against breaking changes
+      env:
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_SHA: ${{ github.sha }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        python ci/check_breaking_changes.py --release-type ${{ inputs.release_type }}
+    
+    - name: Get current version
+      id: current_version
+      run: |
+        CURRENT_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+        echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+        echo "Current version: $CURRENT_VERSION"
+    
+    - name: Calculate new version
+      id: new_version
+      run: |
+        CURRENT="${{ steps.current_version.outputs.version }}"
+        TYPE="${{ inputs.release_type }}"
+        
+        IFS='.' read -r major minor patch <<< "$CURRENT"
+        
+        case "$TYPE" in
+          major)
+            NEW_VERSION="$((major + 1)).0.0"
+            ;;
+          minor)
+            NEW_VERSION="${major}.$((minor + 1)).0"
+            ;;
+          patch)
+            NEW_VERSION="${major}.${minor}.$((patch + 1))"
+            ;;
+        esac
+        
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "New version will be: $NEW_VERSION"
+    
+    - name: Determine tag name
+      id: tag_name
+      run: |
+        if [ "${{ inputs.release_channel }}" == "stable" ]; then
+          VERSION="${{ steps.new_version.outputs.version }}"
+          TAG="v${VERSION}"
+        else
+          # For preview releases, use current version
+          VERSION="${{ steps.current_version.outputs.version }}"
+          # Find the next beta number for current version
+          BETA_TAGS=$(git tag -l "v${VERSION}-beta.*" | sort -V)
+          if [ -z "$BETA_TAGS" ]; then
+            BETA_NUM=1
+          else
+            LAST_BETA=$(echo "$BETA_TAGS" | tail -n 1)
+            LAST_NUM=$(echo "$LAST_BETA" | sed "s/v${VERSION}-beta.//")
+            BETA_NUM=$((LAST_NUM + 1))
+          fi
+          TAG="v${VERSION}-beta.${BETA_NUM}"
+        fi
+        
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "Tag will be: $TAG"
+    
+    - name: Update version (stable releases only)
+      if: inputs.release_channel == 'stable'
+      run: |
+        python ci/bump_version.py ${{ inputs.release_type }}
+    
+    - name: Configure git identity
+      run: |
+        git config user.name 'Lance Release Bot'
+        git config user.email 'lance-dev@lancedb.com'
+    
+    - name: Create release commit (stable releases only)
+      if: inputs.release_channel == 'stable'
+      run: |
+        git add -A
+        git commit -m "chore: release version ${{ steps.new_version.outputs.version }}"
     
     - name: Create tag
-      id: create_tag
-      working-directory: rust
-      env:
-        RELEASE_TYPE: ${{ inputs.type }}
       run: |
-        # Get the current version from cargo metadata
-        CURRENT_VERSION=$(cargo metadata --no-deps --format-version 1 | jq '.packages[0].version' | xargs echo)
-
-        if [ "$RELEASE_TYPE" == "stable" ]; then
-          echo "Creating stable release for version $CURRENT_VERSION"
-          TAG="v${CURRENT_VERSION}"
-        else
-          # Get a list of all tags, filter for current version beta tags, sort them and get the last one
-          LAST_BETA_TAG=$(git tag | grep "^v${CURRENT_VERSION}-beta." | sort -V | tail -n 1)
-
-          if [ -z "$LAST_BETA_TAG" ]; then
-            # If there are no existing beta tags for the current version, start with beta.1
-            NEXT_BETA_TAG="v${CURRENT_VERSION}-beta.1"
-          else
-            # If there are existing beta tags, increment the last beta number to get the next one
-            LAST_BETA_NUMBER=$(echo $LAST_BETA_TAG | sed "s/v${CURRENT_VERSION}-beta.//")
-            NEXT_BETA_NUMBER=$((LAST_BETA_NUMBER + 1))
-            NEXT_BETA_TAG="v${CURRENT_VERSION}-beta.${NEXT_BETA_NUMBER}"
-          fi
-
-          echo "Creating beta release for version $CURRENT_VERSION: $NEXT_BETA_TAG"
-          TAG=$NEXT_BETA_TAG
-        fi
-
-        git tag $TAG
-        echo "tag=$TAG" >> $GITHUB_OUTPUT
-    - name: Push new version tag
+        git tag -a "${{ steps.tag_name.outputs.tag }}" -m "Release ${{ steps.tag_name.outputs.tag }}"
+    
+    - name: Push changes (if not dry run)
       if: ${{ !inputs.dry_run }}
-      uses: ad-m/github-push-action@master
-      with:
-        github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
-        branch: ${{ github.ref }}
-        tags: true
-    - name: Create GH release
+      run: |
+        if [ "${{ inputs.release_channel }}" == "stable" ]; then
+          # Push the commit for stable releases
+          git push origin main
+        fi
+        # Always push the tag
+        git push origin "${{ steps.tag_name.outputs.tag }}"
+    
+    - name: Create GitHub Release (if not dry run)
       if: ${{ !inputs.dry_run }}
       uses: softprops/action-gh-release@v2
       with:
-        prerelease: ${{ inputs.type == 'preview' }}
-        draft: ${{ inputs.draft-release }}
-        tag_name: ${{ steps.create_tag.outputs.tag }}
-        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+        tag_name: ${{ steps.tag_name.outputs.tag }}
+        name: ${{ steps.tag_name.outputs.tag }}
+        draft: ${{ inputs.draft_release }}
+        prerelease: ${{ inputs.release_channel == 'preview' }}
         generate_release_notes: true
-
-    # Remaining steps only apply to stable releases
-    - name: Call bumpversion
-      uses: ./.github/workflows/bump-version
-      if: inputs.type == 'stable'
-      with:
-        part: patch
-    - name: Commit bump version
-      if: inputs.type == 'stable'
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+    
+    - name: Prepare for next development cycle (stable releases only)
+      if: inputs.release_channel == 'stable' && !inputs.dry_run
       run: |
-        git add -u
-        git commit -m "Bump version"
-    - name: Push new version 
-      if: ${{ inputs.type == 'stable' && !inputs.dry_run }}
-      uses: ad-m/github-push-action@master
-      with:
-        github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
-        branch: ${{ github.ref }}
+        # After a stable release, bump to the next patch version with -dev suffix
+        # This will be handled in a follow-up PR
+        echo "Next steps: Create a PR to bump version for next development cycle"
+    
+    - name: Summary
+      run: |
+        echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release Type:** ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release Channel:** ${{ inputs.release_channel }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Current Version:** ${{ steps.current_version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **New Version:** ${{ steps.new_version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Tag:** ${{ steps.tag_name.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ This was a dry run. No changes were pushed." >> $GITHUB_STEP_SUMMARY
+        fi
