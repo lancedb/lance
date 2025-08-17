@@ -600,12 +600,12 @@ public class Dataset implements Closeable {
   private native void nativeRestore();
 
   /**
-   * Creates a new index on the dataset. Only vector indexes are supported.
+   * Creates a new index on the dataset.
    *
    * @param columns the columns to index from
    * @param indexType the index type
    * @param name the name of the created index
-   * @param params index params
+   * @param params index params, can be null for non-vector index types
    * @param replace whether to replace the existing index
    */
   public void createIndex(
