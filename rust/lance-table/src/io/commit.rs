@@ -851,9 +851,8 @@ async fn default_resolve_version(
     }
 
     // If we reach here, no scheme worked
-    Err(Error::Internal {
-        message: format!("Version {version} not found in any supported naming scheme"),
-        location: location!(),
+    Err(Error::VersionNotFound {
+        message: format!("Can not find version {version}"),
     })
 }
 

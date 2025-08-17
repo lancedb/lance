@@ -423,7 +423,12 @@ impl Dataset {
                 &self.object_store.inner,
                 Some(self.manifest_location.naming_scheme),
             )
-            .await?;
+            .await
+            .map_err(|e| Error::DatasetNotFound {
+                path: self.uri.clone(),
+                source: box_error(e),
+                location: location!(),
+            })?;
 
         if self.already_checked_out(&manifest_location) {
             return Ok(self.clone());
