@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.index.IndexParams;
+import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceField;
@@ -916,6 +918,69 @@ public class DatasetTest {
       assertThrows(
           IllegalArgumentException.class,
           () -> dataset.replaceFieldMetadata(Collections.singletonMap(-1, replaceConfig2)));
+    }
+  }
+
+  @Test
+  public void testCreateSimpleIndex(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(1, dataset.version());
+      Dataset dataset2 = testDataset.write(1, 100);
+      IndexParams indexParams = IndexParams.create();
+      dataset2.createIndex(
+          Collections.singletonList("name"),
+          IndexType.SCALAR,
+          Optional.of("name_index_scalar"),
+          indexParams,
+          true);
+      // Verify the index was created.
+      // Currently, Dataset do not have a way to get index metadata
+      assertEquals(3, dataset2.version());
+      dataset2.createIndex(
+          Collections.singletonList("name"),
+          IndexType.BITMAP,
+          Optional.of("name_index_bitmap"),
+          indexParams,
+          true);
+      assertEquals(4, dataset2.version());
+      dataset2.createIndex(
+          Collections.singletonList("name"),
+          IndexType.NGRAM,
+          Optional.of("id_index_ngram"),
+          indexParams,
+          true);
+      assertEquals(5, dataset2.version());
+      dataset2.createIndex(
+          Collections.singletonList("name"),
+          IndexType.INVERTED,
+          Optional.of("id_index_inverted"),
+          indexParams,
+          true);
+      assertEquals(6, dataset2.version());
+      // LabelList index can only be created on List or LargeList type columns
+      assertThrows(
+          IllegalArgumentException.class,
+          () ->
+              dataset2.createIndex(
+                  Collections.singletonList("name"),
+                  IndexType.LABEL_LIST,
+                  Optional.of("name_index_label-list"),
+                  indexParams,
+                  true));
+      assertThrows(
+          IllegalArgumentException.class,
+          () ->
+              dataset2.createIndex(
+                  Collections.singletonList("id"),
+                  IndexType.VECTOR,
+                  Optional.of("id_index_vector"),
+                  indexParams,
+                  true));
     }
   }
 }

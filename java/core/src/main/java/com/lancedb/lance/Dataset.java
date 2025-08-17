@@ -561,7 +561,7 @@ public class Dataset implements Closeable {
    * @param columns the columns to index from
    * @param indexType the index type
    * @param name the name of the created index
-   * @param params index params, can be null for non-vector index types
+   * @param params index params
    * @param replace whether to replace the existing index
    */
   public void createIndex(

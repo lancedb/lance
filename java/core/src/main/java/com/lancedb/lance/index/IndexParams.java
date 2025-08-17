@@ -28,29 +28,28 @@ public class IndexParams {
   }
 
   /**
-   * Creates an empty IndexParams instance with default values. This is useful for non-vector index
-   * types where IndexParams can be empty.
+   * Creates IndexParams instance with default values. This is useful for non-vector index types
+   * where vectorIndexParams can be empty.
    *
-   * @return an empty IndexParams instance
+   * @return an empty IndexParams instance without vectorIndexParams
    */
-  public static IndexParams empty() {
+  public static IndexParams create() {
     return new Builder().build();
+  }
+
+  /**
+   * Creates a builder for IndexParams.
+   *
+   * @return a new Builder instance
+   */
+  public static Builder builder() {
+    return new Builder();
   }
 
   public static class Builder {
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
 
     public Builder() {}
-
-    /**
-     * Set the distance type for calculating the distance between vectors. Default to L2.
-     *
-     * @param distanceType distance type
-     * @return this builder
-     */
-    public Builder setDistanceType(DistanceType distanceType) {
-      return this;
-    }
 
     /**
      * Vector index parameters for creating a vector index.
