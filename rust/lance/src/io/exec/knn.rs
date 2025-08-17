@@ -5,6 +5,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
@@ -691,6 +692,7 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        let timer = Instant::now();
         let stream = futures::stream::once(async move {
             let max_nprobes = query.maximum_nprobes.unwrap_or(partitions.len());
             if max_nprobes == query.minimum_nprobes {
@@ -755,7 +757,7 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
             let metrics_clone = metrics.clone();
-            // There are more partitions to search, start the late search
+
             futures::stream::iter(query.minimum_nprobes..max_nprobes)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
@@ -765,7 +767,6 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     async move {
-                        let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                         let mut query = query.clone();
                         if index.metric_type() == DistanceType::Cosine {
                             let key = normalize_arrow(&query.key)?;
@@ -798,6 +799,10 @@ impl ANNIvfSubIndexExec {
                 })
                 .buffered(get_num_compute_intensive_cpus())
                 .finally(move || {
+                    metrics_clone
+                        .baseline_metrics
+                        .elapsed_compute()
+                        .add_duration(timer.elapsed());
                     metrics_clone.baseline_metrics.done();
                 })
                 .boxed()
@@ -815,6 +820,11 @@ impl ANNIvfSubIndexExec {
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
+
+        // Use a single timer for the entire parallel search operation
+        let metrics_for_timer = metrics.clone();
+        let timer = Instant::now();
+
         futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
                 let part_id = partitions.value(idx);
@@ -824,7 +834,6 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
                         let key = normalize_arrow(&query.key)?;
@@ -848,6 +857,12 @@ impl ANNIvfSubIndexExec {
                 }
             })
             .buffered(get_num_compute_intensive_cpus())
+            .finally(move || {
+                metrics_for_timer
+                    .baseline_metrics
+                    .elapsed_compute()
+                    .add_duration(timer.elapsed());
+            })
     }
 }
 
