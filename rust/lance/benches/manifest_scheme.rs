@@ -66,20 +66,31 @@ fn get_storage_type() -> String {
 }
 
 /// Create a test dataset with specified number of versions and manifest scheme
+/// Only creates the dataset if it doesn't exist, otherwise returns the existing one
 async fn create_test_dataset(
     base_uri: &str,
     num_versions: u64,
     manifest_scheme: ManifestNamingScheme,
 ) -> Dataset {
-    // Clean up existing dataset if using file storage
-    if !base_uri.starts_with("memory://")
-        && !base_uri.starts_with("s3://")
-        && !base_uri.starts_with("gs://")
-        && !base_uri.starts_with("az://")
-    {
-        let _ = std::fs::remove_dir_all(base_uri);
+    // Try to open existing dataset first
+    if let Ok(mut existing_dataset) = Dataset::open(base_uri).await {
+        // Check if it has the expected number of versions
+        let current_version = existing_dataset.version().version;
+        if current_version >= num_versions - 1 {
+            // Dataset exists with enough versions, return it
+            return existing_dataset;
+        }
+        // Add more versions if needed
+        for i in (current_version + 1)..num_versions {
+            existing_dataset
+                .update_config([(format!("version_{}", i), i.to_string())])
+                .await
+                .unwrap();
+        }
+        return existing_dataset;
     }
 
+    // Dataset doesn't exist, create it
     let write_params = WriteParams {
         enable_v2_manifest_paths: matches!(manifest_scheme, ManifestNamingScheme::V2),
         enable_v3_manifest_paths: matches!(manifest_scheme, ManifestNamingScheme::V3),
@@ -200,7 +211,8 @@ fn bench_load_new_transactions_during_commit(c: &mut Criterion) {
                     |b| {
                         b.to_async(&rt).iter(|| async {
                             // Checkout an older version to simulate being behind
-                            let old_dataset = dataset.checkout_version(target_version).await.unwrap();
+                            let old_dataset =
+                                dataset.checkout_version(target_version).await.unwrap();
 
                             // Measure only the load_and_sort_new_transactions function
                             let (_new_dataset, transactions) =
