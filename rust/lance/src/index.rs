@@ -32,6 +32,7 @@ use lance_index::scalar::expression::{
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{ScalarIndex, ScalarIndexType};
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
@@ -1166,6 +1167,19 @@ impl DatasetIndexInternalExt for Dataset {
 
                     "IVF_SQ" => {
                         let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_RABIT" => {
+                        let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),

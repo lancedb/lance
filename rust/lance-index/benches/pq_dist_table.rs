@@ -18,7 +18,7 @@ use rand::{prelude::StdRng, Rng, SeedableRng};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-const PQ: usize = 96;
+const PQ: usize = 192;
 const DIM: usize = 1536;
 const TOTAL: usize = 16 * 1000;
 

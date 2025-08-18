@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta};
 use futures::{StreamExt, TryFutureExt};
+use lance_index::vector::bq::RQBuildParams;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -1479,9 +1480,8 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
-                IndexType::Vector
-            }
+            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RABIT" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
+            | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -2399,6 +2399,7 @@ fn prepare_vector_index_params(
     let mut hnsw_params = HnswBuildParams::default();
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
+    let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
 
     if let Some(kwargs) = kwargs {
@@ -2497,9 +2498,11 @@ fn prepare_vector_index_params(
             hnsw_params.ef_construction = ef_c.extract()?;
         }
 
-        // Parse PQ params
+        // Parse PQ/RQ params
         if let Some(n) = kwargs.get_item("num_bits")? {
-            pq_params.num_bits = n.extract()?
+            let num_bits: u8 = n.extract()?;
+            pq_params.num_bits = num_bits as usize;
+            rq_params.num_bits = num_bits;
         };
 
         if let Some(n) = kwargs.get_item("num_sub_vectors")? {
@@ -2536,6 +2539,10 @@ fn prepare_vector_index_params(
 
         "IVF_SQ" => Ok(Box::new(VectorIndexParams::with_ivf_sq_params(
             m_type, ivf_params, sq_params,
+        ))),
+
+        "IVF_RABIT" => Ok(Box::new(VectorIndexParams::with_ivf_rq_params(
+            m_type, ivf_params, rq_params,
         ))),
 
         "IVF_HNSW_FLAT" => Ok(Box::new(VectorIndexParams::ivf_hnsw(
