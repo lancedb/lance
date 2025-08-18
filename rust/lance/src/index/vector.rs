@@ -487,6 +487,28 @@ pub(crate) async fn build_vector_index(
     Ok(())
 }
 
+/// Build an empty vector index without training on data
+#[instrument(level = "debug", skip_all)]
+pub(crate) async fn build_empty_vector_index(
+    _dataset: &Dataset,
+    column: &str,
+    name: &str,
+    _uuid: &str,
+    _params: &VectorIndexParams,
+) -> Result<()> {
+    // For now, return a NotImplementedError to indicate this functionality
+    // is still being developed
+    Err(Error::NotSupported {
+        source: format!(
+            "Creating empty vector indices with train=False is not yet implemented. \
+            Index '{}' for column '{}' cannot be created without training.",
+            name, column
+        )
+        .into(),
+        location: location!(),
+    })
+}
+
 #[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
 pub(crate) async fn remap_vector_index(
     dataset: Arc<Dataset>,

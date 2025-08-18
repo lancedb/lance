@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::rowids::get_row_id_index;
 use crate::{
     dataset::transaction::{Operation, Transaction},
-    dataset::utils::make_rowaddr_capture_stream,
+    dataset::utils::make_rowid_capture_stream,
     Dataset,
 };
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
+use snafu::location;
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Apply deletions to fragments based on a RoaringTreemap of row IDs.
 ///
@@ -91,9 +93,10 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
             (Vec::new(), deleted_fragment_ids)
         } else {
             // Regular predicate - scan and collect row addresses to delete
-            let removed_row_addrs = Arc::new(RwLock::new(RoaringTreemap::new()));
+            scanner.with_row_id();
             let stream = scanner.try_into_stream().await?.into();
-            let stream = make_rowaddr_capture_stream(removed_row_addrs.clone(), stream)?;
+            let (stream, row_id_rx) =
+                make_rowid_capture_stream(stream, ds.manifest.uses_move_stable_row_ids())?;
 
             // Process the stream to capture row addresses
             // We need to consume the stream to trigger the capture
@@ -103,10 +106,12 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
             }
 
             // Extract the row addresses from the Arc
-            let removed_row_addrs = {
-                let guard = removed_row_addrs.read().unwrap();
-                guard.clone()
-            };
+            let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
+                message: format!("Failed to receive row ids: {}", err),
+                location: location!(),
+            })?;
+            let row_id_index = get_row_id_index(ds).await?;
+            let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
 
             apply_deletions(ds, &removed_row_addrs).await?
         }

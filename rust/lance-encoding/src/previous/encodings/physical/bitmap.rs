@@ -105,7 +105,7 @@ impl PrimitivePageDecoder for BitmapDecoder {
                 rows_to_skip -= chunk.length;
             } else {
                 let start = rows_to_skip + chunk.bit_offset;
-                let num_vals_to_take = rows_remaining.min(chunk.length);
+                let num_vals_to_take = rows_remaining.min(chunk.length - rows_to_skip);
                 let end = start + num_vals_to_take;
                 dest_builder.append_packed_range(start as usize..end as usize, &chunk.data);
                 rows_to_skip = 0;
@@ -132,6 +132,7 @@ mod tests {
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
     use crate::previous::encodings::physical::bitmap::BitmapData;
     use crate::testing::{
@@ -220,7 +221,18 @@ mod tests {
             ],
         };
 
-        let result = decoder.decode(5, 1);
-        assert!(result.is_ok());
+        // Read from first and second chunk
+        let result = decoder.decode(2, 4).unwrap();
+        let DataBlock::FixedWidth(FixedWidthDataBlock { data, .. }) = result else {
+            panic!("expected fixed width data block");
+        };
+        assert_eq!(data.as_ref(), &[0b00000011]);
+
+        // Read from second chunk
+        let result = decoder.decode(5, 1).unwrap();
+        let DataBlock::FixedWidth(FixedWidthDataBlock { data, .. }) = result else {
+            panic!("expected fixed width data block");
+        };
+        assert_eq!(data.as_ref(), &[0b00000000]);
     }
 }

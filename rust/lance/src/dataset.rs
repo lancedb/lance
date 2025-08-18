@@ -43,6 +43,7 @@ use lance_table::io::commit::{
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use object_store::path::Path;
 use prost::Message;
+use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -142,6 +143,9 @@ pub struct Dataset {
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
+
+    // Bitmap of fragment ids in this dataset.
+    pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
     pub(crate) index_cache: Arc<DSIndexCache>,
@@ -387,6 +391,13 @@ impl Dataset {
         let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = manifest;
         self.manifest_location = manifest_location;
+        self.fragment_bitmap = Arc::new(
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect(),
+        );
         Ok(())
     }
 
@@ -553,6 +564,7 @@ impl Dataset {
         );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
+        let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         Ok(Self {
             object_store,
             base: base_path,
@@ -562,6 +574,7 @@ impl Dataset {
             commit_handler,
             session,
             tags,
+            fragment_bitmap,
             metadata_cache,
             index_cache,
             file_reader_options,
@@ -1014,6 +1027,13 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_location = manifest_location;
+        self.fragment_bitmap = Arc::new(
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect(),
+        );
 
         Ok(())
     }
@@ -2147,7 +2167,7 @@ mod tests {
         tokenizer::InvertedIndexParams,
     };
     use lance_index::scalar::FullTextSearchQuery;
-    use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, IndexType};
     use lance_io::utils::CachedFileSize;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -4392,8 +4412,8 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen_batch().col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)));
-        let reader = data.into_reader_rows(RowCount::from(1000), BatchCount::from(10));
+        let data = gen_batch().col("vec", array::rand_vec::<Float32Type>(Dimension::from(32)));
+        let reader = data.into_reader_rows(RowCount::from(500), BatchCount::from(1));
         let mut dataset = Dataset::write(
             reader,
             test_uri,
@@ -4406,7 +4426,7 @@ mod tests {
         .await
         .unwrap();
 
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
         dataset
             .create_index(&["vec"], IndexType::Vector, None, &params, true)
             .await
@@ -4415,14 +4435,22 @@ mod tests {
         dataset.delete("true").await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
-        // Indices should be gone if its fragments are deleted
-        assert_eq!(indices.len(), 0);
+        // With the new retention behavior, indices are kept even when all fragments are deleted
+        // This allows the index configuration to persist through data changes
+        assert_eq!(indices.len(), 1);
+
+        // Verify the index has an empty effective fragment bitmap
+        let index = &indices[0];
+        let effective_bitmap = index
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap();
+        assert!(effective_bitmap.is_empty());
 
         let mut stream = dataset
             .scan()
             .nearest(
                 "vec",
-                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                &Float32Array::from_iter_values((0..32).map(|_| 0.1)),
                 1,
             )
             .unwrap()
@@ -4439,7 +4467,7 @@ mod tests {
                     "vec",
                     DataType::FixedSizeList(
                         Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                        128
+                        32
                     ),
                     false,
                 )
@@ -4457,7 +4485,7 @@ mod tests {
             .scan()
             .nearest(
                 "vec",
-                &Float32Array::from_iter_values((0..128).map(|_| 0.1)),
+                &Float32Array::from_iter_values((0..32).map(|_| 0.1)),
                 1,
             )
             .unwrap()
@@ -4466,7 +4494,8 @@ mod tests {
             .unwrap();
 
         while let Some(batch) = stream.next().await {
-            let schema = batch.unwrap().schema();
+            let batch = batch.unwrap();
+            let schema = batch.schema();
             assert_eq!(schema.fields.len(), 2);
             assert_eq!(
                 schema.field_with_name("vec").unwrap(),
@@ -4474,7 +4503,7 @@ mod tests {
                     "vec",
                     DataType::FixedSizeList(
                         Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                        128
+                        32
                     ),
                     false,
                 )
@@ -4483,6 +4512,7 @@ mod tests {
                 schema.field_with_name(DIST_COL).unwrap(),
                 &ArrowField::new(DIST_COL, DataType::Float32, true)
             );
+            assert_eq!(batch.num_rows(), 0, "Expected no results after delete");
         }
     }
 

@@ -15,6 +15,7 @@ use super::{
     SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::frag_reuse::FragReuseIndex;
+use crate::metrics::NoOpMetricsCollector;
 use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
@@ -782,19 +783,33 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.index_cache.get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
-            metrics.record_part_load();
-            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
-            let index_reader = index_reader.get().await?;
-            let mut serialized_page = index_reader
-                .read_record_batch(page_number as u64, self.batch_size)
-                .await?;
-            if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-                serialized_page = frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
-            }
-            let result = self.sub_index.load_subindex(serialized_page).await?;
-            Ok(CachedScalarIndex::new(result))
-        }).await.map(|v| v.as_ref().clone().into_inner())
+        self.index_cache
+            .get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
+                let result = self.read_page(page_number, index_reader, metrics).await?;
+                Ok(CachedScalarIndex::new(result))
+            })
+            .await
+            .map(|v| v.as_ref().clone().into_inner())
+    }
+
+    async fn read_page(
+        &self,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        metrics.record_part_load();
+        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
+        let index_reader = index_reader.get().await?;
+        let mut serialized_page = index_reader
+            .read_record_batch(page_number as u64, self.batch_size)
+            .await?;
+        if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+            serialized_page =
+                frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+        }
+        let result = self.sub_index.load_subindex(serialized_page).await?;
+        Ok(result)
     }
 
     async fn search_page(
@@ -951,36 +966,35 @@ impl Index for BTreeIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let reader = LazyIndexReader::new(self.store.clone());
-        let reader = reader.get().await?;
+        let index_reader = LazyIndexReader::new(self.store.clone());
+        let reader = index_reader.get().await?;
         let num_rows = reader.num_rows();
-        let all_pages = reader.read_range(0..reader.num_rows(), None).await?;
-
         let batch_size = self.batch_size as usize;
         let num_pages = num_rows.div_ceil(batch_size);
         let mut pages = stream::iter(0..num_pages)
             .map(|page_idx| {
-                let sub_index = self.sub_index.clone();
-                let offset = page_idx * batch_size;
-                let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
-                let page = all_pages.slice(offset, end - offset);
+                let index_reader = index_reader.clone();
+                let page_idx = page_idx as u32;
                 async move {
-                    let sub_idx = sub_index.load_subindex(page).await?;
-                    Result::Ok((page_idx as u32, sub_idx))
+                    let page = self
+                        .read_page(page_idx, index_reader, &NoOpMetricsCollector)
+                        .await?;
+                    Result::Ok((page_idx, page))
                 }
             })
             .buffer_unordered(get_num_compute_intensive_cpus());
 
-        while let Some((page_idx, sub_idx)) = pages.try_next().await? {
+        while let Some((page_idx, page)) = pages.try_next().await? {
             self.index_cache
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
                     },
-                    Arc::new(CachedScalarIndex::new(sub_idx)),
+                    Arc::new(CachedScalarIndex::new(page)),
                 )
                 .await;
         }
+
         Ok(())
     }
 

@@ -116,7 +116,7 @@ fn bench_creation(c: &mut Criterion) {
             &percent_deletions,
             |b, _| {
                 b.iter(|| {
-                    let _index = RowIdIndex::new(&sequences).unwrap();
+                    let _index = RowIdIndex::new(&sequences, false).unwrap();
                 });
             },
         );
@@ -189,7 +189,7 @@ fn bench_get_single(c: &mut Criterion) {
 
     for percent_deletions in [0.0, 0.02, 0.25, 0.5, 0.8] {
         let sequences = make_frag_sequences(num_rows(), 100, percent_deletions);
-        let index = RowIdIndex::new(&sequences).unwrap();
+        let index = RowIdIndex::new(&sequences, false).unwrap();
 
         let mut i = 0;
         let total_rows: u64 = num_rows();

@@ -549,7 +549,7 @@ pub(crate) fn new_mem_wal_index_meta(
 mod tests {
     use super::*;
     use crate::dataset::{WriteDestination, WriteMode, WriteParams};
-    use crate::index::VectorIndexParams;
+    use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Int32Type};
     use lance_datafusion::datagen::DatafusionDatagenExt;
