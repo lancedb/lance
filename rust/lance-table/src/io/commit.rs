@@ -852,7 +852,7 @@ async fn default_resolve_version(
 
     // If we reach here, no scheme worked
     Err(Error::VersionNotFound {
-        message: format!("Can not find version {version}"),
+        message: format!("version {version} does not exist"),
     })
 }
 
