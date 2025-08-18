@@ -466,10 +466,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let timer = Instant::now();
+
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
-
         metrics.deltas_searched.add(self.index_uuids.len());
         let metrics_clone = metrics.clone();
 
@@ -482,8 +483,6 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     let index = ds
                         .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                         .await?;
-
-                    let _timer = metrics.baseline_metrics.elapsed_compute().timer();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
                         let key = normalize_arrow(&query.key)?;
@@ -512,6 +511,10 @@ impl ExecutionPlan for ANNIvfPartitionExec {
             .buffered(self.index_uuids.len())
             .finally(move || {
                 metrics_clone.baseline_metrics.done();
+                metrics_clone
+                    .baseline_metrics
+                    .elapsed_compute()
+                    .add_duration(timer.elapsed());
             });
         let schema = self.schema();
         Ok(
@@ -692,7 +695,6 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        let timer = Instant::now();
         let stream = futures::stream::once(async move {
             let max_nprobes = query.maximum_nprobes.unwrap_or(partitions.len());
             if max_nprobes == query.minimum_nprobes {
@@ -756,7 +758,6 @@ impl ANNIvfSubIndexExec {
             let max_results = max_results.unwrap_or(usize::MAX).min(query.k);
 
             let state_clone = state.clone();
-            let metrics_clone = metrics.clone();
 
             futures::stream::iter(query.minimum_nprobes..max_nprobes)
                 .map(move |idx| {
@@ -798,13 +799,6 @@ impl ANNIvfSubIndexExec {
                     std::future::ready(found_so_far < max_results)
                 })
                 .buffered(get_num_compute_intensive_cpus())
-                .finally(move || {
-                    metrics_clone
-                        .baseline_metrics
-                        .elapsed_compute()
-                        .add_duration(timer.elapsed());
-                    metrics_clone.baseline_metrics.done();
-                })
                 .boxed()
         });
         stream.flatten()
@@ -820,10 +814,6 @@ impl ANNIvfSubIndexExec {
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
-
-        // Use a single timer for the entire parallel search operation
-        let metrics_for_timer = metrics.clone();
-        let timer = Instant::now();
 
         futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
@@ -857,12 +847,6 @@ impl ANNIvfSubIndexExec {
                 }
             })
             .buffered(get_num_compute_intensive_cpus())
-            .finally(move || {
-                metrics_for_timer
-                    .baseline_metrics
-                    .elapsed_compute()
-                    .add_duration(timer.elapsed());
-            })
     }
 }
 
@@ -945,6 +929,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let indices = self.indices.clone();
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
+        let metrics_clone = metrics.clone();
+        let timer = Instant::now();
 
         // Per-delta-index stream:
         //   Stream<(parttitions, index uuid)>
@@ -1031,6 +1017,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 // Each delta stream is split into an early and late search.  The late search
                 // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
+                .finally(move || {
+                    metrics_clone
+                        .baseline_metrics
+                        .elapsed_compute()
+                        .add_duration(timer.elapsed());
+                    metrics_clone.baseline_metrics.done();
+                })
                 .boxed(),
         )))
     }
