@@ -476,13 +476,10 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
 
 fn get_base_id(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
     let base_id = env
-        .call_method(obj, "getPathBaseIndex", "()Ljava/util/Optional;", &[])?
+        .call_method(obj, "getBaseId", "()Ljava/util/Optional;", &[])?
         .l()?;
 
-    if env
-        .call_method(&base_id, "isPresent", "()Z", &[])?
-        .z()?
-    {
+    if env.call_method(&base_id, "isPresent", "()Z", &[])?.z()? {
         let inner_value = env
             .call_method(&base_id, "get", "()Ljava/lang/Object;", &[])?
             .l()?;
