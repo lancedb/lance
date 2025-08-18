@@ -81,28 +81,33 @@
 //! you wish. As long as the tasks don't rewrite any of the same fragments,
 //! they can be committed in any order.
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
-use super::utils::make_rowid_capture_stream;
+use super::transaction::{
+    Operation, OptimizeColumnsGroup, RewriteGroup, RewrittenIndex, Transaction,
+};
+use super::utils::{make_rowid_capture_stream, CapturedRowIds};
 use super::{write_fragments_internal, WriteMode, WriteParams};
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
 use crate::Result;
+use arrow_array::RecordBatch;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::utils::tracing::{
+    DATASET_COMPACTING_EVENT, DATASET_OPTIMIZE_COLUMNS_EVENT, TRACE_DATASET_EVENTS,
+};
 use lance_core::Error;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{DataFile, Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -110,6 +115,8 @@ use tracing::info;
 
 pub mod remapping;
 
+use crate::dataset::scanner::Scanner;
+use crate::dataset::write::open_writer;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
@@ -968,6 +975,567 @@ pub async fn commit_compaction(
     Ok(metrics)
 }
 
+/// A group of columns that should be stored together
+#[derive(Debug, Clone)]
+pub struct ColumnGroup {
+    pub columns: Vec<String>,
+}
+
+impl ColumnGroup {
+    pub fn new(columns: Vec<String>) -> Self {
+        Self { columns }
+    }
+}
+
+/// Configuration options for horizontal column compaction.
+///
+/// This struct controls how columns are regrouped within fragments.
+#[derive(Debug, Clone, Default)]
+pub struct OptimizeColumnOptions {
+    /// Specifies how columns should be grouped into files.
+    /// Each [`ColumnGroup`] will result in one data file per fragment.
+    /// If `None`, all columns will be placed in a single file (the default).
+    pub column_groups: Option<Vec<ColumnGroup>>,
+    /// The number of threads to use (how many compaction tasks to run in parallel).
+    /// Defaults to the number of compute-intensive CPUs.
+    pub num_threads: Option<usize>,
+    /// Whether to defer remapping indices during operation. If true, indices will
+    /// not be remapped during this operation. Instead, the fragment reuse index
+    /// is updated and will be used to perform remapping later.
+    pub defer_index_remap: bool,
+}
+
+/// Tasks of files to create
+#[derive(Debug, Clone)]
+struct DataFileWriteTask {
+    field_ids: Vec<i32>,
+    projected_field_indices: Vec<usize>,
+}
+
+/// Internal plan for optimizing a single fragment.
+#[derive(Debug, Clone)]
+struct FragmentOptimizeColumnsPlan {
+    /// Existing data files that exactly match requested column groups.
+    kept_files: Vec<DataFile>,
+    /// New data files that need to be created
+    write_tasks: Vec<DataFileWriteTask>,
+    /// Whether to preserve deletion files and include deleted rows in scans.
+    preserve_deletions: bool,
+}
+
+/// Represents the result of optimizing a single fragment.
+pub struct OptimizeColumnsResult {
+    /// Statistics about the optimization operation for this fragment
+    pub metrics: CompactionMetrics,
+    /// The original fragment that was optimized
+    pub old_fragment: Fragment,
+    /// The new fragment with reorganized files
+    pub new_fragment: Fragment,
+    /// Mapping from old row IDs to new row IDs for index remapping on legacy ids
+    pub row_id_map: Option<HashMap<u64, Option<u64>>>,
+    /// the changed row addresses in the original fragment
+    /// in the form of serialized RoaringTreemap
+    /// Only set when index remap is deferred after compaction
+    pub changed_row_addrs: Option<Vec<u8>>,
+}
+
+/// Regroups columns within fragments without changing the data content.
+///
+/// This operation performs `column grouping` by reorganizing how columns
+/// are stored across data files within each fragment. this operation keeps
+/// fragments intact but changes their internal data file layout.
+///
+/// For each fragment:
+/// 1. Analyzes current file layout in each fragment and requested column groupings
+/// 2. Identifies files that already match the requested layout
+/// 3. Rewrites remaining columns into new files with the desired grouping
+/// 4. Updates indices to reflect any fragment ID changes (legacy row IDs only)
+///
+///
+/// # Configs
+///
+/// - [`OptimizeColumnOptions`]: Configuration options for this operation
+/// - [`ColumnGroup`]: How to specify column groupings
+pub async fn optimize_columns(
+    dataset: &mut Dataset,
+    options: OptimizeColumnOptions,
+) -> Result<CompactionMetrics> {
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_OPTIMIZE_COLUMNS_EVENT, uri = &dataset.uri);
+
+    // If no column groups specified, create one group with all columns
+    let column_groups = options.column_groups.unwrap_or_else(|| {
+        vec![ColumnGroup {
+            columns: dataset
+                .schema()
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect(),
+        }]
+    });
+
+    // Validate column groups
+    validate_column_groups(dataset.schema(), &column_groups)?;
+    let tasks = build_optimize_column_tasks(dataset, column_groups)?;
+    if tasks.is_empty() {
+        return Ok(CompactionMetrics::default());
+    }
+
+    let defer_index_remap = options.defer_index_remap;
+    let num_threads = options
+        .num_threads
+        .unwrap_or_else(get_num_compute_intensive_cpus);
+    let optimize_columns_results_future = futures::stream::iter(tasks)
+        .map(|(fragment, plan)| {
+            let dataset_ref = dataset.clone();
+            async move {
+                execute_fragment_optimize_columns(&dataset_ref, fragment, plan, defer_index_remap)
+                    .await
+            }
+        })
+        .buffer_unordered(num_threads)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    commit_optimize_columns(dataset, optimize_columns_results_future, defer_index_remap).await
+}
+
+/// Validates that column groups cover the entire schema correctly.
+///
+/// Ensures that:
+/// - No column appears in multiple groups
+/// - All schema columns are assigned to a group
+/// - No groups are empty
+/// - All referenced columns exist in the schema
+fn validate_column_groups(
+    schema: &lance_core::datatypes::Schema,
+    column_groups: &[ColumnGroup],
+) -> Result<()> {
+    let mut seen_columns = HashSet::new();
+
+    for (i, group) in column_groups.iter().enumerate() {
+        if group.columns.is_empty() {
+            return Err(Error::InvalidInput {
+                source: format!("Column group {} is empty", i).into(),
+                location: location!(),
+            });
+        }
+        for col in &group.columns {
+            if col.contains('.') {
+                return Err(Error::InvalidInput {
+                    source: format!("Nested column references not supported: '{}'", col).into(),
+                    location: location!(),
+                });
+            }
+
+            if !schema.fields.iter().any(|f| &f.name == col) {
+                return Err(Error::InvalidInput {
+                    source: format!("Column '{}' in group {} not found in schema", col, i).into(),
+                    location: location!(),
+                });
+            }
+            if !seen_columns.insert(col.clone()) {
+                return Err(Error::InvalidInput {
+                    source: format!("Column '{}' appears in multiple groups", col).into(),
+                    location: location!(),
+                });
+            }
+        }
+    }
+
+    // Verify all columns are assigned
+    let schema_cols: HashSet<_> = schema.fields.iter().map(|f| f.name.clone()).collect();
+    if seen_columns != schema_cols {
+        let missing: Vec<_> = schema_cols.difference(&seen_columns).collect();
+        return Err(Error::InvalidInput {
+            source: format!("Columns not included in any group: {:?}", missing).into(),
+            location: location!(),
+        });
+    }
+    Ok(())
+}
+
+/// Build a fragment optimize column plan each fragment in a dataset
+fn build_optimize_column_tasks(
+    dataset: &Dataset,
+    column_groups: Vec<ColumnGroup>,
+) -> Result<Vec<(FileFragment, FragmentOptimizeColumnsPlan)>> {
+    dataset
+        .get_fragments()
+        .iter()
+        .filter_map(|fragment| {
+            let plan =
+                build_optimize_columns_plan(fragment, &column_groups, &dataset.schema()).ok()?;
+            // Skip no-op tasks
+            if plan.write_tasks.is_empty() {
+                return None;
+            }
+            Some(Ok((fragment.clone(), plan)))
+        })
+        .collect()
+}
+
+/// Creates an optimization plan for a single fragment.
+///
+/// Analyzes the fragment's current file layout against the requested column
+/// groupings to determine which files can be kept and which need rewriting.
+///
+/// For each requested column group:
+/// 1. Include all nested field IDs automatically
+/// 2. Check if any existing file exactly matches this group's field IDs
+/// 3. If exact match found: keep the existing file
+/// 4. If no match: plan to rewrite these columns into a new file
+fn build_optimize_columns_plan(
+    fragment: &FileFragment,
+    column_groups: &[ColumnGroup],
+    schema: &lance_core::datatypes::Schema,
+) -> Result<FragmentOptimizeColumnsPlan> {
+    // All field ids present in this fragment
+    let frag_ids: Vec<_> = fragment
+        .metadata
+        .files
+        .iter()
+        .flat_map(|f| f.fields.iter().copied())
+        .collect();
+
+    // col name -> (field_id, schema_index)
+    let column_to_field_id: HashMap<String, (i32, usize)> = schema
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| (f.name.clone(), (f.id, idx)))
+        .collect();
+
+    let top_level_field_ids = schema.top_level_field_ids();
+
+    // For each data file, collect only its top-level field ids
+    let files_field_ids: Vec<HashSet<i32>> = fragment
+        .metadata
+        .files
+        .iter()
+        .map(|f| {
+            f.fields
+                .iter()
+                .copied()
+                .filter(|id| top_level_field_ids.contains(id))
+                .collect::<HashSet<_>>()
+        })
+        .collect();
+
+    let mut kept_files = Vec::new();
+    let mut write_tasks = Vec::new();
+    for group in column_groups {
+        // Filter to columns that exist in this fragment and preserve order
+        let cols: Vec<(i32, usize)> = group
+            .columns
+            .iter()
+            .filter_map(|name| column_to_field_id.get(name.as_str()).copied())
+            .filter(|(id, _)| frag_ids.contains(id))
+            .collect();
+
+        if cols.is_empty() {
+            continue;
+        }
+        let group_field_ids: HashSet<i32> = cols.iter().map(|(id, _)| *id).collect();
+        // If any existing file has exactly this set of field ids
+        if let Some(idx) = files_field_ids.iter().position(|s| *s == group_field_ids) {
+            kept_files.push(fragment.metadata.files[idx].clone());
+        } else {
+            write_tasks.push(DataFileWriteTask {
+                field_ids: cols.iter().map(|(id, _)| *id).collect(),
+                projected_field_indices: cols.iter().map(|(_, idx)| *idx).collect(),
+            });
+        }
+    }
+
+    Ok(FragmentOptimizeColumnsPlan {
+        preserve_deletions: !kept_files.is_empty(),
+        kept_files,
+        write_tasks,
+    })
+}
+
+/// Executes the optimization plan for a single fragment by performing the actual data rewriting
+/// and row ID management
+async fn execute_fragment_optimize_columns(
+    dataset: &Dataset,
+    fragment: FileFragment,
+    plan: FragmentOptimizeColumnsPlan,
+    defer_index_remap: bool,
+) -> Result<OptimizeColumnsResult> {
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(vec![fragment.metadata.clone()]);
+    scanner.scan_in_order(true);
+    if plan.preserve_deletions {
+        scanner.include_deleted_rows();
+    }
+
+    let uses_stable_row_ids = dataset.manifest.uses_move_stable_row_ids();
+    let needs_row_id_capture = !uses_stable_row_ids && !defer_index_remap;
+    let needs_index_remap = !defer_index_remap;
+
+    let (row_id_rx, data_stream) =
+        setup_row_id_capture(scanner, needs_row_id_capture, uses_stable_row_ids).await?;
+
+    // TODO: investigate batch streaming for writes
+    let all_batches: Vec<RecordBatch> = data_stream.try_collect().await?;
+    let new_data_files = write_all_data_files(&all_batches, &plan.write_tasks, dataset).await?;
+    let mut new_fragment = construct_new_fragment(plan, new_data_files, &fragment, &all_batches);
+
+    reserve_fragment_ids(dataset, std::iter::once(&mut new_fragment)).await?;
+
+    let (row_id_map, changed_row_addrs) = if let Some(row_id_rx) = row_id_rx {
+        let captured_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
+            message: format!("Failed to receive row ids: {}", err),
+            location: location!(),
+        })?;
+        let row_addrs = captured_ids.row_addrs(None).into_owned();
+
+        if needs_index_remap {
+            // Transpose now for immediate remapping
+            let old_fragments = vec![fragment.metadata.clone()];
+            let new_fragments = vec![new_fragment.clone()];
+            let row_id_map =
+                remapping::transpose_row_ids(row_addrs, &old_fragments, &new_fragments);
+            (Some(row_id_map), None)
+        } else {
+            // Serialize for deferred
+            let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
+            row_addrs.serialize_into(&mut serialized)?;
+            (None, Some(serialized))
+        }
+    } else {
+        // Stable row IDs
+        if needs_index_remap {
+            let old_fragments = vec![fragment.metadata.clone()];
+            let mut new_fragments = vec![new_fragment.clone()];
+            rechunk_stable_row_ids(dataset, &mut new_fragments, &old_fragments).await?;
+            new_fragment = new_fragments.into_iter().next().unwrap();
+            (Some(HashMap::new()), None)
+        } else {
+            // Record empty change set for deferred
+            let empty = RoaringTreemap::new();
+            let mut serialized = Vec::with_capacity(empty.serialized_size());
+            empty.serialize_into(&mut serialized)?;
+            (None, Some(serialized))
+        }
+    };
+
+    let mut metrics = CompactionMetrics::default();
+    metrics.fragments_removed = 1;
+    metrics.fragments_added = 1;
+    metrics.files_added = new_fragment.files.len();
+    metrics.files_removed =
+        fragment.metadata.files.len() + fragment.metadata.deletion_file.is_some() as usize;
+    Ok(OptimizeColumnsResult {
+        metrics,
+        old_fragment: fragment.metadata.clone(),
+        new_fragment,
+        row_id_map,
+        changed_row_addrs,
+    })
+}
+
+/// Sets up row ID capture stream if needed for legacy row IDs
+async fn setup_row_id_capture(
+    mut scanner: Scanner,
+    needs_row_id_capture: bool,
+    uses_stable_row_ids: bool,
+) -> Result<(
+    Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
+    SendableRecordBatchStream,
+)> {
+    if needs_row_id_capture {
+        scanner.with_row_id();
+        let data_stream = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+        let (data_no_row_ids, row_id_rx) =
+            make_rowid_capture_stream(data_stream, uses_stable_row_ids)?;
+        Ok((Some(row_id_rx), data_no_row_ids))
+    } else {
+        // Move-stable row IDs don't need capture
+        let data_stream = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+        Ok((None, data_stream))
+    }
+}
+
+/// Writes optimized data files in parallel
+async fn write_all_data_files(
+    all_batches: &[RecordBatch],
+    write_tasks: &[DataFileWriteTask],
+    dataset: &Dataset,
+) -> Result<Vec<DataFile>> {
+    // Filter out empty tasks and create write futures
+    let write_futures: Vec<_> = write_tasks
+        .into_iter()
+        .filter(|task| !task.field_ids.is_empty())
+        .map(|task| write_single_data_file(&task, all_batches, dataset))
+        .collect();
+
+    // Execute all writes in parallel
+    futures::future::try_join_all(write_futures).await
+}
+
+/// Writes a single optimized data file
+async fn write_single_data_file(
+    task: &DataFileWriteTask,
+    all_batches: &[RecordBatch],
+    dataset: &Dataset,
+) -> Result<DataFile> {
+    let data_storage_version = dataset
+        .manifest()
+        .data_storage_format
+        .lance_file_version()?;
+
+    // Project schema for this file
+    let projected_schema = dataset.schema().project_by_ids(&task.field_ids, true);
+
+    // Project batches to include only needed columns
+    let projected_batches: Vec<RecordBatch> = all_batches
+        .iter()
+        .map(|batch| Ok(batch.project(&task.projected_field_indices)?))
+        .collect::<Result<Vec<RecordBatch>>>()?;
+
+    // Write the data file
+    let mut writer = open_writer(
+        &dataset.object_store,
+        &projected_schema,
+        &dataset.base,
+        data_storage_version,
+    )
+    .await?;
+
+    writer.write(&projected_batches).await?;
+    let (_, data_file) = writer.finish().await?;
+
+    Ok(data_file)
+}
+
+/// constructs the new fragment with updated files and metadata
+fn construct_new_fragment(
+    plan: FragmentOptimizeColumnsPlan,
+    new_files: Vec<DataFile>,
+    old_fragment: &FileFragment,
+    all_batches: &[RecordBatch],
+) -> Fragment {
+    // Combine kept and new files
+    let mut files = plan.kept_files;
+    files.extend(new_files);
+
+    // Determine physical rows based on deletion preservation
+    let physical_rows = if plan.preserve_deletions {
+        old_fragment.metadata.physical_rows
+    } else {
+        // TODO: figure out a better way to find the physical row count and avoid double scans
+        Some(all_batches.iter().map(|b| b.num_rows()).sum())
+    };
+
+    // Preserve deletion file and row ID metadata if keeping any files
+    let (deletion_file, row_id_meta) = if plan.preserve_deletions {
+        (
+            old_fragment.metadata.deletion_file.clone(),
+            old_fragment.metadata.row_id_meta.clone(),
+        )
+    } else {
+        (None, None)
+    };
+
+    Fragment {
+        id: 0,
+        files,
+        deletion_file,
+        row_id_meta,
+        physical_rows,
+    }
+}
+
+/// Commit horizontal compaction results in batched transaction
+async fn commit_optimize_columns(
+    dataset: &mut Dataset,
+    completed_results: Vec<OptimizeColumnsResult>,
+    defer_index_remap: bool,
+) -> Result<CompactionMetrics> {
+    if completed_results.is_empty() {
+        return Ok(CompactionMetrics::default());
+    }
+
+    let mut optimize_groups = Vec::with_capacity(completed_results.len());
+    let mut total_metrics = CompactionMetrics::default();
+    let mut combined_row_id_map: HashMap<u64, Option<u64>> = HashMap::new();
+    let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
+    let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
+    let needs_remapping = !dataset.manifest.uses_move_stable_row_ids() && !defer_index_remap;
+
+    // Process each result and build row ID mappings
+    for result in completed_results {
+        total_metrics += result.metrics;
+
+        if needs_remapping {
+            combined_row_id_map.extend(result.row_id_map.unwrap());
+        } else if defer_index_remap {
+            frag_reuse_groups.push(FragReuseGroup {
+                changed_row_addrs: result.changed_row_addrs.unwrap(),
+                old_frags: vec![(&result.old_fragment).into()],
+                new_frags: vec![(&result.new_fragment).into()],
+            });
+
+            new_fragment_bitmap.insert(result.new_fragment.id as u32);
+        }
+
+        let rewrite_group = OptimizeColumnsGroup {
+            old_fragment: result.old_fragment,
+            new_fragment: result.new_fragment,
+        };
+        optimize_groups.push(rewrite_group);
+    }
+
+    let rewritten_indices = if needs_remapping {
+        // Immediate index remapping for legacy row IDs
+        let remap_options = Arc::new(DatasetIndexRemapperOptions::default());
+        let index_remapper = remap_options.create_remapper(dataset)?;
+        let affected_ids = optimize_groups
+            .iter()
+            .map(|group| group.old_fragment.id)
+            .collect::<Vec<_>>();
+
+        let remapped_indices = index_remapper
+            .remap_indices(combined_row_id_map, &affected_ids)
+            .await?;
+
+        remapped_indices
+            .iter()
+            .map(|rewritten| RewrittenIndex {
+                old_id: rewritten.original,
+                new_id: rewritten.new,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let frag_reuse_index = if defer_index_remap {
+        Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
+    } else {
+        None
+    };
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::OptimizeColumns {
+            groups: optimize_groups,
+            rewritten_indices,
+            frag_reuse_index,
+        },
+        None,
+        None,
+    );
+
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
+
+    Ok(total_metrics)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -981,8 +1549,8 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Int32Type, Int64Type};
     use arrow_array::{
-        Float32Array, Int64Array, LargeStringArray, PrimitiveArray, RecordBatch,
-        RecordBatchIterator,
+        ArrayRef, Float32Array, Int64Array, LargeStringArray, PrimitiveArray, RecordBatch,
+        RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
@@ -3419,5 +3987,420 @@ mod tests {
             "Expected no fragment scan in plan: {}",
             plan
         );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_columns_empty() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("data", DataType::Utf8, false),
+            Field::new("value", DataType::Float32, false),
+        ]);
+
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), Arc::new(schema));
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let metrics = optimize_columns(&mut dataset, OptimizeColumnOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(metrics, CompactionMetrics::default());
+        assert_eq!(dataset.manifest.version, 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_optimize_columns_data_preservation(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)] version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = create_test_dataset(test_uri, 100, version).await;
+        let original_data = collect_data(&dataset).await;
+
+        // Regroup columns in different ways
+        let options = OptimizeColumnOptions {
+            column_groups: Some(vec![
+                ColumnGroup::new(vec!["id".to_string()]),
+                ColumnGroup::new(vec!["data".to_string(), "value".to_string()]),
+            ]),
+            num_threads: None,
+            defer_index_remap: false,
+        };
+
+        optimize_columns(&mut dataset, options).await.unwrap();
+        let new_data = collect_data(&dataset).await;
+
+        // GUARANTEE: Data must be identical after optimization
+        assert_eq!(original_data.num_rows(), new_data.num_rows());
+        assert_eq!(original_data.num_columns(), new_data.num_columns());
+        assert_eq!(original_data, new_data);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_guarantee_row_count_invariant(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)] version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = create_test_dataset(test_uri, 150, version).await;
+
+        // Delete some rows to test deletion handling
+        dataset.delete("id >= 120").await.unwrap();
+        let original_count = dataset.count_rows(None).await.unwrap();
+
+        let options = OptimizeColumnOptions {
+            column_groups: Some(vec![
+                ColumnGroup::new(vec!["id".to_string(), "data".to_string()]),
+                ColumnGroup::new(vec!["value".to_string()]),
+            ]),
+            num_threads: None,
+            defer_index_remap: false,
+        };
+
+        optimize_columns(&mut dataset, options).await.unwrap();
+        let new_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(original_count, new_count);
+    }
+
+    #[tokio::test]
+    async fn test_guarantee_column_grouping_correctness() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = create_test_dataset(test_uri, 100, LanceFileVersion::Stable).await;
+
+        let options = OptimizeColumnOptions {
+            column_groups: Some(vec![
+                ColumnGroup::new(vec!["id".to_string()]),
+                ColumnGroup::new(vec!["data".to_string(), "value".to_string()]),
+            ]),
+            num_threads: None,
+            defer_index_remap: false,
+        };
+
+        optimize_columns(&mut dataset, options).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let files = &fragments[0].metadata.files;
+        assert_eq!(files.len(), 2);
+
+        let schema = dataset.schema();
+        let id_field_id = schema.field("id").unwrap().id;
+        let data_field_id = schema.field("data").unwrap().id;
+        let value_field_id = schema.field("value").unwrap().id;
+
+        let single_field_file = files.iter().find(|f| f.fields.len() == 1).unwrap();
+        let double_field_file = files.iter().find(|f| f.fields.len() == 2).unwrap();
+
+        assert_eq!(single_field_file.fields, vec![id_field_id]);
+        assert!(double_field_file.fields.contains(&data_field_id));
+        assert!(double_field_file.fields.contains(&value_field_id));
+    }
+
+    #[tokio::test]
+    async fn test_guarantee_exact_match_noop() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = create_test_dataset(test_uri, 100, LanceFileVersion::Stable).await;
+        let original_version = dataset.version().version;
+        let original_fragment_ids: Vec<_> =
+            dataset.get_fragments().iter().map(|f| f.id()).collect();
+
+        let options = OptimizeColumnOptions {
+            column_groups: Some(vec![ColumnGroup::new(vec![
+                "id".to_string(),
+                "data".to_string(),
+                "value".to_string(),
+            ])]),
+            num_threads: None,
+            defer_index_remap: false,
+        };
+
+        let metrics = optimize_columns(&mut dataset, options).await.unwrap();
+
+        assert_eq!(metrics.fragments_added, 0);
+        assert_eq!(metrics.fragments_removed, 0);
+        assert_eq!(metrics.files_added, 0);
+        assert_eq!(metrics.files_removed, 0);
+        assert_eq!(dataset.version().version, original_version);
+
+        let new_fragment_ids: Vec<_> = dataset.get_fragments().iter().map(|f| f.id()).collect();
+        assert_eq!(original_fragment_ids, new_fragment_ids);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_row_id_remapping() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = create_test_dataset(test_uri, 100, LanceFileVersion::Legacy).await;
+        assert!(!dataset.manifest.uses_move_stable_row_ids());
+
+        // Create index before optimization to test remapping
+        dataset
+            .create_index(
+                &["data"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Delete some rows to force row ID remapping
+        dataset.delete("id >= 80").await.unwrap();
+
+        let options = OptimizeColumnOptions {
+            column_groups: Some(vec![ColumnGroup::new(vec![
+                "id".to_string(),
+                "data".to_string(),
+                "value".to_string(),
+            ])]),
+            num_threads: None,
+            defer_index_remap: false,
+        };
+
+        optimize_columns(&mut dataset, options).await.unwrap();
+
+        let results = dataset
+            .scan()
+            .filter("data = 'data_50'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 80);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_columns_nested_fields() {
+        use arrow_schema::Fields;
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let nested_fields = Fields::from(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("data", DataType::Struct(nested_fields.clone()), false),
+        ]);
+
+        let nested_a_stream: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..50).map(|i| format!("a_{}", i)),
+        ));
+        let nested_b_stream = Arc::new(Int64Array::from_iter_values(0..50)) as ArrayRef;
+        let nested_struct = StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Utf8, false)),
+                nested_a_stream.clone(),
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Int64, false)),
+                nested_b_stream.clone(),
+            ),
+        ]);
+
+        let data = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..50i64)),
+                Arc::new(nested_struct),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 50,
+            ..Default::default()
+        };
+
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let original_data = collect_data(&dataset).await;
+
+        let options = OptimizeColumnOptions {
+            column_groups: Some(vec![
+                ColumnGroup::new(vec!["id".to_string()]),
+                ColumnGroup::new(vec!["data".to_string()]),
+            ]),
+            num_threads: None,
+            defer_index_remap: false,
+        };
+
+        optimize_columns(&mut dataset, options).await.unwrap();
+        let new_data = collect_data(&dataset).await;
+        let fragments = dataset.get_fragments();
+
+        assert_eq!(original_data, new_data);
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_columns_merge_multiple_files() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let initial_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let initial_stream = RecordBatch::try_new(
+            initial_schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..100))],
+        )
+        .unwrap();
+
+        let batch = RecordBatchIterator::new(vec![Ok(initial_stream)], initial_schema);
+        let mut dataset = Dataset::write(batch, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let data_stream = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("data", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|i| format!("data_{}", i)),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let merge_batch = RecordBatchIterator::new(
+            vec![Ok(data_stream)],
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("data", DataType::Utf8, false),
+            ])),
+        );
+
+        dataset.merge(merge_batch, "id", "id").await.unwrap();
+
+        // Verify we now have multiple files
+        let fragments = dataset.get_fragments();
+        let fragment = &fragments[0];
+
+        assert_eq!(fragment.metadata.files.len(), 2);
+        let original_file_count = fragment.metadata.files.len();
+
+        let options = OptimizeColumnOptions {
+            column_groups: Some(vec![ColumnGroup::new(vec![
+                "id".to_string(),
+                "data".to_string(),
+            ])]),
+            num_threads: None,
+            defer_index_remap: false,
+        };
+
+        let metrics = optimize_columns(&mut dataset, options).await.unwrap();
+
+        // Verify optimization worked
+        assert!(metrics.files_added > 0);
+
+        let new_fragments = dataset.get_fragments();
+        let new_fragment = &new_fragments[0];
+
+        assert_eq!(new_fragment.metadata.files.len(), 1);
+
+        // Verify data integrity
+        let row_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(row_count, 100);
+
+        // Verify we can read both columns
+        let batches: Vec<RecordBatch> = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let first_batch = &batches[0];
+        assert!(first_batch.column_by_name("id").is_some());
+        assert!(first_batch.column_by_name("data").is_some());
+
+        println!("Merged {} files into 1 file", original_file_count);
+    }
+
+    async fn create_test_dataset(
+        path: &str,
+        num_rows: usize,
+        version: LanceFileVersion,
+    ) -> Dataset {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("data", DataType::Utf8, false),
+            Field::new("value", DataType::Float32, false),
+        ]);
+
+        let stream = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..num_rows as i64)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..num_rows).map(|i| format!("data_{}", i)),
+                )),
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|i| i as f32 * 0.1),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: num_rows,
+            data_storage_version: Some(version),
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new(vec![Ok(stream.clone())], stream.schema());
+        Dataset::write(batches, path, Some(write_params))
+            .await
+            .unwrap()
+    }
+
+    async fn collect_data(dataset: &Dataset) -> RecordBatch {
+        let batches: Vec<_> = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        concat_batches(&batches[0].schema(), &batches).unwrap()
     }
 }

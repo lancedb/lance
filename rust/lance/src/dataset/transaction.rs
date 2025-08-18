@@ -150,6 +150,21 @@ pub enum Operation {
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<Index>,
     },
+    /// Data is reorganized in a fragment but *not* modified. This is used for
+    /// optimize columns. Contains the old fragments and the new
+    /// ones as pair to be swapped.
+    ///
+    /// This operation will modify the row addresses of existing rows and
+    /// so any existing index covering a rewritten fragment will need to be
+    /// remapped.
+    OptimizeColumns {
+        /// Groups of fragments that have been modified
+        groups: Vec<OptimizeColumnsGroup>,
+        /// Indices that have been updated with the new row addresses
+        rewritten_indices: Vec<RewrittenIndex>,
+        /// The fragment reuse index to be created or updated to
+        frag_reuse_index: Option<Index>,
+    },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
     /// new column that has data.
@@ -245,6 +260,7 @@ impl std::fmt::Display for Operation {
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
+            Self::OptimizeColumns { .. } => write!(f, "OptimizeColumns"),
         }
     }
 }
@@ -310,6 +326,22 @@ impl PartialEq for Operation {
                     frag_reuse_index: a_frag_reuse_index,
                 },
                 Self::Rewrite {
+                    groups: b_groups,
+                    rewritten_indices: b_indices,
+                    frag_reuse_index: b_frag_reuse_index,
+                },
+            ) => {
+                compare_vec(a_groups, b_groups)
+                    && compare_vec(a_indices, b_indices)
+                    && a_frag_reuse_index == b_frag_reuse_index
+            }
+            (
+                Self::OptimizeColumns {
+                    groups: a_groups,
+                    rewritten_indices: a_indices,
+                    frag_reuse_index: a_frag_reuse_index,
+                },
+                Self::OptimizeColumns {
                     groups: b_groups,
                     rewritten_indices: b_indices,
                     frag_reuse_index: b_frag_reuse_index,
@@ -887,6 +919,10 @@ impl PartialEq for Operation {
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_removed, b_removed)
             }
+            // All other combinations involving OptimizeColumns use discriminant comparison
+            (Self::OptimizeColumns { .. }, _) | (_, Self::OptimizeColumns { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
         }
     }
 }
@@ -907,6 +943,18 @@ impl DeepSizeOf for RewrittenIndex {
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct OptimizeColumnsGroup {
+    pub old_fragment: Fragment,
+    pub new_fragment: Fragment,
+}
+
+impl PartialEq for OptimizeColumnsGroup {
+    fn eq(&self, other: &Self) -> bool {
+        self.old_fragment == other.old_fragment && self.new_fragment == other.new_fragment
+    }
 }
 
 impl PartialEq for RewriteGroup {
@@ -1015,6 +1063,7 @@ impl Operation {
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
+            Self::OptimizeColumns { .. } => "OptimizeColumns",
         }
     }
 }
@@ -1525,6 +1574,42 @@ impl Transaction {
                     removed.clone(),
                 )?;
             }
+            Operation::OptimizeColumns {
+                ref groups,
+                ref rewritten_indices,
+                ref frag_reuse_index,
+            } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
+                Self::handle_optimize_columns(
+                    &mut final_fragments,
+                    groups,
+                    &mut fragment_id,
+                    current_version,
+                )?;
+
+                if next_row_id.is_some() {
+                    for index in final_indices.iter_mut() {
+                        if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                            *fragment_bitmap = Self::recalculate_fragment_bitmap_optimize(
+                                fragment_bitmap,
+                                groups,
+                            )?;
+                        }
+                    }
+                } else {
+                    Self::handle_rewrite_indices_optimize(
+                        &mut final_indices,
+                        rewritten_indices,
+                        groups,
+                    )?;
+                }
+
+                if let Some(frag_reuse_index) = frag_reuse_index {
+                    final_indices.retain(|idx| idx.name != frag_reuse_index.name);
+                    final_indices.push(frag_reuse_index.clone());
+                }
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -1885,6 +1970,96 @@ impl Transaction {
         }
         Ok(())
     }
+
+    fn handle_optimize_columns(
+        final_fragments: &mut Vec<Fragment>,
+        groups: &[OptimizeColumnsGroup],
+        fragment_id: &mut u64,
+        version: u64,
+    ) -> Result<()> {
+        for group in groups {
+            if let Some(pos) = final_fragments
+                .iter()
+                .position(|f| f.id == group.old_fragment.id)
+            {
+                let mut new_fragment = group.new_fragment.clone();
+                if new_fragment.id == 0 {
+                    new_fragment.id = *fragment_id;
+                    *fragment_id += 1;
+                }
+                final_fragments[pos] = new_fragment;
+            } else {
+                return Err(Error::CommitConflict {
+                    version,
+                    source: format!(
+                        "Fragment {} not found for optimize columns",
+                        group.old_fragment.id
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_rewrite_indices_optimize(
+        indices: &mut [Index],
+        rewritten_indices: &[RewrittenIndex],
+        groups: &[OptimizeColumnsGroup],
+    ) -> Result<()> {
+        let mut modified_indices = HashSet::new();
+
+        for rewritten_index in rewritten_indices {
+            if !modified_indices.insert(rewritten_index.old_id) {
+                return Err(Error::invalid_input(format!("An invalid compaction plan must have been generated because multiple tasks modified the same index: {}", rewritten_index.old_id), location!()));
+            }
+
+            let index = indices
+                .iter_mut()
+                .find(|idx| idx.uuid == rewritten_index.old_id)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "Invalid compaction plan refers to index {} which does not exist",
+                            rewritten_index.old_id
+                        ),
+                        location!(),
+                    )
+                })?;
+
+            index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap_optimize(
+                index.fragment_bitmap.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "Cannot rewrite index {} which did not store fragment bitmap",
+                            index.uuid
+                        ),
+                        location!(),
+                    )
+                })?,
+                groups,
+            )?);
+
+            index.uuid = rewritten_index.new_id;
+        }
+        Ok(())
+    }
+
+    fn recalculate_fragment_bitmap_optimize(
+        old: &RoaringBitmap,
+        groups: &[OptimizeColumnsGroup],
+    ) -> Result<RoaringBitmap> {
+        let mut new_bitmap = old.clone();
+        for group in groups {
+            // simple 1:1 fragment replacement
+            if old.contains(group.old_fragment.id as u32) {
+                new_bitmap.remove(group.old_fragment.id as u32);
+                new_bitmap.insert(group.new_fragment.id as u32);
+            }
+        }
+        Ok(new_bitmap)
+    }
 }
 
 impl From<&DataReplacementGroup> for pb::transaction::DataReplacementGroup {
@@ -2221,6 +2396,27 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
+impl TryFrom<pb::transaction::optimize_columns::OptimizeColumnGroup> for OptimizeColumnsGroup {
+    type Error = Error;
+
+    fn try_from(message: pb::transaction::optimize_columns::OptimizeColumnGroup) -> Result<Self> {
+        Ok(Self {
+            old_fragment: Fragment::try_from(message.old_fragment.ok_or_else(|| {
+                Error::io(
+                    "required field (old_fragment) missing from message".to_string(),
+                    location!(),
+                )
+            })?)?,
+            new_fragment: Fragment::try_from(message.new_fragment.ok_or_else(|| {
+                Error::io(
+                    "required field (new_fragment) missing from message".to_string(),
+                    location!(),
+                )
+            })?)?,
+        })
+    }
+}
+
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
         let operation = match &value.operation {
@@ -2369,6 +2565,21 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<_>>(),
                 })
             }
+            Operation::OptimizeColumns {
+                groups,
+                rewritten_indices,
+                frag_reuse_index: _,
+            } => pb::transaction::Operation::OptimizeColumns(pb::transaction::OptimizeColumns {
+                groups: groups
+                    .iter()
+                    .map(pb::transaction::optimize_columns::OptimizeColumnGroup::from)
+                    .collect(),
+                rewritten_indices: rewritten_indices
+                    .iter()
+                    .map(|rewritten| rewritten.into())
+                    .collect(),
+                ..Default::default()
+            }),
         };
 
         let blob_operation = value.blobs_op.as_ref().map(|op| match op {
@@ -2432,6 +2643,15 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
                 .iter()
                 .map(pb::DataFragment::from)
                 .collect(),
+        }
+    }
+}
+
+impl From<&OptimizeColumnsGroup> for pb::transaction::optimize_columns::OptimizeColumnGroup {
+    fn from(value: &OptimizeColumnsGroup) -> Self {
+        Self {
+            old_fragment: Some(pb::DataFragment::from(&value.old_fragment)),
+            new_fragment: Some(pb::DataFragment::from(&value.new_fragment)),
         }
     }
 }

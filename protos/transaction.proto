@@ -202,6 +202,26 @@ message Transaction {
     repeated MemWalIndexDetails.MemWal removed = 3;
   }
 
+  message OptimizeColumns {
+    // A pair of fragments that are to be swapped as part of an optimize
+    // columns operation
+    message OptimizeColumnGroup {
+      // The old fragment that is being replaced
+      //
+      // This should have an existing fragment ID.
+      DataFragment old_fragment = 1;
+      // The new fragment
+      //
+      // The ID should have been reserved by an earlier
+      // reserve operation
+      DataFragment new_fragment = 2;
+    }
+
+
+    repeated OptimizeColumnGroup groups = 1;
+    repeated Rewrite.RewrittenIndex rewritten_indices = 2;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
