@@ -33,8 +33,7 @@ use std::sync::Arc;
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance::dataset::{load_and_sort_new_transactions_v3, Dataset, WriteParams};
-use lance::io::commit::load_and_sort_new_transactions;
+use lance::dataset::{Dataset, WriteParams};
 use lance_table::io::commit::ManifestNamingScheme;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -180,88 +179,6 @@ fn bench_checkout_latest(c: &mut Criterion) {
     }
 }
 
-fn bench_load_new_transactions_during_commit(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let storage_prefix = get_storage_prefix();
-    let storage_type = get_storage_type();
-
-    // Test different combinations of commits_behind and head_manifests_batch_size
-    // to better measure the effectiveness, use large commits_behind size
-    // otherwise the time is dominated by the file download time and variance is high
-    let test_configs = [(20, 21)];
-
-    for num_versions in [50, 100, 200] {
-        for (commits_behind, head_manifests_batch_size) in test_configs {
-            // Skip if we don't have enough versions
-            if commits_behind >= num_versions {
-                continue;
-            }
-
-            // Test V2 scheme
-            {
-                let scheme = ManifestNamingScheme::V2;
-                let dataset_uri = format!("{}bench_load_v2_{}.lance", storage_prefix, num_versions);
-                let dataset = rt.block_on(create_test_dataset(&dataset_uri, num_versions, scheme));
-                let latest_version = dataset.version().version;
-                let target_version = latest_version - commits_behind;
-
-                c.bench_function(
-                    &format!(
-                        "load_new_transactions_during_commit_V2 ({} versions, {} behind, {})",
-                        num_versions, commits_behind, storage_type
-                    ),
-                    |b| {
-                        b.to_async(&rt).iter(|| async {
-                            // Checkout an older version to simulate being behind
-                            let old_dataset =
-                                dataset.checkout_version(target_version).await.unwrap();
-
-                            // Measure only the load_and_sort_new_transactions function
-                            let (_new_dataset, transactions) =
-                                load_and_sort_new_transactions(&old_dataset).await.unwrap();
-
-                            // Verify we loaded the expected number of transactions
-                            assert_eq!(transactions.len(), commits_behind as usize);
-                        })
-                    },
-                );
-            }
-
-            // Test V3 scheme
-            {
-                let scheme = ManifestNamingScheme::V3;
-                let dataset_uri = format!("{}bench_load_v3_{}.lance", storage_prefix, num_versions);
-                let dataset = rt.block_on(create_test_dataset(&dataset_uri, num_versions, scheme));
-                let latest_version = dataset.version().version;
-                let target_version = latest_version - commits_behind;
-
-                c.bench_function(
-                    &format!(
-                        "load_new_transactions_during_commit_V3 ({} versions, {} behind, head batch size {}, {})",
-                        num_versions, commits_behind, head_manifests_batch_size, storage_type
-                    ),
-                    |b| {
-                        b.to_async(&rt).iter(|| async {
-                            // Checkout an older version to simulate being behind
-                            let old_dataset =
-                                dataset.checkout_version(target_version).await.unwrap();
-
-                            // Measure only the load_and_sort_new_transactions_v3 function
-                            let (_new_dataset, transactions) =
-                                load_and_sort_new_transactions_v3(&old_dataset, head_manifests_batch_size)
-                                    .await
-                                    .unwrap();
-
-                            // Verify we loaded the expected number of transactions
-                            assert_eq!(transactions.len(), commits_behind as usize);
-                        })
-                    },
-                );
-            }
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
@@ -270,7 +187,7 @@ criterion_group!(
         .sample_size(50)
         .warm_up_time(std::time::Duration::from_secs(5))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_checkout_latest, bench_load_new_transactions_during_commit
+    targets = bench_checkout_latest
 );
 
 #[cfg(not(target_os = "linux"))]
@@ -280,7 +197,7 @@ criterion_group!(
         .significance_level(0.01)
         .sample_size(50)
         .warm_up_time(std::time::Duration::from_secs(5));
-    targets = bench_checkout_latest, bench_load_new_transactions_during_commit
+    targets = bench_checkout_latest
 );
 
 criterion_main!(benches);
