@@ -153,8 +153,26 @@ message Manifest {
   // If this value is 0 then there are no blob fields.
   uint64 blob_dataset_version = 17;
 
-  repeated string reference_paths = 18;
+  // The base paths of data files.
+  //
+  // This is used to determine the base path of a data file. In common cases data file paths are under current dataset base path.
+  // But for shallow cloning, importing file and other multi-tier storage cases, the actual data files could be outside of the current dataset.
+  // This field is used with the `base_id` in `lance.file.File` and `lance.file.DeletionFile`.
+  //
+  // For example, if we have a dataset with base path `s3://bucket/dataset`, we have a DataFile with base_id 0, we get the actual data file path by:
+  // base_paths[id = 0] + /data/ + file.path
+  // the key(a.k.a index) starts from 0, increased by 1 for each new base path.
+  repeated BasePath base_paths = 18;
 } // Manifest
+
+// external dataset base path
+message BasePath {
+  uint32 id = 1;
+  string name = 2;
+  // in case that cloning and importing paths are used in different ways
+  bool dataset_base = 3;
+  string path = 4;
+}
 
 // Auxiliary Data attached to a version.
 // Only load on-demand.
@@ -321,8 +339,10 @@ message DataFile {
   //
   // When this is zero, it should be interpreted as "unknown".
   uint64 file_size_bytes = 6;
-  // The base path of the data file. Used when the file is imported or referred from another dataset
-  optional uint32 path_base_index = 7;
+
+  // The base path index of the data file. Used when the file is imported or referred from another dataset.
+  // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+  optional uint32 base_id = 7;
 } // DataFile
 
 // Deletion File
@@ -352,8 +372,9 @@ message DeletionFile {
   uint64 id = 3;
   // The number of rows that are marked as deleted.
   uint64 num_deleted_rows = 4;
-  // The base path of the deletion file. Used when the file is imported or referred from another dataset
-  optional uint32 path_base_index = 5;
+  // The base path index of the data file. Used when the file is imported or referred from another dataset.
+  // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+  optional uint32 base_id = 7;
 } // DeletionFile
 
 message ExternalFile {

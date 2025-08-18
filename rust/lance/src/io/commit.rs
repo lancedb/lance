@@ -113,16 +113,16 @@ async fn do_commit_new_dataset(
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) = if let Operation::Clone {
-        ref_path: ref source_path,
+        ref_name,
         ref_version,
-        ref_path_index,
+        ref_path,
         ..
-    } = transaction.operation
+    } = &transaction.operation
     {
         let source_manifest_location = commit_handler
             .resolve_version_location(
-                &Path::parse(source_path.as_str())?,
-                ref_version,
+                &Path::parse(ref_path.as_str())?,
+                *ref_version,
                 &object_store.inner,
             )
             .await?;
@@ -134,7 +134,7 @@ async fn do_commit_new_dataset(
         )
         .await?;
         let new_manifest =
-            source_manifest.shallow_clone(source_path, ref_path_index, transaction_file);
+            source_manifest.shallow_clone(ref_name.clone(), ref_path.clone(), transaction_file);
         (new_manifest, Vec::new())
     } else {
         let (manifest, indices) = transaction.build_manifest(
@@ -1450,7 +1450,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version=*/ None,
-            Vec::new(),
+            HashMap::new(),
         );
 
         fix_schema(&mut manifest).unwrap();

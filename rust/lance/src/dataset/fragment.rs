@@ -2376,7 +2376,6 @@ impl FragmentReader {
 
 #[cfg(test)]
 mod tests {
-
     use arrow_arith::numeric::mul;
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};

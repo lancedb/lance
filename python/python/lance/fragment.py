@@ -161,7 +161,7 @@ class DataFile:
     file_major_version: int = 0
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
-    path_base_index: Optional[int] = None
+    base_id: Optional[int] = None
 
     def __init__(
         self,
@@ -171,7 +171,7 @@ class DataFile:
         file_major_version: int = 0,
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
-        path_base_index: Optional[int] = None,
+        base_id: Optional[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -180,7 +180,7 @@ class DataFile:
         self.file_major_version = file_major_version
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
-        self.path_base_index = path_base_index
+        self.base_id = base_id
 
     def __repr__(self):
         # pretend we have a 'path' attribute

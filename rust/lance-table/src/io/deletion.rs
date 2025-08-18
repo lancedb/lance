@@ -66,7 +66,7 @@ pub async fn write_deletion_file(
                 id,
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(set.len()),
-                path_base_index: None,
+                base_id: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 
@@ -103,7 +103,7 @@ pub async fn write_deletion_file(
                 id,
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
-                path_base_index: None,
+                base_id: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 

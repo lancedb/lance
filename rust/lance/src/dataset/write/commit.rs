@@ -490,7 +490,7 @@ mod tests {
                 file_major_version: 2,
                 file_minor_version: 0,
                 file_size_bytes: CachedFileSize::new(100),
-                path_base_index: None,
+                base_id: None,
             }],
             deletion_file: None,
             row_id_meta: None,

@@ -9,6 +9,7 @@ use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
+use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 use tracing::instrument;
 
@@ -226,7 +227,7 @@ impl ManifestProvider for ManifestDescribing {
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
             /*blob_dataset_version= */ None,
-            Vec::new(),
+            HashMap::new(),
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
@@ -278,7 +279,7 @@ mod test {
             Arc::new(vec![]),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            Vec::new(),
+            HashMap::new(),
         );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await

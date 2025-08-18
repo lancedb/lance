@@ -233,7 +233,7 @@ impl IntoJava for &DataFile {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
         };
-        let path_base_index = convert_to_java_integer(env, self.path_base_index)?;
+        let base_id = convert_to_java_integer(env, self.base_id)?;
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -244,7 +244,7 @@ impl IntoJava for &DataFile {
                 JValueGen::Int(self.file_major_version as i32),
                 JValueGen::Int(self.file_minor_version as i32),
                 JValueGen::Object(&file_size_bytes),
-                JValueGen::Object(&path_base_index),
+                JValueGen::Object(&base_id),
             ],
         )?)
     }
@@ -275,7 +275,7 @@ impl IntoJava for &DeletionFile {
             None => JObject::null(),
         };
         let file_type = self.file_type.into_java(env)?;
-        let path_base_index = convert_to_java_integer(env, self.path_base_index)?;
+        let base_id = convert_to_java_integer(env, self.base_id)?;
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -284,7 +284,7 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
-                JValueGen::Object(&path_base_index),
+                JValueGen::Object(&base_id),
             ],
         )?)
     }
@@ -411,13 +411,13 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             )?
             .l()?
             .extract_object(env)?;
-        let path_base_index = get_path_base_index(env, self)?;
+        let base_id = get_base_id(env, self)?;
         Ok(DeletionFile {
             read_version,
             id,
             num_deleted_rows,
             file_type,
-            path_base_index,
+            base_id,
         })
     }
 }
@@ -461,7 +461,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             .extract_object(env)?;
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
-        let path_base_index = get_path_base_index(env, self)?;
+        let base_id = get_base_id(env, self)?;
         Ok(DataFile {
             path,
             fields,
@@ -469,22 +469,22 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
-            path_base_index,
+            base_id,
         })
     }
 }
 
-fn get_path_base_index(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
-    let path_base_index = env
+fn get_base_id(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
+    let base_id = env
         .call_method(obj, "getPathBaseIndex", "()Ljava/util/Optional;", &[])?
         .l()?;
 
     if env
-        .call_method(&path_base_index, "isPresent", "()Z", &[])?
+        .call_method(&base_id, "isPresent", "()Z", &[])?
         .z()?
     {
         let inner_value = env
-            .call_method(&path_base_index, "get", "()Ljava/lang/Object;", &[])?
+            .call_method(&base_id, "get", "()Ljava/lang/Object;", &[])?
             .l()?;
         let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
         Ok(Some(int_value as u32))

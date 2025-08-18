@@ -1181,56 +1181,53 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
-        match data_file.path_base_index.as_ref() {
-            Some(path_index) => {
-                let reference_paths = &self.manifest.reference_paths;
-                reference_paths
-                    .get(*path_index as usize)
-                    .map(|base_path| Path::parse(base_path.as_str()).map(|p| p.child(DATA_DIR)))
-                    .transpose()?
-                    .ok_or_else(|| {
-                        Error::invalid_input(
-                            format!(
-                                "base_paths index {} out of bounds (max {}) for data_file {}",
-                                path_index,
-                                reference_paths.len(),
-                                data_file.path,
-                            ),
-                            location!(),
-                        )
-                    })
-            }
-            _ => Ok(self.base.child(DATA_DIR)),
-        }
-    }
-
-    pub(crate) fn deletion_file_root_dir(&self, deletion_file: &DeletionFile) -> Result<Path> {
-        match deletion_file.path_base_index.as_ref() {
-            Some(path_index) => {
-                let reference_paths = &self.manifest.reference_paths;
-                reference_paths
-                    .get(*path_index as usize)
-                    .map(|base_path| Path::parse(base_path.as_str()))
-                    .transpose()?
-                    .ok_or_else(|| {
-                        Error::invalid_input(
-                            format!(
-                                "base_paths index {} out of bounds (max {}) for deletion_file {}",
-                                path_index,
-                                reference_paths.len(),
-                                deletion_file,
-                            ),
-                            location!(),
-                        )
-                    })
-            }
-            _ => Ok(self.base.clone()),
-        }
-    }
-
     pub(crate) fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
+    }
+
+    pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
+        match data_file.base_id.as_ref() {
+            Some(base_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(base_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "base_path id {} not found for data_file {}",
+                            base_id, data_file.path
+                        ),
+                        location!(),
+                    )
+                })?;
+
+                let path = Path::parse(base_path.path.as_str())?;
+                if base_path.dataset_base {
+                    Ok(path.child(DATA_DIR))
+                } else {
+                    Ok(path)
+                }
+            }
+            None => Ok(self.base.child(DATA_DIR)),
+        }
+    }
+
+    pub(crate) fn deletion_file_base_dir(&self, deletion_file: &DeletionFile) -> Result<Path> {
+        match deletion_file.base_id.as_ref() {
+            Some(base_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(base_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "base_path id {} not found for deletion_file {}",
+                            base_id, deletion_file
+                        ),
+                        location!(),
+                    )
+                })?;
+
+                Ok(Path::parse(base_path.path.as_str())?)
+            }
+            None => Ok(self.base.clone()),
+        }
     }
 
     pub fn session(&self) -> Arc<Session> {
@@ -1647,13 +1644,11 @@ impl Dataset {
     ) -> Result<Self> {
         // self.tags.create(ref_name, self.version().version).await?;
         let version = self.tags.get_version(ref_name).await?;
-        let next_ref_path_index = self.manifest.reference_paths.len();
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: ref_name.to_string(),
             ref_version: version,
             ref_path: String::from(self.base.clone()),
-            ref_path_index: next_ref_path_index as u32,
         };
         let transaction = Transaction::new(version, clone_op, None, None);
 
@@ -6623,7 +6618,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
-            path_base_index: None,
+            base_id: None,
         };
 
         let dataset = Dataset::commit(
@@ -6678,7 +6673,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
-            path_base_index: None,
+            base_id: None,
         };
 
         let dataset = Dataset::commit(
@@ -6777,7 +6772,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
-            path_base_index: None,
+            base_id: None,
         };
 
         let new_data_file = DataFile {

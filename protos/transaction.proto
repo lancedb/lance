@@ -156,13 +156,19 @@ message Transaction {
 
   // An operation that clones a dataset.
   message Clone {
+    // if true, only clone the target manifest and don't copy the data. use base_paths field to reference the data.
+    // if false, copy the data and manifest at the target version. This should be a totally oss copy operation.
     bool is_shallow = 1;
+    // the reference name in the source dataset
+    // for branch scenario, this is the branch name in the source dataset
+    // for non branch scenario(normal cloning), this is an optional tag name in the source dataset
     string ref_name = 2;
+    // the version of the source dataset for cloning
     uint64 ref_version = 3;
+    // the absolute base path of the source dataset for cloning
     string ref_path = 4;
-    uint32 ref_path_index = 5;
   }
-
+  
   // An operation that updates rows but does not add or remove rows.
   message Update {
     // The fragments that have been removed. These are fragments where all rows

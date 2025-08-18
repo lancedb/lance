@@ -13,7 +13,7 @@ pub async fn read_dataset_deletion_file(
     fragment_id: u64,
     deletion_file: &DeletionFile,
 ) -> lance_core::Result<Arc<DeletionVector>> {
-    let deletion_dir = dataset.deletion_file_root_dir(deletion_file)?;
+    let deletion_dir = dataset.deletion_file_base_dir(deletion_file)?;
     let key = DeletionFileKey {
         fragment_id,
         deletion_file,
