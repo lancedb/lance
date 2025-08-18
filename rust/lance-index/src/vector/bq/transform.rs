@@ -7,17 +7,17 @@ use std::sync::{Arc, LazyLock};
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
-use arrow_schema::DataType;
-use lance_arrow::RecordBatchExt;
+use arrow_schema::{DataType, Field};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{norm_squared_fsl, DistanceType};
+use num_traits::Zero;
 use snafu::location;
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::vector::bq::storage::RABIT_CODE_COLUMN;
 use crate::vector::quantizer::Quantization;
-use crate::vector::residual::RESIDUAL_COLUMN;
 use crate::vector::transform::Transformer;
 use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
@@ -73,19 +73,21 @@ impl Transformer for RQTransformer {
             return Ok(batch.clone());
         }
 
-        let residual_vectors = batch.column_by_name(RESIDUAL_COLUMN).ok_or(Error::Index {
-            message: format!(
-                "RQ Transform: column {} not found in batch",
-                RESIDUAL_COLUMN
-            ),
-            location: location!(),
-        })?;
+        let residual_vectors = batch
+            .column_by_name(&self.vector_column)
+            .ok_or(Error::Index {
+                message: format!(
+                    "RQ Transform: column {} not found in batch",
+                    self.vector_column
+                ),
+                location: location!(),
+            })?;
         let residual_vectors = residual_vectors
             .as_fixed_size_list_opt()
             .ok_or(Error::Index {
                 message: format!(
                     "RQ Transform: column {} is not a fixed size list, got {}",
-                    RESIDUAL_COLUMN,
+                    self.vector_column,
                     residual_vectors.data_type(),
                 ),
                 location: location!(),
@@ -212,8 +214,120 @@ impl Transformer for RQTransformer {
 
         let batch = batch
             .drop_column(&self.vector_column)?
-            .drop_column(RESIDUAL_COLUMN)?
             .drop_column(CENTROID_DIST_COLUMN)?;
+        Ok(batch)
+    }
+}
+
+pub struct ExtendDimensionTransformer {
+    vector_column: String,
+    expected_dimension: usize,
+}
+
+impl ExtendDimensionTransformer {
+    pub fn new(vector_column: impl Into<String>, expected_dimension: usize) -> Self {
+        Self {
+            vector_column: vector_column.into(),
+            expected_dimension,
+        }
+    }
+
+    fn pad_vector<T: ArrowFloatType>(
+        &self,
+        vectors: &FixedSizeListArray,
+    ) -> Result<FixedSizeListArray>
+    where
+        T::Native: Zero,
+    {
+        let dimension = vectors.value_length() as usize;
+        let mut padded_vectors = Vec::with_capacity(self.expected_dimension * vectors.len());
+        let padding = vec![T::Native::zero(); self.expected_dimension - dimension];
+        vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice()
+            .chunks_exact(dimension)
+            .for_each(|vec| {
+                padded_vectors.extend_from_slice(vec);
+                padded_vectors.extend_from_slice(&padding);
+            });
+
+        let vectors = T::ArrayType::from(padded_vectors);
+        Ok(FixedSizeListArray::try_new_from_values(
+            vectors,
+            self.expected_dimension as i32,
+        )?)
+    }
+}
+
+impl Debug for ExtendDimensionTransformer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ExtendDimensionTransformer(vector_column={}, expected_dimension={})",
+            self.vector_column, self.expected_dimension
+        )
+    }
+}
+
+impl Transformer for ExtendDimensionTransformer {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let vectors = batch
+            .column_by_name(&self.vector_column)
+            .ok_or(Error::Index {
+                message: format!(
+                    "ExtendDimensionTransformer: column {} not found in batch",
+                    self.vector_column
+                ),
+                location: location!(),
+            })?;
+        let vectors = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "ExtendDimensionTransformer: column {} is not a fixed size list",
+                self.vector_column
+            ),
+            location: location!(),
+        })?;
+
+        let dimension = vectors.value_length() as usize;
+        if self.expected_dimension < dimension {
+            return Err(Error::Index {
+                message: format!("ExtendDimensionTransformer: expected dimension {} is less than the actual dimension {}", self.expected_dimension, dimension),
+                location: location!(),
+            });
+        } else if self.expected_dimension == dimension {
+            return Ok(batch.clone());
+        }
+
+        // padding 0s to the vector
+        let padded_vectors = match vectors.value_type() {
+            DataType::Float16 => self.pad_vector::<Float16Type>(&vectors)?,
+            DataType::Float32 => self.pad_vector::<Float32Type>(&vectors)?,
+            DataType::Float64 => self.pad_vector::<Float64Type>(&vectors)?,
+            _ => {
+                return Err(Error::Index {
+                    message: format!(
+                        "ExtendDimensionTransformer: unsupported vector type: {}",
+                        vectors.value_type()
+                    ),
+                    location: location!(),
+                });
+            }
+        };
+
+        let batch = batch.drop_column(&self.vector_column)?.try_with_column(
+            Field::new(
+                &self.vector_column,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", padded_vectors.value_type(), true)),
+                    self.expected_dimension as i32,
+                ),
+                true,
+            ),
+            Arc::new(padded_vectors),
+        )?;
         Ok(batch)
     }
 }

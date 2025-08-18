@@ -14,7 +14,7 @@ use lance_linalg::distance::{DistanceType, MetricType};
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
-use crate::vector::bq::transform::RQTransformer;
+use crate::vector::bq::transform::{ExtendDimensionTransformer, RQTransformer};
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array};
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
@@ -284,10 +284,16 @@ impl IvfTransformer {
             )));
         }
 
-        transforms.push(Arc::new(
-            ResidualTransform::new(centroids.clone(), PART_ID_COLUMN, vector_column)
-                .keep_original(true),
-        ));
+        transforms.push(Arc::new(ResidualTransform::new(
+            centroids.clone(),
+            PART_ID_COLUMN,
+            vector_column,
+        )));
+
+        transforms.push(Arc::new(ExtendDimensionTransformer::new(
+            vector_column,
+            rq.code_dim(),
+        )));
 
         transforms.push(Arc::new(RQTransformer::new(
             rq,

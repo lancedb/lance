@@ -85,6 +85,12 @@ pub struct RQBuildParams {
     pub num_bits: u8,
 }
 
+impl RQBuildParams {
+    pub fn new(num_bits: u8) -> Self {
+        Self { num_bits }
+    }
+}
+
 impl QuantizerBuildParams for RQBuildParams {
     fn sample_size(&self) -> usize {
         0

@@ -1386,10 +1386,10 @@ mod tests {
     // RQ doesn't perform well for random data
     // need to verify recall with real-world dataset (e.g. sift1m)
     #[rstest]
-    #[case(1, DistanceType::L2, 0.6)]
-    #[case(1, DistanceType::Dot, 0.6)]
-    #[case(4, DistanceType::L2, 0.6)]
-    #[case(4, DistanceType::Dot, 0.6)]
+    #[case(1, DistanceType::L2, 0.65)]
+    #[case(1, DistanceType::Dot, 0.65)]
+    #[case(4, DistanceType::L2, 0.65)]
+    #[case(4, DistanceType::Dot, 0.65)]
     #[tokio::test]
     async fn test_build_ivf_rq(
         #[case] nlist: usize,
@@ -1397,7 +1397,7 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let ivf_params = IvfBuildParams::new(nlist);
-        let rq_params = RQBuildParams::default();
+        let rq_params = RQBuildParams::new(4);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {

@@ -21,6 +21,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::simd::dist_table::{BATCH_SIZE, PERM0, PERM0_INVERSE};
 use lance_linalg::simd::{self};
 use lance_table::utils::LanceIteratorExtension;
+use ndarray::s;
 use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -41,8 +42,8 @@ pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RabitQuantizationMetadata {
     #[serde(skip)]
-    pub inv_p: Option<FixedSizeListArray>,
-    pub inv_p_position: u32,
+    pub rotate_mat: Option<FixedSizeListArray>,
+    pub rotate_mat_position: u32,
     pub num_bits: u8,
     // number of vectors in the vector store,
     // we need to store this because we need to add padding to the vector codes
@@ -52,7 +53,7 @@ pub struct RabitQuantizationMetadata {
 
 impl DeepSizeOf for RabitQuantizationMetadata {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.inv_p
+        self.rotate_mat
             .as_ref()
             .map(|inv_p| inv_p.get_array_memory_size())
             .unwrap_or(0)
@@ -62,22 +63,22 @@ impl DeepSizeOf for RabitQuantizationMetadata {
 #[async_trait]
 impl QuantizerMetadata for RabitQuantizationMetadata {
     fn buffer_index(&self) -> Option<u32> {
-        Some(self.inv_p_position)
+        Some(self.rotate_mat_position)
     }
 
     fn set_buffer_index(&mut self, index: u32) {
-        self.inv_p_position = index;
+        self.rotate_mat_position = index;
     }
 
     fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
         debug_assert!(!bytes.is_empty());
         let codebook_tensor: pb::Tensor = pb::Tensor::decode(bytes)?;
-        self.inv_p = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+        self.rotate_mat = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
         Ok(())
     }
 
     fn extra_metadata(&self) -> Result<Option<Bytes>> {
-        if let Some(inv_p) = &self.inv_p {
+        if let Some(inv_p) = &self.rotate_mat {
             let inv_p_tensor = pb::Tensor::try_from(inv_p)?;
             let mut bytes = BytesMut::new();
             inv_p_tensor.encode(&mut bytes)?;
@@ -128,14 +129,21 @@ impl DeepSizeOf for RabitQuantizationStorage {
 
 impl RabitQuantizationStorage {
     #[inline]
-    fn rotate_query_vector<T: ArrowFloatType>(inv_p: &dyn Array, qr: &dyn Array) -> Vec<T::Native> {
+    fn rotate_query_vector<T: ArrowFloatType>(
+        rotate_mat: &FixedSizeListArray,
+        qr: &dyn Array,
+    ) -> Vec<T::Native> {
         let d = qr.len();
-        let inv_p = inv_p
+        let code_dim = rotate_mat.len();
+        let rotate_mat = rotate_mat
+            .values()
             .as_any()
             .downcast_ref::<T::ArrayType>()
             .unwrap()
             .as_slice();
-        let inv_p = ndarray::ArrayView2::from_shape((d, d), inv_p).unwrap();
+        let rotate_mat = ndarray::ArrayView2::from_shape((code_dim, code_dim), rotate_mat).unwrap();
+        // we need only the first d rows of the rotate_mat
+        let rotate_mat = rotate_mat.slice(s![.., 0..d]);
 
         let qr = qr
             .as_any()
@@ -143,7 +151,7 @@ impl RabitQuantizationStorage {
             .unwrap()
             .as_slice();
         let qr = ndarray::ArrayView2::from_shape((d, 1), qr).unwrap();
-        let rotated_qr = inv_p.dot(&qr);
+        let rotated_qr = rotate_mat.dot(&qr);
         rotated_qr.into_raw_vec_and_offset().0
     }
 }
@@ -174,6 +182,7 @@ impl<'a> RabitDistCalculator<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dim: usize,
+        num_bits: u8,
         dist_table: Vec<f32>,
         sum_q: f32,
         codes: &'a [u8],
@@ -183,13 +192,13 @@ impl<'a> RabitDistCalculator<'a> {
     ) -> Self {
         Self {
             dim,
-            num_bits: 1,
+            num_bits,
             codes,
             dist_table,
             add_factors,
             scale_factors,
             query_factor,
-            sqrt_d: (dim as f32).sqrt(),
+            sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
         }
     }
@@ -197,7 +206,7 @@ impl<'a> RabitDistCalculator<'a> {
 
 #[inline]
 fn lowbit(x: usize) -> usize {
-    1 << x.trailing_zeros() as usize
+    1 << x.trailing_zeros()
 }
 
 #[inline]
@@ -205,12 +214,11 @@ pub fn build_dist_table_direct<T: ArrowFloatType>(qc: &[T::Native]) -> Vec<f32>
 where
     T::Native: AsPrimitive<f32>,
 {
-    let mut dist_table = vec![0.0; qc.len() / SEGMENT_LENGTH * SEGMENT_NUM_CODES];
+    let mut dist_table = vec![0.0; qc.len() * 4];
     qc.chunks_exact(SEGMENT_LENGTH)
         .zip(dist_table.chunks_exact_mut(SEGMENT_NUM_CODES))
         .for_each(|(sub_vec, dist_table)| {
-            dist_table[0] = 0.0;
-            (1..SEGMENT_NUM_CODES).for_each(|j| {
+            (1..16).for_each(|j| {
                 dist_table[j] = dist_table[j - lowbit(j)] + sub_vec[LOWBIT_IDX[j]].as_();
             })
         });
@@ -376,30 +384,29 @@ impl VectorStore for RabitQuantizationStorage {
     // qr = (q-c)
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
-        let inv_p = self
+        let rotate_mat = self
             .metadata
-            .inv_p
+            .rotate_mat
             .as_ref()
-            .map(|inv_p| inv_p.values())
             .expect("RabitQ metadata not loaded");
 
-        let (dist_table, sum_q) = match inv_p.data_type() {
+        let (dist_table, sum_q) = match rotate_mat.value_type() {
             DataType::Float16 => {
-                let rotated_qr = Self::rotate_query_vector::<Float16Type>(&inv_p, &qr);
+                let rotated_qr = Self::rotate_query_vector::<Float16Type>(&rotate_mat, &qr);
                 (
                     build_dist_table_direct::<Float16Type>(&rotated_qr),
                     rotated_qr.into_iter().map(f32::from).sum(),
                 )
             }
             DataType::Float32 => {
-                let rotated_qr = Self::rotate_query_vector::<Float32Type>(&inv_p, &qr);
+                let rotated_qr = Self::rotate_query_vector::<Float32Type>(&rotate_mat, &qr);
                 (
                     build_dist_table_direct::<Float32Type>(&rotated_qr),
                     rotated_qr.into_iter().sum(),
                 )
             }
             DataType::Float64 => {
-                let rotated_qr = Self::rotate_query_vector::<Float64Type>(&inv_p, &qr);
+                let rotated_qr = Self::rotate_query_vector::<Float64Type>(&rotate_mat, &qr);
                 (
                     build_dist_table_direct::<Float64Type>(&rotated_qr),
                     rotated_qr.into_iter().map(|v| v as f32).sum(),
@@ -417,10 +424,8 @@ impl VectorStore for RabitQuantizationStorage {
             ),
         };
         RabitDistCalculator::new(
-            // query_codes,
-            // sq_min,
-            // sq_scale,
             qr.len(),
+            self.metadata.num_bits,
             dist_table,
             sum_q,
             codes,

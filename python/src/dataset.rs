@@ -2396,7 +2396,7 @@ fn prepare_vector_index_params(
     let mut hnsw_params = HnswBuildParams::default();
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
-    let rq_params = RQBuildParams::default();
+    let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
 
     if let Some(kwargs) = kwargs {
@@ -2495,9 +2495,11 @@ fn prepare_vector_index_params(
             hnsw_params.ef_construction = ef_c.extract()?;
         }
 
-        // Parse PQ params
+        // Parse PQ/RQ params
         if let Some(n) = kwargs.get_item("num_bits")? {
-            pq_params.num_bits = n.extract()?
+            let num_bits: u8 = n.extract()?;
+            pq_params.num_bits = num_bits as usize;
+            rq_params.num_bits = num_bits;
         };
 
         if let Some(n) = kwargs.get_item("num_sub_vectors")? {

@@ -51,55 +51,51 @@ pub struct RabitQuantizer {
 impl RabitQuantizer {
     pub fn new<T: ArrowFloatType>(num_bits: u8, dim: i32) -> Self {
         // we don't need to calculate the inverse of P,
-        // because the inverse of an orthogonal matrix is still an orthogonal matrix,
-        // we just generate the inverse of P here.
-        let inv_p = random_orthogonal::<T>(dim as usize);
-        let (inv_p, _) = inv_p.into_raw_vec_and_offset();
+        // just take the generated matrix as P^{-1}
+        let code_dim = dim * num_bits as i32;
+        let rotate_mat = random_orthogonal::<T>(code_dim as usize);
+        let (rotate_mat, _) = rotate_mat.into_raw_vec_and_offset();
 
-        let inv_p = match T::FLOAT_TYPE {
+        let rotate_mat = match T::FLOAT_TYPE {
             FloatType::Float16 => {
-                let inv_p = T::ArrayType::from(inv_p);
-                FixedSizeListArray::try_new_from_values(inv_p, dim).unwrap()
+                let rotate_mat = T::ArrayType::from(rotate_mat);
+                FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
             }
             FloatType::Float32 => {
-                let inv_p = T::ArrayType::from(inv_p);
-                FixedSizeListArray::try_new_from_values(inv_p, dim).unwrap()
+                let rotate_mat = T::ArrayType::from(rotate_mat);
+                FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
             }
             FloatType::Float64 => {
-                let inv_p = T::ArrayType::from(inv_p);
-                FixedSizeListArray::try_new_from_values(inv_p, dim).unwrap()
+                let rotate_mat = T::ArrayType::from(rotate_mat);
+                FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
             }
             _ => unimplemented!("RabitQ does not support data type: {:?}", T::FLOAT_TYPE),
         };
 
         let metadata = RabitQuantizationMetadata {
-            inv_p: Some(inv_p),
-            inv_p_position: 0,
+            rotate_mat: Some(rotate_mat),
+            rotate_mat_position: 0,
             num_bits,
             packed: false,
         };
         Self { metadata }
     }
 
-    fn inv_p<T: ArrowFloatType>(&self) -> ndarray::ArrayView2<T::Native> {
-        let inv_p = self.metadata.inv_p.as_ref().unwrap();
-        let dim = inv_p.len();
+    fn rotate_mat<T: ArrowFloatType>(&self) -> ndarray::ArrayView2<T::Native> {
+        let rotate_mat = self.metadata.rotate_mat.as_ref().unwrap();
+        let dim = rotate_mat.len();
 
-        let inv_p = inv_p
+        let rotate_mat = rotate_mat
             .values()
             .as_any()
             .downcast_ref::<T::ArrayType>()
             .unwrap()
             .as_slice();
-        ndarray::ArrayView2::from_shape((dim, dim), inv_p).unwrap()
+        ndarray::ArrayView2::from_shape((dim, dim), rotate_mat).unwrap()
     }
 
     pub fn dim(&self) -> usize {
-        self.metadata
-            .inv_p
-            .as_ref()
-            .map(|inv_p| inv_p.len())
-            .unwrap_or(0)
+        self.code_dim() / self.metadata.num_bits as usize
     }
 
     // compute the dot product of v_q * v_r
@@ -110,12 +106,12 @@ impl RabitQuantizer {
     where
         T::Native: AsPrimitive<f32>,
     {
-        if residual_vectors.value_length() as usize != self.dim() {
+        if residual_vectors.value_length() as usize != self.code_dim() {
             return Err(Error::invalid_input(
                 format!(
                     "Vector dimension mismatch: {} != {}",
                     residual_vectors.value_length(),
-                    self.dim()
+                    self.code_dim()
                 ),
                 location!(),
             ));
@@ -123,7 +119,7 @@ impl RabitQuantizer {
 
         // convert the vector to a dxN matrix
         let vec_mat = ndarray::ArrayView2::from_shape(
-            (residual_vectors.len(), self.dim()),
+            (residual_vectors.len(), self.code_dim()),
             residual_vectors
                 .values()
                 .as_any()
@@ -132,14 +128,11 @@ impl RabitQuantizer {
                 .as_slice(),
         )
         .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        let vec_matrix = vec_mat.t();
+        let vec_mat = vec_mat.t();
 
-        let transformed_vectors = self.inv_p::<T>().dot(&vec_matrix);
-        let sqrt_dim = (self.dim() as f32).sqrt();
-        let norm_dists = transformed_vectors
-            .mapv(|v| v.as_().abs())
-            .sum_axis(Axis(0))
-            / sqrt_dim;
+        let rotated_vectors = self.rotate_mat::<T>().dot(&vec_mat);
+        let sqrt_dim = (self.code_dim() as f32).sqrt();
+        let norm_dists = rotated_vectors.mapv(|v| v.as_().abs()).sum_axis(Axis(0)) / sqrt_dim;
         debug_assert_eq!(norm_dists.len(), residual_vectors.len());
         Ok(norm_dists.to_vec())
     }
@@ -209,18 +202,13 @@ impl RabitQuantizer {
     where
         T::Native: AsPrimitive<f32>,
     {
-        debug_assert_eq!(
-            self.metadata.num_bits, 1,
-            "RQ only supports 1 bit per element for now"
-        );
-        debug_assert_eq!(residual_vectors.value_length(), self.dim() as i32);
-        debug_assert_eq!(self.code_dim(), self.dim());
-
         // we don't need to normalize the residual vectors,
         // because the signal of P^{-1} x v_r is the same as P^{-1} x v_r / ||v_r||
         let n = residual_vectors.len();
+        debug_assert_eq!(residual_vectors.values().len(), n * self.code_dim());
+
         let vectors = ndarray::ArrayView2::from_shape(
-            (n, self.dim()),
+            (n, self.code_dim()),
             residual_vectors
                 .values()
                 .as_any()
@@ -229,9 +217,8 @@ impl RabitQuantizer {
                 .as_slice(),
         )
         .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-        // let vectors = vectors.mapv(|v| v.as_());
         let vectors = vectors.t();
-        let rotated_vectors = self.inv_p::<T>().dot(&vectors);
+        let rotated_vectors = self.rotate_mat::<T>().dot(&vectors);
 
         let quantized_vectors = rotated_vectors.t().mapv(|v| v.as_().is_sign_positive());
         let bv: BitVec<u8, Lsb0> = BitVec::from_iter(quantized_vectors);
@@ -280,7 +267,11 @@ impl Quantization for RabitQuantizer {
     }
 
     fn code_dim(&self) -> usize {
-        self.dim() * self.metadata.num_bits as usize
+        self.metadata
+            .rotate_mat
+            .as_ref()
+            .map(|inv_p| inv_p.len())
+            .unwrap_or(0)
     }
 
     fn column(&self) -> &'static str {
