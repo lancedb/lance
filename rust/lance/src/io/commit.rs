@@ -764,6 +764,7 @@ pub(crate) async fn commit_transaction(
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
+    // Strict overwrites are not subject to any sort of automatic conflict resolution.
     let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0;
     let mut dataset =
@@ -793,21 +794,24 @@ pub(crate) async fn commit_transaction(
         // slower performance for concurrent writes. But that makes the fast path
         // faster and the slow path slower, which makes performance less predictable
         // for users. So we always check for other transactions.
-        (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+        // We skip this for strict overwrites, because strict overwrites can't be rebased.
+        if !strict_overwrite {
+            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
-        // See if we can retry the commit. Try to account for all
-        // transactions that have been committed since the read_version.
-        // Use small amount of backoff to handle transactions that all
-        // started at exact same time better.
+            // See if we can retry the commit. Try to account for all
+            // transactions that have been committed since the read_version.
+            // Use small amount of backoff to handle transactions that all
+            // started at exact same time better.
 
-        let mut rebase =
-            TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+            let mut rebase =
+                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
 
-        for (other_version, other_transaction) in other_transactions.iter() {
-            rebase.check_txn(other_transaction, *other_version)?;
+            for (other_version, other_transaction) in other_transactions.iter() {
+                rebase.check_txn(other_transaction, *other_version)?;
+            }
+
+            transaction = rebase.finish(&dataset).await?;
         }
-
-        transaction = rebase.finish(&dataset).await?;
 
         let transaction_file =
             write_transaction_file(object_store, &dataset.base, &transaction).await?;
