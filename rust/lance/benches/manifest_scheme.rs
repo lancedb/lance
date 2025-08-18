@@ -186,7 +186,9 @@ fn bench_load_new_transactions_during_commit(c: &mut Criterion) {
     let storage_type = get_storage_type();
 
     // Test different combinations of commits_behind and head_manifests_batch_size
-    let test_configs = [(3, 4), (5, 8)];
+    // to better measure the effectiveness, use large commits_behind size
+    // otherwise the time is dominated by the file download time and variance is high
+    let test_configs = [(20, 21)];
 
     for num_versions in [50, 100, 200] {
         for (commits_behind, head_manifests_batch_size) in test_configs {
