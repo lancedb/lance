@@ -111,7 +111,7 @@ fn compute_distances(c: &mut Criterion) {
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10).measurement_time(Duration::from_secs(10))
+    config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = construct_dist_table, compute_distances);
 

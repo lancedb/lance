@@ -17,11 +17,10 @@ use itertools::Itertools;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
-use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::{DistanceType, Dot};
 use lance_linalg::simd::dist_table::{BATCH_SIZE, PERM0, PERM0_INVERSE};
 use lance_linalg::simd::{self};
 use lance_table::utils::LanceIteratorExtension;
-use ndarray::s;
 use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -132,7 +131,10 @@ impl RabitQuantizationStorage {
     fn rotate_query_vector<T: ArrowFloatType>(
         rotate_mat: &FixedSizeListArray,
         qr: &dyn Array,
-    ) -> Vec<T::Native> {
+    ) -> Vec<f32>
+    where
+        T::Native: Dot,
+    {
         let d = qr.len();
         let code_dim = rotate_mat.len();
         let rotate_mat = rotate_mat
@@ -141,18 +143,23 @@ impl RabitQuantizationStorage {
             .downcast_ref::<T::ArrayType>()
             .unwrap()
             .as_slice();
-        let rotate_mat = ndarray::ArrayView2::from_shape((code_dim, code_dim), rotate_mat).unwrap();
+        // let rotate_mat = ndarray::ArrayView2::from_shape((code_dim, code_dim), rotate_mat).unwrap();
         // we need only the first d rows of the rotate_mat
-        let rotate_mat = rotate_mat.slice(s![.., 0..d]);
+        // let rotate_mat = rotate_mat.slice(s![.., 0..d]);
 
         let qr = qr
             .as_any()
             .downcast_ref::<T::ArrayType>()
             .unwrap()
             .as_slice();
-        let qr = ndarray::ArrayView2::from_shape((d, 1), qr).unwrap();
-        let rotated_qr = rotate_mat.dot(&qr);
-        rotated_qr.into_raw_vec_and_offset().0
+        // let qr = ndarray::ArrayView2::from_shape((d, 1), qr).unwrap();
+        // let rotated_qr = rotate_mat.dot(&qr);
+        // rotated_qr.into_raw_vec_and_offset().0
+
+        rotate_mat
+            .chunks_exact(code_dim)
+            .map(|chunk| lance_linalg::distance::dot(&chunk[..d], qr))
+            .collect()
     }
 }
 
@@ -390,30 +397,42 @@ impl VectorStore for RabitQuantizationStorage {
             .as_ref()
             .expect("RabitQ metadata not loaded");
 
-        let (dist_table, sum_q) = match rotate_mat.value_type() {
-            DataType::Float16 => {
-                let rotated_qr = Self::rotate_query_vector::<Float16Type>(&rotate_mat, &qr);
-                (
-                    build_dist_table_direct::<Float16Type>(&rotated_qr),
-                    rotated_qr.into_iter().map(f32::from).sum(),
-                )
-            }
-            DataType::Float32 => {
-                let rotated_qr = Self::rotate_query_vector::<Float32Type>(&rotate_mat, &qr);
-                (
-                    build_dist_table_direct::<Float32Type>(&rotated_qr),
-                    rotated_qr.into_iter().sum(),
-                )
-            }
-            DataType::Float64 => {
-                let rotated_qr = Self::rotate_query_vector::<Float64Type>(&rotate_mat, &qr);
-                (
-                    build_dist_table_direct::<Float64Type>(&rotated_qr),
-                    rotated_qr.into_iter().map(|v| v as f32).sum(),
-                )
-            }
+        let rotated_qr = match rotate_mat.value_type() {
+            DataType::Float16 => Self::rotate_query_vector::<Float16Type>(&rotate_mat, &qr),
+            DataType::Float32 => Self::rotate_query_vector::<Float32Type>(&rotate_mat, &qr),
+            DataType::Float64 => Self::rotate_query_vector::<Float64Type>(&rotate_mat, &qr),
             dt => unimplemented!("RabitQ does not support data type: {}", dt),
         };
+
+        let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
+        let sum_q = rotated_qr.into_iter().sum();
+
+        // let (dist_table, sum_q) = match rotate_mat.value_type() {
+        //     DataType::Float16 => {
+        //         let rotated_qr = Self::rotate_query_vector::<Float16Type>(&rotate_mat, &qr);
+        //         (
+        //             build_dist_table_direct::<Float16Type>(&rotated_qr),
+        //             rotated_qr.into_iter().map(f32::from).sum(),
+        //         )
+        //     }
+        //     DataType::Float32 => {
+        //         let start = std::time::Instant::now();
+        //         let rotated_qr = Self::rotate_query_vector::<Float32Type>(&rotate_mat, &qr);
+        //         println!("rotate_query_vector time: {:?}", start.elapsed());
+        //         (
+        //             build_dist_table_direct::<Float32Type>(&rotated_qr),
+        //             rotated_qr.into_iter().sum(),
+        //         )
+        //     }
+        //     DataType::Float64 => {
+        //         let rotated_qr = Self::rotate_query_vector::<Float64Type>(&rotate_mat, &qr);
+        //         (
+        //             build_dist_table_direct::<Float64Type>(&rotated_qr),
+        //             rotated_qr.into_iter().map(|v| v as f32).sum(),
+        //         )
+        //     }
+        //     dt => unimplemented!("RabitQ does not support data type: {}", dt),
+        // };
 
         let q_factor = match self.distance_type {
             DistanceType::L2 => dist_q_c,
