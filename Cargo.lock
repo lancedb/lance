@@ -4286,6 +4286,7 @@ dependencies = [
  "num-traits",
  "paste",
  "pprof",
+ "proptest",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
