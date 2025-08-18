@@ -40,6 +40,25 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
             Error::invalid_input(format!("Invalid path in URL: {}", url.path()), location!())
         })
     }
+
+    /// Generate a cache URL for this provider.
+    ///
+    /// Providers can override this to implement custom cache key generation
+    /// that takes into account provider-specific requirements like namespace
+    /// isolation.
+    fn cache_url(&self, url: &Url, _params: &ObjectStoreParams) -> String {
+        if ["file", "file-object-store", "memory"].contains(&url.scheme()) {
+            // For file URLs, cache the URL without the path.
+            // The path can be different for different object stores,
+            // but we want to cache the object store itself.
+            format!("{}://", url.scheme())
+        } else {
+            // Bucket is parsed as domain, so drop the path.
+            let mut url = url.clone();
+            url.set_path("");
+            url.to_string()
+        }
+    }
 }
 
 /// A registry of object store providers.
@@ -68,28 +87,6 @@ pub struct ObjectStoreRegistry {
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
     active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
-}
-
-/// Convert a URL to a cache key.
-///
-/// We truncate to the first path segment. This should capture
-/// buckets and prefixes. We keep URL params since those might be
-/// important.
-///
-/// * s3://bucket/path?param=value -> s3://bucket/path?param=value
-/// * file:///path/to/file -> file:///
-fn cache_url(url: &Url) -> String {
-    if ["file", "file-object-store", "memory"].contains(&url.scheme()) {
-        // For file URLs, we want to cache the URL without the path.
-        // This is because the path can be different for different
-        // object stores, but we want to cache the object store itself.
-        format!("{}://", url.scheme())
-    } else {
-        // Bucket is parsed as domain, so we just drop the path.
-        let mut url = url.clone();
-        url.set_path("");
-        url.to_string()
-    }
 }
 
 impl ObjectStoreRegistry {
@@ -154,7 +151,17 @@ impl ObjectStoreRegistry {
         base_path: Url,
         params: &ObjectStoreParams,
     ) -> Result<Arc<ObjectStore>> {
-        let cache_path = cache_url(&base_path);
+        let scheme = base_path.scheme();
+        let Some(provider) = self.get_provider(scheme) else {
+            let mut message = format!("No object store provider found for scheme: '{}'", scheme);
+            if let Ok(providers) = self.providers.read() {
+                let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
+                message.push_str(&format!("\nValid schemes: {}", valid_schemes));
+            }
+            return Err(Error::invalid_input(message, location!()));
+        };
+
+        let cache_path = provider.cache_url(&base_path, params);
         let cache_key = (cache_path, params.clone());
 
         // Check if we have a cached store for this base path and params
@@ -185,22 +192,12 @@ impl ObjectStoreRegistry {
             }
         }
 
-        let scheme = base_path.scheme();
-        let Some(provider) = self.get_provider(scheme) else {
-            let mut message = format!("No object store provider found for scheme: '{}'", scheme);
-            if let Ok(providers) = self.providers.read() {
-                let valid_schemes = providers.keys().cloned().collect::<Vec<_>>().join(", ");
-                message.push_str(&format!("\nValid schemes: {}", valid_schemes));
-            }
-
-            return Err(Error::invalid_input(message, location!()));
-        };
         let mut store = provider.new_store(base_path, params).await?;
 
         store.inner = store.inner.traced();
 
         if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(store.inner);
+            store.inner = wrapper.wrap(store.inner, params.storage_options.as_ref());
         }
 
         let store = Arc::new(store);
@@ -267,6 +264,24 @@ mod tests {
 
     #[test]
     fn test_cache_url() {
+        // Test the default cache_url implementation using a dummy provider
+        #[derive(Debug)]
+        struct DummyProvider;
+
+        #[async_trait::async_trait]
+        impl ObjectStoreProvider for DummyProvider {
+            async fn new_store(
+                &self,
+                _base_path: Url,
+                _params: &ObjectStoreParams,
+            ) -> Result<ObjectStore> {
+                unreachable!("This test doesn't create stores")
+            }
+        }
+
+        let provider = DummyProvider;
+        let params = ObjectStoreParams::default();
+
         let cases = [
             ("s3://bucket/path?param=value", "s3://bucket?param=value"),
             ("file:///path/to/file", "file://"),
@@ -280,7 +295,7 @@ mod tests {
 
         for (url, expected_cache_url) in cases {
             let url = Url::parse(url).unwrap();
-            let cache_url = cache_url(&url);
+            let cache_url = provider.cache_url(&url, &params);
             assert_eq!(cache_url, expected_cache_url);
         }
     }
