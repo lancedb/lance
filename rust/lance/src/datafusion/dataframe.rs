@@ -3,6 +3,7 @@
 
 use std::{
     any::Any,
+    fmt,
     sync::{Arc, Mutex},
 };
 
@@ -15,12 +16,24 @@ use datafusion::{
     error::DataFusionError,
     execution::{context::SessionContext, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream},
+    physical_plan::{
+        streaming::PartitionStream, 
+        ExecutionPlan, 
+        SendableRecordBatchStream,
+        DisplayAs, 
+        DisplayFormatType,
+        PlanProperties,
+        stream::RecordBatchStreamAdapter,
+    },
 };
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::tracing::{TRACE_EXECUTION, EXECUTION_PLAN_RUN};
+use tracing;
 
 use crate::Dataset;
+
 
 #[derive(Debug)]
 pub struct LanceTableProvider {
@@ -124,7 +137,10 @@ impl TableProvider for LanceTableProvider {
         scan.limit(limit.map(|l| l as i64), None)?;
         scan.scan_in_order(self.ordered);
 
-        scan.create_plan().await.map_err(DataFusionError::from)
+        let plan = scan.create_plan().await.map_err(DataFusionError::from)?;
+        
+        // Wrap the plan with tracing to emit lance::execution events
+        Ok(Arc::new(TracedLanceExec::new(plan)))
     }
 
     // Since we are using datafusion itself to apply the filters it should
@@ -138,6 +154,86 @@ impl TableProvider for LanceTableProvider {
             .iter()
             .map(|_| TableProviderFilterPushDown::Exact)
             .collect())
+    }
+}
+
+/// A wrapper around ExecutionPlan that adds lance::execution tracing events
+#[derive(Debug)]
+struct TracedLanceExec {
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+}
+
+impl TracedLanceExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            properties: input.properties().clone(),
+            input,
+        }
+    }
+}
+
+impl DisplayAs for TracedLanceExec {
+    fn fmt_as(
+        &self,
+        t: DisplayFormatType,
+        f: &mut fmt::Formatter,
+    ) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(f, "TracedLanceExec")
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for TracedLanceExec {
+    fn name(&self) -> &str {
+        "TracedLanceExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(children[0].clone())))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        
+        // Clone the input plan to access metrics after stream completion
+        let plan_for_metrics = self.input.clone();
+        
+        let traced_stream = stream.finally(move || {
+            // Just print the metrics object directly
+            if let Some(metrics) = plan_for_metrics.metrics() {
+                println!("Metrics: {:?}", metrics);
+            } else {
+                println!("No metrics available");
+            }
+        });
+        
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, traced_stream)))
     }
 }
 
