@@ -97,7 +97,7 @@ public class DataFile implements Serializable {
         .append("fileMajorVersion", fileMajorVersion)
         .append("fileMinorVersion", fileMinorVersion)
         .append("fileSizeBytes", fileSizeBytes)
-        .append("pathBaseIndex", pathBaseIndex)
+        .append("baseId", baseId)
         .toString();
   }
 }
