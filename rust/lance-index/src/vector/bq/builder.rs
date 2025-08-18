@@ -375,7 +375,7 @@ fn random_normal_matrix(n: usize) -> ndarray::Array2<f32> {
 fn householder_qr(a: ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array2<f32>) {
     let (m, n) = a.dim();
     let mut q = ndarray::Array2::eye(m);
-    let mut r = a.clone();
+    let mut r = a;
 
     for k in 0..n.min(m - 1) {
         let mut x = r.slice(s![k.., k]).to_owned();
