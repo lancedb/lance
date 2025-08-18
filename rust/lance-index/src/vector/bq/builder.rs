@@ -11,7 +11,7 @@ use bitvec::prelude::{BitVec, Lsb0};
 use deepsize::DeepSizeOf;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use lance_core::{Error, Result};
-use ndarray::Axis;
+use ndarray::{s, Axis};
 use num_traits::{AsPrimitive, FromPrimitive};
 use rand_distr::Distribution;
 use snafu::location;
@@ -372,26 +372,46 @@ fn random_normal_matrix(n: usize) -> ndarray::Array2<f32> {
     ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
 }
 
-fn gram_schmidt(a: ndarray::Array2<f32>) -> ndarray::Array2<f32> {
-    let (n, m) = a.dim();
-    let mut q = ndarray::Array2::<f32>::zeros((n, m));
+fn householder_qr(a: ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array2<f32>) {
+    let (m, n) = a.dim();
+    let mut q = ndarray::Array2::eye(m);
+    let mut r = a.clone();
 
-    for j in 0..m {
-        let mut v = a.column(j).to_owned();
+    for k in 0..n.min(m - 1) {
+        let mut x = r.slice(s![k.., k]).to_owned();
+        let x_norm = x.dot(&x).sqrt();
 
-        for i in 0..j {
-            let qi = q.column(i);
-            let proj = qi.dot(&v) * &qi;
-            v = &v - &proj;
+        if x_norm < f32::EPSILON {
+            continue;
         }
 
-        let norm = v.dot(&v).sqrt();
-        if norm > f32::EPSILON {
-            q.column_mut(j).assign(&(&v / norm));
+        // Create Householder vector
+        let sign = if x[0] >= 0.0 { 1.0 } else { -1.0 };
+        x[0] += sign * x_norm;
+        let u = &x / x.dot(&x).sqrt();
+
+        // Apply Householder transformation to R
+        // Compute outer product manually
+        let mut u_outer = ndarray::Array2::zeros((m - k, m - k));
+        for i in 0..(m - k) {
+            for j in 0..(m - k) {
+                u_outer[[i, j]] = u[i] * u[j];
+            }
         }
+        let h = ndarray::Array2::eye(m - k) - 2.0 * u_outer;
+
+        // Apply transformation to R
+        let r_block = r.slice(s![k.., k..]).to_owned();
+        let h_r = h.dot(&r_block);
+        r.slice_mut(s![k.., k..]).assign(&h_r);
+
+        // Apply transformation to Q
+        let q_block = q.slice(s![.., k..]).to_owned();
+        let q_h = q_block.dot(&h);
+        q.slice_mut(s![.., k..]).assign(&q_h);
     }
 
-    q
+    (q, r)
 }
 
 fn random_orthogonal<T: ArrowFloatType>(n: usize) -> ndarray::Array2<T::Native>
@@ -399,8 +419,8 @@ where
     T::Native: FromPrimitive,
 {
     let a = random_normal_matrix(n);
-    let results = gram_schmidt(a);
+    let (q, _) = householder_qr(a);
 
     // cast f32 matrix to T::Native matrix
-    results.mapv(|v| T::Native::from_f32(v).unwrap())
+    q.mapv(|v| T::Native::from_f32(v).unwrap())
 }
