@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Tuple, Optional
 
 
-def run_command(cmd: list[str], capture_output: bool = True) -> subprocess.CompletedProcess:
+def run_command(cmd: list[str], capture_output: bool = True, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     """Run a command and return the result."""
     print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=capture_output, text=True)
+    result = subprocess.run(cmd, capture_output=capture_output, text=True, cwd=cwd)
     if result.returncode != 0:
         print(f"Error running command: {' '.join(cmd)}")
         if capture_output:
@@ -77,21 +77,8 @@ def validate_version_consistency():
     version = get_current_version()
     errors = []
     
-    # Check all Rust crates
+    # Check all creates with explicit versioning
     rust_crates = [
-        "rust/lance/Cargo.toml",
-        "rust/lance-arrow/Cargo.toml",
-        "rust/lance-core/Cargo.toml",
-        "rust/lance-datafusion/Cargo.toml",
-        "rust/lance-datagen/Cargo.toml",
-        "rust/lance-encoding/Cargo.toml",
-        "rust/lance-file/Cargo.toml",
-        "rust/lance-index/Cargo.toml",
-        "rust/lance-io/Cargo.toml",
-        "rust/lance-linalg/Cargo.toml",
-        "rust/lance-table/Cargo.toml",
-        "rust/lance-test-macros/Cargo.toml",
-        "rust/lance-testing/Cargo.toml",
         "python/Cargo.toml",
         "java/core/lance-jni/Cargo.toml",
     ]
@@ -146,7 +133,7 @@ def main():
     
     # Use bump-my-version to update all files
     print("\nUpdating version in all files...")
-    run_command(["bump-my-version", "bump", "--new-version", new_version])
+    run_command(["bump-my-version", "bump", "--current-version", current_version, "--new-version", new_version, "--ignore-missing-version", "--ignore-missing-files"])
     
     # Update Cargo.lock files
     print("\nUpdating Cargo.lock files...")

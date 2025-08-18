@@ -183,3 +183,9 @@ replace = "<version>{new_version}</version>"
 filename = "java/spark/pom.xml"
 search = "<version>{current_version}</version>"
 replace = "<version>{new_version}</version>"
+
+# FSST crate version
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'fsst = {{ version = "={current_version}"'
+replace = 'fsst = {{ version = "={new_version}"'

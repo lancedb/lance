@@ -70,7 +70,7 @@ impl InlineBitpacking {
     ///
     /// Each chunk has the compressed bit width stored inline in the chunk itself.
     fn bitpack_chunked<T: ArrowNativeType + BitPacking>(
-        mut data: FixedWidthDataBlock,
+        data: FixedWidthDataBlock,
     ) -> MiniBlockCompressed {
         let data_buffer = data.data.borrow_to_typed_slice::<T>();
         let data_buffer = data_buffer.as_ref();
@@ -272,7 +272,7 @@ impl BlockDecompressor for InlineBitpacking {
 /// 1024 values because that's what the bitpacking primitives expect.  They just don't
 /// have a unique bit width for each chunk.
 fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
-    mut data: FixedWidthDataBlock,
+    data: FixedWidthDataBlock,
     bit_width: usize,
 ) -> LanceBuffer {
     let data_buffer = data.data.borrow_to_typed_slice::<T>();
@@ -330,7 +330,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
 
 /// Unpacks a FixedWidthDataBlock that has been bitpacked with a constant bit width
 fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
-    mut data: FixedWidthDataBlock,
+    data: FixedWidthDataBlock,
     num_values: usize,
     bits_per_value: usize,
 ) -> FixedWidthDataBlock {

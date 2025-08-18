@@ -418,7 +418,7 @@ impl CompressedBufferEncoder {
 impl PerValueCompressor for CompressedBufferEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let data_type = data.name();
-        let mut data = data.as_variable_width().ok_or(Error::Internal {
+        let data = data.as_variable_width().ok_or(Error::Internal {
             message: format!(
                 "Attempt to use CompressedBufferEncoder on data of type {}",
                 data_type
@@ -466,7 +466,7 @@ impl PerValueCompressor for CompressedBufferEncoder {
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
-    fn decompress(&self, mut data: VariableWidthBlock) -> Result<DataBlock> {
+    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         let data_bytes = &data.data;
         let mut decompressed = Vec::with_capacity(data_bytes.len() * 2);
 

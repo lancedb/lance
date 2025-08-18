@@ -13,8 +13,11 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.file.LanceFileWriter;
+import com.lancedb.lance.fragment.DataFile;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.operation.Append;
+import com.lancedb.lance.operation.DataReplacement;
 import com.lancedb.lance.operation.Delete;
 import com.lancedb.lance.operation.Merge;
 import com.lancedb.lance.operation.Overwrite;
@@ -26,7 +29,13 @@ import com.lancedb.lance.operation.RewriteGroup;
 import com.lancedb.lance.operation.Update;
 import com.lancedb.lance.operation.UpdateConfig;
 
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
@@ -35,6 +44,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -42,13 +53,18 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TransactionTest {
+
+  public static final int TEST_FILE_FORMAT_MAJOR_VERSION = 2;
+  public static final int TEST_FILE_FORMAT_MINOR_VERSION = 0;
   private static Dataset dataset;
 
   @BeforeAll
@@ -611,5 +627,148 @@ public class TransactionTest {
         }
       }
     }
+  }
+
+  @Test
+  void testDataReplacement(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testDataReplacement").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+
+      // step 1. create a dataset with schema: id: int, name: varchar
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // step 2. create a new VectorSchemaRoot with only id values and append it to the dataset
+      int rowCount = 20;
+      Schema idOnlySchema =
+          new Schema(
+              Collections.singletonList(Field.nullable("id", new ArrowType.Int(32, true))), null);
+
+      try (VectorSchemaRoot idRoot = VectorSchemaRoot.create(idOnlySchema, allocator)) {
+        idRoot.allocateNew();
+        IntVector idVector = (IntVector) idRoot.getVector("id");
+        for (int i = 0; i < rowCount; i++) {
+          idVector.setSafe(i, i);
+        }
+        idRoot.setRowCount(rowCount);
+
+        List<FragmentMetadata> fragmentMetas =
+            Fragment.create(datasetPath, allocator, idRoot, new WriteParams.Builder().build());
+
+        Transaction appendTxn =
+            dataset
+                .newTransactionBuilder()
+                .operation(Append.builder().fragments(fragmentMetas).build())
+                .build();
+
+        try (Dataset initDataset = appendTxn.commit()) {
+          assertEquals(2, initDataset.version());
+          assertEquals(rowCount, initDataset.countRows());
+
+          // step 3. use dataset.addColumn to add a new column named as address with all null values
+          Field addressField = Field.nullable("address", new ArrowType.Utf8());
+          Schema addressSchema = new Schema(Collections.singletonList(addressField), null);
+          initDataset.addColumns(addressSchema);
+
+          try (LanceScanner scanner = initDataset.newScan()) {
+            try (ArrowReader resultReader = scanner.scanBatches()) {
+              assertTrue(resultReader.loadNextBatch());
+              VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+              assertEquals(rowCount, initDataset.countRows());
+              assertEquals(rowCount, batch.getRowCount());
+
+              // verify all null values
+              VarCharVector resultNameVector = (VarCharVector) batch.getVector("address");
+              for (int i = 0; i < rowCount; i++) {
+                Assertions.assertTrue(resultNameVector.isNull(i));
+              }
+            }
+          }
+
+          // step 4. use DataReplacement transaction to replace null values
+          try (VectorSchemaRoot replaceVectorRoot =
+              VectorSchemaRoot.create(addressSchema, allocator)) {
+            replaceVectorRoot.allocateNew();
+            VarCharVector addressVector = (VarCharVector) replaceVectorRoot.getVector("address");
+
+            for (int i = 0; i < rowCount; i++) {
+              String name = "District " + i;
+              addressVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
+            }
+            replaceVectorRoot.setRowCount(rowCount);
+
+            DataFile datafile =
+                createDataFile(dataset.allocator(), datasetPath, replaceVectorRoot, 2);
+            List<DataReplacement.DataReplacementGroup> replacementGroups =
+                Collections.singletonList(
+                    new DataReplacement.DataReplacementGroup(
+                        fragmentMetas.get(0).getId(), datafile));
+            Transaction replaceTxn =
+                initDataset
+                    .newTransactionBuilder()
+                    .operation(DataReplacement.builder().replacements(replacementGroups).build())
+                    .build();
+
+            try (Dataset datasetWithAddress = replaceTxn.commit()) {
+              assertEquals(4, datasetWithAddress.version());
+              assertEquals(rowCount, datasetWithAddress.countRows());
+
+              try (LanceScanner scanner = datasetWithAddress.newScan()) {
+                try (ArrowReader resultReader = scanner.scanBatches()) {
+                  assertTrue(resultReader.loadNextBatch());
+                  VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+                  assertEquals(rowCount, datasetWithAddress.countRows());
+                  assertEquals(rowCount, batch.getRowCount());
+
+                  // verify all address values not null
+                  VarCharVector resultNameVector = (VarCharVector) batch.getVector("address");
+                  for (int i = 0; i < rowCount; i++) {
+                    Assertions.assertFalse(resultNameVector.isNull(i));
+                    String expectedName = "District " + i;
+                    String actualName = new String(resultNameVector.get(i), StandardCharsets.UTF_8);
+                    assertEquals(expectedName, actualName);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Helper method to create a DataFile from a VectorSchemaRoot. This implementation uses
+   * LanceFileWriter to ensure compatibility with Lance format.
+   */
+  private DataFile createDataFile(
+      BufferAllocator allocator, String basePath, VectorSchemaRoot root, int fieldIndex) {
+    // Create a unique file path for the data file
+    String fileName = UUID.randomUUID() + ".lance";
+    String filePath = basePath + "/data/" + fileName;
+
+    // Create parent directories if they don't exist
+    File file = new File(filePath);
+
+    // Use LanceFileWriter to write the data
+    try (LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null)) {
+      writer.write(root);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+
+    // Create a DataFile object with the field index
+    // The fields array contains the indices of the fields in the schema
+    // The columnIndices array contains the indices of the columns in the file
+    // Use a stable file format version
+    return new DataFile(
+        fileName,
+        new int[] {fieldIndex}, // Field index in the schema
+        new int[] {0}, // Column index in the file (always 0 for single column)
+        TEST_FILE_FORMAT_MAJOR_VERSION, // File major version
+        TEST_FILE_FORMAT_MINOR_VERSION, // File minor version
+        file.length() // File size in bytes (now contains actual data)
+        );
   }
 }

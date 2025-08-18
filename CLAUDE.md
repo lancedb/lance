@@ -112,3 +112,16 @@ Tests:
     * Use `pip install pylance=={version}` and then run `python datagen.py` to
       create the dataset. The data files should be checked into git.
     * Use `copy_test_data_to_tmp` to read this data in Lance
+* Avoid using `ignore` in doctests. For APIs with complex inputs, like methods on
+  `Dataset`, instead write Rust doctests that just compile a function. This
+  guarantees that the example code compiles and is in sync with the API. For example:
+
+  ```
+  /// ```
+  /// # use lance::{Dataset, Result};
+  /// # async fn test(dataset: &Dataset) -> Result<()> {
+  /// dataset.delete("id = 25").await?;
+  /// # Ok(())
+  /// # }
+  /// ```
+  ```
