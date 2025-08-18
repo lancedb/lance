@@ -143,7 +143,7 @@ impl ProjectionPlan {
             &projection
                 .fields
                 .iter()
-                .map(|f| (f.name.as_str(), f.name.as_str()))
+                .map(|f| (f.name.as_str(), format!("`{}`", f.name.as_str())))
                 .collect::<Vec<_>>(),
         )
     }
@@ -153,7 +153,7 @@ impl ProjectionPlan {
             .schema()
             .fields
             .iter()
-            .map(|f| (f.name.as_str(), f.name.as_str()))
+            .map(|f| (f.name.as_str(), format!("`{}`", f.name.as_str())))
             .collect::<Vec<_>>();
         Self::from_expressions(base.clone(), &projection)
     }

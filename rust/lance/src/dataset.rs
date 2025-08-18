@@ -343,9 +343,9 @@ impl ProjectionRequest {
                     OnMissing::Error,
                     OnTypeMismatch::Error,
                 )?;
-                ProjectionPlan::from_schema(dataset.clone(), &projection)
+                ProjectionPlan::from_schema(dataset, &projection)
             }
-            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset.clone(), &columns),
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
         }
     }
 }
