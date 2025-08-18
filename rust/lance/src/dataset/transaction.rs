@@ -1149,7 +1149,7 @@ impl Transaction {
         tx_path: &str,
     ) -> Result<(Manifest, Vec<Index>)> {
         let location = commit_handler
-            .resolve_version_location(base_path, version, &object_store.inner)
+            .resolve_version_location(base_path, version, &object_store.inner, None)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));

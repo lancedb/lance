@@ -2165,6 +2165,7 @@ impl Dataset {
             .block_on(None, self.ds.checkout_version(version))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
+                lance::Error::DatasetNotFound { .. } => PyValueError::new_err(err.to_string()),
                 _ => PyIOError::new_err(err.to_string()),
             })?;
 

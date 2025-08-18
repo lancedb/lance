@@ -236,6 +236,11 @@ struct MergeInsertParams {
     // if the writer does not have delete permissions and the clean up would
     // just try and log a failure anyway.
     skip_auto_cleanup: bool,
+    /// Batch size for loading head manifests when checking for concurrent writes
+    /// in V3 manifest naming scheme. Smaller values can help reduce memory usage
+    /// but may increase the number of object store requests.
+    /// Default is 8.
+    head_manifests_batch_size: usize,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -319,6 +324,7 @@ impl MergeInsertBuilder {
                 retry_timeout: Duration::from_secs(30),
                 mem_wal_to_flush: None,
                 skip_auto_cleanup: false,
+                head_manifests_batch_size: 8,
             },
         })
     }
@@ -376,6 +382,13 @@ impl MergeInsertBuilder {
 
     pub fn skip_auto_cleanup(&mut self, skip: bool) -> &mut Self {
         self.params.skip_auto_cleanup = skip;
+        self
+    }
+
+    /// Set the batch size for loading head manifests when checking for concurrent writes
+    /// in V3 manifest naming scheme.
+    pub fn head_manifests_batch_size(&mut self, batch_size: usize) -> &mut Self {
+        self.params.head_manifests_batch_size = batch_size;
         self
     }
 
@@ -1888,8 +1901,9 @@ impl Merger {
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::{
-        types::{Int32Type, UInt32Type},
+        types::{Float32Type, Int32Type, UInt32Type},
         Int32Array, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
     };
     use arrow_select::concat::concat_batches;
@@ -1900,6 +1914,7 @@ mod tests {
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_table::io::commit::{read_latest_manifest_hint_best_effort, ManifestNamingScheme};
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
@@ -1909,10 +1924,7 @@ mod tests {
     use crate::{
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
-        utils::test::{
-            assert_plan_node_equals, assert_string_matches, DatagenExt, FragmentCount,
-            FragmentRowCount, ThrottledStoreWrapper,
-        },
+        utils::test::{assert_plan_node_equals, assert_string_matches, ThrottledStoreWrapper},
     };
 
     use super::*;
@@ -3504,5 +3516,224 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert!(analysis.contains("bytes_written"));
         assert!(analysis.contains("num_files_written"));
         assert!(analysis.contains("elapsed_compute"));
+    }
+
+    #[tokio::test]
+    async fn test_v3_manifest_naming_scheme_concurrent_merge_insert() {
+        let write_params = crate::dataset::WriteParams {
+            enable_v3_manifest_paths: true,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+
+        // Create initial dataset with V3 naming scheme using in-memory storage
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("value", lance_datagen::array::rand::<Float32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+                Some(write_params.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Verify V3 naming scheme is used
+        assert_eq!(
+            dataset.manifest_location.naming_scheme,
+            ManifestNamingScheme::V3
+        );
+        assert_eq!(dataset.manifest.version, 1);
+
+        // Check that _latest_manifest_hint.json exists
+        let latest_manifest_path = dataset
+            .base
+            .child("_versions")
+            .child("_latest_manifest_hint.json");
+        assert!(dataset
+            .object_store
+            .exists(&latest_manifest_path)
+            .await
+            .unwrap());
+
+        // Add 4 new versions using lightweight UpdateConfig transactions (simulating intermediate commits)
+        for i in 1..=4 {
+            dataset
+                .update_config([(format!("test_key_{}", i), format!("test_value_{}", i))])
+                .await
+                .unwrap();
+        }
+
+        // Verify _latest_manifest_hint.json is updated to version 5
+        let latest_version =
+            read_latest_manifest_hint_best_effort(&dataset.object_store, &dataset.base)
+                .await
+                .unwrap();
+        assert_eq!(latest_version.map(|v| v.version), Some(5));
+
+        // Test Case 1: Concurrent merge_insert with default batch size
+        let concurrent_dataset_1 = dataset.checkout_version(1).await.unwrap();
+        assert_eq!(concurrent_dataset_1.manifest.version, 1);
+
+        let merge_data_1 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::cycle::<Int32Type>(vec![3, 15])) // Update row 3, insert row 15
+            .col(
+                "value",
+                lance_datagen::array::cycle::<Float32Type>(vec![30.0, 150.0]),
+            )
+            .into_df_stream(
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(1),
+            );
+
+        let (merged_dataset_1, _stats_1) =
+            MergeInsertBuilder::try_new(Arc::new(concurrent_dataset_1), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute(merge_data_1)
+                .await
+                .unwrap();
+
+        // This should succeed and create version 6 (after rebasing over versions 2-5)
+        assert_eq!(merged_dataset_1.manifest.version, 6);
+
+        // Verify read after write for test case 1
+        let scan_1 = merged_dataset_1.scan();
+        let batches_1: Vec<RecordBatch> = scan_1
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows_1: usize = batches_1.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_1, 11); // 10 original rows + 1 new row (id=15), row 3 updated
+
+        // Test Case 2: Concurrent merge_insert with small batch size (1)
+        let concurrent_dataset_2 = dataset.checkout_version(2).await.unwrap();
+        assert_eq!(concurrent_dataset_2.manifest.version, 2);
+
+        let merge_data_2 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::cycle::<Int32Type>(vec![2, 16])) // Update row 2, insert row 16
+            .col(
+                "value",
+                lance_datagen::array::cycle::<Float32Type>(vec![20.0, 70.0]),
+            )
+            .into_df_stream(
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(1),
+            );
+
+        let (merged_dataset_2, _stats_2) =
+            MergeInsertBuilder::try_new(Arc::new(concurrent_dataset_2), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .head_manifests_batch_size(1) // Small batch size - forces multiple batches
+                .try_build()
+                .unwrap()
+                .execute(merge_data_2)
+                .await
+                .unwrap();
+
+        // This should succeed and create version 7 (after rebasing over versions 3-6)
+        assert_eq!(merged_dataset_2.manifest.version, 7);
+
+        // Verify read after write for test case 2
+        let scan_2 = merged_dataset_2.scan();
+        let batches_2: Vec<RecordBatch> = scan_2
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows_2: usize = batches_2.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_2, 12); // Previous 11 rows + 1 new row (id=16), row 2 updated
+
+        // Test Case 3: Concurrent merge_insert with large batch size (20)
+        let concurrent_dataset_3 = dataset.checkout_version(3).await.unwrap();
+        assert_eq!(concurrent_dataset_3.manifest.version, 3);
+
+        let merge_data_3 = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::cycle::<Int32Type>(vec![1, 17])) // Update row 1, insert row 17
+            .col(
+                "value",
+                lance_datagen::array::cycle::<Float32Type>(vec![10.0, 80.0]),
+            )
+            .into_df_stream(
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(1),
+            );
+
+        let (merged_dataset_3, _stats_3) =
+            MergeInsertBuilder::try_new(Arc::new(concurrent_dataset_3), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .head_manifests_batch_size(20) // Large batch size - single batch
+                .try_build()
+                .unwrap()
+                .execute(merge_data_3)
+                .await
+                .unwrap();
+
+        // This should succeed and create version 8 (after rebasing over versions 4-7)
+        assert_eq!(merged_dataset_3.manifest.version, 8);
+
+        // Verify read after write for test case 3
+        let scan_3 = merged_dataset_3.scan();
+        let batches_3: Vec<RecordBatch> = scan_3
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total_rows_3: usize = batches_3.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_3, 13); // Previous 12 rows + 1 new row (id=17), row 1 updated
+
+        // Verify _latest_manifest_hint.json is updated to version 8
+        let latest_version = read_latest_manifest_hint_best_effort(
+            &merged_dataset_3.object_store,
+            &merged_dataset_3.base,
+        )
+        .await
+        .unwrap();
+        assert_eq!(latest_version.map(|v| v.version), Some(8));
+
+        // Use the latest dataset to verify final state
+        let final_dataset = &merged_dataset_3;
+        assert_eq!(final_dataset.version().version, 8);
+
+        // Verify all versions exist
+        for version in 1..=8 {
+            let version_dataset = final_dataset.checkout_version(version).await.unwrap();
+            assert_eq!(version_dataset.manifest.version, version);
+        }
+
+        // Test that the V3 batched existence checking works correctly
+        // by verifying the latest version
+        let latest_version_id = final_dataset.latest_version_id().await.unwrap();
+        let fresh_dataset = final_dataset
+            .checkout_version(latest_version_id)
+            .await
+            .unwrap();
+        assert_eq!(fresh_dataset.manifest.version, 8);
+
+        // Verify read after write works correctly
+        let fresh_scan = fresh_dataset.scan();
+        let fresh_batches: Vec<RecordBatch> = fresh_scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let fresh_total_rows: usize = fresh_batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(fresh_total_rows, 13);
     }
 }
