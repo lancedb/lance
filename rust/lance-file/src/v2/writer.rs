@@ -42,9 +42,10 @@ use crate::format::MAGIC;
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
-// In 2.1+, we allow larger pages and split them on read instead of write
-// This avoids empty pages and small pages issues from write-time splitting
-const MAX_PAGE_BYTES: usize = 128 * 1024 * 1024; // 128MB default, was 32MB
+// In 2.1+, we split large pages on read instead of write to avoid empty pages
+// and small pages issues. However, we keep the write-time limit at 32MB to avoid
+// potential regressions in 2.0 format readers.
+const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
 
 #[derive(Debug, Clone, Default)]

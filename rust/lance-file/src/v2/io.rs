@@ -67,6 +67,13 @@ impl EncodingsIo for LanceEncodingsIo {
 
         async move {
             let split_results = fut.await?;
+
+            // Fast path: if no splitting occurred, return results directly
+            if split_results.len() == ranges.len() {
+                return Ok(split_results);
+            }
+
+            // Slow path: reassemble split results
             let mut results = vec![Vec::new(); ranges.len()];
 
             for (split_result, &orig_idx) in split_results.iter().zip(split_indices.iter()) {
