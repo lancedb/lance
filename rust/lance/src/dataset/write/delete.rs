@@ -150,7 +150,7 @@ struct DeleteJob {
 struct DeleteData {
     updated_fragments: Vec<Fragment>,
     deleted_fragment_ids: Vec<u64>,
-    affected_rows: RowIdTreeMap,
+    affected_rows: Option<RowIdTreeMap>,
 }
 
 impl RetryExecutor for DeleteJob {
@@ -173,7 +173,7 @@ impl RetryExecutor for DeleteJob {
                     Expr::Literal(ScalarValue::Boolean(Some(false)), _)
                 ) {
                     // Predicate evaluated to false - no deletions
-                    (Vec::new(), Vec::new(), RowIdTreeMap::new())
+                    (Vec::new(), Vec::new(), Some(RowIdTreeMap::new()))
                 } else if matches!(
                     filter_expr,
                     Expr::Literal(ScalarValue::Boolean(Some(true)), _)
@@ -185,9 +185,10 @@ impl RetryExecutor for DeleteJob {
                         .iter()
                         .map(|f| f.id() as u64)
                         .collect();
+
                     // When deleting everything, we don't have specific row addresses,
-                    // but we can create an empty RowIdTreeMap since all fragments are deleted
-                    (Vec::new(), deleted_fragment_ids, RowIdTreeMap::new())
+                    // so better not to emit affected rows.
+                    (Vec::new(), deleted_fragment_ids, None)
                 } else {
                     // Regular predicate - scan and collect row addresses to delete
                     let stream = scanner.try_into_stream().await?.into();
@@ -214,11 +215,11 @@ impl RetryExecutor for DeleteJob {
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;
                     let affected_rows = RowIdTreeMap::from(removed_row_addrs.as_ref().clone());
-                    (fragments, deleted_ids, affected_rows)
+                    (fragments, deleted_ids, Some(affected_rows))
                 }
             } else {
                 // No filter was applied - this shouldn't happen but treat as delete nothing
-                (Vec::new(), Vec::new(), RowIdTreeMap::new())
+                (Vec::new(), Vec::new(), Some(RowIdTreeMap::new()))
             };
 
         Ok(DeleteData {
@@ -241,11 +242,13 @@ impl RetryExecutor for DeleteJob {
             None,
         );
 
-        CommitBuilder::new(dataset)
-            .with_affected_rows(data.affected_rows)
-            .execute(transaction)
-            .await
-            .map(Arc::new)
+        let mut builder = CommitBuilder::new(dataset);
+
+        if let Some(affected_rows) = data.affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+
+        builder.execute(transaction).await.map(Arc::new)
     }
 
     fn update_dataset(&mut self, dataset: Arc<Dataset>) {
@@ -267,7 +270,7 @@ pub async fn delete(ds: &mut Dataset, predicate: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::InsertBuilder;
+    use crate::dataset::{InsertBuilder, UpdateBuilder};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
@@ -758,5 +761,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    #[rstest]
+    async fn test_delete_true_update_conflict(
+        #[values(false, true)] enable_move_stable_row_ids: bool,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::UInt32, false),
+            ArrowField::new("value", DataType::UInt32, false),
+        ]));
+
+        // Create two batches to ensure multiple fragments
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..100)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(100, 100))),
+            ],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                enable_move_stable_row_ids,
+                max_rows_per_file: 50,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+
+        // Verify we have 2 fragments initially
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 100);
+
+        let dataset_arc = Arc::new(dataset);
+        let delete_job = DeleteJob {
+            dataset: dataset_arc.clone(),
+            predicate: "true".to_string(),
+        };
+        let delete_data = delete_job.execute_impl().await.unwrap();
+
+        // Verify delete preparation captured all fragments for deletion
+        assert_eq!(delete_data.deleted_fragment_ids.len(), 2);
+        assert!(delete_data.updated_fragments.is_empty());
+
+        // Run a concurrent update operation that commits
+        let update_job = UpdateBuilder::new(dataset_arc.clone())
+            .update_where("id < 25")
+            .unwrap() // Update first 25 rows
+            .set("value", "value + 1000")
+            .unwrap()
+            .build()
+            .unwrap();
+        let update_result = update_job.execute().await.unwrap();
+        assert_eq!(
+            update_result.new_dataset.count_rows(None).await.unwrap(),
+            100
+        );
+
+        // Now try to commit the delete operation using the stale dataset reference
+        // This should fail because the delete was planning to delete fragments that
+        // have been modified by the update
+        let result = delete_job.commit(dataset_arc.clone(), delete_data).await;
+
+        // When deleting everything with delete("true"), the operation should succeed
+        // but it might not delete all rows if concurrent updates moved some rows
+        assert!(
+            matches!(&result, Err(Error::RetryableCommitConflict { .. })),
+            "Expected retryable conflict due to concurrent update, got {:?}",
+            result
+        );
+
+        // Also verify with the retry mechanism that it works correctly
+        let final_dataset = DeleteBuilder::new(dataset_arc, "true")
+            .conflict_retries(5)
+            .execute()
+            .await
+            .unwrap();
+        // All rows should be deleted, including the updated ones
+        assert_eq!(final_dataset.count_rows(None).await.unwrap(), 0);
     }
 }
