@@ -415,6 +415,18 @@ where
             element_size_bytes: Some(element_size_bytes),
         }
     }
+
+    fn new_unknown_size(data_type: DataType, generator: F, repeat: u32) -> Self {
+        Self {
+            data_type,
+            generator,
+            array_type: PhantomData,
+            repeat,
+            leftover: T::default(),
+            leftover_count: 0,
+            element_size_bytes: None,
+        }
+    }
 }
 
 impl<T, ArrayType, F: FnMut(&mut rand_xoshiro::Xoshiro256PlusPlus) -> T> ArrayGenerator
@@ -1877,9 +1889,9 @@ pub mod array {
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     };
     use arrow_array::{
-        ArrowNativeTypeOp, Date32Array, Date64Array, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        ArrowNativeTypeOp, BooleanArray, Date32Array, Date64Array, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
@@ -1955,6 +1967,23 @@ pub mod array {
                     .expect("Primitive types should have a fixed width"),
             ),
         )
+    }
+
+    /// Create a generator from a vector of booleans
+    ///
+    /// If more rows are requested than the length of values then it will restart from
+    /// the beginning of the vector
+    pub fn cycle_bool(values: Vec<bool>) -> Box<dyn ArrayGenerator> {
+        let mut values_idx = 0;
+        Box::new(FnGen::<bool, BooleanArray, _>::new_unknown_size(
+            DataType::Boolean,
+            move |_| {
+                let val = values[values_idx];
+                values_idx = (values_idx + 1) % values.len();
+                val
+            },
+            1,
+        ))
     }
 
     /// Create a generator that starts at 0 and increments by 1 for each element
@@ -2579,6 +2608,16 @@ mod tests {
             *genn.generate(RowCount::from(1), &mut rng).unwrap(),
             StringArray::from_iter_values(["xyz"])
         );
+
+        let mut genn = array::cycle_bool(vec![false, false, true]);
+        assert_eq!(
+            *genn.generate(RowCount::from(5), &mut rng).unwrap(),
+            BooleanArray::from_iter(vec![false, false, true, false, false].into_iter().map(Some))
+        );
+        assert_eq!(
+            *genn.generate(RowCount::from(1), &mut rng).unwrap(),
+            BooleanArray::from_iter(vec![Some(true)])
+        )
     }
 
     #[test]
