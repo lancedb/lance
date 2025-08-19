@@ -131,7 +131,7 @@ impl IopsQuota {
     }
 
     // Acquire a reservation on the global IOPS quota
-    async fn acquire(&'_ self) -> IopsReservation<'_> {
+    async fn acquire(&self) -> IopsReservation<'_> {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
             IopsReservation {
                 value: Some(iops_avail.acquire().await.unwrap()),
