@@ -1764,6 +1764,11 @@ impl Transaction {
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
+                    } else {
+                        return Err(Error::InvalidInput {
+                            source: format!("Field with id {} does not exist", field_id).into(),
+                            location: location!(),
+                        });
                     }
                 }
             }
