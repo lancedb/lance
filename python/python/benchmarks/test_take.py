@@ -10,7 +10,11 @@ BATCH_SIZE = 1024
 
 
 def create_dataset(
-    path: str, data_storage_version, num_batches: int, file_size: int
+    path: str,
+    data_storage_version,
+    num_batches: int,
+    file_size: int,
+    batch_size: int = BATCH_SIZE,
 ) -> LanceDataset:
     schema = pa.schema(
         [
@@ -22,7 +26,6 @@ def create_dataset(
         ]
     )
 
-    batch_size = BATCH_SIZE
     batches = []
     for i in range(num_batches):
         start = i * batch_size
@@ -61,13 +64,22 @@ def gen_ranges(total_rows, num_rows):
 
 @pytest.mark.benchmark()
 @pytest.mark.parametrize("file_size", (1024 * 1024, 1024))
-@pytest.mark.parametrize("lance_format_version", [("stable", "V2_0"), ("2.1", "V2_1")])
+@pytest.mark.parametrize("lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")])
 @pytest.mark.parametrize("num_rows", [1, 10, 100, 1000])
-def test_dataset_take(benchmark, file_size, lance_format_version, num_rows):
+@pytest.mark.parametrize("batch_size", [512, 1024, 2048])
+@pytest.mark.parametrize("scheme", ["memory", "file"])
+def test_dataset_take(
+    benchmark, tmp_path, file_size, lance_format_version, num_rows, batch_size, scheme
+):
     data_storage_version, version_name = lance_format_version
-    path = "memory://test.lance"
+    if scheme == "memory":
+        path = "memory://test.lance"
+    elif scheme == "file":
+        path = str(tmp_path / "test.lance")
+    else:
+        raise ValueError(f"Unknown scheme: {scheme}")
     num_batches = 1024
-    ds = create_dataset(path, data_storage_version, num_batches, file_size)
+    ds = create_dataset(path, data_storage_version, num_batches, file_size, batch_size)
     total_rows = ds.count_rows()
     rows = gen_ranges(total_rows, num_rows)
 
@@ -77,6 +89,7 @@ def test_dataset_take(benchmark, file_size, lance_format_version, num_rows):
 
     benchmark.group = (
         f"{version_name} Random Take Dataset({file_size} file size, "
-        f"{num_batches} batches, {num_rows} rows per take)"
+        f"{num_batches} batches, {num_rows} rows per take, "
+        f"{batch_size} batch size, {scheme} scheme)"
     )
     benchmark(dataset_take_rows_bench)
