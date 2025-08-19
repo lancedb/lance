@@ -418,7 +418,7 @@ mod v2_adapter {
                 let scheduler = self.file_scheduler.with_priority(op_priority);
                 Arc::new(
                     self.reader
-                        .with_scheduler(Arc::new(LanceEncodingsIo(scheduler))),
+                        .with_scheduler(Arc::new(LanceEncodingsIo::new(scheduler))),
                 )
             } else {
                 self.reader.clone()
@@ -958,7 +958,7 @@ impl FileFragment {
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
-                    Arc::new(LanceEncodingsIo(file_scheduler.clone())),
+                    Arc::new(LanceEncodingsIo::new(file_scheduler.clone())),
                     path,
                     None,
                     Arc::<DecoderPlugins>::default(),

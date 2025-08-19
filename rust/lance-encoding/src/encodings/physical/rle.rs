@@ -48,6 +48,7 @@
 //! - Non-last chunks always contain power-of-2 values
 //! - Byte limits are enforced dynamically during encoding
 
+use arrow_buffer::ArrowNativeType;
 use log::trace;
 use snafu::location;
 
@@ -193,10 +194,9 @@ impl RleMiniBlockEncoder {
         all_lengths: &mut Vec<u8>,
     ) -> (usize, usize, bool)
     where
-        T: bytemuck::Pod + PartialEq + Copy + std::fmt::Debug,
+        T: bytemuck::Pod + PartialEq + Copy + std::fmt::Debug + ArrowNativeType,
     {
         let type_size = std::mem::size_of::<T>();
-        let data_slice = data.as_ref();
 
         let chunk_start = offset * type_size;
         // FIXME(xuanwo): we don't allow 4096 values as a workaround for https://github.com/lancedb/lance/issues/4429
@@ -208,12 +208,14 @@ impl RleMiniBlockEncoder {
         let max_values = values_remaining.min(max_by_count);
         let chunk_end = chunk_start + max_values * type_size;
 
-        if chunk_start >= data_slice.len() {
+        if chunk_start >= data.len() {
             return (0, 0, false);
         }
 
-        let chunk_data = &data_slice[chunk_start..chunk_end.min(data_slice.len())];
-        let typed_data: &[T] = bytemuck::cast_slice(chunk_data);
+        let chunk_len = chunk_end.min(data.len()) - chunk_start;
+        let chunk_buffer = data.slice_with_length(chunk_start, chunk_len);
+        let typed_data_ref = chunk_buffer.borrow_to_typed_slice::<T>();
+        let typed_data: &[T] = typed_data_ref.as_ref();
 
         if typed_data.is_empty() {
             return (0, 0, false);
@@ -437,14 +439,11 @@ impl RleMiniBlockDecompressor {
         num_values: u64,
     ) -> Result<Vec<u8>>
     where
-        T: bytemuck::Pod + Copy + std::fmt::Debug,
+        T: bytemuck::Pod + Copy + std::fmt::Debug + ArrowNativeType,
     {
-        let values_bytes = values_buffer.as_ref();
-        let lengths_bytes = lengths_buffer.as_ref();
-
         let type_size = std::mem::size_of::<T>();
 
-        if values_bytes.is_empty() || lengths_bytes.is_empty() {
+        if values_buffer.is_empty() || lengths_buffer.is_empty() {
             if num_values == 0 {
                 return Ok(Vec::new());
             } else {
@@ -455,30 +454,31 @@ impl RleMiniBlockDecompressor {
             }
         }
 
-        if values_bytes.len() % type_size != 0 || lengths_bytes.is_empty() {
+        if values_buffer.len() % type_size != 0 || lengths_buffer.is_empty() {
             return Err(Error::InvalidInput {
                 location: location!(),
                 source: format!(
                     "Invalid buffer sizes for RLE {} decoding: values {} bytes (not divisible by {}), lengths {} bytes",
                     std::any::type_name::<T>(),
-                    values_bytes.len(),
+                    values_buffer.len(),
                     type_size,
-                    lengths_bytes.len()
+                    lengths_buffer.len()
                 )
                 .into(),
             });
         }
 
-        let num_runs = values_bytes.len() / type_size;
-        let num_length_entries = lengths_bytes.len();
+        let num_runs = values_buffer.len() / type_size;
+        let num_length_entries = lengths_buffer.len();
         assert_eq!(
             num_runs, num_length_entries,
             "Inconsistent RLE buffers: {} runs but {} length entries",
             num_runs, num_length_entries
         );
 
-        let values: &[T] = bytemuck::cast_slice(values_bytes);
-        let lengths: &[u8] = lengths_bytes;
+        let values_ref = values_buffer.borrow_to_typed_slice::<T>();
+        let values: &[T] = values_ref.as_ref();
+        let lengths: &[u8] = lengths_buffer.as_ref();
 
         let expected_byte_count = num_values as usize * type_size;
         let mut decoded = Vec::with_capacity(expected_byte_count);
