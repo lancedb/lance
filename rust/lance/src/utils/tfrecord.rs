@@ -72,7 +72,7 @@ pub async fn infer_tfrecord_schema(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::other(err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let mut records = RecordStream::<Example, _>::from_reader(data, Default::default());
     let mut i = 0;
@@ -134,7 +134,7 @@ pub async fn read_tfrecord(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::other(err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let schema_ref = schema.clone();
     let batch_stream = RecordStream::<Example, _>::from_reader(data, Default::default())
