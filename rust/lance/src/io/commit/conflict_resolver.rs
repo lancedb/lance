@@ -439,12 +439,9 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
-                Operation::Overwrite { .. }
-                | Operation::Restore { .. } => Err(self.incompatible_conflict_err(
-                    other_transaction,
-                    other_version,
-                    location!(),
-                )),
+                Operation::Overwrite { .. } | Operation::Restore { .. } => Err(
+                    self.incompatible_conflict_err(other_transaction, other_version, location!())
+                ),
                 Operation::UpdateMemWalState { added, updated, .. } => {
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         added,
