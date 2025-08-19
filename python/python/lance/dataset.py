@@ -3044,6 +3044,27 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return SqlQueryBuilder(self._ds.sql(sql))
 
+    def diff_meta(self, compared_version: int) -> List[Transaction]:
+        """
+        Get the transaction list between current version and compared version
+        as metadata differences.
+
+        Parameters
+        ----------
+        compared_version : int
+            The version to compare against, the compared_version must be greater than 1
+            and less than the current version.
+            Note that the compared_version may not be existed in the
+            dataset(due to clean-up),
+            in which case it would throw a `VersionNotFound` error.
+
+        Returns
+        -------
+        List[Transaction]
+            List of transactions representing the differences
+        """
+        return self._ds.diff_meta(compared_version)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)

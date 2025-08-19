@@ -2043,6 +2043,16 @@ impl Dataset {
         let builder = ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
+
+    #[pyo3(signature=(compared_version))]
+    fn diff_meta(&self, compared_version: u64) -> PyResult<Vec<PyLance<Transaction>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transactions = RT
+            .block_on(None, new_self.diff_meta(compared_version))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        Ok(transactions.into_iter().map(PyLance).collect())
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]

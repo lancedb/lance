@@ -3983,3 +3983,36 @@ def test_commit_message_and_get_properties(tmp_path):
     assert len(transactions) == 3
     # The latest transaction from delete should have no properties.
     assert transactions[0].transaction_properties == {}
+
+
+def test_diff_meta(tmp_path: Path):
+    table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    lance.write_dataset(table1, tmp_path)
+
+    table2 = pa.table({"id": [4, 5], "value": ["d", "e"]})
+    dataset = lance.write_dataset(
+        table2, tmp_path, mode="append", commit_message="Append data"
+    )
+
+    dataset.delete("id = 2")
+
+    diff = dataset.diff_meta(1)
+
+    assert len(diff) == 2
+
+    for transaction in diff:
+        assert hasattr(transaction, "read_version")
+        assert hasattr(transaction, "transaction_properties")
+
+    dataset_v2 = lance.dataset(tmp_path, version=2)
+    diff_v2 = dataset_v2.diff_meta(1)
+
+    assert len(diff_v2) == 1
+
+    # Test diff with current version (should raise error)
+    with pytest.raises(Exception):
+        dataset.diff_meta(dataset.version)
+
+    # Test diff with future version (should raise error)
+    with pytest.raises(Exception):
+        dataset.diff_meta(dataset.version + 1)
