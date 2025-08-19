@@ -1534,7 +1534,7 @@ impl FileFragment {
             self.dataset.as_ref(),
             transforms,
             read_columns,
-            &[self.clone()],
+            std::slice::from_ref(self),
             batch_size,
         )
         .await?;

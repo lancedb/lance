@@ -110,7 +110,7 @@ impl<T: PartialEq + Eq> OrderedNode<T> {
 
 impl<T: PartialEq + Eq> PartialOrd for OrderedNode<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.dist.cmp(&other.dist))
+        Some(self.cmp(other))
     }
 }
 
