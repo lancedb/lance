@@ -2974,19 +2974,19 @@ mod tests {
         // Initial scan
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count1 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word2.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count2 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word3.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count3 = scanner.count_rows().await.unwrap();
@@ -2994,7 +2994,7 @@ mod tests {
         // Verify that after index creation and compaction, scan uses inverted index scan
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(true).await.unwrap();
@@ -3024,19 +3024,19 @@ mod tests {
         // Verify that scans still work correctly and return the same counts
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count1);
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word2.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count2);
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word3.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count3);

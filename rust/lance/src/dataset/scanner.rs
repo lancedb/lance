@@ -3738,11 +3738,10 @@ mod test {
             .unwrap();
 
         let check_err_msg = |r: Result<DatasetRecordBatchStream>| {
-            let err = match r {
-                Ok(_) => panic!(
+            let Err(err) = r else {
+                panic!(
                     "Expected an error to be raised saying column y is not found but got no error"
-                ),
-                Err(e) => e,
+                )
             };
 
             assert!(
