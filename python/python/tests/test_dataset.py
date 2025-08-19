@@ -4010,9 +4010,20 @@ def test_diff_meta(tmp_path: Path):
     assert len(diff_v2) == 1
 
     # Test diff with current version (should raise error)
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         dataset.diff_meta(dataset.version)
 
     # Test diff with future version (should raise error)
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         dataset.diff_meta(dataset.version + 1)
+
+    # Test diff with non-existent version after cleanup
+    moment = datetime.now()
+    table3 = pa.table({"id": [6, 7], "value": ["f", "g"]})
+    dataset = lance.write_dataset(table3, tmp_path, mode="append")
+
+    dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+
+    # Now try to diff with the cleaned up version 1 (should raise error)
+    with pytest.raises(ValueError):
+        dataset.diff_meta(1)

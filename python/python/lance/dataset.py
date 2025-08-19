@@ -3054,7 +3054,7 @@ class LanceDataset(pa.dataset.Dataset):
         compared_version : int
             The version to compare against, the compared_version must be greater than 0
             and less than the current version.
-            Note that the compared_version may not be existed in the dataset due to
+            Note that the compared_version may not exist in the dataset due to
             clean-up action, in which case it would throw a `VersionNotFound` error.
 
         Returns

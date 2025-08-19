@@ -56,6 +56,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::v2::reader::FileReaderOptions;
@@ -2049,7 +2050,13 @@ impl Dataset {
         let new_self = self.ds.as_ref().clone();
         let transactions = RT
             .block_on(None, new_self.diff_meta(compared_version))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: Error| match err {
+                Error::InvalidInput { source, .. } => PyValueError::new_err(source.to_string()),
+                Error::VersionNotFound { .. } => {
+                    PyValueError::new_err(format!("Version not found: {}", err))
+                }
+                _ => PyIOError::new_err(format!("Storage error: {}", err)),
+            })?;
 
         Ok(transactions.into_iter().map(PyLance).collect())
     }
