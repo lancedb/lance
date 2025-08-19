@@ -16,6 +16,9 @@
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
 
+// Internal column name for the merge action. Using "__action" to avoid collisions with user columns.
+const MERGE_ACTION_COLUMN: &str = "__action";
+
 use assign_action::merge_insert_action;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -1164,7 +1167,7 @@ impl MergeInsertJob {
         let df = scan_aliased
             .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
             .with_column(
-                "action",
+                MERGE_ACTION_COLUMN,
                 merge_insert_action(&self.params, Some(&dataset_schema))?,
             )?;
 
@@ -3152,7 +3155,7 @@ mod tests {
             plan,
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@1 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as action]
+    ProjectionExec: expr=[_rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@1 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
       ProjectionExec: expr=[key@2 IS NOT NULL as __common_expr_1, _rowaddr@0 as _rowaddr, value@1 as value, key@2 as key]
         CoalesceBatchesExec...
           HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
@@ -3200,7 +3203,7 @@ mod tests {
             plan,
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as action]
+    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
           LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
@@ -3246,7 +3249,7 @@ mod tests {
             plan,
             "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL AND value@1 > 20 THEN 1 ELSE 0 END as action]
+    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL AND value@1 > 20 THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
           LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
@@ -3504,5 +3507,123 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert!(analysis.contains("bytes_written"));
         assert!(analysis.contains("num_files_written"));
         assert!(analysis.contains("elapsed_compute"));
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_with_action_column() {
+        // Test that merge_insert works when the user has a column named "action"
+        // This reproduces issue #4498
+
+        // Create a dataset with an "action" column
+        let initial_data = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new("action", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["create", "update", "delete"])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let tempdir = tempdir().unwrap();
+        let dataset_uri = tempdir.path().join("test_dataset");
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
+            dataset_uri.to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Create new data for merge with matching "action" column
+        let new_data = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
+                arrow_schema::Field::new("action", arrow_schema::DataType::Utf8, true),
+                arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4])),
+                Arc::new(StringArray::from(vec!["modify", "insert"])),
+                Arc::new(Int32Array::from(vec![25, 40])),
+            ],
+        )
+        .unwrap();
+
+        // Perform merge insert - this should work despite having "action" column
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new(
+            [Ok(new_data.clone())],
+            new_data.schema(),
+        ));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (merged_dataset, _) = merge_insert_job.execute(new_stream).await.unwrap();
+
+        // Verify the merge worked correctly
+        let result_batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let result_batch = concat_batches(&result_batches[0].schema(), &result_batches).unwrap();
+
+        // Should have 4 rows: 1 (unchanged), 2 (updated), 3 (unchanged), 4 (inserted)
+        assert_eq!(result_batch.num_rows(), 4);
+
+        // Verify the "action" column values are preserved correctly
+        let id_col = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let action_col = result_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let value_col = result_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // Find each row by ID and verify
+        for i in 0..result_batch.num_rows() {
+            match id_col.value(i) {
+                1 => {
+                    assert_eq!(action_col.value(i), "create");
+                    assert_eq!(value_col.value(i), 10);
+                }
+                2 => {
+                    assert_eq!(action_col.value(i), "modify"); // Updated
+                    assert_eq!(value_col.value(i), 25); // Updated
+                }
+                3 => {
+                    assert_eq!(action_col.value(i), "delete");
+                    assert_eq!(value_col.value(i), 30);
+                }
+                4 => {
+                    assert_eq!(action_col.value(i), "insert"); // New row
+                    assert_eq!(value_col.value(i), 40); // New row
+                }
+                _ => panic!("Unexpected id: {}", id_col.value(i)),
+            }
+        }
     }
 }

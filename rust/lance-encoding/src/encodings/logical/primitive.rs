@@ -3491,7 +3491,7 @@ impl PrimitiveStructuralEncoder {
                     0
                 };
 
-                if chunk_idx != 0 && rep_values[0] == max_rep {
+                if chunk_idx != 0 && rep_values.first() == Some(&max_rep) {
                     // This chunk starts with a new row and so, if we thought we had leftovers
                     // in the previous chunk, we were mistaken
                     // TODO: Can use unchecked here
@@ -4387,12 +4387,16 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc};
-
+    use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
+    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+    use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_schema::DataType;
+    use std::collections::HashMap;
+    use std::{collections::VecDeque, sync::Arc};
 
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
@@ -5252,5 +5256,41 @@ mod tests {
                 .is_some(),
             "With enable_cache=true, should return FullZipCacheableState"
         );
+    }
+
+    /// This test is used to reproduce fuzz test https://github.com/lancedb/lance/issues/4492
+    #[tokio::test]
+    async fn test_fuzz_issue_4492_empty_rep_values() {
+        use lance_datagen::{array, gen_batch, RowCount, Seed};
+
+        let seed = 1823859942947654717u64;
+        let num_rows = 2741usize;
+
+        // Generate the exact same data that caused the failure
+        let batch_gen = gen_batch().with_seed(Seed::from(seed));
+        let base_generator = array::rand_type(&DataType::FixedSizeBinary(32));
+        let list_generator = array::rand_list_any(base_generator, false);
+
+        let batch = batch_gen
+            .anon_col(list_generator)
+            .into_batch_rows(RowCount::from(num_rows as u64))
+            .unwrap();
+
+        let list_array = batch.column(0).clone();
+
+        // Force miniblock encoding
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_file_version(LanceFileVersion::V2_1)
+            .with_batch_size(100)
+            .with_range(0..num_rows.min(500) as u64)
+            .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
+
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
     }
 }

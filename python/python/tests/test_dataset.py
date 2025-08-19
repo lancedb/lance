@@ -1225,6 +1225,24 @@ def test_create_from_commit(tmp_path: Path):
     assert tbl == table
 
 
+def test_strict_overwrite(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
+    dataset_v1 = lance.LanceDataset.commit(base_dir, operation, max_retries=0)
+    lance.LanceDataset.commit(
+        base_dir, operation, read_version=dataset_v1.version, max_retries=0
+    )
+    with pytest.raises(
+        OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
+    ):
+        lance.LanceDataset.commit(
+            base_dir, operation, read_version=dataset_v1.version, max_retries=0
+        )
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -3965,3 +3983,47 @@ def test_commit_message_and_get_properties(tmp_path):
     assert len(transactions) == 3
     # The latest transaction from delete should have no properties.
     assert transactions[0].transaction_properties == {}
+
+
+def test_diff_meta(tmp_path: Path):
+    table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    lance.write_dataset(table1, tmp_path)
+
+    table2 = pa.table({"id": [4, 5], "value": ["d", "e"]})
+    dataset = lance.write_dataset(
+        table2, tmp_path, mode="append", commit_message="Append data"
+    )
+
+    dataset.delete("id = 2")
+
+    diff = dataset.diff_meta(1)
+
+    assert len(diff) == 2
+
+    for transaction in diff:
+        assert hasattr(transaction, "read_version")
+        assert hasattr(transaction, "transaction_properties")
+
+    dataset_v2 = lance.dataset(tmp_path, version=2)
+    diff_v2 = dataset_v2.diff_meta(1)
+
+    assert len(diff_v2) == 1
+
+    # Test diff with current version (should raise error)
+    with pytest.raises(ValueError):
+        dataset.diff_meta(dataset.version)
+
+    # Test diff with future version (should raise error)
+    with pytest.raises(ValueError):
+        dataset.diff_meta(dataset.version + 1)
+
+    # Test diff with non-existent version after cleanup
+    moment = datetime.now()
+    table3 = pa.table({"id": [6, 7], "value": ["f", "g"]})
+    dataset = lance.write_dataset(table3, tmp_path, mode="append")
+
+    dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+
+    # Now try to diff with the cleaned up version 1 (should raise error)
+    with pytest.raises(ValueError):
+        dataset.diff_meta(1)

@@ -438,7 +438,7 @@ impl LanceFileReader {
         }
 
         let inner = FileReader::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(file.clone())),
+            Arc::new(LanceEncodingsIo::new(file.clone())),
             path,
             base_projection,
             Arc::<DecoderPlugins>::default(),
