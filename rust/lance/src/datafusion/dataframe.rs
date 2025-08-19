@@ -225,9 +225,21 @@ impl ExecutionPlan for TracedLanceExec {
         let plan_for_metrics = self.input.clone();
         
         let traced_stream = stream.finally(move || {
-            // Just print the metrics object directly
             if let Some(metrics) = plan_for_metrics.metrics() {
-                println!("Metrics: {:?}", metrics);
+                let mut values = [0u64; 4]; // iops, requests, bytes_read, rows_scanned
+                for metric in metrics.iter() {
+                    if let datafusion::physical_plan::metrics::MetricValue::Count { name, count } = metric.value() {
+                        match name.as_ref() {
+                            "iops" => values[0] = count.value() as u64,
+                            "requests" => values[1] = count.value() as u64, 
+                            "bytes_read" => values[2] = count.value() as u64,
+                            "rows_scanned" => values[3] = count.value() as u64,
+                            _ => {}
+                        }
+                    }
+                }
+                println!("iops: {}, requests: {}, bytes_read: {} ({:.1}MB), rows_scanned: {}", 
+                         values[0], values[1], values[2], values[2] as f64 / 1024.0 / 1024.0, values[3]);
             } else {
                 println!("No metrics available");
             }
