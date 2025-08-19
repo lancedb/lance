@@ -346,6 +346,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Append { .. }
+                | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
@@ -439,8 +440,7 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
                 }
                 Operation::Overwrite { .. }
-                | Operation::Restore { .. }
-                | Operation::Clone { .. } => Err(self.incompatible_conflict_err(
+                | Operation::Restore { .. } => Err(self.incompatible_conflict_err(
                     other_transaction,
                     other_version,
                     location!(),

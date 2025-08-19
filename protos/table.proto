@@ -169,8 +169,11 @@ message Manifest {
 message BasePath {
   uint32 id = 1;
   string name = 2;
-  // in case that cloning and importing paths are used in different ways
+  // Flag indicating whether this path is a dataset root path or file directory:
+  // - true:  Path is a dataset root (actual files under subdirectories like `data`, '_deletions')
+  // - false: Path is a direct file directory (scenario like importing files)
   bool dataset_base = 3;
+  // Note: This absolute path will be directly used by Path:parse(),
   string path = 4;
 }
 

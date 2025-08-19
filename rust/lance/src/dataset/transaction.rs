@@ -1350,7 +1350,10 @@ impl Transaction {
 
         match &self.operation {
             Operation::Clone { .. } => {
-                unreachable!()
+                return Err(Error::Internal {
+                    message: "Clone operation should not enter build_manifest.".to_string(),
+                    location: location!(),
+                })
             }
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());

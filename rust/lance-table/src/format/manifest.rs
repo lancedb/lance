@@ -223,6 +223,7 @@ impl Manifest {
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
+            // TODO: apply shallow clone to indexes
             index_section: None,
             timestamp_nanos: self.timestamp_nanos,
             reader_feature_flags: self.reader_feature_flags,

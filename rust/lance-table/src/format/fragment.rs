@@ -209,20 +209,6 @@ pub struct DeletionFile {
     pub base_id: Option<u32>,
 }
 
-impl Display for DeletionFile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "DeletionFile {{ id: {}, read_version: {}, file_type: {:?}, num_deleted_rows: {:?}, base_id: {:?} }}",
-            self.id,
-            self.read_version,
-            self.file_type,
-            self.num_deleted_rows,
-            self.base_id
-        )
-    }
-}
-
 impl TryFrom<pb::DeletionFile> for DeletionFile {
     type Error = Error;
 

@@ -13,7 +13,7 @@ pub async fn read_dataset_deletion_file(
     fragment_id: u64,
     deletion_file: &DeletionFile,
 ) -> lance_core::Result<Arc<DeletionVector>> {
-    let deletion_dir = dataset.deletion_file_base_dir(deletion_file)?;
+    let dataset_dir = dataset.dataset_dir_for_deletion(deletion_file)?;
     let key = DeletionFileKey {
         fragment_id,
         deletion_file,
@@ -26,7 +26,7 @@ pub async fn read_dataset_deletion_file(
             read_deletion_file(
                 fragment_id,
                 deletion_file,
-                &deletion_dir,
+                &dataset_dir,
                 dataset.object_store.as_ref(),
             )
             .await?,

@@ -1230,14 +1230,14 @@ impl Dataset {
         }
     }
 
-    pub(crate) fn deletion_file_base_dir(&self, deletion_file: &DeletionFile) -> Result<Path> {
+    pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
         match deletion_file.base_id.as_ref() {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
                 let base_path = base_paths.get(base_id).ok_or_else(|| {
                     Error::invalid_input(
                         format!(
-                            "base_path id {} not found for deletion_file {}",
+                            "base_path id {} not found for deletion_file {:?}",
                             base_id, deletion_file
                         ),
                         location!(),
@@ -2742,7 +2742,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn clone_dataset(
+    async fn shallow_clone_dataset(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
@@ -2778,7 +2778,6 @@ mod tests {
             .await
             .unwrap();
 
-        let fragments = cloned_dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
 
