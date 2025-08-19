@@ -224,8 +224,8 @@ pub(crate) async fn remap_index(
     if row_id_map.values().all(|v| v.is_none()) {
         let deleted_bitmap = RoaringBitmap::from_iter(
             row_id_map
-                .iter()
-                .map(|(row_id, _)| RowAddress::new_from_u64(*row_id))
+                .keys()
+                .map(|row_id| RowAddress::new_from_u64(*row_id))
                 .map(|addr| addr.fragment_id()),
         );
         if Some(deleted_bitmap) == matched.fragment_bitmap {

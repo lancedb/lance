@@ -989,9 +989,9 @@ impl NGramIndexBuilder {
             NGramIndexSpillState { tokens, bitmaps }
         };
 
-        if left_token.is_some() {
+        if let Some(left_token) = left_token {
             *left_opt = Some(collect_remaining(
-                left_token.unwrap(),
+                left_token,
                 left_tokens,
                 left_bitmap.unwrap(),
                 left_bitmaps,
@@ -999,9 +999,9 @@ impl NGramIndexBuilder {
         } else {
             *left_opt = None;
         }
-        if right_token.is_some() {
+        if let Some(right_token) = right_token {
             *right_opt = Some(collect_remaining(
-                right_token.unwrap(),
+                right_token,
                 right_tokens,
                 right_bitmap.unwrap(),
                 right_bitmaps,

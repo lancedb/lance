@@ -115,7 +115,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
         })
     }
     /// Waits until at least `num_rows` have been loaded
-    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>>;
+    fn wait_for_loaded(&'_ mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>>;
     /// The number of rows loaded so far
     fn rows_loaded(&self) -> u64;
     /// The number of rows that still need loading

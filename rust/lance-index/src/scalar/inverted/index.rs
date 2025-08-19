@@ -663,7 +663,7 @@ impl TokenSet {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> TokenIterator {
+    pub(crate) fn iter(&self) -> TokenIterator<'_> {
         TokenIterator::new(match &self.tokens {
             TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
             TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
@@ -1170,7 +1170,7 @@ impl PostingList {
         }
     }
 
-    pub fn iter(&self) -> PostingListIterator {
+    pub fn iter(&self) -> PostingListIterator<'_> {
         PostingListIterator::new(self)
     }
 
@@ -1317,7 +1317,7 @@ impl PlainPostingList {
         self.len() == 0
     }
 
-    pub fn iter(&self) -> PlainPostingListIterator {
+    pub fn iter(&self) -> PlainPostingListIterator<'_> {
         Box::new(
             self.row_ids
                 .iter()
