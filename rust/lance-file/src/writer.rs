@@ -940,7 +940,10 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
@@ -974,7 +977,10 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
@@ -1016,7 +1022,10 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();

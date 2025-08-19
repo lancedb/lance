@@ -166,7 +166,7 @@ mod tests {
     fn test_slot_backoff() {
         fn assert_in(value: u128, expected: &[u128]) {
             assert!(
-                expected.iter().any(|&x| x == value),
+                expected.contains(&value),
                 "value {} not in {:?}",
                 value,
                 expected

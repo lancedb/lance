@@ -1027,8 +1027,10 @@ pub(crate) mod tests {
     fn fsl_value_miniblock_stress() {
         let sample_array = create_random_fsl();
 
-        let starting_data =
-            DataBlock::from_arrays(&[sample_array.clone()], sample_array.len() as u64);
+        let starting_data = DataBlock::from_arrays(
+            std::slice::from_ref(&sample_array),
+            sample_array.len() as u64,
+        );
 
         let encoder = ValueEncoder::default();
         let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
@@ -1055,8 +1057,10 @@ pub(crate) mod tests {
     fn fsl_value_per_value_stress() {
         let sample_array = create_random_fsl();
 
-        let starting_data =
-            DataBlock::from_arrays(&[sample_array.clone()], sample_array.len() as u64);
+        let starting_data = DataBlock::from_arrays(
+            std::slice::from_ref(&sample_array),
+            sample_array.len() as u64,
+        );
 
         let encoder = ValueEncoder::default();
         let (data, compression) = PerValueCompressor::compress(&encoder, starting_data).unwrap();

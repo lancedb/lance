@@ -1415,14 +1415,14 @@ pub mod tests {
         // Simple check for 1 value (doesn't matter intersection vs union)
         check(
             LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]),
-            Box::new(|vals| vals.iter().any(|val| *val == 1)),
-            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
         )
         .await;
         check(
             LabelListQuery::HasAllLabels(vec![ScalarValue::UInt8(Some(1))]),
-            Box::new(|vals| vals.iter().any(|val| *val == 1)),
-            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
         )
         .await;
         // Set intersection
@@ -1432,9 +1432,9 @@ pub mod tests {
                 ScalarValue::UInt8(Some(2)),
             ]),
             // Match must have 1 and 2
-            Box::new(|vals| vals.iter().any(|val| *val == 1) && vals.iter().any(|val| *val == 2)),
+            Box::new(|vals| vals.contains(&1) && vals.contains(&2)),
             // No-match must either not have 1 or not have 2
-            Box::new(|vals| vals.iter().all(|val| *val != 1) || vals.iter().all(|val| *val != 2)),
+            Box::new(|vals| !vals.contains(&1) || !vals.contains(&2)),
         )
         .await;
         // Set union
@@ -1444,9 +1444,9 @@ pub mod tests {
                 ScalarValue::UInt8(Some(2)),
             ]),
             // Match either have 1 or have 2
-            Box::new(|vals| vals.iter().any(|val| *val == 1) || vals.iter().any(|val| *val == 2)),
+            Box::new(|vals| vals.contains(&1) || vals.contains(&2)),
             // No-match must not have 1 and not have 2
-            Box::new(|vals| vals.iter().all(|val| *val != 1) && vals.iter().all(|val| *val != 2)),
+            Box::new(|vals| !vals.contains(&1) && !vals.contains(&2)),
         )
         .await;
     }
