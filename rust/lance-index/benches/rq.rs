@@ -23,7 +23,7 @@ use lance_linalg::distance::DistanceType;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-const DIM: usize = 1536;
+const DIM: usize = 128;
 const TOTAL: usize = 16 * 1000;
 
 fn mock_rq_storage(num_bits: u8) -> RabitQuantizationStorage {
@@ -52,7 +52,7 @@ fn mock_rq_storage(num_bits: u8) -> RabitQuantizationStorage {
 }
 
 fn construct_dist_table(c: &mut Criterion) {
-    for num_bits in 1..=8 {
+    for num_bits in 1..=1 {
         let rq = mock_rq_storage(num_bits);
         let query = rand_type(&DataType::Float32)
             .generate_default(RowCount::from(DIM as u64))
@@ -75,7 +75,7 @@ fn construct_dist_table(c: &mut Criterion) {
 }
 
 fn compute_distances(c: &mut Criterion) {
-    for num_bits in 1..=8 {
+    for num_bits in 1..=1 {
         let rq = mock_rq_storage(num_bits);
         let query = rand_type(&DataType::Float32)
             .generate_default(RowCount::from(DIM as u64))

@@ -4,6 +4,7 @@
 //! IVF - Inverted File index.
 
 use std::marker::PhantomData;
+use std::time::Instant;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::index::vector::{
@@ -479,10 +480,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        let start = Instant::now();
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        pre_filter.wait_for_ready().await?;
-        let query = self.preprocess_query(partition_id, query)?;
+        println!("partition {} load took {:?}", partition_id, start.elapsed());
 
+        let start = Instant::now();
+        pre_filter.wait_for_ready().await?;
+        println!("partition {} wait for ready took {:?}", partition_id, start.elapsed());
+
+        let start = Instant::now();
+        let query = self.preprocess_query(partition_id, query)?;
+        println!("partition {} preprocess query took {:?}", partition_id, start.elapsed());
+
+        let start = Instant::now();
         let (batch, local_metrics) = spawn_cpu(move || {
             let param = (&query).into();
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
@@ -495,6 +505,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     message: "failed to downcast partition entry".to_string(),
                     location: location!(),
                 })?;
+            let start = Instant::now();
             let batch = part.index.search(
                 query.key,
                 k,
@@ -503,9 +514,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 pre_filter,
                 &local_metrics,
             )?;
+            println!("partition {} index search took {:?}", partition_id, start.elapsed());
             Ok((batch, local_metrics))
         })
         .await?;
+        println!("partition {} search took {:?}", partition_id, start.elapsed());
 
         local_metrics.dump_into(metrics);
 

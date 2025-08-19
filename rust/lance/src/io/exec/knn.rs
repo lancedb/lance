@@ -32,7 +32,7 @@ use datafusion::{
     physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::futures::FinallyStreamExt;
@@ -844,6 +844,7 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
+                    let start = Instant::now();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
                         let key = normalize_arrow(&query.key)?.0;
@@ -861,6 +862,7 @@ impl ANNIvfSubIndexExec {
                             DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
                         })
                         .await?;
+                    println!("partition {} took {:?}", part_id, start.elapsed());
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     state.record_batch(&batch);
                     Ok(batch)

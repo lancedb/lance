@@ -63,6 +63,7 @@ fn sum_4bit_dist_table_scalar(code_len: usize, codes: &[u8], dist_table: &[u8], 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx512bw")]
 #[inline]
 #[allow(unused)]
 unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
