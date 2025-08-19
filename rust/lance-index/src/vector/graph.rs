@@ -94,37 +94,40 @@ impl From<OrderedFloat> for f32 {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
-pub struct OrderedNode {
-    pub id: u32,
+pub struct OrderedNode<T = u32>
+where
+    T: PartialEq + Eq,
+{
+    pub id: T,
     pub dist: OrderedFloat,
 }
 
-impl OrderedNode {
-    pub fn new(id: u32, dist: OrderedFloat) -> Self {
+impl<T: PartialEq + Eq> OrderedNode<T> {
+    pub fn new(id: T, dist: OrderedFloat) -> Self {
         Self { id, dist }
     }
 }
 
-impl PartialOrd for OrderedNode {
+impl<T: PartialEq + Eq> PartialOrd for OrderedNode<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.dist.cmp(&other.dist))
     }
 }
 
-impl Ord for OrderedNode {
+impl<T: PartialEq + Eq> Ord for OrderedNode<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.dist.cmp(&other.dist)
     }
 }
 
-impl From<(OrderedFloat, u32)> for OrderedNode {
-    fn from((dist, id): (OrderedFloat, u32)) -> Self {
+impl<T: PartialEq + Eq> From<(OrderedFloat, T)> for OrderedNode<T> {
+    fn from((dist, id): (OrderedFloat, T)) -> Self {
         Self { id, dist }
     }
 }
 
-impl From<OrderedNode> for (OrderedFloat, u32) {
-    fn from(node: OrderedNode) -> Self {
+impl<T: PartialEq + Eq> From<OrderedNode<T>> for (OrderedFloat, T) {
+    fn from(node: OrderedNode<T>) -> Self {
         (node.dist, node.id)
     }
 }
