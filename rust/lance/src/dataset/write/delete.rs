@@ -651,7 +651,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_concurrency() {
+    #[rstest]
+    async fn test_delete_concurrency(#[values(false, true)] enable_move_stable_row_ids: bool) {
         use crate::{
             dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteParams},
             session::Session,
@@ -693,6 +694,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
+                enable_move_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])
