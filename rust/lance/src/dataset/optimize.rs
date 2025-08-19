@@ -987,7 +987,7 @@ impl ColumnGroup {
     }
 }
 
-/// Configuration options for horizontal column compaction.
+/// Configuration options for Optimize columns.
 ///
 /// This struct controls how columns are regrouped within fragments.
 #[derive(Debug, Clone, Default)]
@@ -1448,7 +1448,7 @@ fn construct_new_fragment(
     }
 }
 
-/// Commit horizontal compaction results in batched transaction
+/// Commit optimize columns results in batched transaction
 async fn commit_optimize_columns(
     dataset: &mut Dataset,
     completed_results: Vec<OptimizeColumnsResult>,
