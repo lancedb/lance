@@ -24,13 +24,13 @@ use datafusion::{
         DisplayFormatType,
         PlanProperties,
         stream::RecordBatchStreamAdapter,
+
     },
 };
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::tracing::{TRACE_EXECUTION, EXECUTION_PLAN_RUN};
-use tracing;
+// Removed unused tracing imports
 
 use crate::Dataset;
 
@@ -225,24 +225,65 @@ impl ExecutionPlan for TracedLanceExec {
         let plan_for_metrics = self.input.clone();
         
         let traced_stream = stream.finally(move || {
-            if let Some(metrics) = plan_for_metrics.metrics() {
-                let mut values = [0u64; 4]; // iops, requests, bytes_read, rows_scanned
-                for metric in metrics.iter() {
-                    if let datafusion::physical_plan::metrics::MetricValue::Count { name, count } = metric.value() {
-                        match name.as_ref() {
-                            "iops" => values[0] = count.value() as u64,
-                            "requests" => values[1] = count.value() as u64, 
-                            "bytes_read" => values[2] = count.value() as u64,
-                            "rows_scanned" => values[3] = count.value() as u64,
-                            _ => {}
+            let operation_name = plan_for_metrics.name();
+            
+            println!("=== Execution Plan Structure ===");
+            use datafusion::physical_plan::display::DisplayableExecutionPlan;
+            let display = DisplayableExecutionPlan::new(plan_for_metrics.as_ref());
+            println!("{}", display.indent(false));
+            println!("================================");
+            
+            fn collect_filtered_read_metrics(plan: &dyn ExecutionPlan) {
+                let plan_name = plan.name();
+                
+                if plan_name == "FilteredReadExec" {
+                    println!("FilteredReadExec Analysis:");
+                    
+                    if let Some(metrics) = plan.metrics() {
+                        let mut io_metrics = [0u64; 4]; // iops, requests, bytes_read, rows_scanned  
+                        let mut fragments = 0u64;
+                        let mut ranges = 0u64;
+                        
+                        for metric in metrics.iter() {
+                            if let datafusion::physical_plan::metrics::MetricValue::Count { name, count } = metric.value() {
+                                match name.as_ref() {
+                                    "iops" => io_metrics[0] = count.value() as u64,
+                                    "requests" => io_metrics[1] = count.value() as u64,
+                                    "bytes_read" => io_metrics[2] = count.value() as u64,
+                                    "rows_scanned" => io_metrics[3] = count.value() as u64,
+                                    "fragments_scanned" => fragments = count.value() as u64,
+                                    "ranges_scanned" => ranges = count.value() as u64,
+                                    _ => {}
+                                }
+                            }
                         }
+                        
+                        let mb_read = io_metrics[2] as f64 / 1024.0 / 1024.0;
+                        
+                        println!("  I/O Stats:");
+                        println!("    - Data Read: {:.1} MB ({} bytes)", mb_read, io_metrics[2]);
+                        println!("    - I/O Operations: {} iops across {} requests", io_metrics[0], io_metrics[1]);
+                        println!("    - Avg Request Size: {:.1} MB", if io_metrics[1] > 0 { mb_read / io_metrics[1] as f64 } else { 0.0 });
+                        println!("    - Rows Scanned: {} rows", io_metrics[3]);
+
+                        println!("  Scan Efficiency:");
+                        println!("    - Fragments Scanned: {} of total", fragments);
+                        println!("    - Ranges Scanned: {}", ranges);  
+                        println!("    - Data per Row: {:.1} KB", if io_metrics[3] > 0 { (io_metrics[2] as f64 / 1024.0) / io_metrics[3] as f64 } else { 0.0 });
+                    } else {
+                        println!("  No metrics available");
                     }
                 }
-                println!("iops: {}, requests: {}, bytes_read: {} ({:.1}MB), rows_scanned: {}", 
-                         values[0], values[1], values[2], values[2] as f64 / 1024.0 / 1024.0, values[3]);
-            } else {
-                println!("No metrics available");
+                
+                // Recursively check children
+                for child in plan.children() {
+                    collect_filtered_read_metrics(child.as_ref());
+                }
             }
+            
+            println!("\n=== FilteredReadExec Analysis ===");
+            collect_filtered_read_metrics(plan_for_metrics.as_ref());
+            println!("=================================");
         });
         
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, traced_stream)))
