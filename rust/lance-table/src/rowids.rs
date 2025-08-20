@@ -561,31 +561,18 @@ impl RowIdSeqSlice<'_> {
 
 /// Re-chunk a sequences of row ids into chunks of a given size.
 ///
-/// # Errors
-///
-/// Will return an error if the sum of the chunk sizes is not equal to the total
-/// number of row ids in the sequences.
-pub fn rechunk_sequences(
-    sequences: impl IntoIterator<Item = RowIdSequence>,
-    chunk_sizes: impl IntoIterator<Item = u64>,
-) -> Result<Vec<RowIdSequence>> {
-    rechunk_sequences_impl(sequences, chunk_sizes, false)
-}
-
-/// Re-chunk a sequences of row ids into chunks of a given size.
 /// The sequences may less than chunk sizes, because the sequences only
 /// contains the row ids that we want to keep, they come from the updates records.
 /// But the chunk sizes are based on the fragment physical rows(may contain inserted records).
 /// So if the sequences are smaller than the chunk sizes, we need to
-/// assign the incremental row ids in the further step.
-pub fn rechunk_sequences_for_merge_insert(
-    sequences: impl IntoIterator<Item = RowIdSequence>,
-    chunk_sizes: impl IntoIterator<Item = u64>,
-) -> Result<Vec<RowIdSequence>> {
-    rechunk_sequences_impl(sequences, chunk_sizes, true)
-}
-
-fn rechunk_sequences_impl(
+/// assign the incremental row ids in the further step. This behavior is controlled by the
+/// `allow_incomplete` parameter.
+///
+/// # Errors
+///
+/// If `allow_incomplete` is false, will return an error if the sum of the chunk sizes
+/// is not equal to the total number of row ids in the sequences.
+pub fn rechunk_sequences(
     sequences: impl IntoIterator<Item = RowIdSequence>,
     chunk_sizes: impl IntoIterator<Item = u64>,
     allow_incomplete: bool,
@@ -846,7 +833,7 @@ mod test {
             chunk_sizes: Vec<u64>,
             expected: Vec<RowIdSequence>,
         ) {
-            let chunked = rechunk_sequences(input, chunk_sizes).unwrap();
+            let chunked = rechunk_sequences(input, chunk_sizes, false).unwrap();
             assert_eq!(chunked, expected);
         }
 
@@ -882,11 +869,11 @@ mod test {
         );
 
         // Too few segments -> error
-        let result = rechunk_sequences(many_segments.clone(), vec![100]);
+        let result = rechunk_sequences(many_segments.clone(), vec![100], false);
         assert!(result.is_err());
 
         // Too many segments -> error
-        let result = rechunk_sequences(many_segments, vec![5]);
+        let result = rechunk_sequences(many_segments, vec![5], false);
         assert!(result.is_err());
     }
 

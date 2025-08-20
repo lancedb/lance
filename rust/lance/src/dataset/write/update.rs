@@ -349,15 +349,18 @@ impl UpdateJob {
             let fragment_sizes = new_fragments
                 .iter()
                 .map(|f| f.physical_rows.unwrap() as u64);
-            let sequences =
-                lance_table::rowids::rechunk_sequences([row_id_sequence.clone()], fragment_sizes)
-                    .map_err(|e| Error::Internal {
-                    message: format!(
-                        "Captured row ids not equal to number of rows written: {}",
-                        e
-                    ),
-                    location: location!(),
-                })?;
+            let sequences = lance_table::rowids::rechunk_sequences(
+                [row_id_sequence.clone()],
+                fragment_sizes,
+                false,
+            )
+            .map_err(|e| Error::Internal {
+                message: format!(
+                    "Captured row ids not equal to number of rows written: {}",
+                    e
+                ),
+                location: location!(),
+            })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                 let serialized = lance_table::rowids::write_row_ids(&sequence);
                 fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));

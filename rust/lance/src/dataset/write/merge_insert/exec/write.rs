@@ -775,9 +775,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .iter()
                     .map(|f| f.physical_rows.unwrap() as u64);
 
-                let sequences = lance_table::rowids::rechunk_sequences_for_merge_insert(
+                let sequences = lance_table::rowids::rechunk_sequences(
                     [row_id_sequence.clone()],
                     fragment_sizes,
+                    true,
                 )
                 .map_err(|e| Error::Internal {
                     message: format!(
