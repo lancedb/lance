@@ -40,7 +40,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -775,7 +774,12 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void updateConfig(Map<String, String> tableConfig) {
-    updateConfig(tableConfig, false);
+    UpdateMap configUpdate = UpdateMap.builder().updates(tableConfig).replace(true).build();
+
+    UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
+
+    Dataset newDataset = newTransactionBuilder().operation(operation).build().commit();
+    updateToNewDataset(newDataset);
   }
 
   /**
@@ -786,13 +790,32 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void deleteConfigKeys(Set<String> deleteKeys) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeDeleteConfigKeys(new ArrayList<>(deleteKeys));
-    }
+    Map<String, String> deleteMap = new HashMap<>();
+    deleteKeys.forEach(key -> deleteMap.put(key, null));
+    UpdateMap configUpdate = UpdateMap.builder().updates(deleteMap).replace(true).build();
+
+    UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
+
+    Dataset newDataset = newTransactionBuilder().operation(operation).build().commit();
+    updateToNewDataset(newDataset);
   }
 
-  private native void nativeDeleteConfigKeys(List<String> deleteKeys);
+  /**
+   * Updates the internal state of this dataset to match the provided new dataset. This is used by
+   * deprecated void methods that need to update the current dataset instance.
+   */
+  private void updateToNewDataset(Dataset newDataset) {
+    // Close the current handle to avoid resource leak
+    close();
+
+    // Replace all internal state with the new dataset
+    this.nativeDatasetHandle = newDataset.nativeDatasetHandle;
+    this.allocator = newDataset.allocator;
+    this.selfManagedAllocator = newDataset.selfManagedAllocator;
+
+    // Prevent the new dataset from closing the handle when it gets GC'd
+    newDataset.nativeDatasetHandle = 0;
+  }
 
   /**
    * Closes this dataset and releases any system resources associated with it. If the dataset is
@@ -859,63 +882,6 @@ public class Dataset implements Closeable {
   }
 
   private native Map<String, String> nativeGetTableMetadata();
-
-  /**
-   * Update the configuration of the dataset.
-   *
-   * <p>This method supports both incremental updates (default) and full replacement.
-   *
-   * @param values configuration updates where keys are config keys and values are: - String: Set
-   *     the config key to this value - null: Remove the config key (ignored in replace mode)
-   * @param replace if true, completely replace all configuration with the provided values. If
-   *     false, incrementally update only the specified keys.
-   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
-   */
-  @Deprecated
-  public void updateConfig(Map<String, String> values, boolean replace) {
-    // Route through the transaction builder API as recommended
-    UpdateMap configUpdate = UpdateMap.builder().updates(values).replace(replace).build();
-
-    UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
-
-    newTransactionBuilder().operation(operation).build().commit();
-  }
-
-  private native void nativeUpdateConfig(Map<String, String> values, boolean replace);
-
-  /**
-   * Replace the schema metadata of the dataset.
-   *
-   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
-   * @param metadata the new schema metadata
-   */
-  @Deprecated
-  public void replaceSchemaMetadata(Map<String, String> metadata) {
-    UpdateMap schemaUpdate = UpdateMap.builder().updates(metadata).replace(true).build();
-
-    UpdateConfig operation = UpdateConfig.builder().schemaMetadataUpdates(schemaUpdate).build();
-
-    newTransactionBuilder().operation(operation).build().commit();
-  }
-
-  /**
-   * Replace target field metadata of the dataset. This method won't affect fields not in the map
-   *
-   * @deprecated Use {@link #newTransactionBuilder()} with {@link UpdateConfig} operation instead
-   * @param fieldMetadataMap field id to metadata map
-   */
-  @Deprecated
-  public void replaceFieldMetadata(Map<Integer, Map<String, String>> fieldMetadataMap) {
-    Map<Integer, UpdateMap> fieldUpdates = new HashMap<>();
-    for (Map.Entry<Integer, Map<String, String>> entry : fieldMetadataMap.entrySet()) {
-      UpdateMap fieldUpdate = UpdateMap.builder().updates(entry.getValue()).replace(true).build();
-      fieldUpdates.put(entry.getKey(), fieldUpdate);
-    }
-
-    UpdateConfig operation = UpdateConfig.builder().fieldMetadataUpdates(fieldUpdates).build();
-
-    newTransactionBuilder().operation(operation).build().commit();
-  }
 
   /** Tag operations of the dataset. */
   public class Tags {
