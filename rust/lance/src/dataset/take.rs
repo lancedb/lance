@@ -562,14 +562,14 @@ mod test {
     async fn test_take(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
-        #[values(false, true)] enable_move_stable_row_ids: bool,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -667,12 +667,12 @@ mod test {
     async fn test_take_with_projection(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
-        #[values(false, true)] enable_move_stable_row_ids: bool,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -884,7 +884,7 @@ mod test {
         let write_params = WriteParams {
             max_rows_per_group: 2,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());

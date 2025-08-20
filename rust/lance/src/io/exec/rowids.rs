@@ -356,7 +356,7 @@ mod test {
             reader,
             "memory://",
             Some(WriteParams {
-                enable_move_stable_row_ids: false,
+                enable_stable_row_ids: false,
                 ..Default::default()
             }),
         )
@@ -392,7 +392,7 @@ mod test {
             reader,
             "memory://",
             Some(WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 max_rows_per_file: 1,
                 ..Default::default()
             }),

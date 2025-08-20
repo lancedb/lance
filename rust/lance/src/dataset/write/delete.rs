@@ -166,61 +166,60 @@ impl RetryExecutor for DeleteJob {
             .filter(&self.predicate)?;
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
-        let (updated_fragments, deleted_fragment_ids, affected_rows) =
-            if let Some(filter_expr) = scanner.get_filter()? {
-                if matches!(
-                    filter_expr,
-                    Expr::Literal(ScalarValue::Boolean(Some(false)), _)
-                ) {
-                    // Predicate evaluated to false - no deletions
-                    (Vec::new(), Vec::new(), Some(RowIdTreeMap::new()))
-                } else if matches!(
-                    filter_expr,
-                    Expr::Literal(ScalarValue::Boolean(Some(true)), _)
-                ) {
-                    // Predicate evaluated to true - delete all fragments
-                    let deleted_fragment_ids = self
-                        .dataset
-                        .get_fragments()
-                        .iter()
-                        .map(|f| f.id() as u64)
-                        .collect();
-
-                    // When deleting everything, we don't have specific row addresses,
-                    // so better not to emit affected rows.
-                    (Vec::new(), deleted_fragment_ids, None)
-                } else {
-                    // Regular predicate - scan and collect row addresses to delete
-                    let stream = scanner.try_into_stream().await?.into();
-                    let (stream, row_id_rx) = make_rowid_capture_stream(
-                        stream,
-                        self.dataset.manifest.uses_move_stable_row_ids(),
-                    )?;
-
-                    // Process the stream to capture row addresses
-                    // We need to consume the stream to trigger the capture
-                    futures::pin_mut!(stream);
-                    while let Some(_batch) = stream.try_next().await? {
-                        // The row addresses are captured automatically by make_rowid_capture_stream
-                    }
-
-                    // Extract the row addresses from the receiver
-                    let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
-                        message: format!("Failed to receive row ids: {}", err),
-                        location: location!(),
-                    })?;
-                    let row_id_index = get_row_id_index(&self.dataset).await?;
-                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-
-                    let (fragments, deleted_ids) =
-                        apply_deletions(&self.dataset, &removed_row_addrs).await?;
-                    let affected_rows = RowIdTreeMap::from(removed_row_addrs.as_ref().clone());
-                    (fragments, deleted_ids, Some(affected_rows))
-                }
-            } else {
-                // No filter was applied - this shouldn't happen but treat as delete nothing
+        let (updated_fragments, deleted_fragment_ids, affected_rows) = if let Some(filter_expr) =
+            scanner.get_filter()?
+        {
+            if matches!(
+                filter_expr,
+                Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+            ) {
+                // Predicate evaluated to false - no deletions
                 (Vec::new(), Vec::new(), Some(RowIdTreeMap::new()))
-            };
+            } else if matches!(
+                filter_expr,
+                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+            ) {
+                // Predicate evaluated to true - delete all fragments
+                let deleted_fragment_ids = self
+                    .dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u64)
+                    .collect();
+
+                // When deleting everything, we don't have specific row addresses,
+                // so better not to emit affected rows.
+                (Vec::new(), deleted_fragment_ids, None)
+            } else {
+                // Regular predicate - scan and collect row addresses to delete
+                let stream = scanner.try_into_stream().await?.into();
+                let (stream, row_id_rx) =
+                    make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+
+                // Process the stream to capture row addresses
+                // We need to consume the stream to trigger the capture
+                futures::pin_mut!(stream);
+                while let Some(_batch) = stream.try_next().await? {
+                    // The row addresses are captured automatically by make_rowid_capture_stream
+                }
+
+                // Extract the row addresses from the receiver
+                let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
+                    message: format!("Failed to receive row ids: {}", err),
+                    location: location!(),
+                })?;
+                let row_id_index = get_row_id_index(&self.dataset).await?;
+                let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+
+                let (fragments, deleted_ids) =
+                    apply_deletions(&self.dataset, &removed_row_addrs).await?;
+                let affected_rows = RowIdTreeMap::from(removed_row_addrs.as_ref().clone());
+                (fragments, deleted_ids, Some(affected_rows))
+            }
+        } else {
+            // No filter was applied - this shouldn't happen but treat as delete nothing
+            (Vec::new(), Vec::new(), Some(RowIdTreeMap::new()))
+        };
 
         Ok(DeleteData {
             updated_fragments,
@@ -655,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     #[rstest]
-    async fn test_delete_concurrency(#[values(false, true)] enable_move_stable_row_ids: bool) {
+    async fn test_delete_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         use crate::{
             dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteParams},
             session::Session,
@@ -697,7 +696,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
-                enable_move_stable_row_ids,
+                enable_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])
@@ -765,9 +764,7 @@ mod tests {
 
     #[tokio::test]
     #[rstest]
-    async fn test_delete_true_update_conflict(
-        #[values(false, true)] enable_move_stable_row_ids: bool,
-    ) {
+    async fn test_delete_true_update_conflict(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::UInt32, false),
             ArrowField::new("value", DataType::UInt32, false),
@@ -785,7 +782,7 @@ mod tests {
 
         let dataset = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
-                enable_move_stable_row_ids,
+                enable_stable_row_ids,
                 max_rows_per_file: 50,
                 ..Default::default()
             })
