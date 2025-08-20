@@ -759,19 +759,8 @@ impl RecordBatchExt for RecordBatch {
     }
 
     fn shrink_to_fit(&self) -> Result<Self> {
-        // Use take with identity indices to force a deep copy of all data
-        // This ensures each array owns its data independently
-        // TODO: Optimize with sequential copy instead of using take() for better performance
-        let num_rows = self.num_rows();
-        let indices: UInt32Array = (0..num_rows as u32).collect();
-
-        let shrunk_columns = self
-            .columns()
-            .iter()
-            .map(|column| take(column.as_ref(), &indices, None).map_err(|e| ArrowError::from(e)))
-            .collect::<Result<Vec<_>>>()?;
-
-        RecordBatch::try_new(self.schema(), shrunk_columns)
+        // Deep copy the sliced record batch, instead of whole batch
+        crate::deepcopy::deep_copy_batch_sliced(self)
     }
 }
 

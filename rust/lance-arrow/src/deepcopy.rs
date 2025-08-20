@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{make_array, Array, RecordBatch};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow_data::{ArrayData, ArrayDataBuilder};
+use arrow_data::{transform::MutableArrayData, ArrayData, ArrayDataBuilder};
 
 pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
     Buffer::from(buffer.as_slice())
@@ -59,6 +59,36 @@ pub fn deep_copy_batch(batch: &RecordBatch) -> crate::Result<RecordBatch> {
         .columns()
         .iter()
         .map(|array| deep_copy_array(array))
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(batch.schema(), arrays)
+}
+
+/// Deep copy array data, extracting only the sliced portion using MutableArrayData
+/// This is the most efficient and correct way to copy just the sliced data
+pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
+    // Use MutableArrayData to efficiently copy just the slice
+    let mut mutable = MutableArrayData::new(vec![data], false, data.len());
+
+    // Copy from offset to offset+len (the visible slice)
+    mutable.extend(0, data.offset(), data.offset() + data.len());
+
+    // Freeze into immutable ArrayData
+    mutable.freeze()
+}
+
+/// Deep copy an array, extracting only the sliced portion using MutableArrayData
+pub fn deep_copy_array_sliced(array: &dyn Array) -> Arc<dyn Array> {
+    let data = array.to_data();
+    let data = deep_copy_array_data_sliced(&data);
+    make_array(data)
+}
+
+/// Deep copy a RecordBatch, extracting only the sliced portion using MutableArrayData
+pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch> {
+    let arrays = batch
+        .columns()
+        .iter()
+        .map(|array| deep_copy_array_sliced(array))
         .collect::<Vec<_>>();
     RecordBatch::try_new(batch.schema(), arrays)
 }
