@@ -215,7 +215,7 @@ impl FullSchemaMergeInsertExec {
                 Self::extract_control_arrays(&batch, rowaddr_idx, action_idx)?;
 
             // Process each row using the shared state
-            let mut keep_rows = Vec::new();
+            let mut keep_rows: Vec<u32> = Vec::new();
 
             let mut merge_state = merge_state.lock().map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!(
@@ -237,7 +237,7 @@ impl FullSchemaMergeInsertExec {
                     .process_row_action(action, row_idx, row_addr_array)?
                     .is_some()
                 {
-                    keep_rows.push(row_idx);
+                    keep_rows.push(row_idx as u32);
                 }
             }
 
@@ -389,7 +389,7 @@ impl FullSchemaMergeInsertExec {
     /// Create filtered batch from selected rows
     fn create_filtered_batch(
         batch: &RecordBatch,
-        keep_rows: Vec<usize>,
+        keep_rows: Vec<u32>,
         data_column_indices: &[usize],
         output_schema: Arc<Schema>,
     ) -> DFResult<RecordBatch> {
@@ -405,8 +405,7 @@ impl FullSchemaMergeInsertExec {
         }
 
         // Create indices for rows to keep
-        let indices =
-            arrow_array::UInt32Array::from(keep_rows.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        let indices = arrow_array::UInt32Array::from(keep_rows);
 
         // Take only the rows we want to keep
         let filtered_batch = arrow_select::take::take_record_batch(batch, &indices)?;
@@ -563,8 +562,8 @@ impl FullSchemaMergeInsertExec {
         let (row_addr_array, action_array) =
             Self::extract_control_arrays(batch, rowaddr_idx, action_idx)?;
 
-        let mut update_indices = Vec::new();
-        let mut insert_indices = Vec::new();
+        let mut update_indices: Vec<u32> = Vec::new();
+        let mut insert_indices: Vec<u32> = Vec::new();
 
         {
             let mut merge_state = merge_state.lock().map_err(|e| {
@@ -588,8 +587,8 @@ impl FullSchemaMergeInsertExec {
                     .is_some()
                 {
                     match action {
-                        Action::UpdateAll => update_indices.push(row_idx),
-                        Action::Insert => insert_indices.push(row_idx),
+                        Action::UpdateAll => update_indices.push(row_idx as u32),
+                        Action::Insert => insert_indices.push(row_idx as u32),
                         _ => {}
                     }
                 }
