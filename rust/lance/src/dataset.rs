@@ -2911,7 +2911,7 @@ mod tests {
             test_uri,
             append_row_count,
             WriteMode::Create,
-            data_storage_version.clone(),
+            data_storage_version,
         )
         .await;
 
@@ -2922,7 +2922,7 @@ mod tests {
         let mut cloned_datasets = Vec::with_capacity(1);
 
         // Unified cloning procedure, write a fragment to each cloned dataset.
-        for (_, path) in clone_paths.iter().enumerate() {
+        for (_, path) in clone_paths.iter() {
             let clone_path = path.to_str().unwrap();
             current_dataset.tags.create("v1", 1).await.unwrap();
 
@@ -2934,7 +2934,7 @@ mod tests {
                 Arc::new(current_dataset),
                 append_row_count,
                 WriteMode::Append,
-                data_storage_version.clone(),
+                data_storage_version,
             )
             .await;
             cloned_datasets.push(current_dataset.clone());
