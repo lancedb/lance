@@ -2742,94 +2742,237 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn shallow_clone_dataset(
+    async fn test_shallow_clone_with_hybrid_paths(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
         let test_dir = tempdir().unwrap();
-        let clone_path = test_dir.path().join("clone");
-        let cloned_dir = clone_path.to_str().unwrap();
-
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..20))],
-        )
-        .unwrap()];
-
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams {
-            max_rows_per_file: 40,
-            max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version),
-            ..Default::default()
+        let clone_dir = test_dir.path().join("clone");
+        let cloned_uri = clone_dir.to_str().unwrap();
+
+        // Generate consistent test data batches
+        let generate_data = |prefix: &str, start_id: i32, row_count: u64| {
+            gen_batch()
+                .col("id", array::step_custom::<Int32Type>(start_id, 1))
+                .col("value", array::fill_utf8(format!("{prefix}_data")))
+                .into_reader_rows(RowCount::from(row_count), BatchCount::from(1))
         };
-        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, Some(write_params.clone()))
+
+        // Reusable dataset writer with configurable mode
+        async fn write_dataset(
+            uri: &str,
+            data_reader: impl RecordBatchReader + Send + 'static,
+            mode: WriteMode,
+            version: LanceFileVersion,
+        ) -> Dataset {
+            let params = WriteParams {
+                max_rows_per_file: 100,
+                max_rows_per_group: 20,
+                data_storage_version: Some(version),
+                mode,
+                ..Default::default()
+            };
+            Dataset::write(data_reader, uri, Some(params))
+                .await
+                .unwrap()
+        }
+
+        // Unified dataset scanning and row counting
+        async fn collect_rows(dataset: &Dataset) -> (usize, Vec<RecordBatch>) {
+            let batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            (batches.iter().map(|b| b.num_rows()).sum(), batches)
+        }
+
+        // Create initial dataset
+        let mut dataset = write_dataset(
+            test_uri,
+            generate_data("initial", 0, 50),
+            WriteMode::Create,
+            data_storage_version,
+        )
+        .await;
+
+        // Store original state for comparison
+        let original_version = dataset.version().version;
+        let original_fragment_count = dataset.fragments().len();
+
+        // Create tag and shallow clone
+        dataset
+            .tags
+            .create("test_tag", original_version)
             .await
             .unwrap();
-        dataset.tags.create("tag", 1).await.unwrap();
         let cloned_dataset = dataset
-            .shallow_clone(cloned_dir, "tag", ObjectStoreParams::default())
+            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
             .await
             .unwrap();
 
-        assert_eq!(fragments.len(), 1);
-        assert_eq!(dataset.manifest.max_fragment_id(), Some(0));
+        // Verify cloned dataset state
+        let (cloned_rows, _) = collect_rows(&cloned_dataset).await;
+        assert_eq!(cloned_rows, 50);
+        assert_eq!(cloned_dataset.version().version, original_version);
 
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(20..40))],
+        // Append data to cloned dataset
+        let updated_cloned = write_dataset(
+            cloned_uri,
+            generate_data("cloned_new", 50, 30),
+            WriteMode::Append,
+            data_storage_version,
         )
-        .unwrap()];
-        write_params.mode = WriteMode::Append;
-        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
-            .await
-            .unwrap();
+        .await;
 
-        let expected_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..40))],
+        // Verify updated cloned dataset
+        let (updated_cloned_rows, updated_batches) = collect_rows(&updated_cloned).await;
+        assert_eq!(updated_cloned_rows, 80);
+        assert_eq!(updated_cloned.version().version, original_version + 1);
+
+        // Append data to original dataset
+        let updated_original = write_dataset(
+            test_uri,
+            generate_data("original_new", 50, 25),
+            WriteMode::Append,
+            data_storage_version,
         )
-        .unwrap();
+        .await;
 
-        let actual_ds = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(actual_ds.version().version, 2);
-        let actual_schema = ArrowSchema::from(actual_ds.schema());
-        assert_eq!(&actual_schema, schema.as_ref());
+        // Verify updated original dataset
+        let (original_rows, _) = collect_rows(&updated_original).await;
+        assert_eq!(original_rows, 75);
+        assert_eq!(updated_original.version().version, original_version + 1);
 
-        let actual_batches = actual_ds
-            .scan()
-            .try_into_stream()
+        // Final validations
+        // Verify cloned dataset isolation
+        let final_cloned = Dataset::open(cloned_uri).await.unwrap();
+        let (final_cloned_rows, _) = collect_rows(&final_cloned).await;
+
+        // Data integrity check
+        let combined_batch =
+            concat_batches(&updated_batches[0].schema(), &updated_batches).unwrap();
+        assert_eq!(combined_batch.column_by_name("id").unwrap().len(), 80);
+        assert_eq!(combined_batch.column_by_name("value").unwrap().len(), 80);
+
+        // Fragment count validation
+        assert_eq!(
+            updated_original.fragments().len(),
+            original_fragment_count + 1
+        );
+        assert_eq!(final_cloned.fragments().len(), original_fragment_count + 1);
+
+        // Final assertions
+        assert_eq!(final_cloned_rows, 80);
+        assert_eq!(final_cloned.version().version, original_version + 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_shallow_clone_multiple_times(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let append_row_count = 36;
+
+        // Async dataset writer function
+        async fn write_dataset(
+            dest: impl Into<WriteDestination<'_>>,
+            row_count: u64,
+            mode: WriteMode,
+            version: LanceFileVersion,
+        ) -> Dataset {
+            let data = gen_batch()
+                .col("index", array::step::<Int32Type>())
+                .col("category", array::fill_utf8("base".to_string()))
+                .col("score", array::step_custom::<Float32Type>(1.0, 0.5));
+            Dataset::write(
+                data.into_reader_rows(RowCount::from(row_count), BatchCount::from(1)),
+                dest,
+                Some(WriteParams {
+                    max_rows_per_file: 60,
+                    max_rows_per_group: 12,
+                    mode,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        // sort
-        let actual_batch = concat_batches(&schema, &actual_batches).unwrap();
-        let idx_arr = actual_batch.column_by_name("i").unwrap();
-        let sorted_indices = sort_to_indices(idx_arr, None, None).unwrap();
-        let struct_arr: StructArray = actual_batch.into();
-        let sorted_arr = arrow_select::take::take(&struct_arr, &sorted_indices, None).unwrap();
+        }
 
-        let expected_struct_arr: StructArray = expected_batch.into();
-        assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
-
-        // Each fragments has different fragment ID
-        assert_eq!(
-            actual_ds
-                .fragments()
-                .iter()
-                .map(|f| f.id)
-                .collect::<Vec<_>>(),
-            (0..2).collect::<Vec<_>>()
+        let mut current_dataset = write_dataset(
+            test_uri,
+            append_row_count,
+            WriteMode::Create,
+            data_storage_version.clone(),
         )
+        .await;
+
+        // Generate clone paths
+        let clone_paths = (1..=1)
+            .map(|i| test_dir.path().join(format!("clone{}", i)))
+            .collect::<Vec<_>>();
+        let mut cloned_datasets = Vec::with_capacity(1);
+
+        // Unified cloning procedure, write a fragment to each cloned dataset.
+        for (_, path) in clone_paths.iter().enumerate() {
+            let clone_path = path.to_str().unwrap();
+            current_dataset.tags.create("v1", 1).await.unwrap();
+
+            current_dataset = current_dataset
+                .shallow_clone(clone_path, "v1", ObjectStoreParams::default())
+                .await
+                .unwrap();
+            current_dataset = write_dataset(
+                Arc::new(current_dataset),
+                append_row_count,
+                WriteMode::Append,
+                data_storage_version.clone(),
+            )
+            .await;
+            cloned_datasets.push(current_dataset.clone());
+        }
+
+        // Validation function
+        async fn validate_dataset(
+            dataset: &Dataset,
+            expected_rows: usize,
+            expected_fragments_count: usize,
+            expected_base_paths_count: usize,
+        ) {
+            let batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, expected_rows);
+            assert_eq!(dataset.fragments().len(), expected_fragments_count);
+            assert_eq!(
+                dataset.manifest().base_paths.len(),
+                expected_base_paths_count
+            );
+        }
+
+        // Verify cloned datasets row count, fragment count, base_path count
+        for (i, ds) in cloned_datasets.iter().enumerate() {
+            validate_dataset(ds, 36 * (i + 2), i + 2, i + 1).await;
+        }
+
+        // Verify original dataset row count, fragment count, base_path count
+        let original = Dataset::open(test_uri).await.unwrap();
+        validate_dataset(&original, 36, 1, 0).await;
     }
 
     #[rstest]
