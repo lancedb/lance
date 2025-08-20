@@ -64,7 +64,11 @@ public class OperationTestBase {
    * LanceFileWriter to ensure compatibility with Lance format.
    */
   protected DataFile writeLanceDataFile(
-      BufferAllocator allocator, String basePath, VectorSchemaRoot root, int[] fieldIndexes, int[] columnIndices) {
+      BufferAllocator allocator,
+      String basePath,
+      VectorSchemaRoot root,
+      int[] fieldIndexes,
+      int[] columnIndices) {
     // Create a unique file path for the data file
     String fileName = UUID.randomUUID() + ".lance";
     String filePath = basePath + "/data/" + fileName;
