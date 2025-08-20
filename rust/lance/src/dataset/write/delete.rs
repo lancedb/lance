@@ -654,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     #[rstest]
-    async fn test_delete_concurrency(#[values(false, true)] enable_move_stable_row_ids: bool) {
+    async fn test_delete_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         use crate::{
             dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteParams},
             session::Session,
@@ -764,9 +764,7 @@ mod tests {
 
     #[tokio::test]
     #[rstest]
-    async fn test_delete_true_update_conflict(
-        #[values(false, true)] enable_move_stable_row_ids: bool,
-    ) {
+    async fn test_delete_true_update_conflict(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::UInt32, false),
             ArrowField::new("value", DataType::UInt32, false),
