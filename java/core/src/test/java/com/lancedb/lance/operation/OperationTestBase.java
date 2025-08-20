@@ -64,7 +64,7 @@ public class OperationTestBase {
    * LanceFileWriter to ensure compatibility with Lance format.
    */
   protected DataFile writeLanceDataFile(
-      BufferAllocator allocator, String basePath, VectorSchemaRoot root, int fieldIndex) {
+      BufferAllocator allocator, String basePath, VectorSchemaRoot root, int[] fieldIndexes, int[] columnIndices) {
     // Create a unique file path for the data file
     String fileName = UUID.randomUUID() + ".lance";
     String filePath = basePath + "/data/" + fileName;
@@ -85,8 +85,8 @@ public class OperationTestBase {
     // Use a stable file format version
     return new DataFile(
         fileName,
-        new int[] {fieldIndex}, // Field index in the schema
-        new int[] {0}, // Column index in the file (always 0 for single column)
+        fieldIndexes, // Field index in the schema
+        columnIndices, // Just the same with fieldIndex for easy test
         TEST_FILE_FORMAT_MAJOR_VERSION, // File major version
         TEST_FILE_FORMAT_MINOR_VERSION, // File minor version
         file.length() // File size in bytes (now contains actual data)

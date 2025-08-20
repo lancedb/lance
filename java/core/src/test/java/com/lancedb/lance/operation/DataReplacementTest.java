@@ -114,7 +114,7 @@ public class DataReplacementTest extends OperationTestBase {
             replaceVectorRoot.setRowCount(rowCount);
 
             DataFile datafile =
-                writeLanceDataFile(dataset.allocator(), datasetPath, replaceVectorRoot, 2);
+                writeLanceDataFile(dataset.allocator(), datasetPath, replaceVectorRoot, new int[]{2}, new int[]{0});
             List<DataReplacement.DataReplacementGroup> replacementGroups =
                 Collections.singletonList(
                     new DataReplacement.DataReplacementGroup(

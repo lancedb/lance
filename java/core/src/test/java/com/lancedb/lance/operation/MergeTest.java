@@ -36,6 +36,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 
 public class MergeTest extends OperationTestBase {
 
@@ -55,7 +56,7 @@ public class MergeTest extends OperationTestBase {
                 Arrays.asList(
                     Field.nullable("id", new ArrowType.Int(32, true)),
                     Field.nullable("name", new ArrowType.Utf8()),
-                    Field.nullable("age", new ArrowType.Int(32, true))),
+                    ageField),
                 null);
 
         try (VectorSchemaRoot ageRoot =
@@ -71,14 +72,20 @@ public class MergeTest extends OperationTestBase {
 
           DataFile ageDataFile =
               writeLanceDataFile(
-                  dataset.allocator(), datasetPath, ageRoot, 2 // field index for age column
+                  dataset.allocator(),
+                  datasetPath,
+                  ageRoot,
+                  new int[] {2},
+                  new int[] {0} // field index for age column
                   );
 
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
+          List<DataFile> dataFiles = fragmentMeta.getFiles();
+          dataFiles.add(ageDataFile);
           FragmentMetadata evolvedFragment =
               new FragmentMetadata(
                   fragmentMeta.getId(),
-                  Collections.singletonList(ageDataFile),
+                  dataFiles,
                   fragmentMeta.getPhysicalRows(),
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
@@ -109,6 +116,89 @@ public class MergeTest extends OperationTestBase {
                 IntVector ageResultVector = (IntVector) batch.getVector("age");
                 for (int i = 0; i < rowCount; i++) {
                   Assertions.assertEquals(20 + i, ageResultVector.get(i));
+                }
+                IntVector idResultVector = (IntVector) batch.getVector("id");
+                for (int i = 0; i < rowCount; i++) {
+                  Assertions.assertEquals(i, idResultVector.get(i));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testReplaceAsDiffColumns(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testMergeNewColumn").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      int rowCount = 15;
+      try (Dataset initialDataset = createAndAppendRows(testDataset, 15)) {
+        // Add a new column with different data type
+        Field ageField = Field.nullable("age", new ArrowType.Int(32, true));
+        Field idField = Field.notNullable("id", new ArrowType.Int(32, true));
+        List<Field> fields = Arrays.asList(idField, ageField);
+        Schema evolvedSchema = new Schema(fields, null);
+
+        try (VectorSchemaRoot ageRoot =
+            VectorSchemaRoot.create(new Schema(fields, null), allocator)) {
+          ageRoot.allocateNew();
+          IntVector ageVector = (IntVector) ageRoot.getVector("age");
+          IntVector idVector = (IntVector) ageRoot.getVector("id");
+
+          for (int i = 0; i < rowCount; i++) {
+            ageVector.setSafe(i, 20 + i);
+            idVector.setSafe(i, i);
+          }
+          ageRoot.setRowCount(rowCount);
+
+          DataFile ageDataFile =
+              writeLanceDataFile(
+                  dataset.allocator(), datasetPath, ageRoot, new int[] {0, 1}, new int[] {0, 1});
+
+          FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
+          FragmentMetadata evolvedFragment =
+              new FragmentMetadata(
+                  fragmentMeta.getId(),
+                  Collections.singletonList(ageDataFile),
+                  fragmentMeta.getPhysicalRows(),
+                  fragmentMeta.getDeletionFile(),
+                  fragmentMeta.getRowIdMeta());
+
+          Transaction mergeTransaction =
+              initialDataset
+                  .newTransactionBuilder()
+                  .operation(
+                      Merge.builder()
+                          .fragments(Collections.singletonList(evolvedFragment))
+                          .schema(evolvedSchema)
+                          .build())
+                  .build();
+
+          try (Dataset evolvedDataset = mergeTransaction.commit()) {
+            Assertions.assertEquals(3, evolvedDataset.version());
+            Assertions.assertEquals(rowCount, evolvedDataset.countRows());
+            Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
+            Assertions.assertEquals(2, evolvedDataset.getSchema().getFields().size());
+            // Verify merged data
+            try (LanceScanner scanner = evolvedDataset.newScan()) {
+              try (ArrowReader resultReader = scanner.scanBatches()) {
+                Assertions.assertTrue(resultReader.loadNextBatch());
+                VectorSchemaRoot batch = resultReader.getVectorSchemaRoot();
+                Assertions.assertEquals(rowCount, batch.getRowCount());
+                Assertions.assertEquals(2, batch.getSchema().getFields().size());
+                // Verify age column
+                IntVector ageResultVector = (IntVector) batch.getVector("age");
+                for (int i = 0; i < rowCount; i++) {
+                  Assertions.assertEquals(20 + i, ageResultVector.get(i));
+                }
+                IntVector idResultVector = (IntVector) batch.getVector("id");
+                for (int i = 0; i < rowCount; i++) {
+                  Assertions.assertEquals(i, idResultVector.get(i));
                 }
               }
             }
@@ -148,15 +238,18 @@ public class MergeTest extends OperationTestBase {
                   dataset.allocator(),
                   datasetPath,
                   updatedNameRoot,
-                  1 // field index for name column
+                  new int[] {1}, // field index for name column
+                  new int[] {0} // column indices
                   );
 
           // Perform merge with updated column
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
-          FragmentMetadata updatedFragment =
+          List<DataFile> dataFiles = fragmentMeta.getFiles();
+          dataFiles.add(updatedNameDataFile);
+          FragmentMetadata evolvedFragment =
               new FragmentMetadata(
                   fragmentMeta.getId(),
-                  Collections.singletonList(updatedNameDataFile),
+                  dataFiles,
                   fragmentMeta.getPhysicalRows(),
                   fragmentMeta.getDeletionFile(),
                   fragmentMeta.getRowIdMeta());
@@ -166,7 +259,7 @@ public class MergeTest extends OperationTestBase {
                   .newTransactionBuilder()
                   .operation(
                       Merge.builder()
-                          .fragments(Collections.singletonList(updatedFragment))
+                          .fragments(Collections.singletonList(evolvedFragment))
                           .schema(testDataset.getSchema())
                           .build())
                   .build();
