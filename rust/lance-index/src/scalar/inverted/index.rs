@@ -1373,7 +1373,7 @@ pub struct CompressedPostingList {
 
 impl DeepSizeOf for CompressedPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        // Empirically determined overhead per entry
+        // Fix issues #4512
         const MIN_ENTRY_SIZE: usize = 7_000; // 7KB minimum based on observation
 
         // Calculate actual compressed blocks data including offsets
