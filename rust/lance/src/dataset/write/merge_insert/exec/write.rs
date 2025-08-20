@@ -47,7 +47,7 @@ struct MergeState {
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     /// Merge operation metrics
     metrics: MergeInsertMetrics,
-    /// Whether to enable move stable row ids
+    /// Whether to enable stable row ids
     enable_stable_row_ids: bool,
 }
 

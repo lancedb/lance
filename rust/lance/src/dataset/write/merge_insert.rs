@@ -1672,7 +1672,7 @@ struct Merger {
     with_row_addr: bool,
     /// The output schema of the stream.
     output_schema: Arc<Schema>,
-    /// Whether to enable move stable row ids
+    /// Whether to enable stable row ids
     enable_stable_row_ids: bool,
 }
 
