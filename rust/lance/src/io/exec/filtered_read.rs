@@ -778,8 +778,10 @@ impl FilteredReadStream {
                         if active_partitions_counter.fetch_sub(1, Ordering::Relaxed) == 1 {
                             global_metrics.io_metrics.record_final(&scan_scheduler);
                         }
-                        partition_metrics.baseline_metrics.elapsed_compute().
-                            add_duration(Instant::now().duration_since(elapsed_compute_start));
+                        partition_metrics
+                            .baseline_metrics
+                            .elapsed_compute()
+                            .add_duration(Instant::now().duration_since(elapsed_compute_start));
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
