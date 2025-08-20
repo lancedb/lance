@@ -1298,17 +1298,13 @@ impl PlainPostingList {
 
     pub fn from_batch(batch: &RecordBatch, max_score: Option<f32>) -> Self {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().clone();
-        let mut frequencies = batch[FREQUENCY_COL]
+        let frequencies = batch[FREQUENCY_COL]
             .as_primitive::<Float32Type>()
             .values()
             .clone();
-        frequencies.shrink_to_fit();
-
-        let positions = batch.column_by_name(POSITION_COL).map(|col| {
-            let mut list = col.as_list::<i32>().clone();
-            list.shrink_to_fit();
-            list
-        });
+        let positions = batch
+            .column_by_name(POSITION_COL)
+            .map(|col| col.as_list::<i32>().clone());
 
         Self::new(row_ids, frequencies, max_score, positions)
     }
@@ -1403,18 +1399,14 @@ impl CompressedPostingList {
 
     pub fn from_batch(batch: &RecordBatch, max_score: f32, length: u32) -> Self {
         debug_assert_eq!(batch.num_rows(), 1);
-        let mut blocks = batch[POSTING_COL]
+        let blocks = batch[POSTING_COL]
             .as_list::<i32>()
             .value(0)
             .as_binary::<i64>()
             .clone();
-        blocks.shrink_to_fit();
-
-        let positions = batch.column_by_name(POSITION_COL).map(|col| {
-            let mut list = col.as_list::<i32>().value(0).as_list::<i32>().clone();
-            list.shrink_to_fit();
-            list
-        });
+        let positions = batch
+            .column_by_name(POSITION_COL)
+            .map(|col| col.as_list::<i32>().value(0).as_list::<i32>().clone());
 
         Self {
             max_score,
