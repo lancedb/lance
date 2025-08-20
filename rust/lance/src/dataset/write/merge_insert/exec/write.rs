@@ -526,13 +526,13 @@ impl FullSchemaMergeInsertExec {
                                 }
                             }
                             Err(e) => {
-                                let _ = update_tx.send(Err(e));
+                                Self::handle_stream_processing_error(e, &update_tx, &insert_tx);
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = update_tx.send(Err(e));
+                        Self::handle_stream_processing_error(e, &update_tx, &insert_tx);
                         break;
                     }
                 }
@@ -618,6 +618,20 @@ impl FullSchemaMergeInsertExec {
         };
 
         Ok((update_batch, insert_batch))
+    }
+
+    fn handle_stream_processing_error(
+        error: datafusion::error::DataFusionError,
+        update_tx: &tokio::sync::mpsc::UnboundedSender<DFResult<RecordBatch>>,
+        insert_tx: &tokio::sync::mpsc::UnboundedSender<DFResult<RecordBatch>>,
+    ) {
+        let error_msg = format!("Stream processing failed: {}", error);
+
+        let update_error = datafusion::error::DataFusionError::Internal(error_msg.clone());
+        let insert_error = datafusion::error::DataFusionError::Internal(error_msg);
+
+        let _ = update_tx.send(Err(update_error));
+        let _ = insert_tx.send(Err(insert_error));
     }
 }
 
