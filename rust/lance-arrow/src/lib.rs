@@ -585,6 +585,9 @@ pub trait RecordBatchExt {
 
     /// Take selected rows from the [RecordBatch].
     fn take(&self, indices: &UInt32Array) -> Result<RecordBatch>;
+
+    /// Create a new RecordBatch with compacted memory after slicing.
+    fn shrink_to_fit(&self) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -753,6 +756,22 @@ impl RecordBatchExt for RecordBatch {
         let struct_array: StructArray = self.clone().into();
         let taken = take(&struct_array, indices, None)?;
         self.try_new_from_struct_array(taken.as_struct().clone())
+    }
+
+    fn shrink_to_fit(&self) -> Result<Self> {
+        // Use take with identity indices to force a deep copy of all data
+        // This ensures each array owns its data independently
+        // TODO: Optimize with sequential copy instead of using take() for better performance
+        let num_rows = self.num_rows();
+        let indices: UInt32Array = (0..num_rows as u32).collect();
+
+        let shrunk_columns = self
+            .columns()
+            .iter()
+            .map(|column| take(column.as_ref(), &indices, None).map_err(|e| ArrowError::from(e)))
+            .collect::<Result<Vec<_>>>()?;
+
+        RecordBatch::try_new(self.schema(), shrunk_columns)
     }
 }
 
