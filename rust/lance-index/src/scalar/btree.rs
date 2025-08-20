@@ -822,7 +822,7 @@ impl BTreeIndex {
         let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
+        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
         // to search for X IN [5, 3]
         match subindex.search(query, metrics).await? {
             SearchResult::Exact(map) => Ok(map),
@@ -1079,7 +1079,7 @@ impl ScalarIndex for BTreeIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
     }
 
@@ -1288,6 +1288,19 @@ pub trait TrainingSource: Send {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream>;
+
+    /// Returns a stream of batches, ordered by the row_address (in ascending order)
+    ///
+    /// Each batch should have chunk_size rows
+    ///
+    /// The schema for the batch is slightly flexible.
+    /// The first column may have any name or type, these are the values to index
+    /// The second column must be the fragment id which must be UInt32Type
+    /// The third column must be the row address which must be UInt64Type
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
@@ -1400,6 +1413,14 @@ impl TrainingSource for BTreeUpdater {
         _chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
         // BTree indices will never use unordered scans
+        unimplemented!()
+    }
+
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        // BTree indices will never use aligned scans
         unimplemented!()
     }
 }

@@ -129,6 +129,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::BTree
                 | IndexType::Inverted
                 | IndexType::NGram
+                | IndexType::ZoneMap
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
