@@ -1970,7 +1970,7 @@ mod tests {
         t
     }
 
-    async fn check_and_refresh_dataset(
+    async fn check_then_refresh_dataset(
         new_data: RecordBatch,
         mut job: MergeInsertJob,
         keys_from_left: &[u32],
@@ -2191,7 +2191,7 @@ mod tests {
 
             let job_builder = self.job_builder.expect("job_builder must be set");
             let job = job_builder(ds);
-            let ds = check_and_refresh_dataset(
+            let ds = check_then_refresh_dataset(
                 new_batch,
                 job,
                 &self.expected_left_keys,
@@ -2231,7 +2231,7 @@ mod tests {
             .unwrap()
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(
+        check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3, 4, 5, 6],
@@ -2246,7 +2246,7 @@ mod tests {
             .when_matched(WhenMatched::UpdateAll)
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(
+        check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3],
@@ -2263,7 +2263,7 @@ mod tests {
             )
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(
+        check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3, 4, 5],
@@ -2279,7 +2279,7 @@ mod tests {
             .when_matched(WhenMatched::update_if(&ds, "target.filterme = 'z'").unwrap())
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[], &[0, 0, 0])
+        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[], &[0, 0, 0])
             .await;
 
         // update only, no delete (useful for bulk update)
@@ -2289,7 +2289,8 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6], &[0, 3, 0]).await;
+        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6], &[0, 3, 0])
+            .await;
 
         // Conditional update
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -2300,7 +2301,8 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5], &[0, 2, 0]).await;
+        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5], &[0, 2, 0])
+            .await;
 
         // No-op (will raise an error)
         assert!(MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -2315,7 +2317,8 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9], &[3, 0, 3]).await;
+        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9], &[3, 0, 3])
+            .await;
 
         // upsert, with delete all
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -2324,7 +2327,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3])
+        check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3])
             .await;
 
         // update only, with delete all (unusual)
@@ -2335,7 +2338,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6], &[0, 3, 3]).await;
+        check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6], &[0, 3, 3]).await;
 
         // just delete all (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -2344,7 +2347,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[], &[0, 0, 3]).await;
+        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[], &[0, 0, 3]).await;
 
         // For the "delete some" tests we use key > 1
         let condition = create_delete_condition();
@@ -2354,7 +2357,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(
+        check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 4, 5, 6],
@@ -2370,7 +2373,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(
+        check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1],
@@ -2387,7 +2390,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[1], &[4, 5, 6], &[0, 3, 2]).await;
+        check_then_refresh_dataset(new_batch.clone(), job, &[1], &[4, 5, 6], &[0, 3, 2]).await;
 
         // just delete some (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -2396,7 +2399,7 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_and_refresh_dataset(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
+        check_then_refresh_dataset(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
     }
 
     #[rstest::rstest]
@@ -2490,7 +2493,7 @@ mod tests {
             .with_expected_stats(&[0, 3, 0])
             .with_job_builder(|ds| {
                 let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds.clone(), keys)
+                MergeInsertBuilder::try_new(ds, keys)
                     .unwrap()
                     .when_matched(WhenMatched::UpdateAll)
                     .when_not_matched(WhenNotMatched::DoNothing)
