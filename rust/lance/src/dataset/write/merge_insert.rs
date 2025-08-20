@@ -2113,48 +2113,101 @@ mod tests {
             .clone()
     }
 
-    async fn test_stable_row_ids_helper(
-        version: LanceFileVersion,
-        enable_stable_row_ids: bool,
-        test_keys: &[u32],
-        expected_left_keys: &[u32],
-        expected_right_keys: &[u32],
-        expected_stats: &[u64],
-        job_builder: impl FnOnce(Arc<Dataset>) -> MergeInsertJob,
-    ) {
-        let schema = create_test_schema();
-        let new_batch = create_new_batch(schema.clone());
-
-        let test_uri = "memory://test.lance";
-
-        let ds = create_test_dataset(test_uri, version, enable_stable_row_ids).await;
-
-        let row_ids_before = get_row_ids_for_keys(&ds, test_keys).await;
-
-        let job = job_builder(ds);
-        let ds = check_and_refresh_dataset(
-            new_batch,
-            job,
-            expected_left_keys,
-            expected_right_keys,
-            expected_stats,
-        )
-        .await;
-
-        let row_ids_after = get_row_ids_for_keys(&ds, test_keys).await;
-
-        if enable_stable_row_ids {
-            assert_eq!(row_ids_before, row_ids_after);
-        } else {
-            assert_ne!(row_ids_before, row_ids_after);
-        }
-    }
-
     fn create_delete_condition() -> Expr {
         Expr::gt(
             Expr::Column(Column::new_unqualified("key")),
             Expr::Literal(ScalarValue::UInt32(Some(1)), None),
         )
+    }
+
+    struct MergeInsertTestBuilder {
+        version: LanceFileVersion,
+        enable_stable_row_ids: bool,
+        test_keys: Vec<u32>,
+        expected_left_keys: Vec<u32>,
+        expected_right_keys: Vec<u32>,
+        expected_stats: Vec<u64>,
+        job_builder: Option<Box<dyn FnOnce(Arc<Dataset>) -> MergeInsertJob>>,
+    }
+
+    impl MergeInsertTestBuilder {
+        fn new() -> Self {
+            Self {
+                version: LanceFileVersion::default(),
+                enable_stable_row_ids: false,
+                test_keys: vec![],
+                expected_left_keys: vec![],
+                expected_right_keys: vec![],
+                expected_stats: vec![],
+                job_builder: None,
+            }
+        }
+
+        fn with_version(mut self, version: LanceFileVersion) -> Self {
+            self.version = version;
+            self
+        }
+
+        fn with_stable_row_ids(mut self, enable: bool) -> Self {
+            self.enable_stable_row_ids = enable;
+            self
+        }
+
+        fn with_test_keys(mut self, keys: &[u32]) -> Self {
+            self.test_keys = keys.to_vec();
+            self
+        }
+
+        fn with_expected_left_keys(mut self, keys: &[u32]) -> Self {
+            self.expected_left_keys = keys.to_vec();
+            self
+        }
+
+        fn with_expected_right_keys(mut self, keys: &[u32]) -> Self {
+            self.expected_right_keys = keys.to_vec();
+            self
+        }
+
+        fn with_expected_stats(mut self, stats: &[u64]) -> Self {
+            self.expected_stats = stats.to_vec();
+            self
+        }
+
+        fn with_job_builder<F>(mut self, builder: F) -> Self
+        where
+            F: FnOnce(Arc<Dataset>) -> MergeInsertJob + 'static,
+        {
+            self.job_builder = Some(Box::new(builder));
+            self
+        }
+
+        async fn run_test(self) {
+            let schema = create_test_schema();
+            let new_batch = create_new_batch(schema.clone());
+            let test_uri = "memory://test.lance";
+
+            let ds = create_test_dataset(test_uri, self.version, self.enable_stable_row_ids).await;
+            let row_ids_before = get_row_ids_for_keys(&ds, &self.test_keys).await;
+
+            let job_builder = self.job_builder.expect("job_builder must be set");
+            let job = job_builder(ds);
+            let ds = check_and_refresh_dataset(
+                new_batch,
+                job,
+                &self.expected_left_keys,
+                &self.expected_right_keys,
+                &self.expected_stats,
+            )
+            .await;
+
+            let row_ids_after = get_row_ids_for_keys(&ds, &self.test_keys).await;
+
+            if self.enable_stable_row_ids {
+                assert_eq!(row_ids_before, row_ids_after);
+            } else {
+                assert_ne!(row_ids_before, row_ids_after);
+            }
+        }
     }
 
     #[rstest::rstest]
@@ -2352,24 +2405,23 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        test_stable_row_ids_helper(
-            version,
-            enable_stable_row_ids,
-            &[4, 5, 6],
-            &[],
-            &[4, 5, 6, 7, 8, 9],
-            &[3, 3, 3],
-            |ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds, keys)
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[4, 5, 6])
+            .with_expected_left_keys(&[])
+            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+            .with_expected_stats(&[3, 3, 3])
+            .with_job_builder(|ds| {
+                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
                     .unwrap()
                     .when_matched(WhenMatched::UpdateAll)
                     .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
                     .try_build()
                     .unwrap()
-            },
-        )
-        .await;
+            })
+            .run_test()
+            .await;
     }
 
     #[rstest::rstest]
@@ -2378,23 +2430,22 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        test_stable_row_ids_helper(
-            version,
-            enable_stable_row_ids,
-            &[4, 5, 6],
-            &[1, 2, 3],
-            &[4, 5, 6, 7, 8, 9],
-            &[3, 3, 0],
-            |ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds, keys)
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[4, 5, 6])
+            .with_expected_left_keys(&[1, 2, 3])
+            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+            .with_expected_stats(&[3, 3, 0])
+            .with_job_builder(|ds| {
+                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
                     .unwrap()
                     .when_matched(WhenMatched::UpdateAll)
                     .try_build()
                     .unwrap()
-            },
-        )
-        .await;
+            })
+            .run_test()
+            .await;
     }
 
     #[rstest::rstest]
@@ -2403,14 +2454,14 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        test_stable_row_ids_helper(
-            version,
-            enable_stable_row_ids,
-            &[6],
-            &[1, 2, 3, 4, 5],
-            &[6, 7, 8, 9],
-            &[3, 1, 0],
-            |ds| {
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[6])
+            .with_expected_left_keys(&[1, 2, 3, 4, 5])
+            .with_expected_right_keys(&[6, 7, 8, 9])
+            .with_expected_stats(&[3, 1, 0])
+            .with_job_builder(|ds| {
                 let keys = vec!["key".to_string()];
                 MergeInsertBuilder::try_new(ds.clone(), keys)
                     .unwrap()
@@ -2419,9 +2470,9 @@ mod tests {
                     )
                     .try_build()
                     .unwrap()
-            },
-        )
-        .await;
+            })
+            .run_test()
+            .await;
     }
 
     #[rstest::rstest]
@@ -2430,24 +2481,24 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        test_stable_row_ids_helper(
-            version,
-            enable_stable_row_ids,
-            &[4, 5, 6],
-            &[1, 2, 3],
-            &[4, 5, 6],
-            &[0, 3, 0],
-            |ds| {
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[4, 5, 6])
+            .with_expected_left_keys(&[1, 2, 3])
+            .with_expected_right_keys(&[4, 5, 6])
+            .with_expected_stats(&[0, 3, 0])
+            .with_job_builder(|ds| {
                 let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds, keys)
+                MergeInsertBuilder::try_new(ds.clone(), keys)
                     .unwrap()
                     .when_matched(WhenMatched::UpdateAll)
                     .when_not_matched(WhenNotMatched::DoNothing)
                     .try_build()
                     .unwrap()
-            },
-        )
-        .await;
+            })
+            .run_test()
+            .await;
     }
 
     #[rstest::rstest]
@@ -2456,14 +2507,14 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        test_stable_row_ids_helper(
-            version,
-            enable_stable_row_ids,
-            &[1, 4, 5, 6],
-            &[1],
-            &[4, 5, 6, 7, 8, 9],
-            &[3, 3, 2],
-            |ds| {
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[1, 4, 5, 6])
+            .with_expected_left_keys(&[1])
+            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+            .with_expected_stats(&[3, 3, 2])
+            .with_job_builder(|ds| {
                 let keys = vec!["key".to_string()];
                 let condition = create_delete_condition();
                 MergeInsertBuilder::try_new(ds, keys)
@@ -2472,9 +2523,9 @@ mod tests {
                     .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
                     .try_build()
                     .unwrap()
-            },
-        )
-        .await;
+            })
+            .run_test()
+            .await;
     }
 
     #[tokio::test]
