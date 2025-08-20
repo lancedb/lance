@@ -628,7 +628,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -656,6 +656,7 @@ impl Dataset {
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
         strict_batch_size: Option<bool>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
+        disable_scoring_autoprojection: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -665,6 +666,10 @@ impl Dataset {
 
         if with_row_address.unwrap_or(false) {
             scanner.with_row_address();
+        }
+
+        if let Some(true) = disable_scoring_autoprojection {
+            scanner.disable_scoring_autoprojection();
         }
 
         match (columns, columns_with_transform) {
