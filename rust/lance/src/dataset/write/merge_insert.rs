@@ -2033,22 +2033,10 @@ mod tests {
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
-            Field::new("filterme", DataType::Utf8, false),
+            Field::new("key", DataType::UInt32, true),
+            Field::new("value", DataType::UInt32, true),
+            Field::new("filterme", DataType::Utf8, true),
         ]))
-    }
-
-    fn create_initial_batch(schema: Arc<Schema>) -> RecordBatch {
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt32Array::from(vec![1, 2, 3, 4, 5, 6])),
-                Arc::new(UInt32Array::from(vec![1, 1, 1, 1, 1, 1])),
-                Arc::new(StringArray::from(vec!["A", "B", "A", "A", "B", "A"])),
-            ],
-        )
-        .unwrap()
     }
 
     fn create_new_batch(schema: Arc<Schema>) -> RecordBatch {
@@ -2064,25 +2052,32 @@ mod tests {
     }
 
     async fn create_test_dataset(
-        schema: Arc<Schema>,
-        batch: RecordBatch,
         test_uri: &str,
         version: LanceFileVersion,
         enable_stable_row_ids: bool,
     ) -> Arc<Dataset> {
-        let write_params = WriteParams {
-            max_rows_per_file: 10,
-            data_storage_version: Some(version),
-            enable_stable_row_ids,
-            ..Default::default()
-        };
+        let dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(1, 1))
+            .col("value", array::fill::<UInt32Type>(1u32))
+            .col(
+                "filterme",
+                array::cycle_utf8_literals(&["A", "B", "A", "A", "B", "A"]),
+            )
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount(1),
+                FragmentRowCount(6),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    data_storage_version: Some(version),
+                    enable_stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
-        let batches = RecordBatchIterator::new([Ok(batch)], schema);
-        Arc::new(
-            Dataset::write(batches, test_uri, Some(write_params))
-                .await
-                .unwrap(),
-        )
+        Arc::new(dataset)
     }
 
     async fn get_row_ids_for_keys(dataset: &Dataset, keys: &[u32]) -> UInt64Array {
@@ -2126,13 +2121,12 @@ mod tests {
         job_builder: impl FnOnce(Arc<Dataset>) -> MergeInsertJob,
     ) {
         let schema = create_test_schema();
-        let batch = create_initial_batch(schema.clone());
         let new_batch = create_new_batch(schema.clone());
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let ds = create_test_dataset(schema, batch, test_uri, version, enable_stable_row_ids).await;
+        let ds = create_test_dataset(test_uri, version, enable_stable_row_ids).await;
 
         let row_ids_before = get_row_ids_for_keys(&ds, test_keys).await;
 
@@ -2169,13 +2163,12 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     ) {
         let schema = create_test_schema();
-        let batch = create_initial_batch(schema.clone());
         let new_batch = create_new_batch(schema.clone());
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let ds = create_test_dataset(schema, batch, test_uri, version, false).await;
+        let ds = create_test_dataset(test_uri, version, false).await;
 
         // Quick test that no on-keys is not valid and fails
         assert!(MergeInsertBuilder::try_new(ds.clone(), vec![]).is_err());
