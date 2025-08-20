@@ -1825,7 +1825,7 @@ impl Scanner {
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
         // Stage 6: if requested, add the row offset column
-        if self.projection_plan.needs_row_offset {
+        if self.projection_plan.must_add_row_offset {
             plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
         }
 

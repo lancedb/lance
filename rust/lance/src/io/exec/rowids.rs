@@ -404,18 +404,12 @@ impl AddRowOffsetExec {
                     deletion_vector,
                 },
             );
-            // Should be sync in most cases
+            // Should be sync unless the dataset was written by an extremely old lance version
             row_offset += frag.count_rows(None).await? as u64;
         }
 
         Self::internal_new(input, Arc::new(frag_id_to_offset))
     }
-
-    // A dummy placeholder to use in emergency when we can't find the fragment info (better than panic)
-    const DUMMY_FRAG_INFO: FragInfo = FragInfo {
-        row_offset: u64::MAX - u32::MAX as u64,
-        deletion_vector: None,
-    };
 
     fn compute_row_offsets(
         row_addr: &ArrayRef,
@@ -434,9 +428,9 @@ impl AddRowOffsetExec {
             let frag_id = addr.fragment_id();
             if frag_id != last_frag_id {
                 last_frag_id = frag_id;
-                let frag_info = frag_id_to_offset
-                    .get(&frag_id)
-                    .unwrap_or(&Self::DUMMY_FRAG_INFO);
+                let Some(frag_info) = frag_id_to_offset.get(&frag_id) else {
+                    return Err(DataFusionError::External(Box::new(LanceError::Internal { message: format!("A row address referred to a fragment {} that wasn't in the frag_id_to_offset map", frag_id), location: location!() })));
+                };
                 last_frag_offset = frag_info.row_offset;
                 last_frag_delete_count = 0;
                 dv_iter = frag_info

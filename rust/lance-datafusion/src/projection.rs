@@ -37,7 +37,7 @@ pub struct ProjectionPlan {
     pub physical_projection: Projection,
 
     /// Needs the row address converted into a row offset
-    pub needs_row_offset: bool,
+    pub must_add_row_offset: bool,
 
     /// The desired output columns
     pub requested_output_expr: Vec<OutputColumn>,
@@ -70,7 +70,7 @@ impl ProjectionPlan {
         let mut physical_cols = vec![];
         let mut needs_row_id = false;
         let mut needs_row_addr = false;
-        let mut needs_row_offset = false;
+        let mut must_add_row_offset = false;
         for (output_name, raw_expr) in columns {
             if output.contains_key(output_name.as_ref()) {
                 return Err(Error::io(
@@ -93,7 +93,7 @@ impl ProjectionPlan {
                 } else if name == ROW_ADDR {
                     needs_row_addr = true;
                 } else if name == ROW_OFFSET {
-                    needs_row_offset = true;
+                    must_add_row_offset = true;
                 }
             }
 
@@ -116,7 +116,7 @@ impl ProjectionPlan {
             Projection::empty(base.clone()).union_columns(&physical_cols, OnMissing::Ignore)?;
 
         physical_projection.with_row_id = needs_row_id;
-        physical_projection.with_row_addr = needs_row_addr || needs_row_offset;
+        physical_projection.with_row_addr = needs_row_addr || must_add_row_offset;
 
         // Save off the expressions (they will be evaluated later to run the projection)
         let mut output_cols = vec![];
@@ -129,7 +129,7 @@ impl ProjectionPlan {
 
         Ok(Self {
             physical_projection,
-            needs_row_offset,
+            must_add_row_offset,
             requested_output_expr: output_cols,
         })
     }
@@ -214,7 +214,7 @@ impl ProjectionPlan {
     pub fn include_row_offset(&mut self) {
         // Need row addr to get row offset
         self.physical_projection.with_row_addr = true;
-        self.needs_row_offset = true;
+        self.must_add_row_offset = true;
         if !self
             .requested_output_expr
             .iter()
