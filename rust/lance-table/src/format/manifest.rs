@@ -17,7 +17,7 @@ use prost::Message;
 use prost_types::Timestamp;
 
 use super::Fragment;
-use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
+use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Schema, StorageClass};
@@ -423,9 +423,9 @@ impl Manifest {
         fragments
     }
 
-    /// Whether the dataset uses move-stable row ids.
-    pub fn uses_move_stable_row_ids(&self) -> bool {
-        self.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0
+    /// Whether the dataset uses stable row ids.
+    pub fn uses_stable_row_ids(&self) -> bool {
+        self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
@@ -603,7 +603,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             metadata: p.metadata,
         };
 
-        if FLAG_MOVE_STABLE_ROW_IDS & p.reader_feature_flags != 0
+        if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
             && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
         {
             return Err(Error::Internal {

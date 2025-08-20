@@ -84,8 +84,7 @@ message Manifest {
   //
   // Known flags:
   // * 1: deletion files are present
-  // * 2: move_stable_row_ids: row IDs are tracked and stable after move operations
-  //       (such as compaction), but not updates.
+  // * 2: row ids are stable and stored as part of the fragment metadata.
   // * 4: use v2 format (deprecated)
   // * 8: table config is present
   uint64 reader_feature_flags = 9;
@@ -121,7 +120,7 @@ message Manifest {
 
   // The next unused row id. If zero, then the table does not have any rows.
   //
-  // This is only used if the "move_stable_row_ids" feature flag is set.
+  // This is only used if the "stable_row_ids" feature flag is set.
   uint64 next_row_id = 14;
 
   message DataStorageFormat {

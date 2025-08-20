@@ -438,12 +438,12 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
-@pytest.mark.parametrize("enable_move_stable_row_ids", [False, True])
-def test_fragment_metadata_pickle(tmp_path: Path, enable_move_stable_row_ids: bool):
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
     ds = write_dataset(
         pa.table({"a": range(100)}),
         tmp_path,
-        enable_move_stable_row_ids=enable_move_stable_row_ids,
+        enable_stable_row_ids=enable_stable_row_ids,
     )
     # Create a deletion file
     ds.delete("a < 50")
@@ -452,7 +452,7 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_move_stable_row_ids: bo
     frag_meta = fragment.metadata
 
     assert frag_meta.deletion_file is not None
-    if enable_move_stable_row_ids:
+    if enable_stable_row_ids:
         assert frag_meta.row_id_meta is not None
 
     # Pickle and unpickle the fragment metadata
