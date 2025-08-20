@@ -1373,12 +1373,21 @@ pub struct CompressedPostingList {
 
 impl DeepSizeOf for CompressedPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.blocks.get_array_memory_size()
-            + self
-                .positions
-                .as_ref()
-                .map(|positions| positions.get_array_memory_size())
-                .unwrap_or(0)
+        let mut blocks_actual_size = 0;
+        for i in 0..self.blocks.len() {
+            blocks_actual_size += self.blocks.value(i).len();
+        }
+
+        let positions_actual_size = self
+            .positions
+            .as_ref()
+            .map(|positions| {
+                positions.len() * positions.values().len() * std::mem::size_of::<i32>()
+                    / positions.len().max(1)
+            })
+            .unwrap_or(0);
+
+        blocks_actual_size + positions_actual_size
     }
 }
 
