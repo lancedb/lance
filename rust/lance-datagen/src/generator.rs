@@ -389,6 +389,8 @@ pub trait ArrayGeneratorExt {
     /// Replaces the validity bitmap of generated arrays with the inverse of `nulls`, cycling if needed
     fn with_nulls(self, nulls: &[bool]) -> Box<dyn ArrayGenerator>;
     /// Replaces the values of generated arrays with NaN values, cycling if needed
+    ///
+    /// Will have no effect if the data type is not a floating point data type
     fn with_nans(self, nans: &[bool]) -> Box<dyn ArrayGenerator>;
     /// Replaces the validity bitmap of generated arrays with `validity`, cycling if needed
     fn with_validity(self, nulls: &[bool]) -> Box<dyn ArrayGenerator>;

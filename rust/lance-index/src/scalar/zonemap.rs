@@ -483,7 +483,6 @@ impl ScalarIndex for ZoneMapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        println!("ZoneMapIndex::search!!!!!");
         metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
@@ -749,11 +748,10 @@ impl ZoneMapIndexBuilder {
 
                 // Check if there is enough data from the current fragment to fill the current zone
                 let desired = if let Some(idx) = next_fragment_index {
-                    // We found a fragment boundary, update cur_fragment_id and reset zone start
-                    let next_fragment_id = row_addrs_array.value(idx) >> 32;
-                    self.cur_fragment_id = next_fragment_id;
-                    // Don't create an empty zone, just process the data up to the boundary
-                    idx - array_offset
+                    self.cur_fragment_id = row_addrs_array.value(idx) >> 32;
+                    // Take the minimum between distance to boundary and space left in zone
+                    // to ensure we don't exceed the zone size limit
+                    std::cmp::min(idx - array_offset, empty_rows_left_in_cur_zone)
                 } else {
                     empty_rows_left_in_cur_zone
                 };
@@ -2061,5 +2059,4 @@ mod tests {
             &[4294967296, 4294967297, 4294967298, 4294967299, 4294967300]
         );
     }
-    // Create another test following test_page_cache in  btree.rs
 }

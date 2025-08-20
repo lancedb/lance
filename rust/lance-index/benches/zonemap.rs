@@ -36,7 +36,7 @@ fn bench_zonemap(c: &mut Criterion) {
         ))
     });
 
-    // Generate random integers for the zonemap index
+    // Generate sequential integers for the zonemap index
     let data_col = arrow_array::Int32Array::from_iter_values(0..TOTAL as i32);
 
     let row_addr_col = Arc::new(UInt64Array::from(

@@ -43,10 +43,7 @@ impl DatasetIndexRemapper {
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<Option<RemappedIndex>> {
         let new_uuid = remap_index(&self.dataset, &index.uuid, mapping).await?;
-        match new_uuid {
-            Some(uuid) => Ok(Some(RemappedIndex::new(index.uuid, uuid))),
-            None => Ok(None), // No remapping occurred
-        }
+        Ok(new_uuid.map(|uuid| RemappedIndex::new(index.uuid, uuid)))
     }
 }
 
