@@ -1681,7 +1681,7 @@ impl Merger {
         params: MergeInsertParams,
         schema: Arc<Schema>,
         with_row_addr: bool,
-        enable_move_stable_row_ids: bool,
+        enable_stable_row_ids: bool,
     ) -> Result<Self> {
         let delete_expr = if let WhenNotMatchedBySource::DeleteIf(expr) =
             &params.delete_not_matched_by_source
@@ -1719,7 +1719,7 @@ impl Merger {
 
         Ok(Self {
             deleted_rows: Arc::new(Mutex::new(RoaringTreemap::new())),
-            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_move_stable_row_ids))),
+            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
             delete_expr,
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
             match_filter_expr,
@@ -1727,7 +1727,7 @@ impl Merger {
             schema,
             with_row_addr,
             output_schema,
-            enable_stable_row_ids: enable_move_stable_row_ids,
+            enable_stable_row_ids,
         })
     }
 
@@ -2067,12 +2067,12 @@ mod tests {
         batch: RecordBatch,
         test_uri: &str,
         version: LanceFileVersion,
-        enable_move_stable_row_ids: bool,
+        enable_stable_row_ids: bool,
     ) -> Arc<Dataset> {
         let write_params = WriteParams {
             max_rows_per_file: 10,
             data_storage_version: Some(version),
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             ..Default::default()
         };
 
@@ -2117,7 +2117,7 @@ mod tests {
 
     async fn test_stable_row_ids_helper(
         version: LanceFileVersion,
-        enable_move_stable_row_ids: bool,
+        enable_stable_row_ids: bool,
         test_keys: &[u32],
         expected_left_keys: &[u32],
         expected_right_keys: &[u32],
@@ -2131,8 +2131,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let ds =
-            create_test_dataset(schema, batch, test_uri, version, enable_move_stable_row_ids).await;
+        let ds = create_test_dataset(schema, batch, test_uri, version, enable_stable_row_ids).await;
 
         let row_ids_before = get_row_ids_for_keys(&ds, test_keys).await;
 
@@ -2149,7 +2148,7 @@ mod tests {
         let ds = Dataset::open(test_uri).await.unwrap();
         let row_ids_after = get_row_ids_for_keys(&ds, test_keys).await;
 
-        if enable_move_stable_row_ids {
+        if enable_stable_row_ids {
             assert_eq!(row_ids_before, row_ids_after);
         } else {
             assert_ne!(row_ids_before, row_ids_after);
@@ -2356,11 +2355,11 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_and_delete_all_with_stable_row_id(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_move_stable_row_ids: bool,
+        #[values(true, false)] enable_stable_row_ids: bool,
     ) {
         test_stable_row_ids_helper(
             version,
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             &[4, 5, 6],
             &[],
             &[4, 5, 6, 7, 8, 9],
@@ -2382,11 +2381,11 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_only_with_stable_row_id(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_move_stable_row_ids: bool,
+        #[values(true, false)] enable_stable_row_ids: bool,
     ) {
         test_stable_row_ids_helper(
             version,
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             &[4, 5, 6],
             &[1, 2, 3],
             &[4, 5, 6, 7, 8, 9],
@@ -2407,11 +2406,11 @@ mod tests {
     #[tokio::test]
     async fn test_conditional_update_with_stable_row_id(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_move_stable_row_ids: bool,
+        #[values(true, false)] enable_stable_row_ids: bool,
     ) {
         test_stable_row_ids_helper(
             version,
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             &[6],
             &[1, 2, 3, 4, 5],
             &[6, 7, 8, 9],
@@ -2434,11 +2433,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_only_with_stable_row_id(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_move_stable_row_ids: bool,
+        #[values(true, false)] enable_stable_row_ids: bool,
     ) {
         test_stable_row_ids_helper(
             version,
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             &[4, 5, 6],
             &[1, 2, 3],
             &[4, 5, 6],
@@ -2460,11 +2459,11 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_with_conditional_delete_and_stable_row_id(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_move_stable_row_ids: bool,
+        #[values(true, false)] enable_stable_row_ids: bool,
     ) {
         test_stable_row_ids_helper(
             version,
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             &[1, 4, 5, 6],
             &[1],
             &[4, 5, 6, 7, 8, 9],

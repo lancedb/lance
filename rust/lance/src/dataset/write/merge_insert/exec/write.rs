@@ -17,7 +17,7 @@ use datafusion::{
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt};
 use roaring::RoaringTreemap;
 
 use crate::dataset::utils::CapturedRowIds;
@@ -52,12 +52,12 @@ struct MergeState {
 }
 
 impl MergeState {
-    fn new(metrics: MergeInsertMetrics, enable_move_stable_row_ids: bool) -> Self {
+    fn new(metrics: MergeInsertMetrics, enable_stable_row_ids: bool) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
-            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_move_stable_row_ids))),
+            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
             metrics,
-            enable_stable_row_ids: enable_move_stable_row_ids,
+            enable_stable_row_ids,
         }
     }
 
@@ -190,7 +190,7 @@ impl FullSchemaMergeInsertExec {
         };
 
         if enable_stable_row_ids {
-            self.create_two_phase_streaming_write_stream(input_stream, merge_state)
+            self.create_ordered_update_insert_stream(input_stream, merge_state)
         } else {
             self.create_streaming_write_stream(input_stream, merge_state)
         }
@@ -255,105 +255,27 @@ impl FullSchemaMergeInsertExec {
         )))
     }
 
-    /// Two-phase streaming implementation for stable row ID scenarios
+    /// Creates an ordered update-insert stream ensuring updated data before inserted data.
     ///
-    /// This method ensures that all update operations are processed before insert operations
-    /// while avoiding full buffering in memory. It works in two phases:
-    /// 1. Process all input batches and separate update vs insert operations
-    /// 2. Return batches in order: updates first, then inserts
-    fn create_two_phase_streaming_write_stream(
+    /// 1. Separating the input stream into update and insert streams
+    /// 2. Using chain operations to guarantee all update batches are processed before any insert batches
+    /// 3. Returning the combined ordered stream
+    fn create_ordered_update_insert_stream(
         &self,
         input_stream: SendableRecordBatchStream,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let (_, rowaddr_idx, action_idx, data_column_indices, output_schema) =
-            self.prepare_stream_schema(input_stream.schema())?;
+        let (update_stream, insert_stream) =
+            self.split_updates_and_inserts(input_stream, merge_state)?;
 
-        let output_schema_clone = output_schema.clone();
-        let merge_state_clone = merge_state;
+        let output_schema = update_stream.schema();
 
-        // Phase 1: Collect all batches and separate update and insert operations
-        let future = async move {
-            let mut update_batches = Vec::new();
-            let mut insert_batches = Vec::new();
-            let mut input_stream = input_stream;
+        // Chain the update and insert streams to ensure order
+        let combined_stream = update_stream.chain(insert_stream);
 
-            // Scan all input batches and separate update and insert operations
-            while let Some(batch_result) = input_stream.next().await {
-                let batch = batch_result?;
-                let (row_addr_array, action_array) =
-                    Self::extract_control_arrays(&batch, rowaddr_idx, action_idx)?;
-
-                let mut update_indices = Vec::new();
-                let mut insert_indices = Vec::new();
-
-                // Process each row, but only collect the indices
-                {
-                    let mut merge_state = merge_state_clone.lock().map_err(|e| {
-                        datafusion::error::DataFusionError::Internal(format!(
-                            "Failed to lock merge state: {}",
-                            e
-                        ))
-                    })?;
-
-                    for row_idx in 0..batch.num_rows() {
-                        let action_code = action_array.value(row_idx);
-                        let action = Action::try_from(action_code).map_err(|e| {
-                            datafusion::error::DataFusionError::Internal(format!(
-                                "Invalid action code {}: {}",
-                                action_code, e
-                            ))
-                        })?;
-
-                        if merge_state
-                            .process_row_action(action, row_idx, row_addr_array)?
-                            .is_some()
-                        {
-                            match action {
-                                Action::UpdateAll => update_indices.push(row_idx),
-                                Action::Insert => insert_indices.push(row_idx),
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
-                // create update batch
-                if !update_indices.is_empty() {
-                    let update_batch = Self::create_filtered_batch(
-                        &batch,
-                        update_indices,
-                        &data_column_indices,
-                        output_schema_clone.clone(),
-                    )?;
-                    update_batches.push(update_batch);
-                }
-
-                // create insertion batch
-                if !insert_indices.is_empty() {
-                    let insert_batch = Self::create_filtered_batch(
-                        &batch,
-                        insert_indices,
-                        &data_column_indices,
-                        output_schema_clone.clone(),
-                    )?;
-                    insert_batches.push(insert_batch);
-                }
-            }
-
-            // Phase 2: Return batches in sequence - update first, then insert
-            let mut all_batches = update_batches;
-            all_batches.extend(insert_batches);
-
-            Ok::<_, datafusion::error::DataFusionError>(stream::iter(
-                all_batches.into_iter().map(Ok),
-            ))
-        };
-
-        let stream = stream::once(future).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            stream,
+            combined_stream,
         )))
     }
 
@@ -561,6 +483,142 @@ impl FullSchemaMergeInsertExec {
         }
 
         Ok((updated_fragments, removed_fragments))
+    }
+
+    fn split_updates_and_inserts(
+        &self,
+        input_stream: SendableRecordBatchStream,
+        merge_state: Arc<Mutex<MergeState>>,
+    ) -> DFResult<(SendableRecordBatchStream, SendableRecordBatchStream)> {
+        let (_, rowaddr_idx, action_idx, data_column_indices, output_schema) =
+            self.prepare_stream_schema(input_stream.schema())?;
+
+        let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (insert_tx, insert_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let output_schema_clone = output_schema.clone();
+        let merge_state_clone = merge_state;
+
+        tokio::spawn(async move {
+            let mut input_stream = input_stream;
+
+            while let Some(batch_result) = input_stream.next().await {
+                match batch_result {
+                    Ok(batch) => {
+                        match Self::process_and_split_batch(
+                            &batch,
+                            rowaddr_idx,
+                            action_idx,
+                            &data_column_indices,
+                            output_schema_clone.clone(),
+                            merge_state_clone.clone(),
+                        ) {
+                            Ok((update_batch_opt, insert_batch_opt)) => {
+                                if let Some(update_batch) = update_batch_opt {
+                                    if update_tx.send(Ok(update_batch)).is_err() {
+                                        break;
+                                    }
+                                }
+
+                                if let Some(insert_batch) = insert_batch_opt {
+                                    if insert_tx.send(Ok(insert_batch)).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = update_tx.send(Err(e));
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = update_tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let update_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(update_rx);
+        let update_stream = Box::pin(RecordBatchStreamAdapter::new(
+            output_schema.clone(),
+            update_stream,
+        ));
+
+        let insert_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(insert_rx);
+        let insert_stream = Box::pin(RecordBatchStreamAdapter::new(output_schema, insert_stream));
+
+        Ok((update_stream, insert_stream))
+    }
+
+    fn process_and_split_batch(
+        batch: &RecordBatch,
+        rowaddr_idx: usize,
+        action_idx: usize,
+        data_column_indices: &[usize],
+        output_schema: Arc<Schema>,
+        merge_state: Arc<Mutex<MergeState>>,
+    ) -> DFResult<(Option<RecordBatch>, Option<RecordBatch>)> {
+        let (row_addr_array, action_array) =
+            Self::extract_control_arrays(batch, rowaddr_idx, action_idx)?;
+
+        let mut update_indices = Vec::new();
+        let mut insert_indices = Vec::new();
+
+        {
+            let mut merge_state = merge_state.lock().map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Failed to lock merge state: {}",
+                    e
+                ))
+            })?;
+
+            for row_idx in 0..batch.num_rows() {
+                let action_code = action_array.value(row_idx);
+                let action = Action::try_from(action_code).map_err(|e| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "Invalid action code {}: {}",
+                        action_code, e
+                    ))
+                })?;
+
+                if merge_state
+                    .process_row_action(action, row_idx, row_addr_array)?
+                    .is_some()
+                {
+                    match action {
+                        Action::UpdateAll => update_indices.push(row_idx),
+                        Action::Insert => insert_indices.push(row_idx),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let update_batch = if !update_indices.is_empty() {
+            Some(Self::create_filtered_batch(
+                batch,
+                update_indices,
+                data_column_indices,
+                output_schema.clone(),
+            )?)
+        } else {
+            None
+        };
+
+        let insert_batch = if !insert_indices.is_empty() {
+            Some(Self::create_filtered_batch(
+                batch,
+                insert_indices,
+                data_column_indices,
+                output_schema,
+            )?)
+        } else {
+            None
+        };
+
+        Ok((update_batch, insert_batch))
     }
 }
 
