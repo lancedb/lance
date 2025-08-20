@@ -672,8 +672,8 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
+    // If we aren't using stable row ids, then we need to remap indices.
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut scanner = dataset.scan();
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
@@ -693,7 +693,7 @@ async fn rewrite_files(
         scanner.with_row_id();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         let (data_no_row_ids, row_id_rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_move_stable_row_ids())?;
+            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
         (Some(row_id_rx), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
@@ -723,8 +723,8 @@ async fn rewrite_files(
         params.max_bytes_per_file = max_bytes_per_file;
     }
 
-    if dataset.manifest.uses_move_stable_row_ids() {
-        params.enable_move_stable_row_ids = true;
+    if dataset.manifest.uses_stable_row_ids() {
+        params.enable_stable_row_ids = true;
     }
 
     let new_fragments = write_fragments_internal(
@@ -880,9 +880,8 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping =
-        !dataset.manifest.uses_move_stable_row_ids() && !options.defer_index_remap;
+    // If we aren't using stable row ids, then we need to remap indices.
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
@@ -1597,7 +1596,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 1000,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1670,15 +1669,12 @@ mod tests {
             assert_eq!(dataset.manifest.version, 6);
         }
 
-        assert_eq!(
-            dataset.manifest.uses_move_stable_row_ids(),
-            use_stable_row_id,
-        );
+        assert_eq!(dataset.manifest.uses_stable_row_ids(), use_stable_row_id,);
     }
 
     #[tokio::test]
     async fn test_stable_row_indices() {
-        // Validate behavior of indices after compaction with move-stable row ids.
+        // Validate behavior of indices after compaction with stable row ids.
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
                 RandomVector::new().vec_width(16).named("vec".to_owned()),
@@ -1688,7 +1684,7 @@ mod tests {
             data_gen.batch(500),
             "memory://test/table",
             Some(WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 max_rows_per_file: 100, // 5 files
                 ..Default::default()
             }),
@@ -1765,7 +1761,7 @@ mod tests {
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
         // The indices should be unchanged after compaction, since we are using
-        // move-stable row ids.
+        // stable row ids.
         let current_indices = index_set(&dataset).await;
         assert_eq!(indices, current_indices);
 

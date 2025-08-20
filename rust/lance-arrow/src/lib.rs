@@ -1309,6 +1309,11 @@ impl BufferExt for arrow_buffer::Buffer {
         let to_fill = size_bytes - bytes.len();
         buf.extend(bytes);
         buf.extend(std::iter::repeat_n(0_u8, to_fill));
+
+        // FIX for issue #4512: Shrink buffer to actual size before converting to immutable
+        // This reduces memory overhead from capacity over-allocation
+        buf.shrink_to_fit();
+
         Self::from(buf)
     }
 }

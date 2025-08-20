@@ -566,6 +566,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -676,6 +677,15 @@ class LanceDataset(pa.dataset.Dataset):
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings. If a string is
             specified, it will assume ascending and nulls last ordering.
+        disable_scoring_autoprojection: bool, default False
+            Currently, when a search (vector or full text) is performed, the scoring
+            column (_distance, _score) is added to the end of the output even when a
+            projection is specified.  In the future, this will change.  The columns will
+            only be present if there is no projection or if they are explicitly
+            specified in the projection.
+
+            This parameter allows you to opt-in to the new behavior early, to avoid
+            being subject to breaking changes in the future.
 
 
         .. note::
@@ -736,6 +746,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.scan_stats_callback, scan_stats_callback)
         setopt(builder.strict_batch_size, strict_batch_size)
         setopt(builder.order_by, order_by)
+        setopt(builder.disable_scoring_autoprojection, disable_scoring_autoprojection)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -817,6 +828,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -900,6 +912,15 @@ class LanceDataset(pa.dataset.Dataset):
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings. If a string is
             specified, it will assume ascending and nulls last ordering.
+        disable_scoring_autoprojection: bool, default False
+            Currently, when a search (vector or full text) is performed, the scoring
+            column (_distance, _score) is added to the end of the output even when a
+            projection is specified.  In the future, this will change.  The columns will
+            only be present if there is no projection or if they are explicitly
+            specified in the projection.
+
+            This parameter allows you to opt-in to the new behavior early, to avoid
+            being subject to breaking changes in the future.
 
         Notes
         -----
@@ -929,6 +950,7 @@ class LanceDataset(pa.dataset.Dataset):
             full_text_query=full_text_query,
             include_deleted_rows=include_deleted_rows,
             order_by=order_by,
+            disable_scoring_autoprojection=disable_scoring_autoprojection,
         ).to_table()
 
     @property
@@ -1015,6 +1037,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -1048,6 +1071,7 @@ class LanceDataset(pa.dataset.Dataset):
             full_text_query=full_text_query,
             strict_batch_size=strict_batch_size,
             order_by=order_by,
+            disable_scoring_autoprojection=disable_scoring_autoprojection,
         ).to_batches()
 
     def sample(
@@ -3044,6 +3068,26 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return SqlQueryBuilder(self._ds.sql(sql))
 
+    def diff_meta(self, compared_version: int) -> List[Transaction]:
+        """
+        Get the transaction list between current version and compared version
+        as metadata differences.
+
+        Parameters
+        ----------
+        compared_version : int
+            The version to compare against, the compared_version must be greater than 0
+            and less than the current version.
+            Note that the compared_version may not exist in the dataset due to
+            clean-up action, in which case it would throw a `VersionNotFound` error.
+
+        Returns
+        -------
+        List[Transaction]
+            List of transactions representing the differences
+        """
+        return self._ds.diff_meta(compared_version)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3731,6 +3775,7 @@ class ScannerBuilder:
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
         self._orderings = None
+        self._disable_scoring_autoprojection = False
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -4107,6 +4152,10 @@ class ScannerBuilder:
         self._orderings = orderings
         return self
 
+    def disable_scoring_autoprojection(self, disable: bool = True) -> ScannerBuilder:
+        self._disable_scoring_autoprojection = disable
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -4134,6 +4183,7 @@ class ScannerBuilder:
             self._scan_stats_callback,
             self._strict_batch_size,
             self._orderings,
+            self._disable_scoring_autoprojection,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -4572,7 +4622,7 @@ def write_dataset(
     ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
-    enable_move_stable_row_ids: bool = False,
+    enable_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
@@ -4629,8 +4679,8 @@ def write_dataset(
         versions on object stores. This parameter has no effect if the dataset
         already exists. To migrate an existing dataset, instead use the
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
-    enable_move_stable_row_ids : bool, optional
-        Experimental parameter: if set to true, the writer will use move-stable row ids.
+    enable_stable_row_ids : bool, optional
+        Experimental parameter: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
@@ -4692,7 +4742,7 @@ def write_dataset(
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
-        "enable_move_stable_row_ids": enable_move_stable_row_ids,
+        "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
         "transaction_properties": merged_properties,
     }

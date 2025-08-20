@@ -123,7 +123,7 @@ impl<'a> InsertBuilder<'a> {
 
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
-            .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
+            .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
@@ -307,18 +307,15 @@ impl<'a> InsertBuilder<'a> {
         // Validate schema
         if matches!(context.params.mode, WriteMode::Append) {
             if let WriteDestination::Dataset(dataset) = &context.dest {
-                // If the dataset is already using (or not using) move stable row ids, we need to match
+                // If the dataset is already using (or not using) stable row ids, we need to match
                 // and ignore whatever the user provided as input
-                if context.params.enable_move_stable_row_ids
-                    != dataset.manifest.uses_move_stable_row_ids()
-                {
+                if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
                     log::info!(
-                        "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
-                        context.params.enable_move_stable_row_ids,
-                        dataset.manifest.uses_move_stable_row_ids()
+                        "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
+                        context.params.enable_stable_row_ids,
+                        dataset.manifest.uses_stable_row_ids()
                     );
-                    context.params.enable_move_stable_row_ids =
-                        dataset.manifest.uses_move_stable_row_ids();
+                    context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
                 }
                 let m = dataset.manifest.as_ref();
                 let mut schema_cmp_opts = SchemaCompareOptions {
@@ -357,13 +354,13 @@ impl<'a> InsertBuilder<'a> {
             }
         }
 
-        // If we are writing a dataset with non-default storage, we need to enable move stable row ids
+        // If we are writing a dataset with non-default storage, we need to enable stable row ids
         if context.dest.dataset().is_none()
-            && !context.params.enable_move_stable_row_ids
+            && !context.params.enable_stable_row_ids
             && data_schema.fields.iter().any(|f| !f.is_default_storage())
         {
-            log::info!("Enabling move stable row ids because non-default storage is used");
-            context.params.enable_move_stable_row_ids = true;
+            log::info!("Enabling stable row ids because non-default storage is used");
+            context.params.enable_stable_row_ids = true;
         }
 
         // Feature flags

@@ -26,6 +26,7 @@ use crate::{
         write::{
             merge_insert::{
                 assign_action::Action, exec::MergeInsertMetrics, MergeInsertParams, MergeStats,
+                MERGE_ACTION_COLUMN,
             },
             write_fragments_internal, WriteParams,
         },
@@ -160,7 +161,7 @@ impl FullSchemaMergeInsertExec {
     }
 
     /// Creates a filtered stream that captures row addresses for deletion and returns
-    /// a stream with only the source data columns (no _rowaddr or action columns)
+    /// a stream with only the source data columns (no _rowaddr or __action columns)
     fn create_filtered_write_stream(
         &self,
         input_stream: SendableRecordBatchStream,
@@ -175,25 +176,31 @@ impl FullSchemaMergeInsertExec {
             )
         })?;
 
-        let (action_idx, _) = input_schema.column_with_name("action").ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal(
-                "Expected action column in merge insert input".to_string(),
-            )
-        })?;
+        let (action_idx, _) = input_schema
+            .column_with_name(MERGE_ACTION_COLUMN)
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Expected {} column in merge insert input",
+                    MERGE_ACTION_COLUMN
+                ))
+            })?;
 
         // Find all data columns to write (everything except special columns)
         // The schema from DataFusion optimization may have collapsed duplicate columns
         // from the logical join, leaving us with the merged data columns plus special columns
         let total_fields = input_schema.fields().len();
 
-        // Select all columns that are data columns (not _rowaddr or action)
+        // Select all columns that are data columns (not _rowaddr or __action)
         // These represent the final merged data values to write
         let data_column_indices: Vec<usize> = (0..total_fields)
             .filter(|&idx| {
                 let field = input_schema.field(idx);
                 let name = field.name();
-                // Skip special columns: _rowaddr and action
-                idx != rowaddr_idx && idx != action_idx && name != ROW_ADDR && name != "action"
+                // Skip special columns: _rowaddr and __action
+                idx != rowaddr_idx
+                    && idx != action_idx
+                    && name != ROW_ADDR
+                    && name != MERGE_ACTION_COLUMN
             })
             .collect();
 
@@ -223,7 +230,7 @@ impl FullSchemaMergeInsertExec {
         let stream = input_stream.map(move |batch_result| -> DFResult<RecordBatch> {
             let batch = batch_result?;
 
-            // Get row address and action arrays
+            // Get row address and __action arrays
             let row_addr_array = batch
                 .column(rowaddr_idx)
                 .as_any()
@@ -239,9 +246,10 @@ impl FullSchemaMergeInsertExec {
                 .as_any()
                 .downcast_ref::<UInt8Array>()
                 .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(
-                        "Expected UInt8Array for action column".to_string(),
-                    )
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "Expected UInt8Array for {} column",
+                        MERGE_ACTION_COLUMN
+                    ))
                 })?;
 
             // Process each row using the shared state
@@ -480,7 +488,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         // Input schema structure based on our logical plan:
         // - target._rowaddr: Address of existing rows to update/delete
         // - source.*: Source data columns (variable schema)
-        // - action: Merge action (1=update, 2=insert, 0=delete, etc.)
+        // - __action: Merge action (1=update, 2=insert, 0=delete, etc.)
 
         // Execute the input plan to get the merge data stream
         let input_stream = self.input.execute(partition, context)?;

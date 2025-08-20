@@ -418,7 +418,7 @@ mod v2_adapter {
                 let scheduler = self.file_scheduler.with_priority(op_priority);
                 Arc::new(
                     self.reader
-                        .with_scheduler(Arc::new(LanceEncodingsIo(scheduler))),
+                        .with_scheduler(Arc::new(LanceEncodingsIo::new(scheduler))),
                 )
             } else {
                 self.reader.clone()
@@ -836,7 +836,7 @@ impl FileFragment {
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
-        let row_id_load = if self.dataset.manifest.uses_move_stable_row_ids() {
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )
@@ -952,7 +952,7 @@ impl FileFragment {
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
-                    Arc::new(LanceEncodingsIo(file_scheduler.clone())),
+                    Arc::new(LanceEncodingsIo::new(file_scheduler.clone())),
                     path,
                     None,
                     Arc::<DecoderPlugins>::default(),
@@ -1743,7 +1743,7 @@ pub struct FragmentReader {
 
     /// The row id sequence
     ///
-    /// Only populated if the move-stable row id feature is enabled.
+    /// Only populated if the stable row id feature is enabled.
     row_id_sequence: Option<Arc<RowIdSequence>>,
 
     /// ID of the fragment

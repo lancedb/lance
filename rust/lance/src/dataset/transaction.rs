@@ -59,7 +59,7 @@ use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MemWal;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
+use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -1169,9 +1169,9 @@ impl Transaction {
         config: &ManifestWriteConfig,
         new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
-        if config.use_move_stable_row_ids
+        if config.use_stable_row_ids
             && current_manifest
-                .map(|m| !m.uses_move_stable_row_ids())
+                .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
             return Err(Error::NotSupported {
@@ -1210,10 +1210,8 @@ impl Transaction {
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
-            match (current_manifest, config.use_move_stable_row_ids) {
-                (Some(manifest), _)
-                    if manifest.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0 =>
-                {
+            match (current_manifest, config.use_stable_row_ids) {
+                (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
                 }
                 (None, true) => Some(0),
@@ -1530,6 +1528,9 @@ impl Transaction {
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
+        // Clean up data files that only contain tombstoned fields
+        Self::remove_tombstoned_data_files(&mut final_fragments);
+
         let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
             (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
             (None, Some(true)) => Some(LanceFileVersion::Legacy),
@@ -1568,7 +1569,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest, config.use_move_stable_row_ids)?;
+            apply_feature_flags(&mut manifest, config.use_stable_row_ids)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -1658,6 +1659,17 @@ impl Transaction {
             details.type_url.ends_with("VectorIndexDetails")
         } else {
             false
+        }
+    }
+
+    /// Remove data files that only contain tombstoned fields (-2)
+    /// These files no longer contain any live data and can be safely dropped
+    fn remove_tombstoned_data_files(fragments: &mut [Fragment]) {
+        for fragment in fragments {
+            fragment.files.retain(|file| {
+                // Keep file if it has at least one non-tombstoned field
+                file.fields.iter().any(|&field_id| field_id != -2)
+            });
         }
     }
 
@@ -2520,6 +2532,7 @@ fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_io::utils::CachedFileSize;
 
     #[test]
     fn test_rewrite_fragments() {
@@ -2569,5 +2582,61 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[test]
+    fn test_remove_tombstoned_data_files() {
+        // Create a fragment with mixed data files: some normal, some fully tombstoned
+        let mut fragment = Fragment::new(1);
+
+        // Add a normal data file with valid field IDs
+        fragment.files.push(DataFile {
+            path: "normal.lance".to_string(),
+            fields: vec![1, 2, 3],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(1000),
+        });
+
+        // Add a data file with all fields tombstoned
+        fragment.files.push(DataFile {
+            path: "all_tombstoned.lance".to_string(),
+            fields: vec![-2, -2, -2],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(500),
+        });
+
+        // Add a data file with mixed tombstoned and valid fields
+        fragment.files.push(DataFile {
+            path: "mixed.lance".to_string(),
+            fields: vec![4, -2, 5],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(750),
+        });
+
+        // Add another fully tombstoned file
+        fragment.files.push(DataFile {
+            path: "another_tombstoned.lance".to_string(),
+            fields: vec![-2],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(250),
+        });
+
+        let mut fragments = vec![fragment];
+
+        // Apply the cleanup
+        Transaction::remove_tombstoned_data_files(&mut fragments);
+
+        // Should have removed the two fully tombstoned files
+        assert_eq!(fragments[0].files.len(), 2);
+        assert_eq!(fragments[0].files[0].path, "normal.lance");
+        assert_eq!(fragments[0].files[1].path, "mixed.lance");
     }
 }

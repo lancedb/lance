@@ -441,7 +441,7 @@ impl FilteredReadStream {
         };
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
-        let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_move_stable_row_ids() {
+        let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
             let row_id_sequence = load_row_id_sequence(dataset.as_ref(), &frag).await?;
             let num_logical_rows = row_id_sequence.len();
             (row_id_sequence, num_logical_rows)

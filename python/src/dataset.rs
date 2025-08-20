@@ -56,6 +56,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::v2::reader::FileReaderOptions;
@@ -441,7 +442,10 @@ impl Dataset {
                 cache_repetition_index,
                 validate_on_decode,
             };
-            let file_reader_options = FileReaderOptions { decoder_config };
+            let file_reader_options = FileReaderOptions {
+                decoder_config,
+                ..Default::default()
+            };
             params.file_reader_options = Some(file_reader_options);
         }
 
@@ -624,7 +628,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -652,6 +656,7 @@ impl Dataset {
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
         strict_batch_size: Option<bool>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
+        disable_scoring_autoprojection: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -661,6 +666,10 @@ impl Dataset {
 
         if with_row_address.unwrap_or(false) {
             scanner.with_row_address();
+        }
+
+        if let Some(true) = disable_scoring_autoprojection {
+            scanner.disable_scoring_autoprojection();
         }
 
         match (columns, columns_with_transform) {
@@ -2043,6 +2052,22 @@ impl Dataset {
         let builder = ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
+
+    #[pyo3(signature=(compared_version))]
+    fn diff_meta(&self, compared_version: u64) -> PyResult<Vec<PyLance<Transaction>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transactions = RT
+            .block_on(None, new_self.diff_meta(compared_version))?
+            .map_err(|err: Error| match err {
+                Error::InvalidInput { source, .. } => PyValueError::new_err(source.to_string()),
+                Error::VersionNotFound { .. } => {
+                    PyValueError::new_err(format!("Version not found: {}", err))
+                }
+                _ => PyIOError::new_err(format!("Storage error: {}", err)),
+            })?;
+
+        Ok(transactions.into_iter().map(PyLance).collect())
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]
@@ -2331,10 +2356,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             });
         }
 
-        if let Some(enable_move_stable_row_ids) =
-            get_dict_opt::<bool>(options, "enable_move_stable_row_ids")?
+        if let Some(enable_stable_row_ids) = get_dict_opt::<bool>(options, "enable_stable_row_ids")?
         {
-            p.enable_move_stable_row_ids = enable_move_stable_row_ids;
+            p.enable_stable_row_ids = enable_stable_row_ids;
         }
         if let Some(enable_v2_manifest_paths) =
             get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
