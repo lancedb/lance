@@ -2871,6 +2871,97 @@ def test_scan_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter=pa_ds.field("a") < 20) == 20
 
 
+def test_with_row_offset(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100)})
+    dataset = lance.write_dataset(df, base_dir, max_rows_per_file=25)
+
+    tbl = dataset.scanner(columns=["_rowoffset"]).to_table()
+    tbl = tbl.combine_chunks()
+    assert tbl == pa.table({"_rowoffset": pa.array(range(100), pa.uint64())})
+
+
+def test_system_columns(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100)})
+    dataset = lance.write_dataset(df, base_dir, max_rows_per_file=25)
+
+    # Projection order is respected when system columns are specified via projection
+    tbl = dataset.scanner(columns=["_rowid", "_rowaddr", "_rowoffset"]).to_table()
+    assert tbl.schema.names == ["_rowid", "_rowaddr", "_rowoffset"]
+    tbl = dataset.scanner(columns=["_rowoffset", "_rowid", "_rowaddr"]).to_table()
+    assert tbl.schema.names == ["_rowoffset", "_rowid", "_rowaddr"]
+
+    # If specified using with_row_id or with_row_address, the system columns are
+    # added to the end of the schema
+    tbl = dataset.scanner(with_row_id=True).to_table()
+    assert tbl.schema.names == ["a", "_rowid"]
+    tbl = dataset.scanner(with_row_address=True).to_table()
+    assert tbl.schema.names == ["a", "_rowaddr"]
+    tbl = dataset.scanner(with_row_address=True, with_row_id=True).to_table()
+    assert tbl.schema.names == ["a", "_rowid", "_rowaddr"]
+
+
+def test_scoring_columns(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pa.table(
+        {
+            "vec": pa.array([[i, i] for i in range(100)], pa.list_(pa.float32(), 2)),
+        }
+    )
+    dataset = lance.write_dataset(df, base_dir)
+
+    nearest = {
+        "column": "vec",
+        "q": pa.array([1, 1], pa.float32()),
+        "k": 10,
+        "use_index": False,
+    }
+
+    # Common behavior, no projection means we add distance column at the end
+    print(dataset.scanner(nearest=nearest).explain_plan())
+    tbl = dataset.scanner(nearest=nearest).to_table()
+    assert tbl.schema.names == ["vec", "_distance"]
+
+    # If _rowid or _rowaddr specified via legacy means, they go after distance
+    tbl = dataset.scanner(nearest=nearest, with_row_id=True).to_table()
+    assert tbl.schema.names == ["vec", "_distance", "_rowid"]
+
+    tbl = dataset.scanner(nearest=nearest, with_row_address=True).to_table()
+    assert tbl.schema.names == ["vec", "_distance", "_rowaddr"]
+
+    tbl = dataset.scanner(
+        nearest=nearest, with_row_address=True, with_row_id=True
+    ).to_table()
+    assert tbl.schema.names == ["vec", "_distance", "_rowid", "_rowaddr"]
+
+    # If _rowid or _rowaddr are specified via projection, they stay in the specified
+    # order
+    tbl = dataset.scanner(
+        columns=["_rowid", "vec"], nearest=nearest, disable_scoring_autoprojection=False
+    ).to_table()
+    assert tbl.schema.names == ["_rowid", "vec", "_distance"]
+    tbl = dataset.scanner(
+        columns=["vec", "_rowaddr"],
+        nearest=nearest,
+        disable_scoring_autoprojection=False,
+    ).to_table()
+    assert tbl.schema.names == ["vec", "_rowaddr", "_distance"]
+
+    # Legacy behavior
+    # Even though projection happens, the distance column is still added to the end
+    tbl = dataset.scanner(
+        columns=["vec"], nearest=nearest, disable_scoring_autoprojection=False
+    ).to_table()
+    assert tbl.schema.names == ["vec", "_distance"]
+
+    # If we disable scoring autoprojection, the distance column is not added
+    tbl = dataset.scanner(
+        columns=["vec"], nearest=nearest, disable_scoring_autoprojection=True
+    ).to_table()
+    assert tbl.schema.names == ["vec"]
+
+
 def test_scanner_schemas(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(50), "s": [f"s-{i}" for i in range(50)]})

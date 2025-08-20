@@ -275,7 +275,7 @@ def test_with_row_id(tmp_path, row_param, column_name):
     assert column_name in table.column_names
     assert table.column(column_name).type == pa.uint64()
 
-    with pytest.raises((ValueError, OSError), match="without enabling"):
-        lance_ds.scanner(
-            **{row_param: False, "columns": ["data_item_id", column_name]}
-        ).to_table()
+    table = lance_ds.scanner(
+        **{row_param: False, "columns": ["data_item_id", column_name]}
+    ).to_table()
+    assert column_name in table.column_names
