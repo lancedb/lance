@@ -169,6 +169,20 @@ def test_indexed_between(tmp_path):
     assert actual_data.num_rows == 0
 
 
+def test_index_combination(tmp_path):
+    # This test regresses a bug in the index combination logic.
+
+    colors = ["red", "green", "blue"]
+    digits = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
+    data = [{"color": colors[i % 3], "digit": digits[i % 10]} for i in range(30000)]
+
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("color", index_type="BTREE")
+    ds.create_scalar_index("digit", index_type="BTREE")
+
+    assert ds.count_rows("color = 'green' or digit <> 9") == 28000
+
+
 def test_temporal_index(tmp_path):
     # Timestamps
     now = datetime.now()
