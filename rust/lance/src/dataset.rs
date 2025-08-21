@@ -7306,8 +7306,12 @@ mod tests {
 
         assert_results(
             results,
-            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat",
-                                    "a white cat catch a big fish", "cat fish catch"]),
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
         );
 
         // Test with fts index
@@ -7327,13 +7331,17 @@ mod tests {
             "foo".to_string(),
             Arc::new(dataset.clone()),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         assert_results(
             results,
-            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat",
-                                    "a white cat catch a big fish", "cat fish catch"]),
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
         );
     }
 

@@ -24,7 +24,10 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
-use super::{AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery, TokenQuery};
+use super::{
+    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
+    TextQuery, TokenQuery,
+};
 
 const MAX_DEPTH: usize = 500;
 

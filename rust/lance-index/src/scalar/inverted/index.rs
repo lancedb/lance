@@ -49,6 +49,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
+use tantivy::tokenizer::Language;
 use tracing::{info, instrument};
 
 use super::{
@@ -71,7 +72,9 @@ use super::{
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
-use crate::scalar::{AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TextQuery, TokenQuery};
+use crate::scalar::{
+    AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TokenQuery,
+};
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 
@@ -328,12 +331,13 @@ impl InvertedIndex {
     fn is_query_allowed(&self, query: &TokenQuery) -> bool {
         match query {
             TokenQuery::TokensContains(_) => {
-                self.params.base_tokenizer == "simple" &&
-                    self.params.max_token_length.is_none()
+                self.params.base_tokenizer == "simple"
+                    && self.params.max_token_length.is_none()
+                    && self.params.language == Language::English
+                    && !self.params.stem
             }
         }
     }
-
 
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
@@ -345,7 +349,7 @@ impl InvertedIndex {
             .bm25_search(
                 tokens.into(),
                 params.into(),
-                Operator::Or,
+                Operator::And,
                 Arc::new(NoFilter),
                 Arc::new(NoOpMetricsCollector),
             )
@@ -370,7 +374,9 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
         if !self.is_query_allowed(query) {
-            return Ok(SearchResult::AtLeast(RowIdTreeMap::from_iter::<Vec<u64>>(vec![])))
+            return Ok(SearchResult::AtLeast(RowIdTreeMap::from_iter::<Vec<u64>>(
+                vec![],
+            )));
         }
 
         match query {

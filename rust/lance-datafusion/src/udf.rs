@@ -49,22 +49,25 @@ fn contains_tokens() -> ScalarUDF {
                 ),
             )?;
 
-            // Split tokens based on punctuations and white spaces.
             let tokens: Option<Vec<&str>> = match scalar_str.len() {
                 0 => None,
-                _ => Some(collect_tokens(scalar_str.value(0)))
+                _ => Some(collect_tokens(scalar_str.value(0))),
             };
 
-            let result = column
-                .iter()
-                .map(|text| text.map(|text| {
+            let result = column.iter().map(|text| {
+                text.map(|text| {
                     let text_tokens = collect_tokens(text);
                     if let Some(tokens) = &tokens {
-                        tokens.len() == tokens.iter().filter(|token| text_tokens.contains(*token)).count()
+                        tokens.len()
+                            == tokens
+                                .iter()
+                                .filter(|token| text_tokens.contains(*token))
+                                .count()
                     } else {
                         true
                     }
-                }));
+                })
+            });
 
             Ok(Arc::new(BooleanArray::from_iter(result)) as ArrayRef)
         },
@@ -83,7 +86,7 @@ fn contains_tokens() -> ScalarUDF {
 /// Split tokens separated by punctuations and white spaces.
 fn collect_tokens(text: &str) -> Vec<&str> {
     text.split(|c: char| !c.is_alphanumeric())
-        .filter(|word|!word.is_empty())
+        .filter(|word| !word.is_empty())
         .collect()
 }
 
@@ -109,7 +112,13 @@ mod tests {
             "cat catchup fish",
             "cat fish catch",
         ]));
-        let token = Arc::new(StringArray::from(vec![" cat catch fish.", " cat catch fish.", " cat catch fish.", " cat catch fish.", " cat catch fish."]));
+        let token = Arc::new(StringArray::from(vec![
+            " cat catch fish.",
+            " cat catch fish.",
+            " cat catch fish.",
+            " cat catch fish.",
+            " cat catch fish.",
+        ]));
 
         let args = vec![ColumnarValue::Array(text_col), ColumnarValue::Array(token)];
         let arg_fields = vec![
