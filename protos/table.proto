@@ -402,6 +402,7 @@ message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message InvertedIndexDetails {}
 message NGramIndexDetails {}
+message ZoneMapIndexDetails {}
 message VectorIndexDetails {}
 
 message FragmentReuseIndexDetails {
