@@ -585,6 +585,9 @@ pub trait RecordBatchExt {
 
     /// Take selected rows from the [RecordBatch].
     fn take(&self, indices: &UInt32Array) -> Result<RecordBatch>;
+
+    /// Create a new RecordBatch with compacted memory after slicing.
+    fn shrink_to_fit(&self) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -753,6 +756,11 @@ impl RecordBatchExt for RecordBatch {
         let struct_array: StructArray = self.clone().into();
         let taken = take(&struct_array, indices, None)?;
         self.try_new_from_struct_array(taken.as_struct().clone())
+    }
+
+    fn shrink_to_fit(&self) -> Result<Self> {
+        // Deep copy the sliced record batch, instead of whole batch
+        crate::deepcopy::deep_copy_batch_sliced(self)
     }
 }
 

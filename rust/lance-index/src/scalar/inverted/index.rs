@@ -1018,6 +1018,9 @@ impl PostingListReader {
         for token_id in 0..self.len() {
             let posting_range = self.posting_list_range(token_id as u32);
             let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
+            // Apply shrink_to_fit to create a deep copy with compacted buffers
+            // This ensures each cached entry has its own memory, not shared references
+            let batch = batch.shrink_to_fit()?;
             let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
             self.index_cache
                 .insert_with_key(
