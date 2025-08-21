@@ -678,8 +678,8 @@ impl ZoneMapIndexBuilder {
     fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
         self.null_count += array.null_count() as u32;
         self.nan_count += Self::count_nans(array);
-        self.min.update_batch(&[array.clone()])?;
-        self.max.update_batch(&[array.clone()])?;
+        self.min.update_batch(std::slice::from_ref(array))?;
+        self.max.update_batch(std::slice::from_ref(array))?;
         Ok(())
     }
 

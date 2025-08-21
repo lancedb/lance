@@ -1661,15 +1661,16 @@ impl Transaction {
                 Arc::new(final_fragments),
                 new_blob_version,
             );
-            if user_requested_version.is_some()
-                && matches!(self.operation, Operation::Overwrite { .. })
+
+            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
+                (user_requested_version, &self.operation)
             {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format =
-                    DataStorageFormat::new(user_requested_version.unwrap());
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
             }
+
             prev_manifest
         } else {
             let data_storage_format =
