@@ -56,6 +56,7 @@ use crate::Dataset;
 
 use super::utils::IoMetrics;
 
+#[derive(Debug)]
 pub struct EvaluatedIndex {
     index_result: IndexExprResult,
     applicable_fragments: RoaringBitmap,
