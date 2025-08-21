@@ -11,7 +11,6 @@ use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
-use tracing::instrument;
 
 use crate::metrics::MetricsCollector;
 
@@ -199,7 +198,6 @@ impl PostingIterator {
     }
 
     // move to the next doc id that is greater than or equal to least_id
-    #[instrument(level = "debug", name = "posting_iter_next", skip(self))]
     fn next(&mut self, least_id: u64) {
         match self.list {
             PostingList::Compressed(ref mut list) => {
@@ -455,7 +453,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
     // find the first term that the sum of upper bound of all preceding terms and itself,
     // are greater than or equal to the threshold
-    #[instrument(level = "debug", skip_all)]
     fn find_pivot_term(&self) -> Option<usize> {
         if self.operator == Operator::And {
             // for AND query, we always require all terms to be present in the document,
@@ -486,7 +483,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
     // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
     // so that we can move the posting iterator to the next doc id that is possible to be candidate
-    #[instrument(level = "debug", skip_all)]
     fn move_term(&mut self, least_id: u64) {
         let picked = self.pick_term(least_id);
         self.postings[picked].next(least_id);
