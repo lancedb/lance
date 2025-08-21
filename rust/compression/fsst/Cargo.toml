@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
 description = "FSST string compression for Lance"
 keywords.workspace = true

@@ -172,15 +172,14 @@ fn try_bitpack_for_mini_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn Min
     {
         use arrow_array::cast::AsArray;
 
-        let bit_widths = _data.expect_stat(Stat::BitWidth);
-        let widths = bit_widths.as_primitive::<UInt64Type>();
-        let has_all_zeros = widths.values().contains(&0);
-        let too_small = widths.len() == 1
-            && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
+        let bits = _data.bits_per_value;
+        if !matches!(bits, 8 | 16 | 32 | 64) {
+            return None;
+        }
 
         let bit_widths = _data.expect_stat(Stat::BitWidth);
         let widths = bit_widths.as_primitive::<UInt64Type>();
-        let has_all_zeros = widths.values().iter().any(|&w| w == 0);
+        let has_all_zeros = widths.values().contains(&0);
         let too_small = widths.len() == 1
             && InlineBitpacking::min_size_bytes(widths.value(0)) >= _data.data_size();
 
