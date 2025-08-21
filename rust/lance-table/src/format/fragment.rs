@@ -47,18 +47,6 @@ pub struct DataFile {
 }
 
 impl DataFile {
-    pub fn refer(datafile: &Self, base_id: u32) -> Self {
-        Self {
-            path: datafile.path.clone(),
-            fields: datafile.fields.clone(),
-            column_indices: datafile.column_indices.clone(),
-            file_major_version: datafile.file_major_version,
-            file_minor_version: datafile.file_minor_version,
-            file_size_bytes: datafile.file_size_bytes.clone(),
-            base_id: Some(base_id),
-        }
-    }
-
     pub fn new(
         path: impl Into<String>,
         fields: Vec<i32>,

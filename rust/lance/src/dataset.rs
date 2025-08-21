@@ -1215,7 +1215,7 @@ impl Dataset {
                 })?;
 
                 let path = Path::parse(base_path.path.as_str())?;
-                if base_path.dataset_base {
+                if base_path.is_dataset_root {
                     Ok(path.child(DATA_DIR))
                 } else {
                     Ok(path)
@@ -1239,6 +1239,15 @@ impl Dataset {
                     )
                 })?;
 
+                if !base_path.is_dataset_root {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "base_path id {} is not a dataset root for deletion_file {:?}",
+                            base_id, deletion_file
+                        ),
+                        location: location!(),
+                    });
+                }
                 Ok(Path::parse(base_path.path.as_str())?)
             }
             None => Ok(self.base.clone()),
@@ -1651,13 +1660,16 @@ impl Dataset {
         Ok(())
     }
 
+    /// Shallow clone the target version into a new dataset at target_path.
+    /// 'target_path': the uri string to clone the dataset into.
+    /// 'ref_name': the ref name to clone.
+    /// 'store_params': the object store params to use for the new dataset.
     pub async fn shallow_clone(
         &mut self,
         target_path: &str,
         ref_name: &str,
         store_params: ObjectStoreParams,
     ) -> Result<Self> {
-        // self.tags.create(ref_name, self.version().version).await?;
         let version = self.tags.get_version(ref_name).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,

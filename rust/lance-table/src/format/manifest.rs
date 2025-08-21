@@ -241,7 +241,7 @@ impl Manifest {
                 let base_path = BasePath {
                     id: new_base_id,
                     name: ref_name,
-                    dataset_base: true,
+                    is_dataset_root: true,
                     path: ref_path,
                 };
                 base_paths.insert(new_base_id, base_path);
@@ -444,7 +444,7 @@ impl Manifest {
 pub struct BasePath {
     pub id: u32,
     pub name: String,
-    pub dataset_base: bool,
+    pub is_dataset_root: bool,
     pub path: String,
 }
 
@@ -569,7 +569,7 @@ impl From<pb::BasePath> for BasePath {
         Self {
             id: p.id,
             name: p.name,
-            dataset_base: p.dataset_base,
+            is_dataset_root: p.is_dataset_root,
             path: p.path,
         }
     }
@@ -714,7 +714,7 @@ impl From<&Manifest> for pb::Manifest {
                 .map(|base_path| pb::BasePath {
                     id: base_path.id,
                     name: base_path.name.clone(),
-                    dataset_base: base_path.dataset_base,
+                    is_dataset_root: base_path.is_dataset_root,
                     path: base_path.path.clone(),
                 })
                 .collect(),

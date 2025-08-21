@@ -26,19 +26,19 @@ public class DeletionFile implements Serializable {
   private final long readVersion;
   private final Long numDeletedRows;
   private final DeletionFileType fileType;
-  private final Integer pathBaseIndex;
+  private final Integer baseId;
 
   public DeletionFile(
       long id,
       long readVersion,
       Long numDeletedRows,
       DeletionFileType fileType,
-      Integer pathBaseIndex) {
+      Integer baseId) {
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
     this.fileType = fileType;
-    this.pathBaseIndex = pathBaseIndex;
+    this.baseId = baseId;
   }
 
   public long getId() {
@@ -57,8 +57,8 @@ public class DeletionFile implements Serializable {
     return fileType;
   }
 
-  public Optional<Integer> getPathBaseIndex() {
-    return Optional.ofNullable(pathBaseIndex);
+  public Optional<Integer> getBaseId() {
+    return Optional.ofNullable(baseId);
   }
 
   @Override
@@ -79,7 +79,7 @@ public class DeletionFile implements Serializable {
         .append("readVersion", readVersion)
         .append("numDeletedRows", numDeletedRows)
         .append("fileType", fileType)
-        .append("pathBaseIndex", pathBaseIndex)
+        .append("baseId", baseId)
         .toString();
   }
 }
