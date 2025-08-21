@@ -690,6 +690,23 @@ def test_fts_stats(dataset):
     assert params["ascii_folding"] is True
 
 
+def test_fts_score():
+    # the number of tokens matters for scoring,
+    # make a table that all docs have the same number of tokens
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "text": ["lance database test", "full text search", "lance search text"],
+        }
+    )
+    ds = lance.write_dataset(data, ":memory:")
+    ds.create_scalar_index("text", "INVERTED")
+
+    results = ds.to_table(full_text_query="lance search text")
+    assert results.num_rows == 3
+    assert results["id"].to_pylist() == [3, 2, 1]
+
+
 def test_fts_on_list(tmp_path):
     data = pa.table(
         {
