@@ -47,17 +47,17 @@ struct MergeState {
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     /// Merge operation metrics
     metrics: MergeInsertMetrics,
-    /// Whether to enable stable row ids
-    enable_stable_row_ids: bool,
+    /// Whether the dataset uses stable row ids.
+    stable_row_ids: bool,
 }
 
 impl MergeState {
-    fn new(metrics: MergeInsertMetrics, enable_stable_row_ids: bool) -> Self {
+    fn new(metrics: MergeInsertMetrics, stable_row_ids: bool) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
-            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
+            updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(stable_row_ids))),
             metrics,
-            enable_stable_row_ids,
+            stable_row_ids,
         }
     }
 
@@ -84,7 +84,7 @@ impl MergeState {
                     let row_addr = row_addr_array.value(row_idx);
                     self.delete_row_addrs.insert(row_addr);
 
-                    if self.enable_stable_row_ids {
+                    if self.stable_row_ids {
                         self.updating_row_ids.lock().unwrap().capture(&[row_addr])?;
                     }
                     // Don't count as actual delete - this is an update
@@ -186,7 +186,7 @@ impl FullSchemaMergeInsertExec {
                     e
                 ))
             })?;
-            state.enable_stable_row_ids
+            state.stable_row_ids
         };
 
         if enable_stable_row_ids {
@@ -215,7 +215,7 @@ impl FullSchemaMergeInsertExec {
                 Self::extract_control_arrays(&batch, rowaddr_idx, action_idx)?;
 
             // Process each row using the shared state
-            let mut keep_rows: Vec<u32> = Vec::new();
+            let mut keep_rows: Vec<u32> = Vec::with_capacity(batch.num_rows());
 
             let mut merge_state = merge_state.lock().map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!(
