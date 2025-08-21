@@ -305,6 +305,7 @@ impl MapIndexExec {
             column: column_name,
             index_name,
             query: Arc::new(SargableQuery::IsIn(index_vals)),
+            needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         let IndexExprResult::Exact(mut row_id_mask) = query_result else {
@@ -585,7 +586,7 @@ async fn row_ids_for_mask(
     match (mask.allow_list, mask.block_list) {
         (None, None) => {
             // Matches all row ids in the given fragments.
-            if dataset.manifest.uses_move_stable_row_ids() {
+            if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
                     .try_collect::<Vec<_>>()
@@ -608,14 +609,14 @@ async fn row_ids_for_mask(
                 Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
             } else {
                 // We shouldn't hit this branch if the row ids are stable.
-                debug_assert!(!dataset.manifest.uses_move_stable_row_ids());
+                debug_assert!(!dataset.manifest.uses_stable_row_ids());
                 Ok(FragIdIter::new(fragments)
                     .filter(|row_id| allow_list.contains(*row_id))
                     .collect())
             }
         }
         (None, Some(block_list)) => {
-            if dataset.manifest.uses_move_stable_row_ids() {
+            if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
                     .try_collect::<Vec<_>>()
@@ -655,7 +656,7 @@ async fn row_ids_for_mask(
                     .collect::<Vec<_>>())
             } else {
                 // We shouldn't hit this branch if the row ids are stable.
-                debug_assert!(!dataset.manifest.uses_move_stable_row_ids());
+                debug_assert!(!dataset.manifest.uses_stable_row_ids());
                 Ok(FragIdIter::new(fragments)
                     .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
                     .collect())
@@ -669,7 +670,7 @@ async fn retain_fragments(
     fragments: &[Fragment],
     dataset: &Dataset,
 ) -> Result<()> {
-    if dataset.manifest.uses_move_stable_row_ids() {
+    if dataset.manifest.uses_stable_row_ids() {
         let fragment_ids = load_row_id_sequences(dataset, fragments)
             .map_ok(|(_frag_id, sequence)| RowIdTreeMap::from(sequence.as_ref()))
             .try_fold(RowIdTreeMap::new(), |mut acc, tree| async {
@@ -835,6 +836,7 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
+            needs_recheck: false,
         });
 
         let fragments = dataset.fragments().clone();
@@ -872,6 +874,7 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
+            needs_recheck: false,
         });
 
         // These plans aren't even valid but it appears we defer all work (even validation) until

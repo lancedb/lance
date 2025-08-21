@@ -173,7 +173,7 @@ fn try_bitpack_for_mini_block(data: &FixedWidthDataBlock) -> Option<Box<dyn Mini
 
     let bit_widths = data.expect_stat(Stat::BitWidth);
     let widths = bit_widths.as_primitive::<UInt64Type>();
-    let has_all_zeros = widths.values().iter().any(|&w| w == 0);
+    let has_all_zeros = widths.values().contains(&0);
     let too_small =
         widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
 

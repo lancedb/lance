@@ -304,10 +304,7 @@ impl From<serde_json::Error> for Error {
 
 #[track_caller]
 fn arrow_io_error_from_msg(message: String) -> ArrowError {
-    ArrowError::IoError(
-        message.clone(),
-        std::io::Error::new(std::io::ErrorKind::Other, message),
-    )
+    ArrowError::IoError(message.clone(), std::io::Error::other(message))
 }
 
 impl From<Error> for ArrowError {

@@ -836,7 +836,7 @@ impl FileFragment {
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
-        let row_id_load = if self.dataset.manifest.uses_move_stable_row_ids() {
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )
@@ -1534,7 +1534,7 @@ impl FileFragment {
             self.dataset.as_ref(),
             transforms,
             read_columns,
-            &[self.clone()],
+            std::slice::from_ref(self),
             batch_size,
         )
         .await?;
@@ -1743,7 +1743,7 @@ pub struct FragmentReader {
 
     /// The row id sequence
     ///
-    /// Only populated if the move-stable row id feature is enabled.
+    /// Only populated if the stable row id feature is enabled.
     row_id_sequence: Option<Arc<RowIdSequence>>,
 
     /// ID of the fragment
@@ -3440,7 +3440,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            Fragment::try_infer_version(&[frag.clone()])
+            Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
             LanceFileVersion::Stable.resolve()

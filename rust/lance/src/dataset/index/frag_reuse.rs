@@ -34,9 +34,9 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         &dataset.manifest,
     )
     .await?;
-    let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-        None => return Ok(()),
-        Some(idx) => idx,
+    let Some(frag_reuse_index_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(());
     };
 
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)

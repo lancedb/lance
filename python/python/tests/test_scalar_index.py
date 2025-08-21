@@ -690,6 +690,23 @@ def test_fts_stats(dataset):
     assert params["ascii_folding"] is True
 
 
+def test_fts_score(tmp_path):
+    # the number of tokens matters for scoring,
+    # make a table that all docs have the same number of tokens
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "text": ["lance database test", "full text search", "lance search text"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED")
+
+    results = ds.to_table(full_text_query="lance search text")
+    assert results.num_rows == 3
+    assert results["id"].to_pylist() == [3, 2, 1]
+
+
 def test_fts_on_list(tmp_path):
     data = pa.table(
         {
@@ -1308,6 +1325,94 @@ def test_ngram_index(tmp_path: Path):
         names=["words"],
     )
     test_with(tbl)
+
+
+def test_zonemap_index(tmp_path: Path):
+    """Test create zonemap index"""
+    tbl = pa.Table.from_arrays([pa.array([i for i in range(8193)])], names=["values"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("values", index_type="ZONEMAP")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "ZoneMap"
+
+    # Get detailed index statistics
+    index_stats = dataset.stats.index_stats("values_idx")
+    assert index_stats["index_type"] == "ZoneMap"
+    assert "indices" in index_stats
+    assert len(index_stats["indices"]) == 1
+
+    # Verify zonemap statistics
+    zonemap_stats = index_stats["indices"][0]
+    assert zonemap_stats["max_zonemap_size"] == 8192
+    assert zonemap_stats["num_zones"] == 2  # Should have 2 zones (8192 rows + 1 row)
+    assert zonemap_stats["type"] == "ZoneMap"
+
+    # Test that the zonemap index is being used in the query plan
+    scanner = dataset.scanner(filter="values > 50", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Verify the query returns correct results
+    result = scanner.to_table()
+    assert result.num_rows == 8142  # 51..8192
+
+
+def test_zonemap_index_remapping(tmp_path: Path):
+    """Test zonemap index remapping after compaction and optimization"""
+    # Create a dataset with 5 fragments by writing data in chunks
+    # Each fragment will have 1000 rows, so we need 5000 total rows
+    tbl = pa.Table.from_arrays([pa.array(range(0, 5000))], names=["values"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset", max_rows_per_file=1000)
+
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 5
+
+    # Train a zone map index
+    dataset.create_scalar_index("values", index_type="ZONEMAP")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "ZoneMap"
+
+    # Confirm the zone map index is used if you search the dataset
+    scanner = dataset.scanner(filter="values > 2500", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Verify the query returns correct results
+    result = scanner.to_table()
+    assert result.num_rows == 2499  # 2501..4999
+
+    # Run compaction to merge fragments
+    compaction = dataset.optimize.compact_files(target_rows_per_fragment=2000)
+    assert compaction.fragments_removed == 5
+    assert len(dataset.get_fragments()) == 3
+
+    # Check if the zone map index is no longer being used
+    scanner = dataset.scanner(filter="values > 2500", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" not in plan
+
+    # Run optimize indices to rebuild the index
+    dataset.optimize.optimize_indices()
+
+    # Confirm the zone map index is used again after optimization
+    scanner = dataset.scanner(filter="values > 2500", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Verify the query returns correct results
+    result = scanner.to_table()
+    assert result.num_rows == 2499  # 2501..4999
+
+    # Test with a different query to ensure index works properly
+    scanner = dataset.scanner(filter="values BETWEEN 1000 AND 1500", prefilter=True)
+    plan = scanner.explain_plan()
+    print(f"Query plan after optimization: {plan}")
+    assert "ScalarIndexQuery" in plan
+
+    result = scanner.to_table()
+    assert result.num_rows == 501  # 1000..1500 inclusive
 
 
 def test_null_handling(tmp_path: Path):

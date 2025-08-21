@@ -83,7 +83,7 @@ impl EmptyStructDecoder {
 }
 
 impl LogicalPageDecoder for EmptyStructDecoder {
-    fn wait_for_loaded(&mut self, _loaded_need: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, _loaded_need: u64) -> BoxFuture<'_, Result<()>> {
         Box::pin(std::future::ready(Ok(())))
     }
     fn rows_loaded(&self) -> u64 {
@@ -537,7 +537,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
         Ok(())
     }
 
-    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {
         self.do_wait_for_loaded(loaded_need).boxed()
     }
 

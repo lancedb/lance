@@ -117,7 +117,8 @@ impl DisplayAs for OneShotExec {
             .schema
             .field_names()
             .iter()
-            .map(|s| s.to_string())
+            .cloned()
+            .cloned()
             .collect::<Vec<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {

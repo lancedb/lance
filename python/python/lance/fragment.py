@@ -706,7 +706,7 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        enable_move_stable_row_ids: bool = False,
+        enable_stable_row_ids: bool = False,
     ) -> Transaction: ...
 
     @overload
@@ -724,7 +724,7 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        enable_move_stable_row_ids: bool = False,
+        enable_stable_row_ids: bool = False,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -742,7 +742,7 @@ def write_fragments(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    enable_move_stable_row_ids: bool = False,
+    enable_stable_row_ids: bool = False,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -791,8 +791,8 @@ def write_fragments(
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    enable_move_stable_row_ids: bool
-        Experimental: if set to true, the writer will use move-stable row ids.
+    enable_stable_row_ids: bool
+        Experimental: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
@@ -843,5 +843,5 @@ def write_fragments(
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
-        enable_move_stable_row_ids=enable_move_stable_row_ids,
+        enable_stable_row_ids=enable_stable_row_ids,
     )
