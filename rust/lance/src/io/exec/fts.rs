@@ -226,7 +226,6 @@ impl ExecutionPlan for MatchQueryExec {
                 ),
             };
             let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
-            log::info!("tokens: {:?}", tokens);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
