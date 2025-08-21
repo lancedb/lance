@@ -29,11 +29,7 @@ public class DeletionFile implements Serializable {
   private final Integer baseId;
 
   public DeletionFile(
-      long id,
-      long readVersion,
-      Long numDeletedRows,
-      DeletionFileType fileType,
-      Integer baseId) {
+      long id, long readVersion, Long numDeletedRows, DeletionFileType fileType, Integer baseId) {
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
