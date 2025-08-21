@@ -2547,7 +2547,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             schema_fragments_valid(schema, manifest.fragments.as_ref())
         }
         Operation::Merge { fragments, schema } => {
-            merge_fragments_vaild(manifest, fragments)?;
+            merge_fragments_valid(manifest, fragments)?;
             schema_fragments_valid(schema, fragments)
         }
         Operation::Overwrite {
@@ -2595,9 +2595,9 @@ fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()>
 }
 
 /// Validate that Merge operations preserve all original fragments.
-/// Merge operations should only add columns, not reduce fragments.
-/// This ensures fragments correspond one-to-one with the original fragment list.
-fn merge_fragments_vaild(manifest: &Manifest, new_fragments: &[Fragment]) -> Result<()> {
+/// Merge operations should only add columns or rows, not reduce fragments.
+/// This ensures fragments correspond at one-to-one with the original fragment list.
+fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Result<()> {
     let original_fragments = manifest.fragments.as_ref();
 
     // Additional validation: ensure we're not accidentally reducing the fragment count
@@ -2740,7 +2740,7 @@ mod tests {
 
         // Test 1: Empty fragments should fail
         let empty_fragments = vec![];
-        let result = merge_fragments_vaild(&manifest, &empty_fragments);
+        let result = merge_fragments_valid(&manifest, &empty_fragments);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2754,7 +2754,7 @@ mod tests {
             // Fragment 3 is missing
             Fragment::new(4), // New fragment
         ];
-        let result = merge_fragments_vaild(&manifest, &missing_fragments);
+        let result = merge_fragments_valid(&manifest, &missing_fragments);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2767,7 +2767,7 @@ mod tests {
             Fragment::new(2),
             // Fragment 3 is missing, no new fragments added
         ];
-        let result = merge_fragments_vaild(&manifest, &reduced_fragments);
+        let result = merge_fragments_valid(&manifest, &reduced_fragments);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2782,12 +2782,12 @@ mod tests {
             Fragment::new(4), // New fragment
             Fragment::new(5), // Another new fragment
         ];
-        let result = merge_fragments_vaild(&manifest, &valid_fragments);
+        let result = merge_fragments_valid(&manifest, &valid_fragments);
         assert!(result.is_ok());
 
         // Test 5: Same fragments (no new ones) should succeed
         let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
-        let result = merge_fragments_vaild(&manifest, &same_fragments);
+        let result = merge_fragments_valid(&manifest, &same_fragments);
         assert!(result.is_ok());
     }
 
