@@ -2773,9 +2773,9 @@ mod tests {
         let new_batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt32Array::from(vec![target_key])), // 更新已存在的 key
-                Arc::new(UInt32Array::from(vec![merge_new_value])), // 新的 value
-                Arc::new(StringArray::from(vec!["UPDATED"])),  // 新的 filterme
+                Arc::new(UInt32Array::from(vec![target_key])),
+                Arc::new(UInt32Array::from(vec![merge_new_value])),
+                Arc::new(StringArray::from(vec!["UPDATED"])),
             ],
         )
         .unwrap();
