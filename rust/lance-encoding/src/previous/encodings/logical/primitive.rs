@@ -326,7 +326,7 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
-    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {
         log::trace!(
             "primitive wait for more than {} rows on column {} and page {} (page has {} rows)",
             loaded_need,

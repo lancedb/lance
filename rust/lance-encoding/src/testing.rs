@@ -99,7 +99,7 @@ fn column_indices_from_schema_helper(
                     *column_counter += 1;
                 }
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
@@ -111,7 +111,7 @@ fn column_indices_from_schema_helper(
                     *column_counter += 1;
                 }
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
@@ -120,7 +120,7 @@ fn column_indices_from_schema_helper(
             DataType::FixedSizeList(inner, _) => {
                 // FSL(primitive) does not get its own column in either approach
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,

@@ -2455,7 +2455,7 @@ mod tests {
                 matches!(
                     &res,
                     &Err(Error::SchemaMismatch { ref difference, .. })
-                        if difference.to_string().contains("fields did not match")
+                        if difference.clone().contains("fields did not match")
                 ),
                 "Expected SchemaMismatch error, got: {:?}",
                 res

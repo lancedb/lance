@@ -1370,7 +1370,7 @@ impl Scanner {
 
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
-    pub fn try_into_stream(&self) -> BoxFuture<Result<DatasetRecordBatchStream>> {
+    pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
@@ -1408,7 +1408,7 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    fn create_count_plan(&self) -> BoxFuture<Result<Arc<dyn ExecutionPlan>>> {
+    fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if self.projection_plan.physical_projection.is_empty() {
@@ -1466,7 +1466,7 @@ impl Scanner {
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
     /// especially if there is no filter.
     #[instrument(skip_all)]
-    pub fn count_rows(&self) -> BoxFuture<Result<u64>> {
+    pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let count_plan = self.create_count_plan().await?;
@@ -3805,11 +3805,10 @@ mod test {
             .unwrap();
 
         let check_err_msg = |r: Result<DatasetRecordBatchStream>| {
-            let err = match r {
-                Ok(_) => panic!(
+            let Err(err) = r else {
+                panic!(
                     "Expected an error to be raised saying column y is not found but got no error"
-                ),
-                Err(e) => e,
+                )
             };
 
             assert!(

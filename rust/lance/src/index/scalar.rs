@@ -955,7 +955,8 @@ mod tests {
         let field_names: Vec<String> = output_schema
             .fields()
             .iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name())
+            .cloned()
             .collect();
 
         // Should have the original column

@@ -62,7 +62,7 @@ impl BFloat16Array {
         values.into()
     }
 
-    pub fn iter(&self) -> BFloat16Iter {
+    pub fn iter(&self) -> BFloat16Iter<'_> {
         BFloat16Iter::new(self)
     }
 
