@@ -34,7 +34,7 @@ use crate::{
     },
     Dataset, Result,
 };
-use lance_core::{Error, ROW_ADDR};
+use lance_core::{Error, ROW_ADDR, ROW_ID};
 use lance_table::format::{Fragment, RowIdMeta};
 use snafu::location;
 use std::collections::BTreeMap;
@@ -67,6 +67,7 @@ impl MergeState {
         action: Action,
         row_idx: usize,
         row_addr_array: &UInt64Array,
+        row_id_array: &UInt64Array,
     ) -> DFResult<Option<usize>> {
         match action {
             Action::Delete => {
@@ -85,7 +86,10 @@ impl MergeState {
                     self.delete_row_addrs.insert(row_addr);
 
                     if self.stable_row_ids {
-                        self.updating_row_ids.lock().unwrap().capture(&[row_addr])?;
+                        self.updating_row_ids
+                            .lock()
+                            .unwrap()
+                            .capture(&[row_id_array.value(row_idx)])?;
                     }
                     // Don't count as actual delete - this is an update
                 }
@@ -205,14 +209,14 @@ impl FullSchemaMergeInsertExec {
         input_stream: SendableRecordBatchStream,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let (_, rowaddr_idx, action_idx, data_column_indices, output_schema) =
+        let (_, rowaddr_idx, rowid_idx, action_idx, data_column_indices, output_schema) =
             self.prepare_stream_schema(input_stream.schema())?;
 
         let output_schema_clone = output_schema.clone();
         let stream = input_stream.map(move |batch_result| -> DFResult<RecordBatch> {
             let batch = batch_result?;
-            let (row_addr_array, action_array) =
-                Self::extract_control_arrays(&batch, rowaddr_idx, action_idx)?;
+            let (row_addr_array, row_id_array, action_array) =
+                Self::extract_control_arrays(&batch, rowaddr_idx, rowid_idx, action_idx)?;
 
             // Process each row using the shared state
             let mut keep_rows: Vec<u32> = Vec::with_capacity(batch.num_rows());
@@ -234,7 +238,7 @@ impl FullSchemaMergeInsertExec {
                 })?;
 
                 if merge_state
-                    .process_row_action(action, row_idx, row_addr_array)?
+                    .process_row_action(action, row_idx, row_addr_array, row_id_array)?
                     .is_some()
                 {
                     keep_rows.push(row_idx as u32);
@@ -288,6 +292,7 @@ impl FullSchemaMergeInsertExec {
         arrow_schema::SchemaRef,
         usize,
         usize,
+        usize,
         Vec<usize>,
         Arc<Schema>,
     )> {
@@ -295,6 +300,12 @@ impl FullSchemaMergeInsertExec {
         let (rowaddr_idx, _) = input_schema.column_with_name(ROW_ADDR).ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(
                 "Expected _rowaddr column in merge insert input".to_string(),
+            )
+        })?;
+
+        let (rowid_idx, _) = input_schema.column_with_name(ROW_ID).ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "Expected _rowid column in merge insert input".to_string(),
             )
         })?;
 
@@ -322,6 +333,7 @@ impl FullSchemaMergeInsertExec {
                 idx != rowaddr_idx
                     && idx != action_idx
                     && name != ROW_ADDR
+                    && name != ROW_ID
                     && name != MERGE_ACTION_COLUMN
             })
             .collect();
@@ -349,6 +361,7 @@ impl FullSchemaMergeInsertExec {
         Ok((
             input_schema,
             rowaddr_idx,
+            rowid_idx,
             action_idx,
             data_column_indices,
             output_schema,
@@ -359,9 +372,10 @@ impl FullSchemaMergeInsertExec {
     fn extract_control_arrays(
         batch: &RecordBatch,
         rowaddr_idx: usize,
+        rowid_idx: usize,
         action_idx: usize,
-    ) -> DFResult<(&UInt64Array, &UInt8Array)> {
-        // Get row address and __action arrays
+    ) -> DFResult<(&UInt64Array, &UInt64Array, &UInt8Array)> {
+        // Get row address, row id and __action arrays
         let row_addr_array = batch
             .column(rowaddr_idx)
             .as_any()
@@ -369,6 +383,16 @@ impl FullSchemaMergeInsertExec {
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Internal(
                     "Expected UInt64Array for _rowaddr column".to_string(),
+                )
+            })?;
+
+        let row_id_array = batch
+            .column(rowid_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "Expected UInt64Array for _rowid column".to_string(),
                 )
             })?;
 
@@ -383,7 +407,7 @@ impl FullSchemaMergeInsertExec {
                 ))
             })?;
 
-        Ok((row_addr_array, action_array))
+        Ok((row_addr_array, row_id_array, action_array))
     }
 
     /// Create filtered batch from selected rows
@@ -489,7 +513,7 @@ impl FullSchemaMergeInsertExec {
         input_stream: SendableRecordBatchStream,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<(SendableRecordBatchStream, SendableRecordBatchStream)> {
-        let (_, rowaddr_idx, action_idx, data_column_indices, output_schema) =
+        let (_, rowaddr_idx, rowid_idx, action_idx, data_column_indices, output_schema) =
             self.prepare_stream_schema(input_stream.schema())?;
 
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -507,6 +531,7 @@ impl FullSchemaMergeInsertExec {
                         match Self::process_and_split_batch(
                             &batch,
                             rowaddr_idx,
+                            rowid_idx,
                             action_idx,
                             &data_column_indices,
                             output_schema_clone.clone(),
@@ -554,13 +579,14 @@ impl FullSchemaMergeInsertExec {
     fn process_and_split_batch(
         batch: &RecordBatch,
         rowaddr_idx: usize,
+        rowid_idx: usize,
         action_idx: usize,
         data_column_indices: &[usize],
         output_schema: Arc<Schema>,
         merge_state: Arc<Mutex<MergeState>>,
     ) -> DFResult<(Option<RecordBatch>, Option<RecordBatch>)> {
-        let (row_addr_array, action_array) =
-            Self::extract_control_arrays(batch, rowaddr_idx, action_idx)?;
+        let (row_addr_array, row_id_array, action_array) =
+            Self::extract_control_arrays(batch, rowaddr_idx, rowid_idx, action_idx)?;
 
         let mut update_indices: Vec<u32> = Vec::new();
         let mut insert_indices: Vec<u32> = Vec::new();
@@ -583,7 +609,7 @@ impl FullSchemaMergeInsertExec {
                 })?;
 
                 if merge_state
-                    .process_row_action(action, row_idx, row_addr_array)?
+                    .process_row_action(action, row_idx, row_addr_array, row_id_array)?
                     .is_some()
                 {
                     match action {

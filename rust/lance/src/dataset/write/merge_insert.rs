@@ -45,6 +45,13 @@ use datafusion::{
     prelude::DataFrame,
     scalar::ScalarValue,
 };
+use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
+use lance_datafusion::{
+    chunker::chunk_stream,
+    dataframe::DataFrameExt,
+    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
+    utils::reader_to_stream,
+};
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{
@@ -54,15 +61,9 @@ use std::{
     time::Duration,
 };
 
-use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{
-    chunker::chunk_stream,
-    dataframe::DataFrameExt,
-    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
-    utils::reader_to_stream,
-};
-
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::utils::CapturedRowIds;
 use crate::{
     datafusion::dataframe::SessionContextExt,
@@ -101,8 +102,6 @@ use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
-
-use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 
 mod assign_action;
 mod exec;
@@ -797,7 +796,11 @@ impl MergeInsertJob {
                 reservation_size: usize,
             ) -> Result<usize> {
                 // batches still have _rowaddr
-                let write_schema = batches[0].schema().as_ref().without_column(ROW_ADDR);
+                let write_schema = batches[0]
+                    .schema()
+                    .as_ref()
+                    .without_column(ROW_ADDR)
+                    .without_column(ROW_ID);
                 let write_schema = dataset.local_schema().project_by_schema(
                     &write_schema,
                     OnMissing::Error,
@@ -1149,7 +1152,7 @@ impl MergeInsertJob {
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
-        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), false, true)?;
+        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
         let on_cols = self
             .params
             .on
@@ -1401,8 +1404,21 @@ impl MergeInsertJob {
             // Apply deletions
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
+            let removed_row_addr_vec =
+                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+                    let addresses: Vec<u64> = removed_row_ids
+                        .iter()
+                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                        .collect::<Vec<_>>();
+                    addresses
+                } else {
+                    removed_row_ids
+                };
+
+            let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec.into_iter());
+
             let (old_fragments, removed_fragment_ids) =
-                Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
+                Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
 
             // Commit updated and new fragments
             let operation = Operation::Update {
@@ -1415,7 +1431,7 @@ impl MergeInsertJob {
                 mem_wal_to_flush: self.params.mem_wal_to_flush,
             };
 
-            let affected_rows = Some(RowIdTreeMap::from(removed_row_ids));
+            let affected_rows = Some(RowIdTreeMap::from(removed_row_addrs));
             (operation, affected_rows)
         };
 
@@ -1655,7 +1671,7 @@ impl RetryExecutor for MergeInsertJobWithIterator {
 #[derive(Debug, Clone)]
 struct Merger {
     // As the merger runs it will update the list of deleted rows
-    deleted_rows: Arc<Mutex<RoaringTreemap>>,
+    deleted_rows: Arc<Mutex<Vec<u64>>>,
     // Shared collection to capture row ids that need to be updated
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
@@ -1719,7 +1735,7 @@ impl Merger {
         };
 
         Ok(Self {
-            deleted_rows: Arc::new(Mutex::new(RoaringTreemap::new())),
+            deleted_rows: Arc::new(Mutex::new(Vec::new())),
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
             delete_expr,
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
@@ -1852,7 +1868,6 @@ impl Merger {
                 let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
                 deleted_row_ids.extend(row_ids.values());
                 if self.enable_stable_row_ids {
-                    let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
                     self.updating_row_ids
                         .lock()
                         .unwrap()
@@ -2067,10 +2082,10 @@ mod tests {
             )
             .into_dataset_with_params(
                 test_uri,
-                FragmentCount(1),
-                FragmentRowCount(6),
+                FragmentCount(2),
+                FragmentRowCount(3),
                 Some(WriteParams {
-                    max_rows_per_file: 10,
+                    max_rows_per_file: 3,
                     data_storage_version: Some(version),
                     enable_stable_row_ids,
                     ..Default::default()
@@ -2078,6 +2093,8 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert_eq!(2, dataset.get_fragments().len());
 
         Arc::new(dataset)
     }
@@ -2529,6 +2546,322 @@ mod tests {
             })
             .run_test()
             .await;
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_multiple_merge_insert_stable_row_id(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(true, false)] enable_stable_row_ids: bool,
+    ) {
+        let schema = create_test_schema();
+        let test_uri = "memory://test_multiple_merge.lance";
+
+        let ds = create_test_dataset(test_uri, version, enable_stable_row_ids).await;
+
+        let target_key = 2u32;
+        let target_keys = vec![target_key];
+
+        let initial_row_ids = get_row_ids_for_keys(&ds, &target_keys).await;
+        let initial_row_id = initial_row_ids.value(0);
+
+        let mut current_ds = ds;
+
+        for iteration in 1..=3 {
+            let new_value = 1000u32 + iteration * 10;
+            let new_batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![target_key])), // key
+                    Arc::new(UInt32Array::from(vec![new_value])),  // value
+                    Arc::new(StringArray::from(vec![format!("iteration_{}", iteration)])), // filterme
+                ],
+            )
+            .unwrap();
+
+            let job = MergeInsertBuilder::try_new(current_ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+            let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+            let new_stream = reader_to_stream(new_reader);
+            let (updated_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+
+            assert_eq!(
+                merge_stats.num_updated_rows, 1,
+                "Iteration {}: Expected 1 updated row",
+                iteration
+            );
+            assert_eq!(
+                merge_stats.num_inserted_rows, 0,
+                "Iteration {}: Expected 0 inserted rows",
+                iteration
+            );
+            assert_eq!(
+                merge_stats.num_deleted_rows, 0,
+                "Iteration {}: Expected 0 deleted rows",
+                iteration
+            );
+
+            let updated_row_ids = get_row_ids_for_keys(&updated_dataset, &target_keys).await;
+            let updated_row_id = updated_row_ids.value(0);
+
+            let updated_batch = updated_dataset
+                .scan()
+                .filter(&format!("key = {}", target_key))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let value_col = updated_batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let filterme_col = updated_batch
+                .column_by_name("filterme")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            assert_eq!(
+                value_col.value(0),
+                new_value,
+                "Iteration {}: Value should be updated to {}",
+                iteration,
+                new_value
+            );
+            assert_eq!(filterme_col.value(0), format!("iteration_{}", iteration));
+
+            if enable_stable_row_ids {
+                assert_eq!(
+                    updated_row_id, initial_row_id,
+                    "Iteration {}: Row ID should remain stable across merge inserts when stable_row_ids is enabled. Initial: {}, Current: {}",
+                    iteration, initial_row_id, updated_row_id
+                );
+            }
+
+            current_ds = updated_dataset;
+        }
+
+        let final_batch = current_ds
+            .scan()
+            .filter(&format!("key = {}", target_key))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_batch.num_rows(),
+            1,
+            "Should have exactly one row for the target key"
+        );
+
+        let final_value = final_batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(0);
+        let final_filterme = final_batch
+            .column_by_name("filterme")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!(
+            final_value, 1030u32,
+            "Final value should be from last iteration"
+        );
+        assert_eq!(
+            final_filterme, "iteration_3",
+            "Final filterme should be from last iteration"
+        );
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_row_id_stability_across_update_and_merge_insert(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(true, false)] enable_stable_row_ids: bool,
+    ) {
+        let schema = create_test_schema();
+        let test_uri = "memory://test_row_id_stability.lance";
+
+        let mut dataset = create_test_dataset(test_uri, version, enable_stable_row_ids).await;
+
+        let target_key = 2u32;
+        let target_keys = vec![target_key];
+
+        let initial_row_ids = get_row_ids_for_keys(&dataset, &target_keys).await;
+        let initial_row_id = initial_row_ids.value(0);
+
+        let initial_batch = dataset
+            .scan()
+            .filter(&format!("key = {}", target_key))
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let initial_value = initial_batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .value(0);
+
+        let update_result = crate::dataset::UpdateBuilder::new(Arc::new((*dataset).clone()))
+            .update_where(&format!("key = {}", target_key))
+            .unwrap()
+            .set("value", "value + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        dataset = update_result.new_dataset.clone();
+
+        let after_update_row_ids = get_row_ids_for_keys(&dataset, &target_keys).await;
+        let after_update_row_id = after_update_row_ids.value(0);
+
+        let after_update_batch = dataset
+            .scan()
+            .filter(&format!("key = {}", target_key))
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_update_value = after_update_batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .value(0);
+
+        if enable_stable_row_ids {
+            assert_eq!(
+                initial_row_id, after_update_row_id,
+                "Row ID should remain stable after update"
+            );
+        } else {
+            assert_ne!(
+                initial_row_id, after_update_row_id,
+                "Row ID should change after update when stable row IDs are disabled"
+            );
+        }
+        assert_eq!(
+            after_update_value,
+            initial_value + 100,
+            "Value should be updated correctly"
+        );
+
+        let merge_new_value = 500u32;
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![target_key])), // 更新已存在的 key
+                Arc::new(UInt32Array::from(vec![merge_new_value])), // 新的 value
+                Arc::new(StringArray::from(vec!["UPDATED"])),  // 新的 filterme
+            ],
+        )
+        .unwrap();
+
+        let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+
+        let after_merge_row_ids = get_row_ids_for_keys(&merged_dataset, &target_keys).await;
+        let after_merge_row_id = after_merge_row_ids.value(0);
+
+        let after_merge_batch = merged_dataset
+            .scan()
+            .filter(&format!("key = {}", target_key))
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let after_merge_value = after_merge_batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .value(0);
+
+        let after_merge_filterme = after_merge_batch
+            .column_by_name("filterme")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+
+        if enable_stable_row_ids {
+            assert_eq!(
+                initial_row_id, after_merge_row_id,
+                "Row ID should remain stable after merge insert"
+            );
+            assert_eq!(
+                after_update_row_id, after_merge_row_id,
+                "Row ID should remain the same across update and merge insert"
+            );
+        } else {
+            assert_ne!(
+                after_update_row_id, after_merge_row_id,
+                "Row ID should change after merge insert when stable row IDs are disabled"
+            );
+        }
+
+        assert_eq!(
+            after_merge_value, merge_new_value,
+            "Value should be updated by merge insert"
+        );
+        assert_eq!(
+            after_merge_filterme, "UPDATED",
+            "Filterme should be updated by merge insert"
+        );
+
+        assert_eq!(
+            merge_stats.num_updated_rows, 1,
+            "Should update exactly 1 row"
+        );
+        assert_eq!(
+            merge_stats.num_inserted_rows, 0,
+            "Should not insert any new rows"
+        );
+        assert_eq!(
+            merge_stats.num_deleted_rows, 0,
+            "Should not delete any rows"
+        );
+
+        if enable_stable_row_ids {
+            assert_eq!(
+                initial_row_id,
+                after_merge_row_id,
+                "Row ID should remain stable throughout the entire process of update and merge insert"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3477,12 +3810,12 @@ mod tests {
             plan,
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@1 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
-      ProjectionExec: expr=[key@2 IS NOT NULL as __common_expr_1, _rowaddr@0 as _rowaddr, value@1 as value, key@2 as key]
+    ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, value@3 as value, key@4 as key, CASE WHEN __common_expr_1@0 AND _rowaddr@2 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@2 IS NOT NULL THEN 1 ELSE 0 END as __action]
+      ProjectionExec: expr=[key@3 IS NOT NULL as __common_expr_1, _rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key]
         CoalesceBatchesExec...
-          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
             LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-            row_id=false, row_addr=true, full_filter=--, refine_filter=--
+            row_id=true, row_addr=true, full_filter=--, refine_filter=--
             RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
               StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
@@ -3525,10 +3858,10 @@ mod tests {
             plan,
             "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as __action]
+    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
-        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
@@ -3571,10 +3904,10 @@ mod tests {
             plan,
             "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
   CoalescePartitionsExec
-    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL AND value@1 > 20 THEN 1 ELSE 0 END as __action]
+    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
-        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
+          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
