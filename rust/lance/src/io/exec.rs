@@ -27,7 +27,7 @@ pub use lance_index::scalar::expression::FilterPlan;
 pub use optimizer::get_physical_optimizer;
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
-pub use rowids::AddRowAddrExec;
+pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;

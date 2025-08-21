@@ -11,9 +11,9 @@ use lance_core::{Error, Result};
 /// Fragments may contain deletion files, which record the tombstones of
 /// soft-deleted rows.
 pub const FLAG_DELETION_FILES: u64 = 1;
-/// Row ids are stable after moves, but not updates. Fragments contain an index
+/// Row ids are stable for both moves and updates. Fragments contain an index
 /// mapping row ids to row addresses.
-pub const FLAG_MOVE_STABLE_ROW_IDS: u64 = 2;
+pub const FLAG_STABLE_ROW_IDS: u64 = 2;
 /// Files are written with the new v2 format (this flag is no longer used)
 pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 4;
 /// Table config is present
@@ -53,8 +53,8 @@ pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) 
                 location!(),
             ));
         }
-        manifest.reader_feature_flags |= FLAG_MOVE_STABLE_ROW_IDS;
-        manifest.writer_feature_flags |= FLAG_MOVE_STABLE_ROW_IDS;
+        manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+        manifest.writer_feature_flags |= FLAG_STABLE_ROW_IDS;
     }
 
     // Test whether any table metadata has been set
@@ -85,11 +85,11 @@ mod tests {
     fn test_read_check() {
         assert!(can_read_dataset(0));
         assert!(can_read_dataset(super::FLAG_DELETION_FILES));
-        assert!(can_read_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
+        assert!(can_read_dataset(super::FLAG_STABLE_ROW_IDS));
         assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
-                | super::FLAG_MOVE_STABLE_ROW_IDS
+                | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
         ));
         assert!(!can_read_dataset(super::FLAG_UNKNOWN));
@@ -99,12 +99,12 @@ mod tests {
     fn test_write_check() {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));
-        assert!(can_write_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
+        assert!(can_write_dataset(super::FLAG_STABLE_ROW_IDS));
         assert!(can_write_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
-                | super::FLAG_MOVE_STABLE_ROW_IDS
+                | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
         ));

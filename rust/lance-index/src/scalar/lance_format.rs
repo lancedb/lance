@@ -10,6 +10,7 @@ use std::{any::Any, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
@@ -331,19 +332,9 @@ pub mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::ROW_ADDR;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
-
-    fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path: &Path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
-                .now_or_never()
-                .unwrap()
-                .unwrap();
-        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
-        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
-    }
 
     pub struct MockTrainingSource {
         data: SendableRecordBatchStream,
@@ -378,6 +369,62 @@ pub mod tests {
         ) -> Result<SendableRecordBatchStream> {
             Ok(self.data)
         }
+
+        async fn scan_aligned_chunks(
+            self: Box<Self>,
+            _chunk_size: u32,
+        ) -> Result<SendableRecordBatchStream> {
+            // Implement similar functionality to TrainingRequest's scan_aligned_chunks
+            // Add _rowaddr column to the data with proper fragment_id and local_offset
+
+            let schema = self.data.schema();
+            let mut new_fields = schema.fields().to_vec();
+            new_fields.push(Arc::new(Field::new(ROW_ADDR, DataType::UInt64, false)));
+
+            let new_schema = Arc::new(Schema::new(new_fields));
+            let schema_for_stream = new_schema.clone();
+
+            // Create a stream that adds proper _rowaddr values
+            // For MockTrainingSource, we'll treat each batch as a separate fragment
+            let mut fragment_id = 0;
+            let data_with_rowaddr = self.data.map_ok(move |batch| {
+                let num_rows = batch.num_rows();
+                let current_fragment_id = fragment_id;
+
+                // Calculate _rowaddr as (fragment_id << 32) | local_offset
+                let rowaddrs = UInt64Array::from_iter_values((0..num_rows).map(|local_offset| {
+                    let fragment_id_u64 = current_fragment_id as u64;
+                    let local_offset_u64 = local_offset as u64;
+                    (fragment_id_u64 << 32) | local_offset_u64
+                }));
+
+                let mut new_columns = batch.columns().to_vec();
+                new_columns.push(Arc::new(rowaddrs));
+
+                // Increment fragment_id for the next batch
+                fragment_id += 1;
+
+                RecordBatch::try_new(schema_for_stream.clone(), new_columns).unwrap()
+            });
+
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    new_schema,
+                    data_with_rowaddr,
+                ),
+            ))
+        }
+    }
+
+    fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
+        let test_path: &Path = tempdir.path();
+        let (object_store, test_path) =
+            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
     async fn train_index(

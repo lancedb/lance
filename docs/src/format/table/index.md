@@ -9,7 +9,7 @@ A `Lance Dataset` is organized in a directory.
     data/*.lance  -- Data directory
     _versions/*.manifest -- Manifest file for each dataset version.
     _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
-    _deletions/*.{arrow,bin} -- Deletion files, which contain ids of rows
+    _deletions/*.{arrow,bin} -- Deletion files, which contain IDs of rows
       that have been deleted.
 ```
 
@@ -35,8 +35,8 @@ stores the rows that have been deleted from the fragment.
 
 ![Fragment Structure](../../images/fragment_structure.png)
 
-Every row has a unique id, which is an u64 that is composed of two u32s: the fragment id and the local row id.
-The local row id is just the index of the row in the data files.
+Every row has a unique ID, which is an u64 that is composed of two u32s: the fragment ID and the local row ID.
+The local row ID is just the index of the row in the data files.
 
 ## Dataset Update and Data Evolution
 
@@ -114,7 +114,7 @@ These files contain the indices of rows that have between deleted for some fragm
 For a given version of the dataset, each fragment can have up to one deletion file.
 Fragments that have no deleted rows have no deletion file.
 
-Readers should filter out row ids contained in these deletion files during a scan or ANN search.
+Readers should filter out row IDs contained in these deletion files during a scan or ANN search.
 
 Deletion files come in two flavors:
 
@@ -226,35 +226,33 @@ The reader load process is as follows:
 4. `RETURN mydataset.lance/_versions/{version}.manifest` always return the finalized path, return error if synchronization fails
 
 
-## Feature: Move-Stable Row IDs
+## Feature: Stable Row IDs
 
-The row ids features assigns a unique u64 id to each row in the table. 
-This id is stable after being moved (such as during compaction), 
-but is not necessarily stable after a row is updated. (A future feature may make them stable after updates.) 
-To make access fast, a secondary index is created that maps row ids to their locations in the table. 
+The row IDs features assigns a unique u64 ID to each row in the table.
+This ID is stable throughout the lifetime of the row. To make access fast, a secondary index is created that maps row IDs to their locations in the table.
 The respective parts of these indices are stored in the respective fragment's metadata.
 
-**row id**
-: A unique auto-incrementing u64 id assigned to each row in the table.
+**row ID**
+: A unique auto-incrementing u64 ID assigned to each row in the table.
 
 **row address**
-: The current location of a row in the table. This is a u64 that can be thought of as a pair of two u32 values: the fragment id and the local row offset. For example, if the row address is (42, 9), then the row is in the 42rd fragment and is the 10th row in that fragment.
+: The current location of a row in the table. This is a u64 that can be thought of as a pair of two u32 values: the fragment ID and the local row offset. For example, if the row address is (42, 9), then the row is in the 42rd fragment and is the 10th row in that fragment.
 
-**row id sequence**
-: The sequence of row ids in a fragment.
+**row ID sequence**
+: The sequence of row IDs in a fragment.
 
-**row id index**
-: A secondary index that maps row ids to row addresses. This index is constructed by reading all the row id sequences.
+**row ID index**
+: A secondary index that maps row IDs to row addresses. This index is constructed by reading all the row ID sequences.
 
 ### Assigning Row IDs
 
-Row ids are assigned in a monotonically increasing sequence. The next row id is stored in the manifest as the field `next_row_id`. This starts at zero. When making a commit, the writer uses that field to assign row ids to new fragments. If the commit fails, the writer will re-read the new `next_row_id`, update the new row ids, and then try again. This is similar to how the `max_fragment_id` is used to assign new fragment ids.
+Row IDs are assigned in a monotonically increasing sequence. The next row ID is stored in the manifest as the field `next_row_id`. This starts at zero. When making a commit, the writer uses that field to assign row IDs to new fragments. If the commit fails, the writer will re-read the new `next_row_id`, update the new row IDs, and then try again. This is similar to how the `max_fragment_id` is used to assign new fragment IDs.
 
-When a row id updated, it is typically assigned a new row id rather than reusing the old one. This is because this feature doesn't have a mechanism to update secondary indices that may reference the old values for the row id. By deleting the old row id and creating a new one, the secondary indices will avoid referencing stale data.
+When a row ID updated, it is typically assigned a new row ID rather than reusing the old one. This is because this feature doesn't have a mechanism to update secondary indices that may reference the old values for the row ID. By deleting the old row ID and creating a new one, the secondary indices will avoid referencing stale data.
 
 ### Row ID Sequences
 
-The row id values for a fragment are stored in a `RowIdSequence` protobuf message. This is described in the [protos/rowids.proto](https://github.com/lancedb/lance/blob/main/protos/rowids.proto) file. Row id sequences are just arrays of u64 values, which have representations optimized for the common case where they are sorted and possibly contiguous. For example, a new fragment will have a row id sequence that is just a simple range, so it is stored as a `start` and `end` value.
+The row ID values for a fragment are stored in a `RowIdSequence` protobuf message. This is described in the [protos/rowids.proto](https://github.com/lancedb/lance/blob/main/protos/rowids.proto) file. Row ID sequences are just arrays of u64 values, which have representations optimized for the common case where they are sorted and possibly contiguous. For example, a new fragment will have a row ID sequence that is just a simple range, so it is stored as a `start` and `end` value.
 
 These sequence messages are either stored inline in the fragment metadata, or are written to a separate file and referenced from the fragment metadata. This choice is typically made based on the size of the sequence. If the sequence is small, it is stored inline. If it is large, it is written to a separate file. By keeping the small sequences inline, we can avoid the overhead of additional IO operations.
 
@@ -269,4 +267,23 @@ oneof row_id_sequence {
 
 ### Row ID Index
 
-To ensure fast access to rows by their row id, a secondary index is created that maps row ids to their locations in the table. This index is built when a table is loaded, based on the row id sequences in the fragments. For example, if fragment 42 has a row id sequence of `[0, 63, 10]`, then the index will have entries for `0 -> (42, 0)`, `63 -> (42, 1)`, `10 -> (42, 2)`. The exact form of this index is left up to the implementation, but it should be optimized for fast lookups. 
+To ensure fast access to rows by their row ID, a secondary index is created that maps row IDs to their locations in the table. This index is built when a table is loaded, based on the row ID sequences in the fragments. For example, if fragment 42 has a row ID sequence of `[0, 63, 10]`, then the index will have entries for `0 -> (42, 0)`, `63 -> (42, 1)`, `10 -> (42, 2)`. The exact form of this index is left up to the implementation, but it should be optimized for fast lookups.
+
+### Row ID masks
+
+Because index files are immutable, they main contain references to row IDs that have been deleted or that have new values.
+To handle this, a mask is created for the index.
+
+![Index and Row ID marks](../../images/stable_row_id_indices.png)
+
+For example, consider the sequence shown in the above image.
+It has a dataset with two columns, `str` and `vec`.
+A string column and a vector column.
+Each of them have indices, a scalar index for the string column and a vector index for the vector column.
+There is just one fragment in the dataset, with contiguous row IDs 1 through 3.
+
+When an update operation is made that modifies the `vec` column in row 2, a new fragment is created with the updated value.
+A deletion file is added to the original fragment marking that row 2 as deleted in the first file.
+In the `str` index, the fragment bitmap is updated to reflect the new location of the row IDs:`{1, 2}`.
+Meanwhile, the `vec` index's fragment bitmap does not update, staying at `{1}`.
+This is because the value in `vec` was updated, so the data in the index no longer reflects the data in the table.
