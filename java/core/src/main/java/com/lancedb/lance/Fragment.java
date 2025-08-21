@@ -101,6 +101,20 @@ public class Fragment {
         dataset.allocator());
   }
 
+  /**
+   * Delete rows by row indexes.
+   *
+   * @param rowIndexes The row indexes to delete.
+   * @return The fragment metadata after deletion. If all rows are deleted, return Null. Otherwise,
+   *     returns a new fragment with the updated deletion vector.
+   */
+  public FragmentMetadata deleteRows(List<Integer> rowIndexes) {
+    return nativeDeleteRows(dataset, fragmentMetadata.getId(), rowIndexes);
+  }
+
+  private static native FragmentMetadata nativeDeleteRows(
+      Dataset dataset, int fragmentId, List<Integer> rowIndexes);
+
   private native int countRowsNative(Dataset dataset, long fragmentId);
 
   public int getId() {
