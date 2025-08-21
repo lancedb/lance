@@ -853,6 +853,7 @@ async fn rechunk_stable_row_ids(
         new_fragments
             .iter()
             .map(|frag| frag.physical_rows.unwrap() as u64),
+        false,
     )?;
 
     for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {

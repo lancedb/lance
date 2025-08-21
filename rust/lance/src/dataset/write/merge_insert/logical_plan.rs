@@ -10,7 +10,7 @@ use datafusion::{
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
-use lance_core::ROW_ADDR;
+use lance_core::{ROW_ADDR, ROW_ID};
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::{dataset::write::merge_insert::exec::FullSchemaMergeInsertExec, Dataset};
@@ -160,6 +160,9 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
                 Some(qualifier) if qualifier.table() == "target" && field.name() == ROW_ADDR => {
                     true
                 }
+
+                // Include target._rowid specifically - needed to locate existing rows for updates
+                Some(qualifier) if qualifier.table() == "target" && field.name() == ROW_ID => true,
 
                 // Include unqualified columns like "__action" - tells us what operation to perform
                 None if field.name() == MERGE_ACTION_COLUMN => true,
