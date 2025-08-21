@@ -71,9 +71,7 @@ use super::{
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
-use crate::scalar::{
-    AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TextQuery,
-};
+use crate::scalar::{AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TextQuery, TokenQuery};
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 
@@ -326,6 +324,17 @@ impl Index for InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Whether the query can use the current index.
+    fn is_query_allowed(&self, query: &TokenQuery) -> bool {
+        match query {
+            TokenQuery::TokensContains(_) => {
+                self.params.base_tokenizer == "simple" &&
+                    self.params.max_token_length.is_none()
+            }
+        }
+    }
+
+
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
@@ -359,9 +368,13 @@ impl ScalarIndex for InvertedIndex {
         query: &dyn AnyQuery,
         _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<TextQuery>().unwrap();
+        let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
+        if !self.is_query_allowed(query) {
+            return Ok(SearchResult::AtLeast(RowIdTreeMap::from_iter::<Vec<u64>>(vec![])))
+        }
+
         match query {
-            TextQuery::StringContains(text) => {
+            TokenQuery::TokensContains(text) => {
                 let records = self.do_search(text).await?;
                 let row_ids = records
                     .column(0)

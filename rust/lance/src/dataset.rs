@@ -7276,11 +7276,11 @@ mod tests {
     #[tokio::test]
     async fn test_sql_contains_tokens() {
         let text_col = Arc::new(StringArray::from(vec![
-            "a cat",
-            "lovely cat",
-            "white cat",
-            "catch up",
-            "fish",
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat catchup fish",
+            "cat fish catch",
         ]));
 
         // Prepare dataset
@@ -7297,7 +7297,7 @@ mod tests {
 
         // Test without fts index
         let results = execute_sql(
-            "select * from foo where contains_tokens(text, 'cat')",
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
             "foo".to_string(),
             Arc::new(dataset.clone()),
         )
@@ -7306,7 +7306,8 @@ mod tests {
 
         assert_results(
             results,
-            &StringArray::from(vec!["a cat", "lovely cat", "white cat", "catch up"]),
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat",
+                                    "a white cat catch a big fish", "cat fish catch"]),
         );
 
         // Test with fts index
@@ -7315,36 +7316,25 @@ mod tests {
                 &["text"],
                 IndexType::Inverted,
                 None,
-                &ScalarIndexParams::default(),
+                &InvertedIndexParams::default().max_token_length(None),
                 false,
             )
             .await
             .unwrap();
 
         let results = execute_sql(
-            "select * from foo where contains_tokens(text, 'cat')",
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
             "foo".to_string(),
             Arc::new(dataset.clone()),
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
-        // FTS index introduces false negatives, so "catch up" will miss.
         assert_results(
             results,
-            &StringArray::from(vec!["a cat", "lovely cat", "white cat"]),
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat",
+                                    "a white cat catch a big fish", "cat fish catch"]),
         );
-
-        // Test multiple tokens
-        let results = execute_sql(
-            "select * from foo where contains_tokens(text, 'lovely cat')",
-            "foo".to_string(),
-            Arc::new(dataset.clone()),
-        )
-        .await
-        .unwrap();
-
-        assert_results(results, &StringArray::from(vec!["lovely cat"]));
     }
 
     async fn execute_sql(

@@ -24,9 +24,7 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
-use super::{
-    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery,
-};
+use super::{AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery, TokenQuery};
 
 const MAX_DEPTH: usize = 500;
 
@@ -479,7 +477,7 @@ impl ScalarQueryParser for FtsQueryParser {
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
             if func.name() == "contains_tokens" {
-                let query = TextQuery::StringContains(scalar_str);
+                let query = TokenQuery::TokensContains(scalar_str);
                 Some(IndexedExpression::index_query(
                     column.to_string(),
                     self.index_name.clone(),

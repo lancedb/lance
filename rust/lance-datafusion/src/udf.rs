@@ -87,7 +87,7 @@ fn collect_tokens(text: &str) -> Vec<&str> {
         .collect()
 }
 
-static CONTAINS_TOKENS_UDF: LazyLock<ScalarUDF> = LazyLock::new(contains_tokens);
+pub static CONTAINS_TOKENS_UDF: LazyLock<ScalarUDF> = LazyLock::new(contains_tokens);
 
 #[cfg(test)]
 mod tests {
