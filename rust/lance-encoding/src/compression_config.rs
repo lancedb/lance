@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
 
 /// Byte stream split encoding mode
 #[derive(Debug, Clone, Copy, PartialEq)]

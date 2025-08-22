@@ -259,10 +259,10 @@ impl ArrayEncoder for PackedStructEncoder {
 #[cfg(test)]
 pub mod tests {
 
-    use arrow::array::ArrayData;
     use arrow_array::{
         Array, ArrayRef, FixedSizeListArray, Int32Array, StructArray, UInt64Array, UInt8Array,
     };
+    use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 

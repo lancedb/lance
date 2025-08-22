@@ -3718,6 +3718,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-bitpacking"
+version = "0.33.0"
+dependencies = [
+ "arrayref",
+ "paste",
+ "seq-macro",
+]
+
+[[package]]
 name = "lance-core"
 version = "0.33.0"
 dependencies = [
@@ -3802,8 +3811,6 @@ dependencies = [
 name = "lance-encoding"
 version = "0.33.0"
 dependencies = [
- "arrayref",
- "arrow",
  "arrow-arith",
  "arrow-array",
  "arrow-buffer",
@@ -3820,16 +3827,15 @@ dependencies = [
  "hyperloglogplus",
  "itertools 0.13.0",
  "lance-arrow",
+ "lance-bitpacking",
  "lance-core",
  "log",
  "lz4",
  "num-traits",
- "paste",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",
  "rand 0.9.1",
- "seq-macro",
  "snafu",
  "tokio",
  "tracing",

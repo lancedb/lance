@@ -13,7 +13,8 @@ members = [
     "rust/lance-table",
     "rust/lance-test-macros",
     "rust/lance-testing",
-    "rust/lance-encoding/src/compression_algo/fsst",
+    "rust/compression/fsst",
+    "rust/compression/bitpacking",
 ]
 exclude = ["python", "java/core/lance-jni"]
 # Python package needs to be built by maturin.
@@ -79,6 +80,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
+lance-bitpacking = { version = "=0.33.0", path = "./rust/compression/bitpacking" }
 bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
@@ -116,7 +118,7 @@ deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=0.33.0", path = "./rust/lance-encoding/src/compression_algo/fsst" }
+fsst = { version = "=0.33.0", path = "./rust/compression/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
@@ -167,7 +169,6 @@ tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 pretty_assertions = "1.4.0"
-zstd = "0.13.1"
 
 [profile.bench]
 opt-level = 3
