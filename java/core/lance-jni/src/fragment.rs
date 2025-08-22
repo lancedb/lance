@@ -20,7 +20,12 @@ use lance_datafusion::utils::StreamingWriteSource;
 
 use crate::error::{Error, Result};
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava, JLance};
-use crate::{blocking_dataset::{BlockingDataset, NATIVE_DATASET}, traits::FromJString, utils::extract_write_params, JNIEnvExt, RT};
+use crate::{
+    blocking_dataset::{BlockingDataset, NATIVE_DATASET},
+    traits::FromJString,
+    utils::extract_write_params,
+    JNIEnvExt, RT,
+};
 
 //////////////////
 // Read Methods //
