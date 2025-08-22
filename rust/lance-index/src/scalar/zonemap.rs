@@ -1791,7 +1791,7 @@ mod tests {
             assert_eq!(fragment1_rowaddrs.values()[0], 1u64 << 32); // fragment_id=1, local_offset=0
             assert_eq!(
                 fragment1_rowaddrs.values()[fragment1_rowaddrs.values().len() - 1],
-                8191 | 1u64 << 32
+                8191 | (1u64 << 32)
             );
 
             // Check fragment 2 _rowaddr values (should start from fragment_id=2)
