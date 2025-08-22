@@ -2568,24 +2568,26 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
 /// Check that each fragment contains all fields in the schema.
 /// It is not required that the schema contains all fields in the fragment.
 /// There may be masked fields.
-fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+fn schema_fragments_valid(manifest: &Manifest, schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // TODO: add additional validation. Consider consolidating with various
     // validate() methods in the codebase.
-    for fragment in fragments {
-        for field in schema.fields_pre_order() {
-            if !fragment
-                .files
-                .iter()
-                .flat_map(|f| f.fields.iter())
-                .any(|f_id| f_id == &field.id)
-            {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Fragment {} does not contain field {:?}",
-                        fragment.id, field
-                    ),
-                    location!(),
-                ));
+    if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
+        for fragment in fragments {
+            for field in schema.fields_pre_order() {
+                if !fragment
+                    .files
+                    .iter()
+                    .flat_map(|f| f.fields.iter())
+                    .any(|f_id| f_id == &field.id)
+                {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Fragment {} does not contain field {:?}",
+                            fragment.id, field
+                        ),
+                        location!(),
+                    ));
+                }
             }
         }
     }
