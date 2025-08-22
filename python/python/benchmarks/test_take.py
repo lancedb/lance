@@ -7,7 +7,7 @@ import pytest
 from lance import LanceDataset
 
 BATCH_SIZE = 1024
-
+TEST_LANCE_DATASET_NAME = "test.lance"
 
 def create_dataset(
     path: str,
@@ -67,7 +67,7 @@ def gen_ranges(total_rows, num_rows):
 @pytest.mark.parametrize("lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")])
 @pytest.mark.parametrize("num_rows", [1, 10, 100, 1000])
 @pytest.mark.parametrize("batch_size", [512, 1024, 2048])
-@pytest.mark.parametrize("scheme", ["memory", "file"])
+@pytest.mark.parametrize("path_prefix", ["memory://", "file", ])
 def test_dataset_take(
     benchmark, tmp_path, file_size, lance_format_version, num_rows, batch_size, scheme
 ):
