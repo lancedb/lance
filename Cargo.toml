@@ -122,6 +122,12 @@ either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
 fsst = { version = "=0.38.2", path = "./rust/compression/fsst" }
 futures = "0.3"
+#geoarrow-array = "0.5.0"
+#geoarrow-schema = "0.5.0"
+geoarrow-array = { git = "https://github.com/geoarrow/geoarrow-rs", rev = "61a535b072766003ad06a4d7a25dcc15f010e68f", version = "0.5" }
+geoarrow-schema = { git = "https://github.com/geoarrow/geoarrow-rs", rev = "61a535b072766003ad06a4d7a25dcc15f010e68f", version = "0.5" }
+geodatafusion = { git = "https://github.com/datafusion-contrib/datafusion-geo", rev = "dfe97cd5b9903a1e8bf03d20c8977bc6cb8e8238" }
+geo-types = "0.7.16"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
@@ -170,7 +176,7 @@ tokio = { version = "1.23", features = [
     "sync",
 ] }
 tokio-stream = "0.1.14"
-tokio-util = { version = "0.7.10" }
+tokio-util = { version = "0.7.16" }
 tracing = "0.1"
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
@@ -204,3 +210,7 @@ multiple-crate-versions = "allow"
 # We use Vec<Range<u64>> in a lot of places and it is very common to use a single range in the vec.
 single_range_in_vec_init = "allow"
 large_futures = "deny"
+
+[patch.crates-io]
+geoarrow-array = { git = "https://github.com/geoarrow/geoarrow-rs", rev = "61a535b072766003ad06a4d7a25dcc15f010e68f" }
+geoarrow-schema = { git = "https://github.com/geoarrow/geoarrow-rs", rev = "61a535b072766003ad06a4d7a25dcc15f010e68f" }

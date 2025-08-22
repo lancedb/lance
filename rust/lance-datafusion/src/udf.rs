@@ -26,6 +26,19 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_get_bool_udf());
     ctx.register_udf(json::json_array_contains_udf());
     ctx.register_udf(json::json_array_length_udf());
+    // GEO functions
+    ctx.register_udf(geodatafusion::udf::geo::measurement::Area::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::measurement::Distance::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::measurement::Length::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::Contains::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::CoveredBy::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::Covers::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::Disjoint::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::Intersects::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::Overlaps::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::Touches::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::relationships::Within::new().into());
+    ctx.register_udf(geodatafusion::udf::geo::validation::IsValid::new().into());
 }
 
 /// This method checks whether a string contains all specified tokens. The tokens are separated by
