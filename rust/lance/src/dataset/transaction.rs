@@ -2518,7 +2518,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             Operation::Overwrite {
                 fragments,
                 schema,
-                config_upsert_values: None,
+                ..
             },
         ) => {
             // Validate here because we are going to return early.
