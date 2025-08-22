@@ -14,12 +14,18 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.ipc.ScanOptions;
+import com.lancedb.lance.operation.Update;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -28,6 +34,8 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class FragmentTest {
@@ -168,5 +176,73 @@ public class FragmentTest {
       List<FragmentMetadata> fragments = testDataset.createNewFragment(20, 10);
       assertEquals(2, fragments.size());
     }
+  }
+
+  @Test
+  void testDeleteByAddrs(@TempDir Path tempDir) throws IOException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset();
+
+      int totalRows = 100;
+      try (Dataset dataset2 = testDataset.write(1, totalRows)) {
+        assertEquals(totalRows, dataset2.countRows());
+
+        Fragment fragment = dataset2.getFragments().get(0);
+        List<Long> rowAddrs = readAllAddrs(fragment);
+
+        // Case 1. Test delete some rows
+
+        Collections.shuffle(rowAddrs);
+        int deleteCount = rowAddrs.size() / 2;
+        FragmentMetadata updateFragment = fragment.deleteByAddrs(rowAddrs.subList(0, deleteCount));
+
+        assertNotNull(updateFragment);
+        assertNotNull(updateFragment.getDeletionFile());
+
+        Update update =
+            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+        Dataset dataset3 = dataset2.newTransactionBuilder().operation(update).build().commit();
+
+        assertEquals(totalRows - deleteCount, dataset3.countRows());
+
+        // Case 2. Test delete all rows
+
+        fragment = dataset3.getFragments().get(0);
+        rowAddrs = readAllAddrs(fragment);
+
+        updateFragment = fragment.deleteByAddrs(rowAddrs);
+
+        assertNull(updateFragment);
+
+        update =
+            Update.builder()
+                .removedFragmentIds(Collections.singletonList(Long.valueOf(fragment.getId())))
+                .build();
+        Dataset dataset4 = dataset3.newTransactionBuilder().operation(update).build().commit();
+
+        assertEquals(0, dataset4.countRows());
+      }
+    }
+  }
+
+  private List<Long> readAllAddrs(Fragment fragment) throws IOException {
+    List<Long> rowAddrs = new ArrayList<>();
+
+    LanceScanner scanner = fragment.newScan(new ScanOptions.Builder().withRowAddress(true).build());
+    try (ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+        UInt8Vector rowAddressVector = (UInt8Vector) root.getVector("_rowaddr");
+        for (int i = 0; i < rowAddressVector.getValueCount(); i++) {
+          rowAddrs.add(rowAddressVector.get(i));
+        }
+      }
+    }
+
+    return rowAddrs;
   }
 }

@@ -957,20 +957,6 @@ public class Dataset implements Closeable {
     return new SqlQuery(this, sql);
   }
 
-  /**
-   * Delete rows by row addresses. All the rows belong to the Fragment with the given fragmentId.
-   *
-   * @param fragmentId The fragment id.
-   * @param rowAddrs The row addresses to delete.
-   * @return The fragment metadata after deletion. If all rows are deleted, return Null. Otherwise,
-   *     returns a new fragment with the updated deletion vector.
-   */
-  public FragmentMetadata deleteByAddrs(int fragmentId, List<Long> rowAddrs) {
-    return nativeDeleteByAddrs(fragmentId, rowAddrs);
-  }
-
-  private native FragmentMetadata nativeDeleteByAddrs(int fragmentId, List<Long> rowAddrs);
-
   private native void nativeCreateTag(String tag, long version);
 
   private native void nativeDeleteTag(String tag);

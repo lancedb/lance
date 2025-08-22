@@ -20,12 +20,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 
 use crate::error::{Error, Result};
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava, JLance};
-use crate::{
-    blocking_dataset::{BlockingDataset, NATIVE_DATASET},
-    traits::FromJString,
-    utils::extract_write_params,
-    RT,
-};
+use crate::{blocking_dataset::{BlockingDataset, NATIVE_DATASET}, traits::FromJString, utils::extract_write_params, JNIEnvExt, RT};
 
 //////////////////
 // Read Methods //
@@ -210,6 +205,73 @@ fn create_fragment<'a>(
         Some(write_params),
     ))?;
     export_vec(env, &fragments)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_nativeDeleteByAddrs<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,
+    fragment_id: jint,
+    jaddrs: JObject, // List<Long>
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        inner_delete_by_addrs(&mut env, jdataset, fragment_id, jaddrs)
+    )
+}
+
+fn inner_delete_by_addrs<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jint,
+    jaddrs: JObject, // List<Long>
+) -> Result<JObject<'local>> {
+    let fragment_id = fragment_id as usize;
+    let fragment = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let Some(fragment) = dataset.inner.get_fragment(fragment_id) else {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )));
+        };
+        fragment
+    };
+
+    let mut indexes: Vec<u32> = Vec::new();
+
+    for (frag_id, index) in env
+        .get_longs(&jaddrs)?
+        .into_iter()
+        .map(|v| {
+            let u = v as u64;
+            ((u >> 32) as usize, u as u32)
+        })
+        .collect::<Vec<(usize, u32)>>()
+    {
+        if frag_id != fragment_id {
+            return Err(Error::input_error(format!(
+                "{frag_id} is not belonged to fragment: {fragment_id}"
+            )));
+        }
+        indexes.push(index);
+    }
+
+    let res = RT.block_on(async move { fragment.extend_deletions(indexes).await });
+
+    let obj = match res {
+        Ok(Some(f)) => f.metadata().into_java(env)?,
+        Ok(None) => JObject::default(),
+        Err(e) => {
+            return Err(Error::runtime_error(format!(
+                "Error to delete fragment:{} with error message:{}",
+                fragment_id, e
+            )))
+        }
+    };
+
+    Ok(obj)
 }
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
