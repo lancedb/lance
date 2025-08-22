@@ -4145,6 +4145,7 @@ dependencies = [
  "test-log",
  "tfrecord",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",

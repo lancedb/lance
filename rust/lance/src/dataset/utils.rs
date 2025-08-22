@@ -75,6 +75,7 @@ pub fn make_rowid_capture_stream(
     Ok((Box::pin(stream), rx))
 }
 
+#[derive(Debug)]
 pub enum CapturedRowIds {
     AddressStyle(RoaringTreemap),
     SequenceStyle(RowIdSequence),
