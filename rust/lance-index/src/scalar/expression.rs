@@ -729,6 +729,7 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+#[derive(Debug)]
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
     Exact(RowIdMask),
