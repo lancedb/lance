@@ -286,7 +286,7 @@ impl DefaultCompressionStrategy {
 
         let base = try_bss_for_mini_block(data, params)
             .or_else(|| try_rle_for_mini_block(data, params))
-            .or_else(|| try_bitpack_for_mini_block(data).map(|v| v as Box<_>))
+            .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
 
         maybe_wrap_general_for_mini_block(base, params)
