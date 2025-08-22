@@ -4,6 +4,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{io::exec::Planner, Error, Result};
+use arrow::compute::can_cast_types;
 use arrow::compute::CastOptions;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -511,7 +512,7 @@ pub(super) async fn alter_columns(
         }
 
         if let Some(data_type) = &alteration.data_type {
-            if !(lance_arrow::cast::can_cast_types(&field_src.data_type(), data_type)
+            if !(can_cast_types(&field_src.data_type(), data_type)
                 && is_upcast_downcast(&field_src.data_type(), data_type))
             {
                 return Err(Error::invalid_input(
