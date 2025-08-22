@@ -418,7 +418,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
 impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFileType> {
         let s = env
-            .call_method(self, "toString", "()Ljava.lang.String;", &[])?
+            .call_method(self, "toString", "()Ljava/lang/String;", &[])?
             .l()?;
         let s: String = env.get_string(&JString::from(s))?.into();
         let t = if s == "ARRAY" {

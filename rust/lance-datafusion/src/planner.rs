@@ -721,11 +721,23 @@ impl Planner {
                 false,
             ))),
             SQLExpr::Cast {
-                expr, data_type, ..
-            } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                expr: Box::new(self.parse_sql_expr(expr)?),
-                data_type: self.parse_type(data_type)?,
-            })),
+                expr,
+                data_type,
+                kind,
+                ..
+            } => match kind {
+                datafusion::sql::sqlparser::ast::CastKind::TryCast
+                | datafusion::sql::sqlparser::ast::CastKind::SafeCast => {
+                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast {
+                        expr: Box::new(self.parse_sql_expr(expr)?),
+                        data_type: self.parse_type(data_type)?,
+                    }))
+                }
+                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast {
+                    expr: Box::new(self.parse_sql_expr(expr)?),
+                    data_type: self.parse_type(data_type)?,
+                })),
+            },
             SQLExpr::JsonAccess { .. } => Err(Error::invalid_input(
                 "JSON access is not supported",
                 location!(),

@@ -45,11 +45,6 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
 use super::ManifestWriteConfig;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
@@ -60,6 +55,7 @@ use lance_index::mem_wal::MemWal;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
+use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -74,6 +70,11 @@ use lance_table::{
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
+use std::cmp::Ordering;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 /// A change to a dataset that can be retried
@@ -1545,15 +1546,16 @@ impl Transaction {
                 Arc::new(final_fragments),
                 new_blob_version,
             );
-            if user_requested_version.is_some()
-                && matches!(self.operation, Operation::Overwrite { .. })
+
+            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
+                (user_requested_version, &self.operation)
             {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format =
-                    DataStorageFormat::new(user_requested_version.unwrap());
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
             }
+
             prev_manifest
         } else {
             let data_storage_format =
@@ -1880,20 +1882,78 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
-            if fragment.row_id_meta.is_some() {
-                // Operation must have already assigned ids.
-                continue;
-            }
             let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
                 message: "Fragment does not have physical rows".into(),
                 location: location!(),
             })? as u64;
-            let row_ids = *next_row_id..(*next_row_id + physical_rows);
-            let sequence = RowIdSequence::from(row_ids);
-            // TODO: write to a separate file if large. Possibly share a file with other fragments.
-            let serialized = write_row_ids(&sequence);
-            fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
-            *next_row_id += physical_rows;
+
+            if fragment.row_id_meta.is_some() {
+                // we may meet merge insert case, it only has partial row ids.
+                // so here, we need to check if the row ids match the physical rows
+                // if yes, continue
+                // if not, fill the remaining row ids to the physical rows, then update row_id_meta
+
+                // Check if existing row IDs match the physical rows count
+                let existing_row_count = match &fragment.row_id_meta {
+                    Some(RowIdMeta::Inline(data)) => {
+                        // Parse the serialized row ID sequence to get the count
+                        let sequence = read_row_ids(data)?;
+                        sequence.len() as u64
+                    }
+                    _ => 0,
+                };
+
+                match existing_row_count.cmp(&physical_rows) {
+                    Ordering::Equal => {
+                        // Row IDs already match physical rows, continue to next fragment
+                        continue;
+                    }
+                    Ordering::Less => {
+                        // Partial row IDs - need to fill the remaining ones
+                        let remaining_rows = physical_rows - existing_row_count;
+                        let new_row_ids = *next_row_id..(*next_row_id + remaining_rows);
+
+                        // Merge existing and new row IDs
+                        let combined_sequence = match &fragment.row_id_meta {
+                            Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
+                            _ => {
+                                return Err(Error::Internal {
+                                    message: "Failed to deserialize existing row ID sequence"
+                                        .into(),
+                                    location: location!(),
+                                })
+                            }
+                        };
+
+                        let mut row_ids: Vec<u64> = combined_sequence.iter().collect();
+                        for row_id in new_row_ids {
+                            row_ids.push(row_id);
+                        }
+                        let combined_sequence = RowIdSequence::from(row_ids.as_slice());
+
+                        let serialized = write_row_ids(&combined_sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        *next_row_id += remaining_rows;
+                    }
+                    Ordering::Greater => {
+                        // More row IDs than physical rows - this shouldn't happen
+                        return Err(Error::Internal {
+                            message: format!(
+                                "Fragment has more row IDs ({}) than physical rows ({})",
+                                existing_row_count, physical_rows
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
+            } else {
+                let row_ids = *next_row_id..(*next_row_id + physical_rows);
+                let sequence = RowIdSequence::from(row_ids);
+                // TODO: write to a separate file if large. Possibly share a file with other fragments.
+                let serialized = write_row_ids(&sequence);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                *next_row_id += physical_rows;
+            }
         }
         Ok(())
     }
@@ -2638,5 +2698,195 @@ mod tests {
         assert_eq!(fragments[0].files.len(), 2);
         assert_eq!(fragments[0].files[0].path, "normal.lance");
         assert_eq!(fragments[0].files[1].path, "mixed.lance");
+    }
+
+    #[test]
+    fn test_assign_row_ids_new_fragment() {
+        // Test assigning row IDs to a fragment without existing row IDs
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(100),
+            row_id_meta: None,
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 0;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        assert_eq!(next_row_id, 100);
+        assert!(fragments[0].row_id_meta.is_some());
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 100);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (0..100).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_existing_complete() {
+        // Test with fragment that already has complete row IDs
+        let existing_sequence = RowIdSequence::from(0..50);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // next_row_id should not change
+        assert_eq!(next_row_id, 100);
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 50);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (0..50).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_partial_existing() {
+        // Test with fragment that has partial row IDs (merge insert case)
+        let existing_sequence = RowIdSequence::from(0..30);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50), // More physical rows than existing row IDs
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // next_row_id should advance by 20 (50 - 30)
+        assert_eq!(next_row_id, 120);
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 50);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            // Should contain original 0-29 plus new 100-119
+            let mut expected = (0..30).collect::<Vec<u64>>();
+            expected.extend(100..120);
+            assert_eq!(row_ids, expected);
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_excess_row_ids() {
+        // Test error case where fragment has more row IDs than physical rows
+        let existing_sequence = RowIdSequence::from(0..60);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50), // Less physical rows than existing row IDs
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+
+        assert!(result.is_err());
+        if let Err(Error::Internal { message, .. }) = result {
+            assert!(message.contains("more row IDs (60) than physical rows (50)"));
+        } else {
+            panic!("Expected Internal error about excess row IDs");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_multiple_fragments() {
+        // Test with multiple fragments, some with existing row IDs, some without
+        let existing_sequence = RowIdSequence::from(500..520);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![
+            Fragment {
+                id: 1,
+                physical_rows: Some(30), // No existing row IDs
+                row_id_meta: None,
+                files: vec![],
+                deletion_file: None,
+            },
+            Fragment {
+                id: 2,
+                physical_rows: Some(25), // Partial existing row IDs
+                row_id_meta: Some(RowIdMeta::Inline(serialized)),
+                files: vec![],
+                deletion_file: None,
+            },
+        ];
+        let mut next_row_id = 1000;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // Should advance by 30 (first fragment) + 5 (second fragment partial)
+        assert_eq!(next_row_id, 1035);
+
+        // Check first fragment
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 30);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (1000..1030).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata for first fragment");
+        }
+
+        // Check second fragment
+        if let Some(RowIdMeta::Inline(data)) = &fragments[1].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 25);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            // Should contain original 500-519 plus new 1030-1034
+            let mut expected = (500..520).collect::<Vec<u64>>();
+            expected.extend(1030..1035);
+            assert_eq!(row_ids, expected);
+        } else {
+            panic!("Expected inline row ID metadata for second fragment");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_missing_physical_rows() {
+        // Test error case where fragment doesn't have physical_rows set
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: None,
+            row_id_meta: None,
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 0;
+
+        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+
+        assert!(result.is_err());
+        if let Err(Error::Internal { message, .. }) = result {
+            assert!(message.contains("Fragment does not have physical rows"));
+        } else {
+            panic!("Expected Internal error about missing physical rows");
+        }
     }
 }

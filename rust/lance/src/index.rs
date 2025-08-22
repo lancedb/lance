@@ -203,7 +203,7 @@ pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &HashMap<u64, Option<u64>>,
-) -> Result<Uuid> {
+) -> Result<Option<Uuid>> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
     let matched = indices
@@ -224,8 +224,8 @@ pub(crate) async fn remap_index(
     if row_id_map.values().all(|v| v.is_none()) {
         let deleted_bitmap = RoaringBitmap::from_iter(
             row_id_map
-                .iter()
-                .map(|(row_id, _)| RowAddress::new_from_u64(*row_id))
+                .keys()
+                .map(|row_id| RowAddress::new_from_u64(*row_id))
                 .map(|addr| addr.fragment_id()),
         );
         if Some(deleted_bitmap) == matched.fragment_bitmap {
@@ -233,7 +233,7 @@ pub(crate) async fn remap_index(
             // This can happen if there is a bug where the index is covering empty
             // fragment that haven't been cleaned up. They should be cleaned up
             // outside of this function.
-            return Ok(*index_id);
+            return Ok(Some(*index_id));
         }
     }
 
@@ -257,6 +257,9 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
+            if !scalar_index.can_remap() {
+                return Ok(None);
+            }
 
             match scalar_index.index_type() {
                 IndexType::Inverted => {
@@ -310,7 +313,7 @@ pub(crate) async fn remap_index(
         }
     }
 
-    Ok(new_id)
+    Ok(Some(new_id))
 }
 
 #[derive(Debug)]
@@ -1353,30 +1356,34 @@ impl DatasetIndexInternalExt for Dataset {
                 ),
                 location: location!(),
             })?;
+            let index_type = detect_scalar_index_type(self, index, &field.name).await?;
 
             let query_parser = match field.data_type() {
                 DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))
                     as Box<dyn ScalarQueryParser>,
-                DataType::Utf8 | DataType::LargeUtf8 => {
-                    let index_type = detect_scalar_index_type(self, index, &field.name).await?;
-                    match index_type {
-                        ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
-                            Box::new(SargableQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        ScalarIndexType::NGram => {
-                            Box::new(TextQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        ScalarIndexType::Inverted => {
-                            Box::new(FtsQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        _ => continue,
+                DataType::Utf8 | DataType::LargeUtf8 => match index_type {
+                    ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
+                        Box::new(SargableQueryParser::new(index.name.clone(), false))
+                            as Box<dyn ScalarQueryParser>
                     }
+                    ScalarIndexType::ZoneMap => {
+                        Box::new(SargableQueryParser::new(index.name.clone(), true))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                    ScalarIndexType::NGram => {
+                        Box::new(TextQueryParser::new(index.name.clone(), true))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                    ScalarIndexType::Inverted => Box::new(FtsQueryParser::new(index.name.clone()))
+                        as Box<dyn ScalarQueryParser>,
+                    _ => continue,
+                },
+                _ => {
+                    // inexact index filter
+                    let needs_recheck = matches!(index_type, ScalarIndexType::ZoneMap);
+                    Box::new(SargableQueryParser::new(index.name.clone(), needs_recheck))
+                        as Box<dyn ScalarQueryParser>
                 }
-                _ => Box::new(SargableQueryParser::new(index.name.clone()))
-                    as Box<dyn ScalarQueryParser>,
             };
 
             indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
@@ -2322,7 +2329,7 @@ mod tests {
         let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
             .await
             .unwrap();
-        assert_eq!(new_uuid, index_uuid);
+        assert_eq!(new_uuid, Some(index_uuid));
     }
 
     #[tokio::test]

@@ -287,13 +287,13 @@ impl SerializedRepDefs {
         }
     }
 
-    pub fn rep_slicer(&self) -> Option<RepDefSlicer> {
+    pub fn rep_slicer(&self) -> Option<RepDefSlicer<'_>> {
         self.repetition_levels
             .as_ref()
             .map(|rep| RepDefSlicer::new(self, rep.clone()))
     }
 
-    pub fn def_slicer(&self) -> Option<RepDefSlicer> {
+    pub fn def_slicer(&self) -> Option<RepDefSlicer<'_>> {
         self.definition_levels
             .as_ref()
             .map(|def| RepDefSlicer::new(self, def.clone()))

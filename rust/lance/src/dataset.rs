@@ -856,7 +856,7 @@ impl Dataset {
         older_than: Duration,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
-    ) -> BoxFuture<Result<RemovalStats>> {
+    ) -> BoxFuture<'_, Result<RemovalStats>> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
         let before = utc_now() - older_than;
         cleanup::cleanup_old_versions(

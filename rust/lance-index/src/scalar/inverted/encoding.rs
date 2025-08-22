@@ -9,7 +9,6 @@ use arrow::array::{ListBuilder, UInt32Builder};
 use arrow_array::{Array, ListArray};
 use bitpacking::{BitPacker, BitPacker4x};
 use lance_core::Result;
-use tracing::instrument;
 
 // we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
@@ -217,7 +216,6 @@ pub fn read_num_positions(compressed: &arrow::array::LargeBinaryArray) -> u32 {
     u32::from_le_bytes(compressed.value(0).try_into().unwrap())
 }
 
-#[instrument(level = "info", name = "decompress_posting_block", skip_all)]
 pub fn decompress_posting_block(
     block: &[u8],
     buffer: &mut [u32; BLOCK_SIZE],
@@ -230,7 +228,6 @@ pub fn decompress_posting_block(
     decompress_block(&block[num_bytes..], buffer, frequencies);
 }
 
-#[instrument(level = "info", name = "decompress_posting_remainder", skip_all)]
 pub fn decompress_posting_remainder(
     block: &[u8],
     n: usize,

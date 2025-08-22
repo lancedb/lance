@@ -1534,7 +1534,7 @@ impl FileFragment {
             self.dataset.as_ref(),
             transforms,
             read_columns,
-            &[self.clone()],
+            std::slice::from_ref(self),
             batch_size,
         )
         .await?;
@@ -3440,7 +3440,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            Fragment::try_infer_version(&[frag.clone()])
+            Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
             LanceFileVersion::Stable.resolve()
