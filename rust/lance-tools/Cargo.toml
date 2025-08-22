@@ -1,0 +1,28 @@
+[package]
+name = "lance-tools"
+description = "Lance tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "lance-tools"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+futures.workspace = true
+lance-core = { path = "../lance-core" }
+lance-encoding = { path = "../lance-encoding" }
+lance-file = { path = "../lance-file" }
+lance-io = { path = "../lance-io" }
+object_store = "0.12.2"
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
