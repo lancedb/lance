@@ -15,9 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::expr::{FieldMetadata, ScalarFunction};
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
+use futures::{future::BoxFuture, FutureExt, Stream};
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
@@ -39,6 +40,7 @@ pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
 pub mod registry;
+pub mod rtree;
 pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -60,6 +62,7 @@ pub enum BuiltinIndexType {
     NGram,
     ZoneMap,
     BloomFilter,
+    RTree,
     Inverted,
 }
 
@@ -73,6 +76,7 @@ impl BuiltinIndexType {
             Self::ZoneMap => "zonemap",
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
+            Self::RTree => "rtree",
         }
     }
 }
@@ -89,6 +93,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
+            IndexType::RTree => Ok(Self::RTree),
             _ => Err(Error::Index {
                 message: "Invalid index type".to_string(),
                 location: location!(),
@@ -196,6 +201,53 @@ pub trait IndexReader: Send + Sync {
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
     fn schema(&self) -> &lance_core::datatypes::Schema;
+}
+
+/// A stream that reads the original training data back out of the index
+///
+/// This is used for updating the index
+pub struct IndexReaderStream {
+    reader: Arc<dyn IndexReader>,
+    batch_size: u64,
+    num_batches: u32,
+    batch_idx: u32,
+}
+
+impl IndexReaderStream {
+    async fn new(reader: Arc<dyn IndexReader>, batch_size: u64) -> Self {
+        let num_batches = reader.num_batches(batch_size).await;
+        Self {
+            reader,
+            batch_size,
+            num_batches,
+            batch_idx: 0,
+        }
+    }
+}
+
+impl Stream for IndexReaderStream {
+    type Item = BoxFuture<'static, Result<RecordBatch>>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.batch_idx >= this.num_batches {
+            return std::task::Poll::Ready(None);
+        }
+        let batch_num = this.batch_idx;
+        this.batch_idx += 1;
+        let reader_copy = this.reader.clone();
+        let batch_size = this.batch_size;
+        let read_task = async move {
+            reader_copy
+                .read_record_batch(batch_num as u64, batch_size)
+                .await
+        }
+        .boxed();
+        std::task::Poll::Ready(Some(read_task))
+    }
 }
 
 /// Trait abstracting I/O away from index logic
@@ -669,6 +721,60 @@ impl AnyQuery for TokenQuery {
                     Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
                 ],
             }),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationQuery {
+    pub func_name: String,
+    pub value: ScalarValue,
+    pub field: Field,
+}
+
+/// A query that a Geo index can satisfy
+#[derive(Debug, Clone, PartialEq)]
+pub enum GeoQuery {
+    RelationQuery(RelationQuery),
+    IsNull,
+}
+
+impl AnyQuery for GeoQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            GeoQuery::RelationQuery(query) => {
+                format!("{} {} {}", col, query.func_name, query.value)
+            }
+            GeoQuery::IsNull => {
+                format!("{} IS NULL", col)
+            }
+        }
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        match self {
+            GeoQuery::RelationQuery(query) => {
+                // TODO recheck here
+                Expr::Literal(
+                    query.value.clone(),
+                    Some(FieldMetadata::from(query.field.metadata())),
+                )
+            }
+            GeoQuery::IsNull => {
+                let col_expr = Expr::Column(Column::new_unqualified(col));
+                col_expr.is_null()
+            }
         }
     }
 

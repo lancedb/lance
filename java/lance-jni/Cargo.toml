@@ -22,7 +22,7 @@ lance-io = { path = "../../rust/lance-io" }
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
 arrow = { version = "56.1", features = ["ffi"] }
-arrow-schema = "56.1"
+arrow-schema = "56.2"
 object_store = { version = "0.12.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",

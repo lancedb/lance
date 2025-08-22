@@ -151,7 +151,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::NGram
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
-                | IndexType::LabelList,
+                | IndexType::LabelList
+                | IndexType::RTree,
                 LANCE_SCALAR_INDEX,
             ) => {
                 let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
