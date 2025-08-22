@@ -2100,6 +2100,7 @@ mod tests {
 
     use crate::datafusion::LanceTableProvider;
     use all_asserts::assert_true;
+    use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::udf::register_functions;
@@ -7314,14 +7315,25 @@ mod tests {
             ]),
         );
 
-        // Test with fts index
+        // Verify plan, should not contain ScalarIndexQuery.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+
+        // Test with unsuitable fts index
         dataset
             .create_index(
                 &["text"],
                 IndexType::Inverted,
                 None,
-                &InvertedIndexParams::default().max_token_length(None),
-                false,
+                &InvertedIndexParams::default().base_tokenizer("raw".to_string()),
+                true,
             )
             .await
             .unwrap();
@@ -7343,6 +7355,60 @@ mod tests {
                 "cat fish catch",
             ]),
         );
+
+        // Verify plan, should not contain ScalarIndexQuery because fts index is not unsuitable.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+
+        // Test with suitable fts index
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .max_token_length(None)
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
+        );
+
+        // Verify plan, should contain ScalarIndexQuery.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_contains!(&plan, "ScalarIndexQuery");
     }
 
     async fn execute_sql(

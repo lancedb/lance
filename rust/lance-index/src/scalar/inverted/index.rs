@@ -328,7 +328,7 @@ impl Index for InvertedIndex {
 
 impl InvertedIndex {
     /// Whether the query can use the current index.
-    fn is_query_allowed(&self, query: &TokenQuery) -> bool {
+    pub fn is_query_allowed(&self, query: &TokenQuery) -> bool {
         match query {
             TokenQuery::TokensContains(_) => {
                 self.params.base_tokenizer == "simple"
@@ -373,11 +373,6 @@ impl ScalarIndex for InvertedIndex {
         _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
-        if !self.is_query_allowed(query) {
-            return Ok(SearchResult::AtLeast(RowIdTreeMap::from_iter::<Vec<u64>>(
-                vec![],
-            )));
-        }
 
         match query {
             TokenQuery::TokensContains(text) => {

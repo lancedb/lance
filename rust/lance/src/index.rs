@@ -71,17 +71,17 @@ pub mod prefilter;
 pub mod scalar;
 pub mod vector;
 
-use crate::dataset::index::LanceIndexStoreExt;
-pub use crate::index::prefilter::{FilterLoader, PreFilter};
-pub use create::CreateIndexBuilder;
-
 use self::append::merge_indices;
 use self::vector::remap_vector_index;
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
+pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{dataset::Dataset, Error, Result};
+pub use create::CreateIndexBuilder;
+use lance_index::scalar::inverted::InvertedIndex;
 
 // Cache keys for different index types
 #[derive(Debug, Clone)]
@@ -1374,8 +1374,19 @@ impl DatasetIndexInternalExt for Dataset {
                         Box::new(TextQueryParser::new(index.name.clone(), true))
                             as Box<dyn ScalarQueryParser>
                     }
-                    ScalarIndexType::Inverted => Box::new(FtsQueryParser::new(index.name.clone()))
-                        as Box<dyn ScalarQueryParser>,
+                    ScalarIndexType::Inverted => {
+                        let fts_index =
+                            lance_index::scalar::expression::ScalarIndexLoader::load_index(
+                                self,
+                                &field.name,
+                                &index.name,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?;
+                        let fts_index = fts_index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+                        Box::new(FtsQueryParser::new(index.name.clone(), fts_index.clone()))
+                            as Box<dyn ScalarQueryParser>
+                    }
                     _ => continue,
                 },
                 _ => {
