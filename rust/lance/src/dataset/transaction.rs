@@ -2516,9 +2516,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         (
             None,
             Operation::Overwrite {
-                fragments,
-                schema,
-                ..
+                fragments, schema, ..
             },
         ) => {
             // Validate here because we are going to return early.
