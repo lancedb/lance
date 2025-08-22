@@ -459,7 +459,7 @@ impl Dataset {
         };
         let object_reader = object_reader.map_err(|e| match &e {
             Error::NotFound { uri, .. } => Error::DatasetNotFound {
-                path: uri.to_string(),
+                path: uri.clone(),
                 source: box_error(e),
                 location: location!(),
             },
