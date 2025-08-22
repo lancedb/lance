@@ -833,6 +833,73 @@ impl BTreeIndex {
         }
     }
 
+/// Bulk search interface that can run multiple queries efficiently by loading each page only once.
+pub async fn search_bulk(
+    &self,
+    queries: &[SargableQuery],
+    metrics: &dyn MetricsCollector,
+) -> Result<Vec<SearchResult>> {
+    use std::collections::HashMap;
+
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    //Determine which pages each query needs
+    let mut query_pages: Vec<Vec<u32>> = Vec::with_capacity(queries.len());
+    for query in queries {
+        let pages: Vec<u32> = match query {
+            SargableQuery::Equals(val) => self
+                .page_lookup
+                .pages_eq(&OrderableScalarValue(val.clone())),
+            SargableQuery::Range(start, end) => self
+                .page_lookup
+                .pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref())),
+            SargableQuery::IsIn(values) => self
+                .page_lookup
+                .pages_in(values.iter().map(|val| OrderableScalarValue(val.clone()))),
+            SargableQuery::FullTextSearch(_) => {
+                return Err(Error::invalid_input(
+                    "full text search is not supported for BTree index, build an inverted index instead",
+                    location!(),
+                ))
+            }
+            SargableQuery::IsNull() => self.page_lookup.pages_null(),
+        };
+        query_pages.push(pages);
+    }
+
+    // Group queries by the pages they need
+    // page_number -> Vec<(query_index, query)>
+    let mut pages_to_queries: HashMap<u32, Vec<(usize, &SargableQuery)>> = HashMap::new();
+
+    for (i, pages) in query_pages.iter().enumerate() {
+        let q: &SargableQuery = &queries[i];
+        for &page in pages {
+            pages_to_queries.entry(page).or_default().push((i, q));
+        }
+    }
+
+    // Load each page once and run all relevant queries against it
+    let lazy_index_reader = LazyIndexReader::new(self.store.clone());
+    let mut results_per_query = vec![RowIdTreeMap::default(); queries.len()];
+
+    for (page_num, query_list) in pages_to_queries {
+        for (query_idx, query) in query_list {
+            let page_result = self
+                .search_page(query, page_num, lazy_index_reader.clone(), metrics)
+                .await?;
+            results_per_query[query_idx] |= page_result;
+        }
+    }
+
+    // Convert to SearchResult format
+    Ok(results_per_query
+        .into_iter()
+        .map(SearchResult::Exact)
+        .collect())
+}
+
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
@@ -1454,7 +1521,7 @@ impl Stream for IndexReaderStream {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, ops::Bound, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::FixedSizeListArray;
@@ -1672,5 +1739,67 @@ mod tests {
         let query2 = index.search(&query, &metrics);
         tokio::join!(query1, query2).0.unwrap();
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_search() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = gen_batch()
+            .col("value", array::step::<Float32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(1000), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+        let data_source = Box::new(MockTrainingSource::from(stream));
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
+
+        train_btree_index(data_source, &sub_index_trainer, test_store.as_ref(), 64)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(
+            test_store,
+            None,
+            LanceCache::with_capacity(100 * 1024 * 1024),
+        )
+        .await
+        .unwrap();
+
+        let queries = vec![
+            SargableQuery::Equals(ScalarValue::Float32(Some(5.0))),     
+            SargableQuery::Equals(ScalarValue::Float32(Some(200.0))), 
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Float32(Some(50.0))),
+                Bound::Excluded(ScalarValue::Float32(Some(60.0)))
+            ), 
+        ];
+
+        let metrics = LocalMetricsCollector::default();
+        
+        let mut expected_results = Vec::new();
+        for query in &queries {
+            let result = index.search(query, &LocalMetricsCollector::default()).await.unwrap();
+            expected_results.push(result);
+        }
+
+        let bulk_results = index.search_bulk(&queries, &metrics).await.unwrap();
+        assert_eq!(bulk_results.len(), expected_results.len());
+        for (bulk_result, expected) in bulk_results.iter().zip(expected_results.iter()) {
+            assert_eq!(bulk_result, expected, "Bulk search results should match individual search results");
+        }
+        let empty_results = index.search_bulk(&[], &metrics).await.unwrap();
+        assert_eq!(empty_results.len(), 0);
     }
 }
