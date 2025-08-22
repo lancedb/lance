@@ -13,10 +13,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 arrow = { version = "56.1", features = ["pyarrow"] }
-arrow-array = "56.1"
-arrow-data = "56.1"
-arrow-schema = "56.1"
-arrow-select = "56.1"
+arrow-array = "56.2"
+arrow-data = "56.2"
+arrow-schema = "56.2"
+arrow-select = "56.2"
 object_store = "0.12.3"
 datafusion = "50.0.0"
 datafusion-ffi = "50.0.0"

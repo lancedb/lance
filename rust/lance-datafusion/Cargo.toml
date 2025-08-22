@@ -29,6 +29,7 @@ lance-core = {workspace = true, features = ["datafusion"]}
 lance-datagen.workspace = true
 chrono.workspace = true
 log.workspace = true
+geodatafusion.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 snafu.workspace = true
