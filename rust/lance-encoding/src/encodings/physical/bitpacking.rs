@@ -403,6 +403,14 @@ pub struct OutOfLineBitpacking {
     compressed_bit_width: usize,
 }
 
+impl OutOfLineBitpacking {
+    pub fn new(compressed_bit_width: usize) -> Self {
+        Self {
+            compressed_bit_width,
+        }
+    }
+}
+
 impl PerValueCompressor for OutOfLineBitpacking {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let fixed_width = data.as_fixed_width().unwrap();
@@ -449,6 +457,55 @@ impl FixedPerValueDecompressor for OutOfLineBitpacking {
 
     fn bits_per_value(&self) -> u64 {
         self.compressed_bit_width as u64
+    }
+}
+
+impl BlockCompressor for OutOfLineBitpacking {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        let fixed_width = data.as_fixed_width().unwrap();
+        let compressed = match fixed_width.bits_per_value {
+            8 => bitpack_out_of_line::<u8>(fixed_width, self.compressed_bit_width),
+            16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width),
+            32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width),
+            64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width),
+            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+        };
+        Ok(compressed)
+    }
+}
+
+impl BlockDecompressor for OutOfLineBitpacking {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        // Determine the word size based on compressed bit width
+        let word_size = if self.compressed_bit_width <= 8 {
+            8
+        } else if self.compressed_bit_width <= 16 {
+            16
+        } else if self.compressed_bit_width <= 32 {
+            32
+        } else {
+            64
+        };
+
+        let words_per_chunk = (ELEMS_PER_CHUNK as usize * self.compressed_bit_width) / word_size;
+        let num_chunks = (num_values as usize).div_ceil(ELEMS_PER_CHUNK as usize);
+        let num_compressed_words = num_chunks * words_per_chunk;
+
+        let data = FixedWidthDataBlock {
+            data,
+            bits_per_value: word_size as u64,
+            num_values: num_compressed_words as u64,
+            block_info: BlockInfo::new(),
+        };
+
+        let unpacked = match word_size {
+            8 => unpack_out_of_line::<u8>(data, num_values as usize, self.compressed_bit_width),
+            16 => unpack_out_of_line::<u16>(data, num_values as usize, self.compressed_bit_width),
+            32 => unpack_out_of_line::<u32>(data, num_values as usize, self.compressed_bit_width),
+            64 => unpack_out_of_line::<u64>(data, num_values as usize, self.compressed_bit_width),
+            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+        };
+        Ok(DataBlock::FixedWidth(unpacked))
     }
 }
 
