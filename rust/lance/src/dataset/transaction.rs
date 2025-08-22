@@ -2659,7 +2659,6 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::DataType;
     use lance_io::utils::CachedFileSize;
 
     #[test]
@@ -2731,7 +2730,7 @@ mod tests {
         // Create a manifest with original fragments
         let manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
-            Arc::new(original_fragments.clone()),
+            Arc::new(original_fragments),
             DataStorageFormat::new(LanceFileVersion::V2_0),
             None,
         );
