@@ -2520,7 +2520,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             },
         ) => {
             // Validate here because we are going to return early.
-            schema_fragments_valid(schema, fragments)?;
+            schema_fragments_valid(None, schema, fragments)?;
 
             return Ok(());
         }
@@ -2539,60 +2539,86 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
     match operation {
         Operation::Append { fragments } => {
             // Fragments must contain all fields in the schema
-            schema_fragments_valid(&manifest.schema, fragments)
+            schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
         Operation::Project { schema } => {
-            schema_fragments_valid(schema, manifest.fragments.as_ref())
+            schema_fragments_valid(Some(manifest), schema, manifest.fragments.as_ref())
         }
         Operation::Merge { fragments, schema } => {
             merge_fragments_valid(manifest, fragments)?;
-            schema_fragments_valid(schema, fragments)
+            schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
             fragments,
             schema,
             config_upsert_values: None,
-        } => schema_fragments_valid(schema, fragments),
+        } => schema_fragments_valid(Some(manifest), schema, fragments),
         Operation::Update {
             updated_fragments,
             new_fragments,
             ..
         } => {
-            schema_fragments_valid(&manifest.schema, updated_fragments)?;
-            schema_fragments_valid(&manifest.schema, new_fragments)
+            schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
+            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
         }
         _ => Ok(()),
     }
 }
 
-/// Check that each fragment contains all fields in the schema.
-/// It is not required that the schema contains all fields in the fragment.
-/// There may be masked fields.
-fn schema_fragments_valid(manifest: &Manifest, schema: &Schema, fragments: &[Fragment]) -> Result<()> {
-    // TODO: add additional validation. Consider consolidating with various
-    // validate() methods in the codebase.
-    if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
-        for fragment in fragments {
-            for field in schema.fields_pre_order() {
-                if !fragment
-                    .files
-                    .iter()
-                    .flat_map(|f| f.fields.iter())
-                    .any(|f_id| f_id == &field.id)
-                {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Fragment {} does not contain field {:?}",
-                            fragment.id, field
-                        ),
-                        location!(),
-                    ));
-                }
+fn schema_fragments_valid(
+    manifest: Option<&Manifest>,
+    schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
+    if let Some(manifest) = manifest {
+        if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
+            return schema_fragments_legacy_valid(schema, fragments);
+        }
+    }
+    // validate that each data file at least contains one field.
+    for fragment in fragments {
+        for data_file in &fragment.files {
+            if data_file.fields.iter().len() == 0 {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Datafile {} does not contain any fields",
+                        data_file.path
+                    ),
+                    location!(),
+                ))
             }
         }
     }
     Ok(())
 }
+
+/// Check that each fragment contains all fields in the schema.
+/// It is not required that the schema contains all fields in the fragment.
+/// There may be masked fields.
+fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+    // TODO: add additional validation. Consider consolidating with various
+    // validate() methods in the codebase.
+    for fragment in fragments {
+        for field in schema.fields_pre_order() {
+            if !fragment
+                .files
+                .iter()
+                .flat_map(|f| f.fields.iter())
+                .any(|f_id| f_id == &field.id)
+            {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Fragment {} does not contain field {:?}",
+                        fragment.id, field
+                    ),
+                    location!(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 
 /// Validate that Merge operations preserve all original fragments.
 /// Merge operations should only add columns or rows, not reduce fragments.
