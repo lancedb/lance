@@ -30,7 +30,7 @@ use crate::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
                 VariableDecoder, VariableEncoder,
             },
-            bitpacking::InlineBitpacking,
+            bitpacking::{InlineBitpacking, OutOfLineBitpacking},
             block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
             byte_stream_split::{
                 should_use_bss, ByteStreamSplitDecompressor, ByteStreamSplitEncoder,
@@ -183,6 +183,36 @@ fn try_bitpack_for_mini_block(data: &FixedWidthDataBlock) -> Option<Box<dyn Mini
     None
 }
 
+fn try_bitpack_for_block(
+    data: &FixedWidthDataBlock,
+) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    let bits = data.bits_per_value;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
+
+    let bit_widths = data.expect_stat(Stat::BitWidth);
+    let widths = bit_widths.as_primitive::<UInt64Type>();
+    let has_all_zeros = widths.values().iter().any(|&w| w == 0);
+    let too_small =
+        widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
+
+    if has_all_zeros || too_small {
+        return None;
+    }
+
+    if data.num_values <= 1024 {
+        let compressor = Box::new(InlineBitpacking::new(bits));
+        let encoding = ProtobufUtils21::inline_bitpacking(bits, None);
+        Some((compressor, encoding))
+    } else {
+        let compressor = Box::new(OutOfLineBitpacking::new(bits as usize));
+        let encoding =
+            ProtobufUtils21::out_of_line_bitpacking(bits, ProtobufUtils21::flat(bits, None));
+        Some((compressor, encoding))
+    }
+}
+
 fn maybe_wrap_general_for_mini_block(
     inner: Box<dyn MiniBlockCompressor>,
     params: &CompressionFieldParams,
@@ -256,7 +286,7 @@ impl DefaultCompressionStrategy {
 
         let base = try_bss_for_mini_block(data, params)
             .or_else(|| try_rle_for_mini_block(data, params))
-            .or_else(|| try_bitpack_for_mini_block(data))
+            .or_else(|| try_bitpack_for_mini_block(data).map(|v| v as Box<_>))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
 
         maybe_wrap_general_for_mini_block(base, params)
@@ -421,11 +451,15 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         _field: &Field,
         data: &DataBlock,
     ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
-        // TODO: We should actually compress here!
         match data {
             // Currently, block compression is used for rep/def (which is fixed width) and for dictionary
             // encoding (which could be fixed width or variable width).
             DataBlock::FixedWidth(fixed_width) => {
+                if let Some((compressor, encoding)) = try_bitpack_for_block(fixed_width) {
+                    return Ok((compressor, encoding));
+                }
+
+                // Default to uncompressed
                 let encoder = Box::new(ValueEncoder::default());
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
                 Ok((encoder, encoding))
@@ -647,12 +681,35 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
         description: &CompressiveEncoding,
     ) -> Result<Box<dyn BlockDecompressor>> {
         match description.compression.as_ref().unwrap() {
+            Compression::InlineBitpacking(inline_bitpacking) => Ok(Box::new(
+                InlineBitpacking::from_description(inline_bitpacking),
+            )),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::Constant(constant) => {
                 let scalar = LanceBuffer::from_bytes(constant.value.clone(), 1);
                 Ok(Box::new(ConstantDecompressor::new(scalar)))
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
+            Compression::OutOfLineBitpacking(out_of_line) => {
+                // Extract the compressed bit width from the values encoding
+                let compressed_bit_width = match out_of_line
+                    .values
+                    .as_ref()
+                    .unwrap()
+                    .compression
+                    .as_ref()
+                    .unwrap()
+                {
+                    Compression::Flat(flat) => flat.bits_per_value as usize,
+                    _ => {
+                        return Err(Error::InvalidInput {
+                            location: location!(),
+                            source: "OutOfLineBitpacking values must use Flat encoding".into(),
+                        })
+                    }
+                };
+                Ok(Box::new(OutOfLineBitpacking::new(compressed_bit_width)))
+            }
             _ => todo!(),
         }
     }
@@ -662,7 +719,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
-    use crate::data::{BlockInfo, DataBlock};
+    use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
     use arrow::datatypes::{DataType, Field as ArrowField};
     use std::collections::HashMap;
 

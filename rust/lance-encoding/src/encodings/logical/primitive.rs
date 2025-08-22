@@ -3440,12 +3440,17 @@ impl PrimitiveStructuralEncoder {
         // Make the levels into a FixedWidth data block
         let num_levels = levels.num_levels() as u64;
         let levels_buf = levels.all_levels().clone();
-        let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+
+        let mut fixed_width_block = FixedWidthDataBlock {
             data: levels_buf,
             bits_per_value: 16,
             num_values: num_levels,
             block_info: BlockInfo::new(),
-        });
+        };
+        // Compute statistics to enable optimal compression for rep/def levels
+        fixed_width_block.compute_stat();
+
+        let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
         // Pick a block compressor
         let (compressor, compressor_desc) =
@@ -3510,12 +3515,14 @@ impl PrimitiveStructuralEncoder {
                 rep_index.push(num_rows as u64);
                 rep_index.push(num_leftovers as u64);
             }
-            let chunk_levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            let mut chunk_fixed_width = FixedWidthDataBlock {
                 data: chunk_levels,
                 bits_per_value: 16,
                 num_values: num_chunk_levels,
                 block_info: BlockInfo::new(),
-            });
+            };
+            chunk_fixed_width.compute_stat();
+            let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
             let compressed_levels = compressor.compress(chunk_levels_block)?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
