@@ -337,7 +337,25 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Located(doc) => doc.row_id,
             };
             if !mask.selected(row_id) {
-                self.move_preceding(pivot, doc.doc_id() + 1);
+                // Find the next valid doc id that passes the filter
+                let mut next_id = doc.doc_id() + 1;
+                let mut found_valid = false;
+                while next_id < self.docs.len() as u64 {
+                    if next_id <= u32::MAX as u64 {
+                        let next_row_id = self.docs.row_id(next_id as u32);
+                        if mask.selected(next_row_id) {
+                            found_valid = true;
+                            break;
+                        }
+                    }
+                    next_id += 1;
+                }
+
+                if found_valid {
+                    self.move_preceding(pivot, next_id);
+                } else {
+                    self.move_preceding(pivot, self.docs.len() as u64);
+                }
                 continue;
             }
 
