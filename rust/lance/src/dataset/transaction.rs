@@ -2580,12 +2580,9 @@ fn schema_fragments_valid(
         for data_file in &fragment.files {
             if data_file.fields.iter().len() == 0 {
                 return Err(Error::invalid_input(
-                    format!(
-                        "Datafile {} does not contain any fields",
-                        data_file.path
-                    ),
+                    format!("Datafile {} does not contain any fields", data_file.path),
                     location!(),
-                ))
+                ));
             }
         }
     }
@@ -2618,7 +2615,6 @@ fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Res
     }
     Ok(())
 }
-
 
 /// Validate that Merge operations preserve all original fragments.
 /// Merge operations should only add columns or rows, not reduce fragments.
