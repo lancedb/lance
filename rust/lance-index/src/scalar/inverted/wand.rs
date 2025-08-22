@@ -341,12 +341,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 let mut next_id = doc.doc_id() + 1;
                 let mut found_valid = false;
                 while next_id < self.docs.len() as u64 {
-                    if next_id <= u32::MAX as u64 {
-                        let next_row_id = self.docs.row_id(next_id as u32);
-                        if mask.selected(next_row_id) {
-                            found_valid = true;
-                            break;
-                        }
+                    let next_row_id = self.docs.row_id(next_id as u32);
+                    if mask.selected(next_row_id) {
+                        found_valid = true;
+                        break;
                     }
                     next_id += 1;
                 }
