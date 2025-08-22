@@ -238,12 +238,13 @@ You can add metadata columns to your vector dataset and query both vectors and f
 
 In real-life situations, users have other feature or metadata columns that need to be stored and fetched together. If you're managing data and the index separately, you have to do a bunch of annoying plumbing to put stuff together. 
 
-With Lance it's a single call:
+With Lance, you can add columns directly to the dataset using `add_columns()`:
 
 ```python
-tbl = sift1m.to_table()
-tbl = tbl.append_column("item_id", pa.array(range(len(tbl))))
-tbl = tbl.append_column("revenue", pa.array((np.random.randn(len(tbl))+5)*1000))
+sift1m = sift1m.add_columns({
+    "item_id": pa.array(range(len(sift1m))),
+    "revenue": pa.array((np.random.randn(len(sift1m))+5)*1000)
+})
 ```
 
 You can then query both vectors and metadata together:
