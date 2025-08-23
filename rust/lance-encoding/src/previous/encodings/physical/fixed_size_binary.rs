@@ -165,8 +165,10 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::LargeStringBuilder;
-    use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray, StringArray};
+    use arrow_array::{
+        builder::LargeStringBuilder, Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray,
+        StringArray,
+    };
     use arrow_buffer::Buffer;
     use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field};

@@ -133,8 +133,7 @@ impl ArrayEncoder for FslEncoder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::datatypes::Int32Type;
-    use arrow_array::{FixedSizeListArray, Int32Array};
+    use arrow_array::{types::Int32Type, FixedSizeListArray, Int32Array};
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field};
     use lance_datagen::{array, gen_array, ArrayGeneratorExt, RowCount};
