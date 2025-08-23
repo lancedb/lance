@@ -9,6 +9,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
 
@@ -321,17 +322,30 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
+        let min_posting_length = self
+            .postings
+            .iter()
+            .map(|p| p.list.len())
+            .min()
+            .unwrap_or(0);
+        match (mask.max_len(), mask.iter_ids()) {
+            (Some(num_rows_matched), Some(row_ids))
+                if num_rows_matched <= min_posting_length as u64 =>
+            {
+                return self.flat_search(params, row_ids, metrics);
+            }
+            _ => {}
+        }
+
         let mut candidates = BinaryHeap::new();
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
             self.cur_doc = Some(doc);
             num_comparisons += 1;
 
-            // if the doc is not located, we need to find the row id
             let row_id = match &doc {
                 DocInfo::Raw(doc) => {
                     // if the doc is not located, we need to find the row id
-                    // in the doc set. This is a bit slow, but it should be rare.
                     self.docs.row_id(doc.doc_id)
                 }
                 DocInfo::Located(doc) => doc.row_id,
@@ -365,6 +379,86 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
+        }
+        metrics.record_comparisons(num_comparisons);
+
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
+                row_id: doc.row_id,
+                freqs,
+                doc_length,
+            })
+            .collect())
+    }
+
+    fn flat_search(
+        &mut self,
+        params: &FtsSearchParams,
+        row_ids: Box<dyn Iterator<Item = RowAddress> + '_>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+
+        let is_compressed = matches!(self.postings[0].list, PostingList::Compressed(_));
+
+        let mut num_comparisons = 0;
+        let mut candidates = BinaryHeap::new();
+        for row_addr in row_ids {
+            let row_id: u64 = row_addr.into();
+            let Some(doc_id) = self.docs.doc_id(row_id) else {
+                continue;
+            };
+
+            num_comparisons += 1;
+
+            // move all postings to this doc id
+            self.move_preceding(self.postings.len() - 1, doc_id);
+            if self.postings.is_empty() {
+                // no more postings, so we can stop
+                break;
+            } else if self.postings[0].doc().map(|d| d.doc_id()) != Some(doc_id) {
+                // this doc is not in the postings, so we can skip it
+                continue;
+            }
+
+            let mut pivot = 0;
+            while pivot + 1 < self.postings.len()
+                && self.postings[pivot + 1].doc().map(|d| d.doc_id()) == Some(doc_id)
+            {
+                pivot += 1;
+            }
+
+            // check positions
+            if params.phrase_slop.is_some()
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+            {
+                continue;
+            }
+
+            // score the doc
+            let doc_length = match is_compressed {
+                true => self.docs.num_tokens(doc_id as u32),
+                false => self.docs.num_tokens_by_row_id(row_id),
+            };
+
+            let score = self.score(pivot, doc_length);
+            let freqs = self
+                .iter_token_freqs(pivot)
+                .map(|(token, freq)| (token.to_owned(), freq))
+                .collect();
+
+            if candidates.len() < limit {
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+                candidates.pop();
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+            }
         }
         metrics.record_comparisons(num_comparisons);
 

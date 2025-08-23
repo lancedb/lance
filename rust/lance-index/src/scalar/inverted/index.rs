@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
-    ops::RangeInclusive,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -159,6 +158,7 @@ impl InvertedIndex {
             return Ok((Vec::new(), Vec::new()));
         }
         let mask = prefilter.mask();
+
         let mut candidates = BinaryHeap::new();
         let parts = self
             .partitions
@@ -390,6 +390,7 @@ impl ScalarIndex for InvertedIndex {
                     .buffer_unordered(store.io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
+
                 let tokenizer = params.build()?;
                 Ok(Arc::new(Self {
                     params,
@@ -1738,6 +1739,9 @@ impl Ord for RawDocInfo {
 pub struct DocSet {
     row_ids: Vec<u64>,
     num_tokens: Vec<u32>,
+    // (row_id, doc_id) pairs sorted by row_id
+    inv: Vec<(u64, u32)>,
+
     total_tokens: u64,
 }
 
@@ -1759,8 +1763,19 @@ impl DocSet {
         self.row_ids[doc_id as usize]
     }
 
-    pub fn row_range(&self) -> RangeInclusive<u64> {
-        self.row_ids[0]..=self.row_ids[self.len() - 1]
+    pub fn doc_id(&self, row_id: u64) -> Option<u64> {
+        if self.inv.is_empty() {
+            // in legacy format, the row id is doc id
+            match self.row_ids.binary_search(&row_id) {
+                Ok(_) => Some(row_id),
+                Err(_) => None,
+            }
+        } else {
+            match self.inv.binary_search_by_key(&row_id, |x| x.0) {
+                Ok(idx) => Some(self.inv[idx].1 as u64),
+                Err(_) => None,
+            }
+        }
     }
 
     pub fn total_tokens_num(&self) -> u64 {
@@ -1829,25 +1844,30 @@ impl DocSet {
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-        let (row_ids, num_tokens) = match is_legacy {
+        let (row_ids, num_tokens, inv) = match is_legacy {
             // for legacy format, the row id is doc id,
             // in order to support efficient search, we need to sort the row ids,
             // so that we can use binary search to get num_tokens
-            true => row_id_col
-                .values()
-                .iter()
-                .filter_map(|id| {
-                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
-                    } else {
-                        Some(*id)
-                    }
-                })
-                .zip(num_tokens_col.values().iter())
-                .sorted_unstable_by_key(|x| x.0)
-                .unzip(),
+            true => {
+                let (row_ids, num_tokens) = row_id_col
+                    .values()
+                    .iter()
+                    .filter_map(|id| {
+                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                            frag_reuse_index_ref.remap_row_id(*id)
+                        } else {
+                            Some(*id)
+                        }
+                    })
+                    .zip(num_tokens_col.values().iter())
+                    .sorted_unstable_by_key(|x| x.0)
+                    .unzip();
+
+                // the legacy format doesn't need to store the inv
+                (row_ids, num_tokens, Vec::new())
+            }
             false => {
-                let row_ids = row_id_col
+                let row_ids: Vec<u64> = row_id_col
                     .values()
                     .iter()
                     .filter_map(|id| {
@@ -1859,7 +1879,15 @@ impl DocSet {
                     })
                     .collect();
                 let num_tokens = num_tokens_col.values().to_vec();
-                (row_ids, num_tokens)
+
+                // build the inv
+                let inv = row_ids
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, row_id)| (row_id, i as u32))
+                    .collect();
+                (row_ids, num_tokens, inv)
             }
         };
 
@@ -1867,6 +1895,7 @@ impl DocSet {
         Ok(Self {
             row_ids,
             num_tokens,
+            inv,
             total_tokens,
         })
     }
@@ -1901,6 +1930,8 @@ impl DocSet {
         self.num_tokens[doc_id as usize]
     }
 
+    // this can be used only if it's a legacy format,
+    // which store the sorted row ids so that we can use binary search
     #[inline]
     pub fn num_tokens_by_row_id(&self, row_id: u64) -> u32 {
         self.row_ids
