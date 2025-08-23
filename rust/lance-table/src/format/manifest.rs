@@ -92,6 +92,9 @@ pub struct Manifest {
 
     /// Blob dataset version
     pub blob_dataset_version: Option<u64>,
+
+    /* external base paths */
+    pub base_paths: HashMap<u32, BasePath>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -120,6 +123,7 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
         blob_dataset_version: Option<u64>,
+        base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let local_schema = schema.retain_storage_class(StorageClass::Default);
@@ -143,6 +147,7 @@ impl Manifest {
             data_storage_format,
             config: HashMap::new(),
             blob_dataset_version,
+            base_paths,
         }
     }
 
@@ -176,6 +181,72 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             blob_dataset_version,
+            base_paths: previous.base_paths.clone(),
+        }
+    }
+
+    pub fn shallow_clone(
+        &self,
+        ref_name: Option<String>,
+        ref_path: String,
+        transaction_file: String,
+    ) -> Self {
+        let new_base_id = self.base_paths.keys().max().map(|id| *id + 1).unwrap_or(0);
+        let cloned_fragments = self
+            .fragments
+            .as_ref()
+            .iter()
+            .map(|fragment| {
+                let mut cloned_fragment = fragment.clone();
+                cloned_fragment.files = cloned_fragment
+                    .files
+                    .into_iter()
+                    .map(|mut file| {
+                        file.base_id = Some(new_base_id);
+                        file
+                    })
+                    .collect();
+
+                if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
+                    deletion.base_id = Some(new_base_id);
+                    cloned_fragment.deletion_file = Some(deletion);
+                }
+
+                cloned_fragment
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            schema: self.schema.clone(),
+            local_schema: self.local_schema.clone(),
+            version: self.version,
+            writer_version: self.writer_version.clone(),
+            fragments: Arc::new(cloned_fragments),
+            version_aux_data: self.version_aux_data,
+            // TODO: apply shallow clone to indexes
+            index_section: None,
+            timestamp_nanos: self.timestamp_nanos,
+            reader_feature_flags: self.reader_feature_flags,
+            tag: None,
+            writer_feature_flags: self.writer_feature_flags,
+            max_fragment_id: self.max_fragment_id,
+            transaction_file: Some(transaction_file),
+            fragment_offsets: self.fragment_offsets.clone(),
+            next_row_id: self.next_row_id,
+            data_storage_format: self.data_storage_format.clone(),
+            config: self.config.clone(),
+            blob_dataset_version: self.blob_dataset_version,
+            base_paths: {
+                let mut base_paths = self.base_paths.clone();
+                let base_path = BasePath {
+                    id: new_base_id,
+                    name: ref_name,
+                    is_dataset_root: true,
+                    path: ref_path,
+                };
+                base_paths.insert(new_base_id, base_path);
+                base_paths
+            },
         }
     }
 
@@ -370,6 +441,14 @@ impl Manifest {
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct BasePath {
+    pub id: u32,
+    pub name: Option<String>,
+    pub is_dataset_root: bool,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
@@ -485,6 +564,17 @@ impl ProtoStruct for Manifest {
     type Proto = pb::Manifest;
 }
 
+impl From<pb::BasePath> for BasePath {
+    fn from(p: pb::BasePath) -> Self {
+        Self {
+            id: p.id,
+            name: p.name,
+            is_dataset_root: p.is_dataset_root,
+            path: p.path,
+        }
+    }
+}
+
 impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
@@ -569,6 +659,11 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.blob_dataset_version)
             },
+            base_paths: p
+                .base_paths
+                .iter()
+                .map(|item| (item.id, item.clone().into()))
+                .collect(),
         })
     }
 }
@@ -613,6 +708,16 @@ impl From<&Manifest> for pb::Manifest {
             }),
             config: m.config.clone(),
             blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
+            base_paths: m
+                .base_paths
+                .values()
+                .map(|base_path| pb::BasePath {
+                    id: base_path.id,
+                    name: base_path.name.clone(),
+                    is_dataset_root: base_path.is_dataset_root,
+                    path: base_path.path.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -733,6 +838,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            /*ref_main_location= */ HashMap::new(),
         );
 
         let actual = manifest.fragments_by_offset_range(0..10);
@@ -800,6 +906,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            /*ref_main_location= */ HashMap::new(),
         );
 
         assert_eq!(manifest.max_field_id(), 43);
@@ -823,6 +930,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            /*ref_main_location= */ HashMap::new(),
         );
 
         let mut config = manifest.config.clone();
