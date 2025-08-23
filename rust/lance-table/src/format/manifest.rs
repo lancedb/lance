@@ -187,7 +187,7 @@ impl Manifest {
 
     pub fn shallow_clone(
         &self,
-        ref_name: String,
+        ref_name: Option<String>,
         ref_path: String,
         transaction_file: String,
     ) -> Self {
@@ -443,7 +443,7 @@ impl Manifest {
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct BasePath {
     pub id: u32,
-    pub name: String,
+    pub name: Option<String>,
     pub is_dataset_root: bool,
     pub path: String,
 }

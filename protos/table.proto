@@ -167,7 +167,9 @@ message Manifest {
 // external dataset base path
 message BasePath {
   uint32 id = 1;
-  string name = 2;
+  // This is an alias name of the base path, it is optional.
+  // When we use shallow clone and the target version is a tag, the tag name will be set here.
+  optional string name = 2;
   // Flag indicating whether this path is a dataset root path or file directory:
   // - true:  Path is a dataset root (actual files under subdirectories like `data`, '_deletions')
   // - false: Path is a direct file directory (scenario like importing files)

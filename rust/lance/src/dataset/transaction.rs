@@ -229,9 +229,10 @@ pub enum Operation {
         removed: Vec<MemWal>,
     },
 
+    /// Clone a dataset.
     Clone {
         is_shallow: bool,
-        ref_name: String,
+        ref_name: Option<String>,
         ref_version: u64,
         ref_path: String,
     },

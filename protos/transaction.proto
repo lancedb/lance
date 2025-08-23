@@ -169,7 +169,7 @@ message Transaction {
     // the reference name in the source dataset
     // for branch scenario, this is the branch name in the source dataset
     // for non branch scenario(normal cloning), this is an optional tag name in the source dataset
-    string ref_name = 2;
+    optional string ref_name = 2;
     // the version of the source dataset for cloning
     uint64 ref_version = 3;
     // the absolute base path of the source dataset for cloning

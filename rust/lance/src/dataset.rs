@@ -1662,22 +1662,26 @@ impl Dataset {
 
     /// Shallow clone the target version into a new dataset at target_path.
     /// 'target_path': the uri string to clone the dataset into.
-    /// 'ref_name': the ref name to clone.
+    /// 'version': the version cloned from, could be a version number or tag.
     /// 'store_params': the object store params to use for the new dataset.
     pub async fn shallow_clone(
         &mut self,
         target_path: &str,
-        ref_name: &str,
+        version: impl Into<refs::Ref>,
         store_params: ObjectStoreParams,
     ) -> Result<Self> {
-        let version = self.tags.get_version(ref_name).await?;
+        let ref_: refs::Ref = version.into();
+        let (version_number, ref_name) = match ref_ {
+            refs::Ref::Version(version) => (version, None),
+            refs::Ref::Tag(tag) => (self.tags.get_version(tag.as_str()).await?, Some(tag)),
+        };
         let clone_op = Operation::Clone {
             is_shallow: true,
-            ref_name: ref_name.to_string(),
-            ref_version: version,
+            ref_name,
+            ref_version: version_number,
             ref_path: String::from(self.base.clone()),
         };
-        let transaction = Transaction::new(version, clone_op, None, None);
+        let transaction = Transaction::new(version_number, clone_op, None, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params)
