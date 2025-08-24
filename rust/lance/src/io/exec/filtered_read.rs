@@ -9,6 +9,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::common::instant::Instant;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -745,6 +746,7 @@ impl FilteredReadStream {
         match self.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => {
                 assert_eq!(partition, 0);
+                let elapsed_compute_start = Instant::now();
                 let output_schema = self.output_schema.clone();
                 let task_stream = self.task_stream.clone();
                 let partition_metrics_clone = partition_metrics.clone();
@@ -752,10 +754,6 @@ impl FilteredReadStream {
                     move |task_stream| {
                         let partition_metrics = partition_metrics_clone.clone();
                         async move {
-                            // There is no compute we can meaningfully measure here.  The actual work is
-                            // done by spawned background threads.
-                            let _timer =
-                                partition_metrics.baseline_metrics.elapsed_compute().timer();
                             let _task_wait_timer = partition_metrics.task_wait_time.timer();
                             let maybe_task = task_stream.lock().await.next().await.transpose()?;
                             Result::Ok(maybe_task.map(|task| (task, task_stream)))
@@ -781,6 +779,10 @@ impl FilteredReadStream {
                         if active_partitions_counter.fetch_sub(1, Ordering::Relaxed) == 1 {
                             global_metrics.io_metrics.record_final(&scan_scheduler);
                         }
+                        partition_metrics
+                            .baseline_metrics
+                            .elapsed_compute()
+                            .add_duration(Instant::now().duration_since(elapsed_compute_start));
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
