@@ -1885,6 +1885,7 @@ impl DocSet {
                     .iter()
                     .copied()
                     .enumerate()
+                    .sorted_unstable()
                     .map(|(i, row_id)| (row_id, i as u32))
                     .collect();
                 (row_ids, num_tokens, inv)

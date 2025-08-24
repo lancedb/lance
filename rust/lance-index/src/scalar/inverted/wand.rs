@@ -9,6 +9,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
+use itertools::Itertools;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
@@ -322,15 +323,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
-        let min_posting_length = self
-            .postings
-            .iter()
-            .map(|p| p.list.len())
-            .min()
-            .unwrap_or(0);
+        let avg_posting_length =
+            self.postings.iter().map(|p| p.list.len()).sum::<usize>() / self.postings.len();
         match (mask.max_len(), mask.iter_ids()) {
             (Some(num_rows_matched), Some(row_ids))
-                if num_rows_matched <= min_posting_length as u64 =>
+                if num_rows_matched <= avg_posting_length as u64 =>
             {
                 return self.flat_search(params, row_ids, metrics);
             }
@@ -404,16 +401,20 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
+        // we need to map the row ids to doc ids, and sort them,
+        // because WAND PostingIterator can't go back to the previous doc id
+        let doc_ids = row_ids
+            .filter_map(|row_addr| {
+                let row_id: u64 = row_addr.into();
+                self.docs.doc_id(row_id).map(|doc_id| (doc_id, row_id))
+            })
+            .sorted_unstable()
+            .collect::<Vec<_>>();
         let is_compressed = matches!(self.postings[0].list, PostingList::Compressed(_));
 
         let mut num_comparisons = 0;
         let mut candidates = BinaryHeap::new();
-        for row_addr in row_ids {
-            let row_id: u64 = row_addr.into();
-            let Some(doc_id) = self.docs.doc_id(row_id) else {
-                continue;
-            };
-
+        for (doc_id, row_id) in doc_ids {
             num_comparisons += 1;
 
             // move all postings to this doc id
