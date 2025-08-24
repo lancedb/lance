@@ -13,7 +13,7 @@ pub use fragment::*;
 pub use index::Index;
 pub use manifest::{
     is_detached_version, DataStorageFormat, Manifest, SelfDescribingFileReader, WriterVersion,
-    DETACHED_VERSION_MASK,
+    DETACHED_VERSION_MASK, BasePath,
 };
 
 use lance_core::{Error, Result};

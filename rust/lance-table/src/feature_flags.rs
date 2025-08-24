@@ -18,8 +18,10 @@ pub const FLAG_STABLE_ROW_IDS: u64 = 2;
 pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 4;
 /// Table config is present
 pub const FLAG_TABLE_CONFIG: u64 = 8;
+/// Dataset is a shallow clone with external base paths
+pub const FLAG_SHALLOW_CLONE: u64 = 16;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 16;
+pub const FLAG_UNKNOWN: u64 = 32;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) -> Result<()> {
@@ -62,6 +64,12 @@ pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) 
         manifest.writer_feature_flags |= FLAG_TABLE_CONFIG;
     }
 
+    // Check if this is a shallow clone dataset by examining base_paths
+    if !manifest.base_paths.is_empty() {
+        manifest.reader_feature_flags |= FLAG_SHALLOW_CLONE;
+        manifest.writer_feature_flags |= FLAG_SHALLOW_CLONE;
+    }
+
     Ok(())
 }
 
@@ -79,6 +87,7 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::format::BasePath;
     use super::*;
 
     #[test]
@@ -87,6 +96,8 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_DELETION_FILES));
         assert!(can_read_dataset(super::FLAG_STABLE_ROW_IDS));
         assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
+        assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
+        assert!(can_read_dataset(super::FLAG_SHALLOW_CLONE));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -102,12 +113,59 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_STABLE_ROW_IDS));
         assert!(can_write_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
+        assert!(can_write_dataset(super::FLAG_SHALLOW_CLONE));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
+                | super::FLAG_SHALLOW_CLONE
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_shallow_clone_feature_flags() {
+        use crate::format::{Manifest, DataStorageFormat};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use lance_core::datatypes::Schema;
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        // Create a basic schema for testing
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "test_field",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        // Test 1: Normal dataset (no base_paths) should not have FLAG_SHALLOW_CLONE
+        let mut normal_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(), // Empty base_paths
+        );
+        apply_feature_flags(&mut normal_manifest, false).unwrap();
+        assert_eq!(normal_manifest.reader_feature_flags & FLAG_SHALLOW_CLONE, 0);
+        assert_eq!(normal_manifest.writer_feature_flags & FLAG_SHALLOW_CLONE, 0);
+        // Test 2: Cloned dataset (with base_paths) should have FLAG_SHALLOW_CLONE
+        let mut base_paths: HashMap<u32, BasePath> = HashMap::new();
+        base_paths.insert(1, BasePath {
+            id: 1,
+            name: Some("test_ref".to_string()),
+            is_dataset_root: true,
+            path: "/path/to/original".to_string(),
+        });
+        let mut cloned_manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            None,
+            base_paths,
+        );
+        apply_feature_flags(&mut cloned_manifest, false).unwrap();
+        assert_ne!(cloned_manifest.reader_feature_flags & FLAG_SHALLOW_CLONE, 0);
+        assert_ne!(cloned_manifest.writer_feature_flags & FLAG_SHALLOW_CLONE, 0);
     }
 }
