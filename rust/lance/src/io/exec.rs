@@ -14,6 +14,7 @@ mod projection;
 mod pushdown_scan;
 mod rowids;
 pub mod scalar_index;
+pub mod scalar_index_join;
 mod scan;
 mod take;
 #[cfg(test)]
@@ -28,6 +29,7 @@ pub use optimizer::get_physical_optimizer;
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
 pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
+pub use scalar_index_join::ScalarIndexJoinExec;
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;
