@@ -489,7 +489,9 @@ async fn infer_scalar_index_type(
     index: &Index,
     column: &str,
 ) -> Result<ScalarIndexType> {
-    let index_dir = dataset.indice_files_dir(index)?.child(index.uuid.to_string());
+    let index_dir = dataset
+        .indice_files_dir(index)?
+        .child(index.uuid.to_string());
     let col = dataset.schema().field(column).ok_or(Error::Internal {
         message: format!(
             "Index refers to column {} which does not exist in dataset schema",

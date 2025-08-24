@@ -36,7 +36,9 @@ use lance_index::vector::{
     sq::{builder::SQBuildParams, ScalarQuantizer},
     VectorIndex,
 };
-use lance_index::{DatasetIndexExt, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{
+    DatasetIndexExt, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -653,17 +655,18 @@ pub(crate) async fn open_vector_index_v2(
 
     let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
     // Load the index metadata to get the correct index directory
-    let index_meta = dataset.load_index(uuid).await?.ok_or_else(|| Error::Index {
-        message: format!("Index with id {} does not exist", uuid),
-        location: location!(),
-    })?;
+    let index_meta = dataset
+        .load_index(uuid)
+        .await?
+        .ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
     let index_dir = dataset.indice_files_dir(&index_meta)?;
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
-            let aux_path = index_dir
-                .child(uuid)
-                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
@@ -690,9 +693,7 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
-            let aux_path = index_dir
-                .child(uuid)
-                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
