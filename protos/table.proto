@@ -224,6 +224,10 @@ message IndexMetadata {
   // This field is optional for backward compatibility. For existing indices created before
   // this field was added, this will be None/null.
   optional uint64 created_at = 8;
+
+  // The base path index of the data file. Used when the file is imported or referred from another dataset.
+  // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+  optional uint32 base_id = 9;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.

@@ -529,6 +529,7 @@ impl DatasetIndexExt for Dataset {
             index_details: None,
             index_version: 0,
             created_at: Some(chrono::Utc::now()),
+            base_id: None, // New indices don't have base_id (they're not from shallow clone)
         };
 
         let transaction = Transaction::new(
@@ -643,6 +644,7 @@ impl DatasetIndexExt for Dataset {
                 index_details: last_idx.index_details.clone(),
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
+                base_id: last_idx.base_id, // Preserve base_id from the last delta
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             if deltas.len() > removed_indices.len() {
@@ -978,8 +980,12 @@ impl DatasetIndexInternalExt for Dataset {
         // scalar indices, we may start having this file with scalar indices too.  Once that happens
         // we can just read this file and look at the `implementation` or `index_type` fields to
         // determine what kind of index it is.
-        let index_dir = self.indices_dir().child(uuid);
-        let index_file = index_dir.child(INDEX_FILE_NAME);
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+        let index_dir = self.indice_files_dir(&index_meta)?;
+        let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         if self.object_store.exists(&index_file).await? {
             let index = self.open_vector_index(column, uuid, metrics).await?;
             Ok(index.as_index())
@@ -1032,8 +1038,12 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_dir = self.indices_dir().child(uuid);
-        let index_file = index_dir.child(INDEX_FILE_NAME);
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+        let index_dir = self.indice_files_dir(&index_meta)?;
+        let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
@@ -1124,7 +1134,7 @@ impl DatasetIndexInternalExt for Dataset {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
                                 self.object_store.clone(),
-                                self.indices_dir(),
+                                index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
@@ -1136,7 +1146,7 @@ impl DatasetIndexInternalExt for Dataset {
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
                                 self.object_store.clone(),
-                                self.indices_dir(),
+                                index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
@@ -1181,12 +1191,12 @@ impl DatasetIndexInternalExt for Dataset {
                     }
 
                     "IVF_HNSW_FLAT" => {
-                        let uri = self.indices_dir().child(uuid).child("index.pb");
+                        let uri = index_dir.child(uuid).child("index.pb");
                         let file_metadata_cache =
                             self.session.metadata_cache.file_metadata_cache(&uri);
                         let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             &file_metadata_cache,
@@ -1199,7 +1209,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -1212,7 +1222,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_HNSW_PQ" => {
                         let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -1467,7 +1477,7 @@ fn is_vector_field(data_type: DataType) -> bool {
 mod tests {
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::{ReadParams, WriteParams};
+    use crate::dataset::{ReadParams, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{
@@ -3126,5 +3136,469 @@ mod tests {
             stats_after_optimization["num_unindexed_rows"], 0,
             "Index should have zero unindexed rows after optimization"
         );
+    }
+
+    #[tokio::test]
+    async fn test_comprehensive_shallow_clone_with_indices() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let clone_dir = test_dir.path().join("clone");
+        let cloned_uri = clone_dir.to_str().unwrap();
+
+        // Create a schema with both vector and scalar columns
+        let dimensions = 16;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            ),
+            Field::new(
+                "category",
+                DataType::Utf8,
+                false,
+            ),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimensions,
+                ),
+                false,
+            ),
+        ]));
+
+        // Generate test data
+        let float_arr = generate_random_array(300 * dimensions as usize);
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap(),
+        );
+        let ids = Arc::new(Int32Array::from_iter_values(0..300));
+        let categories = Arc::new(StringArray::from_iter_values(
+            (0..300).map(|i| format!("category_{}", i % 5))
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![ids, categories, vectors],
+        ).unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![batch].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        // Create initial dataset
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        println!("✅ Created initial dataset with 300 rows");
+
+        // Create vector index
+        let vector_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+        println!("✅ Created vector index");
+
+        // Create scalar index
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::BTree,
+                Some("category_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        println!("✅ Created scalar index");
+
+        // Verify indices were created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2, "Should have 2 indices");
+        let index_names: HashSet<String> = indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(index_names.contains("vector_idx"));
+        assert!(index_names.contains("category_idx"));
+        println!("✅ Verified indices creation");
+
+        // Create tag for shallow cloning
+        dataset.tags.create("test_tag", dataset.version().version).await.unwrap();
+
+        // Perform shallow clone
+        let cloned_dataset = dataset
+            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .await
+            .unwrap();
+        println!("✅ Performed shallow clone");
+
+        // Verify cloned dataset has indices
+        let cloned_indices = cloned_dataset.load_indices().await.unwrap();
+        assert_eq!(cloned_indices.len(), 2, "Cloned dataset should have 2 indices");
+        let cloned_index_names: HashSet<String> = cloned_indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(cloned_index_names.contains("vector_idx"));
+        assert!(cloned_index_names.contains("category_idx"));
+
+        // Debug: Check base_id of cloned indices
+        for index in cloned_indices.iter() {
+            println!("🔍 Index '{}' has base_id: {:?}", index.name, index.base_id);
+        }
+
+        // Debug: Check base_paths in cloned dataset
+        println!("🔍 Cloned dataset base_paths: {:?}", cloned_dataset.manifest.base_paths);
+        println!("🔍 Cloned dataset base path: {:?}", cloned_dataset.base);
+        println!("🔍 Cloned dataset indices_dir(): {:?}", cloned_dataset.indices_dir());
+
+        println!("✅ Verified cloned dataset has indices");
+
+        // Test vector search on cloned dataset
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let search_results = cloned_dataset
+            .scan()
+            .nearest("vector", &query_vector, 5).unwrap()
+            .limit(Some(5), None).unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(search_results.num_rows() > 0, "Vector search should return results");
+        println!("✅ Vector search works on cloned dataset");
+
+        // Test scalar query on cloned dataset
+        let scalar_results = cloned_dataset
+            .scan()
+            .filter("category = 'category_0'").unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(scalar_results.num_rows() > 0, "Scalar query should return results");
+        println!("✅ Scalar query works on cloned dataset");
+
+        // Append new data to cloned dataset
+        let new_float_arr = generate_random_array(50 * dimensions as usize);
+        let new_vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(new_float_arr, dimensions).unwrap(),
+        );
+        let new_ids = Arc::new(Int32Array::from_iter_values(300..350));
+        let new_categories = Arc::new(StringArray::from_iter_values(
+            (300..350).map(|i| format!("new_category_{}", i % 3))
+        ));
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![new_ids, new_categories, new_vectors],
+        ).unwrap();
+
+        let new_reader = RecordBatchIterator::new(
+            vec![new_batch].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        let mut updated_cloned_dataset = Dataset::write(
+            new_reader,
+            cloned_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        ).await.unwrap();
+        println!("✅ Appended new data to cloned dataset");
+
+        // Verify row count increased
+        let total_rows = updated_cloned_dataset.count_rows(None).await.unwrap();
+        assert_eq!(total_rows, 350, "Should have 350 rows after append");
+        println!("✅ Verified row count after append");
+
+        // Call optimize_indices
+        updated_cloned_dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        println!("✅ Optimized indices");
+
+        // Test vector search after optimization (should find both old and new data)
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let optimized_search_results = updated_cloned_dataset
+            .scan()
+            .nearest("vector", &query_vector, 10).unwrap()
+            .limit(Some(10), None).unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(optimized_search_results.num_rows() > 0, "Vector search should work after optimization");
+        println!("✅ Vector search works after optimization");
+
+        // Test scalar query after optimization (should find both old and new data)
+        let old_category_results = updated_cloned_dataset
+            .scan()
+            .filter("category = 'category_0'").unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let new_category_results = updated_cloned_dataset
+            .scan()
+            .filter("category = 'new_category_0'").unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(old_category_results.num_rows() > 0, "Should find old category data");
+        assert!(new_category_results.num_rows() > 0, "Should find new category data");
+        println!("✅ Can query both old and new data after optimization");
+
+        // Verify index statistics
+        let vector_stats: serde_json::Value = serde_json::from_str(
+            &updated_cloned_dataset.index_statistics("vector_idx").await.unwrap()
+        ).unwrap();
+        let category_stats: serde_json::Value = serde_json::from_str(
+            &updated_cloned_dataset.index_statistics("category_idx").await.unwrap()
+        ).unwrap();
+
+        assert_eq!(vector_stats["num_indexed_rows"].as_u64().unwrap(), 350);
+        assert_eq!(category_stats["num_indexed_rows"].as_u64().unwrap(), 350);
+        println!("✅ Index statistics show all rows are indexed");
+
+        println!("🎉 Comprehensive shallow clone with indices test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_shallow_clone_with_index() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let clone_dir = test_dir.path().join("clone");
+        let cloned_uri = clone_dir.to_str().unwrap();
+
+        // Create a schema with both vector and scalar columns
+        let dimensions = 16;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            ),
+            Field::new(
+                "category",
+                DataType::Utf8,
+                false,
+            ),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimensions,
+                ),
+                false,
+            ),
+        ]));
+
+        // Generate test data (300 rows to satisfy PQ training requirements)
+        let float_arr = generate_random_array(300 * dimensions as usize);
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap(),
+        );
+        let ids = Arc::new(Int32Array::from_iter_values(0..300));
+        let categories = Arc::new(StringArray::from_iter_values(
+            (0..300).map(|i| format!("category_{}", i % 5))
+        ));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![ids, categories, vectors],
+        ).unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![batch].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        // Create initial dataset
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        println!("✅ Created initial dataset with 300 rows");
+
+        // Create vector index (IVF_PQ)
+        let vector_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+        println!("✅ Created vector index");
+
+        // Create scalar index (BTree)
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::BTree,
+                Some("category_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        println!("✅ Created scalar index");
+
+        // Verify indices were created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2, "Should have 2 indices");
+        let index_names: HashSet<String> = indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(index_names.contains("vector_idx"));
+        assert!(index_names.contains("category_idx"));
+        println!("✅ Verified indices creation");
+
+        // Create tag for shallow cloning
+        dataset.tags.create("test_tag", dataset.version().version).await.unwrap();
+
+        // Perform shallow clone
+        let cloned_dataset = dataset
+            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .await
+            .unwrap();
+        println!("✅ Performed shallow clone");
+
+        // Verify cloned dataset has indices
+        let cloned_indices = cloned_dataset.load_indices().await.unwrap();
+        assert_eq!(cloned_indices.len(), 2, "Cloned dataset should have 2 indices");
+        let cloned_index_names: HashSet<String> = cloned_indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(cloned_index_names.contains("vector_idx"));
+        assert!(cloned_index_names.contains("category_idx"));
+
+        // Debug: Check base_id of cloned indices
+        for index in cloned_indices.iter() {
+            println!("🔍 Index '{}' has base_id: {:?}", index.name, index.base_id);
+        }
+
+        // Debug: Check base_paths in cloned dataset
+        println!("🔍 Cloned dataset base_paths: {:?}", cloned_dataset.manifest.base_paths);
+
+        println!("✅ Verified cloned dataset has indices");
+
+        // Test vector search on cloned dataset
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let search_results = cloned_dataset
+            .scan()
+            .nearest("vector", &query_vector, 5).unwrap()
+            .limit(Some(5), None).unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(search_results.num_rows() > 0, "Vector search should return results");
+        println!("✅ Vector search works on cloned dataset");
+
+        // Test scalar query on cloned dataset
+        let scalar_results = cloned_dataset
+            .scan()
+            .filter("category = 'category_0'").unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(scalar_results.num_rows() > 0, "Scalar query should return results");
+        println!("✅ Scalar query works on cloned dataset");
+
+        // Append new data to cloned dataset
+        let new_float_arr = generate_random_array(50 * dimensions as usize);
+        let new_vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(new_float_arr, dimensions).unwrap(),
+        );
+        let new_ids = Arc::new(Int32Array::from_iter_values(300..350));
+        let new_categories = Arc::new(StringArray::from_iter_values(
+            (300..350).map(|i| format!("new_category_{}", i % 3))
+        ));
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![new_ids, new_categories, new_vectors],
+        ).unwrap();
+
+        let new_reader = RecordBatchIterator::new(
+            vec![new_batch].into_iter().map(Ok),
+            schema.clone(),
+        );
+
+        let mut updated_cloned_dataset = Dataset::write(
+            new_reader,
+            cloned_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        ).await.unwrap();
+        println!("✅ Appended new data to cloned dataset");
+
+        // Verify row count increased
+        let total_rows = updated_cloned_dataset.count_rows(None).await.unwrap();
+        assert_eq!(total_rows, 350, "Should have 350 rows after append");
+        println!("✅ Verified row count after append");
+
+        // Call optimize_indices
+        updated_cloned_dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        println!("✅ Optimized indices");
+
+        // Test vector search after optimization (should find both old and new data)
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let optimized_search_results = updated_cloned_dataset
+            .scan()
+            .nearest("vector", &query_vector, 10).unwrap()
+            .limit(Some(10), None).unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(optimized_search_results.num_rows() > 0, "Vector search should work after optimization");
+        println!("✅ Vector search works after optimization");
+
+        // Test scalar query after optimization (should find both old and new data)
+        let old_category_results = updated_cloned_dataset
+            .scan()
+            .filter("category = 'category_0'").unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let new_category_results = updated_cloned_dataset
+            .scan()
+            .filter("category = 'new_category_0'").unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(old_category_results.num_rows() > 0, "Should find old category data");
+        assert!(new_category_results.num_rows() > 0, "Should find new category data");
+        println!("✅ Can query both old and new data after optimization");
+
+        // Verify index statistics
+        let vector_stats: serde_json::Value = serde_json::from_str(
+            &updated_cloned_dataset.index_statistics("vector_idx").await.unwrap()
+        ).unwrap();
+        let category_stats: serde_json::Value = serde_json::from_str(
+            &updated_cloned_dataset.index_statistics("category_idx").await.unwrap()
+        ).unwrap();
+
+        assert_eq!(vector_stats["num_indexed_rows"].as_u64().unwrap(), 350);
+        assert_eq!(category_stats["num_indexed_rows"].as_u64().unwrap(), 350);
+        println!("✅ Index statistics show all rows are indexed");
+
+        println!("🎉 Comprehensive shallow clone index functionality test passed!");
     }
 }

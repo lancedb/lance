@@ -542,6 +542,7 @@ pub(crate) fn new_mem_wal_index_meta(
         ))?),
         index_version: 0,
         created_at: Some(chrono::Utc::now()),
+        base_id: None,
     })
 }
 
