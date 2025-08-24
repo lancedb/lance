@@ -87,8 +87,8 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::format::BasePath;
     use super::*;
+    use crate::format::BasePath;
 
     #[test]
     fn test_read_check() {
@@ -126,11 +126,11 @@ mod tests {
 
     #[test]
     fn test_shallow_clone_feature_flags() {
-        use crate::format::{Manifest, DataStorageFormat};
+        use crate::format::{DataStorageFormat, Manifest};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
         use std::collections::HashMap;
         use std::sync::Arc;
-        use lance_core::datatypes::Schema;
-        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
         // Create a basic schema for testing
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "test_field",
@@ -151,12 +151,15 @@ mod tests {
         assert_eq!(normal_manifest.writer_feature_flags & FLAG_SHALLOW_CLONE, 0);
         // Test 2: Cloned dataset (with base_paths) should have FLAG_SHALLOW_CLONE
         let mut base_paths: HashMap<u32, BasePath> = HashMap::new();
-        base_paths.insert(1, BasePath {
-            id: 1,
-            name: Some("test_ref".to_string()),
-            is_dataset_root: true,
-            path: "/path/to/original".to_string(),
-        });
+        base_paths.insert(
+            1,
+            BasePath {
+                id: 1,
+                name: Some("test_ref".to_string()),
+                is_dataset_root: true,
+                path: "/path/to/original".to_string(),
+            },
+        );
         let mut cloned_manifest = Manifest::new(
             schema,
             Arc::new(vec![]),
