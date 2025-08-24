@@ -17,16 +17,17 @@ use datafusion_expr::{
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
 };
 
+use super::{
+    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
+    TextQuery, TokenQuery,
+};
+use crate::scalar::inverted::InvertedIndex;
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
-
-use super::{
-    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery,
-};
 
 const MAX_DEPTH: usize = 500;
 
@@ -427,11 +428,15 @@ impl ScalarQueryParser for TextQueryParser {
 #[derive(Debug, Clone)]
 pub struct FtsQueryParser {
     index_name: String,
+    index: InvertedIndex,
 }
 
 impl FtsQueryParser {
-    pub fn new(index_name: String) -> Self {
-        Self { index_name }
+    pub fn new(name: String, index: InvertedIndex) -> Self {
+        Self {
+            index_name: name,
+            index,
+        }
     }
 }
 
@@ -478,22 +483,18 @@ impl ScalarQueryParser for FtsQueryParser {
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            // TODO(https://github.com/lancedb/lance/issues/3855):
-            //
-            // Create the contains_tokens UDF
             if func.name() == "contains_tokens" {
-                let query = TextQuery::StringContains(scalar_str);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    Arc::new(query),
-                ))
-            } else {
-                None
+                let query = TokenQuery::TokensContains(scalar_str);
+                if self.index.is_query_allowed(&query) {
+                    return Some(IndexedExpression::index_query(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                    ));
+                }
             }
-        } else {
-            None
         }
+        None
     }
 }
 
