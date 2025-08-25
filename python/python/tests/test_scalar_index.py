@@ -750,6 +750,7 @@ def test_fts_with_filter(tmp_path):
     plan = ds.scanner(
         full_text_query="lance search text", filter="id <= 1", prefilter=True
     ).analyze_plan()
+    print(plan)
     assert "index_comparisons=1" in plan
 
 
