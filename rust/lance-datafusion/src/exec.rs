@@ -22,11 +22,13 @@ use datafusion::{
     },
     physical_plan::{
         analyze::AnalyzeExec,
+        coalesce_partitions::CoalescePartitionsExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, EmptyRecordBatchStream, ExecutionPlan,
+        ExecutionPlanProperties, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
@@ -464,6 +466,19 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
+    let num_partitions = plan.output_partitioning().partition_count();
+    let plan = match num_partitions {
+        0 => {
+            debug!(
+                "Executing zero-partition plan:\n{}",
+                DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+            );
+            return Ok(Box::pin(EmptyRecordBatchStream::new(plan.schema())));
+        }
+        1 => plan,
+        2.. => Arc::new(CoalescePartitionsExec::new(plan)),
+    };
+
     debug!(
         "Executing plan:\n{}",
         DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
@@ -471,8 +486,7 @@ pub fn execute_plan(
 
     let session_ctx = get_session_context(&options);
 
-    // NOTE: we are only executing the first partition here. Therefore, if
-    // the plan has more than one partition, we will be missing data.
+    // If there was more than 1 partition it should have been coalesced above
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
     let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
 
