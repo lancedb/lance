@@ -165,6 +165,37 @@ def test_ray_write_lance_none_str_datasink(tmp_path: Path):
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_ray_datasink_with_empty_map_batches(tmp_path: Path):
+    def f(row):
+        return {
+            "id": row["id"],
+            "str": None,
+        }
+
+    def to_pd(batch: pd.DataFrame):
+        return batch
+
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
+
+    sink = LanceDatasink(tmp_path, schema=schema)
+    (
+        ray.data.range(10)
+        .map(f)
+        .map_batches(lambda batch: to_pd(batch), batch_format="pandas")
+        .write_datasink(sink)
+    )
+    ds = lance.dataset(tmp_path)
+    ds.count_rows() == 10
+    assert ds.schema == schema
+
+    tbl = ds.to_table()
+    pylist = tbl["str"].to_pylist()
+    assert len(pylist) == 10
+    for item in pylist:
+        assert item is None
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_lance_parallel_merge_columns(tmp_path: Path):
     def generate_label(batch: pa.RecordBatch) -> pa.RecordBatch:
         heights = batch.column("height").to_pylist()
