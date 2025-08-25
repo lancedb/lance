@@ -41,6 +41,9 @@ pub struct DataFile {
 
     /// The size of the file in bytes, if known.
     pub file_size_bytes: CachedFileSize,
+
+    /// The base path of the datafile, when the datafile is outside the dataset.
+    pub base_id: Option<u32>,
 }
 
 impl DataFile {
@@ -59,6 +62,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
+            base_id: None,
         }
     }
 
@@ -75,6 +79,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
+            base_id: None,
         }
     }
 
@@ -143,6 +148,7 @@ impl From<&DataFile> for pb::DataFile {
             file_major_version: df.file_major_version,
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
+            base_id: df.base_id,
         }
     }
 }
@@ -158,6 +164,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_major_version: proto.file_major_version,
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
+            base_id: proto.base_id,
         })
     }
 }
@@ -186,6 +193,7 @@ pub struct DeletionFile {
     pub file_type: DeletionFileType,
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
+    pub base_id: Option<u32>,
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -212,6 +220,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             id: value.id,
             file_type,
             num_deleted_rows,
+            base_id: value.base_id,
         })
     }
 }
@@ -453,6 +462,7 @@ impl From<&Fragment> for pb::DataFragment {
                 id: f.id,
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
+                base_id: f.base_id,
             }
         });
 
@@ -523,6 +533,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            base_id: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -545,6 +556,7 @@ mod tests {
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
+            base_id: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();
@@ -557,10 +569,10 @@ mod tests {
                 "files":[
                     {"path": "foobar.lance", "fields": [0], "column_indices": [], 
                      "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null }
+                     "file_size_bytes": null, "base_id": null }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
-                                  "num_deleted_rows": 10},
+                                  "num_deleted_rows": 10, "base_id": null},
                 "physical_rows": None::<usize>}),
         );
 

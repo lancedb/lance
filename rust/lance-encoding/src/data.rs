@@ -19,11 +19,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
-use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, OffsetSizeTrait, UInt64Array};
+use arrow_array::{
+    cast::AsArray, new_empty_array, new_null_array, Array, ArrayRef, OffsetSizeTrait, UInt64Array,
+};
 use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
 };
+use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
 use snafu::location;
@@ -1559,10 +1561,11 @@ impl DataBlockBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
-        make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
-        StringArray, UInt16Array, UInt8Array,
+        make_array, new_null_array,
+        types::{Int32Type, Int8Type},
+        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt16Array,
+        UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
@@ -1574,7 +1577,6 @@ mod tests {
 
     use super::{AllNullDataBlock, DataBlock};
 
-    use arrow::compute::concat;
     use arrow_array::Array;
 
     #[test]
@@ -1920,7 +1922,7 @@ mod tests {
         let arr3 = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9);
 
-        let concatenated_array = concat(&[
+        let concatenated_array = arrow_select::concat::concat(&[
             &*Arc::new(arr1.clone()) as &dyn Array,
             &*Arc::new(arr2.clone()) as &dyn Array,
             &*Arc::new(arr3.clone()) as &dyn Array,
