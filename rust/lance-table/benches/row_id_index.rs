@@ -23,7 +23,9 @@ use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::deletion::DeletionVector;
 use lance_io::ReadBatchParams;
+use lance_table::rowids::FragmentRowIdIndex;
 use lance_table::{
     rowids::{write_row_ids, RowIdIndex, RowIdSequence},
     utils::stream::{apply_row_id_and_deletes, RowIdAndDeletesConfig},
@@ -111,12 +113,22 @@ fn bench_creation(c: &mut Criterion) {
 
     for percent_deletions in [0.0, 0.25, 0.5] {
         let sequences = make_frag_sequences(num_rows(), 100, percent_deletions);
+
+        let fragment_indices: Vec<FragmentRowIdIndex> = sequences
+            .iter()
+            .map(|(frag_id, sequence)| FragmentRowIdIndex {
+                fragment_id: *frag_id,
+                row_id_sequence: sequence.clone(),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            })
+            .collect();
+
         group.bench_with_input(
             BenchmarkId::new("BuildIndex", percent_deletions),
             &percent_deletions,
             |b, _| {
                 b.iter(|| {
-                    let _index = RowIdIndex::new(&sequences, false).unwrap();
+                    let _index = RowIdIndex::new(&fragment_indices).unwrap();
                 });
             },
         );
@@ -189,7 +201,17 @@ fn bench_get_single(c: &mut Criterion) {
 
     for percent_deletions in [0.0, 0.02, 0.25, 0.5, 0.8] {
         let sequences = make_frag_sequences(num_rows(), 100, percent_deletions);
-        let index = RowIdIndex::new(&sequences, false).unwrap();
+
+        let fragment_indices: Vec<FragmentRowIdIndex> = sequences
+            .iter()
+            .map(|(frag_id, sequence)| FragmentRowIdIndex {
+                fragment_id: *frag_id,
+                row_id_sequence: sequence.clone(),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            })
+            .collect();
+
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
 
         let mut i = 0;
         let total_rows: u64 = num_rows();

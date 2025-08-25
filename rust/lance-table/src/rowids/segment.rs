@@ -204,8 +204,15 @@ impl U64Segment {
     }
 
     pub fn from_slice(slice: &[u64]) -> Self {
-        let stats = Self::compute_stats(slice.iter().copied());
-        Self::from_stats_and_sequence(stats, slice.iter().copied())
+        Self::from_iter(slice.iter().copied())
+    }
+}
+
+impl FromIterator<u64> for U64Segment {
+    fn from_iter<T: IntoIterator<Item = u64>>(iter: T) -> Self {
+        let values: Vec<u64> = iter.into_iter().collect();
+        let stats = Self::compute_stats(values.iter().copied());
+        Self::from_stats_and_sequence(stats, values)
     }
 }
 
