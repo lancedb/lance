@@ -3147,19 +3147,6 @@ mod tests {
 
         // Create a schema with both vector and scalar columns
         let dimensions = 16u32;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("category", DataType::Utf8, false),
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dimensions as i32,
-                ),
-                false,
-            ),
-        ]));
-
         // Generate test data using lance_datagen (300 rows to satisfy PQ training requirements)
         let data = gen_batch()
             .col("id", array::step::<Int32Type>())
@@ -3172,8 +3159,6 @@ mod tests {
 
         // Create initial dataset
         let mut dataset = Dataset::write(data, test_uri, None).await.unwrap();
-        println!("✅ Created initial dataset with 300 rows");
-
         // Create vector index (IVF_PQ)
         let vector_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 10);
         dataset
@@ -3186,7 +3171,6 @@ mod tests {
             )
             .await
             .unwrap();
-        println!("✅ Created vector index");
 
         // Create scalar index (BTree)
         dataset
@@ -3199,7 +3183,6 @@ mod tests {
             )
             .await
             .unwrap();
-        println!("✅ Created scalar index");
 
         // Verify indices were created
         let indices = dataset.load_indices().await.unwrap();
@@ -3207,7 +3190,6 @@ mod tests {
         let index_names: HashSet<String> = indices.iter().map(|idx| idx.name.clone()).collect();
         assert!(index_names.contains("vector_idx"));
         assert!(index_names.contains("category_idx"));
-        println!("✅ Verified indices creation");
 
         // Test scalar query on source dataset
         let scalar_results = dataset
@@ -3223,7 +3205,6 @@ mod tests {
             scalar_results.num_rows() > 0,
             "Scalar query should return results"
         );
-        println!("✅ Scalar query works on source dataset");
 
         // Create tag for shallow cloning
         dataset
@@ -3237,7 +3218,6 @@ mod tests {
             .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
             .await
             .unwrap();
-        println!("✅ Performed shallow clone");
 
         // Verify cloned dataset has indices
         let cloned_indices = cloned_dataset.load_indices().await.unwrap();
@@ -3251,22 +3231,8 @@ mod tests {
         assert!(cloned_index_names.contains("vector_idx"));
         assert!(cloned_index_names.contains("category_idx"));
 
-        // Debug: Check base_id of cloned indices
-        for index in cloned_indices.iter() {
-            println!("🔍 Index '{}' has base_id: {:?}", index.name, index.base_id);
-        }
-
-        // Debug: Check base_paths in cloned dataset
-        println!(
-            "🔍 Cloned dataset base_paths: {:?}",
-            cloned_dataset.manifest.base_paths
-        );
-
-        println!("✅ Verified cloned dataset has indices");
-
         // Test vector search on cloned dataset
         let query_vector = generate_random_array(dimensions as usize);
-
         let search_results = cloned_dataset
             .scan()
             .nearest("vector", &query_vector, 5)
@@ -3281,7 +3247,6 @@ mod tests {
             search_results.num_rows() > 0,
             "Vector search should return results"
         );
-        println!("✅ Vector search works on cloned dataset");
 
         // Test scalar query on cloned dataset
         let scalar_results = cloned_dataset
@@ -3297,7 +3262,6 @@ mod tests {
             scalar_results.num_rows(),
             "Scalar query should return results"
         );
-        println!("✅ Scalar query works on cloned dataset");
 
         // Append new data to cloned dataset using lance_datagen
         let new_data = gen_batch()
@@ -3319,7 +3283,6 @@ mod tests {
         )
         .await
         .unwrap();
-        println!("✅ Appended new data to cloned dataset");
 
         // Test scalar query on cloned dataset after appending
         let scalar_results = cloned_dataset
@@ -3350,18 +3313,15 @@ mod tests {
             source_scalar_query_rows
         );
 
-        println!("✅ Scalar query works on cloned dataset after append");
         // Verify row count increased
         let total_rows = updated_cloned_dataset.count_rows(None).await.unwrap();
         assert_eq!(total_rows, 350, "Should have 350 rows after append");
-        println!("✅ Verified row count after append");
 
         // Call optimize_indices
         updated_cloned_dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
-        println!("✅ Optimized indices");
 
         // Test vector search after optimization (should find both old and new data)
         let query_vector = generate_random_array(dimensions as usize);
@@ -3380,7 +3340,6 @@ mod tests {
             optimized_search_results.num_rows() > 0,
             "Vector search should work after optimization"
         );
-        println!("✅ Vector search works after optimization");
 
         // Test scalar query after optimization (should find both old and new data)
         let old_category_results = updated_cloned_dataset
@@ -3409,7 +3368,6 @@ mod tests {
             new_category_results.num_rows() > 0,
             "Should find new category data"
         );
-        println!("✅ Can query both old and new data after optimization");
 
         // Verify index statistics
         let vector_stats: serde_json::Value = serde_json::from_str(
@@ -3429,8 +3387,5 @@ mod tests {
 
         assert_eq!(vector_stats["num_indexed_rows"].as_u64().unwrap(), 350);
         assert_eq!(category_stats["num_indexed_rows"].as_u64().unwrap(), 350);
-        println!("✅ Index statistics show all rows are indexed");
-
-        println!("🎉 Both vector and scalar indexes for shallow cloning testcases passed!");
     }
 }
