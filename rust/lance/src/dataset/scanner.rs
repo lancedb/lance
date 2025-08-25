@@ -3686,6 +3686,7 @@ mod test {
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
+    use arrow_schema::Fields;
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
     use half::f16;
@@ -3923,6 +3924,63 @@ mod test {
             assert_eq!(batch, expected_batch);
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nested_projection() {
+        let point_fields: Fields = vec![
+            ArrowField::new("x", DataType::Float32, true),
+            ArrowField::new("y", DataType::Float32, true),
+        ]
+        .into();
+        let metadata_fields: Fields = vec![
+            ArrowField::new("location", DataType::Struct(point_fields), true),
+            ArrowField::new("age", DataType::Int32, true),
+        ]
+        .into();
+        let metadata_field = ArrowField::new("metadata", DataType::Struct(metadata_fields), true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            metadata_field,
+            ArrowField::new("idx", DataType::Int32, true),
+        ]));
+        let data = lance_datagen::rand(&schema)
+            .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
+            .await
+            .unwrap();
+
+        let mut scan = data.scan();
+        scan.project(&["metadata.location.x", "metadata.age"])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("metadata.location.x", DataType::Float32, true),
+                ArrowField::new("metadata.age", DataType::Int32, true),
+            ])
+        );
+
+        // 0 - metadata
+        // 2 - x
+        // 4 - age
+        let take_schema = data.schema().project_by_ids(&[0, 2, 4], false);
+
+        let taken = data.take_rows(&[0, 5], take_schema).await.unwrap();
+
+        // The expected schema drops y from the location field
+        let part_point_fields = Fields::from(vec![ArrowField::new("x", DataType::Float32, true)]);
+        let part_metadata_fields = Fields::from(vec![
+            ArrowField::new("location", DataType::Struct(part_point_fields), true),
+            ArrowField::new("age", DataType::Int32, true),
+        ]);
+        let part_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "metadata",
+            DataType::Struct(part_metadata_fields),
+            true,
+        )]));
+
+        assert_eq!(taken.schema(), part_schema);
     }
 
     #[rstest]
