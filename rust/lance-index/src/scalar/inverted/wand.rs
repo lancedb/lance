@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
@@ -333,7 +334,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         match (mask.max_len(), mask.iter_ids()) {
             (Some(num_rows_matched), Some(row_ids))
                 if num_rows_matched * 100
-                    <= *FLAT_SEARCH_PERCENT_THRESHOLD * self.docs.len() as u64 =>
+                    <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
             {
                 return self.flat_search(params, row_ids, metrics);
             }
