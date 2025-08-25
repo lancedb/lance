@@ -2897,6 +2897,7 @@ mod tests {
             Arc::new(original_fragments),
             DataStorageFormat::new(LanceFileVersion::V2_0),
             None,
+            HashMap::new(),
         );
 
         // Test 1: Empty fragments should fail
