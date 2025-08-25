@@ -284,6 +284,7 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::{prelude::Strategy, prop_assert_eq};
 
     #[test]
     fn test_new_index() {
@@ -328,7 +329,6 @@ mod tests {
 
     #[test]
     fn test_new_index_overlap() {
-        // TODO: what if the row ids are not internally sorted?
         let fragment_indices = vec![
             FragmentRowIdIndex {
                 fragment_id: 23,
@@ -368,6 +368,51 @@ mod tests {
     }
 
     #[test]
+    fn test_new_index_unsorted_row_ids() {
+        // Test case with unsorted row ids within fragments
+        let fragment_indices = vec![
+            FragmentRowIdIndex {
+                fragment_id: 10,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Array(
+                    vec![9, 3, 6].into(), // Unsorted array
+                )])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+            FragmentRowIdIndex {
+                fragment_id: 20,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Array(
+                    vec![8, 2, 5].into(), // Unsorted array
+                )])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+            FragmentRowIdIndex {
+                fragment_id: 30,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Array(
+                    vec![7, 1, 4].into(), // Unsorted array
+                )])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+        ];
+
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+
+        // Check that all row ids can be found regardless of their order in the segments
+        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(30, 1)));
+        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(20, 1)));
+        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(10, 1)));
+        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(30, 2)));
+        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 2)));
+        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(10, 2)));
+        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(30, 0)));
+        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(20, 0)));
+        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(10, 0)));
+
+        // Check that non-existent row ids return None
+        assert_eq!(index.get(0), None);
+        assert_eq!(index.get(10), None);
+    }
+
+    #[test]
     fn test_new_index_partial_overlap() {
         let fragment_indices = vec![
             FragmentRowIdIndex {
@@ -393,5 +438,140 @@ mod tests {
         assert_eq!(index.get(50), Some(RowAddress::new_from_parts(1, 0)));
         assert_eq!(index.get(51), Some(RowAddress::new_from_parts(0, 50)));
         assert_eq!(index.get(99), Some(RowAddress::new_from_parts(0, 98)));
+    }
+
+    #[test]
+    fn test_index_with_deletion_vector() {
+        let deletion_vector = DeletionVector::from_iter(vec![2, 3]);
+
+        let fragment_indices = vec![FragmentRowIdIndex {
+            fragment_id: 10,
+            row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Range(0..6)])),
+            deletion_vector: Arc::new(deletion_vector),
+        }];
+
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+
+        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
+        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 1)));
+        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 4)));
+        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(10, 5)));
+
+        assert_eq!(index.get(2), None);
+        assert_eq!(index.get(3), None);
+    }
+
+    #[test]
+    fn test_empty_fragment_sequences() {
+        let fragment_indices = vec![
+            FragmentRowIdIndex {
+                fragment_id: 10,
+                row_id_sequence: Arc::new(RowIdSequence(vec![])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+            FragmentRowIdIndex {
+                fragment_id: 20,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Range(5..8)])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+        ];
+
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+
+        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 0)));
+        assert_eq!(index.get(7), Some(RowAddress::new_from_parts(20, 2)));
+        assert_eq!(index.get(4), None);
+    }
+
+    #[test]
+    fn test_completely_empty_index() {
+        let fragment_indices = vec![];
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+
+        assert_eq!(index.get(0), None);
+        assert_eq!(index.get(100), None);
+    }
+
+    #[test]
+    fn test_non_overlapping_ranges() {
+        let fragment_indices = vec![
+            FragmentRowIdIndex {
+                fragment_id: 10,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Range(0..5)])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+            FragmentRowIdIndex {
+                fragment_id: 20,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Range(5..10)])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+            FragmentRowIdIndex {
+                fragment_id: 30,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Range(10..15)])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+        ];
+
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+
+        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(10, 0)));
+        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(10, 4)));
+        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(20, 0)));
+        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(20, 4)));
+        assert_eq!(index.get(10), Some(RowAddress::new_from_parts(30, 0)));
+        assert_eq!(index.get(14), Some(RowAddress::new_from_parts(30, 4)));
+    }
+
+    fn arbitrary_row_ids(
+        num_fragments_range: std::ops::Range<usize>,
+        frag_size_range: std::ops::Range<usize>,
+    ) -> impl Strategy<Value = Vec<(u32, Arc<RowIdSequence>)>> {
+        let fragment_sizes = proptest::collection::vec(frag_size_range, num_fragments_range);
+        fragment_sizes.prop_flat_map(|fragment_sizes| {
+            let num_rows = fragment_sizes.iter().sum::<usize>() as u64;
+            let row_ids = 0..num_rows;
+            let row_ids = row_ids.collect::<Vec<_>>();
+            let row_ids_shuffled = proptest::strategy::Just(row_ids).prop_shuffle();
+            row_ids_shuffled.prop_map(move |row_ids| {
+                let mut sequences = Vec::with_capacity(fragment_sizes.len());
+                let mut i = 0;
+                for size in &fragment_sizes {
+                    let end = i + size;
+                    let sequence =
+                        RowIdSequence(vec![U64Segment::from_slice(row_ids[i..end].into())]);
+                    sequences.push((i as u32, Arc::new(sequence)));
+                    i = end;
+                }
+                sequences
+            })
+        })
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_new_index_robustness(row_ids in arbitrary_row_ids(0..5, 0..32)) {
+            let fragment_indices: Vec<FragmentRowIdIndex> = row_ids
+                .iter()
+                .map(|(frag_id, sequence)| FragmentRowIdIndex {
+                    fragment_id: *frag_id,
+                    row_id_sequence: sequence.clone(),
+                    deletion_vector: Arc::new(DeletionVector::default()),
+                })
+                .collect();
+
+            let index = RowIdIndex::new(&fragment_indices).unwrap();
+            for (frag_id, sequence) in row_ids.iter() {
+                for (local_offset, row_id) in sequence.iter().enumerate() {
+                    prop_assert_eq!(
+                        index.get(row_id),
+                        Some(RowAddress::new_from_parts(*frag_id, local_offset as u32)),
+                        "Row id {} in sequence {:?} not found in index {:?}",
+                        row_id,
+                        sequence,
+                        index
+                    );
+                }
+            }
+        }
     }
 }
