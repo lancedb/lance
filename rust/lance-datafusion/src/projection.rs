@@ -142,7 +142,7 @@ impl ProjectionPlan {
     ///
     /// For example, if the schema is:
     ///
-    /// ```
+    /// ```ignore
     /// {
     ///   "metadata": {
     ///     "location": {
@@ -156,7 +156,7 @@ impl ProjectionPlan {
     ///
     /// It is possible to project a partial schema that drops `y` like:
     ///
-    /// ```
+    /// ```ignore
     /// {
     ///   "metadata": {
     ///     "location": {
