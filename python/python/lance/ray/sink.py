@@ -43,10 +43,11 @@ def _pd_to_arrow(
         return pa.Table.from_pydict(df, schema=schema)
     elif _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
         tbl = pa.Table.from_pandas(df, schema=schema)
-        tbl.schema = tbl.schema.remove_metadata()
-        return tbl
+        new_schema = tbl.schema.remove_metadata()
+        new_table = tbl.replace_schema_metadata(new_schema.metadata)
+        return new_table
     elif isinstance(df, pa.Table):
-        if schema is not None:
+        if len(df.schema.names) > 0 and schema is not None:
             return df.cast(schema)
     return df
 
