@@ -19,7 +19,6 @@ use datafusion_physical_plan::metrics::BaselineMetrics;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 
 use lance_index::metrics::MetricsCollector;
@@ -396,7 +395,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
-        let metrics_clone2 = metrics.clone();
         let unindexed_input = self.unindexed_input.execute(partition, context)?;
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
@@ -404,7 +402,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
             query.terms
         )))?;
 
-        let timer = std::time::Instant::now();
         let stream = stream::once(async move {
             let index_meta = ds
                 .load_scalar_index(
@@ -445,13 +442,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     .record_output(batch.num_rows());
             }
             batch
-        })
-        .finally(move || {
-            metrics_clone2
-                .baseline_metrics
-                .elapsed_compute()
-                .add_elapsed(timer);
-            metrics_clone2.baseline_metrics.done();
         });
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
