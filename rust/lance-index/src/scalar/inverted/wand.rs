@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
 
@@ -28,6 +28,13 @@ use super::{
     query::Operator,
     scorer::{idf, K1},
 };
+
+pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse::<u64>()
+        .unwrap_or(10)
+});
 
 pub struct PostingIterator {
     token: String,
@@ -323,11 +330,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
-        let avg_posting_length =
-            self.postings.iter().map(|p| p.list.len()).sum::<usize>() / self.postings.len();
         match (mask.max_len(), mask.iter_ids()) {
             (Some(num_rows_matched), Some(row_ids))
-                if num_rows_matched <= avg_posting_length as u64 =>
+                if num_rows_matched * 100
+                    <= *FLAT_SEARCH_PERCENT_THRESHOLD * self.docs.len() as u64 =>
             {
                 return self.flat_search(params, row_ids, metrics);
             }
