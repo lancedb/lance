@@ -1099,7 +1099,7 @@ def test_vector_with_nans(tmp_path: Path):
     tbl = pa.Table.from_pydict({"vector": fsl})
 
     dataset = lance.write_dataset(tbl, tmp_path)
-    row = dataset._take_rows([1])
+    row = dataset.take_rows([1])
     assert row["vector"]
 
     ds = dataset.create_index(
