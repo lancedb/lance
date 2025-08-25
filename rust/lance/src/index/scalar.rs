@@ -445,7 +445,14 @@ pub async fn open_scalar_index(
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
-    let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, &uuid_str));
+    let index_dir = dataset.indice_files_dir(index)?.child(uuid_str.as_str());
+    let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+    let index_store = Arc::new(LanceIndexStore::new(
+        dataset.object_store.clone(),
+        index_dir,
+        Arc::new(cache),
+    ));
+
     let index_type = detect_scalar_index_type(dataset, index, column).await?;
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 
@@ -486,10 +493,12 @@ pub async fn open_scalar_index(
 
 async fn infer_scalar_index_type(
     dataset: &Dataset,
-    index_uuid: &str,
+    index: &Index,
     column: &str,
 ) -> Result<ScalarIndexType> {
-    let index_dir = dataset.indices_dir().child(index_uuid.to_string());
+    let index_dir = dataset
+        .indice_files_dir(index)?
+        .child(index.uuid.to_string());
     let col = dataset.schema().field(column).ok_or(Error::Internal {
         message: format!(
             "Index refers to column {} which does not exist in dataset schema",
@@ -550,7 +559,7 @@ pub async fn detect_scalar_index_type(
         if let Some(index_type) = dataset.index_cache.get_with_key(&type_key).await {
             return Ok(*index_type.as_ref());
         }
-        let index_type = infer_scalar_index_type(dataset, &index.uuid.to_string(), column).await?;
+        let index_type = infer_scalar_index_type(dataset, index, column).await?;
         dataset
             .index_cache
             .insert_with_key(&type_key, Arc::new(index_type))
@@ -693,6 +702,7 @@ mod tests {
             index_details,
             index_version: 0,
             created_at: None,
+            base_id: None,
         }
     }
 

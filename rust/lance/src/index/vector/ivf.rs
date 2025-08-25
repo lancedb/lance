@@ -2282,6 +2282,7 @@ mod tests {
             index_details: Some(vector_index_details()),
             index_version: index.index_type().version(),
             created_at: None, // Test index, not setting timestamp
+            base_id: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));

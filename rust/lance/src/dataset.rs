@@ -1254,6 +1254,32 @@ impl Dataset {
         }
     }
 
+    /// Get the indices directory for a specific index, considering its base_id
+    pub(crate) fn indice_files_dir(&self, index: &Index) -> Result<Path> {
+        match index.base_id.as_ref() {
+            Some(base_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(base_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "base_path id {} not found for index {}",
+                            base_id, index.uuid
+                        ),
+                        location!(),
+                    )
+                })?;
+                let path = Path::parse(base_path.path.as_str())?;
+                if base_path.is_dataset_root {
+                    Ok(path.child(INDICES_DIR))
+                } else {
+                    // For non-dataset-root base paths, we assume the path already points to the indices directory
+                    Ok(path)
+                }
+            }
+            None => Ok(self.base.child(INDICES_DIR)),
+        }
+    }
+
     pub fn session(&self) -> Arc<Session> {
         self.session.clone()
     }

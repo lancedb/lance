@@ -276,6 +276,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_details: Some(index_details),
             index_version: self.index_type.version(),
             created_at: Some(chrono::Utc::now()),
+            base_id: None,
         };
         let transaction = Transaction::new(
             self.dataset.manifest.version,

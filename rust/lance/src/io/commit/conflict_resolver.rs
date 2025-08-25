@@ -1959,6 +1959,7 @@ mod tests {
             index_details: None,
             index_version: 0,
             created_at: None, // Test index, not setting timestamp
+            base_id: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);

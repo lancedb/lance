@@ -622,6 +622,8 @@ impl Dataset {
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
+                // Convert base_id from Option<u32> to Optional[int] for Python
+                dict.set_item("base_id", idx.base_id.map(|id| id as i64)).unwrap();
                 dict.into_py_any(py)
             })
             .collect::<PyResult<Vec<_>>>()
