@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -437,6 +437,66 @@ impl Manifest {
     pub fn should_use_legacy_format(&self) -> bool {
         self.data_storage_format.version == LEGACY_FORMAT_VERSION
     }
+
+    /// Get the summary information of a manifest.
+    ///
+    /// This function calculates various statistics about the manifest, including:
+    /// - total-records: Total number of records in the dataset
+    /// - total-file-sizes: Total size of all data files in bytes
+    /// - total-fragments: Number of fragments in the dataset
+    /// - total-data-files: Total number of data files across all fragments
+    /// - total-deletions: Total number of deleted records
+    /// - total-deletion-files: Number of fragments with deletion files
+    ///
+    /// # Returns
+    ///  A BTreeMap containing the calculated metadata
+    pub fn summary(&self) -> BTreeMap<String, String> {
+        let mut metadata = BTreeMap::new();
+
+        // Calculate total fragments
+        let total_fragments = self.fragments.len();
+        metadata.insert("total-fragments".to_string(), total_fragments.to_string());
+
+        // Calculate total data files
+        let total_data_files: usize = self.fragments.iter().map(|f| f.files.len()).sum();
+        metadata.insert("total-data-files".to_string(), total_data_files.to_string());
+
+        // Calculate total records
+        let total_records: usize = self.fragments.iter().filter_map(|f| f.num_rows()).sum();
+        metadata.insert("total-records".to_string(), total_records.to_string());
+
+        // Calculate total file sizes
+        let total_file_sizes: u64 = self
+            .fragments
+            .iter()
+            .flat_map(|f| &f.files)
+            .filter_map(|df| df.file_size_bytes.get())
+            .map(|size| size.get())
+            .sum();
+        metadata.insert("total-file-sizes".to_string(), total_file_sizes.to_string());
+
+        // Calculate total deletion files
+        let total_deletion_files = self
+            .fragments
+            .iter()
+            .filter(|f| f.deletion_file.is_some())
+            .count();
+        metadata.insert(
+            "total-deletion-files".to_string(),
+            total_deletion_files.to_string(),
+        );
+
+        // Calculate total deletions
+        let total_deletions: usize = self
+            .fragments
+            .iter()
+            .filter_map(|f| f.deletion_file.as_ref())
+            .filter_map(|df| df.num_deleted_rows)
+            .sum();
+        metadata.insert("total-deletions".to_string(), total_deletions.to_string());
+
+        metadata
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -786,12 +846,13 @@ impl SelfDescribingFileReader for FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::format::DataFile;
+    use crate::format::{DataFile, DeletionFile, DeletionFileType};
 
     use super::*;
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_writer_version() {
@@ -942,5 +1003,112 @@ mod tests {
         config.remove("other-key");
         manifest.delete_config_keys(&["other-key"]);
         assert_eq!(manifest.config, config);
+    }
+
+    #[test]
+    fn test_manifest_summary() {
+        // Step 1: test empty manifest summary
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", arrow_schema::DataType::Int64, false),
+            ArrowField::new("name", arrow_schema::DataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let empty_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let empty_summary = empty_manifest.summary();
+        assert_eq!(empty_summary.get("total-records").unwrap(), "0");
+        assert_eq!(empty_summary.get("total-file-sizes").unwrap(), "0");
+        assert_eq!(empty_summary.get("total-fragments").unwrap(), "0");
+        assert_eq!(empty_summary.get("total-data-files").unwrap(), "0");
+        assert_eq!(empty_summary.get("total-deletions").unwrap(), "0");
+        assert_eq!(empty_summary.get("total-deletion-files").unwrap(), "0");
+        assert_eq!(empty_summary.len(), 6);
+
+        // Step 2: write empty files and verify summary
+        let empty_fragments = vec![
+            Fragment::with_file_legacy(0, "empty_file1.lance", &schema, Some(0)),
+            Fragment::with_file_legacy(1, "empty_file2.lance", &schema, Some(0)),
+        ];
+
+        let empty_files_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(empty_fragments),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let empty_files_summary = empty_files_manifest.summary();
+        assert_eq!(empty_files_summary.get("total-records").unwrap(), "0");
+        assert_eq!(empty_files_summary.get("total-file-sizes").unwrap(), "0"); // 文件大小未知时为0
+        assert_eq!(empty_files_summary.get("total-fragments").unwrap(), "2");
+        assert_eq!(empty_files_summary.get("total-data-files").unwrap(), "2");
+        assert_eq!(empty_files_summary.get("total-deletions").unwrap(), "0");
+        assert_eq!(
+            empty_files_summary.get("total-deletion-files").unwrap(),
+            "0"
+        );
+        assert_eq!(empty_files_summary.len(), 6);
+
+        // Step 3: write real data and verify summary
+        let real_fragments = vec![
+            Fragment::with_file_legacy(0, "data_file1.lance", &schema, Some(100)),
+            Fragment::with_file_legacy(1, "data_file2.lance", &schema, Some(250)),
+            Fragment::with_file_legacy(2, "data_file3.lance", &schema, Some(75)),
+        ];
+
+        let real_data_manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(real_fragments),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let real_data_summary = real_data_manifest.summary();
+        assert_eq!(real_data_summary.get("total-records").unwrap(), "425"); // 100 + 250 + 75
+        assert_eq!(real_data_summary.get("total-file-sizes").unwrap(), "0"); // 文件大小未知时为0
+        assert_eq!(real_data_summary.get("total-fragments").unwrap(), "3");
+        assert_eq!(real_data_summary.get("total-data-files").unwrap(), "3");
+        assert_eq!(real_data_summary.get("total-deletions").unwrap(), "0");
+        assert_eq!(real_data_summary.get("total-deletion-files").unwrap(), "0");
+        assert_eq!(real_data_summary.len(), 6);
+
+        // Step 4: write deletion files and verify summary
+        let mut fragment_with_deletion =
+            Fragment::with_file_legacy(0, "data_with_deletion.lance", &schema, Some(50));
+        fragment_with_deletion.deletion_file = Some(DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(10),
+            base_id: None,
+        });
+
+        let manifest_with_deletion = Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_deletion]),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        let deletion_summary = manifest_with_deletion.summary();
+        assert_eq!(deletion_summary.get("total-records").unwrap(), "40"); // 50 - 10 (删除的行数)
+        assert_eq!(deletion_summary.get("total-file-sizes").unwrap(), "0");
+        assert_eq!(deletion_summary.get("total-fragments").unwrap(), "1");
+        assert_eq!(deletion_summary.get("total-data-files").unwrap(), "1");
+        assert_eq!(deletion_summary.get("total-deletions").unwrap(), "10");
+        assert_eq!(deletion_summary.get("total-deletion-files").unwrap(), "1");
+
+        // 验证 BTreeMap 只包含这6个字段
+        assert_eq!(deletion_summary.len(), 6);
     }
 }
