@@ -243,7 +243,11 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        if dest.dataset().is_none() && !matches!(transaction.operation, Operation::Overwrite { .. })
+        if dest.dataset().is_none()
+            && !matches!(
+                transaction.operation,
+                Operation::Overwrite { .. } | Operation::Clone { .. }
+            )
         {
             return Err(Error::DatasetNotFound {
                 path: base_path.to_string(),
@@ -499,6 +503,7 @@ mod tests {
                 file_major_version: 2,
                 file_minor_version: 0,
                 file_size_bytes: CachedFileSize::new(100),
+                base_id: None,
             }],
             deletion_file: None,
             row_id_meta: None,

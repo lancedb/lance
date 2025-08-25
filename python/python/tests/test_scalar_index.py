@@ -721,6 +721,38 @@ def test_fts_score(tmp_path):
     assert results["id"].to_pylist() == [3, 2, 1]
 
 
+def test_fts_with_filter(tmp_path):
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "text": ["lance database test", "full text search", "lance search text"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("id", "BTREE")
+    ds.create_scalar_index("text", "INVERTED")
+
+    results = ds.to_table(full_text_query="lance search text")
+    assert results.num_rows == 3
+    assert results["id"].to_pylist() == [3, 2, 1]
+
+    score_id1 = results.column("_score")[2].as_py()
+
+    results = ds.to_table(
+        full_text_query="lance search text",
+        filter="id <= 1",
+        prefilter=True,
+    )
+    assert results.num_rows == 1
+    assert results["id"].to_pylist() == [1]
+    assert results.column("_score")[0].as_py() == score_id1
+
+    plan = ds.scanner(
+        full_text_query="lance search text", filter="id <= 1", prefilter=True
+    ).analyze_plan()
+    assert "index_comparisons=1" in plan
+
+
 def test_fts_on_list(tmp_path):
     data = pa.table(
         {

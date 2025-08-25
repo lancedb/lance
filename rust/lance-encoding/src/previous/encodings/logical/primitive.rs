@@ -3,8 +3,7 @@
 
 use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
-use arrow::array::AsArray;
-use arrow_array::{make_array, Array, ArrayRef};
+use arrow_array::{cast::AsArray, make_array, Array, ArrayRef};
 use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};

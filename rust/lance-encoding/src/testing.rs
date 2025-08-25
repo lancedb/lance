@@ -9,8 +9,8 @@ use crate::{
     format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
 };
 
-use arrow::array::make_comparator;
 use arrow_array::{Array, StructArray, UInt64Array};
+use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
