@@ -71,8 +71,8 @@ public class ReadOptions {
 
     private Optional<Integer> version = Optional.empty();
     private Optional<Integer> blockSize = Optional.empty();
-    private long indexCacheSizeBytes = 6 * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
-    private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
+    private int indexCacheSize = 256;
+    private int metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
 
     /**
