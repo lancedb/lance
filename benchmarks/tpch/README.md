@@ -1,10 +1,36 @@
-***Compare lance vs parquet for TPCH Q1 and Q6 using SF1 dataset***
+# TPC-H
 
-**Steps to run the benchmark:**
+Compares Lance with Parquet, using `duckdb` as the query engine. Uses the default options for both formats.
 
-1. `cd lance/benchmarks/tpch`
-2. `mkdir dataset && cd dataset`
-3. download parquet file lineitem from : "https://github.com/cwida/duckdb-data/releases/download/v1.0/lineitemsf1.snappy.parquet"; then rename it to "lineitem_sf1.parquet"
-4. generate lance file from the parquet file in the same directory
-5. `cd ..`
-6. `python3 benchmark.py q1`
+## Setting Up
+
+```shell
+cd benchmarks/tpch
+python3 -m venv .venv
+source .venv/bin/activate # unix
+# .venv\Scripts\activate # windows
+pip3 install pylance duckdb pyarrow matplotlib pandas
+```
+
+## Running
+
+```shell
+# prints the results in the terminal and generates CSV and PNG files
+python3 benchmark.py ...
+```
+
+```
+usage: benchmark.py [-h] [-r RUNS] [-s SCALEFACTOR] [-d DATASET] [-l LOGGING_LEVEL]
+
+TPCH Benchmark
+
+options:
+  -h, --help            show this help message and exit
+  -r RUNS, --runs RUNS  Number of runs per query
+  -s SCALEFACTOR, --scalefactor SCALEFACTOR
+                        Scale of the TPC-H dataset
+  -d DATASET, --dataset DATASET
+                        Path to the dataset
+  -l LOGGING_LEVEL, --logging_level LOGGING_LEVEL
+                        Logging level
+```
