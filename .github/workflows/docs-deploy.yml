@@ -71,6 +71,7 @@ jobs:
           cat >> docs/src/integrations/.pages << 'EOF'
             - Ray: ray
           EOF
+          cp lance-ray/CONTRIBUTING.md docs/src/community/contributing/ray.md
       - name: Deploy
         working-directory: docs
         run: uv run mkdocs gh-deploy --force

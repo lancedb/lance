@@ -242,8 +242,6 @@ def test_s3_ddb_distributed_commit(s3_bucket: str, ddb_table: str):
     assert ds.count_rows() == 1024
 
 
-
-
 @pytest.mark.integration
 def test_file_writer_reader(s3_bucket: str):
     storage_options = copy.deepcopy(CONFIG)
@@ -264,8 +262,6 @@ def test_file_writer_reader(s3_bucket: str):
         bytes(reader.read_global_buffer(global_buffer_pos)).decode()
         == global_buffer_text
     )
-
-
 
 
 @pytest.mark.integration
