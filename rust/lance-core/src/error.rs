@@ -225,9 +225,19 @@ impl From<std::io::Error> for Error {
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+        match e {
+            object_store::Error::NotFound {
+                ref path,
+                source: _,
+            } => Self::DatasetNotFound {
+                path: path.clone(),
+                source: box_error(e),
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
+            _ => Self::IO {
+                source: box_error(e),
+                location: std::panic::Location::caller().to_snafu_location(),
+            },
         }
     }
 }
