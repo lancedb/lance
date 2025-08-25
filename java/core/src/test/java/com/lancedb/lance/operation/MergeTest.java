@@ -131,7 +131,7 @@ public class MergeTest extends OperationTestBase {
 
   @Test
   void testReplaceAsDiffColumns(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("testMergeNewColumn").toString();
+    String datasetPath = tempDir.resolve("testReplaceAsDiffColumns").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);

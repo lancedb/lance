@@ -28,18 +28,20 @@ import org.junit.jupiter.api.BeforeAll;
 import java.io.File;
 import java.util.Collections;
 import java.util.UUID;
+import org.junit.jupiter.api.TestInstance;
 
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 public class OperationTestBase {
 
   public static final int TEST_FILE_FORMAT_MAJOR_VERSION = 2;
   public static final int TEST_FILE_FORMAT_MINOR_VERSION = 0;
-  protected static Dataset dataset;
+  protected Dataset dataset;
 
   @BeforeAll
-  static void setup() {}
+  void setup() {}
 
   @AfterAll
-  static void tearDown() {
+  void tearDown() {
     // Cleanup resources used by the tests
     if (dataset != null) {
       dataset.close();
