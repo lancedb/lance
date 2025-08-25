@@ -3339,6 +3339,7 @@ class Index:
     fragment_ids: Set[int]
     index_version: int
     created_at: Optional[datetime] = None
+    base_id: Optional[int] = None
 
 
 class AutoCleanupConfig(TypedDict):

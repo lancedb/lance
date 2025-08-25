@@ -445,7 +445,14 @@ pub async fn open_scalar_index(
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
-    let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, &uuid_str));
+    let index_dir = dataset.indice_files_dir(index)?.child(uuid_str.as_str());
+    let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+    let index_store = Arc::new(LanceIndexStore::new(
+        dataset.object_store.clone(),
+        index_dir,
+        Arc::new(cache),
+    ));
+
     let index_type = detect_scalar_index_type(dataset, index, column).await?;
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 
@@ -695,6 +702,7 @@ mod tests {
             index_details,
             index_version: 0,
             created_at: None,
+            base_id: None,
         }
     }
 

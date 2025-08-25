@@ -119,10 +119,17 @@ impl IntoJava for Index {
             JObject::null()
         };
 
+        // Convert base_id from Option<u32> to Integer for Java
+        let base_id = if let Some(id) = self.base_id {
+            env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(id as i32)])?
+        } else {
+            JObject::null()
+        };
+
         // Create Index object
         Ok(env.new_object(
             "com/lancedb/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;J[B[BILjava/time/Instant;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;J[B[BILjava/time/Instant;Ljava/lang/Integer;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -132,6 +139,7 @@ impl IntoJava for Index {
                 JValue::Object(&index_details),
                 JValue::Int(self.index_version),
                 JValue::Object(&created_at),
+                JValue::Object(&base_id),
             ],
         )?)
     }
@@ -232,6 +240,13 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
                 .i()? as u32;
             Some(DateTime::from_timestamp(seconds, nanos).unwrap())
         };
+        let base_id_obj = env.get_field(self, "baseId", "Ljava/lang/Integer;")?.l()?;
+        let base_id = if base_id_obj.is_null() {
+            None
+        } else {
+            let id_value = env.call_method(&base_id_obj, "intValue", "()I", &[])?.i()? as u32;
+            Some(id_value)
+        };
 
         Ok(Index {
             uuid,
@@ -242,6 +257,7 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
             index_details,
             index_version,
             created_at,
+            base_id,
         })
     }
 }

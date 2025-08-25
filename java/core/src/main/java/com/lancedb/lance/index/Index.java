@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance.index;
 
+import org.apache.arrow.flatbuf.Int;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.time.Instant;
@@ -35,6 +36,7 @@ public class Index {
   private final byte[] indexDetails;
   private final int indexVersion;
   private final Instant createdAt;
+  private final Integer baseId;
 
   private Index(
       UUID uuid,
@@ -44,7 +46,8 @@ public class Index {
       byte[] fragmentBitmap,
       byte[] indexDetails,
       int indexVersion,
-      Instant createdAt) {
+      Instant createdAt,
+      Integer baseId) {
     this.uuid = uuid;
     this.fields = fields;
     this.name = name;
@@ -53,6 +56,7 @@ public class Index {
     this.indexDetails = indexDetails;
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
+    this.baseId = baseId;
   }
 
   public UUID uuid() {
@@ -94,6 +98,10 @@ public class Index {
     return Optional.ofNullable(indexDetails);
   }
 
+  public Optional<Integer> baseId() {
+    return Optional.ofNullable(baseId);
+  }
+
   /**
    * Get the index version.
    *
@@ -124,12 +132,13 @@ public class Index {
         && Objects.equals(name, index.name)
         && Arrays.equals(fragmentBitmap, index.fragmentBitmap)
         && Arrays.equals(indexDetails, index.indexDetails)
-        && Objects.equals(createdAt, index.createdAt);
+        && Objects.equals(createdAt, index.createdAt)
+        && Objects.equals(baseId, index.baseId);
   }
 
   @Override
   public int hashCode() {
-    int result = Objects.hash(uuid, fields, name, datasetVersion, indexVersion, createdAt);
+    int result = Objects.hash(uuid, fields, name, datasetVersion, indexVersion, createdAt, baseId);
     result = 31 * result + Arrays.hashCode(fragmentBitmap);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
@@ -144,6 +153,7 @@ public class Index {
         .append("datasetVersion", datasetVersion)
         .append("indexVersion", indexVersion)
         .append("createdAt", createdAt)
+        .append("baseId", baseId)
         .toString();
   }
 
@@ -166,6 +176,7 @@ public class Index {
     private byte[] indexDetails;
     private int indexVersion;
     private Instant createdAt;
+    private Integer baseId;
 
     private Builder() {}
 
@@ -209,6 +220,11 @@ public class Index {
       return this;
     }
 
+    public Builder baseId(Integer baseId) {
+      this.baseId = baseId;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -218,7 +234,8 @@ public class Index {
           fragmentBitmap,
           indexDetails,
           indexVersion,
-          createdAt);
+          createdAt,
+          baseId);
     }
   }
 }
