@@ -209,9 +209,24 @@ public class FragmentTest {
 
         assertEquals(totalRows - deleteCount, dataset3.countRows());
 
-        // Case 2. Test delete all rows
-
+        // Case 2. Test more some rows
         fragment = dataset3.getFragments().get(0);
+        rowAddrs = readAllAddrs(fragment);
+
+        int deleteCount2 = rowAddrs.size() / 2;
+        updateFragment = fragment.deleteByAddrs(rowAddrs.subList(0, deleteCount2));
+
+        assertNotNull(updateFragment);
+        assertNotNull(updateFragment.getDeletionFile());
+
+        update =
+            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+        Dataset dataset4 = dataset3.newTransactionBuilder().operation(update).build().commit();
+        assertEquals(totalRows - deleteCount - deleteCount2, dataset4.countRows());
+
+        // Case 3. Test delete all rows
+
+        fragment = dataset4.getFragments().get(0);
         rowAddrs = readAllAddrs(fragment);
 
         updateFragment = fragment.deleteByAddrs(rowAddrs);
@@ -222,9 +237,9 @@ public class FragmentTest {
             Update.builder()
                 .removedFragmentIds(Collections.singletonList(Long.valueOf(fragment.getId())))
                 .build();
-        Dataset dataset4 = dataset3.newTransactionBuilder().operation(update).build().commit();
+        Dataset dataset5 = dataset4.newTransactionBuilder().operation(update).build().commit();
 
-        assertEquals(0, dataset4.countRows());
+        assertEquals(0, dataset5.countRows());
       }
     }
   }
