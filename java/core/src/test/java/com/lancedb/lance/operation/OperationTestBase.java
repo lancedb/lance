@@ -93,7 +93,8 @@ public class OperationTestBase {
         columnIndices, // Just the same with fieldIndex for easy test
         TEST_FILE_FORMAT_MAJOR_VERSION, // File major version
         TEST_FILE_FORMAT_MINOR_VERSION, // File minor version
-        file.length() // File size in bytes (now contains actual data)
+        file.length(), // File size in bytes (now contains actual data)
+        null
         );
   }
 }
