@@ -13,7 +13,6 @@
  */
 package com.lancedb.lance.index;
 
-import org.apache.arrow.flatbuf.Int;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.time.Instant;
