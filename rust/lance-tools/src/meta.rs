@@ -22,9 +22,7 @@ impl fmt::Display for LanceToolFileMetadata {
 }
 
 impl LanceToolFileMetadata {
-    async fn open(
-        source: &String,
-    ) -> Result<Self> {
+    async fn open(source: &String) -> Result<Self> {
         let (object_store, path) = crate::util::get_object_store_and_path(source).await?;
         let scan_scheduler = ScanScheduler::new(
             object_store,
@@ -32,16 +30,19 @@ impl LanceToolFileMetadata {
                 io_buffer_size_bytes: 2 * 1024 * 1024 * 1024,
             },
         );
-        let file_scheduler = scan_scheduler.open_file(&path,  &CachedFileSize::unknown()).await?;
+        let file_scheduler = scan_scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await?;
         let file_metadata = FileReader::read_all_metadata(&file_scheduler).await?;
-        let lance_tool_file_metadata = LanceToolFileMetadata {
-            file_metadata,
-         };
+        let lance_tool_file_metadata = LanceToolFileMetadata { file_metadata };
         return Ok(lance_tool_file_metadata);
     }
 }
 
-pub (crate) async fn show_file_meta(mut writer: impl std::io::Write, args: &LanceFileMetaArgs) -> Result<()> {
+pub(crate) async fn show_file_meta(
+    mut writer: impl std::io::Write,
+    args: &LanceFileMetaArgs,
+) -> Result<()> {
     let metadata = LanceToolFileMetadata::open(&args.source).await?;
     writeln!(writer, "{}", metadata.to_string())?;
     return Ok(());

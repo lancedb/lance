@@ -7,7 +7,7 @@ use object_store::path::Path;
 use std::sync::Arc;
 
 /// Get an object store and a path from a source string.
-pub (crate) async fn get_object_store_and_path(source: &String) -> Result<(Arc<ObjectStore>, Path)> {
+pub(crate) async fn get_object_store_and_path(source: &String) -> Result<(Arc<ObjectStore>, Path)> {
     let path = Path::parse(source)?;
-    return Ok((Arc::new(ObjectStore::local()),  path));
+    return Ok((Arc::new(ObjectStore::local()), path));
 }

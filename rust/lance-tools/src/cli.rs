@@ -5,11 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use lance_core::Result;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "lance-tools",
-    about = "Tools for working with Lance",
-    version
-)]
+#[command(name = "lance-tools", about = "Tools for working with Lance", version)]
 pub struct LanceToolsArgs {
     /// Subcommand to run
     #[command(subcommand)]
@@ -18,6 +14,7 @@ pub struct LanceToolsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum LanceToolsCommand {
+    /// Commands for interacting with Lance files.
     File(LanceFileArgs),
 }
 
@@ -29,14 +26,15 @@ pub struct LanceFileArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum LanceFileCommand {
+    /// Display Lance file metadata.
     Meta(LanceFileMetaArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct LanceFileMetaArgs {
-    // The source file to examine.
+    // The Lance file to examine.
     #[arg(short = 's', long, value_name = "source")]
-    pub (crate) source: String,
+    pub(crate) source: String,
 }
 
 impl LanceToolsArgs {
