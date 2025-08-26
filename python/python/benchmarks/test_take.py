@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
+import tempfile
+import uuid
+
 import lance
 import numpy as np
 import pyarrow as pa
@@ -8,6 +12,19 @@ from lance import LanceDataset
 
 BATCH_SIZE = 1024
 TEST_LANCE_DATASET_NAME = "test.lance"
+ENV_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX = (
+    "LANCE_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX"
+)
+
+
+def get_path_prefixes():
+    temp_dir = tempfile.mkdtemp()
+    prefixes = ["memory://", f"file://{temp_dir}"]
+    object_store_path_prefix = os.getenv(ENV_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX, "")
+    if object_store_path_prefix:
+        prefixes.append(object_store_path_prefix)
+    return prefixes
+
 
 def create_dataset(
     path: str,
@@ -49,12 +66,26 @@ def create_dataset(
         batches.append(batch)
 
     table = pa.Table.from_batches(batches, schema=schema)
+
+    storage_options = None
+    if not path.startswith(("memory://", "file://")):
+        storage_options = {
+            "access_key_id": os.getenv("ACCESS_KEY_ID", ""),
+            "secret_access_key": os.getenv("SECRET_ACCESS_KEY", ""),
+            "session_token": os.getenv("SESSION_TOKEN", ""),
+            "endpoint": os.getenv("ENDPOINT", ""),
+            "virtual_hosted_style_request": os.getenv(
+                "VIRTUAL_HOSTED_STYLE_REQUEST", "true"
+            ),
+        }
+
     return lance.write_dataset(
         table,
         path,
         max_rows_per_file=file_size,
         max_rows_per_group=batch_size,
         data_storage_version=data_storage_version,
+        storage_options=storage_options,
     )
 
 
@@ -67,17 +98,21 @@ def gen_ranges(total_rows, num_rows):
 @pytest.mark.parametrize("lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")])
 @pytest.mark.parametrize("num_rows", [1, 10, 100, 1000])
 @pytest.mark.parametrize("batch_size", [512, 1024, 2048])
-@pytest.mark.parametrize("path_prefix", ["memory://", "file", ])
+@pytest.mark.parametrize("path_prefix", get_path_prefixes())
 def test_dataset_take(
-    benchmark, tmp_path, file_size, lance_format_version, num_rows, batch_size, scheme
+    benchmark,
+    tmp_path,
+    file_size,
+    lance_format_version,
+    num_rows,
+    batch_size,
+    path_prefix,
 ):
     data_storage_version, version_name = lance_format_version
-    if scheme == "memory":
-        path = "memory://test.lance"
-    elif scheme == "file":
-        path = str(tmp_path / "test.lance")
-    else:
-        raise ValueError(f"Unknown scheme: {scheme}")
+
+    random_uuid = str(uuid.uuid4())
+    path = f"{path_prefix.rstrip('/')}/{random_uuid}.lance/"
+
     num_batches = 1024
     ds = create_dataset(path, data_storage_version, num_batches, file_size, batch_size)
     total_rows = ds.count_rows()
@@ -90,6 +125,6 @@ def test_dataset_take(
     benchmark.group = (
         f"{version_name} Random Take Dataset({file_size} file size, "
         f"{num_batches} batches, {num_rows} rows per take, "
-        f"{batch_size} batch size, {scheme} scheme)"
+        f"{batch_size} batch size, {path} path)"
     )
     benchmark(dataset_take_rows_bench)
