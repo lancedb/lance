@@ -2275,7 +2275,13 @@ mod tests {
             dataset_version: dataset.version().version,
             fields: vec![field.id],
             name: INDEX_NAME.to_string(),
-            fragment_bitmap: Some(dataset.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            fragment_bitmap: Some(
+                dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
             index_details: Some(vector_index_details()),
             index_version: 1, // Use version 1 for IVF PQ index
             created_at: Some(chrono::Utc::now()),
@@ -2283,7 +2289,7 @@ mod tests {
         };
 
         // We need to commit this index to the dataset so it can be found
-        use crate::dataset::transaction::{Transaction, Operation};
+        use crate::dataset::transaction::{Operation, Transaction};
         let transaction = Transaction::new(
             dataset.version().version,
             Operation::CreateIndex {
@@ -2297,7 +2303,8 @@ mod tests {
         // Apply the transaction to register the index
         // Since dataset is Arc<Dataset>, we need to create a mutable reference
         let mut dataset_mut = (*dataset).clone();
-        dataset_mut.apply_commit(transaction, &Default::default(), &Default::default())
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
             .await
             .unwrap();
 
@@ -2307,7 +2314,11 @@ mod tests {
             .unwrap();
 
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
-        let prefilter = Arc::new(DatasetPreFilter::new(Arc::new(dataset_mut.clone()), &[index_meta.clone()], None));
+        let prefilter = Arc::new(DatasetPreFilter::new(
+            Arc::new(dataset_mut.clone()),
+            &[index_meta.clone()],
+            None,
+        ));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
@@ -2348,16 +2359,24 @@ mod tests {
         .await
         .unwrap();
 
-
         // After remapping the index file, we need to register the new index metadata
         // so that the dataset can find it when we try to open it
-        let field = dataset_mut.schema().field(WellKnownIvfPqData::COLUMN).unwrap();
+        let field = dataset_mut
+            .schema()
+            .field(WellKnownIvfPqData::COLUMN)
+            .unwrap();
         let new_index_meta = lance_table::format::Index {
             uuid: new_uuid,
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],
             name: format!("{}_remapped", INDEX_NAME),
-            fragment_bitmap: Some(dataset_mut.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            fragment_bitmap: Some(
+                dataset_mut
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
             index_details: Some(vector_index_details()),
             index_version: index.index_type().version(),
             created_at: Some(chrono::Utc::now()),
@@ -2376,7 +2395,8 @@ mod tests {
         );
 
         // Apply the transaction to register the new index
-        dataset_mut.apply_commit(transaction, &Default::default(), &Default::default())
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
             .await
             .unwrap();
 
