@@ -85,6 +85,16 @@ filename = "Cargo.toml"
 search = 'lance-testing = {{ version = "={current_version}"'
 replace = 'lance-testing = {{ version = "={new_version}"'
 
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'fsst = {{ version = "={current_version}"'
+replace = 'fsst = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
+search = 'lance-bitpacking = {{ version = "={current_version}"'
+replace = 'lance-bitpacking = {{ version = "={new_version}"'
+
 # Update all rust crate Cargo.toml files
 [[tool.bumpversion.files]]
 filename = "rust/lance/Cargo.toml"
@@ -142,6 +152,16 @@ search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
 
 [[tool.bumpversion.files]]
+filename = "rust/compression/bitpacking/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "rust/compression/fsst/Cargo.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
 filename = "rust/lance-test-macros/Cargo.toml"
 search = 'version = "{current_version}"'
 replace = 'version = "{new_version}"'
@@ -183,9 +203,3 @@ replace = "<version>{new_version}</version>"
 filename = "java/spark/pom.xml"
 search = "<version>{current_version}</version>"
 replace = "<version>{new_version}</version>"
-
-# FSST crate version
-[[tool.bumpversion.files]]
-filename = "Cargo.toml"
-search = 'fsst = {{ version = "={current_version}"'
-replace = 'fsst = {{ version = "={new_version}"'
