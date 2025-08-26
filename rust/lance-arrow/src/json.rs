@@ -25,6 +25,22 @@ pub fn is_json_field(field: &ArrowField) -> bool {
             .unwrap_or_default()
 }
 
+/// Check if a field or any of its descendants is a JSON field
+pub fn has_json_fields(field: &ArrowField) -> bool {
+    if is_json_field(field) {
+        return true;
+    }
+
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().any(|f| has_json_fields(f)),
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            has_json_fields(f)
+        }
+        DataType::Map(f, _) => has_json_fields(f),
+        _ => false,
+    }
+}
+
 /// Create a JSON field with the appropriate extension metadata
 pub fn json_field(name: &str, nullable: bool) -> ArrowField {
     let mut field = ArrowField::new(name, DataType::LargeBinary, nullable);
