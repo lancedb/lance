@@ -33,6 +33,12 @@ pub mod json;
 pub mod list;
 pub mod memory;
 
+/// Arrow extension metadata key for extension name
+pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
+
+/// Arrow extension metadata key for extension metadata  
+pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
+
 type Result<T> = std::result::Result<T, ArrowError>;
 
 pub trait DataTypeExt {

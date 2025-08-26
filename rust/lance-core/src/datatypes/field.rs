@@ -20,7 +20,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
-use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, json::is_json_field, *};
+use lance_arrow::{json::is_json_field, ARROW_EXT_NAME_KEY, *};
 use snafu::location;
 
 use super::{
@@ -1034,7 +1034,7 @@ impl From<&Field> for ArrowField {
         // Add JSON extension metadata if this is a JSON field
         if field.logical_type.0 == "json" {
             metadata.insert(
-                lance_arrow::json::ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_EXT_NAME_KEY.to_string(),
                 lance_arrow::json::JSON_EXT_NAME.to_string(),
             );
         }

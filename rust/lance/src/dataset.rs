@@ -2087,7 +2087,8 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
-    use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;

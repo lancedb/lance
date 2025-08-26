@@ -10,14 +10,10 @@ use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField};
 
+use crate::ARROW_EXT_NAME_KEY;
+
 /// Arrow extension type name for JSON data
 pub const JSON_EXT_NAME: &str = "lance.json";
-
-/// Arrow extension metadata key for extension name
-pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
-
-/// Arrow extension metadata key for extension metadata
-pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 /// Check if a field is a JSON extension field
 pub fn is_json_field(field: &ArrowField) -> bool {
