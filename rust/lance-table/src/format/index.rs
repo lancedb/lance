@@ -71,10 +71,10 @@ impl DeepSizeOf for Index {
             + self.name.deep_size_of_children(context)
             + self.dataset_version.deep_size_of_children(context)
             + self
-            .fragment_bitmap
-            .as_ref()
-            .map(|fragment_bitmap| fragment_bitmap.serialized_size())
-            .unwrap_or(0)
+                .fragment_bitmap
+                .as_ref()
+                .map(|fragment_bitmap| fragment_bitmap.serialized_size())
+                .unwrap_or(0)
     }
 }
 
