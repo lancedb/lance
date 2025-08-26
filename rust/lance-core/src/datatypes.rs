@@ -422,26 +422,65 @@ mod tests {
     #[test]
     fn test_invalid_fixed_size_list_format_returns_invalid_query() {
         let test_cases = vec![
-            ("fixed_size_list:invalid", "InvalidQuery", "Unsupported logical type"),
-            ("fixed_size_list:", "InvalidQuery", "Unsupported logical type"),
-            ("fixed_size_list:type:", "Schema", "cannot parse integer from empty string"),
-            ("fixed_size_list:type:invalid_size", "Schema", "invalid digit found in string"),
-            ("fixed_size_list:type:abc", "Schema", "invalid digit found in string"),
+            (
+                "fixed_size_list:invalid",
+                "InvalidQuery",
+                "Unsupported logical type",
+            ),
+            (
+                "fixed_size_list:",
+                "InvalidQuery",
+                "Unsupported logical type",
+            ),
+            (
+                "fixed_size_list:type:",
+                "Schema",
+                "cannot parse integer from empty string",
+            ),
+            (
+                "fixed_size_list:type:invalid_size",
+                "Schema",
+                "invalid digit found in string",
+            ),
+            (
+                "fixed_size_list:type:abc",
+                "Schema",
+                "invalid digit found in string",
+            ),
         ];
-        
+
         for (invalid_type_string, expected_error_type, expected_message) in test_cases {
             let result = DataType::try_from(&LogicalType(invalid_type_string.to_string()));
-            assert!(result.is_err(), "Expected error for '{}'", invalid_type_string);
+            assert!(
+                result.is_err(),
+                "Expected error for '{}'",
+                invalid_type_string
+            );
             match result.unwrap_err() {
                 Error::InvalidQuery { message, .. } => {
                     assert_eq!(expected_error_type, "InvalidQuery");
-                    assert!(message.contains(expected_message), "Message '{}' should contain '{}' for '{}'", message, expected_message, invalid_type_string);
+                    assert!(
+                        message.contains(expected_message),
+                        "Message '{}' should contain '{}' for '{}'",
+                        message,
+                        expected_message,
+                        invalid_type_string
+                    );
                 }
                 Error::Schema { message, .. } => {
                     assert_eq!(expected_error_type, "Schema");
-                    assert!(message.contains(expected_message), "Message '{}' should contain '{}' for '{}'", message, expected_message, invalid_type_string);
+                    assert!(
+                        message.contains(expected_message),
+                        "Message '{}' should contain '{}' for '{}'",
+                        message,
+                        expected_message,
+                        invalid_type_string
+                    );
                 }
-                other => panic!("Expected {} error for '{}', got {:?}", expected_error_type, invalid_type_string, other),
+                other => panic!(
+                    "Expected {} error for '{}', got {:?}",
+                    expected_error_type, invalid_type_string, other
+                ),
             }
         }
     }
@@ -450,7 +489,6 @@ mod tests {
     fn test_empty_logical_type_string_returns_invalid_query() {
         let empty_type = LogicalType("".to_string());
         let result = DataType::try_from(&empty_type);
-        
         assert!(result.is_err());
         match result.unwrap_err() {
             Error::InvalidQuery { message, .. } => {
@@ -462,9 +500,10 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_invalid_type_returns_invalid_query() {
-        let invalid_nested = LogicalType("fixed_size_list:fixed_size_list:invalid:10:5".to_string());
+        let invalid_nested =
+            LogicalType("fixed_size_list:fixed_size_list:invalid:10:5".to_string());
         let result = DataType::try_from(&invalid_nested);
-        
+
         assert!(result.is_err());
         match result.unwrap_err() {
             Error::InvalidQuery { message, .. } => {

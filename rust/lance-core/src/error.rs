@@ -496,9 +496,9 @@ mod test {
             message: "Test error message".to_string(),
             location: location!(),
         };
-        
+
         let error_string = error.to_string();
-        
+
         // Verify the error message format matches the expected pattern
         assert!(error_string.contains("Invalid query/input: Test error message"));
         // Note: The location is not included in the display format, only in debug format
@@ -513,20 +513,18 @@ mod test {
                 location: location!(),
             })
         }
-        
         fn middle_function() -> Result<()> {
             inner_function()?;
             Ok(())
         }
-        
         fn outer_function() -> Result<()> {
             middle_function()?;
             Ok(())
         }
-        
+
         let result = outer_function();
         assert!(result.is_err());
-        
+
         match result.unwrap_err() {
             Error::InvalidQuery { message, .. } => {
                 assert!(message.contains("Test error from inner function"));
@@ -542,7 +540,6 @@ mod test {
             message: "Test conversion error".to_string(),
             location: location!(),
         };
-        
         // Test conversion to object_store::Error
         let object_store_error: object_store::Error = lance_error.into();
         match object_store_error {
@@ -561,15 +558,21 @@ mod test {
             message: "Original error message".to_string(),
             location: location!(),
         };
-        
+
         // Test CloneableError
         let cloneable_error = CloneableError(original_error);
         let cloned_error = cloneable_error.clone();
-        
+
         // Both should contain the same error message
-        assert!(cloneable_error.0.to_string().contains("Original error message"));
-        assert!(cloned_error.0.to_string().contains("Original error message"));
-        
+        assert!(cloneable_error
+            .0
+            .to_string()
+            .contains("Original error message"));
+        assert!(cloned_error
+            .0
+            .to_string()
+            .contains("Original error message"));
+
         // The cloned error should be Error::Cloned
         match cloned_error.0 {
             Error::Cloned { message, .. } => {

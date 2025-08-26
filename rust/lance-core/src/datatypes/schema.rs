@@ -2029,33 +2029,63 @@ mod tests {
         // Test cases for different column projection error scenarios
         let test_cases = vec![
             // Project with non-existent column
-            ("project", vec!["a", "nonexistent_column"], "Column nonexistent_column does not exist"),
+            (
+                "project",
+                vec!["a", "nonexistent_column"],
+                "Column nonexistent_column does not exist",
+            ),
             // Project by schema with missing field
-            ("project_by_schema", vec!["nonexistent"], "Field nonexistent not found"),
+            (
+                "project_by_schema",
+                vec!["nonexistent"],
+                "Field nonexistent not found",
+            ),
             // Field ID lookup for non-existent column
-            ("field_id", vec!["nonexistent_column"], "Vector column not in schema"),
+            (
+                "field_id",
+                vec!["nonexistent_column"],
+                "Vector column not in schema",
+            ),
         ];
 
         for (test_type, columns, expected_message) in test_cases {
             let result: Result<()> = match test_type {
                 "project" => schema.project(&columns).map(|_| ()),
                 "project_by_schema" => {
-                    let projection_schema = ArrowSchema::new(vec![
-                        ArrowField::new(columns[0], DataType::Int32, false)
-                    ]);
-                    schema.project_by_schema(&projection_schema, OnMissing::Error, OnTypeMismatch::Error).map(|_| ())
+                    let projection_schema =
+                        ArrowSchema::new(vec![ArrowField::new(columns[0], DataType::Int32, false)]);
+                    schema
+                        .project_by_schema(
+                            &projection_schema,
+                            OnMissing::Error,
+                            OnTypeMismatch::Error,
+                        )
+                        .map(|_| ())
                 }
                 "field_id" => schema.field_id(columns[0]).map(|_| ()),
                 _ => panic!("Unknown test type: {}", test_type),
             };
 
-            assert!(result.is_err(), "Expected error for {} test with columns {:?}", test_type, columns);
+            assert!(
+                result.is_err(),
+                "Expected error for {} test with columns {:?}",
+                test_type,
+                columns
+            );
             match result.unwrap_err() {
                 Error::InvalidQuery { message, .. } => {
-                    assert!(message.contains(expected_message), 
-                        "Message '{}' should contain '{}' for {} test", message, expected_message, test_type);
+                    assert!(
+                        message.contains(expected_message),
+                        "Message '{}' should contain '{}' for {} test",
+                        message,
+                        expected_message,
+                        test_type
+                    );
                 }
-                other => panic!("Expected InvalidQuery error for {} test, got {:?}", test_type, other),
+                other => panic!(
+                    "Expected InvalidQuery error for {} test, got {:?}",
+                    test_type, other
+                ),
             }
         }
     }
