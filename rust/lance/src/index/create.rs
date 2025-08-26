@@ -2,10 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use futures::future::BoxFuture;
-use lance_index::{IndexParams, IndexType};
+use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::Index as IndexMetadata;
 use snafu::location;
-use std::future::IntoFuture;
+use std::{future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -15,7 +15,7 @@ use crate::{
         Dataset,
     },
     index::{
-        scalar::{build_inverted_index, build_scalar_index, inverted_index_details},
+        scalar::{build_inverted_index, build_scalar_index},
         vector::{
             build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
         },
@@ -123,7 +123,7 @@ impl<'a> CreateIndexBuilder<'a> {
         }
 
         let index_id = Uuid::new_v4();
-        let index_details = match (self.index_type, self.params.index_name()) {
+        let created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -133,7 +133,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
-                let params = ScalarIndexParams::new(self.index_type.try_into()?);
+                let params = ScalarIndexParams::default_for_type(self.index_type.try_into()?);
                 build_scalar_index(self.dataset, column, &index_id.to_string(), &params, train)
                     .await?
             }
@@ -168,8 +168,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     inverted_params,
                     train,
                 )
-                .await?;
-                inverted_index_details()
+                .await?
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
@@ -204,7 +203,10 @@ impl<'a> CreateIndexBuilder<'a> {
                     )
                     .await?;
                 }
-                vector_index_details()
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: VECTOR_INDEX_VERSION,
+                }
             }
             // Can't use if let Some(...) here because it's not stable yet.
             // TODO: fix after https://github.com/rust-lang/rust/issues/51114
@@ -236,7 +238,10 @@ impl<'a> CreateIndexBuilder<'a> {
                 } else {
                     todo!("create empty vector index when train=false");
                 }
-                vector_index_details()
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: VECTOR_INDEX_VERSION,
+                }
             }
             (IndexType::FragmentReuse, _) => {
                 return Err(Error::Index {
@@ -273,8 +278,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 // Empty bitmap for untrained indices
                 Some(roaring::RoaringBitmap::new())
             },
-            index_details: Some(index_details),
-            index_version: self.index_type.version(),
+            index_details: Some(Arc::new(created_index.index_details)),
+            index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
         };

@@ -20,12 +20,12 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
-use lance_core::cache::LanceCache;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
+use crate::pb;
 use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
@@ -36,6 +36,7 @@ pub mod inverted;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
+pub mod registry;
 pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -88,14 +89,47 @@ impl From<ScalarIndexType> for IndexType {
 
 #[derive(Default)]
 pub struct ScalarIndexParams {
-    /// If set then always use the given index type and skip auto-detection
-    pub force_index_type: Option<ScalarIndexType>,
+    /// The parameters to train the index
+    ///
+    /// Since indexes are "pluggable" this is a generic Any message.  The id of
+    /// the message will determine the type of index that is used.  The contents of the
+    /// message will be specific to the index type.
+    ///
+    /// If this is not set then the best set of index parameters will be inferred from
+    /// the data.
+    ///
+    /// Currently the only supported "inference" strategy is "always use BTree by default"
+    pub params: Option<prost_types::Any>,
 }
 
 impl ScalarIndexParams {
-    pub fn new(index_type: ScalarIndexType) -> Self {
-        Self {
-            force_index_type: Some(index_type),
+    pub fn try_from_params<M: prost::Message + prost::Name>(params: &M) -> Result<Self> {
+        Ok(Self {
+            params: Some(prost_types::Any::from_msg(params)?),
+        })
+    }
+
+    /// Creates a default set of parameters for the given index type
+    pub fn default_for_type(index_type: ScalarIndexType) -> Self {
+        match index_type {
+            ScalarIndexType::BTree => {
+                Self::try_from_params(&pb::BTreeIndexParams::default()).unwrap()
+            }
+            ScalarIndexType::Bitmap => {
+                Self::try_from_params(&pb::BitmapIndexParams::default()).unwrap()
+            }
+            ScalarIndexType::LabelList => {
+                Self::try_from_params(&pb::LabelListIndexParams::default()).unwrap()
+            }
+            ScalarIndexType::NGram => {
+                Self::try_from_params(&pb::NGramIndexParams::default()).unwrap()
+            }
+            ScalarIndexType::ZoneMap => {
+                Self::try_from_params(&pb::ZoneMapIndexParams::default()).unwrap()
+            }
+            ScalarIndexType::Inverted => {
+                Self::try_from_params(&pb::InvertedIndexParams::default()).unwrap()
+            }
         }
     }
 }
@@ -103,17 +137,6 @@ impl ScalarIndexParams {
 impl IndexParams for ScalarIndexParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn index_type(&self) -> IndexType {
-        match self.force_index_type {
-            Some(ScalarIndexType::BTree) | None => IndexType::BTree,
-            Some(ScalarIndexType::Bitmap) => IndexType::Bitmap,
-            Some(ScalarIndexType::LabelList) => IndexType::LabelList,
-            Some(ScalarIndexType::Inverted) => IndexType::Inverted,
-            Some(ScalarIndexType::NGram) => IndexType::NGram,
-            Some(ScalarIndexType::ZoneMap) => IndexType::ZoneMap,
-        }
     }
 
     fn index_name(&self) -> &str {
@@ -124,10 +147,6 @@ impl IndexParams for ScalarIndexParams {
 impl IndexParams for InvertedIndexParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn index_type(&self) -> IndexType {
-        IndexType::Inverted
     }
 
     fn index_name(&self) -> &str {
@@ -214,7 +233,7 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     /// Cast the query as Any to allow for downcasting
     fn as_any(&self) -> &dyn Any;
-    /// Format the query as a string
+    /// Format the query as a string for display purposes
     fn format(&self, col: &str) -> String;
     /// Convert the query to a datafusion expression
     fn to_expr(&self, col: String) -> Expr;
@@ -622,6 +641,19 @@ impl SearchResult {
     }
 }
 
+/// Brief information about an index that was created
+pub struct CreatedIndex {
+    /// The details of the index that was created
+    ///
+    /// These should be stored somewhere as they will be needed to
+    /// load the index later.
+    pub index_details: prost_types::Any,
+    /// The version of the index that was created
+    ///
+    /// This can be used to determine if a reader is able to load the index.
+    pub index_version: u32,
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -634,15 +666,6 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
 
-    /// Load the scalar index from storage
-    async fn load(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
-    ) -> Result<Arc<Self>>
-    where
-        Self: Sized;
-
     /// Returns true if the remap operation is supported
     fn can_remap(&self) -> bool;
 
@@ -651,12 +674,12 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()>;
+    ) -> Result<CreatedIndex>;
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()>;
+    ) -> Result<CreatedIndex>;
 }

@@ -11,21 +11,116 @@ mod scorer;
 pub mod tokenizer;
 mod wand;
 
+use std::sync::Arc;
+
+use arrow_schema::{DataType, Field};
+use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
-use lance_core::Result;
+use lance_core::{cache::LanceCache, Result};
 pub use tokenizer::*;
 
-use super::btree::TrainingSource;
+use lance_core::Error;
+use snafu::location;
+
+use crate::{
+    frag_reuse::FragReuseIndex,
+    pb,
+    scalar::{
+        expression::{FtsQueryParser, ScalarQueryParser},
+        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering},
+        CreatedIndex, ScalarIndex,
+    },
+};
+
 use super::IndexStore;
 
-pub async fn train_inverted_index(
-    data_source: Box<dyn TrainingSource>,
-    index_store: &dyn IndexStore,
-    params: InvertedIndexParams,
-) -> Result<()> {
-    let batch_stream = data_source.scan_unordered_chunks(4096).await?;
-    // mapping from item to list of the row ids where it is present
-    let mut inverted_index = InvertedIndexBuilder::new(params);
-    inverted_index.update(batch_stream, index_store).await
+#[derive(Debug, Default)]
+pub struct InvertedIndexPlugin;
+
+impl InvertedIndexPlugin {
+    pub async fn train_inverted_index(
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        params: InvertedIndexParams,
+    ) -> Result<CreatedIndex> {
+        let mut inverted_index = InvertedIndexBuilder::new(params);
+        inverted_index.update(data, index_store).await?;
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::InvertedIndexDetails::default())
+                .unwrap(),
+            index_version: INVERTED_INDEX_VERSION,
+        })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for InvertedIndexPlugin {
+    fn training_criteria(&self, _params: &prost_types::Any) -> Result<TrainingCriteria> {
+        Ok(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+    }
+
+    fn check_can_train(&self, field: &Field) -> Result<()> {
+        if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "A ngram index can only be created on a Utf8 or LargeUtf8 field.  Column has type {:?}",
+                    field.data_type()
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+        Ok(())
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        0
+    }
+
+    fn new_query_parser(&self, index_name: String) -> Box<dyn ScalarQueryParser> {
+        Box::new(FtsQueryParser::new(index_name))
+    }
+
+    /// Train a new index
+    ///
+    /// The provided data must fulfill all the criteria returned by `training_criteria`.
+    /// It is the caller's responsibility to ensure this.
+    ///
+    /// Returns index details that describe the index.  These details can potentially be
+    /// useful for planning (although this will currently require inside information on
+    /// the index type) and they will need to be provided when loading the index.
+    ///
+    /// It is the caller's responsibility to store these details somewhere.
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        params: &prost_types::Any,
+    ) -> Result<CreatedIndex> {
+        let params = params.to_msg::<pb::InvertedIndexParams>()?;
+        Self::train_inverted_index(data, index_store, (&params).try_into()?).await
+    }
+
+    /// Load an index from storage
+    ///
+    /// The index details should match the details that were returned when the index was
+    /// originally trained.
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(
+            InvertedIndex::load(index_store, frag_reuse_index, cache).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
 }

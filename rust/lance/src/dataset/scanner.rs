@@ -58,7 +58,7 @@ use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
 };
 use lance_index::scalar::inverted::SCORE_COL;
-use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::ScalarIndexCriteria;
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
@@ -2165,7 +2165,7 @@ impl Scanner {
             .load_scalar_index(
                 ScalarIndexCriteria::default()
                     .for_column(column)
-                    .with_type(ScalarIndexType::Inverted),
+                    .supports_fts(),
             )
             .await?
             .ok_or(Error::invalid_input(
@@ -2307,20 +2307,17 @@ impl Scanner {
 
             let mut indexed_columns = Vec::new();
             for column in string_columns {
-                let index = self
+                let has_fts_index = self
                     .dataset
                     .load_scalar_index(
                         ScalarIndexCriteria::default()
                             .for_column(column)
-                            .with_type(ScalarIndexType::Inverted),
+                            .supports_fts(),
                     )
-                    .await?;
-                if let Some(index) = index {
-                    let index_type =
-                        detect_scalar_index_type(&self.dataset, &index, column).await?;
-                    if matches!(index_type, ScalarIndexType::Inverted) {
-                        indexed_columns.push(column.clone());
-                    }
+                    .await?
+                    .is_some();
+                if has_fts_index {
+                    indexed_columns.push(column.clone());
                 }
             }
 
@@ -2565,7 +2562,7 @@ impl Scanner {
             .load_scalar_index(
                 ScalarIndexCriteria::default()
                     .for_column(&column)
-                    .with_type(ScalarIndexType::Inverted),
+                    .supports_fts(),
             )
             .await?
             .ok_or(Error::invalid_input(

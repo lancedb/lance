@@ -181,3 +181,49 @@ message VectorIndex {
   // Vector distance metrics type
   VectorMetricType metric_type = 4;
 }
+
+// Parameters for BTreeIndex
+message BTreeIndexParams {
+  // The size of each zone
+  optional uint64 zone_size = 1;
+}
+
+// Parameters for BitmapIndex
+message BitmapIndexParams {}
+
+// Parameters for LabelListIndex
+message LabelListIndexParams {}
+
+// Parameters for NGramIndex
+message NGramIndexParams {}
+
+// Parameters for ZoneMapIndex
+message ZoneMapIndexParams {
+  optional uint64 zone_size = 1;
+}
+
+// Parameters for InvertedIndex
+message InvertedIndexParams {
+  optional string base_tokenizer = 1;
+  optional string language = 2;
+  optional bool with_position = 3;
+  optional uint32 max_token_length = 4;
+  optional bool lower_case = 5;
+  optional bool stem = 6;
+  optional bool remove_stop_words = 7;
+  optional bool ascii_folding = 8;
+  optional uint32 min_ngram_length = 9;
+  optional uint32 max_ngram_length = 10;
+  optional bool prefix_only = 11;
+}
+
+// Currently these are all empty messages because all needed details are either hard-coded (e.g.
+// filenames) or stored in the index itself.  However, we may want to add more details in the
+// future, in particular we can add details that may be useful for planning queries (e.g. don't
+// force us to load the index until we know we need it)
+message BTreeIndexDetails {}
+message BitmapIndexDetails {}
+message LabelListIndexDetails {}
+message NGramIndexDetails {}
+message ZoneMapIndexDetails {}
+message InvertedIndexDetails {}

@@ -72,10 +72,13 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
-    AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TokenQuery,
+    AnyQuery, CreatedIndex, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult,
+    TokenQuery,
 };
-use crate::Index;
+use crate::{pb, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+
+pub const INVERTED_INDEX_VERSION: u32 = 0;
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -278,6 +281,67 @@ impl InvertedIndex {
     pub fn is_legacy(&self) -> bool {
         self.partitions.len() == 1 && self.partitions[0].is_legacy()
     }
+
+    pub async fn load(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        // for new index format, there is a metadata file and multiple partitions,
+        // each partition is a separate index containing tokens, inverted list and docs.
+        // for old index format, there is no metadata file, and it's just like a single partition
+
+        match store.open_index_file(METADATA_FILE).await {
+            Ok(reader) => {
+                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
+                    message: "params not found in metadata".to_owned(),
+                    location: location!(),
+                })?;
+                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
+                let partitions =
+                    reader
+                        .schema()
+                        .metadata
+                        .get("partitions")
+                        .ok_or(Error::Index {
+                            message: "partitions not found in metadata".to_owned(),
+                            location: location!(),
+                        })?;
+                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
+
+                let partitions = partitions.into_iter().map(|id| {
+                    let store = store.clone();
+                    let frag_reuse_index_clone = frag_reuse_index.clone();
+                    let index_cache = index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                    async move {
+                        Result::Ok(Arc::new(
+                            InvertedPartition::load(store, id, frag_reuse_index_clone, index_cache)
+                                .await?,
+                        ))
+                    }
+                });
+                let partitions = stream::iter(partitions)
+                    .buffer_unordered(store.io_parallelism())
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let tokenizer = params.build()?;
+                Ok(Arc::new(Self {
+                    params,
+                    store,
+                    tokenizer,
+                    partitions,
+                }))
+            }
+            Err(_) => {
+                // old index format
+                Self::load_legacy_index(store, frag_reuse_index, index_cache).await
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -397,83 +461,34 @@ impl ScalarIndex for InvertedIndex {
         true
     }
 
-    async fn load(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
-    ) -> Result<Arc<Self>>
-    where
-        Self: Sized,
-    {
-        // for new index format, there is a metadata file and multiple partitions,
-        // each partition is a separate index containing tokens, inverted list and docs.
-        // for old index format, there is no metadata file, and it's just like a single partition
-
-        match store.open_index_file(METADATA_FILE).await {
-            Ok(reader) => {
-                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
-                    message: "params not found in metadata".to_owned(),
-                    location: location!(),
-                })?;
-                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
-                let partitions =
-                    reader
-                        .schema()
-                        .metadata
-                        .get("partitions")
-                        .ok_or(Error::Index {
-                            message: "partitions not found in metadata".to_owned(),
-                            location: location!(),
-                        })?;
-                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
-
-                let partitions = partitions.into_iter().map(|id| {
-                    let store = store.clone();
-                    let frag_reuse_index_clone = frag_reuse_index.clone();
-                    let index_cache = index_cache.with_key_prefix(format!("part-{}", id).as_str());
-                    async move {
-                        Result::Ok(Arc::new(
-                            InvertedPartition::load(store, id, frag_reuse_index_clone, index_cache)
-                                .await?,
-                        ))
-                    }
-                });
-                let partitions = stream::iter(partitions)
-                    .buffer_unordered(store.io_parallelism())
-                    .try_collect::<Vec<_>>()
-                    .await?;
-
-                let tokenizer = params.build()?;
-                Ok(Arc::new(Self {
-                    params,
-                    store,
-                    tokenizer,
-                    partitions,
-                }))
-            }
-            Err(_) => {
-                // old index format
-                Self::load_legacy_index(store, frag_reuse_index, index_cache).await
-            }
-        }
-    }
-
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         self.to_builder()
             .remap(mapping, self.store.clone(), dest_store)
-            .await
+            .await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::InvertedIndexDetails::default())
+                .unwrap(),
+            index_version: INVERTED_INDEX_VERSION,
+        })
     }
 
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        self.to_builder().update(new_data, dest_store).await
+    ) -> Result<CreatedIndex> {
+        self.to_builder().update(new_data, dest_store).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::InvertedIndexDetails::default())
+                .unwrap(),
+            index_version: INVERTED_INDEX_VERSION,
+        })
     }
 }
 

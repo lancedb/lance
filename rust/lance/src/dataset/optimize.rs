@@ -924,10 +924,12 @@ pub async fn commit_compaction(
             .remap_indices(row_id_map, &affected_ids)
             .await?;
         remapped_indices
-            .iter()
+            .into_iter()
             .map(|rewritten| RewrittenIndex {
-                old_id: rewritten.original,
-                new_id: rewritten.new,
+                old_id: rewritten.old_id,
+                new_id: rewritten.new_id,
+                new_index_details: rewritten.index_details,
+                new_index_version: rewritten.index_version,
             })
             .collect()
     } else if !options.defer_index_remap {
@@ -1069,13 +1071,13 @@ mod tests {
         .unwrap()
     }
 
-    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     struct MockIndexRemapperExpectation {
         expected: HashMap<u64, Option<u64>>,
         answer: Vec<RemappedIndex>,
     }
 
-    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     struct MockIndexRemapper {
         expectations: Vec<MockIndexRemapperExpectation>,
     }

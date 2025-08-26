@@ -535,11 +535,11 @@ pub(crate) fn new_mem_wal_index_meta(
         fields: vec![],
         dataset_version,
         fragment_bitmap: None,
-        index_details: Some(prost_types::Any::from_msg(&pb::MemWalIndexDetails::from(
-            &MemWalIndexDetails {
+        index_details: Some(Arc::new(prost_types::Any::from_msg(
+            &pb::MemWalIndexDetails::from(&MemWalIndexDetails {
                 mem_wal_list: new_mem_wal_list,
-            },
-        ))?),
+            }),
+        )?)),
         index_version: 0,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
