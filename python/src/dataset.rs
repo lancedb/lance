@@ -33,7 +33,7 @@ use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
 use lance::dataset::index::LanceIndexStoreExt;
-use lance::dataset::refs::{Ref, TagContents};
+use lance::dataset::refs::{Ref, RefOperations, TagContents};
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
 };
@@ -1394,7 +1394,9 @@ impl Dataset {
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
-        let inner_result = RT.block_on(None, self_.ds.tags.get_version(&tag))?;
+        let inner_result = RT
+            .block_on(None, self_.ds.tags.get(&tag))?
+            .map(|tag_content| tag_content.version);
 
         inner_result.map_err(|err: lance::Error| match err {
             lance::Error::NotFound { .. } => {
@@ -1409,7 +1411,7 @@ impl Dataset {
 
     fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags.create(tag.as_str(), version))?
+        RT.block_on(None, new_self.tags.create(tag.as_str(), version, None))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
                 lance::Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
@@ -1434,7 +1436,7 @@ impl Dataset {
 
     fn update_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags.update(tag.as_str(), version))?
+        RT.block_on(None, new_self.tags.update(tag.as_str(), version, None))?
             .infer_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -1874,7 +1876,7 @@ impl Dataset {
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        let uri = ds.uri().to_string();
+        let uri = ds.uri().clone();
         Ok(Self {
             ds: Arc::new(ds),
             uri,
@@ -1929,7 +1931,7 @@ impl Dataset {
         let res = RT
             .block_on(None, builder.execute_batch(transactions))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        let uri = res.dataset.uri().to_string();
+        let uri = res.dataset.uri().clone();
         let ds = Self {
             ds: Arc::new(res.dataset),
             uri,
@@ -2337,10 +2339,8 @@ impl Dataset {
             }
             None => None,
         };
-        RT.block_on(None, async {
-            self.ds.tags.list_tags_ordered(ordering).await
-        })?
-        .infer_error()
+        RT.block_on(None, async { self.ds.tags.list_ordered(ordering).await })?
+            .infer_error()
     }
 
     fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
@@ -2393,7 +2393,7 @@ pub fn write_dataset(
         .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
     Ok(Dataset {
-        uri: ds.uri().to_string(),
+        uri: ds.uri().clone(),
         ds: Arc::new(ds),
     })
 }

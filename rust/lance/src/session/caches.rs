@@ -69,6 +69,7 @@ impl Deref for DSMetadataCache {
 // Cache key types for type-safe cache access
 #[derive(Debug)]
 pub struct ManifestKey<'a> {
+    pub branch: Option<&'a str>,
     pub version: u64,
     pub e_tag: Option<&'a str>,
 }
@@ -77,10 +78,13 @@ impl CacheKey for ManifestKey<'_> {
     type ValueType = Manifest;
 
     fn key(&self) -> Cow<'_, str> {
-        if let Some(e_tag) = self.e_tag {
-            Cow::Owned(format!("manifest/{}/{}", self.version, e_tag))
-        } else {
-            Cow::Owned(format!("manifest/{}", self.version))
+        match (self.branch, self.e_tag) {
+            (Some(branch), Some(e_tag)) => {
+                Cow::Owned(format!("{}/manifest/{}/{}", branch, self.version, e_tag))
+            }
+            (Some(branch), None) => Cow::Owned(format!("{}/manifest/{}", branch, self.version)),
+            (None, Some(e_tag)) => Cow::Owned(format!("manifest/{}/{}", self.version, e_tag)),
+            (None, None) => Cow::Owned(format!("manifest/{}", self.version)),
         }
     }
 }

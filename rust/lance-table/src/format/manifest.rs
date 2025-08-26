@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
-use std::ops::Range;
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use chrono::prelude::*;
 use deepsize::DeepSizeOf;
@@ -15,6 +11,9 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
@@ -42,6 +41,9 @@ pub struct Manifest {
 
     /// Dataset version
     pub version: u64,
+
+    /// Branch name, None if the dataset is the main branch.
+    pub branch: Option<String>,
 
     /// Version of the writer library that wrote this manifest.
     pub writer_version: Option<WriterVersion>,
@@ -132,6 +134,7 @@ impl Manifest {
             schema,
             local_schema,
             version: 1,
+            branch: None,
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -166,6 +169,7 @@ impl Manifest {
             schema,
             local_schema,
             version: previous.version + 1,
+            branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -188,11 +192,13 @@ impl Manifest {
     /// Performs a shallow_clone of the manifest entirely in memory without:
     /// - Any persistent storage operations
     /// - Modifications to the original data
+    /// - If the shallow clone is for branch, ref_name is the source branch
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
         ref_path: String,
         ref_base_id: u32,
+        branch_name: Option<String>,
         transaction_file: String,
     ) -> Self {
         let cloned_fragments = self
@@ -220,6 +226,7 @@ impl Manifest {
             schema: self.schema.clone(),
             local_schema: self.local_schema.clone(),
             version: self.version,
+            branch: branch_name,
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
@@ -635,6 +642,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             schema,
             local_schema,
             version: p.version,
+            branch: p.branch,
             writer_version,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
@@ -683,6 +691,7 @@ impl From<&Manifest> for pb::Manifest {
         Self {
             fields: fields_with_meta.fields.0,
             version: m.version,
+            branch: m.branch.clone(),
             writer_version: m
                 .writer_version
                 .as_ref()

@@ -1488,6 +1488,7 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::refs::RefOperations;
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
@@ -3292,17 +3293,13 @@ mod tests {
             let current_version = current_dataset.version().version;
             current_dataset
                 .tags
-                .create(&tag_name, current_version)
+                .create(&tag_name, current_version, None)
                 .await
                 .unwrap();
 
             // Perform shallow clone for this round (chain cloning from current dataset)
             let mut round_cloned_dataset = current_dataset
-                .shallow_clone(
-                    round_cloned_uri,
-                    tag_name.as_str(),
-                    ObjectStoreParams::default(),
-                )
+                .shallow_clone(round_cloned_uri, tag_name.as_str(), None)
                 .await
                 .unwrap();
 
