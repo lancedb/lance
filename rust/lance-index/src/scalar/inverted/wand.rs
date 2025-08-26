@@ -467,8 +467,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 // which means we have to skip at least the current block
                 if let Some(least_id) = self.get_new_candidate(pivot) {
                     current_doc = std::cmp::max(doc_id, least_id);
+                    continue;
+                } else {
+                    break;
                 }
-                continue;
             }
 
             // move all postings to this doc id
