@@ -3,7 +3,6 @@
 
 use clap::Parser;
 use lance_tools::cli::LanceToolsArgs;
-use snafu::location;
 
 #[tokio::main]
 pub async fn main() -> Result<(), lance_core::Error> {
@@ -65,6 +64,7 @@ fn install_panic_handler() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snafu::location;
 
     #[test]
     fn test_ok_lance_result_to_ok_std_result() {
