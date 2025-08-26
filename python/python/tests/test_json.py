@@ -31,9 +31,7 @@ def test_json_basic_write_read():
     # Create a PyArrow table with JSON field
     # Using LargeBinary with extension metadata for JSON
     json_field = pa.field(
-        "data",
-        pa.large_binary(),
-        metadata={"ARROW:extension:name": "lance.json"}
+        "data", pa.large_binary(), metadata={"ARROW:extension:name": "lance.json"}
     )
 
     # Create array from JSON strings
@@ -46,10 +44,12 @@ def test_json_basic_write_read():
             "id": pa.array([1, 2, 3, 4, 5], type=pa.int32()),
             "data": json_binary_array,
         },
-        schema=pa.schema([
-            pa.field("id", pa.int32()),
-            json_field,
-        ])
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int32()),
+                json_field,
+            ]
+        ),
     )
 
     # Write to Lance dataset
@@ -104,9 +104,7 @@ def test_json_with_other_types():
 
     # Create table with multiple types
     json_field = pa.field(
-        "metadata",
-        pa.large_binary(),
-        metadata={"ARROW:extension:name": "lance.json"}
+        "metadata", pa.large_binary(), metadata={"ARROW:extension:name": "lance.json"}
     )
 
     json_array = pa.array(json_strings, type=pa.string())
@@ -120,13 +118,15 @@ def test_json_with_other_types():
             "metadata": json_binary_array,
             "in_stock": pa.array([True, False], type=pa.bool_()),
         },
-        schema=pa.schema([
-            pa.field("id", pa.int64()),
-            pa.field("name", pa.string()),
-            pa.field("price", pa.float64()),
-            json_field,
-            pa.field("in_stock", pa.bool_()),
-        ])
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field("name", pa.string()),
+                pa.field("price", pa.float64()),
+                json_field,
+                pa.field("in_stock", pa.bool_()),
+            ]
+        ),
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -154,20 +154,17 @@ def test_json_append_and_overwrite():
 
         # Initial data
         json_field = pa.field(
-            "config",
-            pa.large_binary(),
-            metadata={"ARROW:extension:name": "lance.json"}
+            "config", pa.large_binary(), metadata={"ARROW:extension:name": "lance.json"}
         )
 
         initial_json = [json.dumps({"version": 1, "enabled": True})]
         initial_array = pa.compute.cast(
-            pa.array(initial_json, type=pa.string()),
-            pa.large_binary()
+            pa.array(initial_json, type=pa.string()), pa.large_binary()
         )
 
         initial_table = pa.table(
             {"id": pa.array([1]), "config": initial_array},
-            schema=pa.schema([pa.field("id", pa.int32()), json_field])
+            schema=pa.schema([pa.field("id", pa.int32()), json_field]),
         )
 
         # Write initial data
@@ -176,13 +173,12 @@ def test_json_append_and_overwrite():
         # Append more data
         append_json = [json.dumps({"version": 2, "enabled": False})]
         append_array = pa.compute.cast(
-            pa.array(append_json, type=pa.string()),
-            pa.large_binary()
+            pa.array(append_json, type=pa.string()), pa.large_binary()
         )
 
         append_table = pa.table(
             {"id": pa.array([2]), "config": append_array},
-            schema=pa.schema([pa.field("id", pa.int32()), json_field])
+            schema=pa.schema([pa.field("id", pa.int32()), json_field]),
         )
 
         dataset = lance.dataset(dataset_path)
@@ -196,13 +192,12 @@ def test_json_append_and_overwrite():
         # Test overwrite
         overwrite_json = [json.dumps({"version": 3, "enabled": True})]
         overwrite_array = pa.compute.cast(
-            pa.array(overwrite_json, type=pa.string()),
-            pa.large_binary()
+            pa.array(overwrite_json, type=pa.string()), pa.large_binary()
         )
 
         overwrite_table = pa.table(
             {"id": pa.array([3]), "config": overwrite_array},
-            schema=pa.schema([pa.field("id", pa.int32()), json_field])
+            schema=pa.schema([pa.field("id", pa.int32()), json_field]),
         )
 
         dataset = lance.write_dataset(overwrite_table, dataset_path, mode="overwrite")
@@ -224,14 +219,11 @@ def test_json_filter_and_select():
 
     json_strings = [json.dumps(d) for d in json_data]
     json_field = pa.field(
-        "user_data",
-        pa.large_binary(),
-        metadata={"ARROW:extension:name": "lance.json"}
+        "user_data", pa.large_binary(), metadata={"ARROW:extension:name": "lance.json"}
     )
 
     json_array = pa.compute.cast(
-        pa.array(json_strings, type=pa.string()),
-        pa.large_binary()
+        pa.array(json_strings, type=pa.string()), pa.large_binary()
     )
 
     table = pa.table(
@@ -240,11 +232,13 @@ def test_json_filter_and_select():
             "user_data": json_array,
             "active": pa.array([True, False, True]),
         },
-        schema=pa.schema([
-            pa.field("id", pa.int32()),
-            json_field,
-            pa.field("active", pa.bool_()),
-        ])
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int32()),
+                json_field,
+                pa.field("active", pa.bool_()),
+            ]
+        ),
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -270,7 +264,7 @@ def test_json_null_handling():
         "optional_data",
         pa.large_binary(),
         nullable=True,
-        metadata={"ARROW:extension:name": "lance.json"}
+        metadata={"ARROW:extension:name": "lance.json"},
     )
 
     # Mix of valid JSON and nulls
@@ -287,7 +281,7 @@ def test_json_null_handling():
 
     table = pa.table(
         {"id": pa.array(range(5)), "optional_data": json_binary_array},
-        schema=pa.schema([pa.field("id", pa.int32()), json_field])
+        schema=pa.schema([pa.field("id", pa.int32()), json_field]),
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -319,30 +313,25 @@ def test_json_large_documents():
                 "name": f"Item {i}",
                 "description": f"Description for item {i}" * 10,
                 "tags": [f"tag{j}" for j in range(20)],
-                "properties": {
-                    f"prop{j}": f"value{j}" for j in range(50)
-                }
+                "properties": {f"prop{j}": f"value{j}" for j in range(50)},
             }
             for i in range(100)
-        ]
+        ],
     }
 
     json_string = json.dumps(large_doc)
 
     json_field = pa.field(
-        "large_json",
-        pa.large_binary(),
-        metadata={"ARROW:extension:name": "lance.json"}
+        "large_json", pa.large_binary(), metadata={"ARROW:extension:name": "lance.json"}
     )
 
     json_array = pa.compute.cast(
-        pa.array([json_string], type=pa.string()),
-        pa.large_binary()
+        pa.array([json_string], type=pa.string()), pa.large_binary()
     )
 
     table = pa.table(
         {"id": pa.array([1]), "large_json": json_array},
-        schema=pa.schema([pa.field("id", pa.int32()), json_field])
+        schema=pa.schema([pa.field("id", pa.int32()), json_field]),
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -363,9 +352,7 @@ def test_json_batch_operations():
     """Test batch operations with JSON data."""
 
     json_field = pa.field(
-        "batch_data",
-        pa.large_binary(),
-        metadata={"ARROW:extension:name": "lance.json"}
+        "batch_data", pa.large_binary(), metadata={"ARROW:extension:name": "lance.json"}
     )
 
     # Create multiple batches
@@ -377,13 +364,11 @@ def test_json_batch_operations():
 
         for batch_num in range(num_batches):
             json_data = [
-                json.dumps({"batch": batch_num, "item": i})
-                for i in range(batch_size)
+                json.dumps({"batch": batch_num, "item": i}) for i in range(batch_size)
             ]
 
             json_array = pa.compute.cast(
-                pa.array(json_data, type=pa.string()),
-                pa.large_binary()
+                pa.array(json_data, type=pa.string()), pa.large_binary()
             )
 
             table = pa.table(
@@ -393,7 +378,7 @@ def test_json_batch_operations():
                     ),
                     "batch_data": json_array,
                 },
-                schema=pa.schema([pa.field("id", pa.int32()), json_field])
+                schema=pa.schema([pa.field("id", pa.int32()), json_field]),
             )
 
             if batch_num == 0:
