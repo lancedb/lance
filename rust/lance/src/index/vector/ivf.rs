@@ -2316,7 +2316,7 @@ mod tests {
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
         let prefilter = Arc::new(DatasetPreFilter::new(
             Arc::new(dataset_mut.clone()),
-            &[index_meta.clone()],
+            std::slice::from_ref(&index_meta),
             None,
         ));
 
