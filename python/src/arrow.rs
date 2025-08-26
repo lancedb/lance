@@ -114,7 +114,7 @@ pub fn json_array(array_obj: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PyOb
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
     );
-    
+
     // Wrap JsonArray in a RecordBatch to preserve metadata through PyArrow conversion
     let schema = Schema::new(vec![field]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_array)])
