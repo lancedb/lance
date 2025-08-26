@@ -3,10 +3,9 @@
 
 use clap::Parser;
 use lance_tools::cli::LanceToolsArgs;
-use std::io::{Error, ErrorKind};
 
 #[tokio::main]
-pub async fn main() -> Result<(), std::io::Error> {
+pub async fn main() -> Result<(), lance_core::Error> {
     // Install global panic handler
     install_panic_handler();
 
@@ -17,10 +16,10 @@ pub async fn main() -> Result<(), std::io::Error> {
     return lance_result_to_std_result(args.run(&mut std::io::stdout()).await);
 }
 
-fn lance_result_to_std_result<T>(lance_result: lance_core::Result<T>) -> Result<T, std::io::Error> {
+fn lance_result_to_std_result<T>(lance_result: lance_core::Result<T>) -> Result<T, lance_core::Error> {
     return match lance_result {
         Ok(t) => Result::Ok(t),
-        Err(e) => Result::Err(Error::new(ErrorKind::Other, e.to_string())),
+        Err(e) => Result::Err(e),
     };
 }
 

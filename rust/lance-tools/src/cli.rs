@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use lance_core::Result;
 
 #[derive(Parser, Debug)]
-#[command(name = "lance-tools", about = "Tools for working with Lance", version)]
+#[command(name = "lance-tools", about = "Tools for interacting with Lance files and tables", version)]
 pub struct LanceToolsArgs {
     /// Subcommand to run
     #[command(subcommand)]

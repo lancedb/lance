@@ -1,6 +1,6 @@
 [package]
 name = "lance-tools"
-description = "Lance tools"
+description = "Tools for interacting with Lance files and tables"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
