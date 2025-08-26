@@ -136,16 +136,66 @@ impl ProjectionPlan {
 
     /// Set the projection from a schema
     ///
-    /// This plan will have no complex expressions
+    /// This plan will have no complex expressions, the schema must be a subset of the dataset schema.
+    ///
+    /// With this approach it is possible to refer to portions of nested fields.
+    ///
+    /// For example, if the schema is:
+    ///
+    /// ```ignore
+    /// {
+    ///   "metadata": {
+    ///     "location": {
+    ///       "x": f32,
+    ///       "y": f32,
+    ///     },
+    ///     "age": i32,
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// It is possible to project a partial schema that drops `y` like:
+    ///
+    /// ```ignore
+    /// {
+    ///   "metadata": {
+    ///     "location": {
+    ///       "x": f32,
+    ///     },
+    ///     "age": i32,
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// This is something that cannot be done easily using expressions.
     pub fn from_schema(base: Arc<dyn Projectable>, projection: &Schema) -> Result<Self> {
-        Self::from_expressions(
-            base,
-            &projection
-                .fields
-                .iter()
-                .map(|f| (f.name.as_str(), format!("`{}`", f.name.as_str())))
-                .collect::<Vec<_>>(),
-        )
+        // Calculate the physical projection directly from the schema
+        //
+        // The _rowid and _rowaddr columns will be recognized and added to the physical projection
+        //
+        // Any columns with an id of -1 (e.g. _rowoffset) will be ignored
+        let physical_projection = Projection::empty(base).union_schema(projection);
+        let mut must_add_row_offset = false;
+        // Now calculate the output expressions.  This will only reorder top-level columns.  We don't
+        // support reordering nested fields.
+        let exprs = projection
+            .fields
+            .iter()
+            .map(|f| {
+                if f.name == ROW_ADDR {
+                    must_add_row_offset = true;
+                }
+                OutputColumn {
+                    expr: Expr::Column(Column::from_name(&f.name)),
+                    name: f.name.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            physical_projection,
+            requested_output_expr: exprs,
+            must_add_row_offset,
+        })
     }
 
     pub fn full(base: Arc<dyn Projectable>) -> Result<Self> {
