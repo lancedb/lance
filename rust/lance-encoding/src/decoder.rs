@@ -2267,7 +2267,7 @@ impl SchedulerContext {
         &self.cache
     }
 
-    pub fn push(&mut self, name: &str, index: u32) -> ScopedSchedulerContext {
+    pub fn push(&'_ mut self, name: &str, index: u32) -> ScopedSchedulerContext<'_> {
         self.path.push(index);
         self.path_names.push(name.to_string());
         ScopedSchedulerContext { context: self }

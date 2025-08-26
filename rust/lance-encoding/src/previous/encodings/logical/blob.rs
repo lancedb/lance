@@ -3,8 +3,10 @@
 
 use std::{collections::VecDeque, sync::Arc, vec};
 
-use arrow::{array::AsArray, datatypes::UInt64Type};
-use arrow_array::{Array, ArrayRef, LargeBinaryArray, PrimitiveArray, StructArray, UInt64Array};
+use arrow_array::{
+    cast::AsArray, types::UInt64Type, Array, ArrayRef, LargeBinaryArray, PrimitiveArray,
+    StructArray, UInt64Array,
+};
 use arrow_buffer::{
     BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
@@ -180,7 +182,7 @@ impl std::fmt::Debug for BlobFieldDecoder {
 }
 
 impl LogicalPageDecoder for BlobFieldDecoder {
-    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {
         async move {
             if self.unloaded_descriptions.is_some() {
                 let descriptions = self.unloaded_descriptions.take().unwrap().await?;

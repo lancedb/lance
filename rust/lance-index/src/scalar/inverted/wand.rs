@@ -9,9 +9,10 @@ use arrow::array::AsArray;
 use arrow::datatypes::{Int32Type, UInt32Type};
 use arrow_array::{Array, UInt32Array};
 use arrow_schema::DataType;
+use itertools::Itertools;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
-use tracing::instrument;
 
 use crate::metrics::MetricsCollector;
 
@@ -199,7 +200,6 @@ impl PostingIterator {
     }
 
     // move to the next doc id that is greater than or equal to least_id
-    #[instrument(level = "debug", name = "posting_iter_next", skip(self))]
     fn next(&mut self, least_id: u64) {
         match self.list {
             PostingList::Compressed(ref mut list) => {
@@ -267,6 +267,12 @@ impl PostingIterator {
     }
 }
 
+pub struct DocCandidate {
+    pub row_id: u64,
+    pub freqs: Vec<(String, u32)>,
+    pub doc_length: u32,
+}
+
 pub struct Wand<'a, S: Scorer> {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     operator: Operator,
@@ -311,10 +317,21 @@ impl<'a, S: Scorer> Wand<'a, S> {
         params: &FtsSearchParams,
         mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u64, u32, u32)>> {
+    ) -> Result<Vec<DocCandidate>> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(vec![]);
+        }
+
+        let avg_posting_length =
+            self.postings.iter().map(|p| p.list.len()).sum::<usize>() / self.postings.len();
+        match (mask.max_len(), mask.iter_ids()) {
+            (Some(num_rows_matched), Some(row_ids))
+                if num_rows_matched <= avg_posting_length as u64 =>
+            {
+                return self.flat_search(params, row_ids, metrics);
+            }
+            _ => {}
         }
 
         let mut candidates = BinaryHeap::new();
@@ -323,11 +340,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
             self.cur_doc = Some(doc);
             num_comparisons += 1;
 
-            // if the doc is not located, we need to find the row id
             let row_id = match &doc {
                 DocInfo::Raw(doc) => {
                     // if the doc is not located, we need to find the row id
-                    // in the doc set. This is a bit slow, but it should be rare.
                     self.docs.row_id(doc.doc_id)
                 }
                 DocInfo::Located(doc) => doc.row_id,
@@ -348,20 +363,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
-            let score = self.score(pivot, doc.doc_id(), doc.frequency(), doc_length);
+            let score = self.score(pivot, doc_length);
+            let freqs = self
+                .iter_token_freqs(pivot)
+                .map(|(token, freq)| (token.to_owned(), freq))
+                .collect();
             if candidates.len() < limit {
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    doc.frequency(),
-                    doc_length,
-                )));
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
             } else if score > candidates.peek().unwrap().0 .0.score.0 {
                 candidates.pop();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    doc.frequency(),
-                    doc_length,
-                )));
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
@@ -371,27 +382,114 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_sorted_vec()
             .into_iter()
-            .map(|Reverse((doc, freq, length))| (doc.row_id, freq, length))
+            .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
+                row_id: doc.row_id,
+                freqs,
+                doc_length,
+            })
             .collect())
     }
 
-    // calculate the score of the document
-    fn score(&self, pivot: usize, doc_id: u64, freq: u32, doc_length: u32) -> f32 {
-        let mut score = 0.0;
-        for posting in self.postings[..=pivot].iter() {
-            score += self.scorer.score(&posting.token, freq, doc_length);
+    fn flat_search(
+        &mut self,
+        params: &FtsSearchParams,
+        row_ids: Box<dyn Iterator<Item = RowAddress> + '_>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(vec![]);
         }
-        for posting in self.postings[pivot + 1..].iter() {
-            let doc = posting.doc().unwrap();
-            if doc.doc_id() > doc_id {
-                // the posting iterator is sorted by doc id,
-                // so we can stop here
+
+        // we need to map the row ids to doc ids, and sort them,
+        // because WAND PostingIterator can't go back to the previous doc id
+        let doc_ids = row_ids
+            .filter_map(|row_addr| {
+                let row_id: u64 = row_addr.into();
+                self.docs.doc_id(row_id).map(|doc_id| (doc_id, row_id))
+            })
+            .sorted_unstable()
+            .collect::<Vec<_>>();
+        let is_compressed = matches!(self.postings[0].list, PostingList::Compressed(_));
+
+        let mut num_comparisons = 0;
+        let mut candidates = BinaryHeap::new();
+        for (doc_id, row_id) in doc_ids {
+            num_comparisons += 1;
+
+            // move all postings to this doc id
+            self.move_preceding(self.postings.len() - 1, doc_id);
+            if self.postings.is_empty() {
+                // no more postings, so we can stop
                 break;
+            } else if self.postings[0].doc().map(|d| d.doc_id()) != Some(doc_id) {
+                // this doc is not in the postings, so we can skip it
+                continue;
             }
-            debug_assert_eq!(doc.doc_id(), doc_id);
-            score += self.scorer.score(&posting.token, freq, doc_length);
+
+            let mut pivot = 0;
+            while pivot + 1 < self.postings.len()
+                && self.postings[pivot + 1].doc().map(|d| d.doc_id()) == Some(doc_id)
+            {
+                pivot += 1;
+            }
+
+            // check positions
+            if params.phrase_slop.is_some()
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+            {
+                continue;
+            }
+
+            // score the doc
+            let doc_length = match is_compressed {
+                true => self.docs.num_tokens(doc_id as u32),
+                false => self.docs.num_tokens_by_row_id(row_id),
+            };
+
+            let score = self.score(pivot, doc_length);
+            let freqs = self
+                .iter_token_freqs(pivot)
+                .map(|(token, freq)| (token.to_owned(), freq))
+                .collect();
+
+            if candidates.len() < limit {
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+            } else if score > candidates.peek().unwrap().0 .0.score.0 {
+                candidates.pop();
+                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+            }
+        }
+        metrics.record_comparisons(num_comparisons);
+
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
+                row_id: doc.row_id,
+                freqs,
+                doc_length,
+            })
+            .collect())
+    }
+
+    // calculate the score of the current document
+    fn score(&self, pivot: usize, doc_length: u32) -> f32 {
+        let mut score = 0.0;
+        for (token, freq) in self.iter_token_freqs(pivot) {
+            score += self.scorer.score(token, freq, doc_length);
         }
         score
+    }
+
+    // iterate over all the preceding terms and collect the token and frequency
+    fn iter_token_freqs(&self, pivot: usize) -> impl Iterator<Item = (&str, u32)> + '_ {
+        self.postings[..=pivot].iter().filter_map(|posting| {
+            posting
+                .doc()
+                .map(|doc| (posting.token.as_str(), doc.frequency()))
+        })
     }
 
     // find the next doc candidate
@@ -450,7 +548,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
     // find the first term that the sum of upper bound of all preceding terms and itself,
     // are greater than or equal to the threshold
-    #[instrument(level = "debug", skip_all)]
     fn find_pivot_term(&self) -> Option<usize> {
         if self.operator == Operator::And {
             // for AND query, we always require all terms to be present in the document,
@@ -481,7 +578,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
     // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
     // so that we can move the posting iterator to the next doc id that is possible to be candidate
-    #[instrument(level = "debug", skip_all)]
     fn move_term(&mut self, least_id: u64) {
         let picked = self.pick_term(least_id);
         self.postings[picked].next(least_id);

@@ -304,7 +304,7 @@ impl ScalarIndex for FlatIndex {
         )))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
     }
 

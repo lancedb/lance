@@ -119,6 +119,107 @@ pub struct CycleNullGenerator {
     validity: Vec<bool>,
     idx: usize,
 }
+#[derive(Debug)]
+pub struct CycleNanGenerator {
+    generator: Box<dyn ArrayGenerator>,
+    nan_pattern: Vec<bool>,
+    idx: usize,
+}
+
+impl ArrayGenerator for CycleNanGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let array = self.generator.generate(length, rng)?;
+
+        // Only apply NaN pattern to float types
+        match array.data_type() {
+            DataType::Float16 => {
+                let float_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float16Array>()
+                    .unwrap();
+                let mut values: Vec<half::f16> = float_array.values().to_vec();
+
+                for (i, &should_be_nan) in self
+                    .nan_pattern
+                    .iter()
+                    .cycle()
+                    .skip(self.idx)
+                    .take(length.0 as usize)
+                    .enumerate()
+                {
+                    if should_be_nan {
+                        values[i] = half::f16::NAN;
+                    }
+                }
+
+                self.idx = (self.idx + (length.0 as usize)) % self.nan_pattern.len();
+                Ok(Arc::new(arrow_array::Float16Array::from(values)))
+            }
+            DataType::Float32 => {
+                let float_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .unwrap();
+                let mut values: Vec<f32> = float_array.values().to_vec();
+
+                for (i, &should_be_nan) in self
+                    .nan_pattern
+                    .iter()
+                    .cycle()
+                    .skip(self.idx)
+                    .take(length.0 as usize)
+                    .enumerate()
+                {
+                    if should_be_nan {
+                        values[i] = f32::NAN;
+                    }
+                }
+
+                self.idx = (self.idx + (length.0 as usize)) % self.nan_pattern.len();
+                Ok(Arc::new(arrow_array::Float32Array::from(values)))
+            }
+            DataType::Float64 => {
+                let float_array = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap();
+                let mut values: Vec<f64> = float_array.values().to_vec();
+
+                for (i, &should_be_nan) in self
+                    .nan_pattern
+                    .iter()
+                    .cycle()
+                    .skip(self.idx)
+                    .take(length.0 as usize)
+                    .enumerate()
+                {
+                    if should_be_nan {
+                        values[i] = f64::NAN;
+                    }
+                }
+
+                self.idx = (self.idx + (length.0 as usize)) % self.nan_pattern.len();
+                Ok(Arc::new(arrow_array::Float64Array::from(values)))
+            }
+            _ => {
+                // For non-float types, just return the original array unchanged
+                Ok(array)
+            }
+        }
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.generator.data_type()
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        self.generator.element_size_bytes()
+    }
+}
 
 impl ArrayGenerator for CycleNullGenerator {
     fn generate(
@@ -287,6 +388,10 @@ pub trait ArrayGeneratorExt {
     fn with_random_nulls(self, null_probability: f64) -> Box<dyn ArrayGenerator>;
     /// Replaces the validity bitmap of generated arrays with the inverse of `nulls`, cycling if needed
     fn with_nulls(self, nulls: &[bool]) -> Box<dyn ArrayGenerator>;
+    /// Replaces the values of generated arrays with NaN values, cycling if needed
+    ///
+    /// Will have no effect if the data type is not a floating point data type
+    fn with_nans(self, nans: &[bool]) -> Box<dyn ArrayGenerator>;
     /// Replaces the validity bitmap of generated arrays with `validity`, cycling if needed
     fn with_validity(self, nulls: &[bool]) -> Box<dyn ArrayGenerator>;
     fn with_metadata(self, metadata: HashMap<String, String>) -> Box<dyn ArrayGenerator>;
@@ -304,6 +409,14 @@ impl ArrayGeneratorExt for Box<dyn ArrayGenerator> {
         Box::new(CycleNullGenerator {
             generator: self,
             validity: nulls.iter().map(|v| !*v).collect(),
+            idx: 0,
+        })
+    }
+
+    fn with_nans(self, nans: &[bool]) -> Box<dyn ArrayGenerator> {
+        Box::new(CycleNanGenerator {
+            generator: self,
+            nan_pattern: nans.to_vec(),
             idx: 0,
         })
     }
@@ -413,6 +526,18 @@ where
             leftover: T::default(),
             leftover_count: 0,
             element_size_bytes: Some(element_size_bytes),
+        }
+    }
+
+    fn new_unknown_size(data_type: DataType, generator: F, repeat: u32) -> Self {
+        Self {
+            data_type,
+            generator,
+            array_type: PhantomData,
+            repeat,
+            leftover: T::default(),
+            leftover_count: 0,
+            element_size_bytes: None,
         }
     }
 }
@@ -1877,9 +2002,9 @@ pub mod array {
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     };
     use arrow_array::{
-        ArrowNativeTypeOp, Date32Array, Date64Array, Time32MillisecondArray, Time32SecondArray,
-        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        ArrowNativeTypeOp, BooleanArray, Date32Array, Date64Array, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{IntervalUnit, TimeUnit};
     use chrono::Utc;
@@ -1955,6 +2080,23 @@ pub mod array {
                     .expect("Primitive types should have a fixed width"),
             ),
         )
+    }
+
+    /// Create a generator from a vector of booleans
+    ///
+    /// If more rows are requested than the length of values then it will restart from
+    /// the beginning of the vector
+    pub fn cycle_bool(values: Vec<bool>) -> Box<dyn ArrayGenerator> {
+        let mut values_idx = 0;
+        Box::new(FnGen::<bool, BooleanArray, _>::new_unknown_size(
+            DataType::Boolean,
+            move |_| {
+                let val = values[values_idx];
+                values_idx = (values_idx + 1) % values.len();
+                val
+            },
+            1,
+        ))
     }
 
     /// Create a generator that starts at 0 and increments by 1 for each element
@@ -2579,6 +2721,16 @@ mod tests {
             *genn.generate(RowCount::from(1), &mut rng).unwrap(),
             StringArray::from_iter_values(["xyz"])
         );
+
+        let mut genn = array::cycle_bool(vec![false, false, true]);
+        assert_eq!(
+            *genn.generate(RowCount::from(5), &mut rng).unwrap(),
+            BooleanArray::from_iter(vec![false, false, true, false, false].into_iter().map(Some))
+        );
+        assert_eq!(
+            *genn.generate(RowCount::from(1), &mut rng).unwrap(),
+            BooleanArray::from_iter(vec![Some(true)])
+        )
     }
 
     #[test]

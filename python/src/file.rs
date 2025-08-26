@@ -271,7 +271,7 @@ impl LanceFileWriter {
         })
     }
 
-    fn inner_lock(&self) -> PyResult<MutexGuard<Box<FileWriter>>> {
+    fn inner_lock(&self) -> PyResult<MutexGuard<'_, Box<FileWriter>>> {
         self.inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))

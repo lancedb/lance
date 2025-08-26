@@ -9,8 +9,8 @@ use crate::{
     format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
 };
 
-use arrow::array::make_comparator;
 use arrow_array::{Array, StructArray, UInt64Array};
+use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
@@ -99,7 +99,7 @@ fn column_indices_from_schema_helper(
                     *column_counter += 1;
                 }
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
@@ -111,7 +111,7 @@ fn column_indices_from_schema_helper(
                     *column_counter += 1;
                 }
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
@@ -120,7 +120,7 @@ fn column_indices_from_schema_helper(
             DataType::FixedSizeList(inner, _) => {
                 // FSL(primitive) does not get its own column in either approach
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
