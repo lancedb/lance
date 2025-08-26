@@ -19,10 +19,10 @@ pub async fn main() -> Result<(), lance_core::Error> {
 fn lance_result_to_std_result<T>(
     lance_result: lance_core::Result<T>,
 ) -> Result<T, lance_core::Error> {
-    return match lance_result {
+    match lance_result {
         Ok(t) => Result::Ok(t),
         Err(e) => Result::Err(e),
-    };
+    }
 }
 
 /// Install custom panic handler for better error reporting

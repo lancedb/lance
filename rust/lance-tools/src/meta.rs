@@ -30,7 +30,7 @@ impl fmt::Display for LanceToolFileMetadata {
         )?;
         writeln!(f, "schema:")?;
         write!(f, "{}", self.file_metadata.file_schema)?;
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -48,7 +48,7 @@ impl LanceToolFileMetadata {
             .await?;
         let file_metadata = FileReader::read_all_metadata(&file_scheduler).await?;
         let lance_tool_file_metadata = LanceToolFileMetadata { file_metadata };
-        return Ok(lance_tool_file_metadata);
+        Ok(lance_tool_file_metadata)
     }
 }
 
@@ -57,6 +57,6 @@ pub(crate) async fn show_file_meta(
     args: &LanceFileMetaArgs,
 ) -> Result<()> {
     let metadata = LanceToolFileMetadata::open(&args.source).await?;
-    write!(writer, "{}", metadata.to_string())?;
-    return Ok(());
+    write!(writer, "{}", metadata)?;
+    Ok(())
 }
