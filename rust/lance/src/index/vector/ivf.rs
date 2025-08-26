@@ -2288,7 +2288,7 @@ mod tests {
             base_id: None,
         };
 
-        // We need to commit this index to the dataset so it can be found
+        // We need to commit this index to the dataset so that it can be found
         use crate::dataset::transaction::{Operation, Transaction};
         let transaction = Transaction::new(
             dataset.version().version,

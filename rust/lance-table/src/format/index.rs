@@ -11,29 +11,6 @@ use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
-impl Index {
-    pub fn effective_fragment_bitmap(
-        &self,
-        existing_fragments: &RoaringBitmap,
-    ) -> Option<RoaringBitmap> {
-        let fragment_bitmap = self.fragment_bitmap.as_ref()?;
-        Some(fragment_bitmap & existing_fragments)
-    }
-}
-
-impl DeepSizeOf for Index {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.uuid.as_bytes().deep_size_of_children(context)
-            + self.fields.deep_size_of_children(context)
-            + self.name.deep_size_of_children(context)
-            + self.dataset_version.deep_size_of_children(context)
-            + self
-                .fragment_bitmap
-                .as_ref()
-                .map(|fragment_bitmap| fragment_bitmap.serialized_size())
-                .unwrap_or(0)
-    }
-}
 
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +52,30 @@ pub struct Index {
     /// The base path index of the index files. Used when the index is imported or referred from another dataset.
     /// Lance uses it as key of the base_paths field in Manifest to determine the actual base path of the index files.
     pub base_id: Option<u32>,
+}
+
+impl Index {
+    pub fn effective_fragment_bitmap(
+        &self,
+        existing_fragments: &RoaringBitmap,
+    ) -> Option<RoaringBitmap> {
+        let fragment_bitmap = self.fragment_bitmap.as_ref()?;
+        Some(fragment_bitmap & existing_fragments)
+    }
+}
+
+impl DeepSizeOf for Index {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.uuid.as_bytes().deep_size_of_children(context)
+            + self.fields.deep_size_of_children(context)
+            + self.name.deep_size_of_children(context)
+            + self.dataset_version.deep_size_of_children(context)
+            + self
+            .fragment_bitmap
+            .as_ref()
+            .map(|fragment_bitmap| fragment_bitmap.serialized_size())
+            .unwrap_or(0)
+    }
 }
 
 impl TryFrom<pb::IndexMetadata> for Index {
