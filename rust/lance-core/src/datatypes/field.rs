@@ -111,7 +111,7 @@ impl FromStr for StorageClass {
         match s {
             "default" | "" => Ok(Self::Default),
             "blob" => Ok(Self::Blob),
-            _ => Err(Error::Schema {
+            _ => Err(Error::InvalidQuery {
                 message: format!("Unknown storage class: {}", s),
                 location: location!(),
             }),
@@ -1513,5 +1513,29 @@ mod tests {
         // Finally, ignore will ignore
         assert!(f1.compare_with_options(&f2, &ignore_nullability));
         assert!(f2.compare_with_options(&f1, &ignore_nullability));
+    }
+
+    #[test]
+    fn test_invalid_storage_class_returns_invalid_query() {
+        let result = StorageClass::from_str("invalid_storage_class");
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidQuery { message, .. } => {
+                assert!(message.contains("Unknown storage class: invalid_storage_class"));
+            }
+            other => panic!("Expected InvalidQuery error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_valid_storage_class_parsing() {
+        // Test valid cases still work
+        assert_eq!(
+            StorageClass::from_str("default").unwrap(),
+            StorageClass::Default
+        );
+        assert_eq!(StorageClass::from_str("blob").unwrap(), StorageClass::Blob);
+        assert_eq!(StorageClass::from_str("").unwrap(), StorageClass::Default);
     }
 }

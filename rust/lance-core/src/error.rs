@@ -20,6 +20,8 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
+    #[snafu(display("Invalid query/input: {message}, {location}"))]
+    InvalidQuery { message: String, location: Location },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists { uri: String, location: Location },
     #[snafu(display("Append with different schema: {difference}, location: {location}"))]
@@ -432,6 +434,7 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use snafu::location;
 
     #[test]
     fn test_caller_location_capture() {
@@ -452,6 +455,127 @@ mod test {
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_query_error_creation() {
+        let err = Error::InvalidQuery {
+            message: "test query error".to_string(),
+            location: location!(),
+        };
+
+        match err {
+            Error::InvalidQuery { message, .. } => {
+                assert_eq!(message, "test query error");
+            }
+            _ => panic!("Expected InvalidQuery error"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_query_vs_schema_error_distinction() {
+        let query_error = Error::InvalidQuery {
+            message: "Column does not exist".to_string(),
+            location: location!(),
+        };
+
+        let schema_error = Error::Schema {
+            message: "Internal schema validation failed".to_string(),
+            location: location!(),
+        };
+
+        // Verify they are different error types
+        assert!(!matches!(query_error, Error::Schema { .. }));
+        assert!(!matches!(schema_error, Error::InvalidQuery { .. }));
+    }
+
+    #[test]
+    fn test_error_message_formatting() {
+        let error = Error::InvalidQuery {
+            message: "Test error message".to_string(),
+            location: location!(),
+        };
+        
+        let error_string = error.to_string();
+        
+        // Verify the error message format matches the expected pattern
+        assert!(error_string.contains("Invalid query/input: Test error message"));
+        // Note: The location is not included in the display format, only in debug format
+    }
+
+    #[test]
+    fn test_error_propagation_through_call_stack() {
+        // Test that errors propagate correctly through function calls
+        fn inner_function() -> Result<()> {
+            Err(Error::InvalidQuery {
+                message: "Test error from inner function".to_string(),
+                location: location!(),
+            })
+        }
+        
+        fn middle_function() -> Result<()> {
+            inner_function()?;
+            Ok(())
+        }
+        
+        fn outer_function() -> Result<()> {
+            middle_function()?;
+            Ok(())
+        }
+        
+        let result = outer_function();
+        assert!(result.is_err());
+        
+        match result.unwrap_err() {
+            Error::InvalidQuery { message, .. } => {
+                assert!(message.contains("Test error from inner function"));
+            }
+            other => panic!("Expected InvalidQuery error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_error_conversion_traits() {
+        // Test that errors can be converted to other error types
+        let lance_error = Error::InvalidQuery {
+            message: "Test conversion error".to_string(),
+            location: location!(),
+        };
+        
+        // Test conversion to object_store::Error
+        let object_store_error: object_store::Error = lance_error.into();
+        match object_store_error {
+            object_store::Error::Generic { source, .. } => {
+                // The source should contain our error message
+                let source_string = source.to_string();
+                assert!(source_string.contains("Test conversion error"));
+            }
+            _ => panic!("Expected Generic error type"),
+        }
+    }
+
+    #[test]
+    fn test_error_cloning_and_cloneable_error() {
+        let original_error = Error::InvalidQuery {
+            message: "Original error message".to_string(),
+            location: location!(),
+        };
+        
+        // Test CloneableError
+        let cloneable_error = CloneableError(original_error);
+        let cloned_error = cloneable_error.clone();
+        
+        // Both should contain the same error message
+        assert!(cloneable_error.0.to_string().contains("Original error message"));
+        assert!(cloned_error.0.to_string().contains("Original error message"));
+        
+        // The cloned error should be Error::Cloned
+        match cloned_error.0 {
+            Error::Cloned { message, .. } => {
+                assert!(message.contains("Original error message"));
+            }
+            _ => panic!("Expected Cloned error type"),
         }
     }
 }

@@ -193,7 +193,7 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
-                return Err(Error::Schema {
+                return Err(Error::InvalidQuery {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
                 });
@@ -229,7 +229,7 @@ impl Schema {
 
         for field in self.fields.iter() {
             if field.name.contains('.') {
-                return Err(Error::Schema{message:format!(
+                return Err(Error::InvalidQuery{message:format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
                 ), location: location!(),});
@@ -353,7 +353,7 @@ impl Schema {
             if let Some(self_field) = self.field(&field.name) {
                 new_fields.push(self_field.project_by_field(field, on_type_mismatch)?);
             } else if matches!(on_missing, OnMissing::Error) {
-                return Err(Error::Schema {
+                return Err(Error::InvalidQuery {
                     message: format!("Field {} not found", field.name),
                     location: location!(),
                 });
@@ -402,7 +402,7 @@ impl Schema {
     pub fn field_id(&self, column: &str) -> Result<i32> {
         self.field(column)
             .map(|f| f.id)
-            .ok_or_else(|| Error::Schema {
+            .ok_or_else(|| Error::InvalidQuery {
                 message: "Vector column not in schema".to_string(),
                 location: location!(),
             })
@@ -2015,6 +2015,71 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains(error_message_contains[idx]));
+        }
+    }
+
+    #[test]
+    fn test_column_projection_errors_return_invalid_query() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Utf8, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // Test cases for different column projection error scenarios
+        let test_cases = vec![
+            // Project with non-existent column
+            ("project", vec!["a", "nonexistent_column"], "Column nonexistent_column does not exist"),
+            // Project by schema with missing field
+            ("project_by_schema", vec!["nonexistent"], "Field nonexistent not found"),
+            // Field ID lookup for non-existent column
+            ("field_id", vec!["nonexistent_column"], "Vector column not in schema"),
+        ];
+
+        for (test_type, columns, expected_message) in test_cases {
+            let result: Result<()> = match test_type {
+                "project" => schema.project(&columns).map(|_| ()),
+                "project_by_schema" => {
+                    let projection_schema = ArrowSchema::new(vec![
+                        ArrowField::new(columns[0], DataType::Int32, false)
+                    ]);
+                    schema.project_by_schema(&projection_schema, OnMissing::Error, OnTypeMismatch::Error).map(|_| ())
+                }
+                "field_id" => schema.field_id(columns[0]).map(|_| ()),
+                _ => panic!("Unknown test type: {}", test_type),
+            };
+
+            assert!(result.is_err(), "Expected error for {} test with columns {:?}", test_type, columns);
+            match result.unwrap_err() {
+                Error::InvalidQuery { message, .. } => {
+                    assert!(message.contains(expected_message), 
+                        "Message '{}' should contain '{}' for {} test", message, expected_message, test_type);
+                }
+                other => panic!("Expected InvalidQuery error for {} test, got {:?}", test_type, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_field_name_returns_invalid_query() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "invalid.field.name",
+            DataType::Int32,
+            false,
+        )]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // Manually set the field name to simulate this error condition
+        schema.fields[0].name = "invalid.field.name".to_string();
+
+        let result = schema.validate();
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidQuery { message, .. } => {
+                assert!(message.contains("Top level field invalid.field.name cannot contain `.`"));
+            }
+            other => panic!("Expected InvalidQuery error, got {:?}", other),
         }
     }
 }

@@ -168,7 +168,7 @@ impl TryFrom<&DataType> for LogicalType {
             }
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => {
-                return Err(Error::Schema {
+                return Err(Error::InvalidQuery {
                     message: format!("Unsupported data type: {:?}", dt),
                     location: location!(),
                 })
@@ -220,7 +220,7 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() < 3 {
-                        return Err(Error::Schema {
+                        return Err(Error::InvalidQuery {
                             message: format!("Unsupported logical type: {}", lt),
                             location: location!(),
                         });
@@ -288,7 +288,7 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "decimal" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema {
+                        Err(Error::InvalidQuery {
                             message: format!("Unsupported decimal type: {}", lt),
                             location: location!(),
                         })
@@ -323,7 +323,7 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "timestamp" => {
                     if splits.len() != 3 {
-                        Err(Error::Schema {
+                        Err(Error::InvalidQuery {
                             message: format!("Unsupported timestamp type: {}", lt),
                             location: location!(),
                         })
@@ -337,7 +337,7 @@ impl TryFrom<&LogicalType> for DataType {
                         Ok(Timestamp(timeunit, tz))
                     }
                 }
-                _ => Err(Error::Schema {
+                _ => Err(Error::InvalidQuery {
                     message: format!("Unsupported logical type: {}", lt),
                     location: location!(),
                 }),
@@ -384,4 +384,121 @@ pub fn lance_supports_nulls(datatype: &DataType) -> bool {
             | DataType::FixedSizeBinary(_)
             | DataType::FixedSizeList(_, _)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, IntervalUnit};
+
+    #[test]
+    fn test_unsupported_datatype_returns_invalid_query() {
+        // Test with an unsupported Arrow type
+        let result = LogicalType::try_from(&DataType::Interval(IntervalUnit::YearMonth));
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidQuery { message, .. } => {
+                assert!(message.contains("Unsupported data type"));
+            }
+            other => panic!("Expected InvalidQuery error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_invalid_logical_type_string_returns_invalid_query() {
+        let invalid_type_string = LogicalType("invalid_type_format".to_string());
+        let result = DataType::try_from(&invalid_type_string);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidQuery { message, .. } => {
+                assert!(message.contains("Unsupported logical type"));
+            }
+            other => panic!("Expected InvalidQuery error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_invalid_fixed_size_list_format_returns_invalid_query() {
+        let test_cases = vec![
+            ("fixed_size_list:invalid", "InvalidQuery", "Unsupported logical type"),
+            ("fixed_size_list:", "InvalidQuery", "Unsupported logical type"),
+            ("fixed_size_list:type:", "Schema", "cannot parse integer from empty string"),
+            ("fixed_size_list:type:invalid_size", "Schema", "invalid digit found in string"),
+            ("fixed_size_list:type:abc", "Schema", "invalid digit found in string"),
+        ];
+        
+        for (invalid_type_string, expected_error_type, expected_message) in test_cases {
+            let result = DataType::try_from(&LogicalType(invalid_type_string.to_string()));
+            assert!(result.is_err(), "Expected error for '{}'", invalid_type_string);
+            match result.unwrap_err() {
+                Error::InvalidQuery { message, .. } => {
+                    assert_eq!(expected_error_type, "InvalidQuery");
+                    assert!(message.contains(expected_message), "Message '{}' should contain '{}' for '{}'", message, expected_message, invalid_type_string);
+                }
+                Error::Schema { message, .. } => {
+                    assert_eq!(expected_error_type, "Schema");
+                    assert!(message.contains(expected_message), "Message '{}' should contain '{}' for '{}'", message, expected_message, invalid_type_string);
+                }
+                other => panic!("Expected {} error for '{}', got {:?}", expected_error_type, invalid_type_string, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_logical_type_string_returns_invalid_query() {
+        let empty_type = LogicalType("".to_string());
+        let result = DataType::try_from(&empty_type);
+        
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidQuery { message, .. } => {
+                assert!(message.contains("Unsupported logical type"));
+            }
+            other => panic!("Expected InvalidQuery error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_invalid_type_returns_invalid_query() {
+        let invalid_nested = LogicalType("fixed_size_list:fixed_size_list:invalid:10:5".to_string());
+        let result = DataType::try_from(&invalid_nested);
+        
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidQuery { message, .. } => {
+                assert!(message.contains("Unsupported logical type"));
+            }
+            other => panic!("Expected InvalidQuery error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_invalid_decimal_format_returns_schema_error() {
+        let invalid_type_string = LogicalType("decimal:128:invalid:0".to_string());
+        let result = DataType::try_from(&invalid_type_string);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Schema { message, .. } => {
+                assert!(message.contains("invalid digit found in string"));
+            }
+            other => panic!("Expected Schema error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_invalid_timestamp_format_returns_arrow_error() {
+        let invalid_type_string = LogicalType("timestamp:invalid:utc".to_string());
+        let result = DataType::try_from(&invalid_type_string);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Arrow { message, .. } => {
+                assert!(message.contains("Unsupported TimeUnit: invalid"));
+            }
+            other => panic!("Expected Arrow error, got {:?}", other),
+        }
+    }
 }
