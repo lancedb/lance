@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 
+use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 use snafu::location;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -832,6 +833,24 @@ pub async fn assert_plan_node_equals(
 
     // Use the extracted string matching logic
     assert_string_matches(&raw_plan_desc, raw_expected)
+}
+
+#[derive(Default)]
+pub struct ScanStatsHolder {
+    pub collected_stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
+}
+
+impl ScanStatsHolder {
+    pub fn get_setter(&self) -> ExecutionStatsCallback {
+        let collected_stats = self.collected_stats.clone();
+        Arc::new(move |stats| {
+            *collected_stats.lock().unwrap() = Some(stats.clone());
+        })
+    }
+
+    pub fn consume(self) -> ExecutionSummaryCounts {
+        self.collected_stats.lock().unwrap().take().unwrap()
+    }
 }
 
 #[cfg(test)]

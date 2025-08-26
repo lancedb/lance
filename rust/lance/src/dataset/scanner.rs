@@ -3698,6 +3698,7 @@ mod test {
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_arrow::SchemaExt;
+    use lance_datafusion::utils::{MAX_MATCHED_ROWS_METRIC, MIN_MATCHED_ROWS_METRIC};
     use lance_datagen::{array, gen_batch, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
@@ -3721,7 +3722,7 @@ mod test {
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
         assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, IoStats,
-        IoTrackingStore,
+        IoTrackingStore, ScanStatsHolder,
     };
 
     #[tokio::test]
@@ -5905,6 +5906,63 @@ mod test {
             .unwrap();
         let batches = stream.collect::<Vec<_>>().await;
         assert_eq!(batches.len(), 1000_usize.div_ceil(16));
+    }
+
+    #[tokio::test]
+    async fn test_scan_stats() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["x"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        async fn check(
+            scan: &mut Scanner,
+            expected_rows: usize,
+            expected_min_matched: Option<usize>,
+            expected_max_matched: Option<usize>,
+        ) {
+            let stats_holder = ScanStatsHolder::default();
+            scan.scan_stats_callback(stats_holder.get_setter());
+
+            let batch = scan.try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), expected_rows);
+            let stats = stats_holder.consume();
+            assert_eq!(
+                stats.all_counts.get(MIN_MATCHED_ROWS_METRIC).copied(),
+                expected_min_matched
+            );
+            assert_eq!(
+                stats.all_counts.get(MAX_MATCHED_ROWS_METRIC).copied(),
+                expected_max_matched
+            );
+        }
+
+        check(
+            dataset.scan().filter("x > 50").unwrap(),
+            49,
+            Some(49),
+            Some(49),
+        )
+        .await;
+        check(
+            dataset.scan().filter("x = 50").unwrap(),
+            1,
+            Some(1),
+            Some(1),
+        )
+        .await;
+        check(dataset.scan().filter("x != 50").unwrap(), 99, Some(0), None).await;
     }
 
     /// Assert that the plan when formatted matches the expected string.

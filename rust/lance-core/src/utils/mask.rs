@@ -47,6 +47,45 @@ impl RowIdMask {
         }
     }
 
+    pub fn max_matched(&self) -> Option<u64> {
+        // We don't consider the block list here because it may not have intersection
+        // with the allow list and we don't want to spend time computing the intersection.
+        self.allow_list
+            .as_ref()
+            .and_then(|allow_list| allow_list.len())
+    }
+
+    pub fn min_matched(&self) -> Option<u64> {
+        // Similar to max_matched, we assume worst case which here is that the block list
+        // fully intersects with the allow list
+        let mut allow_list_len = None;
+        let mut block_list_len = None;
+
+        // If there is an allow/block list, but the len is unknown, then we can't compute
+        // the min matched
+        if let Some(allow_list) = self.allow_list.as_ref() {
+            if let Some(len) = allow_list.len() {
+                allow_list_len = Some(len);
+            } else {
+                return None;
+            }
+        }
+        if let Some(block_list) = self.block_list.as_ref() {
+            if let Some(len) = block_list.len() {
+                block_list_len = Some(len);
+            } else {
+                return None;
+            }
+        }
+
+        match (allow_list_len, block_list_len) {
+            (Some(allow_list_len), Some(block_list_len)) => Some(allow_list_len - block_list_len),
+            (Some(allow_list_len), None) => Some(allow_list_len),
+            (None, Some(_)) => Some(0),
+            (None, None) => None,
+        }
+    }
+
     // Create a mask from an allow list
     pub fn from_allowed(allow_list: RowIdTreeMap) -> Self {
         Self {
