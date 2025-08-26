@@ -193,6 +193,13 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
+                // Don't treat FTS internal columns (starting with _) as user validation errors
+                if first.starts_with('_') {
+                    return Err(Error::Schema {
+                        message: format!("Internal column {} does not exist", col.as_ref()),
+                        location: location!(),
+                    });
+                }
                 return Err(Error::InvalidQuery {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
