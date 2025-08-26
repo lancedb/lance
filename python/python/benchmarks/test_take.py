@@ -10,8 +10,7 @@ import pyarrow as pa
 import pytest
 from lance import LanceDataset
 
-BATCH_SIZE = 1024
-TEST_LANCE_DATASET_NAME = "test.lance"
+DEFAULT_BATCH_SIZE = 1024
 ENV_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX = (
     "LANCE_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX"
 )
@@ -31,7 +30,7 @@ def create_dataset(
     data_storage_version,
     num_batches: int,
     file_size: int,
-    batch_size: int = BATCH_SIZE,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> LanceDataset:
     schema = pa.schema(
         [
@@ -72,7 +71,6 @@ def create_dataset(
         storage_options = {
             "access_key_id": os.getenv("ACCESS_KEY_ID", ""),
             "secret_access_key": os.getenv("SECRET_ACCESS_KEY", ""),
-            "session_token": os.getenv("SESSION_TOKEN", ""),
             "endpoint": os.getenv("ENDPOINT", ""),
             "virtual_hosted_style_request": os.getenv(
                 "VIRTUAL_HOSTED_STYLE_REQUEST", "true"
