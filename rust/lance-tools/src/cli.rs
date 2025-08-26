@@ -1,39 +1,50 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use clap::{Parser, Subcommand};
-use std::io::Error;
-use std::io::ErrorKind;
-use lance_core::Result as LanceResult;
+use clap::{Args, Parser, Subcommand};
+use lance_core::Result;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "lance-tools",
-    about = "Tools for working with Lance files",
+    about = "Tools for working with Lance",
     version
 )]
 pub struct LanceToolsArgs {
     /// Subcommand to run
     #[command(subcommand)]
-    pub command: LanceToolsCommand,
+    command: LanceToolsCommand,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum LanceToolsCommand {
-    Meta(crate::meta::MetaArgs),
+    File(LanceFileArgs),
 }
 
-pub async fn run(args: LanceToolsArgs) -> Result<(), std::io::Error> {
-    match args.command {
-        LanceToolsCommand::Meta(meta_args) => {
-            return crate::meta::run(meta_args).await;
-        },
-    };
+#[derive(Parser, Debug)]
+pub struct LanceFileArgs {
+    #[command(subcommand)]
+    command: LanceFileCommand,
 }
 
-pub fn lance_result_to_std_result<T>(lance_result: LanceResult<T>) -> Result<T, std::io::Error> {
-    return match lance_result {
-        Ok(t) => Result::Ok(t),
-        Err(e) => Result::Err(Error::new(ErrorKind::Other, e.to_string())),
-    };
+#[derive(Subcommand, Debug)]
+pub enum LanceFileCommand {
+    Meta(LanceFileMetaArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct LanceFileMetaArgs {
+    // The source file to examine.
+    #[arg(short = 's', long, value_name = "source")]
+    pub (crate) source: String,
+}
+
+impl LanceToolsArgs {
+    pub async fn run(&self, writer: impl std::io::Write) -> Result<()> {
+        match &self.command {
+            LanceToolsCommand::File(args) => match &args.command {
+                LanceFileCommand::Meta(args) => crate::meta::show_file_meta(writer, args).await,
+            },
+        }
+    }
 }

@@ -4591,6 +4591,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-tools"
+version = "0.33.0"
+dependencies = [
+ "clap",
+ "futures",
+ "lance-core",
+ "lance-encoding",
+ "lance-file",
+ "lance-io",
+ "object_store",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+]
+
+[[package]]
 name = "lapack"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

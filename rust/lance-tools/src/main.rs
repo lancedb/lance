@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use clap::Parser;
-use lance_tools::cli::{LanceToolsArgs, run};
+use lance_tools::cli::LanceToolsArgs;
+use std::io::{Error, ErrorKind};
 
 #[tokio::main]
-async fn main() -> Result<(), std::io::Error> {
+pub async fn main() -> Result<(), std::io::Error> {
     // Install global panic handler
     install_panic_handler();
 
@@ -13,7 +14,14 @@ async fn main() -> Result<(), std::io::Error> {
     let args = LanceToolsArgs::parse();
 
     // Run with the parsed arguments
-    return run(args).await;
+    return lance_result_to_std_result(args.run(&mut std::io::stdout()).await);
+}
+
+fn lance_result_to_std_result<T>(lance_result: lance_core::Result<T>) -> Result<T, std::io::Error> {
+    return match lance_result {
+        Ok(t) => Result::Ok(t),
+        Err(e) => Result::Err(Error::new(ErrorKind::Other, e.to_string())),
+    };
 }
 
 /// Install custom panic handler for better error reporting

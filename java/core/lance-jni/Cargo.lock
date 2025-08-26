@@ -2974,6 +2974,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tracing",
  "url",
  "uuid",
@@ -2994,6 +2995,15 @@ dependencies = [
  "half",
  "num-traits",
  "rand 0.9.1",
+]
+
+[[package]]
+name = "lance-bitpacking"
+version = "0.33.0"
+dependencies = [
+ "arrayref",
+ "paste",
+ "seq-macro",
 ]
 
 [[package]]
@@ -3070,6 +3080,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "futures",
+ "half",
  "hex",
  "rand 0.9.1",
  "rand_xoshiro",
@@ -3080,8 +3091,6 @@ dependencies = [
 name = "lance-encoding"
 version = "0.33.0"
 dependencies = [
- "arrayref",
- "arrow",
  "arrow-arith",
  "arrow-array",
  "arrow-buffer",
@@ -3098,16 +3107,15 @@ dependencies = [
  "hyperloglogplus",
  "itertools 0.13.0",
  "lance-arrow",
+ "lance-bitpacking",
  "lance-core",
  "log",
  "lz4",
  "num-traits",
- "paste",
  "prost",
  "prost-build",
  "prost-types",
  "rand 0.9.1",
- "seq-macro",
  "snafu",
  "tokio",
  "tracing",
@@ -3179,6 +3187,7 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-datafusion",
+ "lance-datagen",
  "lance-encoding",
  "lance-file",
  "lance-io",
