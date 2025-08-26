@@ -43,6 +43,9 @@ pub struct Manifest {
     /// Dataset version
     pub version: u64,
 
+    /// Branch name, None if the dataset is the main branch.
+    pub branch: Option<String>,
+
     /// Version of the writer library that wrote this manifest.
     pub writer_version: Option<WriterVersion>,
 
@@ -132,6 +135,7 @@ impl Manifest {
             schema,
             local_schema,
             version: 1,
+            branch: None,
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -166,6 +170,7 @@ impl Manifest {
             schema,
             local_schema,
             version: previous.version + 1,
+            branch: previous.branch.clone(),
             writer_version: Some(WriterVersion::default()),
             fragments,
             version_aux_data: 0,
@@ -220,6 +225,8 @@ impl Manifest {
             schema: self.schema.clone(),
             local_schema: self.local_schema.clone(),
             version: self.version,
+            // shallow clone does not create a branch
+            branch: None,
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
@@ -636,6 +643,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             schema,
             local_schema,
             version: p.version,
+            branch: p.branch,
             writer_version,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
@@ -684,6 +692,7 @@ impl From<&Manifest> for pb::Manifest {
         Self {
             fields: fields_with_meta.fields.0,
             version: m.version,
+            branch: m.branch.clone(),
             writer_version: m
                 .writer_version
                 .as_ref()

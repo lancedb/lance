@@ -137,7 +137,7 @@ impl<'a> CleanupTask<'a> {
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
 
-        let tags = self.dataset.tags.list().await?;
+        let tags = self.dataset.refs.list_tags().await?;
         let tagged_versions: HashSet<u64> = tags
             .values()
             .map(|tag_content| tag_content.version)
@@ -163,7 +163,7 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
-            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
+            .list_manifest_locations(&self.dataset.base(), &self.dataset.object_store, false)
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
@@ -228,15 +228,15 @@ impl<'a> CleanupTask<'a> {
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
                 let full_data_path = self.dataset.data_dir().child(file.path.as_str());
-                let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
+                let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base());
                 referenced_files.data_paths.insert(relative_data_path);
             }
             let delpath = fragment
                 .deletion_file
                 .as_ref()
-                .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
+                .map(|delfile| deletion_file_path(&self.dataset.base(), fragment.id, delfile));
             if let Some(delpath) = delpath {
-                let relative_path = remove_prefix(&delpath, &self.dataset.base);
+                let relative_path = remove_prefix(&delpath, &self.dataset.base());
                 referenced_files.delete_paths.insert(relative_path);
             }
         }
@@ -264,7 +264,7 @@ impl<'a> CleanupTask<'a> {
         let unreferenced_paths = self
             .dataset
             .object_store
-            .read_dir_all(&self.dataset.base, Some(self.before))
+            .read_dir_all(self.dataset.base(), Some(self.before))
             .try_filter_map(|obj_meta| {
                 // If a file is new-ish then it might be part of an ongoing operation and so we only
                 // delete it if we can verify it is part of an old version.
@@ -326,7 +326,7 @@ impl<'a> CleanupTask<'a> {
         maybe_in_progress: bool,
         inspection: &CleanupInspection,
     ) -> Result<Option<Path>> {
-        let relative_path = remove_prefix(&path, &self.dataset.base);
+        let relative_path = remove_prefix(&path, &self.dataset.base());
         if relative_path.as_ref().starts_with("_versions/.tmp") {
             // This is a temporary manifest file.
             //
@@ -523,7 +523,7 @@ fn tagged_old_versions_cleanup_error(
 ) -> Error {
     let unreferenced_tags: HashMap<String, u64> = tags
         .iter()
-        .filter_map(|(k, &v)| {
+        .filter_map(|(k, v)| {
             if tagged_old_versions.contains(&v.version) {
                 Some((k.clone(), v.version))
             } else {

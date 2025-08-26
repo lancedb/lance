@@ -176,6 +176,7 @@ async fn do_commit_new_dataset(
                 .await;
 
             let manifest_key = crate::session::caches::ManifestKey {
+                branch: manifest.branch.as_deref(),
                 version: manifest_location.version,
                 e_tag: manifest_location.e_tag.as_deref(),
             };
@@ -460,7 +461,7 @@ pub(crate) async fn migrate_fragments(
                     } else {
                         Either::Right(async {
                             object_store
-                                .size(&dataset.base.child("data").child(file.path.clone()))
+                                .size(&dataset.base().child("data").child(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| Error::Internal {
                                         message: format!("File {} has size 0", file.path),
@@ -588,7 +589,7 @@ pub(crate) async fn do_commit_detached_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
-    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+    let transaction_file = write_transaction_file(object_store, dataset.base(), transaction).await?;
 
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
@@ -601,7 +602,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    dataset.base(),
                     version,
                     write_config,
                     &transaction_file,
@@ -631,7 +632,7 @@ pub(crate) async fn do_commit_detached_transaction(
         let result = write_manifest_file(
             object_store,
             commit_handler,
-            &dataset.base,
+            dataset.base(),
             &mut manifest,
             if indices.is_empty() {
                 None
@@ -814,7 +815,7 @@ pub(crate) async fn commit_transaction(
         }
 
         let transaction_file =
-            write_transaction_file(object_store, &dataset.base, &transaction).await?;
+            write_transaction_file(object_store, dataset.base(), &transaction).await?;
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
@@ -826,7 +827,7 @@ pub(crate) async fn commit_transaction(
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
-                    &dataset.base,
+                    dataset.base(),
                     version,
                     write_config,
                     &transaction_file,
@@ -863,7 +864,7 @@ pub(crate) async fn commit_transaction(
         let result = write_manifest_file(
             object_store,
             commit_handler,
-            &dataset.base,
+            dataset.base(),
             &mut manifest,
             if indices.is_empty() {
                 None
@@ -887,6 +888,7 @@ pub(crate) async fn commit_transaction(
                     .await;
 
                 let manifest_key = crate::session::caches::ManifestKey {
+                    branch: manifest.branch.as_deref(),
                     version: manifest_location.version,
                     e_tag: manifest_location.e_tag.as_deref(),
                 };

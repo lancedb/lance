@@ -325,7 +325,7 @@ impl UpdateJob {
         let written = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
-            &self.dataset.base,
+            self.dataset.base(),
             self.dataset.schema().clone(),
             Box::pin(stream),
             WriteParams::with_storage_version(version),
