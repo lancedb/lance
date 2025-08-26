@@ -202,6 +202,7 @@ impl TryFrom<&LogicalType> for DataType {
             "binary" => Some(Binary),
             "large_string" => Some(LargeUtf8),
             "large_binary" => Some(LargeBinary),
+            "json" => Some(LargeBinary),
             "date32:day" => Some(Date32),
             "date64:ms" => Some(Date64),
             "time32:s" => Some(Time32(TimeUnit::Second)),

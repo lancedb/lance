@@ -29,6 +29,7 @@ pub mod bfloat16;
 pub mod floats;
 pub use floats::*;
 pub mod cast;
+pub mod json;
 pub mod list;
 pub mod memory;
 

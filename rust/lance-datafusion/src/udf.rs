@@ -10,9 +10,12 @@ use datafusion::prelude::SessionContext;
 use datafusion_functions::utils::make_scalar_function;
 use std::sync::{Arc, LazyLock};
 
+mod json;
+
 /// Register UDF functions to datafusion context.
 pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(CONTAINS_TOKENS_UDF.clone());
+    ctx.register_udf(json::json_extract_udf());
 }
 
 /// This method checks whether a string contains another string. It utilizes FTS (Full-Text Search)

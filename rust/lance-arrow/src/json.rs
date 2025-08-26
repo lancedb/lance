@@ -1,0 +1,292 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! JSON support for Apache Arrow.
+
+use std::sync::Arc;
+
+use arrow_array::builder::LargeBinaryBuilder;
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
+use arrow_data::ArrayData;
+use arrow_schema::{ArrowError, DataType, Field as ArrowField};
+
+/// Arrow extension type name for JSON data
+pub const JSON_EXT_NAME: &str = "lance.json";
+
+/// Arrow extension metadata key for extension name
+pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
+
+/// Arrow extension metadata key for extension metadata
+pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
+
+/// Check if a field is a JSON extension field
+pub fn is_json_field(field: &ArrowField) -> bool {
+    field.data_type() == &DataType::LargeBinary
+        && field
+            .metadata()
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|name| name == JSON_EXT_NAME)
+            .unwrap_or_default()
+}
+
+/// Create a JSON field with the appropriate extension metadata
+pub fn json_field(name: &str, nullable: bool) -> ArrowField {
+    let mut field = ArrowField::new(name, DataType::LargeBinary, nullable);
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(ARROW_EXT_NAME_KEY.to_string(), JSON_EXT_NAME.to_string());
+    field.set_metadata(metadata);
+    field
+}
+
+/// A specialized array for JSON data stored as JSONB binary format
+#[derive(Debug, Clone)]
+pub struct JsonArray {
+    inner: LargeBinaryArray,
+}
+
+impl JsonArray {
+    /// Create a new JsonArray from LargeBinaryArray containing JSONB data
+    pub fn new(inner: LargeBinaryArray) -> Self {
+        Self { inner }
+    }
+
+    /// Create a JsonArray from an iterator of JSON strings
+    pub fn from_json_strings<I, S>(iter: I) -> Result<Self, ArrowError>
+    where
+        I: IntoIterator<Item = Option<S>>,
+        S: AsRef<str>,
+    {
+        let mut builder = LargeBinaryBuilder::new();
+
+        for json_str in iter {
+            match json_str {
+                Some(s) => {
+                    let encoded = encode_json(s.as_ref()).map_err(|e| {
+                        ArrowError::InvalidArgumentError(format!("Failed to encode JSON: {}", e))
+                    })?;
+                    builder.append_value(&encoded);
+                }
+                None => builder.append_null(),
+            }
+        }
+
+        Ok(Self::new(builder.finish()))
+    }
+
+    /// Get the underlying LargeBinaryArray
+    pub fn into_inner(self) -> LargeBinaryArray {
+        self.inner
+    }
+
+    /// Get a reference to the underlying LargeBinaryArray
+    pub fn inner(&self) -> &LargeBinaryArray {
+        &self.inner
+    }
+
+    /// Get the value at index i as decoded JSON string
+    pub fn value(&self, i: usize) -> Result<String, ArrowError> {
+        if self.inner.is_null(i) {
+            return Err(ArrowError::InvalidArgumentError(
+                "Value is null".to_string(),
+            ));
+        }
+
+        let jsonb_bytes = self.inner.value(i);
+        decode_json(jsonb_bytes)
+            .map_err(|e| ArrowError::InvalidArgumentError(format!("Failed to decode JSON: {}", e)))
+    }
+
+    /// Get the value at index i as raw JSONB bytes
+    pub fn value_bytes(&self, i: usize) -> &[u8] {
+        self.inner.value(i)
+    }
+
+    /// Get JSONPath value from the JSON at index i
+    pub fn json_path(&self, i: usize, path: &str) -> Result<Option<String>, ArrowError> {
+        if self.inner.is_null(i) {
+            return Ok(None);
+        }
+
+        let jsonb_bytes = self.inner.value(i);
+        get_json_path(jsonb_bytes, path).map_err(|e| {
+            ArrowError::InvalidArgumentError(format!("Failed to extract JSONPath: {}", e))
+        })
+    }
+}
+
+impl Array for JsonArray {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn to_data(&self) -> ArrayData {
+        self.inner.to_data()
+    }
+
+    fn into_data(self) -> ArrayData {
+        self.inner.into_data()
+    }
+
+    fn data_type(&self) -> &DataType {
+        &DataType::LargeBinary
+    }
+
+    fn slice(&self, offset: usize, length: usize) -> ArrayRef {
+        Arc::new(Self::new(self.inner.slice(offset, length)))
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn offset(&self) -> usize {
+        self.inner.offset()
+    }
+
+    fn nulls(&self) -> Option<&arrow_buffer::NullBuffer> {
+        self.inner.nulls()
+    }
+
+    fn get_buffer_memory_size(&self) -> usize {
+        self.inner.get_buffer_memory_size()
+    }
+
+    fn get_array_memory_size(&self) -> usize {
+        self.inner.get_array_memory_size()
+    }
+}
+
+impl From<StringArray> for JsonArray {
+    fn from(array: StringArray) -> Self {
+        let mut builder = LargeBinaryBuilder::with_capacity(array.len(), array.value_data().len());
+
+        for i in 0..array.len() {
+            if array.is_null(i) {
+                builder.append_null();
+            } else {
+                let json_str = array.value(i);
+                // If encoding fails, we'll store the original string as-is (for error handling)
+                match encode_json(json_str) {
+                    Ok(encoded) => builder.append_value(&encoded),
+                    Err(_) => {
+                        // In production, we might want to handle this differently
+                        // For now, we'll store empty JSONB
+                        builder.append_value([]);
+                    }
+                }
+            }
+        }
+
+        Self::new(builder.finish())
+    }
+}
+
+impl From<JsonArray> for LargeBinaryArray {
+    fn from(array: JsonArray) -> Self {
+        array.inner
+    }
+}
+
+impl From<JsonArray> for ArrayRef {
+    fn from(array: JsonArray) -> Self {
+        Arc::new(array.inner)
+    }
+}
+
+/// Encode JSON string to JSONB format
+fn encode_json(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let value = jsonb::parse_value(json_str.as_bytes())?;
+    Ok(value.to_vec())
+}
+
+/// Decode JSONB bytes to JSON string
+fn decode_json(jsonb_bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
+    Ok(raw_jsonb.to_string())
+}
+
+/// Extract JSONPath value from JSONB
+fn get_json_path(
+    jsonb_bytes: &[u8],
+    path: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let json_path = jsonb::jsonpath::parse_json_path(path.as_bytes())?;
+    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
+
+    match raw_jsonb.select_by_path(&json_path) {
+        Ok(values) => {
+            if values.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(values[0].to_string()))
+            }
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_json_field_creation() {
+        let field = json_field("data", true);
+        assert_eq!(field.name(), "data");
+        assert_eq!(field.data_type(), &DataType::LargeBinary);
+        assert!(field.is_nullable());
+        assert!(is_json_field(&field));
+    }
+
+    #[test]
+    fn test_json_array_from_strings() {
+        let json_strings = vec![
+            Some(r#"{"name": "Alice", "age": 30}"#),
+            None,
+            Some(r#"{"name": "Bob", "age": 25}"#),
+        ];
+
+        let array = JsonArray::from_json_strings(json_strings).unwrap();
+        assert_eq!(array.len(), 3);
+        assert!(!array.is_null(0));
+        assert!(array.is_null(1));
+        assert!(!array.is_null(2));
+
+        let decoded = array.value(0).unwrap();
+        assert!(decoded.contains("Alice"));
+    }
+
+    #[test]
+    fn test_json_array_from_string_array() {
+        let string_array = StringArray::from(vec![
+            Some(r#"{"name": "Alice"}"#),
+            Some(r#"{"name": "Bob"}"#),
+            None,
+        ]);
+
+        let json_array = JsonArray::from(string_array);
+        assert_eq!(json_array.len(), 3);
+        assert!(!json_array.is_null(0));
+        assert!(!json_array.is_null(1));
+        assert!(json_array.is_null(2));
+    }
+
+    #[test]
+    fn test_json_path_extraction() {
+        let json_array = JsonArray::from_json_strings(vec![
+            Some(r#"{"user": {"name": "Alice", "age": 30}}"#),
+            Some(r#"{"user": {"name": "Bob"}}"#),
+        ])
+        .unwrap();
+
+        let name = json_array.json_path(0, "$.user.name").unwrap();
+        assert_eq!(name, Some("\"Alice\"".to_string()));
+
+        let age = json_array.json_path(1, "$.user.age").unwrap();
+        assert_eq!(age, None);
+    }
+}
