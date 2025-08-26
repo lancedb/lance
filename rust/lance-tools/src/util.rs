@@ -39,3 +39,18 @@ pub(crate) async fn get_object_store_and_path(source: &String) -> Result<(Arc<Ob
     let object_store = Arc::new(ObjectStore::local());
     return Ok((object_store, path));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_path_to_parent() {
+        let (parent_path, filename) = path_to_parent(&object_store::path::Path::parse("/a/b/c").unwrap()).unwrap();
+        assert_eq!("c", filename);
+        let parts: Vec<_> = parent_path.parts().collect();
+        assert_eq!(2, parts.len());
+        assert_eq!("a", parts.get(0).unwrap().as_ref());
+        assert_eq!("b", parts.get(1).unwrap().as_ref());
+    }
+}
