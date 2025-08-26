@@ -237,6 +237,39 @@ impl TryFrom<&LargeStringArray> for JsonArray {
     }
 }
 
+impl TryFrom<ArrayRef> for JsonArray {
+    type Error = ArrowError;
+
+    fn try_from(array_ref: ArrayRef) -> Result<Self, Self::Error> {
+        match array_ref.data_type() {
+            DataType::Utf8 => {
+                let string_array = array_ref
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("Failed to downcast to StringArray".into())
+                    })?;
+                Self::try_from(string_array)
+            }
+            DataType::LargeUtf8 => {
+                let large_string_array = array_ref
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError(
+                            "Failed to downcast to LargeStringArray".into(),
+                        )
+                    })?;
+                Self::try_from(large_string_array)
+            }
+            dt => Err(ArrowError::InvalidArgumentError(format!(
+                "Unsupported array type for JSON: {:?}. Expected Utf8 or LargeUtf8",
+                dt
+            ))),
+        }
+    }
+}
+
 /// Encode JSON string to JSONB format
 pub fn encode_json(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let value = jsonb::parse_value(json_str.as_bytes())?;

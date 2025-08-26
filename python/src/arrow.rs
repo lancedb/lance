@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use arrow::pyarrow::*;
 use arrow_array::RecordBatch;
+use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
 use lance::arrow::bfloat16::BFloat16Array;
 use lance_arrow::bfloat16::BFLOAT16_EXT_NAME;
+use lance_arrow::json::{JsonArray, JSON_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use pyo3::{exceptions::PyValueError, prelude::*, pyclass::CompareOp, types::PyType};
 
@@ -88,4 +91,36 @@ pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyOb
 
     let pyarrow_batch = batch.to_pyarrow(py)?;
     pyarrow_batch.call_method1(py, "__getitem__", ("bfloat16",))
+}
+
+const JSON_EXPORT_METADATA: [(&str, &str); 2] = [
+    (ARROW_EXT_NAME_KEY, JSON_EXT_NAME),
+    (ARROW_EXT_META_KEY, ""),
+];
+
+#[pyfunction]
+pub fn json_array(array_obj: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PyObject> {
+    let array = ArrayData::from_pyarrow_bound(array_obj)?;
+    let array_ref = arrow::array::make_array(array);
+
+    // Use the new TryFrom<ArrayRef> implementation
+    let json_array = JsonArray::try_from(array_ref)
+        .map_err(|e| PyValueError::new_err(format!("Failed to create JsonArray: {}", e)))?;
+
+    // Create a field with JSON extension metadata
+    let field = Field::new("json", DataType::LargeBinary, true).with_metadata(
+        JSON_EXPORT_METADATA
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    );
+    
+    // Wrap JsonArray in a RecordBatch to preserve metadata through PyArrow conversion
+    let schema = Schema::new(vec![field]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_array)])
+        .map_err(|err| PyValueError::new_err(format!("Failed to build array: {}", err)))?;
+
+    // Convert to PyArrow and extract the column
+    let pyarrow_batch = batch.to_pyarrow(py)?;
+    pyarrow_batch.call_method1(py, "__getitem__", ("json",))
 }

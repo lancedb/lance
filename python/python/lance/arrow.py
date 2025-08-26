@@ -15,6 +15,11 @@ from ._arrow.bf16 import (  # noqa: F401
     BFloat16Type,
     PandasBFloat16Array,
 )
+from ._arrow.json import (  # noqa: F401
+    JsonArray,
+    JsonType,
+    json_field,
+)
 from .dependencies import numpy as np
 from .lance import bfloat16_array
 
@@ -29,6 +34,9 @@ __all__ = [
     "ImageScalar",
     "ImageURIArray",
     "ImageURIType",
+    "JsonArray",
+    "JsonType",
+    "json_field",
 ]
 
 
