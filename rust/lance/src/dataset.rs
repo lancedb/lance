@@ -134,7 +134,7 @@ pub struct Dataset {
     /// Uri of the dataset.
     ///
     /// On cloud storage, we can not use [Dataset::base] to build the full uri because the
-    /// `bucket` is swlloed in the inner [ObjectStore].
+    /// `bucket` is swallowed in the inner [ObjectStore].
     uri: String,
     pub(crate) base: Path,
     pub manifest: Arc<Manifest>,

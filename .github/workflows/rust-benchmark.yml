@@ -32,6 +32,10 @@ jobs:
     runs-on: warp-ubuntu-latest-arm64-8x
     timeout-minutes: 120
     steps:
+      - name: Apt-get
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run linalg benchmarks
