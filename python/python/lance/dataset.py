@@ -1970,7 +1970,7 @@ class LanceDataset(pa.dataset.Dataset):
             structure. If False, an empty index will be created that can be
             populated later.
 
-        with_position: bool, default True
+        with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
             query. This will significantly increase the index size.
@@ -1991,13 +1991,13 @@ class LanceDataset(pa.dataset.Dataset):
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
-        stem: bool, default False
+        stem: bool, default True
             This is for the ``INVERTED`` index. If True, the index will stem the
             tokens.
-        remove_stop_words: bool, default False
+        remove_stop_words: bool, default True
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
-        ascii_folding: bool, default False
+        ascii_folding: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
