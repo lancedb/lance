@@ -6,11 +6,7 @@ import tempfile
 from pathlib import Path
 
 import lance
-import numpy as np
-import pandas as pd
 import pyarrow as pa
-import pyarrow.compute as pc
-import pytest
 
 
 def test_json_basic_write_read():
