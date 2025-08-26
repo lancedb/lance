@@ -3,10 +3,11 @@
 
 //! JSON support for Apache Arrow.
 
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use arrow_array::builder::LargeBinaryBuilder;
-use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField};
 
@@ -57,13 +58,8 @@ pub struct JsonArray {
 }
 
 impl JsonArray {
-    /// Create a new JsonArray from LargeBinaryArray containing JSONB data
-    pub fn new(inner: LargeBinaryArray) -> Self {
-        Self { inner }
-    }
-
-    /// Create a JsonArray from an iterator of JSON strings
-    pub fn from_json_strings<I, S>(iter: I) -> Result<Self, ArrowError>
+    /// Create a new JsonArray from an iterator of JSON strings
+    pub fn try_from_iter<I, S>(iter: I) -> Result<Self, ArrowError>
     where
         I: IntoIterator<Item = Option<S>>,
         S: AsRef<str>,
@@ -82,7 +78,9 @@ impl JsonArray {
             }
         }
 
-        Ok(Self::new(builder.finish()))
+        Ok(Self {
+            inner: builder.finish(),
+        })
     }
 
     /// Get the underlying LargeBinaryArray
@@ -144,7 +142,9 @@ impl Array for JsonArray {
     }
 
     fn slice(&self, offset: usize, length: usize) -> ArrayRef {
-        Arc::new(Self::new(self.inner.slice(offset, length)))
+        Arc::new(Self {
+            inner: self.inner.slice(offset, length),
+        })
     }
 
     fn len(&self) -> usize {
@@ -172,8 +172,19 @@ impl Array for JsonArray {
     }
 }
 
-impl From<StringArray> for JsonArray {
-    fn from(array: StringArray) -> Self {
+// TryFrom implementations for string arrays
+impl TryFrom<StringArray> for JsonArray {
+    type Error = ArrowError;
+
+    fn try_from(array: StringArray) -> Result<Self, Self::Error> {
+        Self::try_from(&array)
+    }
+}
+
+impl TryFrom<&StringArray> for JsonArray {
+    type Error = ArrowError;
+
+    fn try_from(array: &StringArray) -> Result<Self, Self::Error> {
         let mut builder = LargeBinaryBuilder::with_capacity(array.len(), array.value_data().len());
 
         for i in 0..array.len() {
@@ -181,42 +192,59 @@ impl From<StringArray> for JsonArray {
                 builder.append_null();
             } else {
                 let json_str = array.value(i);
-                // If encoding fails, we'll store the original string as-is (for error handling)
-                match encode_json(json_str) {
-                    Ok(encoded) => builder.append_value(&encoded),
-                    Err(_) => {
-                        // In production, we might want to handle this differently
-                        // For now, we'll store empty JSONB
-                        builder.append_value([]);
-                    }
-                }
+                let encoded = encode_json(json_str).map_err(|e| {
+                    ArrowError::InvalidArgumentError(format!("Failed to encode JSON: {}", e))
+                })?;
+                builder.append_value(&encoded);
             }
         }
 
-        Self::new(builder.finish())
+        Ok(Self {
+            inner: builder.finish(),
+        })
     }
 }
 
-impl From<JsonArray> for LargeBinaryArray {
-    fn from(array: JsonArray) -> Self {
-        array.inner
+impl TryFrom<LargeStringArray> for JsonArray {
+    type Error = ArrowError;
+
+    fn try_from(array: LargeStringArray) -> Result<Self, Self::Error> {
+        Self::try_from(&array)
     }
 }
 
-impl From<JsonArray> for ArrayRef {
-    fn from(array: JsonArray) -> Self {
-        Arc::new(array.inner)
+impl TryFrom<&LargeStringArray> for JsonArray {
+    type Error = ArrowError;
+
+    fn try_from(array: &LargeStringArray) -> Result<Self, Self::Error> {
+        let mut builder = LargeBinaryBuilder::with_capacity(array.len(), array.value_data().len());
+
+        for i in 0..array.len() {
+            if array.is_null(i) {
+                builder.append_null();
+            } else {
+                let json_str = array.value(i);
+                let encoded = encode_json(json_str).map_err(|e| {
+                    ArrowError::InvalidArgumentError(format!("Failed to encode JSON: {}", e))
+                })?;
+                builder.append_value(&encoded);
+            }
+        }
+
+        Ok(Self {
+            inner: builder.finish(),
+        })
     }
 }
 
 /// Encode JSON string to JSONB format
-fn encode_json(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub fn encode_json(json_str: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let value = jsonb::parse_value(json_str.as_bytes())?;
     Ok(value.to_vec())
 }
 
 /// Decode JSONB bytes to JSON string
-fn decode_json(jsonb_bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+pub fn decode_json(jsonb_bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
     Ok(raw_jsonb.to_string())
 }
@@ -262,7 +290,7 @@ mod tests {
             Some(r#"{"name": "Bob", "age": 25}"#),
         ];
 
-        let array = JsonArray::from_json_strings(json_strings).unwrap();
+        let array = JsonArray::try_from_iter(json_strings).unwrap();
         assert_eq!(array.len(), 3);
         assert!(!array.is_null(0));
         assert!(array.is_null(1));
@@ -280,7 +308,7 @@ mod tests {
             None,
         ]);
 
-        let json_array = JsonArray::from(string_array);
+        let json_array = JsonArray::try_from(string_array).unwrap();
         assert_eq!(json_array.len(), 3);
         assert!(!json_array.is_null(0));
         assert!(!json_array.is_null(1));
@@ -289,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_json_path_extraction() {
-        let json_array = JsonArray::from_json_strings(vec![
+        let json_array = JsonArray::try_from_iter(vec![
             Some(r#"{"user": {"name": "Alice", "age": 30}}"#),
             Some(r#"{"user": {"name": "Bob"}}"#),
         ])
