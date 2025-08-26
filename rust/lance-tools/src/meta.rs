@@ -18,8 +18,16 @@ impl fmt::Display for LanceToolFileMetadata {
         writeln!(f, "version: {}", self.file_metadata.version())?;
         writeln!(f, "num_rows: {}", self.file_metadata.num_rows)?;
         writeln!(f, "num_data_bytes: {}", self.file_metadata.num_data_bytes)?;
-        writeln!(f, "num_column_metadata_bytes: {}", self.file_metadata.num_column_metadata_bytes)?;
-        writeln!(f, "num_footer_bytes: {}", self.file_metadata.num_footer_bytes)?;
+        writeln!(
+            f,
+            "num_column_metadata_bytes: {}",
+            self.file_metadata.num_column_metadata_bytes
+        )?;
+        writeln!(
+            f,
+            "num_footer_bytes: {}",
+            self.file_metadata.num_footer_bytes
+        )?;
         writeln!(f, "schema:")?;
         write!(f, "{}", self.file_metadata.file_schema)?;
         return Ok(());

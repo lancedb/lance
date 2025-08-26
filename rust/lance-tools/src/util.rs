@@ -11,7 +11,10 @@ use url::Url;
 fn path_to_parent(path: &Path) -> Result<(Path, String)> {
     let mut parts = path.parts().collect::<Vec<_>>();
     if parts.is_empty() {
-        return Err(Error::invalid_input(format!("Path {} is not a valid path to a file", path), location!()));
+        return Err(Error::invalid_input(
+            format!("Path {} is not a valid path to a file", path),
+            location!(),
+        ));
     }
     let filename = parts.pop().unwrap().as_ref().to_owned();
     Ok((Path::from_iter(parts), filename))
@@ -30,7 +33,8 @@ pub(crate) async fn get_object_store_and_path(source: &String) -> Result<(Arc<Ob
                 object_store_registry,
                 url.as_str(),
                 &object_store_params,
-            ).await?;
+            )
+            .await?;
             let child_path = dir_path.child(filename);
             return Ok((object_store, child_path));
         }
@@ -46,7 +50,8 @@ mod tests {
 
     #[test]
     fn test_path_to_parent() {
-        let (parent_path, filename) = path_to_parent(&object_store::path::Path::parse("/a/b/c").unwrap()).unwrap();
+        let (parent_path, filename) =
+            path_to_parent(&object_store::path::Path::parse("/a/b/c").unwrap()).unwrap();
         assert_eq!("c", filename);
         let parts: Vec<_> = parent_path.parts().collect();
         assert_eq!(2, parts.len());

@@ -17,7 +17,9 @@ pub async fn main() -> Result<(), lance_core::Error> {
     return lance_result_to_std_result(args.run(&mut std::io::stdout()).await);
 }
 
-fn lance_result_to_std_result<T>(lance_result: lance_core::Result<T>) -> Result<T, lance_core::Error> {
+fn lance_result_to_std_result<T>(
+    lance_result: lance_core::Result<T>,
+) -> Result<T, lance_core::Error> {
     return match lance_result {
         Ok(t) => Result::Ok(t),
         Err(e) => Result::Err(e),
@@ -71,6 +73,9 @@ mod tests {
 
     #[test]
     fn test_error_lance_result_to_error_std_result() {
-        assert!(lance_result_to_std_result::<()>(lance_core::Result::Err(lance_core::Error::invalid_input("bad input", location!()))).is_err());
+        assert!(lance_result_to_std_result::<()>(lance_core::Result::Err(
+            lance_core::Error::invalid_input("bad input", location!())
+        ))
+        .is_err());
     }
 }
