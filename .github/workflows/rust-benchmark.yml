@@ -34,8 +34,8 @@ jobs:
     steps:
       - name: Apt-get
         run: |
-          apt update
-          apt install -y protobuf-compiler
+          sudo apt update
+          sudo apt install -y protobuf-compiler
       - name: Checkout
         uses: actions/checkout@v4
       - name: Run linalg benchmarks
