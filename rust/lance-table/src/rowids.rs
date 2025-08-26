@@ -12,7 +12,6 @@
 //! sequences. The on-disk format is designed to align well with the in-memory
 //! representation, to avoid unnecessary deserialization.
 use std::ops::Range;
-
 // TODO: replace this with Arrow BooleanBuffer.
 
 // These are all internal data structures, and are private.
@@ -34,10 +33,9 @@ pub use serde::{read_row_ids, write_row_ids};
 
 use snafu::location;
 
+use crate::utils::LanceIteratorExtension;
 use segment::U64Segment;
 use tracing::instrument;
-
-use crate::utils::LanceIteratorExtension;
 
 /// A sequence of row ids.
 ///
@@ -563,13 +561,21 @@ impl RowIdSeqSlice<'_> {
 
 /// Re-chunk a sequences of row ids into chunks of a given size.
 ///
+/// The sequences may less than chunk sizes, because the sequences only
+/// contains the row ids that we want to keep, they come from the updates records.
+/// But the chunk sizes are based on the fragment physical rows(may contain inserted records).
+/// So if the sequences are smaller than the chunk sizes, we need to
+/// assign the incremental row ids in the further step. This behavior is controlled by the
+/// `allow_incomplete` parameter.
+///
 /// # Errors
 ///
-/// Will return an error if the sum of the chunk sizes is not equal to the total
-/// number of row ids in the sequences.
+/// If `allow_incomplete` is false, will return an error if the sum of the chunk sizes
+/// is not equal to the total number of row ids in the sequences.
 pub fn rechunk_sequences(
     sequences: impl IntoIterator<Item = RowIdSequence>,
     chunk_sizes: impl IntoIterator<Item = u64>,
+    allow_incomplete: bool,
 ) -> Result<Vec<RowIdSequence>> {
     // TODO: return an iterator. (with a good size hint?)
     let chunk_size_iter = chunk_sizes.into_iter();
@@ -608,9 +614,14 @@ pub fn rechunk_sequences(
                 }
                 (_, 0) => {
                     // Can push the entire segment.
-                    let segment = segment_iter.next().ok_or_else(too_many_segments_error)?;
-                    sequence.extend(RowIdSequence(vec![segment]));
-                    remaining = 0;
+                    if let Some(segment) = segment_iter.next() {
+                        sequence.extend(RowIdSequence(vec![segment]));
+                        remaining = 0;
+                    } else if allow_incomplete {
+                        remaining = 0;
+                    } else {
+                        return Err(too_many_segments_error());
+                    }
                 }
                 (_, _) => {
                     // Push remaining segment
@@ -822,7 +833,7 @@ mod test {
             chunk_sizes: Vec<u64>,
             expected: Vec<RowIdSequence>,
         ) {
-            let chunked = rechunk_sequences(input, chunk_sizes).unwrap();
+            let chunked = rechunk_sequences(input, chunk_sizes, false).unwrap();
             assert_eq!(chunked, expected);
         }
 
@@ -858,11 +869,11 @@ mod test {
         );
 
         // Too few segments -> error
-        let result = rechunk_sequences(many_segments.clone(), vec![100]);
+        let result = rechunk_sequences(many_segments.clone(), vec![100], false);
         assert!(result.is_err());
 
         // Too many segments -> error
-        let result = rechunk_sequences(many_segments, vec![5]);
+        let result = rechunk_sequences(many_segments, vec![5], false);
         assert!(result.is_err());
     }
 

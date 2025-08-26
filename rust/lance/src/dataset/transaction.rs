@@ -45,11 +45,6 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
 use super::ManifestWriteConfig;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
@@ -60,6 +55,7 @@ use lance_index::mem_wal::MemWal;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
+use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -74,6 +70,11 @@ use lance_table::{
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
+use std::cmp::Ordering;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 /// A change to a dataset that can be retried
@@ -227,6 +228,14 @@ pub enum Operation {
         updated: Vec<MemWal>,
         removed: Vec<MemWal>,
     },
+
+    /// Clone a dataset.
+    Clone {
+        is_shallow: bool,
+        ref_name: Option<String>,
+        ref_version: u64,
+        ref_path: String,
+    },
 }
 
 impl std::fmt::Display for Operation {
@@ -244,6 +253,7 @@ impl std::fmt::Display for Operation {
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
+            Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
         }
     }
@@ -261,6 +271,25 @@ impl PartialEq for Operation {
         }
         match (self, other) {
             (Self::Append { fragments: a }, Self::Append { fragments: b }) => compare_vec(a, b),
+            (
+                Self::Clone {
+                    is_shallow: a_is_shallow,
+                    ref_name: a_ref_name,
+                    ref_version: a_ref_version,
+                    ref_path: a_source_path,
+                },
+                Self::Clone {
+                    is_shallow: b_is_shallow,
+                    ref_name: b_ref_name,
+                    ref_version: b_ref_version,
+                    ref_path: b_source_path,
+                },
+            ) => {
+                a_is_shallow == b_is_shallow
+                    && a_ref_name == b_ref_name
+                    && a_ref_version == b_ref_version
+                    && a_source_path == b_source_path
+            }
             (
                 Self::Delete {
                     updated_fragments: a_updated,
@@ -427,6 +456,9 @@ impl PartialEq for Operation {
             (Self::Append { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Append { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Delete { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -462,6 +494,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Delete { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -501,6 +536,9 @@ impl PartialEq for Operation {
             (Self::Overwrite { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Overwrite { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::CreateIndex { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -536,6 +574,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::CreateIndex { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -575,6 +616,9 @@ impl PartialEq for Operation {
             (Self::Rewrite { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Rewrite { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Merge { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -610,6 +654,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Merge { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -649,6 +696,9 @@ impl PartialEq for Operation {
             (Self::Restore { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Restore { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::ReserveFragments { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -684,6 +734,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::ReserveFragments { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -723,6 +776,9 @@ impl PartialEq for Operation {
             (Self::Update { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Update { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Project { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -758,6 +814,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Project { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -797,6 +856,9 @@ impl PartialEq for Operation {
             (Self::UpdateConfig { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateConfig { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::DataReplacement { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -832,6 +894,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::DataReplacement { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -871,6 +936,9 @@ impl PartialEq for Operation {
             (Self::UpdateMemWalState { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateMemWalState { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
             (
                 Self::UpdateMemWalState {
                     added: a_added,
@@ -886,6 +954,45 @@ impl PartialEq for Operation {
                 compare_vec(a_added, b_added)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_removed, b_removed)
+            }
+            (Self::Clone { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
             }
         }
     }
@@ -1015,6 +1122,7 @@ impl Operation {
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
+            Self::Clone { .. } => "Clone",
         }
     }
 }
@@ -1179,6 +1287,10 @@ impl Transaction {
                 location: location!(),
             });
         }
+        let reference_paths = match current_manifest {
+            Some(m) => m.base_paths.clone(),
+            None => HashMap::new(),
+        };
 
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -1237,6 +1349,12 @@ impl Transaction {
                 });
 
         match &self.operation {
+            Operation::Clone { .. } => {
+                return Err(Error::Internal {
+                    message: "Clone operation should not enter build_manifest.".to_string(),
+                    location: location!(),
+                })
+            }
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
@@ -1545,15 +1663,16 @@ impl Transaction {
                 Arc::new(final_fragments),
                 new_blob_version,
             );
-            if user_requested_version.is_some()
-                && matches!(self.operation, Operation::Overwrite { .. })
+
+            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
+                (user_requested_version, &self.operation)
             {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format =
-                    DataStorageFormat::new(user_requested_version.unwrap());
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
             }
+
             prev_manifest
         } else {
             let data_storage_format =
@@ -1563,6 +1682,7 @@ impl Transaction {
                 Arc::new(final_fragments),
                 data_storage_format,
                 new_blob_version,
+                reference_paths,
             )
         };
 
@@ -1880,20 +2000,78 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
-            if fragment.row_id_meta.is_some() {
-                // Operation must have already assigned ids.
-                continue;
-            }
             let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
                 message: "Fragment does not have physical rows".into(),
                 location: location!(),
             })? as u64;
-            let row_ids = *next_row_id..(*next_row_id + physical_rows);
-            let sequence = RowIdSequence::from(row_ids);
-            // TODO: write to a separate file if large. Possibly share a file with other fragments.
-            let serialized = write_row_ids(&sequence);
-            fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
-            *next_row_id += physical_rows;
+
+            if fragment.row_id_meta.is_some() {
+                // we may meet merge insert case, it only has partial row ids.
+                // so here, we need to check if the row ids match the physical rows
+                // if yes, continue
+                // if not, fill the remaining row ids to the physical rows, then update row_id_meta
+
+                // Check if existing row IDs match the physical rows count
+                let existing_row_count = match &fragment.row_id_meta {
+                    Some(RowIdMeta::Inline(data)) => {
+                        // Parse the serialized row ID sequence to get the count
+                        let sequence = read_row_ids(data)?;
+                        sequence.len() as u64
+                    }
+                    _ => 0,
+                };
+
+                match existing_row_count.cmp(&physical_rows) {
+                    Ordering::Equal => {
+                        // Row IDs already match physical rows, continue to next fragment
+                        continue;
+                    }
+                    Ordering::Less => {
+                        // Partial row IDs - need to fill the remaining ones
+                        let remaining_rows = physical_rows - existing_row_count;
+                        let new_row_ids = *next_row_id..(*next_row_id + remaining_rows);
+
+                        // Merge existing and new row IDs
+                        let combined_sequence = match &fragment.row_id_meta {
+                            Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
+                            _ => {
+                                return Err(Error::Internal {
+                                    message: "Failed to deserialize existing row ID sequence"
+                                        .into(),
+                                    location: location!(),
+                                })
+                            }
+                        };
+
+                        let mut row_ids: Vec<u64> = combined_sequence.iter().collect();
+                        for row_id in new_row_ids {
+                            row_ids.push(row_id);
+                        }
+                        let combined_sequence = RowIdSequence::from(row_ids.as_slice());
+
+                        let serialized = write_row_ids(&combined_sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        *next_row_id += remaining_rows;
+                    }
+                    Ordering::Greater => {
+                        // More row IDs than physical rows - this shouldn't happen
+                        return Err(Error::Internal {
+                            message: format!(
+                                "Fragment has more row IDs ({}) than physical rows ({})",
+                                existing_row_count, physical_rows
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
+            } else {
+                let row_ids = *next_row_id..(*next_row_id + physical_rows);
+                let sequence = RowIdSequence::from(row_ids);
+                // TODO: write to a separate file if large. Possibly share a file with other fragments.
+                let serialized = write_row_ids(&sequence);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                *next_row_id += physical_rows;
+            }
         }
         Ok(())
     }
@@ -1940,6 +2118,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .collect::<Result<Vec<_>>>()?,
                 }
             }
+            Some(pb::transaction::Operation::Clone(pb::transaction::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            })) => Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -2241,6 +2430,17 @@ impl From<&Transaction> for pb::Transaction {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                 })
             }
+            Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            } => pb::transaction::Operation::Clone(pb::transaction::Clone {
+                is_shallow: *is_shallow,
+                ref_name: ref_name.clone(),
+                ref_version: *ref_version,
+                ref_path: ref_path.clone(),
+            }),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -2597,6 +2797,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
+            base_id: None,
         });
 
         // Add a data file with all fields tombstoned
@@ -2607,6 +2808,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
+            base_id: None,
         });
 
         // Add a data file with mixed tombstoned and valid fields
@@ -2617,6 +2819,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
+            base_id: None,
         });
 
         // Add another fully tombstoned file
@@ -2627,6 +2830,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),
+            base_id: None,
         });
 
         let mut fragments = vec![fragment];
@@ -2638,5 +2842,195 @@ mod tests {
         assert_eq!(fragments[0].files.len(), 2);
         assert_eq!(fragments[0].files[0].path, "normal.lance");
         assert_eq!(fragments[0].files[1].path, "mixed.lance");
+    }
+
+    #[test]
+    fn test_assign_row_ids_new_fragment() {
+        // Test assigning row IDs to a fragment without existing row IDs
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(100),
+            row_id_meta: None,
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 0;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        assert_eq!(next_row_id, 100);
+        assert!(fragments[0].row_id_meta.is_some());
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 100);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (0..100).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_existing_complete() {
+        // Test with fragment that already has complete row IDs
+        let existing_sequence = RowIdSequence::from(0..50);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // next_row_id should not change
+        assert_eq!(next_row_id, 100);
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 50);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (0..50).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_partial_existing() {
+        // Test with fragment that has partial row IDs (merge insert case)
+        let existing_sequence = RowIdSequence::from(0..30);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50), // More physical rows than existing row IDs
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // next_row_id should advance by 20 (50 - 30)
+        assert_eq!(next_row_id, 120);
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 50);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            // Should contain original 0-29 plus new 100-119
+            let mut expected = (0..30).collect::<Vec<u64>>();
+            expected.extend(100..120);
+            assert_eq!(row_ids, expected);
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_excess_row_ids() {
+        // Test error case where fragment has more row IDs than physical rows
+        let existing_sequence = RowIdSequence::from(0..60);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50), // Less physical rows than existing row IDs
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+
+        assert!(result.is_err());
+        if let Err(Error::Internal { message, .. }) = result {
+            assert!(message.contains("more row IDs (60) than physical rows (50)"));
+        } else {
+            panic!("Expected Internal error about excess row IDs");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_multiple_fragments() {
+        // Test with multiple fragments, some with existing row IDs, some without
+        let existing_sequence = RowIdSequence::from(500..520);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![
+            Fragment {
+                id: 1,
+                physical_rows: Some(30), // No existing row IDs
+                row_id_meta: None,
+                files: vec![],
+                deletion_file: None,
+            },
+            Fragment {
+                id: 2,
+                physical_rows: Some(25), // Partial existing row IDs
+                row_id_meta: Some(RowIdMeta::Inline(serialized)),
+                files: vec![],
+                deletion_file: None,
+            },
+        ];
+        let mut next_row_id = 1000;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // Should advance by 30 (first fragment) + 5 (second fragment partial)
+        assert_eq!(next_row_id, 1035);
+
+        // Check first fragment
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 30);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (1000..1030).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata for first fragment");
+        }
+
+        // Check second fragment
+        if let Some(RowIdMeta::Inline(data)) = &fragments[1].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 25);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            // Should contain original 500-519 plus new 1030-1034
+            let mut expected = (500..520).collect::<Vec<u64>>();
+            expected.extend(1030..1035);
+            assert_eq!(row_ids, expected);
+        } else {
+            panic!("Expected inline row ID metadata for second fragment");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_missing_physical_rows() {
+        // Test error case where fragment doesn't have physical_rows set
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: None,
+            row_id_meta: None,
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 0;
+
+        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+
+        assert!(result.is_err());
+        if let Err(Error::Internal { message, .. }) = result {
+            assert!(message.contains("Fragment does not have physical rows"));
+        } else {
+            panic!("Expected Internal error about missing physical rows");
+        }
     }
 }

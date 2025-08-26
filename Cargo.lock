@@ -4194,6 +4194,7 @@ dependencies = [
  "test-log",
  "tfrecord",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
@@ -4217,6 +4218,15 @@ dependencies = [
  "jsonb",
  "num-traits",
  "rand 0.9.1",
+]
+
+[[package]]
+name = "lance-bitpacking"
+version = "0.33.0"
+dependencies = [
+ "arrayref",
+ "paste",
+ "seq-macro",
 ]
 
 [[package]]
@@ -4299,6 +4309,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "half",
  "hex",
  "pprof",
  "rand 0.9.1",
@@ -4310,13 +4321,12 @@ dependencies = [
 name = "lance-encoding"
 version = "0.33.0"
 dependencies = [
- "arrayref",
- "arrow",
  "arrow-arith",
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
  "arrow-data",
+ "arrow-ord",
  "arrow-schema",
  "arrow-select",
  "bytemuck",
@@ -4329,13 +4339,13 @@ dependencies = [
  "hyperloglogplus",
  "itertools 0.13.0",
  "lance-arrow",
+ "lance-bitpacking",
  "lance-core",
  "lance-datagen",
  "lance-testing",
  "log",
  "lz4",
  "num-traits",
- "paste",
  "pprof",
  "proptest",
  "prost 0.13.5",
@@ -4345,7 +4355,6 @@ dependencies = [
  "rand 0.9.1",
  "rand_xoshiro",
  "rstest",
- "seq-macro",
  "snafu",
  "tempfile",
  "test-log",

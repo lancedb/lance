@@ -850,7 +850,10 @@ mod tests {
         .await
         .unwrap();
         for batch in batches.iter() {
-            file_writer.write(&[batch.clone()]).await.unwrap();
+            file_writer
+                .write(std::slice::from_ref(batch))
+                .await
+                .unwrap();
         }
         file_writer.finish().await.unwrap();
 
@@ -910,7 +913,10 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
@@ -1307,7 +1313,10 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         // Make sure the big array was not written to the file
@@ -1474,7 +1483,10 @@ mod tests {
         let array = Int32Array::from(vec![0; 15]);
         let batch =
             RecordBatch::try_new(Arc::new(partial_arrow), vec![Arc::new(array.clone())]).unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let field_id = partial_schema.fields.first().unwrap().id;

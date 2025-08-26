@@ -17,6 +17,7 @@ import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
 import java.util.Objects;
+import java.util.Optional;
 
 public class DeletionFile implements Serializable {
   private static final long serialVersionUID = 3786348766842875859L;
@@ -25,12 +26,15 @@ public class DeletionFile implements Serializable {
   private final long readVersion;
   private final Long numDeletedRows;
   private final DeletionFileType fileType;
+  private final Integer baseId;
 
-  public DeletionFile(long id, long readVersion, Long numDeletedRows, DeletionFileType fileType) {
+  public DeletionFile(
+      long id, long readVersion, Long numDeletedRows, DeletionFileType fileType, Integer baseId) {
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
     this.fileType = fileType;
+    this.baseId = baseId;
   }
 
   public long getId() {
@@ -47,6 +51,10 @@ public class DeletionFile implements Serializable {
 
   public DeletionFileType getFileType() {
     return fileType;
+  }
+
+  public Optional<Integer> getBaseId() {
+    return Optional.ofNullable(baseId);
   }
 
   @Override
@@ -67,6 +75,7 @@ public class DeletionFile implements Serializable {
         .append("readVersion", readVersion)
         .append("numDeletedRows", numDeletedRows)
         .append("fileType", fileType)
+        .append("baseId", baseId)
         .toString();
   }
 }
