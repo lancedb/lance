@@ -15,7 +15,7 @@ pub struct LanceToolFileMetadata {
 
 impl fmt::Display for LanceToolFileMetadata {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.file_metadata.file_schema)?;
+        write!(f, "{}", self.file_metadata.file_schema)?;
         //writeln!(f, "{}", self.file_metadata.column_metadatas)?;
         return Ok(());
     }
@@ -44,6 +44,6 @@ pub(crate) async fn show_file_meta(
     args: &LanceFileMetaArgs,
 ) -> Result<()> {
     let metadata = LanceToolFileMetadata::open(&args.source).await?;
-    writeln!(writer, "{}", metadata.to_string())?;
+    write!(writer, "{}", metadata.to_string())?;
     return Ok(());
 }
