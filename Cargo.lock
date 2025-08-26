@@ -4601,9 +4601,11 @@ dependencies = [
  "lance-file",
  "lance-io",
  "object_store",
+ "snafu",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "url",
 ]
 
 [[package]]

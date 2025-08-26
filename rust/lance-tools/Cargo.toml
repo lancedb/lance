@@ -23,6 +23,8 @@ lance-encoding = { path = "../lance-encoding" }
 lance-file = { path = "../lance-file" }
 lance-io = { path = "../lance-io" }
 object_store.workspace = true
+snafu.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
+url.workspace = true

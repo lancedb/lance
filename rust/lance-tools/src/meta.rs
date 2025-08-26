@@ -15,8 +15,13 @@ pub struct LanceToolFileMetadata {
 
 impl fmt::Display for LanceToolFileMetadata {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "version: {}", self.file_metadata.version())?;
+        writeln!(f, "num_rows: {}", self.file_metadata.num_rows)?;
+        writeln!(f, "num_data_bytes: {}", self.file_metadata.num_data_bytes)?;
+        writeln!(f, "num_column_metadata_bytes: {}", self.file_metadata.num_column_metadata_bytes)?;
+        writeln!(f, "num_footer_bytes: {}", self.file_metadata.num_footer_bytes)?;
+        writeln!(f, "schema:")?;
         write!(f, "{}", self.file_metadata.file_schema)?;
-        //writeln!(f, "{}", self.file_metadata.column_metadatas)?;
         return Ok(());
     }
 }
