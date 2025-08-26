@@ -2664,7 +2664,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
 
             return Ok(());
         }
-        (None, Operation::Clone) => return Ok(()),
+        (None, Operation::Clone { .. }) => return Ok(()),
         (Some(manifest), _) => manifest,
         (None, _) => {
             return Err(Error::invalid_input(
