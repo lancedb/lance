@@ -3,6 +3,7 @@
 
 use clap::Parser;
 use lance_tools::cli::LanceToolsArgs;
+use snafu::location;
 
 #[tokio::main]
 pub async fn main() -> Result<(), lance_core::Error> {
@@ -57,4 +58,19 @@ fn install_panic_handler() {
             }
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ok_lance_result_to_ok_std_result() {
+        assert!(lance_result_to_std_result(lance_core::Result::Ok(())).is_ok());
+    }
+
+    #[test]
+    fn test_error_lance_result_to_error_std_result() {
+        assert!(lance_result_to_std_result::<()>(lance_core::Result::Err(lance_core::Error::invalid_input("bad input", location!()))).is_err());
+    }
 }
