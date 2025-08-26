@@ -38,7 +38,9 @@ impl FromPyObject<'_> for PyLance<Index> {
                 .map(|id| id.extract::<u32>())
                 .collect::<PyResult<RoaringBitmap>>()?,
         );
-        let base_id: Option<u32> = ob.getattr("base_id")?.extract::<Option<i64>>()?
+        let base_id: Option<u32> = ob
+            .getattr("base_id")?
+            .extract::<Option<i64>>()?
             .map(|id| id as u32);
 
         Ok(Self(Index {
