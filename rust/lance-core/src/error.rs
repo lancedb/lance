@@ -114,6 +114,14 @@ pub enum Error {
 }
 
 impl Error {
+    pub fn not_supported(operation: impl Into<String>, location: Location) -> Self {
+        let operation: String = operation.into();
+        Self::NotSupported {
+            source: operation.into(),
+            location,
+        }
+    }
+
     pub fn corrupt_file(
         path: object_store::path::Path,
         message: impl Into<String>,

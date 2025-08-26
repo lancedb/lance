@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use super::refs::{Ref, Tags};
+use super::refs::{Ref, RefOperations, Refs};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use crate::dataset::dataset_location::DatasetLocation;
 use crate::{
     error::{Error, Result},
     session::Session,
@@ -26,6 +27,7 @@ use prost::Message;
 use snafu::location;
 use tracing::{info, instrument};
 use url::Url;
+
 /// builder for loading a [`Dataset`].
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
@@ -300,31 +302,73 @@ impl DatasetBuilder {
             )),
         };
 
-        let mut version: Option<u64> = None;
         let cloned_ref = self.version.clone();
         let table_uri = self.table_uri.clone();
-
-        // How do we detect which version scheme is in use?
-
-        let manifest = self.manifest.take();
-
         let file_reader_options = self.file_reader_options.clone();
+        let manifest = self.manifest.take();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
-        if let Some(r) = cloned_ref {
-            version = match r {
-                Ref::Version(v) => Some(v),
-                Ref::Tag(t) => {
-                    let tags = Tags::new(
-                        object_store.clone(),
-                        commit_handler.clone(),
-                        base_path.clone(),
-                    );
-                    Some(tags.get_version(t.as_str()).await?)
-                }
+        let (branch, version_number) = match cloned_ref {
+            Some(Ref::Version(version_number)) => (None, Some(version_number)),
+            Some(Ref::Tag(tag_name)) => {
+                let refs = Refs::new(
+                    object_store.clone(),
+                    commit_handler.clone(),
+                    DatasetLocation::new(table_uri.clone(), base_path.clone(), None)?,
+                );
+                let tag_content = refs.tags().get(&tag_name).await?;
+                (tag_content.branch.clone(), Some(tag_content.version))
             }
-        }
+            Some(Ref::Branch(branch_name, version_number)) => {
+                (Some(branch_name), Some(version_number))
+            }
+            None => (None, None),
+        };
 
+        if let Some(branch_name) = branch {
+            let mut dataset = Self::load_by_uri(
+                session,
+                manifest,
+                file_reader_options,
+                table_uri,
+                version_number,
+                object_store,
+                base_path,
+                commit_handler,
+            )
+            .await?;
+            if let Some(current_branch) = dataset.branch() {
+                if current_branch == branch_name {
+                    return Ok(dataset);
+                }
+            };
+            dataset.checkout_branch(branch_name.as_str()).await
+        } else {
+            Self::load_by_uri(
+                session,
+                manifest,
+                file_reader_options,
+                table_uri,
+                version_number,
+                object_store,
+                base_path,
+                commit_handler,
+            )
+            .await
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_by_uri(
+        session: Arc<Session>,
+        manifest: Option<Manifest>,
+        file_reader_options: Option<FileReaderOptions>,
+        table_uri: String,
+        version_number: Option<u64>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        commit_handler: Arc<dyn CommitHandler>,
+    ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
@@ -335,7 +379,7 @@ impl DatasetBuilder {
             }
             (manifest, location)
         } else {
-            let manifest_location = match version {
+            let manifest_location = match version_number {
                 Some(version) => {
                     commit_handler
                         .resolve_version_location(&base_path, version, &object_store.inner)
@@ -350,7 +394,6 @@ impl DatasetBuilder {
                         location: location!(),
                     })?,
             };
-
             let manifest = Dataset::load_manifest(
                 &object_store,
                 &manifest_location,
@@ -361,10 +404,11 @@ impl DatasetBuilder {
             (manifest, manifest_location)
         };
 
+        let dataset_location = DatasetLocation::new(table_uri, base_path, manifest.branch.clone())?;
+
         Dataset::checkout_manifest(
             object_store,
-            base_path,
-            table_uri,
+            dataset_location,
             Arc::new(manifest),
             location,
             session,

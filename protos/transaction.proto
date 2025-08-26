@@ -179,6 +179,8 @@ message Transaction {
     uint64 ref_version = 3;
     // the absolute base path of the source dataset for cloning
     string ref_path = 4;
+    // if the cloned dataset is a branch, this is the branch name of the cloned dataset
+    optional string branch_name = 5;
   }
   
   // An operation that updates rows but does not add or remove rows.

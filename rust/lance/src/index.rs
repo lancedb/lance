@@ -1486,6 +1486,7 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::refs::RefOperations;
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
@@ -3208,13 +3209,13 @@ mod tests {
         // Create tag for shallow cloning
         dataset
             .tags
-            .create("test_tag", dataset.version().version)
+            .create("test_tag", dataset.version().version, None)
             .await
             .unwrap();
 
         // Perform shallow clone
         let cloned_dataset = dataset
-            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .shallow_clone(cloned_uri, "test_tag", Some(ObjectStoreParams::default()))
             .await
             .unwrap();
 

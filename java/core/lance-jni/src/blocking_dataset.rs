@@ -20,7 +20,7 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::TagContents;
+use lance::dataset::refs::{RefOperations, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
@@ -193,7 +193,7 @@ impl BlockingDataset {
     }
 
     pub fn get_version(&self, tag: &str) -> Result<u64> {
-        let version = RT.block_on(self.inner.tags.get_version(tag))?;
+        let version = RT.block_on(self.inner.tags.get(tag))?.version;
         Ok(version)
     }
 

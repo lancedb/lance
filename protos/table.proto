@@ -162,6 +162,9 @@ message Manifest {
   // base_paths[id = 0] + /data/ + file.path
   // the key(a.k.a index) starts from 0, increased by 1 for each new base path.
   repeated BasePath base_paths = 18;
+
+  // The branch of the dataset. None means main branch.
+  optional string branch = 19;
 } // Manifest
 
 // external dataset base path
