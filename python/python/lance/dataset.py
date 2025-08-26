@@ -1182,6 +1182,7 @@ class LanceDataset(pa.dataset.Dataset):
         object. For more details, see :py:class:`lance.BlobFile`.
 
         Exactly one of ids, addresses, or indices must be specified.
+
         Parameters
         ----------
         blob_column : str
