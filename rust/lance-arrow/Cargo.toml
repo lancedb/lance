@@ -22,7 +22,7 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 bytes = { workspace = true }
 half = { workspace = true }
-jsonb = "0.5.3"
+jsonb ={ workspace = true }
 num-traits = { workspace = true }
 rand.workspace = true
 

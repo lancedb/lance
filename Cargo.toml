@@ -125,6 +125,7 @@ humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 jieba-rs = { version = "0.7", default-features = false }
+jsonb = "0.5.3"
 log = "0.4"
 mockall = { version = "0.13.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }
