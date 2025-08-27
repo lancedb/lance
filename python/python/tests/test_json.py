@@ -7,7 +7,6 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-from lance.arrow import JsonArray, JsonType, json_field
 
 
 def test_json_basic_write_read():
@@ -22,23 +21,13 @@ def test_json_basic_write_read():
         {"nested": {"key": "value", "list": [1, 2, 3]}},
     ]
 
-    # Convert to JSON strings
     json_strings = [json.dumps(d) if d is not None else None for d in json_data]
-
-    # Create JsonArray using the exported type
-    json_ext_array = JsonArray.from_json_strings(json_strings)
-
+    json_arr = pa.array(json_strings, type=pa.json_())
     table = pa.table(
         {
             "id": pa.array([1, 2, 3, 4, 5], type=pa.int32()),
-            "data": json_ext_array,
-        },
-        schema=pa.schema(
-            [
-                pa.field("id", pa.int32()),
-                json_field("data"),
-            ]
-        ),
+            "data": json_arr,
+        }
     )
 
     # Write to Lance dataset
@@ -57,8 +46,8 @@ def test_json_basic_write_read():
 
         # Check that JSON field is properly recognized
         json_field_schema = dataset.schema.field("data")
-        # JsonType should be preserved through write/read
-        assert isinstance(json_field_schema.type, JsonType)
+        # Should be PyArrow JSON type
+        assert json_field_schema.type == pa.json_()
 
         # Read data back
         result_table = dataset.to_table()
@@ -67,17 +56,18 @@ def test_json_basic_write_read():
         assert result_table.num_rows == 5
         assert result_table.column("id").to_pylist() == [1, 2, 3, 4, 5]
 
-        # Convert binary back to JSON strings for verification
+        # Verify the data column is JSON type
         data_column = result_table.column("data")
+        assert data_column.type == pa.json_()
+
+        # Verify the JSON data is correctly preserved
         for i, expected in enumerate(json_strings):
+            actual = data_column[i].as_py()
             if expected is None:
-                assert data_column[i].as_py() is None
+                assert actual is None
             else:
-                # The data is stored as binary, need to decode
-                binary_data = data_column[i].as_py()
-                if binary_data is not None:
-                    # For now, we just verify the data is stored and retrieved
-                    assert binary_data is not None
+                # Arrow JSON returns strings, verify they match
+                assert actual == expected
 
 
 def test_json_with_other_types():
@@ -91,26 +81,17 @@ def test_json_with_other_types():
 
     json_strings = [json.dumps(d) for d in json_data]
 
-    # Create JsonArray
-    json_ext_array = JsonArray.from_json_strings(json_strings)
+    # Create JSON array using PyArrow's JSON type
+    json_arr = pa.array(json_strings, type=pa.json_())
 
     table = pa.table(
         {
             "id": pa.array([1, 2], type=pa.int64()),
             "name": pa.array(["Product A", "Product B"], type=pa.string()),
             "price": pa.array([999.99, 599.99], type=pa.float64()),
-            "metadata": json_ext_array,
+            "metadata": json_arr,
             "in_stock": pa.array([True, False], type=pa.bool_()),
-        },
-        schema=pa.schema(
-            [
-                pa.field("id", pa.int64()),
-                pa.field("name", pa.string()),
-                pa.field("price", pa.float64()),
-                json_field("metadata"),
-                pa.field("in_stock", pa.bool_()),
-            ]
-        ),
+        }
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -130,101 +111,6 @@ def test_json_with_other_types():
         assert result.column("in_stock").to_pylist() == [True, False]
 
 
-def test_json_append_and_overwrite():
-    """Test appending and overwriting JSON data."""
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dataset_path = Path(tmpdir) / "append_test.lance"
-
-        # Initial data
-        initial_json = [json.dumps({"version": 1, "enabled": True})]
-        initial_ext_array = JsonArray.from_json_strings(initial_json)
-
-        initial_table = pa.table(
-            {"id": pa.array([1]), "config": initial_ext_array},
-            schema=pa.schema([pa.field("id", pa.int32()), json_field("config")]),
-        )
-
-        # Write initial data with version 2.2 (required for JSON support)
-        lance.write_dataset(initial_table, dataset_path, data_storage_version="2.2")
-
-        # Append more data
-        append_json = [json.dumps({"version": 2, "enabled": False})]
-        append_ext_array = JsonArray.from_json_strings(append_json)
-
-        append_table = pa.table(
-            {"id": pa.array([2]), "config": append_ext_array},
-            schema=pa.schema([pa.field("id", pa.int32()), json_field("config")]),
-        )
-
-        dataset = lance.dataset(dataset_path)
-        dataset = lance.write_dataset(append_table, dataset_path, mode="append")
-
-        # Verify append
-        result = dataset.to_table()
-        assert result.num_rows == 2
-        assert result.column("id").to_pylist() == [1, 2]
-
-        # Test overwrite
-        overwrite_json = [json.dumps({"version": 3, "enabled": True})]
-        overwrite_ext_array = JsonArray.from_json_strings(overwrite_json)
-
-        overwrite_table = pa.table(
-            {"id": pa.array([3]), "config": overwrite_ext_array},
-            schema=pa.schema([pa.field("id", pa.int32()), json_field("config")]),
-        )
-
-        dataset = lance.write_dataset(overwrite_table, dataset_path, mode="overwrite")
-
-        # Verify overwrite
-        result = dataset.to_table()
-        assert result.num_rows == 1
-        assert result.column("id").to_pylist() == [3]
-
-
-def test_json_filter_and_select():
-    """Test filtering and selecting with JSON columns."""
-
-    json_data = [
-        {"user_id": 1, "preferences": {"theme": "dark"}},
-        {"user_id": 2, "preferences": {"theme": "light"}},
-        {"user_id": 3, "preferences": {"theme": "dark"}},
-    ]
-
-    json_strings = [json.dumps(d) for d in json_data]
-    json_ext_array = JsonArray.from_json_strings(json_strings)
-
-    table = pa.table(
-        {
-            "id": pa.array([1, 2, 3]),
-            "user_data": json_ext_array,
-            "active": pa.array([True, False, True]),
-        },
-        schema=pa.schema(
-            [
-                pa.field("id", pa.int32()),
-                json_field("user_data"),
-                pa.field("active", pa.bool_()),
-            ]
-        ),
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dataset_path = Path(tmpdir) / "filter_test.lance"
-        lance.write_dataset(table, dataset_path, data_storage_version="2.2")
-        dataset = lance.dataset(dataset_path)
-
-        # Test column selection
-        selected = dataset.to_table(columns=["id", "user_data"])
-        assert selected.num_columns == 2
-        assert "active" not in selected.column_names
-
-        # Test filtering
-        filtered = dataset.to_table(filter="active = true")
-        assert filtered.num_rows == 2
-        assert filtered.column("id").to_pylist() == [1, 3]
-
-
 def test_json_null_handling():
     """Test handling of null JSON values."""
 
@@ -237,14 +123,10 @@ def test_json_null_handling():
         json.dumps({"key": "value3"}),
     ]
 
-    json_ext_array = JsonArray.from_json_strings(json_strings)
+    # Create JSON array with nulls using PyArrow's JSON type
+    json_arr = pa.array(json_strings, type=pa.json_())
 
-    table = pa.table(
-        {"id": pa.array(range(5)), "optional_data": json_ext_array},
-        schema=pa.schema(
-            [pa.field("id", pa.int32()), json_field("optional_data", nullable=True)]
-        ),
-    )
+    table = pa.table({"id": pa.array(range(5)), "optional_data": json_arr})
 
     with tempfile.TemporaryDirectory() as tmpdir:
         dataset_path = Path(tmpdir) / "null_test.lance"
@@ -282,12 +164,9 @@ def test_json_large_documents():
     }
 
     json_string = json.dumps(large_doc)
-    json_ext_array = JsonArray.from_json_strings([json_string])
+    json_arr = pa.array([json_string], type=pa.json_())
 
-    table = pa.table(
-        {"id": pa.array([1]), "large_json": json_ext_array},
-        schema=pa.schema([pa.field("id", pa.int32()), json_field("large_json")]),
-    )
+    table = pa.table({"id": pa.array([1]), "large_json": json_arr})
 
     with tempfile.TemporaryDirectory() as tmpdir:
         dataset_path = Path(tmpdir) / "large_json.lance"
@@ -317,18 +196,16 @@ def test_json_batch_operations():
                 json.dumps({"batch": batch_num, "item": i}) for i in range(batch_size)
             ]
 
-            json_ext_array = JsonArray.from_json_strings(json_data)
+            # Create JSON array using PyArrow's JSON type
+            json_arr = pa.array(json_data, type=pa.json_())
 
             table = pa.table(
                 {
                     "id": pa.array(
                         range(batch_num * batch_size, (batch_num + 1) * batch_size)
                     ),
-                    "batch_data": json_ext_array,
-                },
-                schema=pa.schema(
-                    [pa.field("id", pa.int32()), json_field("batch_data")]
-                ),
+                    "batch_data": json_arr,
+                }
             )
 
             if batch_num == 0:

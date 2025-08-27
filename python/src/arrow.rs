@@ -103,24 +103,16 @@ pub fn json_array(array_obj: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PyOb
     let array = ArrayData::from_pyarrow_bound(array_obj)?;
     let array_ref = arrow::array::make_array(array);
 
-    // Use the new TryFrom<ArrayRef> implementation
+    // Use the new TryFrom<ArrayRef> implementation (supports Arrow JSON type)
     let json_array = JsonArray::try_from(array_ref)
         .map_err(|e| PyValueError::new_err(format!("Failed to create JsonArray: {}", e)))?;
 
-    // Create a field with JSON extension metadata
-    let field = Field::new("json", DataType::LargeBinary, true).with_metadata(
-        JSON_EXPORT_METADATA
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-    );
+    // Convert to Arrow JSON type for output
+    let arrow_json = json_array
+        .to_arrow_json()
+        .map_err(|e| PyValueError::new_err(format!("Failed to convert to Arrow JSON: {}", e)))?;
 
-    // Wrap JsonArray in a RecordBatch to preserve metadata through PyArrow conversion
-    let schema = Schema::new(vec![field]);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(json_array)])
-        .map_err(|err| PyValueError::new_err(format!("Failed to build array: {}", err)))?;
-
-    // Convert to PyArrow and extract the column
-    let pyarrow_batch = batch.to_pyarrow(py)?;
-    pyarrow_batch.call_method1(py, "__getitem__", ("json",))
+    // Convert ArrayRef to ArrayData, then to PyArrow
+    let array_data = arrow_json.to_data();
+    array_data.to_pyarrow(py)
 }
