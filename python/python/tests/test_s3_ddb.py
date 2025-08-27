@@ -17,7 +17,6 @@ from threading import Barrier
 import lance
 import pyarrow as pa
 import pytest
-from lance.dependencies import _RAY_AVAILABLE, ray
 from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import write_fragments
 
@@ -244,30 +243,6 @@ def test_s3_ddb_distributed_commit(s3_bucket: str, ddb_table: str):
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not _RAY_AVAILABLE, reason="ray is not available")
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_ray_committer(s3_bucket: str, ddb_table: str):
-    from lance.ray.sink import write_lance
-
-    table_name = uuid.uuid4().hex
-    table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
-
-    schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
-
-    ds = ray.data.range(10).map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
-    write_lance(ds, table_dir, schema=schema, storage_options=CONFIG)
-
-    ds = lance.dataset(table_dir, storage_options=CONFIG)
-    assert ds.count_rows() == 10
-    assert ds.schema == schema
-
-    tbl = ds.to_table()
-    assert sorted(tbl["id"].to_pylist()) == list(range(10))
-    assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
-    assert len(ds.get_fragments()) == 1
-
-
-@pytest.mark.integration
 def test_file_writer_reader(s3_bucket: str):
     storage_options = copy.deepcopy(CONFIG)
     del storage_options["dynamodb_endpoint"]
@@ -287,18 +262,6 @@ def test_file_writer_reader(s3_bucket: str):
         bytes(reader.read_global_buffer(global_buffer_pos)).decode()
         == global_buffer_text
     )
-
-
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-@pytest.mark.integration
-@pytest.mark.skipif(not _RAY_AVAILABLE, reason="ray is not available")
-def test_ray_read_lance(s3_bucket: str):
-    storage_options = copy.deepcopy(CONFIG)
-    table = pa.table({"a": [1, 2], "b": ["a", "b"]})
-    path = f"s3://{s3_bucket}/test_ray_read.lance"
-    lance.write_dataset(table, path, storage_options=storage_options)
-    ds = ray.data.read_lance(path, storage_options=storage_options, concurrency=1)
-    ds.take(1)
 
 
 @pytest.mark.integration

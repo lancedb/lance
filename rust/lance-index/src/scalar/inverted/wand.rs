@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
 
@@ -28,6 +29,13 @@ use super::{
     query::Operator,
     scorer::{idf, K1},
 };
+
+pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse::<u64>()
+        .unwrap_or(10)
+});
 
 pub struct PostingIterator {
     token: String,
@@ -252,6 +260,16 @@ impl PostingIterator {
         }
     }
 
+    fn block_first_doc(&self) -> Option<u64> {
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                let block_idx = self.index / BLOCK_SIZE;
+                Some(list.block_least_doc_id(block_idx) as u64)
+            }
+            PostingList::Plain(ref plain) => plain.row_ids.get(self.index).cloned(),
+        }
+    }
+
     #[inline]
     fn next_block_first_doc(&self) -> Option<u64> {
         match self.list {
@@ -323,11 +341,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
-        let avg_posting_length =
-            self.postings.iter().map(|p| p.list.len()).sum::<usize>() / self.postings.len();
         match (mask.max_len(), mask.iter_ids()) {
             (Some(num_rows_matched), Some(row_ids))
-                if num_rows_matched <= avg_posting_length as u64 =>
+                if num_rows_matched * 100
+                    <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
             {
                 return self.flat_search(params, row_ids, metrics);
             }
@@ -370,6 +387,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 .collect();
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                if candidates.len() == limit {
+                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                }
             } else if score > candidates.peek().unwrap().0 .0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
@@ -414,11 +434,47 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         let mut num_comparisons = 0;
         let mut candidates = BinaryHeap::new();
+        let mut current_doc = 0;
         for (doc_id, row_id) in doc_ids {
             num_comparisons += 1;
 
+            if doc_id < current_doc {
+                continue;
+            }
+            current_doc = doc_id;
+
+            if let Some(least_id) = self.postings[0].block_first_doc() {
+                if least_id > doc_id {
+                    current_doc = least_id;
+                    continue;
+                }
+            }
+            self.move_shallow(self.postings.len() - 1, doc_id);
+            let mut pivot = 0;
+            while pivot + 1 < self.postings.len() {
+                if let Some(block_doc_id) = self.postings[pivot + 1].block_first_doc() {
+                    if block_doc_id > doc_id {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+                pivot += 1;
+            }
+
+            if !self.check_block_max(pivot) {
+                // the current block max score is less than the threshold,
+                // which means we have to skip at least the current block
+                if let Some(least_id) = self.get_new_candidate(pivot) {
+                    current_doc = std::cmp::max(doc_id, least_id);
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
             // move all postings to this doc id
-            self.move_preceding(self.postings.len() - 1, doc_id);
+            self.move_preceding(pivot, doc_id);
             if self.postings.is_empty() {
                 // no more postings, so we can stop
                 break;
@@ -427,7 +483,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             }
 
-            let mut pivot = 0;
+            pivot = 0;
             while pivot + 1 < self.postings.len()
                 && self.postings[pivot + 1].doc().map(|d| d.doc_id()) == Some(doc_id)
             {
@@ -455,6 +511,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                if candidates.len() == limit {
+                    self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
+                }
             } else if score > candidates.peek().unwrap().0 .0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
@@ -499,9 +558,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             let doc = posting.doc().unwrap();
             let doc_id = doc.doc_id();
 
-            for posting in self.postings[..pivot].iter_mut() {
-                posting.shallow_next(doc_id);
-            }
+            self.move_shallow(pivot, doc_id);
 
             if self.check_block_max(pivot) {
                 if !self.postings[0].empty() && self.postings[0].doc().unwrap().doc_id() == doc_id {
@@ -588,6 +645,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
             } else {
                 break;
             }
+        }
+    }
+
+    // move the posting iterators preceding the pivot to the block that contains the least_id
+    fn move_shallow(&mut self, pivot: usize, least_id: u64) {
+        for posting in self.postings[..=pivot].iter_mut() {
+            posting.shallow_next(least_id);
         }
     }
 

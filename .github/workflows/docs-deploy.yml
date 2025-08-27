@@ -35,6 +35,11 @@ jobs:
         with:
           repository: lancedb/lance-namespace
           path: lance-namespace
+      - name: Checkout lance-ray
+        uses: actions/checkout@v4
+        with:
+          repository: lancedb/lance-ray
+          path: lance-ray
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
@@ -60,6 +65,13 @@ jobs:
           cat >> docs/src/integrations/.pages << 'EOF'
             - Apache Spark: spark
           EOF
+      - name: Copy lance-ray docs
+        run: |
+          cp -r lance-ray/docs/src docs/src/integrations/ray
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Ray: ray
+          EOF
+          cp lance-ray/CONTRIBUTING.md docs/src/community/contributing/ray.md
       - name: Deploy
         working-directory: docs
         run: uv run mkdocs gh-deploy --force
