@@ -29,8 +29,15 @@ pub mod bfloat16;
 pub mod floats;
 pub use floats::*;
 pub mod cast;
+pub mod json;
 pub mod list;
 pub mod memory;
+
+/// Arrow extension metadata key for extension name
+pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
+
+/// Arrow extension metadata key for extension metadata  
+pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
