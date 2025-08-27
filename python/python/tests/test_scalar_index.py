@@ -724,8 +724,19 @@ def test_fts_score(tmp_path):
 def test_fts_with_filter(tmp_path):
     data = pa.table(
         {
-            "id": [1, 2, 3],
-            "text": ["lance database test", "full text search", "lance search text"],
+            "id": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "text": [
+                "lance database test",
+                "full text search",
+                "lance search text",
+                "some other content",
+                "some other content",
+                "some other content",
+                "some other content",
+                "some other content",
+                "some other content",
+                "some other content",
+            ],
         }
     )
     ds = lance.write_dataset(data, tmp_path)
