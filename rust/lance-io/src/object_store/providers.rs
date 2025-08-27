@@ -46,7 +46,7 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// Providers can override this to implement custom cache key generation
     /// that takes into account provider-specific requirements like namespace
     /// isolation.
-    fn cache_url(&self, url: &Url, _params: &ObjectStoreParams) -> String {
+    fn cache_url(&self, url: &Url) -> String {
         if ["file", "file-object-store", "memory"].contains(&url.scheme()) {
             // For file URLs, cache the URL without the path.
             // The path can be different for different object stores,
@@ -161,7 +161,7 @@ impl ObjectStoreRegistry {
             return Err(Error::invalid_input(message, location!()));
         };
 
-        let cache_path = provider.cache_url(&base_path, params);
+        let cache_path = provider.cache_url(&base_path);
         let cache_key = (cache_path, params.clone());
 
         // Check if we have a cached store for this base path and params
@@ -280,8 +280,6 @@ mod tests {
         }
 
         let provider = DummyProvider;
-        let params = ObjectStoreParams::default();
-
         let cases = [
             ("s3://bucket/path?param=value", "s3://bucket?param=value"),
             ("file:///path/to/file", "file://"),
@@ -295,7 +293,7 @@ mod tests {
 
         for (url, expected_cache_url) in cases {
             let url = Url::parse(url).unwrap();
-            let cache_url = provider.cache_url(&url, &params);
+            let cache_url = provider.cache_url(&url);
             assert_eq!(cache_url, expected_cache_url);
         }
     }
