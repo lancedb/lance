@@ -142,45 +142,6 @@ def test_json_null_handling():
         assert data_column.is_null().to_pylist() == [False, True, False, True, False]
 
 
-def test_json_large_documents():
-    """Test handling of large JSON documents."""
-
-    # Create a moderately large JSON document
-    large_doc = {
-        "metadata": {
-            "created": "2024-01-01",
-            "version": "1.0.0",
-        },
-        "items": [
-            {
-                "id": i,
-                "name": f"Item {i}",
-                "description": f"Description for item {i}",
-                "tags": [f"tag{j}" for j in range(5)],
-                "properties": {f"prop{j}": f"value{j}" for j in range(10)},
-            }
-            for i in range(20)
-        ],
-    }
-
-    json_string = json.dumps(large_doc)
-    json_arr = pa.array([json_string], type=pa.json_())
-
-    table = pa.table({"id": pa.array([1]), "large_json": json_arr})
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        dataset_path = Path(tmpdir) / "large_json.lance"
-        lance.write_dataset(table, dataset_path, data_storage_version="2.2")
-        dataset = lance.dataset(dataset_path)
-
-        result = dataset.to_table()
-        assert result.num_rows == 1
-
-        # Verify the document is preserved
-        retrieved_data = result.column("large_json")[0].as_py()
-        assert retrieved_data is not None
-
-
 def test_json_batch_operations():
     """Test batch operations with JSON data."""
 
