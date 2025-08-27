@@ -141,6 +141,30 @@ impl FileFragment {
         })
     }
 
+    #[pyo3(signature=(columns=None, with_row_address=None))]
+    fn open_session(
+        self_: PyRef<'_, Self>,
+        columns: Option<Vec<String>>,
+        with_row_address: Option<bool>
+    ) -> PyResult<FragmentSession> {
+        let dataset_schema = self_.fragment.dataset().schema();
+        let projection = if let Some(columns) = columns {
+            dataset_schema
+                .project(&columns)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+        } else {
+            dataset_schema.clone()
+        };
+
+        let fragment = self_.fragment.clone();
+        let session = RT
+            .spawn(Some(self_.py()), async move {
+                fragment.open_session(&projection, with_row_address.unwrap_or(false)).await
+            })?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(FragmentSession { session: Arc::new(session) })
+    }
+
     #[pyo3(signature=(row_indices, columns=None))]
     fn take(
         self_: PyRef<'_, Self>,
@@ -608,6 +632,26 @@ impl PyRowIdMeta {
                 "Only == and != are supported for CompactionTask",
             )),
         }
+    }
+}
+
+#[pyclass(name = "FragmentSession", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct FragmentSession {
+    session: Arc<lance::dataset::fragment::session::FragmentSession>,
+}
+
+#[pymethods]
+impl FragmentSession {
+    #[pyo3(signature=(indices))]
+    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject>  {
+        let session = self_.session.clone();
+        let batch = RT
+            .spawn(Some(self_.py()), async move {
+                session.take(&indices).await
+            })?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        batch.to_pyarrow(self_.py())
     }
 }
 
