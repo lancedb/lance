@@ -106,6 +106,20 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
     assert actual == expected
 
 
+def test_fragment_session(tmp_path: Path):
+    tab = pa.table({"a": range(100), "b": range(100, 200)})
+    ds = write_dataset(tab, tmp_path)
+    frag = ds.get_fragments()[0]
+
+    session = frag.open_session(columns=["a", "b"], with_row_address=False)
+    expected = frag.take(indices=range(1, 50), columns=["a", "b"])
+    actual = session.take(range(1, 50))
+    assert actual == expected
+
+    session = frag.open_session(columns=["a", "b"], with_row_address=True)
+    assert session.take(range(1, 5)).schema.names == ["a", "b", "_rowaddr"]
+
+
 def test_write_fragments(tmp_path: Path):
     # Should result in two files since each batch is 8MB and max_bytes_per_file is small
     batches = pa.RecordBatchReader.from_batches(
