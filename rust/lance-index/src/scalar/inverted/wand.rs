@@ -480,13 +480,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             // move all postings to this doc id
-            self.move_preceding(pivot, doc_id);
-            if self.postings.is_empty() {
-                // no more postings, so we can stop
-                break;
-            } else if self.postings[0].doc().map(|d| d.doc_id()) != Some(doc_id) {
-                // this doc is not in the postings, so we can skip it
-                continue;
+            if !self.check_pivot_aligned(pivot, doc_id) {
+                if self.postings.is_empty() {
+                    break;
+                } else {
+                    continue;
+                }
             }
 
             pivot = 0;
