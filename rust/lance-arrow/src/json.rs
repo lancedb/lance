@@ -16,7 +16,7 @@ use crate::ARROW_EXT_NAME_KEY;
 /// Arrow extension type name for JSON data
 pub const JSON_EXT_NAME: &str = "lance.json";
 
-/// Check if a field is a JSON extension field
+/// Check if a field is a JSON extension field (Lance internal JSONB storage)
 pub fn is_json_field(field: &ArrowField) -> bool {
     field.data_type() == &DataType::LargeBinary
         && field
@@ -121,6 +121,26 @@ impl JsonArray {
         get_json_path(jsonb_bytes, path).map_err(|e| {
             ArrowError::InvalidArgumentError(format!("Failed to extract JSONPath: {}", e))
         })
+    }
+
+    /// Convert to Arrow string array (JSON as UTF-8)
+    pub fn to_arrow_json(&self) -> Result<ArrayRef, ArrowError> {
+        let mut builder = arrow_array::builder::StringBuilder::new();
+
+        for i in 0..self.len() {
+            if self.is_null(i) {
+                builder.append_null();
+            } else {
+                let jsonb_bytes = self.inner.value(i);
+                let json_str = decode_json(jsonb_bytes).map_err(|e| {
+                    ArrowError::InvalidArgumentError(format!("Failed to decode JSON: {}", e))
+                })?;
+                builder.append_value(&json_str);
+            }
+        }
+
+        // Return as UTF-8 string array (Arrow represents JSON as strings)
+        Ok(Arc::new(builder.finish()))
     }
 }
 
