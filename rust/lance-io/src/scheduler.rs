@@ -1118,6 +1118,7 @@ mod tests {
             false,
             1,
             DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
         ));
 
         let config = SchedulerConfig {
@@ -1207,6 +1208,7 @@ mod tests {
             false,
             1,
             DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
         ));
 
         let config = SchedulerConfig {

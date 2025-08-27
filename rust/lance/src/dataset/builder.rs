@@ -271,6 +271,7 @@ impl DatasetBuilder {
                     // cloud-like
                     DEFAULT_CLOUD_IO_PARALLELISM,
                     download_retry_count,
+                    None, // No storage_options available here
                 )),
                 Path::from(store.1.path()),
                 commit_handler,
