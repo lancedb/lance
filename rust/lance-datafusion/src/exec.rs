@@ -4,8 +4,7 @@
 //! Utilities for working with datafusion execution plans
 
 use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
+    collections::HashMap, fmt, fmt::Formatter, sync::{Arc, LazyLock, Mutex}
 };
 
 use arrow_array::RecordBatch;
@@ -508,8 +507,52 @@ pub async fn analyze_plan(
     // fully execute the plan
     while (stream.next().await).is_some() {}
 
-    let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
-    Ok(format!("{}", display.indent(true)))
+    Ok(format_plan(analyze))
+}
+
+pub fn format_plan(
+    plan: Arc<dyn ExecutionPlan>,
+) -> String {
+    struct Wrapper {
+        plan: Arc<dyn ExecutionPlan>,
+        indent: usize,
+    }
+    impl Wrapper {
+        fn write_output(
+            &self,
+            plan: &Arc<dyn ExecutionPlan>,
+            f: &mut Formatter,
+            indent: usize,
+        ) -> std::fmt::Result {
+            write!(f, "{:indent$}", "", indent = self.indent * 2)?;
+            plan.fmt_as(datafusion::physical_plan::DisplayFormatType::Verbose, f)?;
+            if let Some(metrics) = plan.metrics() {
+                let metrics = metrics
+                    .aggregate_by_name()
+                    .sorted_for_display()
+                    .timestamps_removed();
+
+                write!(f, ", metrics=[{metrics}]")?;
+            } else {
+                write!(f, ", metrics=[]")?;
+            }
+            writeln!(f)?;
+            for child in plan.children() {
+                self.write_output(child, f, indent + 1)?;
+            }
+            std::fmt::Result::Ok(())
+        }
+    }
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+            self.write_output(&self.plan, f, 0)
+        }
+    }
+    let wrapper = Wrapper {
+        plan: plan,
+        indent: 0,
+    };
+    format!("{}", wrapper)
 }
 
 pub trait SessionContextExt {
