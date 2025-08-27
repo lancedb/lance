@@ -30,6 +30,8 @@ use super::{
     scorer::{idf, K1},
 };
 
+const TERMINATED_DOC_ID: u64 = u64::MAX;
+
 pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
         .unwrap_or_else(|_| "10".to_string())
@@ -354,6 +356,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut candidates = BinaryHeap::new();
         let mut num_comparisons = 0;
         while let Some((pivot, doc)) = self.next()? {
+            if let Some(cur_doc) = self.cur_doc {
+                if cur_doc.doc_id() >= doc.doc_id() {
+                    continue;
+                }
+            }
             self.cur_doc = Some(doc);
             num_comparisons += 1;
 
@@ -400,7 +407,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
         metrics.record_comparisons(num_comparisons);
 
         Ok(candidates
-            .into_sorted_vec()
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
                 row_id: doc.row_id,
@@ -523,7 +529,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
         metrics.record_comparisons(num_comparisons);
 
         Ok(candidates
-            .into_sorted_vec()
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
                 row_id: doc.row_id,
@@ -553,32 +558,32 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
     // find the next doc candidate
     fn next(&mut self) -> Result<Option<(usize, DocInfo)>> {
-        while let Some(pivot) = self.find_pivot_term() {
+        while let Some((pivot, max_pivot)) = self.find_pivot_term() {
             let posting = &self.postings[pivot];
             let doc = posting.doc().unwrap();
             let doc_id = doc.doc_id();
 
-            self.move_shallow(pivot, doc_id);
+            self.move_shallow(max_pivot, doc_id);
 
-            if self.check_block_max(pivot) {
-                if !self.postings[0].empty() && self.postings[0].doc().unwrap().doc_id() == doc_id {
-                    // all the posting iterators preceding pivot have reached this doc id,
-                    // so that means the sum of upper bound of all terms is not less than the threshold,
-                    // this document is a candidate
-                    return Ok(Some((pivot, doc)));
-                } else {
-                    self.move_term(doc_id);
-                }
-            } else {
+            if !self.check_block_max(max_pivot) {
                 // the current block max score is less than the threshold,
                 // which means we have to skip at least the current block
-                if let Some(least_id) = self.get_new_candidate(pivot) {
+                if let Some(least_id) = self.get_new_candidate(max_pivot) {
                     self.move_term(least_id);
                 } else {
                     // no more candidates, so we can stop
                     return Ok(None);
                 }
             }
+
+            if !self.check_pivot_aligned(pivot, doc_id) {
+                continue;
+            }
+
+            // all the posting iterators preceding pivot have reached this doc id,
+            // this means the sum of upper bound of all terms is not less than the threshold,
+            // this document is a candidate, but we still need to check filters, positions, etc.
+            return Ok(Some((max_pivot, doc)));
         }
         Ok(None)
     }
@@ -588,7 +593,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         for posting in self.postings[..=pivot].iter() {
             sum += posting.block_max_score();
         }
-        sum >= self.threshold
+        sum > self.threshold
     }
 
     fn get_new_candidate(&self, pivot: usize) -> Option<u64> {
@@ -604,13 +609,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     // find the first term that the sum of upper bound of all preceding terms and itself,
-    // are greater than or equal to the threshold
-    fn find_pivot_term(&self) -> Option<usize> {
+    // are greater than or equal to the threshold.
+    // returns the least pivot and the max index of the terms that have the same doc id.
+    fn find_pivot_term(&self) -> Option<(usize, usize)> {
         if self.operator == Operator::And {
             // for AND query, we always require all terms to be present in the document,
             // so the pivot is always the last term as long as no posting list is exhausted
             if self.postings.len() == self.num_terms {
-                return Some(self.num_terms - 1);
+                return Some((self.num_terms - 1, self.num_terms - 1));
             }
             return None;
         }
@@ -623,14 +629,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 break;
             }
         }
-        let mut pivot = pivot?;
+        let pivot = pivot?;
+        let mut max_pivot = pivot;
         let doc_id = self.postings[pivot].doc().unwrap().doc_id();
-        while pivot + 1 < self.postings.len()
-            && self.postings[pivot + 1].doc().unwrap().doc_id() == doc_id
+        while max_pivot + 1 < self.postings.len()
+            && self.postings[max_pivot + 1].doc().unwrap().doc_id() == doc_id
         {
-            pivot += 1;
+            max_pivot += 1;
         }
-        Some(pivot)
+        Some((pivot, max_pivot))
     }
 
     // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
@@ -638,14 +645,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn move_term(&mut self, least_id: u64) {
         let picked = self.pick_term(least_id);
         self.postings[picked].next(least_id);
-        self.postings.sort_unstable();
-        while let Some(posting) = self.postings.last() {
-            if posting.empty() {
-                self.postings.pop();
-            } else {
-                break;
-            }
+        let doc_id = self.postings[picked]
+            .doc()
+            .map(|d| d.doc_id())
+            .unwrap_or(TERMINATED_DOC_ID);
+        if doc_id == TERMINATED_DOC_ID {
+            self.postings.swap_remove(picked);
         }
+        self.bubble_up(picked, doc_id);
     }
 
     // move the posting iterators preceding the pivot to the block that contains the least_id
@@ -655,18 +662,46 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
     }
 
+    fn check_pivot_aligned(&mut self, pivot: usize, least_id: u64) -> bool {
+        for i in (0..=pivot).rev() {
+            self.postings[i].next(least_id);
+            let doc_id = self.postings[i]
+                .doc()
+                .map(|d| d.doc_id())
+                .unwrap_or(TERMINATED_DOC_ID);
+            if doc_id > least_id {
+                if doc_id == TERMINATED_DOC_ID {
+                    self.postings.swap_remove(i);
+                }
+                self.bubble_up(i, doc_id);
+                return false;
+            }
+        }
+        true
+    }
+
     fn move_preceding(&mut self, pivot: usize, least_id: u64) {
-        for posting in self.postings[..=pivot].iter_mut() {
-            posting.next(least_id);
+        for i in 0..=pivot {
+            self.postings[i].next(least_id);
         }
 
-        self.postings.sort_unstable();
-        while let Some(posting) = self.postings.last() {
-            if posting.empty() {
-                self.postings.pop();
+        let mut i = 0;
+        while i < self.postings.len() {
+            if self.postings[i].doc().is_none() {
+                self.postings.swap_remove(i);
             } else {
+                i += 1;
+            }
+        }
+        self.postings.sort_unstable();
+    }
+
+    fn bubble_up(&mut self, index: usize, doc_id: u64) {
+        for i in index + 1..self.postings.len() {
+            if self.postings[i].doc().unwrap().doc_id() >= doc_id {
                 break;
             }
+            self.postings.swap(i - 1, i);
         }
     }
 
