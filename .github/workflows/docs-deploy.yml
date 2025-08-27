@@ -70,7 +70,7 @@ jobs:
           EOF
           cp lance-spark/CONTRIBUTING.md docs/src/community/contributing/spark.md
           # Update contributing .pages to include spark.md in navbar
-          echo "  - Spark: spark.md" >> docs/src/community/contributing/.pages
+          echo "  - Apache Spark: spark.md" >> docs/src/community/contributing/.pages
       - name: Copy lance-ray docs
         run: |
           cp -r lance-ray/docs/src docs/src/integrations/ray
