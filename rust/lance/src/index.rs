@@ -3317,11 +3317,90 @@ mod tests {
         let total_rows = updated_cloned_dataset.count_rows(None).await.unwrap();
         assert_eq!(total_rows, 350, "Should have 350 rows after append");
 
+        // Store indices before optimization for comparison
+        let indices_before_optimize = updated_cloned_dataset.load_indices().await.unwrap();
+        let vector_idx_before = indices_before_optimize
+            .iter()
+            .find(|idx| idx.name == "vector_idx")
+            .unwrap();
+        let category_idx_before = indices_before_optimize
+            .iter()
+            .find(|idx| idx.name == "category_idx")
+            .unwrap();
+
         // Call optimize_indices
         updated_cloned_dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
+
+        // Critical test: Verify new indices are created in the cloned dataset location
+        let optimized_indices = updated_cloned_dataset.load_indices().await.unwrap();
+
+        // Find the new index metadata after optimization
+        let new_vector_idx = optimized_indices
+            .iter()
+            .find(|idx| idx.name == "vector_idx")
+            .unwrap();
+        let new_category_idx = optimized_indices
+            .iter()
+            .find(|idx| idx.name == "category_idx")
+            .unwrap();
+
+        // The UUIDs should be different after optimization (new indices were created)
+        assert_ne!(
+            new_vector_idx.uuid, vector_idx_before.uuid,
+            "Vector index should have a new UUID after optimization"
+        );
+        assert_ne!(
+            new_category_idx.uuid, category_idx_before.uuid,
+            "Category index should have a new UUID after optimization"
+        );
+
+        // Verify the new index files are in the cloned dataset's directory
+        use std::path::PathBuf;
+        let clone_indices_dir = PathBuf::from(cloned_uri).join("_indices");
+        let vector_index_dir = clone_indices_dir.join(new_vector_idx.uuid.to_string());
+        let category_index_dir = clone_indices_dir.join(new_category_idx.uuid.to_string());
+
+        assert!(
+            vector_index_dir.exists(),
+            "New vector index directory should exist in cloned dataset location: {:?}",
+            vector_index_dir
+        );
+        assert!(
+            category_index_dir.exists(),
+            "New category index directory should exist in cloned dataset location: {:?}",
+            category_index_dir
+        );
+
+        // Verify that the new indices do NOT have base_id set (they're local to the cloned dataset)
+        assert!(
+            new_vector_idx.base_id.is_none(),
+            "New vector index should not have base_id after optimization in cloned dataset"
+        );
+        assert!(
+            new_category_idx.base_id.is_none(),
+            "New category index should not have base_id after optimization in cloned dataset"
+        );
+
+        // Also verify the original dataset's index directories are NOT modified
+        let original_indices_dir = PathBuf::from(test_uri).join("_indices");
+
+        // The new index UUIDs should NOT exist in the original dataset's directory
+        let wrong_vector_dir = original_indices_dir.join(new_vector_idx.uuid.to_string());
+        let wrong_category_dir = original_indices_dir.join(new_category_idx.uuid.to_string());
+
+        assert!(
+            !wrong_vector_dir.exists(),
+            "New vector index should NOT be in original dataset location: {:?}",
+            wrong_vector_dir
+        );
+        assert!(
+            !wrong_category_dir.exists(),
+            "New category index should NOT be in original dataset location: {:?}",
+            wrong_category_dir
+        );
 
         // Test vector search after optimization (should find both old and new data)
         let query_vector = generate_random_array(dimensions as usize);
