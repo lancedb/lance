@@ -77,7 +77,7 @@ pub(crate) mod tracing;
 pub(crate) mod transaction;
 pub(crate) mod utils;
 
-pub use crate::arrow::{bfloat16_array, json_array, BFloat16};
+pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{write_fragments, write_fragments_transaction};
 use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
@@ -163,7 +163,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
-    m.add_wrapped(wrap_pyfunction!(json_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
