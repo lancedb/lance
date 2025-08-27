@@ -285,6 +285,7 @@ pub(crate) async fn remap_index(
                             training_request,
                             &new_store,
                             inverted_index.params().clone(),
+                            None,
                         )
                         .await?;
                     } else {
@@ -2974,7 +2975,7 @@ mod tests {
     ///
     /// This test verifies that when we:
     /// 1. Create a table with data
-    /// 2. Add a scalar index with train=true  
+    /// 2. Add a scalar index with train=true
     /// 3. Update rows in the table
     /// The index remains available on the table.
     #[rstest]
