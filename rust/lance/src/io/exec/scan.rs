@@ -517,13 +517,19 @@ impl DisplayAs for LanceScanExec {
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+            
+        // Calculate fragment scatter metrics
+        let fragment_metrics = self.calculate_fragment_scatter();
+        
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "LanceScan: uri={}, projection=[{}], row_id={}, row_addr={}, ordered={}, range={:?}",
+                    "LanceScan: uri={}, projection=[{}], fragments_accessed={}, fragment_scatter_score={:.2}, row_id={}, row_addr={}, ordered={}, range={:?}",
                     self.dataset.data_dir(),
                     columns,
+                    fragment_metrics.fragments_accessed,
+                    fragment_metrics.scatter_score,
                     self.config.with_row_id,
                     self.config.with_row_address,
                     self.config.ordered_output,
@@ -533,9 +539,11 @@ impl DisplayAs for LanceScanExec {
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "LanceScan\nuri={}\nprojection=[{}]\nrow_id={}\nrow_addr={}\nordered={}\nrange={:?}",
+                    "LanceScan\nuri={}\nprojection=[{}]\nfragments_accessed={}\nfragment_scatter_score={:.2}\nrow_id={}\nrow_addr={}\nordered={}\nrange={:?}",
                     self.dataset.data_dir(),
                     columns,
+                    fragment_metrics.fragments_accessed,
+                    fragment_metrics.scatter_score,
                     self.config.with_row_id,
                     self.config.with_row_address,
                     self.config.ordered_output,
@@ -546,7 +554,32 @@ impl DisplayAs for LanceScanExec {
     }
 }
 
+#[derive(Debug)]
+struct FragmentScatterMetrics {
+    fragments_accessed: usize,
+    scatter_score: f64,
+}
+
 impl LanceScanExec {
+    /// Calculate fragment scatter metrics for explain_plan output
+    fn calculate_fragment_scatter(&self) -> FragmentScatterMetrics {
+        let fragments_accessed = self.fragments.len();
+        
+        // Calculate scatter score based on fragment distribution
+        let scatter_score = if fragments_accessed <= 1 {
+            0.0 // Perfect locality for single fragment
+        } else {
+            // Simple heuristic: more fragments = higher scatter
+            // You can enhance this with actual fragment metadata analysis
+            let max_fragments = 100; // Reasonable maximum for normalization
+            (fragments_accessed as f64 / max_fragments as f64).min(1.0)
+        };
+        
+        FragmentScatterMetrics {
+            fragments_accessed,
+            scatter_score,
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Arc<Dataset>,
