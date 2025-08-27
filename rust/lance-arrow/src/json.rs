@@ -309,8 +309,9 @@ fn get_json_path(
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let json_path = jsonb::jsonpath::parse_json_path(path.as_bytes())?;
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
+    let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
 
-    match raw_jsonb.select_by_path(&json_path) {
+    match selector.select_values(&json_path) {
         Ok(values) => {
             if values.is_empty() {
                 Ok(None)
