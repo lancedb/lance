@@ -16,6 +16,7 @@ use arrow_schema::DataType;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::TryStreamExt;
+use itertools::Itertools;
 use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
@@ -40,46 +41,62 @@ use tracing::instrument;
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
 
-async fn create_empty_stream(
-    dataset: &Dataset,
-    column: &str,
-    criteria: &TrainingCriteria,
-) -> Result<SendableRecordBatchStream> {
-    let column_field = dataset.schema().field(column).ok_or(Error::InvalidInput {
-        source: format!("No column with name {}", column).into(),
-        location: location!(),
-    })?;
+pub(crate) struct TrainingRequest {
+    pub fragment_ids: Option<Vec<u32>>,
+}
 
-    let mut fields = Vec::with_capacity(3);
-    fields.push(arrow_schema::Field::new(
-        VALUE_COLUMN_NAME,
-        column_field.data_type(),
-        true,
-    ));
-    if criteria.needs_row_ids {
-        fields.push(arrow_schema::Field::new(
-            ROW_ID,
-            arrow_schema::DataType::UInt64,
-            false,
-        ));
-    }
-    if criteria.needs_row_addrs {
-        fields.push(arrow_schema::Field::new(
-            ROW_ADDR,
-            arrow_schema::DataType::UInt64,
-            false,
-        ));
+impl TrainingRequest {
+    pub fn with_fragment_ids(
+        _dataset: Arc<Dataset>,
+        _column: String,
+        fragment_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            fragment_ids: Some(fragment_ids),
+        }
     }
 
-    // Create schema with the column and row_id field (matching scan_chunks behavior)
-    let schema = Arc::new(arrow_schema::Schema::new(fields));
+    async fn create_empty_stream(
+        dataset: &Dataset,
+        column: &str,
+        criteria: &TrainingCriteria,
+    ) -> Result<SendableRecordBatchStream> {
+        let column_field = dataset.schema().field(column).ok_or(Error::InvalidInput {
+            source: format!("No column with name {}", column).into(),
+            location: location!(),
+        })?;
 
-    // Create empty stream
-    let empty_stream = futures::stream::empty();
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        empty_stream,
-    )))
+        let mut fields = Vec::with_capacity(3);
+        fields.push(arrow_schema::Field::new(
+            VALUE_COLUMN_NAME,
+            column_field.data_type(),
+            true,
+        ));
+        if criteria.needs_row_ids {
+            fields.push(arrow_schema::Field::new(
+                ROW_ID,
+                arrow_schema::DataType::UInt64,
+                false,
+            ));
+        }
+        if criteria.needs_row_addrs {
+            fields.push(arrow_schema::Field::new(
+                ROW_ADDR,
+                arrow_schema::DataType::UInt64,
+                false,
+            ));
+        }
+
+        // Create schema with the column and row_id field (matching scan_chunks behavior)
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+
+        // Create empty stream
+        let empty_stream = futures::stream::empty();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            empty_stream,
+        )))
+    }
 }
 
 pub(crate) async fn scan_training_data(
@@ -91,6 +108,9 @@ pub(crate) async fn scan_training_data(
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
+
+    // Fragment filtering is now handled in load_training_data function
+    // This function just processes the fragments passed to it
 
     let column_field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -164,11 +184,42 @@ pub(crate) async fn load_training_data(
     criteria: &TrainingCriteria,
     fragments: Option<Vec<Fragment>>,
     train: bool,
+    fragment_ids: Option<Vec<u32>>,
 ) -> Result<SendableRecordBatchStream> {
+    // Create training request with fragment_ids if provided
+    let training_request = Box::new(match fragment_ids.clone() {
+        Some(fragment_ids) => TrainingRequest::with_fragment_ids(
+            Arc::new(dataset.clone()),
+            column.to_string(),
+            fragment_ids,
+        ),
+        None => TrainingRequest { fragment_ids: None },
+    });
+
     if train {
-        scan_training_data(dataset, column, criteria, fragments).await
+        // Use the training request to scan data with fragment filtering
+        if let Some(ref fragment_ids) = training_request.fragment_ids {
+            let fragment_ids = fragment_ids.clone().into_iter().dedup().collect_vec();
+            let frags = dataset.get_frags_from_ordered_ids(&fragment_ids);
+            let frags: Result<Vec<_>> = fragment_ids
+                .iter()
+                .zip(frags)
+                .map(|(id, frag)| {
+                    let Some(frag) = frag else {
+                        return Err(Error::InvalidInput {
+                            source: format!("No fragment with id {}", id).into(),
+                            location: location!(),
+                        });
+                    };
+                    Ok(frag.metadata().clone())
+                })
+                .collect();
+            scan_training_data(dataset, column, criteria, Some(frags?)).await
+        } else {
+            scan_training_data(dataset, column, criteria, fragments).await
+        }
     } else {
-        create_empty_stream(dataset, column, criteria).await
+        TrainingRequest::create_empty_stream(dataset, column, criteria).await
     }
 }
 
@@ -213,6 +264,7 @@ pub(super) async fn build_scalar_index(
     uuid: &str,
     params: &ScalarIndexParams,
     train: bool,
+    fragment_ids: Option<Vec<u32>>,
 ) -> Result<CreatedIndex> {
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -226,8 +278,15 @@ pub(super) async fn build_scalar_index(
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
-    let training_data =
-        load_training_data(dataset, column, training_request.criteria(), None, train).await?;
+    let training_data = load_training_data(
+        dataset,
+        column,
+        training_request.criteria(),
+        None,
+        train,
+        fragment_ids,
+    )
+    .await?;
 
     plugin
         .train_index(training_data, &index_store, training_request)
@@ -242,6 +301,7 @@ pub(super) async fn build_inverted_index(
     uuid: &str,
     params: &InvertedIndexParams,
     train: bool,
+    fragment_ids: Option<Vec<u32>>,
 ) -> Result<CreatedIndex> {
     let data = load_training_data(
         dataset,
@@ -249,10 +309,12 @@ pub(super) async fn build_inverted_index(
         &TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
         None,
         train,
+        fragment_ids.clone(),
     )
     .await?;
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
-    InvertedIndexPlugin::train_inverted_index(data, &index_store, params.clone()).await
+    InvertedIndexPlugin::train_inverted_index(data, &index_store, params.clone(), fragment_ids)
+        .await
 }
 
 /// Fetches the scalar index plugin for a given index metadata
@@ -584,6 +646,7 @@ mod tests {
             &TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
             None,
             true,
+            None,
         )
         .await
         .unwrap();

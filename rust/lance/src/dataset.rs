@@ -1209,7 +1209,7 @@ impl Dataset {
             .await
     }
 
-    pub(crate) fn object_store(&self) -> &ObjectStore {
+    pub fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
 
@@ -1217,7 +1217,7 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub(crate) fn indices_dir(&self) -> Path {
+    pub fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
     }
 
@@ -1407,7 +1407,7 @@ impl Dataset {
 
     // Gets a filtered list of fragments from ids in O(N) time instead of using
     // `get_fragment` which would require O(N^2) time.
-    fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
         let mut fragments = Vec::with_capacity(ordered_ids.len());
         let mut id_iter = ordered_ids.iter();
         let mut id = id_iter.next();
