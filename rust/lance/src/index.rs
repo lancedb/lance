@@ -285,12 +285,14 @@ pub(crate) async fn remap_index(
                             &TrainingCriteria::new(TrainingOrdering::None),
                             None,
                             true, // Legacy reindexing should always train
+                            None,
                         )
                         .await?;
                         InvertedIndexPlugin::train_inverted_index(
                             training_data,
                             &new_store,
                             inverted_index.params().clone(),
+                            None,
                         )
                         .await?
                     } else {
@@ -2962,7 +2964,7 @@ mod tests {
     ///
     /// This test verifies that when we:
     /// 1. Create a table with data
-    /// 2. Add a scalar index with train=true  
+    /// 2. Add a scalar index with train=true
     /// 3. Update rows in the table
     /// The index remains available on the table.
     #[rstest]

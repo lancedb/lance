@@ -13,6 +13,7 @@ from .blob import BlobColumn, BlobFile
 from .dataset import (
     DataStatistics,
     FieldStatistics,
+    Index,
     LanceDataset,
     LanceOperation,
     LanceScanner,
@@ -48,6 +49,7 @@ __all__ = [
     "DataStatistics",
     "FieldStatistics",
     "FragmentMetadata",
+    "Index",
     "LanceDataset",
     "LanceFragment",
     "LanceOperation",

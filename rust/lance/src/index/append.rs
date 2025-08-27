@@ -117,6 +117,7 @@ pub async fn merge_indices<'a>(
                 &update_criteria.data_criteria,
                 fragments,
                 true,
+                None,
             )
             .await?;
 

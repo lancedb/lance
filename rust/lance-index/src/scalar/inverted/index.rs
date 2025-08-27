@@ -128,14 +128,32 @@ impl DeepSizeOf for InvertedIndex {
 
 impl InvertedIndex {
     fn to_builder(&self) -> InvertedIndexBuilder {
+        self.to_builder_with_offset(None)
+    }
+
+    fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
-            InvertedIndexBuilder::new(self.params.clone())
+            InvertedIndexBuilder::new_with_fragment_mask(self.params.clone(), fragment_mask)
         } else {
+            let partitions = match fragment_mask {
+                Some(fragment_mask) => self
+                    .partitions
+                    .iter()
+                    // Filter partitions that belong to the specified fragment
+                    // The mask contains fragment_id in high 32 bits, we check if partition's
+                    // fragment_id matches by comparing the masked result with the original mask
+                    .filter(|part| part.belongs_to_fragment(fragment_mask))
+                    .map(|part| part.id())
+                    .collect(),
+                None => self.partitions.iter().map(|part| part.id()).collect(),
+            };
+
             InvertedIndexBuilder::from_existing_index(
                 self.params.clone(),
                 Some(self.store.clone()),
-                self.partitions.iter().map(|part| part.id).collect(),
+                partitions,
+                fragment_mask,
             )
         }
     }
@@ -274,6 +292,7 @@ impl InvertedIndex {
                 tokens,
                 inverted_list,
                 docs,
+                fragments: Default::default(),
             })],
         }))
     }
@@ -499,9 +518,24 @@ pub struct InvertedPartition {
     pub(crate) tokens: TokenSet,
     pub(crate) inverted_list: Arc<PostingListReader>,
     pub(crate) docs: DocSet,
+    pub(crate) fragments: HashSet<u32>,
 }
 
 impl InvertedPartition {
+    /// Check if this partition belongs to the specified fragment.
+    ///
+    /// This method encapsulates the bit manipulation logic for fragment filtering
+    /// in distributed indexing scenarios.
+    ///
+    /// # Arguments
+    /// * `fragment_mask` - A mask with fragment_id in high 32 bits
+    ///
+    /// # Returns
+    /// * `true` if the partition belongs to the fragment, `false` otherwise
+    pub fn belongs_to_fragment(&self, fragment_mask: u64) -> bool {
+        (self.id() & fragment_mask) == fragment_mask
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -526,6 +560,7 @@ impl InvertedPartition {
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
+        let fragments = docs.fragment_ids();
 
         Ok(Self {
             id,
@@ -533,6 +568,7 @@ impl InvertedPartition {
             tokens,
             inverted_list: Arc::new(inverted_list),
             docs,
+            fragments,
         })
     }
 
@@ -1842,6 +1878,12 @@ impl DocSet {
                 Err(_) => None,
             }
         }
+    }
+    pub fn fragment_ids(&self) -> HashSet<u32> {
+        self.row_ids
+            .iter()
+            .map(|row_id| (row_id >> 32) as u32)
+            .collect()
     }
 
     pub fn total_tokens_num(&self) -> u64 {
