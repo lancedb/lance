@@ -467,11 +467,7 @@ def test_deletion_file_with_base_id_serialization():
 
     # Create a DeletionFile with base_id
     deletion_file = DeletionFile(
-        read_version=1,
-        id=123,
-        file_type='array',
-        num_deleted_rows=10,
-        base_id=456
+        read_version=1, id=123, file_type="array", num_deleted_rows=10, base_id=456
     )
 
     # Verify the base_id is set
@@ -479,15 +475,12 @@ def test_deletion_file_with_base_id_serialization():
 
     # Test asdict includes base_id
     deletion_dict = deletion_file.asdict()
-    assert 'base_id' in deletion_dict
-    assert deletion_dict['base_id'] == 456
+    assert "base_id" in deletion_dict
+    assert deletion_dict["base_id"] == 456
 
     # Create a FragmentMetadata with the deletion file
     metadata = FragmentMetadata(
-        id=1,
-        files=[],
-        physical_rows=1000,
-        deletion_file=deletion_file
+        id=1, files=[], physical_rows=1000, deletion_file=deletion_file
     )
 
     # Test pickle serialization/deserialization
@@ -501,7 +494,7 @@ def test_deletion_file_with_base_id_serialization():
 
     # Test JSON serialization/deserialization
     json_data = metadata.to_json()
-    assert json_data['deletion_file']['base_id'] == 456
+    assert json_data["deletion_file"]["base_id"] == 456
 
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
