@@ -12,6 +12,8 @@ use std::{
     ops::Range,
 };
 
+use crate::metrics::NoOpMetricsCollector;
+use crate::prefilter::NoFilter;
 use arrow::{
     array::LargeBinaryBuilder,
     datatypes::{self, Float32Type, Int32Type, UInt64Type},
@@ -32,10 +34,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
@@ -45,6 +48,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
+use tantivy::tokenizer::Language;
 use tracing::{info, instrument};
 
 use super::{
@@ -68,7 +72,7 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
-    AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
+    AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TokenQuery,
 };
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -93,6 +97,8 @@ pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
 pub static FTS_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
+static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 #[derive(Clone)]
 pub struct InvertedIndex {
@@ -325,6 +331,43 @@ impl Index for InvertedIndex {
     }
 }
 
+impl InvertedIndex {
+    /// Whether the query can use the current index.
+    pub fn is_query_allowed(&self, query: &TokenQuery) -> bool {
+        match query {
+            TokenQuery::TokensContains(_) => {
+                self.params.base_tokenizer == "simple"
+                    && self.params.max_token_length.is_none()
+                    && self.params.language == Language::English
+                    && !self.params.stem
+            }
+        }
+    }
+
+    /// Search docs match the input text.
+    async fn do_search(&self, text: &str) -> Result<RecordBatch> {
+        let params = FtsSearchParams::new();
+        let mut tokenizer = self.tokenizer.clone();
+        let tokens = collect_tokens(text, &mut tokenizer, None);
+
+        let (doc_ids, _) = self
+            .bm25_search(
+                tokens.into(),
+                params.into(),
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .boxed()
+            .await?;
+
+        Ok(RecordBatch::try_new(
+            ROW_ID_SCHEMA.clone(),
+            vec![Arc::new(UInt64Array::from(doc_ids))],
+        )?)
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
@@ -334,11 +377,20 @@ impl ScalarIndex for InvertedIndex {
         query: &dyn AnyQuery,
         _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        return Err(Error::invalid_input(
-            format!("unsupported query {:?} for inverted index", query),
-            location!(),
-        ));
+        let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
+
+        match query {
+            TokenQuery::TokensContains(text) => {
+                let records = self.do_search(text).await?;
+                let row_ids = records
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let row_ids = row_ids.iter().flatten().collect_vec();
+                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
+            }
+        }
     }
 
     fn can_remap(&self) -> bool {
