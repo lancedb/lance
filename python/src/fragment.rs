@@ -469,6 +469,7 @@ impl PyDeletionFile {
             intern!(slf.py(), "num_deleted_rows"),
             slf.0.num_deleted_rows,
         )?;
+        dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
 
         Ok(dict)
     }
