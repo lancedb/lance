@@ -43,10 +43,10 @@ impl RowIdIndex {
         let mut final_chunks = Vec::new();
         for processed_chunk in prep_index_chunks(chunks) {
             match processed_chunk {
-                SomethingIndexChunk::NonOverlapping(chunk) => {
+                RawIndexChunk::NonOverlapping(chunk) => {
                     final_chunks.push(chunk);
                 }
-                SomethingIndexChunk::Overlapping(range, overlapping_chunks) => {
+                RawIndexChunk::Overlapping(range, overlapping_chunks) => {
                     debug_assert_eq!(
                         range.end() - range.start() + 1,
                         overlapping_chunks
@@ -142,12 +142,12 @@ fn decompose_sequence(
 type IndexChunk = (RangeInclusive<u64>, (U64Segment, U64Segment));
 
 #[derive(Debug)]
-enum SomethingIndexChunk {
+enum RawIndexChunk {
     NonOverlapping(IndexChunk),
     Overlapping(RangeInclusive<u64>, Vec<IndexChunk>),
 }
 
-impl SomethingIndexChunk {
+impl RawIndexChunk {
     fn range_end(&self) -> u64 {
         match self {
             Self::NonOverlapping((range, _)) => *range.end(),
@@ -160,14 +160,14 @@ impl SomethingIndexChunk {
 ///
 /// The iterator will yield chunks that are non-overlapping or a set of chunks
 /// that are overlapping.
-fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = SomethingIndexChunk> {
+fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = RawIndexChunk> {
     chunks.sort_by_key(|(range, _)| u64::MAX - *range.start());
 
     let mut output = Vec::new();
 
     // Start assuming non-overlapping in first chunk.
     if let Some(first_chunk) = chunks.pop() {
-        output.push(SomethingIndexChunk::NonOverlapping(first_chunk));
+        output.push(RawIndexChunk::NonOverlapping(first_chunk));
     } else {
         // Early return for empty.
         return output.into_iter();
@@ -199,7 +199,7 @@ fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = Someth
             if *chunk.0.start() <= last_chunk_end {
                 // We have found overlap.
                 match output.pop().unwrap() {
-                    SomethingIndexChunk::NonOverlapping(chunk) => {
+                    RawIndexChunk::NonOverlapping(chunk) => {
                         current_overlap.push(chunk);
                     }
                     _ => unreachable!(),
@@ -216,7 +216,7 @@ fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = Someth
                 current_range = range_start..=range_end;
             } else {
                 // We are still in non-overlapping space.
-                output.push(SomethingIndexChunk::NonOverlapping(chunk));
+                output.push(RawIndexChunk::NonOverlapping(chunk));
             }
         } else {
             // We are making an overlap chunk
@@ -228,11 +228,11 @@ fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = Someth
                 current_overlap.push(chunk);
             } else {
                 // We have exited overlap.
-                output.push(SomethingIndexChunk::Overlapping(
+                output.push(RawIndexChunk::Overlapping(
                     std::mem::replace(&mut current_range, 0..=0),
                     std::mem::take(&mut current_overlap),
                 ));
-                output.push(SomethingIndexChunk::NonOverlapping(chunk));
+                output.push(RawIndexChunk::NonOverlapping(chunk));
             }
         }
     }
@@ -254,7 +254,7 @@ fn prep_index_chunks(mut chunks: Vec<IndexChunk>) -> impl Iterator<Item = Someth
     );
 
     if !current_overlap.is_empty() {
-        output.push(SomethingIndexChunk::Overlapping(
+        output.push(RawIndexChunk::Overlapping(
             current_range.clone(),
             current_overlap,
         ));
