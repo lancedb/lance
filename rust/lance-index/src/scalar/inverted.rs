@@ -19,6 +19,7 @@ pub use builder::InvertedIndexBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{cache::LanceCache, Result};
+use tantivy::tokenizer::Language;
 pub use tokenizer::*;
 
 use lance_core::Error;
@@ -45,13 +46,21 @@ impl InvertedIndexPlugin {
         index_store: &dyn IndexStore,
         params: InvertedIndexParams,
     ) -> Result<CreatedIndex> {
+        let details = pb::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index = InvertedIndexBuilder::new(params);
         inverted_index.update(data, index_store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::InvertedIndexDetails::default())
-                .unwrap(),
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: INVERTED_INDEX_VERSION,
         })
+    }
+
+    /// Return true if the query can be used to speed up contains_tokens queries
+    fn can_accelerate_queries(details: &pb::InvertedIndexDetails) -> bool {
+        details.base_tokenizer == Some("simple".to_string())
+            && details.max_token_length.is_none()
+            && details.language == serde_json::to_string(&Language::English).unwrap()
+            && !details.stem
     }
 }
 
@@ -83,8 +92,20 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         0
     }
 
-    fn new_query_parser(&self, index_name: String) -> Box<dyn ScalarQueryParser> {
-        Box::new(FtsQueryParser::new(index_name))
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        let Ok(index_details) = _index_details.to_msg::<pb::InvertedIndexDetails>() else {
+            return None;
+        };
+
+        if Self::can_accelerate_queries(&index_details) {
+            Some(Box::new(FtsQueryParser::new(index_name)))
+        } else {
+            None
+        }
     }
 
     /// Train a new index

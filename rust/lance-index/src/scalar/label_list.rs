@@ -373,8 +373,12 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         0
     }
 
-    fn new_query_parser(&self, index_name: String) -> Box<dyn ScalarQueryParser> {
-        Box::new(LabelListQueryParser::new(index_name))
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(LabelListQueryParser::new(index_name)))
     }
 
     /// Train a new index

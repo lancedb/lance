@@ -48,7 +48,6 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
-use tantivy::tokenizer::Language;
 use tracing::{info, instrument};
 
 use super::{
@@ -396,18 +395,6 @@ impl Index for InvertedIndex {
 }
 
 impl InvertedIndex {
-    /// Whether the query can use the current index.
-    pub fn is_query_allowed(&self, query: &TokenQuery) -> bool {
-        match query {
-            TokenQuery::TokensContains(_) => {
-                self.params.base_tokenizer == "simple"
-                    && self.params.max_token_length.is_none()
-                    && self.params.language == Language::English
-                    && !self.params.stem
-            }
-        }
-    }
-
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
@@ -470,9 +457,10 @@ impl ScalarIndex for InvertedIndex {
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
+        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::InvertedIndexDetails::default())
-                .unwrap(),
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: INVERTED_INDEX_VERSION,
         })
     }
@@ -484,9 +472,10 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 
+        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::InvertedIndexDetails::default())
-                .unwrap(),
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: INVERTED_INDEX_VERSION,
         })
     }

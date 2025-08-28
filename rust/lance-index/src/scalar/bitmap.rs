@@ -506,8 +506,12 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         BITMAP_INDEX_VERSION
     }
 
-    fn new_query_parser(&self, index_name: String) -> Box<dyn ScalarQueryParser> {
-        Box::new(SargableQueryParser::new(index_name, false))
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(index_name, false)))
     }
 
     async fn train_index(

@@ -121,15 +121,37 @@ impl IndexRemapper for DatasetIndexRemapper {
 }
 
 pub trait LanceIndexStoreExt {
-    fn from_dataset(dataset: &Dataset, uuid: &str) -> Self;
+    /// Create an index store for a new index (will always be absolute with no base id)
+    fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Open an index store for an existing index (might be relative or absolute)
+    fn from_dataset_for_existing(dataset: &Dataset, index: &Index) -> Result<Self>
+    where
+        Self: Sized;
 }
 
 impl LanceIndexStoreExt for LanceIndexStore {
-    fn from_dataset(dataset: &Dataset, index: &Index) -> Self {
+    fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self> {
+        let index_dir = dataset.indices_dir().child(uuid);
+        let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+        Ok(Self::new(
+            dataset.object_store.clone(),
+            index_dir,
+            Arc::new(cache),
+        ))
+    }
+
+    fn from_dataset_for_existing(dataset: &Dataset, index: &Index) -> Result<Self> {
         let index_dir = dataset
-            .indice_files_dir(index)
+            .indice_files_dir(index)?
             .child(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
-        Self::new(dataset.object_store.clone(), index_dir, Arc::new(cache))
+        Ok(Self::new(
+            dataset.object_store.clone(),
+            index_dir,
+            Arc::new(cache),
+        ))
     }
 }

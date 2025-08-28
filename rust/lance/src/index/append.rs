@@ -144,7 +144,7 @@ pub async fn merge_indices<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
+            let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
             let created_index = index.update(new_data_stream, &new_store).await?;
 
             // TODO: don't hard-code index version

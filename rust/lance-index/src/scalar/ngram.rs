@@ -1265,8 +1265,12 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         0
     }
 
-    fn new_query_parser(&self, index_name: String) -> Box<dyn ScalarQueryParser> {
-        Box::new(TextQueryParser::new(index_name, true))
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(TextQueryParser::new(index_name, true)))
     }
 
     async fn train_index(

@@ -220,7 +220,7 @@ pub(super) async fn build_scalar_index(
     })?;
     let field: arrow_schema::Field = field.into();
 
-    let index_store = LanceIndexStore::from_dataset(dataset, uuid);
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
 
     let default_params =
         prost_types::Any::from_msg(&lance_index::pb::BTreeIndexParams::default()).unwrap();
@@ -254,7 +254,7 @@ pub(super) async fn build_inverted_index(
         train,
     )
     .await?;
-    let index_store = LanceIndexStore::from_dataset(dataset, uuid);
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
     InvertedIndexPlugin::train_inverted_index(data, &index_store, params.clone()).await
 }
 
@@ -284,7 +284,7 @@ pub async fn open_scalar_index(
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
-    let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, index));
+    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index)?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin =
@@ -312,7 +312,7 @@ pub(crate) async fn infer_scalar_index_details(
         return Ok(index_details.0.clone());
     }
 
-    let index_dir = dataset.indice_files_dir(index).child(uuid.clone());
+    let index_dir = dataset.indice_files_dir(index)?.child(uuid.clone());
     let col = dataset.schema().field(column).ok_or(Error::Internal {
         message: format!(
             "Index refers to column {} which does not exist in dataset schema",

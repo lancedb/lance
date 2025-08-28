@@ -2283,8 +2283,8 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
-            index_details: Some(vector_index_details()),
-            index_version: 1, // Use version 1 for IVF PQ index
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
         };
@@ -2387,8 +2387,8 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
-            index_details: Some(vector_index_details()),
-            index_version: index.index_type().version(),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
         };

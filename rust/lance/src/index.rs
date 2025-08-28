@@ -72,24 +72,19 @@ pub mod prefilter;
 pub mod scalar;
 pub mod vector;
 
-use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::optimize::remapping::RemapResult;
-use crate::dataset::optimize::RemappedIndex;
-pub use crate::index::prefilter::{FilterLoader, PreFilter};
-use crate::index::scalar::{fetch_index_details, load_training_data, IndexDetails};
-pub use create::CreateIndexBuilder;
-
 use self::append::merge_indices;
 use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::optimize::remapping::RemapResult;
+use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::scalar::{fetch_index_details, load_training_data, IndexDetails};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{dataset::Dataset, Error, Result};
 pub use create::CreateIndexBuilder;
-use lance_index::scalar::inverted::InvertedIndex;
 
 // Cache keys for different index types
 #[derive(Debug, Clone)]
@@ -260,7 +255,7 @@ pub(crate) async fn remap_index(
 
     let created_index = match generic.index_type() {
         it if it.is_scalar() => {
-            let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
+            let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id.to_string())?;
 
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
@@ -1396,9 +1391,11 @@ impl DatasetIndexInternalExt for Dataset {
             })?;
             let index_details = IndexDetails(fetch_index_details(self, &field.name, index).await?);
             let plugin = index_details.get_plugin()?;
-            let query_parser = plugin.new_query_parser(index.name.clone());
+            let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
-            indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+            if let Some(query_parser) = query_parser {
+                indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+            }
         }
         let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
         for indexed_field in indexed_fields {

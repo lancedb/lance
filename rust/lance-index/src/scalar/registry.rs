@@ -84,7 +84,13 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     fn version(&self) -> u32;
 
     /// Returns a new query parser for the index
-    fn new_query_parser(&self, index_name: String) -> Box<dyn ScalarQueryParser>;
+    ///
+    /// Can return None if this index cannot participate in query optimization
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>>;
 
     /// Train a new index
     ///
