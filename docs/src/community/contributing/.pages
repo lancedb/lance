@@ -1,5 +1,5 @@
 nav:
   - index.md
-  - rust.md
-  - python.md
-  - docs.md
+  - Rust: rust.md
+  - Python: python.md
+  - Documentation: docs.md
