@@ -4133,10 +4133,12 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         // Test analyze_plan. We enclose the analysis output string in brackets to make it easier
         // to use assert_string_matches.  (That function requires a known string at the beginning
         // and end.)
-        let analysis = "[".to_owned() + &merge_insert_job
-            .analyze_plan(Box::pin(source_stream))
-            .await
-            .unwrap() + "]";
+        let analysis = "[".to_owned()
+            + &merge_insert_job
+                .analyze_plan(Box::pin(source_stream))
+                .await
+                .unwrap()
+            + "]";
 
         // Verify the analysis contains expected components
         assert!(analysis.contains("MergeInsert"));
@@ -4157,7 +4159,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         );
 
         // Also validate the full string structure with pattern matching
-        let expected_pattern = "[MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1], cumulative_cpu=...
+        let expected_pattern = "[...MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1], cumulative_cpu=...
     ...
     StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[], cumulative_cpu=...]";
         assert_string_matches(&analysis, expected_pattern).unwrap();
