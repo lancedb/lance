@@ -3340,6 +3340,7 @@ class Index:
     fragment_ids: Set[int]
     index_version: int
     created_at: Optional[datetime] = None
+    base_id: Optional[int] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -3676,7 +3677,7 @@ class LanceOperation:
         """
 
         groups: Iterable[LanceOperation.RewriteGroup]
-        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+        rewritten_indices: Iterable[LanceOperation.RewrfittenIndex]
 
         def __post_init__(self):
             all_frags = [old for group in self.groups for old in group.old_fragments]

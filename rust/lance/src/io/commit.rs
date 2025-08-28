@@ -133,9 +133,37 @@ async fn do_commit_new_dataset(
             &Session::default(),
         )
         .await?;
-        let new_manifest =
-            source_manifest.shallow_clone(ref_name.clone(), ref_path.clone(), transaction_file);
-        (new_manifest, Vec::new())
+
+        let new_base_id = source_manifest
+            .base_paths
+            .keys()
+            .max()
+            .map(|id| *id + 1)
+            .unwrap_or(0);
+        let new_manifest = source_manifest.shallow_clone(
+            ref_name.clone(),
+            ref_path.clone(),
+            new_base_id,
+            transaction_file,
+        );
+
+        let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
+            let reader = object_store.open(&source_manifest_location.path).await?;
+            let section: pb::IndexSection =
+                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            section
+                .indices
+                .into_iter()
+                .map(|index_pb| {
+                    let mut index = lance_table::format::Index::try_from(index_pb)?;
+                    index.base_id = Some(new_base_id);
+                    Ok(index)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        (new_manifest, updated_indices)
     } else {
         let (manifest, indices) = transaction.build_manifest(
             None,

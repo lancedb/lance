@@ -272,6 +272,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     index_details: curr_index_meta.index_details.clone(),
                     index_version: curr_index_meta.index_version,
                     created_at: curr_index_meta.created_at,
+                    base_id: None,
                 };
 
                 let transaction = Transaction::new(
