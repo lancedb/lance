@@ -524,11 +524,8 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
         fn calculate_cumulative_cpu(&mut self, plan: &Arc<dyn ExecutionPlan>) -> usize {
             self.highest_index += 1;
             let plan_index = self.highest_index;
-            let elapsed_cpu = match plan.metrics() {
-                Some(metrics) => match metrics.elapsed_compute() {
-                    Some(s) => s,
-                    None => 0,
-                },
+            let elapsed_cpu: usize = match plan.metrics() {
+                Some(metrics) => metrics.elapsed_compute().unwrap_or_default(),
                 None => 0,
             };
             let mut cumulative_cpu = elapsed_cpu;
@@ -599,7 +596,7 @@ pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
             prints.write_output(&self.plan, f, &calcs)
         }
     }
-    let wrapper = PrintWrapper { plan: plan };
+    let wrapper = PrintWrapper { plan };
     format!("{}", wrapper)
 }
 
