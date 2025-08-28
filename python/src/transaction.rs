@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::schema::LanceSchema;
+use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
@@ -16,9 +18,6 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
-
-use crate::schema::LanceSchema;
-use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 
 // Add Index bindings
 impl FromPyObject<'_> for PyLance<Index> {
@@ -131,6 +130,54 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateMode {
+    /// Vertical update with partial schema: adds new rows with only some fields
+    /// The new fragments contain a subset of the schema fields
+    /// This is used by the dataset updater when doing partial updates
+    VerticalPartialSchema,
+
+    /// Vertical update with full schema: adds new rows with all schema fields
+    /// The new fragments contain all fields from the current schema
+    /// This is used when merge_insert matches the complete schema
+    VerticalFullSchema,
+
+    /// Horizontal update: adds new columns
+    /// In this case, updated_fragments may have fields removed or added
+    /// It is even possible for a field to be tombstoned and then added back in the same update (which is a field modification)
+    /// If any fields are modified in this way then they need to be added to the fields_modified list
+    /// This way we can correctly update the indices
+    /// This is what is used by a merge insert that does not match the whole schema
+    Horizontal,
+}
+
+impl FromPyObject<'_> for UpdateMode {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mode_str: String = ob.extract()?;
+        match mode_str.as_str() {
+            "vertical_partial_schema" => Ok(Self::VerticalPartialSchema),
+            "vertical_full_schema" => Ok(Self::VerticalFullSchema),
+            "horizontal" => Ok(Self::Horizontal),
+            _ => Err(PyValueError::new_err(format!(
+                "Invalid UpdateMode: {}. Valid options are: vertical_partial_schema, vertical_full_schema, horizontal",
+                mode_str
+            ))),
+        }
+    }
+}
+
+impl UpdateMode {
+    fn to_lance_update_mode(&self) -> lance::dataset::transaction::UpdateMode {
+        match self {
+            Self::VerticalPartialSchema => {
+                lance::dataset::transaction::UpdateMode::VerticalPartialSchema
+            }
+            Self::VerticalFullSchema => lance::dataset::transaction::UpdateMode::VerticalFullSchema,
+            Self::Horizontal => lance::dataset::transaction::UpdateMode::Horizontal,
+        }
+    }
+}
+
 impl FromPyObject<'_> for PyLance<Operation> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         match class_name(ob)?.as_str() {
@@ -172,12 +219,25 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let fields_modified = ob.getattr("fields_modified")?.extract()?;
 
+                let value_updated_fields = ob
+                    .getattr("value_updated_fields")?
+                    .extract()
+                    .unwrap_or_default();
+
+                let update_mode = ob
+                    .getattr("update_mode")?
+                    .extract::<UpdateMode>()
+                    .ok()
+                    .map(|mode| mode.to_lance_update_mode());
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
+                    value_updated_fields,
                     mem_wal_to_flush: None,
+                    update_mode,
                 };
                 Ok(Self(op))
             }
@@ -280,12 +340,27 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                value_updated_fields,
+                update_mode,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let fields_modified = fields_modified.into_pyobject(py)?;
+                let value_updated_fields = value_updated_fields.into_pyobject(py)?;
+                let update_mode = match update_mode {
+                    Some(mode) => match mode {
+                        lance::dataset::transaction::UpdateMode::VerticalPartialSchema => {
+                            "vertical_partial_schema"
+                        }
+                        lance::dataset::transaction::UpdateMode::VerticalFullSchema => {
+                            "vertical_full_schema"
+                        }
+                        lance::dataset::transaction::UpdateMode::Horizontal => "horizontal",
+                    },
+                    None => "horizontal", // Default to horizontal if not set
+                };
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -294,6 +369,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
+                    value_updated_fields,
+                    update_mode,
                 ))
             }
             Operation::DataReplacement { replacements } => {
