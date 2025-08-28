@@ -185,13 +185,16 @@ impl Manifest {
         }
     }
 
+    /// Performs a shallow_clone of the manifest entirely in memory without:
+    /// - Any persistent storage operations
+    /// - Modifications to the original data
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
         ref_path: String,
+        ref_base_id: u32,
         transaction_file: String,
     ) -> Self {
-        let new_base_id = self.base_paths.keys().max().map(|id| *id + 1).unwrap_or(0);
         let cloned_fragments = self
             .fragments
             .as_ref()
@@ -202,13 +205,13 @@ impl Manifest {
                     .files
                     .into_iter()
                     .map(|mut file| {
-                        file.base_id = Some(new_base_id);
+                        file.base_id = Some(ref_base_id);
                         file
                     })
                     .collect();
 
                 if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
-                    deletion.base_id = Some(new_base_id);
+                    deletion.base_id = Some(ref_base_id);
                     cloned_fragment.deletion_file = Some(deletion);
                 }
 
@@ -223,12 +226,11 @@ impl Manifest {
             writer_version: self.writer_version.clone(),
             fragments: Arc::new(cloned_fragments),
             version_aux_data: self.version_aux_data,
-            // TODO: apply shallow clone to indexes
-            index_section: None,
+            index_section: None, // These will be set on commit
             timestamp_nanos: self.timestamp_nanos,
-            reader_feature_flags: self.reader_feature_flags,
             tag: None,
-            writer_feature_flags: self.writer_feature_flags,
+            reader_feature_flags: 0, // These will be set on commit
+            writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             fragment_offsets: self.fragment_offsets.clone(),
@@ -239,12 +241,12 @@ impl Manifest {
             base_paths: {
                 let mut base_paths = self.base_paths.clone();
                 let base_path = BasePath {
-                    id: new_base_id,
+                    id: ref_base_id,
                     name: ref_name,
                     is_dataset_root: true,
                     path: ref_path,
                 };
-                base_paths.insert(new_base_id, base_path);
+                base_paths.insert(ref_base_id, base_path);
                 base_paths
             },
         }

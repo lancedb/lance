@@ -40,6 +40,7 @@ pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
+use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
@@ -538,6 +539,43 @@ impl AnyQuery for TextQuery {
         match self {
             Self::StringContains(substr) => Expr::ScalarFunction(ScalarFunction {
                 func: Arc::new(ContainsFunc::new().into()),
+                args: vec![
+                    Expr::Column(Column::new_unqualified(col)),
+                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
+                ],
+            }),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
+/// A query that a InvertedIndex can satisfy
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenQuery {
+    /// Retrieve all row ids where the text contains all tokens parsed from given string. The tokens
+    /// are separated by punctuations and white spaces.
+    TokensContains(String),
+}
+
+impl AnyQuery for TokenQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        format!("{}", self.to_expr(col.to_string()))
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        match self {
+            Self::TokensContains(substr) => Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(CONTAINS_TOKENS_UDF.clone()),
                 args: vec![
                     Expr::Column(Column::new_unqualified(col)),
                     Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),

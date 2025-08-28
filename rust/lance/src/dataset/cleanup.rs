@@ -199,7 +199,8 @@ impl<'a> CleanupTask<'a> {
         let mut inspection = inspection.lock().unwrap();
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
-        if is_tagged {
+        // Only track tagged when it is old.
+        if is_tagged && !is_latest && manifest.timestamp() < self.before {
             inspection.tagged_old_versions.insert(manifest.version);
         }
 
@@ -927,6 +928,12 @@ mod tests {
         fixture
             .clock
             .set_system_time(TimeDelta::try_days(10).unwrap());
+
+        let removed = fixture
+            .run_cleanup(utc_now() - TimeDelta::try_days(20).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(removed.old_versions, 0);
 
         let mut cleanup_error = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
