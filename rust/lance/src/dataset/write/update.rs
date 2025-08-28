@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{io::exec::Planner, Dataset};
 use crate::{Error, Result};
@@ -401,12 +401,27 @@ impl UpdateJob {
             fields_modified: vec![],
             mem_wal_to_flush: None,
         };
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+
+        let mut data_columns_updated = Vec::new();
+        for column_name in self.updates.keys() {
+            if let Ok(field_id) = dataset.schema().field_id(column_name) {
+                data_columns_updated.push(field_id as u32);
+            }
+        }
+
+        let mut transaction_properties = HashMap::new();
+        if !data_columns_updated.is_empty() {
+            let data_columns_str = data_columns_updated
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            transaction_properties.insert("data_columns_updated".to_string(), data_columns_str);
+        }
+
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .transaction_properties(Some(Arc::new(transaction_properties)))
+            .build();
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)

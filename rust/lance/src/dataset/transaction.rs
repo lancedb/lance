@@ -1409,9 +1409,28 @@ impl Transaction {
                     fields_modified,
                 );
 
+                let effective_fields_modified = {
+                    let from_properties =
+                        Self::get_data_columns_updated_from_transaction_properties(
+                            &self.transaction_properties,
+                        );
+                    if from_properties.is_empty() {
+                        fields_modified.to_vec()
+                    } else {
+                        from_properties
+                    }
+                };
+
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+
+                Self::add_new_fragments_to_unmodified_indices(
+                    &mut final_indices,
+                    &new_fragments,
+                    &effective_fields_modified,
+                );
+
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
@@ -1745,6 +1764,47 @@ impl Transaction {
         }
 
         Ok((manifest, final_indices))
+    }
+
+    fn add_new_fragments_to_unmodified_indices(
+        indices: &mut [Index],
+        new_fragments: &[Fragment],
+        fields_modified: &[u32],
+    ) {
+        if new_fragments.is_empty() {
+            return;
+        }
+
+        let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
+
+        for index in indices.iter_mut() {
+            let index_covers_modified_field = index
+                .fields
+                .iter()
+                .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()));
+
+            if !index_covers_modified_field {
+                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                    for fragment_id in new_fragments.iter().map(|f| f.id as u32) {
+                        fragment_bitmap.insert(fragment_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_data_columns_updated_from_transaction_properties(
+        transaction_properties: &Option<Arc<HashMap<String, String>>>,
+    ) -> Vec<u32> {
+        if let Some(properties) = transaction_properties {
+            if let Some(data_columns_str) = properties.get("data_columns_updated") {
+                return data_columns_str
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u32>().ok())
+                    .collect();
+            }
+        }
+        Vec::new()
     }
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
