@@ -569,6 +569,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 // which means we have to skip at least the current block
                 if let Some(least_id) = self.get_new_candidate(max_pivot) {
                     self.move_term(least_id);
+                    continue;
                 } else {
                     // no more candidates, so we can stop
                     return Ok(None);
@@ -651,7 +652,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         if doc_id == TERMINATED_DOC_ID {
             self.postings.swap_remove(picked);
         }
-        self.bubble_up(picked, doc_id);
+        self.bubble_up(picked);
     }
 
     // move the posting iterators preceding the pivot to the block that contains the least_id
@@ -672,7 +673,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 if doc_id == TERMINATED_DOC_ID {
                     self.postings.swap_remove(i);
                 }
-                self.bubble_up(i, doc_id);
+                self.bubble_up(i);
                 return false;
             }
         }
@@ -695,7 +696,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
         self.postings.sort_unstable();
     }
 
-    fn bubble_up(&mut self, index: usize, doc_id: u64) {
+    fn bubble_up(&mut self, index: usize) {
+        if index >= self.postings.len() {
+            return;
+        }
+
+        let doc_id = self.postings[index].doc().unwrap().doc_id();
         for i in index + 1..self.postings.len() {
             if self.postings[i].doc().unwrap().doc_id() >= doc_id {
                 break;
@@ -849,16 +855,17 @@ mod tests {
     fn generate_posting_list(
         doc_ids: Vec<u32>,
         max_score: f32,
+        block_max_scores: Option<Vec<f32>>,
         is_compressed: bool,
     ) -> PostingList {
         let freqs = vec![1; doc_ids.len()];
-        let max_scores = vec![max_score; doc_ids.len()];
+        let block_max_scores = block_max_scores.unwrap_or_else(|| vec![max_score; doc_ids.len()]);
         if is_compressed {
             let blocks = compress_posting_list(
                 doc_ids.len(),
                 doc_ids.iter(),
                 freqs.iter(),
-                max_scores.into_iter(),
+                block_max_scores.into_iter(),
             )
             .unwrap();
             PostingList::Compressed(CompressedPostingList::new(
@@ -894,6 +901,7 @@ mod tests {
                 generate_posting_list(
                     Vec::from_iter(0..=BLOCK_SIZE as u32 + 1),
                     1.0,
+                    None,
                     is_compressed,
                 ),
                 docs.len(),
@@ -902,7 +910,7 @@ mod tests {
                 String::from("full"),
                 1,
                 1,
-                generate_posting_list(vec![BLOCK_SIZE as u32 + 2], 1.0, is_compressed),
+                generate_posting_list(vec![BLOCK_SIZE as u32 + 2], 1.0, None, is_compressed),
                 docs.len(),
             ),
         ];
@@ -918,5 +926,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.len(), 0); // Should not panic
+    }
+
+    #[test]
+    fn test_wand_skip_to_next_block() {
+        let mut docs = DocSet::default();
+        for i in 0..201 {
+            docs.append(i as u64, 1);
+        }
+
+        let large_posting_docs1: Vec<u32> = (0..=200).collect();
+
+        let postings = vec![
+            PostingIterator::new(
+                String::from("full"),
+                0,
+                0,
+                generate_posting_list(large_posting_docs1, 1.0, Some(vec![0.5, 0.5]), true),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("text"),
+                1,
+                1,
+                generate_posting_list(vec![0], 1.0, Some(vec![0.5]), true),
+                docs.len(),
+            ),
+        ];
+
+        let bm25 = BM25Scorer::new(std::iter::empty());
+        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, bm25);
+
+        // set a threshold that the sum of max scores can hit,
+        // but the sum of block max scores is less than the threshold,
+        wand.threshold = 1.5;
+
+        let result = wand.search(
+            &FtsSearchParams::default(),
+            Arc::new(RowIdMask::default()),
+            &NoOpMetricsCollector,
+        );
+
+        assert!(result.is_ok());
     }
 }
