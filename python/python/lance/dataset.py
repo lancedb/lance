@@ -3632,12 +3632,18 @@ class LanceOperation:
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
             those fields.
+        value_updated_fields: list[int]
+            If any fields their values are updated, then they must be
+            listed here so that we can refresh the fragment bitmaps of the
+            specified indices.
         """
 
         removed_fragment_ids: List[int]
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
         fields_modified: List[int]
+        value_updated_fields: List[int]
+        update_mode: str
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)

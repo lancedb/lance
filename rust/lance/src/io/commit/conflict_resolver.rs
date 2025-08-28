@@ -1589,6 +1589,8 @@ mod tests {
             new_fragments: vec![],
             fields_modified: vec![],
             mem_wal_to_merge: None,
+            value_updated_fields: vec![],
+            update_mode: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1598,6 +1600,8 @@ mod tests {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                value_updated_fields: vec![],
+                update_mode: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1610,6 +1614,8 @@ mod tests {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                value_updated_fields: vec![],
+                update_mode: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1709,6 +1715,8 @@ mod tests {
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                value_updated_fields: vec![],
+                update_mode: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1721,6 +1729,8 @@ mod tests {
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                value_updated_fields: vec![],
+                update_mode: None,
             },
         ];
         let transactions =
@@ -1840,6 +1850,8 @@ mod tests {
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
                     mem_wal_to_merge: None,
+                    value_updated_fields: vec![],
+                    update_mode: None,
                 },
             ),
             (
@@ -1850,6 +1862,8 @@ mod tests {
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
                     mem_wal_to_merge: None,
+                    value_updated_fields: vec![],
+                    update_mode: None,
                 },
             ),
             (
@@ -2005,6 +2019,8 @@ mod tests {
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
                 mem_wal_to_merge: None,
+                value_updated_fields: vec![],
+                update_mode: None,
             },
             Operation::UpdateConfig {
                 upsert_values: Some(HashMap::from_iter(vec![(
@@ -2197,6 +2213,8 @@ mod tests {
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
                     mem_wal_to_merge: None,
+                    value_updated_fields: vec![],
+                    update_mode: None,
                 },
                 [
                     Compatible,    // append

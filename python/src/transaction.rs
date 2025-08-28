@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::schema::LanceSchema;
+use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
-    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMode,
 };
 use lance::datatypes::Schema;
 use lance_table::format::{DataFile, Fragment, Index};
@@ -16,9 +18,6 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
-
-use crate::schema::LanceSchema;
-use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 
 // Add Index bindings
 impl FromPyObject<'_> for PyLance<Index> {
@@ -141,6 +140,24 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PyUpdateMode(pub UpdateMode);
+
+impl FromPyObject<'_> for PyUpdateMode {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mode_str: String = ob.extract()?;
+        match mode_str.as_str() {
+            "vertical_partial_schema" => Ok(Self(UpdateMode::VerticalPartialSchema)),
+            "vertical_full_schema" => Ok(Self(UpdateMode::VerticalFullSchema)),
+            "horizontal" => Ok(Self(UpdateMode::Horizontal)),
+            _ => Err(PyValueError::new_err(format!(
+                "Invalid UpdateMode: {}. Valid options are: vertical_partial_schema, vertical_full_schema, horizontal",
+                mode_str
+            ))),
+        }
+    }
+}
+
 impl FromPyObject<'_> for PyLance<Operation> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         match class_name(ob)?.as_str() {
@@ -182,12 +199,25 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let fields_modified = ob.getattr("fields_modified")?.extract()?;
 
+                let value_updated_fields = ob
+                    .getattr("value_updated_fields")?
+                    .extract()
+                    .unwrap_or_default();
+
+                let update_mode = ob
+                    .getattr("update_mode")?
+                    .extract::<PyUpdateMode>()
+                    .ok()
+                    .map(|py_mode| py_mode.0);
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
                     mem_wal_to_merge: None,
+                    value_updated_fields,
+                    update_mode,
                 };
                 Ok(Self(op))
             }
@@ -290,12 +320,27 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                value_updated_fields,
+                update_mode,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let fields_modified = fields_modified.into_pyobject(py)?;
+                let value_updated_fields = value_updated_fields.into_pyobject(py)?;
+                let update_mode = match update_mode {
+                    Some(mode) => match mode {
+                        lance::dataset::transaction::UpdateMode::VerticalPartialSchema => {
+                            "vertical_partial_schema"
+                        }
+                        lance::dataset::transaction::UpdateMode::VerticalFullSchema => {
+                            "vertical_full_schema"
+                        }
+                        lance::dataset::transaction::UpdateMode::Horizontal => "horizontal",
+                    },
+                    None => "horizontal", // Default to horizontal if not set
+                };
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -304,6 +349,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
+                    value_updated_fields,
+                    update_mode,
                 ))
             }
             Operation::DataReplacement { replacements } => {

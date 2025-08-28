@@ -194,6 +194,26 @@ message Transaction {
     repeated uint32 fields_modified = 4;
     /// The MemWAL (pre-image) that should be marked as merged after this transaction
     MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
+    /// The field ids that their values have been updated
+    repeated uint32 value_updated_fields = 6;
+    // The mode of update
+    UpdateMode update_mode = 7;
+  }
+
+  // The mode of update operation
+  enum UpdateMode {
+    // Vertical update with partial schema: adds new rows with only some fields
+    // The update contains a subset of the schema fields
+    // This is used by the dataset updater and merge insert(non-full schema) when doing partial updates
+    VERTICAL_PARTIAL_SCHEMA = 0;
+
+    // Vertical update with full schema: adds new rows with all schema fields
+    // The update contains all fields from the current schema
+    // This is used when merge_insert matches the full schema
+    VERTICAL_FULL_SCHEMA = 1;
+
+    // Horizontal update: adds/modify/delete columns
+    HORIZONTAL = 2;
   }
   
   // An operation that updates the table config.
