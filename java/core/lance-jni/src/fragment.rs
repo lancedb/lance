@@ -24,7 +24,7 @@ use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
     utils::extract_write_params,
-    RT,
+    JNIEnvExt, RT,
 };
 
 //////////////////
@@ -210,6 +210,60 @@ fn create_fragment<'a>(
         Some(write_params),
     ))?;
     export_vec(env, &fragments)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_nativeDeleteRows<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,
+    fragment_id: jint,
+    row_indexes: JObject, // List<Integer>
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        inner_delete_rows(&mut env, jdataset, fragment_id, row_indexes)
+    )
+}
+
+fn inner_delete_rows<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jint,
+    row_indexes: JObject, // List<Integer>
+) -> Result<JObject<'local>> {
+    let fragment_id = fragment_id as usize;
+    let fragment = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let Some(fragment) = dataset.inner.get_fragment(fragment_id) else {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )));
+        };
+        fragment
+    };
+
+    let indexes: Vec<u32> = env
+        .get_integers(&row_indexes)?
+        .into_iter()
+        .map(|x| x as u32)
+        .collect();
+
+    let res = RT.block_on(async move { fragment.extend_deletions(indexes).await });
+
+    let obj = match res {
+        Ok(Some(f)) => f.metadata().into_java(env)?,
+        Ok(None) => JObject::default(),
+        Err(e) => {
+            return Err(Error::runtime_error(format!(
+                "Cannot delete rows in fragment {}: {:?}",
+                fragment_id, e
+            )))
+        }
+    };
+
+    Ok(obj)
 }
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
