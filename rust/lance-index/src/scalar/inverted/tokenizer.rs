@@ -39,7 +39,7 @@ pub struct InvertedIndexParams {
     /// If true, store the position of the term in the document
     /// This can significantly increase the size of the index
     /// If false, only store the frequency of the term in the document
-    /// Default is true
+    /// Default is false
     #[serde(default)]
     pub(crate) with_position: bool,
 

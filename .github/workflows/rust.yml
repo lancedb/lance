@@ -9,6 +9,7 @@ on:
       - protos/**
       - .github/workflows/rust.yml
       - Cargo.toml
+      - Cargo.lock
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
