@@ -5,6 +5,7 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::Field as ArrowField;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
 use deepsize::DeepSizeOf;
@@ -552,6 +553,26 @@ impl Dataset {
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
     ) -> Result<Self> {
+        let schema_has_json = manifest.schema.fields_pre_order().any(|field| {
+            let arrow_field = ArrowField::from(field);
+            lance_arrow::json::has_json_fields(&arrow_field)
+        });
+
+        if schema_has_json {
+            let storage_version = manifest.data_storage_format.lance_file_version()?;
+            if storage_version < lance_file::version::LanceFileVersion::V2_2 {
+                return Err(Error::NotSupported {
+                    source: format!(
+                        "Cannot read dataset with JSON fields from file format version {}. \
+                         JSON fields require Lance file format version 2.2 or later.",
+                        storage_version
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+        }
+
         let tags = Tags::new(
             object_store.clone(),
             commit_handler.clone(),
@@ -2168,7 +2189,8 @@ mod tests {
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
-    use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
@@ -5789,7 +5811,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 5);
+        assert_eq!(result.num_rows(), 5, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));

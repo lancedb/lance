@@ -1628,7 +1628,7 @@ impl FileFragment {
         self.write_deletions(deletion_vector).await
     }
 
-    pub(crate) async fn extend_deletions(
+    pub async fn extend_deletions(
         self,
         new_deletions: impl IntoIterator<Item = u32>,
     ) -> Result<Option<Self>> {

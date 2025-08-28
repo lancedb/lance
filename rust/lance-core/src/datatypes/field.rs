@@ -20,7 +20,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
-use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
+use lance_arrow::{json::is_json_field, ARROW_EXT_NAME_KEY, *};
 use snafu::location;
 
 use super::{
@@ -63,11 +63,11 @@ pub struct SchemaCompareOptions {
     pub compare_field_ids: bool,
     /// Should nullability be compared (default Strict)
     pub compare_nullability: NullabilityComparison,
-    /// Allow fields in the expected schema to be missing from the schema being tested if  
-    /// they are nullable (default false)  
-    ///  
-    /// Fields in the schema being tested must always be present in the expected schema  
-    /// regardless of this flag.  
+    /// Allow fields in the expected schema to be missing from the schema being tested if
+    /// they are nullable (default false)
+    ///
+    /// Fields in the schema being tested must always be present in the expected schema
+    /// regardless of this flag.
     pub allow_missing_if_nullable: bool,
     /// Allow out of order fields (default false)
     pub ignore_field_order: bool,
@@ -988,11 +988,18 @@ impl TryFrom<&ArrowField> for Field {
             .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
 
+        // Check for JSON extension type
+        let logical_type = if is_json_field(field) {
+            LogicalType::from("json")
+        } else {
+            LogicalType::try_from(field.data_type())?
+        };
+
         Ok(Self {
             id: -1,
             parent_id: -1,
             name: field.name().clone(),
-            logical_type: LogicalType::try_from(field.data_type())?,
+            logical_type,
             encoding: match field.data_type() {
                 dt if dt.is_fixed_stride() => Some(Encoding::Plain),
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
@@ -1023,6 +1030,15 @@ impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         let mut metadata = field.metadata.clone();
+
+        // Add JSON extension metadata if this is a JSON field
+        if field.logical_type.0 == "json" {
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::JSON_EXT_NAME.to_string(),
+            );
+        }
+
         match field.storage_class {
             StorageClass::Default => {}
             StorageClass::Blob => {
@@ -1032,7 +1048,7 @@ impl From<&Field> for ArrowField {
                 );
             }
         }
-        out.with_metadata(field.metadata.clone())
+        out.with_metadata(metadata)
     }
 }
 

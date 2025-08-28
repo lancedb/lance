@@ -553,6 +553,7 @@ impl FileWriter {
         match version.resolve() {
             LanceFileVersion::V2_0 => (0, 3),
             LanceFileVersion::V2_1 => (2, 1),
+            LanceFileVersion::V2_2 => (2, 2),
             _ => panic!("Unsupported version: {}", version),
         }
     }

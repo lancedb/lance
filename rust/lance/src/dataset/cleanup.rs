@@ -576,6 +576,7 @@ mod tests {
         fn wrap(
             &self,
             original: Arc<dyn object_store::ObjectStore>,
+            _storage_options: Option<&std::collections::HashMap<String, String>>,
         ) -> Arc<dyn object_store::ObjectStore> {
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
         }
