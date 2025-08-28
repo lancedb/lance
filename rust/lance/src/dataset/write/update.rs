@@ -509,14 +509,21 @@ mod tests {
 
     use super::*;
 
+    use crate::index::vector::VectorIndexParams;
     use arrow::{array::AsArray, datatypes::UInt32Type};
-    use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
+    use arrow_array::{
+        FixedSizeListArray, Float32Array, Int64Array, RecordBatchIterator, StringArray,
+        UInt32Array, UInt64Array,
+    };
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::{future::try_join_all, TryStreamExt};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
     use lance_file::version::LanceFileVersion;
+    use lance_index::DatasetIndexExt;
     use lance_io::object_store::ObjectStoreParams;
+    use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
@@ -1047,5 +1054,123 @@ mod tests {
                 assert_eq!(updated_name, orig_names.value(i));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_index_fragment_bitmap_behavior() {
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::IndexType;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("str", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        ]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let str_values = StringArray::from(vec!["a", "b", "c"]);
+        let vec_values = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ]),
+            4,
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(str_values), Arc::new(vec_values)],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["str"],
+                IndexType::Scalar,
+                Some("str_idx".to_string()),
+                &scalar_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let str_index = indices.iter().find(|idx| idx.name == "str_idx").unwrap();
+        let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
+
+        assert_eq!(str_index.fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
+
+        let updated_dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("str = 'b'")
+            .unwrap()
+            .set("vec", "array[13.0, 14.0, 15.0, 16.0]")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let updated_indices = updated_dataset.load_indices().await.unwrap();
+        let updated_str_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "str_idx")
+            .unwrap();
+        let updated_vec_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "vec_idx")
+            .unwrap();
+
+        let str_bitmap = updated_str_index.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(str_bitmap.len(), 2);
+        assert_eq!(str_bitmap.iter().collect::<Vec<_>>(), vec![0, 1]);
+
+        let vec_bitmap = updated_vec_index.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(vec_bitmap.len(), 1);
+        assert!(vec_bitmap.contains(0));
+
+        let fragments = updated_dataset.get_fragments();
+        assert!(fragments.len() > 1);
+
+        let original_fragment = &fragments[0];
+        assert!(original_fragment
+            .get_deletion_vector()
+            .await
+            .unwrap()
+            .is_some());
     }
 }
