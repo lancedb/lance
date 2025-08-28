@@ -10,7 +10,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_functions::utils::make_scalar_function;
 use std::sync::{Arc, LazyLock};
 
-mod json;
+pub(crate) mod json;
 
 /// Register UDF functions to datafusion context.
 pub fn register_functions(ctx: &SessionContext) {
