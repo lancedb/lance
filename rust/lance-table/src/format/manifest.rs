@@ -185,6 +185,9 @@ impl Manifest {
         }
     }
 
+    /// Performs a shallow_clone of the manifest entirely in memory without:
+    /// - Any persistent storage operations
+    /// - Modifications to the original data
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
