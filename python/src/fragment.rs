@@ -145,7 +145,7 @@ impl FileFragment {
     fn open_session(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
-        with_row_address: Option<bool>
+        with_row_address: Option<bool>,
     ) -> PyResult<FragmentSession> {
         let dataset_schema = self_.fragment.dataset().schema();
         let projection = if let Some(columns) = columns {
@@ -159,10 +159,14 @@ impl FileFragment {
         let fragment = self_.fragment.clone();
         let session = RT
             .spawn(Some(self_.py()), async move {
-                fragment.open_session(&projection, with_row_address.unwrap_or(false)).await
+                fragment
+                    .open_session(&projection, with_row_address.unwrap_or(false))
+                    .await
             })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(FragmentSession { session: Arc::new(session) })
+        Ok(FragmentSession {
+            session: Arc::new(session),
+        })
     }
 
     #[pyo3(signature=(row_indices, columns=None))]
@@ -644,12 +648,13 @@ pub struct FragmentSession {
 #[pymethods]
 impl FragmentSession {
     #[pyo3(signature=(indices))]
-    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject>  {
+    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject> {
         let session = self_.session.clone();
         let batch = RT
-            .spawn(Some(self_.py()), async move {
-                session.take(&indices).await
-            })?
+            .spawn(
+                Some(self_.py()),
+                async move { session.take(&indices).await },
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
     }
