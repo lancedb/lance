@@ -357,7 +357,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - rows_scanned: total rows examined during the scan
         - iops: number of I/O operations performed
         - requests: number of storage requests made
-        """ # noqa: E501
+        """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
