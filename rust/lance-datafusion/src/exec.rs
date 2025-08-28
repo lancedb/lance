@@ -4,7 +4,10 @@
 //! Utilities for working with datafusion execution plans
 
 use std::{
-    collections::HashMap, fmt, fmt::Formatter, sync::{Arc, LazyLock, Mutex}
+    collections::HashMap,
+    fmt::{self, Formatter},
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 
 use arrow_array::RecordBatch;
@@ -507,23 +510,50 @@ pub async fn analyze_plan(
     // fully execute the plan
     while (stream.next().await).is_some() {}
 
-    Ok(format_plan(analyze))
+    let result = format_plan(analyze);
+    Ok(result)
 }
 
-pub fn format_plan(
-    plan: Arc<dyn ExecutionPlan>,
-) -> String {
-    struct Wrapper {
-        plan: Arc<dyn ExecutionPlan>,
+pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
+    /// A visitor which calculates additional metrics for all the plans.
+    struct CalculateVisitor {
+        highest_index: usize,
+        index_to_cumulative_cpu: HashMap<usize, usize>,
+    }
+    impl CalculateVisitor {
+        fn calculate_cumulative_cpu(&mut self, plan: &Arc<dyn ExecutionPlan>) -> usize {
+            self.highest_index += 1;
+            let plan_index = self.highest_index;
+            let elapsed_cpu = match plan.metrics() {
+                Some(metrics) => match metrics.elapsed_compute() {
+                    Some(s) => s,
+                    None => 0,
+                },
+                None => 0,
+            };
+            let mut cumulative_cpu = elapsed_cpu;
+            for child in plan.children() {
+                cumulative_cpu += self.calculate_cumulative_cpu(child);
+            }
+            self.index_to_cumulative_cpu
+                .insert(plan_index, cumulative_cpu);
+            cumulative_cpu
+        }
+    }
+
+    /// A visitor which prints out all the plans.
+    struct PrintVisitor {
+        highest_index: usize,
         indent: usize,
     }
-    impl Wrapper {
+    impl PrintVisitor {
         fn write_output(
-            &self,
+            &mut self,
             plan: &Arc<dyn ExecutionPlan>,
             f: &mut Formatter,
-            indent: usize,
+            calcs: &CalculateVisitor,
         ) -> std::fmt::Result {
+            self.highest_index += 1;
             write!(f, "{:indent$}", "", indent = self.indent * 2)?;
             plan.fmt_as(datafusion::physical_plan::DisplayFormatType::Verbose, f)?;
             if let Some(metrics) = plan.metrics() {
@@ -536,22 +566,40 @@ pub fn format_plan(
             } else {
                 write!(f, ", metrics=[]")?;
             }
+            let cumulative_cpu = calcs
+                .index_to_cumulative_cpu
+                .get(&self.highest_index)
+                .unwrap();
+            let cumulative_cpu_duration = Duration::from_nanos((*cumulative_cpu) as u64);
+            write!(f, ", cumulative_cpu={cumulative_cpu_duration:?}")?;
             writeln!(f)?;
+            self.indent += 1;
             for child in plan.children() {
-                self.write_output(child, f, indent + 1)?;
+                self.write_output(child, f, calcs)?;
             }
+            self.indent -= 1;
             std::fmt::Result::Ok(())
         }
     }
-    impl fmt::Display for Wrapper {
+    // A wrapper which prints out a plan.
+    struct PrintWrapper {
+        plan: Arc<dyn ExecutionPlan>,
+    }
+    impl fmt::Display for PrintWrapper {
         fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-            self.write_output(&self.plan, f, 0)
+            let mut calcs = CalculateVisitor {
+                highest_index: 0,
+                index_to_cumulative_cpu: HashMap::new(),
+            };
+            calcs.calculate_cumulative_cpu(&self.plan);
+            let mut prints = PrintVisitor {
+                highest_index: 0,
+                indent: 0,
+            };
+            prints.write_output(&self.plan, f, &calcs)
         }
     }
-    let wrapper = Wrapper {
-        plan: plan,
-        indent: 0,
-    };
+    let wrapper = PrintWrapper { plan: plan };
     format!("{}", wrapper)
 }
 
