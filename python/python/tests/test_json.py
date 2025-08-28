@@ -195,32 +195,38 @@ def test_json_path_queries():
         {"user": {"name": "Charlie"}, "tags": []},
         None,
     ]
-    
+
     json_strings = [json.dumps(d) if d is not None else None for d in json_data]
     json_arr = pa.array(json_strings, type=pa.json_())
-    
+
     # Create a Lance dataset with JSON data
-    table = pa.table({
-        "id": [1, 2, 3, 4],
-        "data": json_arr,
-    })
-    
+    table = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "data": json_arr,
+        }
+    )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "json_test.lance"
         lance.write_dataset(table, ds_path, data_storage_version="2.2")
         dataset = lance.dataset(ds_path)
-        
+
         # Test json_extract
-        result = dataset.to_table(filter="json_extract(data, '$.user.name') = '\"Alice\"'")
+        result = dataset.to_table(
+            filter="json_extract(data, '$.user.name') = '\"Alice\"'"
+        )
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
-        
+
         # Test json_exists
         result = dataset.to_table(filter="json_exists(data, '$.user.age')")
         assert result.num_rows == 2  # Alice and Bob have age field
-        
+
         # Test json_array_contains
-        result = dataset.to_table(filter="json_array_contains(data, '$.tags', 'python')")
+        result = dataset.to_table(
+            filter="json_array_contains(data, '$.tags', 'python')"
+        )
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
 
@@ -234,33 +240,35 @@ def test_json_get_functions():
         {"name": "Charlie", "age": "35", "active": "true", "score": "92"},
         {"name": "David"},  # Missing fields
     ]
-    
+
     json_strings = [json.dumps(d) for d in json_data]
     json_arr = pa.array(json_strings, type=pa.json_())
-    
-    table = pa.table({
-        "id": [1, 2, 3, 4],
-        "data": json_arr,
-    })
-    
+
+    table = pa.table(
+        {
+            "id": [1, 2, 3, 4],
+            "data": json_arr,
+        }
+    )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "json_get_test.lance"
         lance.write_dataset(table, ds_path, data_storage_version="2.2")
         dataset = lance.dataset(ds_path)
-        
+
         # Test json_get_string
         result = dataset.to_table(filter="json_get_string(data, 'name') = 'Alice'")
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
-        
+
         # Test json_get_int with type coercion
         result = dataset.to_table(filter="json_get_int(data, 'age') > 28")
         assert result.num_rows == 2  # Alice (30) and Charlie ("35" -> 35)
-        
+
         # Test json_get_bool with type coercion
         result = dataset.to_table(filter="json_get_bool(data, 'active') = true")
         assert result.num_rows == 2  # Alice (true) and Charlie ("true" -> true)
-        
+
         # Test json_get_float
         result = dataset.to_table(filter="json_get_float(data, 'score') > 90")
         assert result.num_rows == 2  # Alice (95.5) and Charlie ("92" -> 92.0)
@@ -272,28 +280,36 @@ def test_nested_json_access():
         {"user": {"profile": {"name": "Alice", "settings": {"theme": "dark"}}}},
         {"user": {"profile": {"name": "Bob", "settings": {"theme": "light"}}}},
     ]
-    
+
     json_strings = [json.dumps(d) for d in json_data]
     json_arr = pa.array(json_strings, type=pa.json_())
-    
-    table = pa.table({
-        "id": [1, 2],
-        "data": json_arr,
-    })
-    
+
+    table = pa.table(
+        {
+            "id": [1, 2],
+            "data": json_arr,
+        }
+    )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "nested_json_test.lance"
         lance.write_dataset(table, ds_path, data_storage_version="2.2")
         dataset = lance.dataset(ds_path)
-        
+
         # Access nested fields using json_get recursively
         # First get user, then profile, then name
         result = dataset.to_table(
-            filter="json_get_string(json_get(json_get(data, 'user'), 'profile'), 'name') = 'Alice'"
+            filter="""
+                json_get_string(
+                    json_get(
+                        json_get(data, 'user'),
+                        'profile'),
+                    'name')
+                = 'Alice'"""
         )
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
-        
+
         # Or use JSONPath for deep access
         result = dataset.to_table(
             filter="json_extract(data, '$.user.profile.settings.theme') = '\"dark\"'"
@@ -309,30 +325,34 @@ def test_json_array_operations():
         {"items": ["grape", "melon"], "counts": [10, 20]},
         {"items": [], "counts": []},
     ]
-    
+
     json_strings = [json.dumps(d) for d in json_data]
     json_arr = pa.array(json_strings, type=pa.json_())
-    
-    table = pa.table({
-        "id": [1, 2, 3],
-        "data": json_arr,
-    })
-    
+
+    table = pa.table(
+        {
+            "id": [1, 2, 3],
+            "data": json_arr,
+        }
+    )
+
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "array_json_test.lance"
         lance.write_dataset(table, ds_path, data_storage_version="2.2")
         dataset = lance.dataset(ds_path)
-        
+
         # Test array contains
-        result = dataset.to_table(filter="json_array_contains(data, '$.items', 'apple')")
+        result = dataset.to_table(
+            filter="json_array_contains(data, '$.items', 'apple')"
+        )
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
-        
+
         # Test array length
         result = dataset.to_table(filter="json_array_length(data, '$.counts') > 3")
         assert result.num_rows == 1
         assert result["id"][0].as_py() == 1
-        
+
         # Test empty array
         result = dataset.to_table(filter="json_array_length(data, '$.items') = 0")
         assert result.num_rows == 1
