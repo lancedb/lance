@@ -4133,12 +4133,14 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         // Test analyze_plan. We enclose the analysis output string in brackets to make it easier
         // to use assert_string_matches.  (That function requires a known string at the beginning
         // and end.)
-        let analysis = "[".to_owned()
-            + &merge_insert_job
+        let mut analysis = "[";
+        analysis.push_str(
+            merge_insert_job
                 .analyze_plan(Box::pin(source_stream))
                 .await
-                .unwrap()
-            + "]";
+                .unwrap(),
+        );
+        analysis.push_str("]");
 
         // Verify the analysis contains expected components
         assert!(analysis.contains("MergeInsert"));
