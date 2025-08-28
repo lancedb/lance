@@ -341,7 +341,17 @@ fn get_json_path(
 pub fn arrow_json_to_lance_json(field: &ArrowField) -> ArrowField {
     if is_arrow_json_field(field) {
         // Convert Arrow JSON (Utf8/LargeUtf8) to Lance JSON (LargeBinary)
-        json_field(field.name(), field.is_nullable())
+        // Preserve all metadata from the original field
+        let mut new_field =
+            ArrowField::new(field.name(), DataType::LargeBinary, field.is_nullable());
+
+        // Copy all metadata from the original field
+        let mut metadata = field.metadata().clone();
+        // Add/override the extension metadata for Lance JSON
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), JSON_EXT_NAME.to_string());
+
+        new_field = new_field.with_metadata(metadata);
+        new_field
     } else {
         field.clone()
     }

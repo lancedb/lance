@@ -41,6 +41,8 @@ use super::transaction::Transaction;
 use super::utils::wrap_json_stream_for_writing;
 use super::DATA_DIR;
 
+use lance_arrow::json::is_arrow_json_field;
+
 mod commit;
 pub mod delete;
 mod insert;
@@ -388,18 +390,29 @@ pub async fn write_fragments_internal(
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
-    _schema: Schema,
+    schema: Schema,
     data: SendableRecordBatchStream,
     mut params: WriteParams,
 ) -> Result<WrittenFragments> {
     // Convert Arrow JSON columns to Lance JSON (JSONB) format
     //
     // FIXME: this is bad, really bad, we need to find a way to remove this.
-    let data = wrap_json_stream_for_writing(data);
+    let needs_conversion = data
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| is_arrow_json_field(f));
 
-    // Update the schema to match the converted data
-    let arrow_schema = data.schema();
-    let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
+    let (data, converted_schema) = if needs_conversion {
+        let data = wrap_json_stream_for_writing(data);
+        // Update the schema to match the converted data
+        let arrow_schema = data.schema();
+        let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
+        (data, converted_schema)
+    } else {
+        // No conversion needed, use original schema to preserve dictionary info
+        (data, schema)
+    };
 
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);

@@ -160,9 +160,9 @@ pub fn wrap_json_stream_for_writing(
     let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
     for field in arrow_schema.fields() {
         if is_arrow_json_field(field) {
-            new_fields.push(arrow_json_to_lance_json(field));
+            new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
         } else {
-            new_fields.push(field.as_ref().clone());
+            new_fields.push(Arc::clone(field));
         }
     }
     let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
