@@ -652,7 +652,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         if doc_id == TERMINATED_DOC_ID {
             self.postings.swap_remove(picked);
         }
-        self.bubble_up(picked, doc_id);
+        self.bubble_up(picked);
     }
 
     // move the posting iterators preceding the pivot to the block that contains the least_id
@@ -673,7 +673,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 if doc_id == TERMINATED_DOC_ID {
                     self.postings.swap_remove(i);
                 }
-                self.bubble_up(i, doc_id);
+                self.bubble_up(i);
                 return false;
             }
         }
@@ -696,7 +696,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
         self.postings.sort_unstable();
     }
 
-    fn bubble_up(&mut self, index: usize, doc_id: u64) {
+    fn bubble_up(&mut self, index: usize) {
+        if index >= self.postings.len() {
+            return;
+        }
+
+        let doc_id = self.postings[index].doc().unwrap().doc_id();
         for i in index + 1..self.postings.len() {
             if self.postings[i].doc().unwrap().doc_id() >= doc_id {
                 break;
