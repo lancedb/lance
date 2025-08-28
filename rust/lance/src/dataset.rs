@@ -1275,6 +1275,32 @@ impl Dataset {
         }
     }
 
+    /// Get the indices directory for a specific index, considering its base_id
+    pub(crate) fn indice_files_dir(&self, index: &Index) -> Result<Path> {
+        match index.base_id.as_ref() {
+            Some(base_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(base_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "base_path id {} not found for index {}",
+                            base_id, index.uuid
+                        ),
+                        location!(),
+                    )
+                })?;
+                let path = Path::parse(base_path.path.as_str())?;
+                if base_path.is_dataset_root {
+                    Ok(path.child(INDICES_DIR))
+                } else {
+                    // For non-dataset-root base paths, we assume the path already points to the indices directory
+                    Ok(path)
+                }
+            }
+            None => Ok(self.base.child(INDICES_DIR)),
+        }
+    }
+
     pub fn session(&self) -> Arc<Session> {
         self.session.clone()
     }
@@ -2187,7 +2213,7 @@ mod tests {
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
-        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+        DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
     use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
@@ -2206,8 +2232,12 @@ mod tests {
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
+    use crate::datafusion::LanceTableProvider;
     use all_asserts::assert_true;
+    use datafusion::common::{assert_contains, assert_not_contains};
+    use datafusion::prelude::SessionContext;
     use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion::udf::register_functions;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -5811,7 +5841,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 5);
+        assert_eq!(result.num_rows(), 5, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
@@ -7614,5 +7644,174 @@ mod tests {
 
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sql_contains_tokens() {
+        let text_col = Arc::new(StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat catchup fish",
+            "cat fish catch",
+        ]));
+
+        // Prepare dataset
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        // Test without fts index
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
+        );
+
+        // Verify plan, should not contain ScalarIndexQuery.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+
+        // Test with unsuitable fts index
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().base_tokenizer("raw".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
+        );
+
+        // Verify plan, should not contain ScalarIndexQuery because fts index is not unsuitable.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+
+        // Test with suitable fts index
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .max_token_length(None)
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
+        );
+
+        // Verify plan, should contain ScalarIndexQuery.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    async fn execute_sql(
+        sql: &str,
+        table: String,
+        dataset: Arc<Dataset>,
+    ) -> Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            table,
+            Arc::new(LanceTableProvider::new(dataset, false, false)),
+        )?;
+        register_functions(&ctx);
+
+        let df = ctx.sql(sql).await?;
+        Ok(df
+            .execute_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await?)
+    }
+
+    fn assert_results<T: Array + PartialEq + 'static>(results: Vec<RecordBatch>, values: &T) {
+        assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        assert_eq!(results.num_columns(), 1);
+
+        assert_eq!(
+            results.column(0).as_any().downcast_ref::<T>().unwrap(),
+            values
+        )
     }
 }

@@ -3,7 +3,7 @@
 
 //! Datafusion user defined functions
 
-use arrow_array::{ArrayRef, BooleanArray, StringArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, StringArray};
 use arrow_schema::DataType;
 use datafusion::logical_expr::{create_udf, ScalarUDF, Volatility};
 use datafusion::prelude::SessionContext;
@@ -27,20 +27,25 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_array_length_udf());
 }
 
-/// This method checks whether a string contains another string. It utilizes FTS (Full-Text Search)
-/// indexes, but due to the false negative characteristic of FTS, the results may have omissions.
-/// For example, "bakin" will not match documents containing "baking."
-/// If the query string is a whole word, or if you prioritize better performance, `contains_tokens`
-/// is the better choice. Otherwise, you can use the `contains` method to obtain accurate results.
+/// This method checks whether a string contains all specified tokens. The tokens are separated by
+/// punctuations and white spaces.
 ///
+/// The functionality is equivalent to FTS MatchQuery (with fuzziness disabled, Operator::And,
+/// and using the simple tokenizer). If FTS index exists and suites the query, it will be used to
+/// optimize the query.
 ///
 /// Usage
 /// * Use `contains_tokens` in sql.
 /// ```rust,ignore
-/// let sql = "SELECT * FROM table WHERE contains_tokens(text_col, 'bakin')"
+/// let sql = "SELECT * FROM table WHERE contains_tokens(text_col, 'fox jumps dog')";
 /// let mut ds = Dataset::open(&ds_path).await?;
-/// let mut builder = ds.sql(&sql);
-/// let records = builder.clone().build().await?.into_batch_records().await?;
+/// let ctx = SessionContext::new();
+/// ctx.register_table(
+///     "table",
+///     Arc::new(LanceTableProvider::new(dataset, false, false)),
+/// )?;
+/// register_functions(&ctx);
+/// let df = ctx.sql(sql).await?;
 /// ```
 fn contains_tokens() -> ScalarUDF {
     let function = Arc::new(make_scalar_function(
@@ -56,10 +61,25 @@ fn contains_tokens() -> ScalarUDF {
                 ),
             )?;
 
-            let result = column
-                .iter()
-                .enumerate()
-                .map(|(i, column)| column.map(|value| value.contains(scalar_str.value(i))));
+            let tokens: Option<Vec<&str>> = match scalar_str.len() {
+                0 => None,
+                _ => Some(collect_tokens(scalar_str.value(0))),
+            };
+
+            let result = column.iter().map(|text| {
+                text.map(|text| {
+                    let text_tokens = collect_tokens(text);
+                    if let Some(tokens) = &tokens {
+                        tokens.len()
+                            == tokens
+                                .iter()
+                                .filter(|token| text_tokens.contains(*token))
+                                .count()
+                    } else {
+                        true
+                    }
+                })
+            });
 
             Ok(Arc::new(BooleanArray::from_iter(result)) as ArrayRef)
         },
@@ -75,7 +95,14 @@ fn contains_tokens() -> ScalarUDF {
     )
 }
 
-static CONTAINS_TOKENS_UDF: LazyLock<ScalarUDF> = LazyLock::new(contains_tokens);
+/// Split tokens separated by punctuations and white spaces.
+fn collect_tokens(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+pub static CONTAINS_TOKENS_UDF: LazyLock<ScalarUDF> = LazyLock::new(contains_tokens);
 
 #[cfg(test)]
 mod tests {
@@ -91,13 +118,19 @@ mod tests {
         // Prepare arguments
         let contains_tokens = CONTAINS_TOKENS_UDF.clone();
         let text_col = Arc::new(StringArray::from(vec![
-            "a cat",
-            "lovely cat",
-            "white cat",
-            "catch up",
-            "fish",
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat catchup fish",
+            "cat fish catch",
         ]));
-        let token = Arc::new(StringArray::from(vec!["cat", "cat", "cat", "cat", "cat"]));
+        let token = Arc::new(StringArray::from(vec![
+            " cat catch fish.",
+            " cat catch fish.",
+            " cat catch fish.",
+            " cat catch fish.",
+            " cat catch fish.",
+        ]));
 
         let args = vec![ColumnarValue::Array(text_col), ColumnarValue::Array(token)];
         let arg_fields = vec![
@@ -119,7 +152,7 @@ mod tests {
             let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             assert_eq!(
                 array.clone(),
-                BooleanArray::from(vec![true, true, true, true, false])
+                BooleanArray::from(vec![true, true, true, false, true])
             );
         } else {
             panic!("Expected an Array but got {:?}", values);

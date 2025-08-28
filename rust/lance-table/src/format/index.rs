@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
+
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
 pub struct Index {
@@ -47,6 +48,10 @@ pub struct Index {
     /// This field is optional for backward compatibility. For existing indices created before
     /// this field was added, this will be None.
     pub created_at: Option<DateTime<Utc>>,
+
+    /// The base path index of the index files. Used when the index is imported or referred from another dataset.
+    /// Lance uses it as key of the base_paths field in Manifest to determine the actual base path of the index files.
+    pub base_id: Option<u32>,
 }
 
 impl Index {
@@ -102,6 +107,7 @@ impl TryFrom<pb::IndexMetadata> for Index {
                 DateTime::from_timestamp_millis(ts as i64)
                     .expect("Invalid timestamp in index metadata")
             }),
+            base_id: proto.base_id,
         })
     }
 }
@@ -127,6 +133,7 @@ impl From<&Index> for pb::IndexMetadata {
             index_details: idx.index_details.clone(),
             index_version: Some(idx.index_version),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
+            base_id: idx.base_id,
         }
     }
 }

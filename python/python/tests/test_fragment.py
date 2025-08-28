@@ -459,3 +459,43 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
     round_trip = pickle.loads(pickle.dumps(frag_meta))
 
     assert frag_meta == round_trip
+
+
+def test_deletion_file_with_base_id_serialization():
+    """Test that DeletionFile with base_id serializes correctly."""
+    from lance.fragment import DeletionFile, FragmentMetadata
+
+    # Create a DeletionFile with base_id
+    deletion_file = DeletionFile(
+        read_version=1, id=123, file_type="array", num_deleted_rows=10, base_id=456
+    )
+
+    # Verify the base_id is set
+    assert deletion_file.base_id == 456
+
+    # Test asdict includes base_id
+    deletion_dict = deletion_file.asdict()
+    assert "base_id" in deletion_dict
+    assert deletion_dict["base_id"] == 456
+
+    # Create a FragmentMetadata with the deletion file
+    metadata = FragmentMetadata(
+        id=1, files=[], physical_rows=1000, deletion_file=deletion_file
+    )
+
+    # Test pickle serialization/deserialization
+    pickled = pickle.dumps(metadata)
+    unpickled = pickle.loads(pickled)
+
+    # Verify the deletion file was correctly deserialized
+    assert unpickled.deletion_file is not None
+    assert unpickled.deletion_file.base_id == 456
+    assert unpickled == metadata
+
+    # Test JSON serialization/deserialization
+    json_data = metadata.to_json()
+    assert json_data["deletion_file"]["base_id"] == 456
+
+    deserialized = FragmentMetadata.from_json(json.dumps(json_data))
+    assert deserialized.deletion_file is not None
+    assert deserialized.deletion_file.base_id == 456
