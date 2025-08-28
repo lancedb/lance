@@ -4140,7 +4140,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 .await
                 .unwrap(),
         );
-        analysis.push_str("]");
+        analysis.push_str(&String::from("]"));
 
         // Verify the analysis contains expected components
         assert!(analysis.contains("MergeInsert"));
