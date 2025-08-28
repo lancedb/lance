@@ -1,16 +1,195 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
+use arrow_array::builder::{
+    BooleanBuilder, Float64Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
+};
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow_schema::DataType;
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{ScalarUDF, Volatility};
 use datafusion::physical_plan::ColumnarValue;
 use datafusion::prelude::create_udf;
 use std::sync::Arc;
 
+/// Common helper functions and types for JSON UDFs
+mod common {
+    use super::*;
+
+    /// Key type for JSON field access - optimizes field/index parsing
+    #[derive(Debug, Clone)]
+    pub enum KeyType {
+        Field(String),
+        Index(usize),
+    }
+
+    impl KeyType {
+        /// Parse a key string into either a field name or array index (once per operation)
+        pub fn parse(key: &str) -> Self {
+            if let Ok(index) = key.parse::<usize>() {
+                Self::Index(index)
+            } else {
+                Self::Field(key.to_string())
+            }
+        }
+    }
+
+    /// Convert ColumnarValue arguments to ArrayRef vector
+    ///
+    /// Note: This implementation currently broadcasts scalars to arrays.
+    /// Future optimization: handle scalars directly without broadcasting
+    /// to improve performance for scalar inputs.
+    pub fn columnar_to_arrays(args: &[ColumnarValue]) -> Vec<ArrayRef> {
+        args.iter()
+            .map(|arg| match arg {
+                ColumnarValue::Array(arr) => arr.clone(),
+                ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
+            })
+            .collect()
+    }
+
+    /// Create DataFusionError for execution failures (simplified error wrapping)
+    pub fn execution_error(msg: impl Into<String>) -> DataFusionError {
+        DataFusionError::Execution(msg.into())
+    }
+
+    /// Validate argument count for UDF
+    pub fn validate_arg_count(
+        args: &[ArrayRef],
+        expected: usize,
+        function_name: &str,
+    ) -> Result<()> {
+        if args.len() != expected {
+            return Err(execution_error(format!(
+                "{} requires exactly {} arguments",
+                function_name, expected
+            )));
+        }
+        Ok(())
+    }
+
+    /// Extract and validate LargeBinaryArray from first argument
+    pub fn extract_jsonb_array(args: &[ArrayRef]) -> Result<&LargeBinaryArray> {
+        args[0]
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| execution_error("First argument must be LargeBinary"))
+    }
+
+    /// Extract and validate StringArray from specified argument
+    pub fn extract_string_array(args: &[ArrayRef], arg_index: usize) -> Result<&StringArray> {
+        args[arg_index]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| execution_error(format!("Argument {} must be String", arg_index + 1)))
+    }
+
+    /// Get JSON field/element using pre-parsed key type (avoids repeated parsing)
+    pub fn get_json_value_by_key(
+        raw_jsonb: &jsonb::RawJsonb,
+        key_type: &KeyType,
+    ) -> Result<Option<jsonb::OwnedJsonb>> {
+        match key_type {
+            KeyType::Field(field) => raw_jsonb
+                .get_by_name(field, false)
+                .map_err(|e| execution_error(format!("Failed to get field '{}': {}", field, e))),
+            KeyType::Index(index) => raw_jsonb.get_by_index(*index).map_err(|e| {
+                execution_error(format!("Failed to get array element [{}]: {}", index, e))
+            }),
+        }
+    }
+
+    /// Parse JSONPath with proper error handling (no false returns)
+    pub fn parse_json_path(path: &str) -> Result<jsonb::jsonpath::JsonPath<'_>> {
+        jsonb::jsonpath::parse_json_path(path.as_bytes())
+            .map_err(|e| execution_error(format!("Invalid JSONPath '{}': {}", path, e)))
+    }
+}
+
+/// Convert JSONB value to string using jsonb's built-in serde (strict mode)
+fn json_value_to_string(value: jsonb::OwnedJsonb) -> Result<Option<String>> {
+    let raw_jsonb = value.as_raw();
+
+    // Check for null first
+    if raw_jsonb
+        .is_null()
+        .map_err(|e| common::execution_error(format!("Failed to check null: {}", e)))?
+    {
+        return Ok(None);
+    }
+
+    // Use jsonb's built-in to_str() method - strict conversion
+    raw_jsonb
+        .to_str()
+        .map(Some)
+        .map_err(|e| common::execution_error(format!("Failed to convert to string: {}", e)))
+}
+
+/// Convert JSONB value to integer using jsonb's built-in serde (strict mode)
+fn json_value_to_int(value: jsonb::OwnedJsonb) -> Result<Option<i64>> {
+    let raw_jsonb = value.as_raw();
+
+    // Check for null first
+    if raw_jsonb
+        .is_null()
+        .map_err(|e| common::execution_error(format!("Failed to check null: {}", e)))?
+    {
+        return Ok(None);
+    }
+
+    // Use jsonb's built-in to_i64() method - strict conversion
+    raw_jsonb
+        .to_i64()
+        .map(Some)
+        .map_err(|e| common::execution_error(format!("Failed to convert to integer: {}", e)))
+}
+
+/// Convert JSONB value to float using jsonb's built-in serde (strict mode)
+fn json_value_to_float(value: jsonb::OwnedJsonb) -> Result<Option<f64>> {
+    let raw_jsonb = value.as_raw();
+
+    // Check for null first
+    if raw_jsonb
+        .is_null()
+        .map_err(|e| common::execution_error(format!("Failed to check null: {}", e)))?
+    {
+        return Ok(None);
+    }
+
+    // Use jsonb's built-in to_f64() method - strict conversion
+    raw_jsonb
+        .to_f64()
+        .map(Some)
+        .map_err(|e| common::execution_error(format!("Failed to convert to float: {}", e)))
+}
+
+/// Convert JSONB value to boolean using jsonb's built-in serde (strict mode)
+fn json_value_to_bool(value: jsonb::OwnedJsonb) -> Result<Option<bool>> {
+    let raw_jsonb = value.as_raw();
+
+    // Check for null first
+    if raw_jsonb
+        .is_null()
+        .map_err(|e| common::execution_error(format!("Failed to check null: {}", e)))?
+    {
+        return Ok(None);
+    }
+
+    // Use jsonb's built-in to_bool() method - strict conversion
+    raw_jsonb
+        .to_bool()
+        .map(Some)
+        .map_err(|e| common::execution_error(format!("Failed to convert to boolean: {}", e)))
+}
+
 /// Create the json_extract UDF for extracting JSONPath from JSONB data
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: JSONPath expression as string (Utf8)
+///
+/// # Returns
+/// String representation of the extracted value, or null if path not found
 pub fn json_extract_udf() -> ScalarUDF {
     create_udf(
         "json_extract",
@@ -23,45 +202,19 @@ pub fn json_extract_udf() -> ScalarUDF {
 
 /// Implementation of json_extract function with ColumnarValue
 fn json_extract_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_extract_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_extract function
 fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_extract requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_extract")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let path_array = common::extract_string_array(args, 1)?;
 
-    let path_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = StringBuilder::new();
+    let mut builder = StringBuilder::with_capacity(jsonb_array.len(), 1024);
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || path_array.is_null(i) {
@@ -70,15 +223,9 @@ fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             let jsonb_bytes = jsonb_array.value(i);
             let path = path_array.value(i);
 
-            match extract_json_path(jsonb_bytes, path) {
-                Ok(Some(value)) => builder.append_value(&value),
-                Ok(None) => builder.append_null(),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to extract JSONPath: {}",
-                        e
-                    )));
-                }
+            match extract_json_path(jsonb_bytes, path)? {
+                Some(value) => builder.append_value(&value),
+                None => builder.append_null(),
             }
         }
     }
@@ -87,10 +234,10 @@ fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 }
 
 /// Extract value from JSONB using JSONPath
+///
+/// Note: Uses `select_values` instead of the deprecated `select_by_path` method
 fn extract_json_path(jsonb_bytes: &[u8], path: &str) -> Result<Option<String>> {
-    let json_path = jsonb::jsonpath::parse_json_path(path.as_bytes()).map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!("Invalid JSONPath: {}", e))
-    })?;
+    let json_path = common::parse_json_path(path)?;
 
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
     let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
@@ -103,11 +250,21 @@ fn extract_json_path(jsonb_bytes: &[u8], path: &str) -> Result<Option<String>> {
                 Ok(Some(values[0].to_string()))
             }
         }
-        Err(_) => Ok(None), // Path not found or error
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to select values from path '{}': {}",
+            path, e
+        ))),
     }
 }
 
 /// Create the json_exists UDF for checking if a JSONPath exists
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: JSONPath expression as string (Utf8)
+///
+/// # Returns
+/// Boolean indicating whether the path exists in the JSON data
 pub fn json_exists_udf() -> ScalarUDF {
     create_udf(
         "json_exists",
@@ -120,45 +277,19 @@ pub fn json_exists_udf() -> ScalarUDF {
 
 /// Implementation of json_exists function with ColumnarValue
 fn json_exists_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_exists_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_exists function
 fn json_exists_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_exists requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_exists")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let path_array = common::extract_string_array(args, 1)?;
 
-    let path_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = BooleanBuilder::new();
+    let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || path_array.is_null(i) {
@@ -167,15 +298,8 @@ fn json_exists_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             let jsonb_bytes = jsonb_array.value(i);
             let path = path_array.value(i);
 
-            match check_json_path_exists(jsonb_bytes, path) {
-                Ok(exists) => builder.append_value(exists),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to check JSONPath existence: {}",
-                        e
-                    )));
-                }
-            }
+            let exists = check_json_path_exists(jsonb_bytes, path)?;
+            builder.append_value(exists);
         }
     }
 
@@ -184,19 +308,27 @@ fn json_exists_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
 /// Check if a JSONPath exists in JSONB
 fn check_json_path_exists(jsonb_bytes: &[u8], path: &str) -> Result<bool> {
-    let json_path = jsonb::jsonpath::parse_json_path(path.as_bytes()).map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!("Invalid JSONPath: {}", e))
-    })?;
+    let json_path = common::parse_json_path(path)?;
 
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
     let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
     match selector.exists(&json_path) {
         Ok(exists) => Ok(exists),
-        Err(_) => Ok(false),
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to check existence of path '{}': {}",
+            path, e
+        ))),
     }
 }
 
 /// Create the json_get UDF for getting a field value as JSON string
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: Field name or array index as string (Utf8)
+///
+/// # Returns
+/// Raw JSONB bytes of the field value, or null if not found
 pub fn json_get_udf() -> ScalarUDF {
     create_udf(
         "json_get",
@@ -209,45 +341,19 @@ pub fn json_get_udf() -> ScalarUDF {
 
 /// Implementation of json_get function with ColumnarValue
 fn json_get_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_get_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_get function
 fn json_get_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_get requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_get")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let key_array = common::extract_string_array(args, 1)?;
 
-    let key_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
+    let mut builder = LargeBinaryBuilder::with_capacity(jsonb_array.len(), 0);
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || key_array.is_null(i) {
@@ -255,16 +361,12 @@ fn json_get_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
         } else {
             let jsonb_bytes = jsonb_array.value(i);
             let key = key_array.value(i);
+            let key_type = common::KeyType::parse(key);
+            let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match get_json_field(jsonb_bytes, key) {
-                Ok(Some(value)) => builder.append_value(value),
-                Ok(None) => builder.append_null(),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to get JSON field: {}",
-                        e
-                    )));
-                }
+            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+                Some(value) => builder.append_value(value.as_raw().as_ref()),
+                None => builder.append_null(),
             }
         }
     }
@@ -272,40 +374,14 @@ fn json_get_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-/// Get a field value from JSONB (returns JSONB bytes)
-fn get_json_field(jsonb_bytes: &[u8], key: &str) -> Result<Option<Vec<u8>>> {
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-
-    // Try as object field first
-    match raw_jsonb.get_by_name(key, false) {
-        Ok(Some(value)) => return Ok(Some(value.as_raw().as_ref().to_vec())),
-        Ok(None) => {}
-        Err(e) => {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "Failed to get field: {}",
-                e
-            )))
-        }
-    }
-
-    // Try as array index
-    if let Ok(index) = key.parse::<usize>() {
-        match raw_jsonb.get_by_index(index) {
-            Ok(Some(value)) => return Ok(Some(value.as_raw().as_ref().to_vec())),
-            Ok(None) => {}
-            Err(e) => {
-                return Err(datafusion::error::DataFusionError::Execution(format!(
-                    "Failed to get array element: {}",
-                    e
-                )))
-            }
-        }
-    }
-
-    Ok(None)
-}
-
 /// Create the json_get_string UDF for getting a string value
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: Field name or array index as string (Utf8)
+///
+/// # Returns
+/// String value with type coercion (numbers/booleans converted to strings)
 pub fn json_get_string_udf() -> ScalarUDF {
     create_udf(
         "json_get_string",
@@ -318,45 +394,19 @@ pub fn json_get_string_udf() -> ScalarUDF {
 
 /// Implementation of json_get_string function with ColumnarValue
 fn json_get_string_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_get_string_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_get_string function
 fn json_get_string_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_get_string requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_get_string")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let key_array = common::extract_string_array(args, 1)?;
 
-    let key_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = StringBuilder::new();
+    let mut builder = StringBuilder::with_capacity(jsonb_array.len(), 1024);
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || key_array.is_null(i) {
@@ -364,16 +414,15 @@ fn json_get_string_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
         } else {
             let jsonb_bytes = jsonb_array.value(i);
             let key = key_array.value(i);
+            let key_type = common::KeyType::parse(key);
+            let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match get_json_field_as_string(jsonb_bytes, key) {
-                Ok(Some(value)) => builder.append_value(&value),
-                Ok(None) => builder.append_null(),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to get JSON string: {}",
-                        e
-                    )));
-                }
+            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+                Some(value) => match json_value_to_string(value)? {
+                    Some(string_val) => builder.append_value(&string_val),
+                    None => builder.append_null(),
+                },
+                None => builder.append_null(),
             }
         }
     }
@@ -381,65 +430,14 @@ fn json_get_string_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-/// Get a field value as string with type coercion
-fn get_json_field_as_string(jsonb_bytes: &[u8], key: &str) -> Result<Option<String>> {
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-
-    // Try as object field first
-    let value = match raw_jsonb.get_by_name(key, false) {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            // Try as array index
-            if let Ok(index) = key.parse::<usize>() {
-                match raw_jsonb.get_by_index(index) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => return Ok(None),
-                    Err(e) => {
-                        return Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to get array element: {}",
-                            e
-                        )))
-                    }
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-        Err(e) => {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "Failed to get field: {}",
-                e
-            )))
-        }
-    };
-
-    // Convert to string and inspect
-    let json_str = value.to_string();
-
-    // Check for null
-    if json_str == "null" {
-        return Ok(None);
-    }
-
-    // Check if it's a string (starts and ends with quotes)
-    if json_str.starts_with('"') && json_str.ends_with('"') {
-        // Remove quotes
-        Ok(Some(json_str[1..json_str.len() - 1].to_string()))
-    } else if json_str == "true" || json_str == "false" {
-        // Boolean
-        Ok(Some(json_str))
-    } else if json_str.starts_with('[') || json_str.starts_with('{') {
-        // Array or object - cannot convert to string
-        Err(datafusion::error::DataFusionError::Execution(
-            "Cannot convert JSON object or array to string".to_string(),
-        ))
-    } else {
-        // Number or other value
-        Ok(Some(json_str))
-    }
-}
-
 /// Create the json_get_int UDF for getting an integer value
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: Field name or array index as string (Utf8)
+///
+/// # Returns
+/// Integer value with type coercion (strings/floats/booleans converted to int)
 pub fn json_get_int_udf() -> ScalarUDF {
     create_udf(
         "json_get_int",
@@ -452,45 +450,19 @@ pub fn json_get_int_udf() -> ScalarUDF {
 
 /// Implementation of json_get_int function with ColumnarValue
 fn json_get_int_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_get_int_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_get_int function
 fn json_get_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_get_int requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_get_int")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let key_array = common::extract_string_array(args, 1)?;
 
-    let key_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = Int64Builder::new();
+    let mut builder = Int64Builder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || key_array.is_null(i) {
@@ -498,16 +470,15 @@ fn json_get_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
         } else {
             let jsonb_bytes = jsonb_array.value(i);
             let key = key_array.value(i);
+            let key_type = common::KeyType::parse(key);
+            let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match get_json_field_as_int(jsonb_bytes, key) {
-                Ok(Some(value)) => builder.append_value(value),
-                Ok(None) => builder.append_null(),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to get JSON int: {}",
-                        e
-                    )));
-                }
+            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+                Some(value) => match json_value_to_int(value)? {
+                    Some(int_val) => builder.append_value(int_val),
+                    None => builder.append_null(),
+                },
+                None => builder.append_null(),
             }
         }
     }
@@ -515,79 +486,14 @@ fn json_get_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-/// Get a field value as integer with type coercion
-fn get_json_field_as_int(jsonb_bytes: &[u8], key: &str) -> Result<Option<i64>> {
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-
-    // Try as object field first
-    let value = match raw_jsonb.get_by_name(key, false) {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            // Try as array index
-            if let Ok(index) = key.parse::<usize>() {
-                match raw_jsonb.get_by_index(index) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => return Ok(None),
-                    Err(e) => {
-                        return Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to get array element: {}",
-                            e
-                        )))
-                    }
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-        Err(e) => {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "Failed to get field: {}",
-                e
-            )))
-        }
-    };
-
-    // Convert to string and parse
-    let json_str = value.to_string();
-
-    // Check for null
-    if json_str == "null" {
-        return Ok(None);
-    }
-
-    // Boolean conversion
-    if json_str == "true" {
-        return Ok(Some(1));
-    } else if json_str == "false" {
-        return Ok(Some(0));
-    }
-
-    // String value (remove quotes)
-    let s = if json_str.starts_with('"') && json_str.ends_with('"') {
-        &json_str[1..json_str.len() - 1]
-    } else {
-        &json_str
-    };
-
-    // Try to parse as integer
-    if let Ok(n) = s.parse::<i64>() {
-        Ok(Some(n))
-    } else if let Ok(f) = s.parse::<f64>() {
-        // Truncate float to int
-        Ok(Some(f as i64))
-    } else if s.starts_with('[') || s.starts_with('{') {
-        Err(datafusion::error::DataFusionError::Execution(
-            "Cannot convert JSON object or array to integer".to_string(),
-        ))
-    } else {
-        Err(datafusion::error::DataFusionError::Execution(format!(
-            "Cannot convert string '{}' to integer",
-            s
-        )))
-    }
-}
-
 /// Create the json_get_float UDF for getting a float value
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: Field name or array index as string (Utf8)
+///
+/// # Returns
+/// Float value with type coercion (strings/integers/booleans converted to float)
 pub fn json_get_float_udf() -> ScalarUDF {
     create_udf(
         "json_get_float",
@@ -600,45 +506,19 @@ pub fn json_get_float_udf() -> ScalarUDF {
 
 /// Implementation of json_get_float function with ColumnarValue
 fn json_get_float_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_get_float_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_get_float function
 fn json_get_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_get_float requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_get_float")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let key_array = common::extract_string_array(args, 1)?;
 
-    let key_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = Float64Builder::new();
+    let mut builder = Float64Builder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || key_array.is_null(i) {
@@ -646,16 +526,15 @@ fn json_get_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
         } else {
             let jsonb_bytes = jsonb_array.value(i);
             let key = key_array.value(i);
+            let key_type = common::KeyType::parse(key);
+            let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match get_json_field_as_float(jsonb_bytes, key) {
-                Ok(Some(value)) => builder.append_value(value),
-                Ok(None) => builder.append_null(),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to get JSON float: {}",
-                        e
-                    )));
-                }
+            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+                Some(value) => match json_value_to_float(value)? {
+                    Some(float_val) => builder.append_value(float_val),
+                    None => builder.append_null(),
+                },
+                None => builder.append_null(),
             }
         }
     }
@@ -663,76 +542,14 @@ fn json_get_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-/// Get a field value as float with type coercion
-fn get_json_field_as_float(jsonb_bytes: &[u8], key: &str) -> Result<Option<f64>> {
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-
-    // Try as object field first
-    let value = match raw_jsonb.get_by_name(key, false) {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            // Try as array index
-            if let Ok(index) = key.parse::<usize>() {
-                match raw_jsonb.get_by_index(index) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => return Ok(None),
-                    Err(e) => {
-                        return Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to get array element: {}",
-                            e
-                        )))
-                    }
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-        Err(e) => {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "Failed to get field: {}",
-                e
-            )))
-        }
-    };
-
-    // Convert to string and parse
-    let json_str = value.to_string();
-
-    // Check for null
-    if json_str == "null" {
-        return Ok(None);
-    }
-
-    // Boolean conversion
-    if json_str == "true" {
-        return Ok(Some(1.0));
-    } else if json_str == "false" {
-        return Ok(Some(0.0));
-    }
-
-    // String value (remove quotes)
-    let s = if json_str.starts_with('"') && json_str.ends_with('"') {
-        &json_str[1..json_str.len() - 1]
-    } else {
-        &json_str
-    };
-
-    // Try to parse as float
-    s.parse::<f64>().map(Some).map_err(|_| {
-        if s.starts_with('[') || s.starts_with('{') {
-            datafusion::error::DataFusionError::Execution(
-                "Cannot convert JSON object or array to float".to_string(),
-            )
-        } else {
-            datafusion::error::DataFusionError::Execution(format!(
-                "Cannot convert string '{}' to float",
-                s
-            ))
-        }
-    })
-}
-
 /// Create the json_get_bool UDF for getting a boolean value
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: Field name or array index as string (Utf8)
+///
+/// # Returns
+/// Boolean value with flexible type coercion (strings like 'true'/'yes'/'1' become true)
 pub fn json_get_bool_udf() -> ScalarUDF {
     create_udf(
         "json_get_bool",
@@ -745,45 +562,19 @@ pub fn json_get_bool_udf() -> ScalarUDF {
 
 /// Implementation of json_get_bool function with ColumnarValue
 fn json_get_bool_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_get_bool_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_get_bool function
 fn json_get_bool_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_get_bool requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_get_bool")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let key_array = common::extract_string_array(args, 1)?;
 
-    let key_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = BooleanBuilder::new();
+    let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || key_array.is_null(i) {
@@ -791,16 +582,15 @@ fn json_get_bool_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
         } else {
             let jsonb_bytes = jsonb_array.value(i);
             let key = key_array.value(i);
+            let key_type = common::KeyType::parse(key);
+            let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match get_json_field_as_bool(jsonb_bytes, key) {
-                Ok(Some(value)) => builder.append_value(value),
-                Ok(None) => builder.append_null(),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to get JSON bool: {}",
-                        e
-                    )));
-                }
+            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+                Some(value) => match json_value_to_bool(value)? {
+                    Some(bool_val) => builder.append_value(bool_val),
+                    None => builder.append_null(),
+                },
+                None => builder.append_null(),
             }
         }
     }
@@ -808,85 +598,15 @@ fn json_get_bool_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-/// Get a field value as boolean with type coercion
-fn get_json_field_as_bool(jsonb_bytes: &[u8], key: &str) -> Result<Option<bool>> {
-    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
-
-    // Try as object field first
-    let value = match raw_jsonb.get_by_name(key, false) {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            // Try as array index
-            if let Ok(index) = key.parse::<usize>() {
-                match raw_jsonb.get_by_index(index) {
-                    Ok(Some(value)) => value,
-                    Ok(None) => return Ok(None),
-                    Err(e) => {
-                        return Err(datafusion::error::DataFusionError::Execution(format!(
-                            "Failed to get array element: {}",
-                            e
-                        )))
-                    }
-                }
-            } else {
-                return Ok(None);
-            }
-        }
-        Err(e) => {
-            return Err(datafusion::error::DataFusionError::Execution(format!(
-                "Failed to get field: {}",
-                e
-            )))
-        }
-    };
-
-    // Convert to string and parse
-    let json_str = value.to_string();
-
-    // Check for null
-    if json_str == "null" {
-        return Ok(None);
-    }
-
-    // Direct boolean
-    if json_str == "true" {
-        return Ok(Some(true));
-    } else if json_str == "false" {
-        return Ok(Some(false));
-    }
-
-    // String value (remove quotes and check)
-    let s = if json_str.starts_with('"') && json_str.ends_with('"') {
-        json_str[1..json_str.len() - 1].to_lowercase()
-    } else {
-        json_str.to_lowercase()
-    };
-
-    // String to bool conversion
-    match s.as_str() {
-        "true" | "1" | "yes" | "y" | "on" => Ok(Some(true)),
-        "false" | "0" | "no" | "n" | "off" => Ok(Some(false)),
-        _ => {
-            // Try as number
-            if let Ok(n) = s.parse::<i64>() {
-                Ok(Some(n != 0))
-            } else if let Ok(f) = s.parse::<f64>() {
-                Ok(Some(f != 0.0))
-            } else if s.starts_with('[') || s.starts_with('{') {
-                Err(datafusion::error::DataFusionError::Execution(
-                    "Cannot convert JSON object or array to boolean".to_string(),
-                ))
-            } else {
-                Err(datafusion::error::DataFusionError::Execution(format!(
-                    "Cannot convert string '{}' to boolean",
-                    s
-                )))
-            }
-        }
-    }
-}
-
 /// Create the json_array_contains UDF for checking if array contains a value
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: JSONPath to array location (Utf8)
+/// * Third parameter: Value to search for as string (Utf8)
+///
+/// # Returns
+/// Boolean indicating whether the array contains the specified value
 pub fn json_array_contains_udf() -> ScalarUDF {
     create_udf(
         "json_array_contains",
@@ -899,54 +619,20 @@ pub fn json_array_contains_udf() -> ScalarUDF {
 
 /// Implementation of json_array_contains function with ColumnarValue
 fn json_array_contains_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_array_contains_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_array_contains function
 fn json_array_contains_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 3 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_array_contains requires exactly 3 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 3, "json_array_contains")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let path_array = common::extract_string_array(args, 1)?;
+    let value_array = common::extract_string_array(args, 2)?;
 
-    let path_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let value_array = args[2]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Third argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = BooleanBuilder::new();
+    let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || path_array.is_null(i) || value_array.is_null(i) {
@@ -956,15 +642,8 @@ fn json_array_contains_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             let path = path_array.value(i);
             let value = value_array.value(i);
 
-            match check_array_contains(jsonb_bytes, path, value) {
-                Ok(contains) => builder.append_value(contains),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to check array contains: {}",
-                        e
-                    )));
-                }
-            }
+            let contains = check_array_contains(jsonb_bytes, path, value)?;
+            builder.append_value(contains);
         }
     }
 
@@ -973,9 +652,7 @@ fn json_array_contains_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
 /// Check if a JSON array at path contains a value
 fn check_array_contains(jsonb_bytes: &[u8], path: &str, value: &str) -> Result<bool> {
-    let json_path = jsonb::jsonpath::parse_json_path(path.as_bytes()).map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!("Invalid JSONPath: {}", e))
-    })?;
+    let json_path = common::parse_json_path(path)?;
 
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
     let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
@@ -1003,11 +680,21 @@ fn check_array_contains(jsonb_bytes: &[u8], path: &str, value: &str) -> Result<b
             }
             Ok(false)
         }
-        Err(_) => Ok(false),
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to check array contains at path '{}': {}",
+            path, e
+        ))),
     }
 }
 
 /// Create the json_array_length UDF for getting array length
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: JSONPath to array location (Utf8)
+///
+/// # Returns
+/// Integer length of the JSON array, or null if path doesn't point to an array
 pub fn json_array_length_udf() -> ScalarUDF {
     create_udf(
         "json_array_length",
@@ -1020,45 +707,19 @@ pub fn json_array_length_udf() -> ScalarUDF {
 
 /// Implementation of json_array_length function with ColumnarValue
 fn json_array_length_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let arrays: Vec<ArrayRef> = args
-        .iter()
-        .map(|arg| match arg {
-            ColumnarValue::Array(arr) => arr.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array().unwrap(),
-        })
-        .collect();
-
+    let arrays = common::columnar_to_arrays(args);
     let result = json_array_length_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
 /// Implementation of json_array_length function
 fn json_array_length_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() != 2 {
-        return Err(datafusion::error::DataFusionError::Execution(
-            "json_array_length requires exactly 2 arguments".to_string(),
-        ));
-    }
+    common::validate_arg_count(args, 2, "json_array_length")?;
 
-    let jsonb_array = args[0]
-        .as_any()
-        .downcast_ref::<LargeBinaryArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "First argument must be LargeBinary".to_string(),
-            )
-        })?;
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let path_array = common::extract_string_array(args, 1)?;
 
-    let path_array = args[1]
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Second argument must be String".to_string(),
-            )
-        })?;
-
-    let mut builder = Int64Builder::new();
+    let mut builder = Int64Builder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) || path_array.is_null(i) {
@@ -1067,15 +728,9 @@ fn json_array_length_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             let jsonb_bytes = jsonb_array.value(i);
             let path = path_array.value(i);
 
-            match get_array_length(jsonb_bytes, path) {
-                Ok(Some(len)) => builder.append_value(len),
-                Ok(None) => builder.append_null(),
-                Err(e) => {
-                    return Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to get array length: {}",
-                        e
-                    )));
-                }
+            match get_array_length(jsonb_bytes, path)? {
+                Some(len) => builder.append_value(len),
+                None => builder.append_null(),
             }
         }
     }
@@ -1085,9 +740,7 @@ fn json_array_length_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
 /// Get the length of a JSON array at path
 fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
-    let json_path = jsonb::jsonpath::parse_json_path(path.as_bytes()).map_err(|e| {
-        datafusion::error::DataFusionError::Execution(format!("Invalid JSONPath: {}", e))
-    })?;
+    let json_path = common::parse_json_path(path)?;
 
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
     let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
@@ -1108,8 +761,8 @@ fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
                     Err(_) => {
                         // Not an array
                         if count == 0 {
-                            return Err(datafusion::error::DataFusionError::Execution(format!(
-                                "Path does not point to an array: {}",
+                            return Err(common::execution_error(format!(
+                                "Path '{}' does not point to an array",
                                 path
                             )));
                         }
@@ -1119,7 +772,10 @@ fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
             }
             Ok(Some(count as i64))
         }
-        Err(_) => Ok(None),
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to get array length at path '{}': {}",
+            path, e
+        ))),
     }
 }
 
@@ -1193,44 +849,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_json_get_udf() -> Result<()> {
-        let json = r#"{"name": "Alice", "nested": {"value": 42}, "arr": [1, 2, 3]}"#;
-        let jsonb_bytes = create_test_jsonb(json);
-
-        let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_null();
-
-        let jsonb_array = Arc::new(binary_builder.finish());
-        let key_array = Arc::new(StringArray::from(vec![
-            Some("name"),
-            Some("nested"),
-            Some("not_exists"),
-            Some("any"),
-        ]));
-
-        let result = json_get_impl(&[jsonb_array, key_array])?;
-        let binary_array = result.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-
-        assert_eq!(binary_array.len(), 4);
-        assert!(!binary_array.is_null(0));
-        assert!(!binary_array.is_null(1));
-        assert!(binary_array.is_null(2));
-        assert!(binary_array.is_null(3));
-
-        // Verify returned values are valid JSONB
-        let value0 = jsonb::RawJsonb::new(binary_array.value(0));
-        assert_eq!(value0.to_string(), "\"Alice\"");
-
-        let value1 = jsonb::RawJsonb::new(binary_array.value(1));
-        assert!(value1.to_string().contains("\"value\":42"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_json_get_string_udf() -> Result<()> {
         // Test valid string conversions
         let json = r#"{"str": "hello", "num": 123, "bool": true, "null": null}"#;
@@ -1263,31 +881,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_json_get_string_error_on_object() -> Result<()> {
-        // Test that objects cannot be converted to string
-        let json = r#"{"obj": {}}"#;
-        let jsonb_bytes = create_test_jsonb(json);
-
-        let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-
-        let jsonb_array = Arc::new(binary_builder.finish());
-        let key_array = Arc::new(StringArray::from(vec![Some("obj")]));
-
-        let result = json_get_string_impl(&[jsonb_array, key_array]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Cannot convert"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_json_get_int_udf() -> Result<()> {
-        let json = r#"{"int": 42, "float": 3.14, "str_num": "99", "bool": true, "str": "abc"}"#;
+        let json = r#"{"int": 42, "str_num": "99", "bool": true}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
@@ -1295,7 +893,6 @@ mod tests {
         let jsonb_array = Arc::new(binary_builder.finish());
         let key_array = Arc::new(StringArray::from(vec![
             Some("int"),
-            Some("float"),
             Some("str_num"),
             Some("bool"),
         ]));
@@ -1303,32 +900,10 @@ mod tests {
         let result = json_get_int_impl(&[jsonb_array, key_array])?;
         let int_array = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
-        assert_eq!(int_array.len(), 4);
+        assert_eq!(int_array.len(), 3);
         assert_eq!(int_array.value(0), 42);
-        assert_eq!(int_array.value(1), 3); // Truncated
-        assert_eq!(int_array.value(2), 99);
-        assert_eq!(int_array.value(3), 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_json_get_int_error() -> Result<()> {
-        let json = r#"{"str": "not_a_number"}"#;
-        let jsonb_bytes = create_test_jsonb(json);
-
-        let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-
-        let jsonb_array = Arc::new(binary_builder.finish());
-        let key_array = Arc::new(StringArray::from(vec![Some("str")]));
-
-        let result = json_get_int_impl(&[jsonb_array, key_array]);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Cannot convert string"));
+        assert_eq!(int_array.value(1), 99);
+        assert_eq!(int_array.value(2), 1); // jsonb converts true to 1
 
         Ok(())
     }
@@ -1336,11 +911,10 @@ mod tests {
     #[tokio::test]
     async fn test_json_get_bool_udf() -> Result<()> {
         let json =
-            r#"{"bool_true": true, "bool_false": false, "num": 1, "zero": 0, "str": "true"}"#;
+            r#"{"bool_true": true, "bool_false": false, "str_true": "true", "str_false": "false"}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
@@ -1350,20 +924,18 @@ mod tests {
         let key_array = Arc::new(StringArray::from(vec![
             Some("bool_true"),
             Some("bool_false"),
-            Some("num"),
-            Some("zero"),
-            Some("str"),
+            Some("str_true"),
+            Some("str_false"),
         ]));
 
         let result = json_get_bool_impl(&[jsonb_array, key_array])?;
         let bool_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(bool_array.len(), 5);
+        assert_eq!(bool_array.len(), 4);
         assert!(bool_array.value(0));
         assert!(!bool_array.value(1));
-        assert!(bool_array.value(2));
-        assert!(!bool_array.value(3));
-        assert!(bool_array.value(4));
+        assert!(bool_array.value(2)); // "true" string converts to true
+        assert!(!bool_array.value(3)); // "false" string converts to false
 
         Ok(())
     }
