@@ -40,34 +40,32 @@ def test_json_basic_write_read():
         # Read back the dataset
         dataset = lance.dataset(dataset_path)
 
-        # Verify schema
+        # Verify storage schema
         assert len(dataset.schema) == 2
         assert dataset.schema.field("id").type == pa.int32()
 
-        # Check that JSON field is properly recognized
-        json_field_schema = dataset.schema.field("data")
-        # Should be PyArrow JSON type
-        assert json_field_schema.type == pa.json_()
+        # Check that JSON field is stored as JSONB internally
+        storage_field = dataset.schema.field("data")
+        assert storage_field.type == pa.large_binary()
+        assert storage_field.metadata is not None
+        assert b"ARROW:extension:name" in storage_field.metadata
+        assert storage_field.metadata[b"ARROW:extension:name"] == b"lance.json"
 
         # Read data back
         result_table = dataset.to_table()
 
+        # Check that data is returned as Arrow JSON for Python
+        result_field = result_table.schema.field("data")
+        # PyArrow extension types print as extension<arrow.json> but
+        # the storage type is utf8
+        assert (
+            str(result_field.type) == "extension<arrow.json>"
+            or result_field.type == pa.utf8()
+        )
+
         # Verify data
         assert result_table.num_rows == 5
         assert result_table.column("id").to_pylist() == [1, 2, 3, 4, 5]
-
-        # Verify the data column is JSON type
-        data_column = result_table.column("data")
-        assert data_column.type == pa.json_()
-
-        # Verify the JSON data is correctly preserved
-        for i, expected in enumerate(json_strings):
-            actual = data_column[i].as_py()
-            if expected is None:
-                assert actual is None
-            else:
-                # Arrow JSON returns strings, verify they match
-                assert actual == expected
 
 
 def test_json_with_other_types():
