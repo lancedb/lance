@@ -84,6 +84,20 @@ mod common {
             .ok_or_else(|| execution_error(format!("Argument {} must be String", arg_index + 1)))
     }
 
+    /// Get string value at index, handling scalar broadcast case
+    /// When a scalar is converted to an array, it becomes a single-element array
+    /// This function handles accessing that value repeatedly for all rows
+    pub fn get_string_value_at(string_array: &StringArray, index: usize) -> Option<&str> {
+        // Handle scalar broadcast case: if array has only 1 element, always use index 0
+        let actual_index = if string_array.len() == 1 { 0 } else { index };
+
+        if string_array.is_null(actual_index) {
+            None
+        } else {
+            Some(string_array.value(actual_index))
+        }
+    }
+
     /// Get JSON field/element using pre-parsed key type (avoids repeated parsing)
     pub fn get_json_value_by_key(
         raw_jsonb: &jsonb::RawJsonb,
@@ -182,7 +196,7 @@ fn json_value_to_bool(value: jsonb::OwnedJsonb) -> Result<Option<bool>> {
         .map_err(|e| common::execution_error(format!("Failed to convert to boolean: {}", e)))
 }
 
-/// Create the json_extract UDF for extracting JSONPath from JSONB data
+/// Create the json_extract UDF for extracting JSONPath from JSON data
 ///
 /// # Arguments
 /// * First parameter: JSONB binary data (LargeBinary)
@@ -213,20 +227,19 @@ fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
     let jsonb_array = common::extract_jsonb_array(args)?;
     let path_array = common::extract_string_array(args, 1)?;
-
     let mut builder = StringBuilder::with_capacity(jsonb_array.len(), 1024);
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || path_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
-        } else {
+        } else if let Some(path) = common::get_string_value_at(path_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let path = path_array.value(i);
-
             match extract_json_path(jsonb_bytes, path)? {
                 Some(value) => builder.append_value(&value),
                 None => builder.append_null(),
             }
+        } else {
+            builder.append_null();
         }
     }
 
@@ -292,14 +305,16 @@ fn json_exists_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || path_array.is_null(i) {
-            builder.append_null();
-        } else {
+        if jsonb_array.is_null(i) {
+            // For null JSON values, return false instead of null
+            // This allows filters like "json_exists(data, '$.field') = false" to match null JSON
+            builder.append_value(false);
+        } else if let Some(path) = common::get_string_value_at(path_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let path = path_array.value(i);
-
             let exists = check_json_path_exists(jsonb_bytes, path)?;
             builder.append_value(exists);
+        } else {
+            builder.append_null();
         }
     }
 
@@ -356,11 +371,10 @@ fn json_get_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = LargeBinaryBuilder::with_capacity(jsonb_array.len(), 0);
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || key_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
-        } else {
+        } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key = key_array.value(i);
             let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
@@ -368,6 +382,8 @@ fn json_get_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
                 Some(value) => builder.append_value(value.as_raw().as_ref()),
                 None => builder.append_null(),
             }
+        } else {
+            builder.append_null();
         }
     }
 
@@ -409,11 +425,10 @@ fn json_get_string_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = StringBuilder::with_capacity(jsonb_array.len(), 1024);
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || key_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
-        } else {
+        } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key = key_array.value(i);
             let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
@@ -424,6 +439,8 @@ fn json_get_string_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
                 },
                 None => builder.append_null(),
             }
+        } else {
+            builder.append_null();
         }
     }
 
@@ -465,11 +482,10 @@ fn json_get_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = Int64Builder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || key_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
-        } else {
+        } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key = key_array.value(i);
             let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
@@ -480,6 +496,8 @@ fn json_get_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
                 },
                 None => builder.append_null(),
             }
+        } else {
+            builder.append_null();
         }
     }
 
@@ -521,11 +539,10 @@ fn json_get_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = Float64Builder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || key_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
-        } else {
+        } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key = key_array.value(i);
             let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
@@ -536,6 +553,8 @@ fn json_get_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
                 },
                 None => builder.append_null(),
             }
+        } else {
+            builder.append_null();
         }
     }
 
@@ -577,11 +596,10 @@ fn json_get_bool_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || key_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
-        } else {
+        } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key = key_array.value(i);
             let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
@@ -592,6 +610,8 @@ fn json_get_bool_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
                 },
                 None => builder.append_null(),
             }
+        } else {
+            builder.append_null();
         }
     }
 
@@ -635,15 +655,20 @@ fn json_array_contains_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = BooleanBuilder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || path_array.is_null(i) || value_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
         } else {
-            let jsonb_bytes = jsonb_array.value(i);
-            let path = path_array.value(i);
-            let value = value_array.value(i);
+            let path = common::get_string_value_at(path_array, i);
+            let value = common::get_string_value_at(value_array, i);
 
-            let contains = check_array_contains(jsonb_bytes, path, value)?;
-            builder.append_value(contains);
+            match (path, value) {
+                (Some(p), Some(v)) => {
+                    let jsonb_bytes = jsonb_array.value(i);
+                    let contains = check_array_contains(jsonb_bytes, p, v)?;
+                    builder.append_value(contains);
+                }
+                _ => builder.append_null(),
+            }
         }
     }
 
@@ -722,16 +747,16 @@ fn json_array_length_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     let mut builder = Int64Builder::with_capacity(jsonb_array.len());
 
     for i in 0..jsonb_array.len() {
-        if jsonb_array.is_null(i) || path_array.is_null(i) {
+        if jsonb_array.is_null(i) {
             builder.append_null();
-        } else {
+        } else if let Some(path) = common::get_string_value_at(path_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let path = path_array.value(i);
-
             match get_array_length(jsonb_bytes, path)? {
                 Some(len) => builder.append_value(len),
                 None => builder.append_null(),
             }
+        } else {
+            builder.append_null();
         }
     }
 

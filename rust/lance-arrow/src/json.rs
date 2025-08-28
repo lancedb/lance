@@ -7,14 +7,17 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 
 use arrow_array::builder::LargeBinaryBuilder;
-use arrow_array::{Array, ArrayRef, LargeBinaryArray, LargeStringArray, StringArray};
+use arrow_array::{Array, ArrayRef, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray};
 use arrow_data::ArrayData;
-use arrow_schema::{ArrowError, DataType, Field as ArrowField};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema};
 
 use crate::ARROW_EXT_NAME_KEY;
 
-/// Arrow extension type name for JSON data
+/// Arrow extension type name for JSON data (Lance internal)
 pub const JSON_EXT_NAME: &str = "lance.json";
+
+/// Arrow extension type name for JSON data (Arrow official)
+pub const ARROW_JSON_EXT_NAME: &str = "arrow.json";
 
 /// Check if a field is a JSON extension field (Lance internal JSONB storage)
 pub fn is_json_field(field: &ArrowField) -> bool {
@@ -23,6 +26,17 @@ pub fn is_json_field(field: &ArrowField) -> bool {
             .metadata()
             .get(ARROW_EXT_NAME_KEY)
             .map(|name| name == JSON_EXT_NAME)
+            .unwrap_or_default()
+}
+
+/// Check if a field is an Arrow JSON extension field (PyArrow pa.json() type)
+pub fn is_arrow_json_field(field: &ArrowField) -> bool {
+    // Arrow JSON extension type uses Utf8 or LargeUtf8 as storage type
+    (field.data_type() == &DataType::Utf8 || field.data_type() == &DataType::LargeUtf8)
+        && field
+            .metadata()
+            .get(ARROW_EXT_NAME_KEY)
+            .map(|name| name == ARROW_JSON_EXT_NAME)
             .unwrap_or_default()
 }
 
@@ -323,6 +337,156 @@ fn get_json_path(
     }
 }
 
+/// Convert an Arrow JSON field to Lance JSON field (with JSONB storage)
+pub fn arrow_json_to_lance_json(field: &ArrowField) -> ArrowField {
+    if is_arrow_json_field(field) {
+        // Convert Arrow JSON (Utf8/LargeUtf8) to Lance JSON (LargeBinary)
+        json_field(field.name(), field.is_nullable())
+    } else {
+        field.clone()
+    }
+}
+
+/// Convert a RecordBatch with Lance JSON columns (JSONB) back to Arrow JSON format (strings)
+pub fn convert_lance_json_to_arrow(
+    batch: &arrow_array::RecordBatch,
+) -> Result<arrow_array::RecordBatch, ArrowError> {
+    let schema = batch.schema();
+    let mut needs_conversion = false;
+    let mut new_fields = Vec::with_capacity(schema.fields().len());
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        let column = batch.column(i);
+
+        if is_json_field(field) {
+            needs_conversion = true;
+
+            // Convert the field back to Arrow JSON (Utf8)
+            let mut new_field = ArrowField::new(field.name(), DataType::Utf8, field.is_nullable());
+            let mut metadata = field.metadata().clone();
+            // Change from lance.json to arrow.json
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            );
+            new_field.set_metadata(metadata);
+            new_fields.push(new_field);
+
+            // Convert the data from JSONB to JSON strings
+            if batch.num_rows() == 0 {
+                // For empty batches, create an empty String array
+                let empty_strings = arrow_array::builder::StringBuilder::new().finish();
+                new_columns.push(Arc::new(empty_strings) as ArrayRef);
+            } else {
+                // Convert JSONB back to JSON strings
+                let binary_array = column
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError(format!(
+                            "Lance JSON field '{}' has unexpected type",
+                            field.name()
+                        ))
+                    })?;
+
+                let mut builder = arrow_array::builder::StringBuilder::new();
+                for i in 0..binary_array.len() {
+                    if binary_array.is_null(i) {
+                        builder.append_null();
+                    } else {
+                        let jsonb_bytes = binary_array.value(i);
+                        let json_str = decode_json(jsonb_bytes).map_err(|e| {
+                            ArrowError::InvalidArgumentError(format!(
+                                "Failed to decode JSON: {}",
+                                e
+                            ))
+                        })?;
+                        builder.append_value(&json_str);
+                    }
+                }
+                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
+            }
+        } else {
+            new_fields.push(field.as_ref().clone());
+            new_columns.push(column.clone());
+        }
+    }
+
+    if needs_conversion {
+        let new_schema = Arc::new(Schema::new_with_metadata(
+            new_fields,
+            schema.metadata().clone(),
+        ));
+        RecordBatch::try_new(new_schema, new_columns)
+    } else {
+        // No conversion needed, return original batch
+        Ok(batch.clone())
+    }
+}
+
+/// Convert a RecordBatch with Arrow JSON columns to Lance JSON format (JSONB)
+pub fn convert_json_columns(
+    batch: &arrow_array::RecordBatch,
+) -> Result<arrow_array::RecordBatch, ArrowError> {
+    let schema = batch.schema();
+    let mut needs_conversion = false;
+    let mut new_fields = Vec::with_capacity(schema.fields().len());
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        let column = batch.column(i);
+
+        if is_arrow_json_field(field) {
+            needs_conversion = true;
+
+            // Convert the field metadata
+            new_fields.push(arrow_json_to_lance_json(field));
+
+            // Convert the data from JSON strings to JSONB
+            if batch.num_rows() == 0 {
+                // For empty batches, create an empty LargeBinary array
+                let empty_binary = LargeBinaryBuilder::new().finish();
+                new_columns.push(Arc::new(empty_binary) as ArrayRef);
+            } else {
+                // Convert non-empty data
+                let json_array =
+                    if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
+                        JsonArray::try_from(string_array)?
+                    } else if let Some(large_string_array) =
+                        column.as_any().downcast_ref::<LargeStringArray>()
+                    {
+                        JsonArray::try_from(large_string_array)?
+                    } else {
+                        return Err(ArrowError::InvalidArgumentError(format!(
+                            "Arrow JSON field '{}' has unexpected storage type: {:?}",
+                            field.name(),
+                            column.data_type()
+                        )));
+                    };
+
+                let binary_array = json_array.into_inner();
+
+                new_columns.push(Arc::new(binary_array) as ArrayRef);
+            }
+        } else {
+            new_fields.push(field.as_ref().clone());
+            new_columns.push(column.clone());
+        }
+    }
+
+    if needs_conversion {
+        let new_schema = Arc::new(Schema::new_with_metadata(
+            new_fields,
+            schema.metadata().clone(),
+        ));
+        RecordBatch::try_new(new_schema, new_columns)
+    } else {
+        // No conversion needed, return original batch
+        Ok(batch.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +546,53 @@ mod tests {
 
         let age = json_array.json_path(1, "$.user.age").unwrap();
         assert_eq!(age, None);
+    }
+
+    #[test]
+    fn test_convert_json_columns() {
+        // Create a batch with Arrow JSON column
+        let json_strings = vec![Some(r#"{"name": "Alice"}"#), Some(r#"{"name": "Bob"}"#)];
+        let json_arr = StringArray::from(json_strings);
+
+        // Create field with arrow.json extension
+        let mut field = ArrowField::new("data", DataType::Utf8, false);
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        field.set_metadata(metadata);
+
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(json_arr) as ArrayRef]).unwrap();
+
+        // Convert the batch
+        let converted = convert_json_columns(&batch).unwrap();
+
+        // Check the converted schema
+        assert_eq!(converted.num_columns(), 1);
+        let converted_schema = converted.schema();
+        let converted_field = converted_schema.field(0);
+        assert_eq!(converted_field.data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            converted_field.metadata().get(ARROW_EXT_NAME_KEY),
+            Some(&JSON_EXT_NAME.to_string())
+        );
+
+        // Check the data was converted
+        let converted_column = converted.column(0);
+        assert_eq!(converted_column.data_type(), &DataType::LargeBinary);
+        assert_eq!(converted_column.len(), 2);
+
+        // Verify the data is valid JSONB
+        let binary_array = converted_column
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        for i in 0..binary_array.len() {
+            let jsonb_bytes = binary_array.value(i);
+            let decoded = decode_json(jsonb_bytes).unwrap();
+            assert!(decoded.contains("name"));
+        }
     }
 }

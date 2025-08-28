@@ -20,7 +20,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
-use lance_arrow::{json::is_json_field, ARROW_EXT_NAME_KEY, *};
+use lance_arrow::{
+    json::{is_arrow_json_field, is_json_field},
+    ARROW_EXT_NAME_KEY, *,
+};
 use snafu::location;
 
 use super::{
@@ -988,8 +991,8 @@ impl TryFrom<&ArrowField> for Field {
             .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
 
-        // Check for JSON extension type
-        let logical_type = if is_json_field(field) {
+        // Check for JSON extension types (both Arrow and Lance)
+        let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
             LogicalType::from("json")
         } else {
             LogicalType::try_from(field.data_type())?

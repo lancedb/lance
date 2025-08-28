@@ -38,6 +38,7 @@ use crate::Dataset;
 use super::blob::BlobStreamExt;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
+use super::utils::wrap_json_stream_for_writing;
 use super::DATA_DIR;
 
 mod commit;
@@ -305,6 +306,11 @@ pub async fn do_write_fragments(
     params: WriteParams,
     storage_version: LanceFileVersion,
 ) -> Result<Vec<Fragment>> {
+    // Convert arrow.json to lance.json (JSONB) for storage if needed
+    //
+    // FIXME: this is bad, really bad, we need to find a way to remove this.
+    let data = wrap_json_stream_for_writing(data);
+
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
         // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
@@ -382,10 +388,19 @@ pub async fn write_fragments_internal(
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
-    schema: Schema,
+    _schema: Schema,
     data: SendableRecordBatchStream,
     mut params: WriteParams,
 ) -> Result<WrittenFragments> {
+    // Convert Arrow JSON columns to Lance JSON (JSONB) format
+    //
+    // FIXME: this is bad, really bad, we need to find a way to remove this.
+    let data = wrap_json_stream_for_writing(data);
+
+    // Update the schema to match the converted data
+    let arrow_schema = data.schema();
+    let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
+
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
@@ -393,7 +408,7 @@ pub async fn write_fragments_internal(
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
-                schema.check_compatible(
+                converted_schema.check_compatible(
                     dataset.schema(),
                     &SchemaCompareOptions {
                         // We don't care if the user claims their data is nullable / non-nullable.  We will
@@ -407,7 +422,7 @@ pub async fn write_fragments_internal(
                 )?;
                 // Project from the dataset schema, because it has the correct field ids.
                 let write_schema = dataset.schema().project_by_schema(
-                    &schema,
+                    &converted_schema,
                     OnMissing::Error,
                     OnTypeMismatch::Error,
                 )?;
@@ -428,13 +443,13 @@ pub async fn write_fragments_internal(
                         .data_storage_format
                         .lance_file_version()?,
                 );
-                (schema, data_storage_version)
+                (converted_schema, data_storage_version)
             }
         }
     } else {
         // Brand new dataset, use the schema from the data and the storage version
         // from the user or the default.
-        (schema, params.storage_version_or_default())
+        (converted_schema, params.storage_version_or_default())
     };
 
     let data_schema = schema.project_by_schema(
