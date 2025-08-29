@@ -5,13 +5,13 @@ use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
-use snafu::location;
-use std::sync::Arc;
-
+use lance_core::utils::deletion::DeletionVector;
 use lance_table::{
     format::{Fragment, RowIdMeta},
-    rowids::{read_row_ids, RowIdIndex, RowIdSequence},
+    rowids::{read_row_ids, FragmentRowIdIndex, RowIdIndex, RowIdSequence},
 };
+use snafu::location;
+use std::sync::Arc;
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -96,7 +96,31 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
         .try_collect::<Vec<_>>()
         .await?;
 
-    let index = RowIdIndex::new(&sequences, dataset.manifest.uses_stable_row_ids())?;
+    let fragment_indices: Vec<_> =
+        futures::future::try_join_all(sequences.into_iter().map(|(fragment_id, sequence)| {
+            let dataset = dataset.clone();
+            async move {
+                let fragments = dataset.get_fragments();
+                let fragment = fragments
+                    .iter()
+                    .find(|f| f.id() as u32 == fragment_id)
+                    .expect("Fragment should exist");
+
+                let deletion_vector = match fragment.get_deletion_vector().await {
+                    Ok(Some(dv)) => dv,
+                    Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
+                };
+
+                Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
+                    fragment_id,
+                    row_id_sequence: sequence,
+                    deletion_vector,
+                })
+            }
+        }))
+        .await?;
+
+    let index = RowIdIndex::new(&fragment_indices)?;
 
     Ok(index)
 }
