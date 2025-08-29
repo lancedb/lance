@@ -5962,7 +5962,7 @@ mod test {
             Some(1),
         )
         .await;
-        check(dataset.scan().filter("x != 50").unwrap(), 99, Some(0), None).await;
+        check(dataset.scan().filter("x != 50").unwrap(), 99, None, None).await;
     }
 
     /// Assert that the plan when formatted matches the expected string.
