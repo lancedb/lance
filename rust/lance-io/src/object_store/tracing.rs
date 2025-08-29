@@ -12,8 +12,8 @@ use futures::StreamExt;
 use lance_core::utils::tracing::StreamTracingExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions,
-    PutPayload, PutResult, Result as OSResult, UploadPart,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use tracing::{debug_span, instrument, Instrument, Span};
 
