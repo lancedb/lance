@@ -61,6 +61,10 @@ impl LanceTableProvider {
             ordered,
         }
     }
+
+    pub fn dataset(&self) -> Arc<Dataset> {
+        self.dataset.clone()
+    }
 }
 
 #[async_trait]
