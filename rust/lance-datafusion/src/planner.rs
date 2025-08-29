@@ -20,7 +20,7 @@ use datafusion::common::DFSchema;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::SessionState;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
@@ -162,20 +162,24 @@ impl Default for LanceContextProvider {
     fn default() -> Self {
         let config = SessionConfig::new();
         let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+
+        let ctx = SessionContext::new_with_config_rt(config.clone(), runtime.clone());
+        crate::udf::register_functions(&ctx);
+
+        let state = ctx.state();
+
+        // SessionState does not expose expr_planners, so we need to get them separately
         let mut state_builder = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime)
             .with_default_features();
-
-        // SessionState does not expose expr_planners, so we need to get the default ones from
-        // the builder and store them to return from get_expr_planners
 
         // unwrap safe because with_default_features sets expr_planners
         let expr_planners = state_builder.expr_planners().as_ref().unwrap().clone();
 
         Self {
             options: ConfigOptions::default(),
-            state: state_builder.build(),
+            state,
             expr_planners,
         }
     }

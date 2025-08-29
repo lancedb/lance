@@ -10,12 +10,21 @@ use datafusion::prelude::SessionContext;
 use datafusion_functions::utils::make_scalar_function;
 use std::sync::{Arc, LazyLock};
 
-mod json;
+pub(crate) mod json;
 
 /// Register UDF functions to datafusion context.
 pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(CONTAINS_TOKENS_UDF.clone());
+    // JSON functions
     ctx.register_udf(json::json_extract_udf());
+    ctx.register_udf(json::json_exists_udf());
+    ctx.register_udf(json::json_get_udf());
+    ctx.register_udf(json::json_get_string_udf());
+    ctx.register_udf(json::json_get_int_udf());
+    ctx.register_udf(json::json_get_float_udf());
+    ctx.register_udf(json::json_get_bool_udf());
+    ctx.register_udf(json::json_array_contains_udf());
+    ctx.register_udf(json::json_array_length_udf());
 }
 
 /// This method checks whether a string contains all specified tokens. The tokens are separated by

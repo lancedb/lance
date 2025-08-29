@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::Result;
 use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::Schema as ArrowSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
+use lance_arrow::json::{
+    arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
+    is_arrow_json_field, is_json_field,
+};
+use lance_core::ROW_ID;
+use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-
-use crate::Result;
-use lance_core::ROW_ID;
-use lance_table::rowids::{RowIdIndex, RowIdSequence};
 
 fn extract_row_ids(
     row_ids: &mut CapturedRowIds,
@@ -132,4 +136,111 @@ impl Default for CapturedRowIds {
     fn default() -> Self {
         Self::AddressStyle(RoaringTreemap::new())
     }
+}
+
+/// Wrap a stream to convert arrow.json to lance.json for writing
+///
+// FIXME: this is bad, really bad, we need to find a way to remove this.
+pub fn wrap_json_stream_for_writing(
+    stream: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    // Check if any fields need conversion
+    let needs_conversion = stream
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| is_arrow_json_field(f));
+
+    if !needs_conversion {
+        return stream;
+    }
+
+    // Convert the schema
+    let arrow_schema = stream.schema();
+    let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
+    for field in arrow_schema.fields() {
+        if is_arrow_json_field(field) {
+            new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
+        } else {
+            new_fields.push(Arc::clone(field));
+        }
+    }
+    let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
+        new_fields,
+        arrow_schema.metadata().clone(),
+    ));
+
+    // Convert the stream
+    let converted_stream = stream.map(move |batch_result| {
+        batch_result.and_then(|batch| {
+            convert_json_columns(&batch)
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
+        })
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        converted_schema,
+        converted_stream,
+    ))
+}
+
+/// Wrap a stream to convert lance.json (JSONB) back to arrow.json (strings) for reading
+///
+// FIXME: this is bad, really bad, we need to find a way to remove this.
+pub fn wrap_json_stream_for_reading(
+    stream: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+
+    // Check if any fields need conversion
+    let needs_conversion = stream.schema().fields().iter().any(|f| is_json_field(f));
+
+    if !needs_conversion {
+        return stream;
+    }
+
+    // Convert the schema
+    let arrow_schema = stream.schema();
+    let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
+    for field in arrow_schema.fields() {
+        if is_json_field(field) {
+            // Convert lance.json (LargeBinary) to arrow.json (Utf8)
+            let mut new_field = arrow_schema::Field::new(
+                field.name(),
+                arrow_schema::DataType::Utf8,
+                field.is_nullable(),
+            );
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            );
+            new_field.set_metadata(metadata);
+            new_fields.push(new_field);
+        } else {
+            new_fields.push(field.as_ref().clone());
+        }
+    }
+    let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
+        new_fields,
+        arrow_schema.metadata().clone(),
+    ));
+
+    // Convert the stream
+    let converted_stream = stream.map(move |batch_result| {
+        batch_result.and_then(|batch| {
+            convert_lance_json_to_arrow(&batch).map_err(|e| {
+                datafusion::error::DataFusionError::ArrowError(
+                    arrow_schema::ArrowError::InvalidArgumentError(e.to_string()),
+                    None,
+                )
+            })
+        })
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        converted_schema,
+        converted_stream,
+    ))
 }
