@@ -1259,7 +1259,6 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -1273,6 +1272,7 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::io::exec::testing::TestingExec;
+    use crate::utils::test::ScanStatsHolder;
 
     #[tokio::test]
     async fn knn_flat_search() {
@@ -1575,31 +1575,13 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct StatsHolder {
-        pub collected_stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
-    }
-
-    impl StatsHolder {
-        fn get_setter(&self) -> ExecutionStatsCallback {
-            let collected_stats = self.collected_stats.clone();
-            Arc::new(move |stats| {
-                *collected_stats.lock().unwrap() = Some(stats.clone());
-            })
-        }
-
-        fn consume(self) -> ExecutionSummaryCounts {
-            self.collected_stats.lock().unwrap().take().unwrap()
-        }
-    }
-
     #[rstest]
     #[tokio::test]
     async fn test_no_max_nprobes(#[values(1, 20)] num_deltas: usize) {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
-        let stats_holder = StatsHolder::default();
+        let stats_holder = ScanStatsHolder::default();
 
         let results = fixture
             .dataset
@@ -1636,7 +1618,7 @@ mod tests {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
-        let stats_holder = StatsHolder::default();
+        let stats_holder = ScanStatsHolder::default();
 
         let results = fixture
             .dataset
@@ -1673,7 +1655,7 @@ mod tests {
 
         for (max_nprobes, expected_results) in [(10, 16), (20, 33), (30, 48)] {
             let q = fixture.get_centroid(0);
-            let stats_holder = StatsHolder::default();
+            let stats_holder = ScanStatsHolder::default();
             let results = fixture
                 .dataset
                 .scan()
@@ -1712,7 +1694,7 @@ mod tests {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
-        let stats_holder = StatsHolder::default();
+        let stats_holder = ScanStatsHolder::default();
         let results = fixture
             .dataset
             .scan()
@@ -1786,7 +1768,7 @@ mod tests {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
-        let stats_holder = StatsHolder::default();
+        let stats_holder = ScanStatsHolder::default();
         // There is no filter but we only have 10K rows.  Since maximum_nprobes is not set
         // we will search all partitions.
         let results = fixture

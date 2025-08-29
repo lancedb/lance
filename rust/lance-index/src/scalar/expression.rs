@@ -773,6 +773,22 @@ impl IndexExprResult {
         }
     }
 
+    pub fn max_matched(&self) -> Option<u64> {
+        match self {
+            Self::Exact(mask) => mask.max_matched(),
+            Self::AtMost(mask) => mask.max_matched(),
+            Self::AtLeast(_) => None,
+        }
+    }
+
+    pub fn min_matched(&self) -> Option<u64> {
+        match self {
+            Self::Exact(mask) => mask.min_matched(),
+            Self::AtMost(mask) => mask.min_matched(),
+            Self::AtLeast(_) => None,
+        }
+    }
+
     #[instrument(skip_all)]
     pub fn serialize_to_arrow(
         &self,
