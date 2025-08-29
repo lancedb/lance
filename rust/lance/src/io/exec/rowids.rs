@@ -378,7 +378,7 @@ impl AddRowOffsetExec {
         ));
 
         let new_eq_props =
-            EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone());
+            EquivalenceProperties::new(schema).extend(input.properties().eq_properties.clone())?;
         let properties = input.properties().clone().with_eq_properties(new_eq_props);
 
         Ok(Self {
