@@ -868,7 +868,7 @@ mod tests {
         assert!(bool_array.value(0));
         assert!(!bool_array.value(1));
         assert!(bool_array.value(2));
-        assert!(bool_array.is_null(3));
+        assert!(!bool_array.value(3));
 
         Ok(())
     }
