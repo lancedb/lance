@@ -31,8 +31,11 @@ use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
         expression::SargableQueryParser,
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME},
-        CreatedIndex,
+        registry::{
+            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME,
+        },
+        CreatedIndex, UpdateCriteria,
     },
 };
 use crate::{metrics::MetricsCollector, Index, IndexType};
@@ -364,6 +367,10 @@ impl ScalarIndex for BitmapIndex {
             index_version: BITMAP_INDEX_VERSION,
         })
     }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -484,18 +491,20 @@ impl BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
-    fn training_criteria(&self, _params: &prost_types::Any) -> Result<TrainingCriteria> {
-        Ok(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
-    }
-
-    fn check_can_train(&self, field: &Field) -> Result<()> {
+    fn new_training_request(
+        &self,
+        _params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
             return Err(Error::InvalidInput {
                 source: "A bitmap index can only be created on a non-nested field.".into(),
                 location: location!(),
             });
         }
-        Ok(())
+        Ok(Box::new(DefaultTrainingRequest::new(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+        )))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -518,7 +527,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        _params: &prost_types::Any,
+        _request: Box<dyn TrainingRequest>,
     ) -> Result<CreatedIndex> {
         Self::train_bitmap_index(data, index_store).await?;
         Ok(CreatedIndex {

@@ -311,7 +311,7 @@ pub mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::bitmap::BitmapIndexPlugin;
-    use crate::scalar::btree::BTreeIndexPlugin;
+    use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
     use crate::scalar::label_list::LabelListIndexPlugin;
     use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
@@ -355,14 +355,20 @@ pub mod tests {
         custom_batch_size: Option<u64>,
     ) {
         let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
-        let params = crate::pb::BTreeIndexParams {
+        let params = BTreeParameters {
             zone_size: Some(batch_size),
         };
-        let params = prost_types::Any::from_msg(&params).unwrap();
+        let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let request = btree_plugin
+            .new_training_request(
+                &params,
+                &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            )
+            .unwrap();
         btree_plugin
-            .train_index(data, index_store.as_ref(), &params)
+            .train_index(data, index_store.as_ref(), request)
             .await
             .unwrap();
     }
@@ -859,7 +865,7 @@ pub mod tests {
             data,
             &sub_index_trainer,
             index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE as u32,
+            DEFAULT_BTREE_BATCH_SIZE,
         )
         .await
         .unwrap();
@@ -901,10 +907,11 @@ pub mod tests {
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
-        let params = crate::pb::BitmapIndexParams {};
-        let params = prost_types::Any::from_msg(&params).unwrap();
+        let request = BitmapIndexPlugin
+            .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
+            .unwrap();
         BitmapIndexPlugin
-            .train_index(data, index_store.as_ref(), &params)
+            .train_index(data, index_store.as_ref(), request)
             .await
             .unwrap();
     }
@@ -1381,10 +1388,18 @@ pub mod tests {
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
         let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
-        let params = crate::pb::LabelListIndexParams {};
-        let params = prost_types::Any::from_msg(&params).unwrap();
+        let request = LabelListIndexPlugin
+            .new_training_request(
+                "{}",
+                &Field::new(
+                    VALUE_COLUMN_NAME,
+                    DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+                    false,
+                ),
+            )
+            .unwrap();
         LabelListIndexPlugin
-            .train_index(data, index_store.as_ref(), &params)
+            .train_index(data, index_store.as_ref(), request)
             .await
             .unwrap();
     }

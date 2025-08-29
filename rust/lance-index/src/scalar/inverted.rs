@@ -30,7 +30,7 @@ use crate::{
     pb,
     scalar::{
         expression::{FtsQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering},
+        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
         CreatedIndex, ScalarIndex,
     },
 };
@@ -64,13 +64,37 @@ impl InvertedIndexPlugin {
     }
 }
 
-#[async_trait]
-impl ScalarIndexPlugin for InvertedIndexPlugin {
-    fn training_criteria(&self, _params: &prost_types::Any) -> Result<TrainingCriteria> {
-        Ok(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+struct InvertedIndexTrainingRequest {
+    parameters: InvertedIndexParams,
+    criteria: TrainingCriteria,
+}
+
+impl InvertedIndexTrainingRequest {
+    pub fn new(parameters: InvertedIndexParams) -> Self {
+        Self {
+            parameters,
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+        }
+    }
+}
+
+impl TrainingRequest for InvertedIndexTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
-    fn check_can_train(&self, field: &Field) -> Result<()> {
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for InvertedIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
         if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
             return Err(Error::InvalidInput {
                 source: format!(
@@ -81,7 +105,9 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                 location: location!(),
             });
         }
-        Ok(())
+
+        let params = serde_json::from_str::<InvertedIndexParams>(params)?;
+        Ok(Box::new(InvertedIndexTrainingRequest::new(params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -122,10 +148,15 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        params: &prost_types::Any,
+        request: Box<dyn TrainingRequest>,
     ) -> Result<CreatedIndex> {
-        let params = params.to_msg::<pb::InvertedIndexParams>()?;
-        Self::train_inverted_index(data, index_store, (&params).try_into()?).await
+        let request = (request as Box<dyn std::any::Any>)
+            .downcast::<InvertedIndexTrainingRequest>()
+            .map_err(|_| Error::InvalidInput {
+                source: "must provide training request created by new_training_request".into(),
+                location: location!(),
+            })?;
+        Self::train_inverted_index(data, index_store, request.parameters.clone()).await
     }
 
     /// Load an index from storage

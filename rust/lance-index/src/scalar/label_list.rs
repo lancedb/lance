@@ -25,9 +25,10 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::bitmap::BitmapIndexPlugin;
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    VALUE_COLUMN_NAME,
 };
-use crate::scalar::CreatedIndex;
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{pb, Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
@@ -215,6 +216,10 @@ impl ScalarIndex for LabelListIndex {
             index_version: LABEL_LIST_INDEX_VERSION,
         })
     }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+    }
 }
 
 fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
@@ -344,11 +349,11 @@ pub struct LabelListIndexPlugin;
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
-    fn training_criteria(&self, _params: &prost_types::Any) -> Result<TrainingCriteria> {
-        Ok(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
-    }
-
-    fn check_can_train(&self, field: &Field) -> Result<()> {
+    fn new_training_request(
+        &self,
+        _params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
         if !matches!(
             field.data_type(),
             DataType::List(_) | DataType::LargeList(_)
@@ -362,7 +367,10 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
                 location: location!(),
             });
         }
-        Ok(())
+
+        Ok(Box::new(DefaultTrainingRequest::new(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+        )))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -389,7 +397,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        params: &prost_types::Any,
+        request: Box<dyn TrainingRequest>,
     ) -> Result<CreatedIndex> {
         let schema = data.schema();
         let field = schema
@@ -418,7 +426,9 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
         let data = unnest_chunks(data)?;
         let bitmap_plugin = BitmapIndexPlugin;
-        bitmap_plugin.train_index(data, index_store, params).await?;
+        bitmap_plugin
+            .train_index(data, index_store, request)
+            .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
                 .unwrap(),

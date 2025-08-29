@@ -133,7 +133,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
-                let params = ScalarIndexParams::default_for_type(self.index_type.try_into()?);
+                let params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
                 build_scalar_index(self.dataset, column, &index_id.to_string(), &params, train)
                     .await?
             }

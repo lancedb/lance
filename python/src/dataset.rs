@@ -1501,35 +1501,24 @@ impl Dataset {
         log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
             "BTREE" => Box::new(ScalarIndexParams {
-                params: Some(
-                    prost_types::Any::from_msg(&lance_index::pb::BTreeIndexParams::default())
-                        .unwrap(),
-                ),
+                index_type: "btree".to_string(),
+                params: None,
             }),
             "BITMAP" => Box::new(ScalarIndexParams {
-                // Temporary workaround until we add support for auto-detection of scalar index type
-                params: Some(
-                    prost_types::Any::from_msg(&lance_index::pb::BitmapIndexParams::default())
-                        .unwrap(),
-                ),
+                index_type: "bitmap".to_string(),
+                params: None,
             }),
             "NGRAM" => Box::new(ScalarIndexParams {
-                params: Some(
-                    prost_types::Any::from_msg(&lance_index::pb::NGramIndexParams::default())
-                        .unwrap(),
-                ),
+                index_type: "ngram".to_string(),
+                params: None,
             }),
             "ZONEMAP" => Box::new(ScalarIndexParams {
-                params: Some(
-                    prost_types::Any::from_msg(&lance_index::pb::ZoneMapIndexParams::default())
-                        .unwrap(),
-                ),
+                index_type: "zonemap".to_string(),
+                params: None,
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
-                params: Some(
-                    prost_types::Any::from_msg(&lance_index::pb::LabelListIndexParams::default())
-                        .unwrap(),
-                ),
+                index_type: "label_list".to_string(),
+                params: None,
             }),
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();

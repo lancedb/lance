@@ -70,7 +70,7 @@ impl BenchmarkFixture {
             test_data_stream(),
             &sub_index_trainer,
             index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE as u32,
+            DEFAULT_BTREE_BATCH_SIZE,
         )
         .await
         .unwrap();

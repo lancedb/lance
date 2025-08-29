@@ -99,48 +99,6 @@ impl TryFrom<&InvertedIndexParams> for pb::InvertedIndexDetails {
     }
 }
 
-impl TryFrom<&pb::InvertedIndexParams> for InvertedIndexParams {
-    type Error = Error;
-
-    fn try_from(value: &pb::InvertedIndexParams) -> Result<Self> {
-        let mut params = Self::default();
-        if let Some(base_tokenizer) = value.base_tokenizer.as_ref() {
-            params.base_tokenizer = base_tokenizer.clone();
-        }
-        if let Some(language) = value.language.as_ref() {
-            params.language = serde_json::from_str(language)?;
-        }
-        if let Some(with_position) = value.with_position {
-            params.with_position = with_position;
-        }
-        if let Some(max_token_length) = value.max_token_length {
-            params.max_token_length = Some(max_token_length as usize);
-        }
-        if let Some(lower_case) = value.lower_case {
-            params.lower_case = lower_case;
-        }
-        if let Some(stem) = value.stem {
-            params.stem = stem;
-        }
-        if let Some(remove_stop_words) = value.remove_stop_words {
-            params.remove_stop_words = remove_stop_words;
-        }
-        if let Some(ascii_folding) = value.ascii_folding {
-            params.ascii_folding = ascii_folding;
-        }
-        if let Some(min_ngram_length) = value.min_ngram_length {
-            params.min_ngram_length = min_ngram_length;
-        }
-        if let Some(max_ngram_length) = value.max_ngram_length {
-            params.max_ngram_length = max_ngram_length;
-        }
-        if let Some(prefix_only) = value.prefix_only {
-            params.prefix_only = prefix_only;
-        }
-        Ok(params)
-    }
-}
-
 fn bool_true() -> bool {
     true
 }

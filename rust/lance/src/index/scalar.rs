@@ -192,7 +192,7 @@ impl IndexDetails {
 
     /// Returns the plugin for the index
     pub fn get_plugin(&self) -> Result<&dyn ScalarIndexPlugin> {
-        SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_loading_details(self.0.as_ref())
+        SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(self.0.as_ref())
     }
 
     /// Returns the index version
@@ -222,18 +222,15 @@ pub(super) async fn build_scalar_index(
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
 
-    let default_params =
-        prost_types::Any::from_msg(&lance_index::pb::BTreeIndexParams::default()).unwrap();
-    let index_params = params.params.as_ref().unwrap_or(&default_params);
-    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_training_params(index_params)?;
-    plugin.check_can_train(&field)?;
-    let training_criteria = plugin.training_criteria(index_params)?;
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let training_request =
+        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
     let training_data =
-        load_training_data(dataset, column, &training_criteria, None, train).await?;
+        load_training_data(dataset, column, training_request.criteria(), None, train).await?;
 
     plugin
-        .train_index(training_data, &index_store, index_params)
+        .train_index(training_data, &index_store, training_request)
         .await
 }
 
@@ -287,8 +284,7 @@ pub async fn open_scalar_index(
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index)?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
-    let plugin =
-        SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_loading_details(index_details.as_ref())?;
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 

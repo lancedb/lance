@@ -13,8 +13,10 @@
 //!
 //!
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
-use crate::scalar::registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering};
-use crate::scalar::{CreatedIndex, SargableQuery};
+use crate::scalar::registry::{
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+};
+use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
 use crate::{pb, Any};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
@@ -22,6 +24,7 @@ use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
@@ -564,7 +567,7 @@ impl ScalarIndex for ZoneMapIndex {
         let value_type = batches_source.schema().field(0).data_type().clone();
 
         let mut builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderOptions::new(self.max_zonemap_size),
+            ZoneMapIndexBuilderParams::new(self.max_zonemap_size),
             value_type,
         )?;
 
@@ -579,7 +582,7 @@ impl ScalarIndex for ZoneMapIndex {
 
         // Create a new builder with all zones to write them out
         let mut combined_builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderOptions::new(self.max_zonemap_size),
+            ZoneMapIndexBuilderParams::new(self.max_zonemap_size),
             self.data_type.clone(),
         )?;
         combined_builder.maps = all_zones;
@@ -593,10 +596,14 @@ impl ScalarIndex for ZoneMapIndex {
             index_version: ZONEMAP_INDEX_VERSION,
         })
     }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct ZoneMapIndexBuilderOptions {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneMapIndexBuilderParams {
     rows_per_zone: u64,
 }
 
@@ -607,7 +614,7 @@ static DEFAULT_ROWS_PER_ZONE: LazyLock<u64> = LazyLock::new(|| {
         .expect("failed to parse Lance_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
 });
 
-impl Default for ZoneMapIndexBuilderOptions {
+impl Default for ZoneMapIndexBuilderParams {
     fn default() -> Self {
         Self {
             rows_per_zone: *DEFAULT_ROWS_PER_ZONE,
@@ -615,20 +622,15 @@ impl Default for ZoneMapIndexBuilderOptions {
     }
 }
 
-impl ZoneMapIndexBuilderOptions {
+impl ZoneMapIndexBuilderParams {
     fn new(rows_per_zone: u64) -> Self {
-        Self { rows_per_zone }
-    }
-
-    fn from_params(params: &pb::ZoneMapIndexParams) -> Self {
-        let rows_per_zone = params.zone_size.unwrap_or(*DEFAULT_ROWS_PER_ZONE);
         Self { rows_per_zone }
     }
 }
 
 // A builder for zonemap index
 pub struct ZoneMapIndexBuilder {
-    options: ZoneMapIndexBuilderOptions,
+    options: ZoneMapIndexBuilderParams,
 
     items_type: DataType,
     maps: Vec<ZoneMapStatistics>,
@@ -643,7 +645,7 @@ pub struct ZoneMapIndexBuilder {
 }
 
 impl ZoneMapIndexBuilder {
-    pub fn try_new(options: ZoneMapIndexBuilderOptions, items_type: DataType) -> Result<Self> {
+    pub fn try_new(options: ZoneMapIndexBuilderParams, items_type: DataType) -> Result<Self> {
         let min = MinAccumulator::try_new(&items_type)?;
         let max = MaxAccumulator::try_new(&items_type)?;
         Ok(Self {
@@ -875,7 +877,7 @@ impl ZoneMapIndexPlugin {
     async fn train_zonemap_index(
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        options: Option<ZoneMapIndexBuilderOptions>,
+        options: Option<ZoneMapIndexBuilderParams>,
     ) -> Result<()> {
         // train_zonemap_index: calling scan_aligned_chunks
         let value_type = batches_source.schema().field(0).data_type().clone();
@@ -889,20 +891,46 @@ impl ZoneMapIndexPlugin {
     }
 }
 
+pub struct ZoneMapIndexTrainingRequest {
+    pub params: ZoneMapIndexBuilderParams,
+    pub criteria: TrainingCriteria,
+}
+
+impl ZoneMapIndexTrainingRequest {
+    pub fn new(params: ZoneMapIndexBuilderParams) -> Self {
+        Self {
+            params,
+            criteria: TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
+        }
+    }
+}
+
+impl TrainingRequest for ZoneMapIndexTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
 #[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
-    fn training_criteria(&self, _params: &prost_types::Any) -> Result<TrainingCriteria> {
-        Ok(TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr())
-    }
-
-    fn check_can_train(&self, field: &Field) -> Result<()> {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
             return Err(Error::InvalidInput {
                 source: "A zone map index can only be created on a non-nested field.".into(),
                 location: location!(),
             });
         }
-        Ok(())
+
+        let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
+
+        Ok(Box::new(ZoneMapIndexTrainingRequest::new(params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -925,11 +953,15 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        params: &prost_types::Any,
+        request: Box<dyn TrainingRequest>,
     ) -> Result<CreatedIndex> {
-        let params = params.to_msg::<crate::pb::ZoneMapIndexParams>()?;
-        let options = ZoneMapIndexBuilderOptions::from_params(&params);
-        Self::train_zonemap_index(data, index_store, Some(options)).await?;
+        let request = (request as Box<dyn std::any::Any>)
+            .downcast::<ZoneMapIndexTrainingRequest>()
+            .map_err(|_| Error::InvalidInput {
+                source: "must provide training request created by new_training_request".into(),
+                location: location!(),
+            })?;
+        Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
@@ -972,7 +1004,7 @@ mod tests {
     use crate::scalar::{
         lance_format::LanceIndexStore,
         zonemap::{
-            ZoneMapIndex, ZoneMapIndexBuilderOptions, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY,
+            ZoneMapIndex, ZoneMapIndexBuilderParams, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY,
         },
         SargableQuery, ScalarIndex, SearchResult,
     };
@@ -1070,7 +1102,7 @@ mod tests {
         ZoneMapIndexPlugin::train_zonemap_index(
             stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::new(5000)),
+            Some(ZoneMapIndexBuilderParams::new(5000)),
         )
         .await
         .unwrap();
@@ -1215,7 +1247,7 @@ mod tests {
         ZoneMapIndexPlugin::train_zonemap_index(
             data_stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::new(100)),
+            Some(ZoneMapIndexBuilderParams::new(100)),
         )
         .await
         .unwrap();
@@ -1391,7 +1423,7 @@ mod tests {
         ZoneMapIndexPlugin::train_zonemap_index(
             data_stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::new(100)),
+            Some(ZoneMapIndexBuilderParams::new(100)),
         )
         .await
         .unwrap();
@@ -1607,7 +1639,7 @@ mod tests {
         ZoneMapIndexPlugin::train_zonemap_index(
             data_stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::default()),
+            Some(ZoneMapIndexBuilderParams::default()),
         )
         .await
         .unwrap();
@@ -1763,7 +1795,7 @@ mod tests {
             ZoneMapIndexPlugin::train_zonemap_index(
                 data_stream,
                 test_store.as_ref(),
-                Some(ZoneMapIndexBuilderOptions::new(5000)),
+                Some(ZoneMapIndexBuilderParams::new(5000)),
             )
             .await
             .unwrap();
@@ -1961,7 +1993,7 @@ mod tests {
             ZoneMapIndexPlugin::train_zonemap_index(
                 data_stream,
                 test_store.as_ref(),
-                Some(ZoneMapIndexBuilderOptions::default()),
+                Some(ZoneMapIndexBuilderParams::default()),
             )
             .await
             .unwrap();
@@ -2030,7 +2062,7 @@ mod tests {
             ZoneMapIndexPlugin::train_zonemap_index(
                 data_stream,
                 test_store.as_ref(),
-                Some(ZoneMapIndexBuilderOptions::new(ZONEMAP_DEFAULT_SIZE * 3)),
+                Some(ZoneMapIndexBuilderParams::new(ZONEMAP_DEFAULT_SIZE * 3)),
             )
             .await
             .unwrap();

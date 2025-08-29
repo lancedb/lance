@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lance_core::{Error, Result};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
-use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::InvertedIndex};
-use lance_index::{IndexType, VECTOR_INDEX_VERSION};
+use lance_index::VECTOR_INDEX_VERSION;
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -19,7 +19,7 @@ use super::vector::ivf::optimize_vector_indices;
 use super::DatasetIndexInternalExt;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::Dataset;
-use crate::index::scalar::{fetch_index_details, load_training_data, IndexDetails};
+use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
 pub struct IndexMergeResults<'a> {
@@ -104,39 +104,17 @@ pub async fn merge_indices<'a>(
                 )
                 .await?;
 
-            let details = IndexDetails(
-                fetch_index_details(dataset.as_ref(), &column.name, old_indices[0]).await?,
-            );
+            let update_criteria = index.update_criteria();
 
-            let need_full_data = match index.index_type() {
-                IndexType::Inverted => {
-                    // we can't directly update the legacy inverted index to the new format,
-                    // so we need to read the full data and rebuild it.
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or(Error::Index {
-                                message: "Append index: invalid index type".to_string(),
-                                location: location!(),
-                            })?;
-                    index.is_legacy()
-                }
-
-                _ => false,
-            };
-
-            let plugin = details.get_plugin()?;
-            let training_criteria = plugin.training_criteria(&details.0)?;
-            let fragments = if !need_full_data {
-                Some(unindexed.clone())
-            } else {
+            let fragments = if update_criteria.requires_old_data {
                 None
+            } else {
+                Some(unindexed.clone())
             };
             let new_data_stream = load_training_data(
                 dataset.as_ref(),
                 &column.name,
-                &training_criteria,
+                &update_criteria.data_criteria,
                 fragments,
                 true,
             )

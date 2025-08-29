@@ -16,9 +16,10 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    VALUE_COLUMN_NAME,
 };
-use crate::scalar::CreatedIndex;
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::vector::VectorIndex;
 use crate::{pb, Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
@@ -532,6 +533,10 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
     }
 }
 
@@ -1239,11 +1244,11 @@ impl NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
-    fn training_criteria(&self, _params: &prost_types::Any) -> Result<TrainingCriteria> {
-        Ok(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
-    }
-
-    fn check_can_train(&self, field: &Field) -> Result<()> {
+    fn new_training_request(
+        &self,
+        _params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
         if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
             return Err(Error::InvalidInput {
                 source: format!(
@@ -1254,7 +1259,9 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
                 location: location!(),
             });
         }
-        Ok(())
+        Ok(Box::new(DefaultTrainingRequest::new(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+        )))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -1277,7 +1284,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        _params: &prost_types::Any,
+        _request: Box<dyn TrainingRequest>,
     ) -> Result<CreatedIndex> {
         Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {

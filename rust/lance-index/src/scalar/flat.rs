@@ -24,7 +24,7 @@ use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
 use super::{AnyQuery, MetricsCollector, SargableQuery, SearchResult};
 use crate::scalar::btree::{BTREE_IDS_COLUMN, BTREE_VALUES_COLUMN};
 use crate::scalar::registry::VALUE_COLUMN_NAME;
-use crate::scalar::CreatedIndex;
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 
 /// A flat index is just a batch of value/row-id pairs
@@ -328,6 +328,10 @@ impl ScalarIndex for FlatIndex {
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // If this was desired, then you would need to merge new_data and data and write it back out
+        unimplemented!()
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
         unimplemented!()
     }
 }

@@ -19,8 +19,8 @@ use crate::{
     pb,
     scalar::{
         expression::{SargableQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME},
-        CreatedIndex,
+        registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
+        CreatedIndex, UpdateCriteria,
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
@@ -56,7 +56,7 @@ use lance_datafusion::{
 };
 use log::debug;
 use roaring::RoaringBitmap;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
 use tracing::info;
 
@@ -978,7 +978,7 @@ impl BTreeIndex {
     async fn combine_old_new(
         self,
         new_data: SendableRecordBatchStream,
-        chunk_size: u32,
+        chunk_size: u64,
     ) -> Result<SendableRecordBatchStream> {
         let data_type = new_data.schema().field(0).data_type().clone();
         // Datafusion currently has bugs with spilling on string columns
@@ -1224,13 +1224,13 @@ impl ScalarIndex for BTreeIndex {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
-            .combine_old_new(new_data, DEFAULT_BTREE_BATCH_SIZE as u32)
+            .combine_old_new(new_data, DEFAULT_BTREE_BATCH_SIZE)
             .await?;
         train_btree_index(
             merged_data_source,
             self.sub_index.as_ref(),
             dest_store,
-            DEFAULT_BTREE_BATCH_SIZE as u32,
+            DEFAULT_BTREE_BATCH_SIZE,
         )
         .await?;
 
@@ -1238,6 +1238,10 @@ impl ScalarIndex for BTreeIndex {
             index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
     }
 }
 
@@ -1361,7 +1365,7 @@ pub async fn train_btree_index(
     batches_source: SendableRecordBatchStream,
     sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
-    batch_size: u32,
+    batch_size: u64,
 ) -> Result<()> {
     let mut sub_index_file = index_store
         .new_index_file(BTREE_PAGES_NAME, sub_index_trainer.schema().clone())
@@ -1444,23 +1448,57 @@ impl Stream for IndexReaderStream {
     }
 }
 
+/// Parameters for a btree index
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BTreeParameters {
+    /// The number of rows to include in each zone
+    pub zone_size: Option<u64>,
+}
+
+struct BTreeTrainingRequest {
+    parameters: BTreeParameters,
+    criteria: TrainingCriteria,
+}
+
+impl BTreeTrainingRequest {
+    pub fn new(parameters: BTreeParameters) -> Self {
+        Self {
+            parameters,
+            // BTree indexes need data sorted by the value column
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        }
+    }
+}
+
+impl TrainingRequest for BTreeTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BTreeIndexPlugin;
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
-    fn training_criteria(&self, _params: &prost_types::Any) -> Result<TrainingCriteria> {
-        Ok(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
-    }
-
-    fn check_can_train(&self, field: &Field) -> Result<()> {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
             return Err(Error::InvalidInput {
                 source: "A btree index can only be created on a non-nested field.".into(),
                 location: location!(),
             });
         }
-        Ok(())
+
+        let params = serde_json::from_str::<BTreeParameters>(params)?;
+        Ok(Box::new(BTreeTrainingRequest::new(params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -1483,17 +1521,28 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        params: &prost_types::Any,
+        request: Box<dyn TrainingRequest>,
     ) -> Result<CreatedIndex> {
-        let params = params.to_msg::<crate::pb::BTreeIndexParams>()?;
-        let batch_size = params.zone_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+        let request = request
+            .as_any()
+            .downcast_ref::<BTreeTrainingRequest>()
+            .unwrap();
         let value_type = data
             .schema()
             .field_with_name(VALUE_COLUMN_NAME)?
             .data_type()
             .clone();
         let flat_index_trainer = FlatIndexMetadata::new(value_type);
-        train_btree_index(data, &flat_index_trainer, index_store, batch_size as u32).await?;
+        train_btree_index(
+            data,
+            &flat_index_trainer,
+            index_store,
+            request
+                .parameters
+                .zone_size
+                .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
+        )
+        .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
             index_version: BTREE_INDEX_VERSION,

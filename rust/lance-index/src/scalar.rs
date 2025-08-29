@@ -22,10 +22,11 @@ use deepsize::DeepSizeOf;
 use inverted::query::{fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
+use serde::Serialize;
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
-use crate::pb;
+use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
@@ -45,8 +46,13 @@ use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, DeepSizeOf)]
-pub enum ScalarIndexType {
+/// Builtin index types supported by the Lance library
+///
+/// This is primarily for convenience to avoid a bunch of string
+/// constants and provide some auto-complete.  This type should not
+/// be used in the manifest as plugins cannot add new entries.
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+pub enum BuiltinIndexType {
     BTree,
     Bitmap,
     LabelList,
@@ -55,82 +61,83 @@ pub enum ScalarIndexType {
     Inverted,
 }
 
-impl TryFrom<IndexType> for ScalarIndexType {
+impl BuiltinIndexType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::BTree => "btree",
+            Self::Bitmap => "bitmap",
+            Self::LabelList => "labellist",
+            Self::NGram => "ngram",
+            Self::ZoneMap => "zonemap",
+            Self::Inverted => "inverted",
+        }
+    }
+}
+
+impl TryFrom<IndexType> for BuiltinIndexType {
     type Error = Error;
 
     fn try_from(value: IndexType) -> Result<Self> {
         match value {
-            IndexType::BTree | IndexType::Scalar => Ok(Self::BTree),
+            IndexType::BTree => Ok(Self::BTree),
             IndexType::Bitmap => Ok(Self::Bitmap),
             IndexType::LabelList => Ok(Self::LabelList),
             IndexType::NGram => Ok(Self::NGram),
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
-            _ => Err(Error::InvalidInput {
-                source: format!("Index type {:?} is not a scalar index", value).into(),
+            _ => Err(Error::Index {
+                message: "Invalid index type".to_string(),
                 location: location!(),
             }),
         }
     }
 }
 
-impl From<ScalarIndexType> for IndexType {
-    fn from(val: ScalarIndexType) -> Self {
-        match val {
-            ScalarIndexType::BTree => Self::BTree,
-            ScalarIndexType::Bitmap => Self::Bitmap,
-            ScalarIndexType::LabelList => Self::LabelList,
-            ScalarIndexType::NGram => Self::NGram,
-            ScalarIndexType::ZoneMap => Self::ZoneMap,
-            ScalarIndexType::Inverted => Self::Inverted,
-        }
-    }
-}
-
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScalarIndexParams {
+    /// The type of index to create
+    ///
+    /// Builtin indexes are "btree", "ngram", "bitmap", "inverted", "labellist", and "zonemap"
+    ///
+    /// Plugins may add additional index types.  Index type lookup is case-insensitive.
+    pub index_type: String,
     /// The parameters to train the index
     ///
-    /// Since indexes are "pluggable" this is a generic Any message.  The id of
-    /// the message will determine the type of index that is used.  The contents of the
-    /// message will be specific to the index type.
-    ///
-    /// If this is not set then the best set of index parameters will be inferred from
-    /// the data.
-    ///
-    /// Currently the only supported "inference" strategy is "always use BTree by default"
-    pub params: Option<prost_types::Any>,
+    /// This should be a JSON string.  The contents of the JSON string will be specific to the
+    /// index type.  If not set, then default parameters will be used for the index type.
+    pub params: Option<String>,
+}
+
+impl Default for ScalarIndexParams {
+    fn default() -> Self {
+        Self {
+            index_type: BuiltinIndexType::BTree.as_str().to_string(),
+            params: None,
+        }
+    }
 }
 
 impl ScalarIndexParams {
-    pub fn try_from_params<M: prost::Message + prost::Name>(params: &M) -> Result<Self> {
-        Ok(Self {
-            params: Some(prost_types::Any::from_msg(params)?),
-        })
+    /// Creates a new ScalarIndexParams from one of the builtin index types
+    pub fn for_builtin(index_type: BuiltinIndexType) -> Self {
+        Self {
+            index_type: index_type.as_str().to_string(),
+            params: None,
+        }
     }
 
-    /// Creates a default set of parameters for the given index type
-    pub fn default_for_type(index_type: ScalarIndexType) -> Self {
-        match index_type {
-            ScalarIndexType::BTree => {
-                Self::try_from_params(&pb::BTreeIndexParams::default()).unwrap()
-            }
-            ScalarIndexType::Bitmap => {
-                Self::try_from_params(&pb::BitmapIndexParams::default()).unwrap()
-            }
-            ScalarIndexType::LabelList => {
-                Self::try_from_params(&pb::LabelListIndexParams::default()).unwrap()
-            }
-            ScalarIndexType::NGram => {
-                Self::try_from_params(&pb::NGramIndexParams::default()).unwrap()
-            }
-            ScalarIndexType::ZoneMap => {
-                Self::try_from_params(&pb::ZoneMapIndexParams::default()).unwrap()
-            }
-            ScalarIndexType::Inverted => {
-                Self::try_from_params(&pb::InvertedIndexParams::default()).unwrap()
-            }
+    /// Create a new ScalarIndexParams with the given index type
+    pub fn new(index_type: String) -> Self {
+        Self {
+            index_type,
+            params: None,
         }
+    }
+
+    /// Set the parameters for the index
+    pub fn with_params<ParamsType: Serialize>(mut self, params: ParamsType) -> Self {
+        self.params = Some(serde_json::to_string(&params).unwrap());
+        self
     }
 }
 
@@ -654,6 +661,32 @@ pub struct CreatedIndex {
     pub index_version: u32,
 }
 
+/// The criteria that specifies how to update an index
+pub struct UpdateCriteria {
+    /// If true, then we need to read the old data to update the index
+    ///
+    /// This should be avoided if possible but is left in for some legacy paths
+    pub requires_old_data: bool,
+    /// The criteria required for data (both old and new)
+    pub data_criteria: TrainingCriteria,
+}
+
+impl UpdateCriteria {
+    pub fn requires_old_data(data_criteria: TrainingCriteria) -> Self {
+        Self {
+            requires_old_data: true,
+            data_criteria,
+        }
+    }
+
+    pub fn only_new_data(data_criteria: TrainingCriteria) -> Self {
+        Self {
+            requires_old_data: false,
+            data_criteria,
+        }
+    }
+}
+
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -682,4 +715,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex>;
+
+    /// Returns the criteria that will be used to update the index
+    fn update_criteria(&self) -> UpdateCriteria;
 }
