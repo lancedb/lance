@@ -174,7 +174,7 @@ pub fn wrap_json_stream_for_writing(
     let converted_stream = stream.map(move |batch_result| {
         batch_result.and_then(|batch| {
             convert_json_columns(&batch)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
         })
     });
 
@@ -232,7 +232,9 @@ pub fn wrap_json_stream_for_reading(
         batch_result.and_then(|batch| {
             convert_lance_json_to_arrow(&batch).map_err(|e| {
                 datafusion::error::DataFusionError::ArrowError(
-                    arrow_schema::ArrowError::InvalidArgumentError(e.to_string()),
+                    Box::new(arrow_schema::ArrowError::InvalidArgumentError(
+                        e.to_string(),
+                    )),
                     None,
                 )
             })

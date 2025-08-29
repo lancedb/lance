@@ -447,7 +447,7 @@ impl Planner {
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
                 collect_spans: false,
-                map_varchar_to_utf8view: false,
+                map_string_types_to_utf8view: false,
             },
         );
 
