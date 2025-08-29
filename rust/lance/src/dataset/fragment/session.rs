@@ -14,6 +14,7 @@ use std::sync::Arc;
 /// internal states instead of creating new ones each time.
 ///
 /// This API works well for users making repeated requests over the same projected schema.
+#[derive(Clone, Debug)]
 pub struct FragmentSession {
     reader: FragmentReader,
     sorted_deleted_ids: Option<Vec<u32>>,
