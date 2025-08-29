@@ -306,9 +306,7 @@ fn json_exists_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
 
     for i in 0..jsonb_array.len() {
         if jsonb_array.is_null(i) {
-            // For null JSON values, return false instead of null
-            // This allows filters like "json_exists(data, '$.field') = false" to match null JSON
-            builder.append_value(false);
+            builder.append_null();
         } else if let Some(path) = common::get_string_value_at(path_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
             let exists = check_json_path_exists(jsonb_bytes, path)?;
@@ -868,7 +866,7 @@ mod tests {
         assert!(bool_array.value(0));
         assert!(!bool_array.value(1));
         assert!(bool_array.value(2));
-        assert!(!bool_array.value(3));
+        assert!(bool_array.is_null(3));
 
         Ok(())
     }
