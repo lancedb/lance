@@ -60,7 +60,7 @@ tests = [
     # tensorflow is broken on 2.20.0 with macOS ARM.
     "tensorflow<=2.19.0",
     "tqdm",
-    "datafusion",
+    "datafusion<=48.0.0",
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
