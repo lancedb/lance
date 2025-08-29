@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
+import threading
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 from lance.file import LanceFileReader, LanceFileWriter
@@ -514,3 +516,109 @@ def test_blob(tmp_path):
         expected_bytes = expected.column("val").chunk(0)[row_num].as_py()
         assert len(actual_bytes) == len(expected_bytes)
         assert actual_bytes == expected_bytes
+
+
+def test_multithreaded_writer(tmp_path):
+    """Test concurrent multi-threaded writing to the same LanceFileWriter"""
+    path = tmp_path / "multithreaded.lance"
+    schema = pa.schema(
+        [
+            pa.field("thread_id", pa.int64()),
+            pa.field("value", pa.int64()),
+            pa.field("data", pa.string()),
+        ]
+    )
+
+    # Used to store all written data for subsequent validation
+    all_data = []
+    data_lock = threading.Lock()
+
+    def write_thread_data(thread_id, writer, num_records):
+        """Function for individual thread to write data"""
+        thread_data = []
+        for i in range(num_records):
+            record = {
+                "thread_id": thread_id,
+                "value": thread_id * 1000 + i,
+                "data": f"thread_{thread_id}_record_{i}",
+            }
+            thread_data.append(record)
+
+        # Create pyarrow table
+        table = pa.table(
+            {
+                "thread_id": [r["thread_id"] for r in thread_data],
+                "value": [r["value"] for r in thread_data],
+                "data": [r["data"] for r in thread_data],
+            }
+        )
+
+        # Write data
+        writer.write_batch(table)
+
+        # Record written data for validation
+        with data_lock:
+            all_data.extend(thread_data)
+
+    # Test parameters
+    num_threads = 5
+    records_per_thread = 100
+
+    # Create writer and start multi-threaded writing
+    with LanceFileWriter(str(path), schema) as writer:
+        threads = []
+
+        # Start multiple threads
+        for thread_id in range(num_threads):
+            thread = threading.Thread(
+                target=write_thread_data, args=(thread_id, writer, records_per_thread)
+            )
+            threads.append(thread)
+            thread.start()
+
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+
+    # Validate written data
+    reader = LanceFileReader(str(path))
+    result_table = reader.read_all().to_table()
+
+    # Check if total row count is correct
+    expected_total_rows = num_threads * records_per_thread
+    assert result_table.num_rows == expected_total_rows, (
+        f"Expected {expected_total_rows} rows, got {result_table.num_rows}"
+    )
+
+    # Check data content correctness (order may differ, but data should be complete)
+    # Convert results to dictionary list for comparison
+    result_data = [
+        {
+            "thread_id": result_table.column("thread_id").chunk(0)[i].as_py(),
+            "value": result_table.column("value").chunk(0)[i].as_py(),
+            "data": result_table.column("data").chunk(0)[i].as_py(),
+        }
+        for i in range(result_table.num_rows)
+    ]
+
+    # Verify all data exists (order not considered)
+    all_data_sorted = sorted(all_data, key=lambda x: (x["thread_id"], x["value"]))
+    result_data_sorted = sorted(result_data, key=lambda x: (x["thread_id"], x["value"]))
+
+    assert len(all_data_sorted) == len(result_data_sorted)
+
+    # Compare data item by item
+    for expected, actual in zip(all_data_sorted, result_data_sorted):
+        assert expected == actual, f"Data mismatch: expected {expected}, got {actual}"
+
+    # Verify data from each thread exists
+    thread_ids_in_result = set(result_table.column("thread_id").chunk(0).to_pylist())
+    expected_thread_ids = set(range(num_threads))
+    assert thread_ids_in_result == expected_thread_ids
+
+    # Verify record count for each thread
+    for thread_id in range(num_threads):
+        thread_rows = result_table.filter(
+            pc.equal(result_table.column("thread_id"), thread_id)
+        )
+        assert thread_rows.num_rows == records_per_thread
