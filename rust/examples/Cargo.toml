@@ -31,6 +31,10 @@ path = "src/llm_dataset_creation.rs"
 name = "write_read_ds"
 path = "src/write_read_ds.rs"
 
+[[example]]
+name = "perf_vector_search"
+path = "src/perf_vector_search.rs"
+
 [dependencies]
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
