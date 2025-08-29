@@ -72,7 +72,6 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::wrap_json_stream_for_reading;
-use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
