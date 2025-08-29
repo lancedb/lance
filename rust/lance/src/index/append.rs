@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lance_core::{Error, Result};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::IndexType;
-use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::InvertedIndex};
+use lance_index::scalar::CreatedIndex;
+use lance_index::VECTOR_INDEX_VERSION;
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
 use snafu::location;
@@ -17,14 +18,16 @@ use uuid::Uuid;
 use super::vector::ivf::optimize_vector_indices;
 use super::DatasetIndexInternalExt;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
+use crate::index::scalar::load_training_data;
+use crate::index::vector_index_details;
 
 pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
     pub new_fragment_bitmap: RoaringBitmap,
     pub new_index_version: i32,
+    pub new_index_details: prost_types::Any,
 }
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
@@ -85,7 +88,7 @@ pub async fn merge_indices<'a>(
     });
 
     let index_type = indices[0].index_type();
-    let (new_uuid, indices_merged) = match index_type {
+    let (new_uuid, indices_merged, created_index) = match index_type {
         it if it.is_scalar() => {
             // There are no delta indices for scalar, so adding all indexed
             // fragments to the new index.
@@ -101,50 +104,29 @@ pub async fn merge_indices<'a>(
                 )
                 .await?;
 
-            let need_full_data = match index.index_type() {
-                IndexType::Inverted => {
-                    // we can't directly update the legacy inverted index to the new format,
-                    // so we need to read the full data and rebuild it.
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or(Error::Index {
-                                message: "Append index: invalid index type".to_string(),
-                                location: location!(),
-                            })?;
-                    index.is_legacy()
-                }
+            let update_criteria = index.update_criteria();
 
-                _ => false,
+            let fragments = if update_criteria.requires_old_data {
+                None
+            } else {
+                Some(unindexed.clone())
             };
-
-            let mut scanner = dataset.scan();
-            let ordering = match index.index_type() {
-                IndexType::Inverted => None,
-                _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
-            };
-            // ZoneMap filter replies on row_address to do categorization
-            if index.index_type() == IndexType::ZoneMap {
-                scanner.with_row_address();
-            }
-
-            scanner
-                .with_row_id()
-                .order_by(ordering)?
-                .project(&[&column.name])?;
-
-            if !need_full_data {
-                scanner.with_fragments(unindexed);
-            }
-            let new_data_stream = scanner.try_into_stream().await?;
+            let new_data_stream = load_training_data(
+                dataset.as_ref(),
+                &column.name,
+                &update_criteria.data_criteria,
+                fragments,
+                true,
+            )
+            .await?;
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
-            index.update(new_data_stream.into(), &new_store).await?;
+            let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+            let created_index = index.update(new_data_stream, &new_store).await?;
 
-            Ok((new_uuid, 1))
+            // TODO: don't hard-code index version
+            Ok((new_uuid, 1, created_index))
         }
         it if it.is_vector() => {
             let start_pos = old_indices
@@ -169,7 +151,7 @@ pub async fn merge_indices<'a>(
                 Some(scanner.try_into_stream().await?)
             };
 
-            optimize_vector_indices(
+            let (new_uuid, indices_merged) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
                 &column.name,
@@ -177,7 +159,15 @@ pub async fn merge_indices<'a>(
                 options,
             )
             .boxed()
-            .await
+            .await?;
+            Ok((
+                new_uuid,
+                indices_merged,
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: VECTOR_INDEX_VERSION,
+                },
+            ))
         }
         _ => Err(Error::Index {
             message: format!(
@@ -197,7 +187,8 @@ pub async fn merge_indices<'a>(
         new_uuid,
         removed_indices,
         new_fragment_bitmap: frag_bitmap,
-        new_index_version: index_type.version(),
+        new_index_version: created_index.index_version as i32,
+        new_index_details: created_index.index_details,
     }))
 }
 

@@ -25,13 +25,15 @@ use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
 use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
+use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
-    FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
-    SargableQueryParser, ScalarQueryParser, TextQueryParser,
+    IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
 };
+use lance_index::scalar::inverted::InvertedIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{ScalarIndex, ScalarIndexType};
+use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use lance_index::scalar::{CreatedIndex, ScalarIndex};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
@@ -42,9 +44,8 @@ use lance_index::{
     metrics::{MetricsCollector, NoOpMetricsCollector},
     ScalarIndexCriteria,
 };
-use lance_index::{optimize::OptimizeOptions, scalar::inverted::train_inverted_index};
 use lance_index::{pb, vector::VectorIndex, Index, IndexType, INDEX_FILE_NAME};
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -55,7 +56,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::{detect_scalar_index_type, index_matches_criteria, infer_index_type, TrainingRequest};
+use scalar::index_matches_criteria;
 use serde_json::json;
 use snafu::location;
 use tracing::{info, instrument};
@@ -74,14 +75,16 @@ pub mod vector;
 use self::append::merge_indices;
 use self::vector::remap_vector_index;
 use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::optimize::remapping::RemapResult;
+use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
+use crate::index::scalar::{fetch_index_details, load_training_data, IndexDetails};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{dataset::Dataset, Error, Result};
 pub use create::CreateIndexBuilder;
-use lance_index::scalar::inverted::InvertedIndex;
 
 // Cache keys for different index types
 #[derive(Debug, Clone)]
@@ -203,7 +206,7 @@ pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &HashMap<u64, Option<u64>>,
-) -> Result<Option<Uuid>> {
+) -> Result<RemapResult> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
     let matched = indices
@@ -233,7 +236,7 @@ pub(crate) async fn remap_index(
             // This can happen if there is a bug where the index is covering empty
             // fragment that haven't been cleaned up. They should be cleaned up
             // outside of this function.
-            return Ok(Some(*index_id));
+            return Ok(RemapResult::Keep(*index_id));
         }
     }
 
@@ -250,15 +253,15 @@ pub(crate) async fn remap_index(
         .open_generic_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
         .await?;
 
-    match generic.index_type() {
+    let created_index = match generic.index_type() {
         it if it.is_scalar() => {
-            let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
+            let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id.to_string())?;
 
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
             if !scalar_index.can_remap() {
-                return Ok(None);
+                return Ok(RemapResult::Drop);
             }
 
             match scalar_index.index_type() {
@@ -276,23 +279,26 @@ pub(crate) async fn remap_index(
                             index_id,
                             field.name
                         );
-                        let training_request = Box::new(TrainingRequest::new(
-                            Arc::new(dataset.clone()),
-                            field.name.clone(),
+                        let training_data = load_training_data(
+                            dataset,
+                            &field.name,
+                            &TrainingCriteria::new(TrainingOrdering::None),
+                            None,
                             true, // Legacy reindexing should always train
-                        ));
-                        train_inverted_index(
-                            training_request,
+                        )
+                        .await?;
+                        InvertedIndexPlugin::train_inverted_index(
+                            training_data,
                             &new_store,
                             inverted_index.params().clone(),
                         )
-                        .await?;
+                        .await?
                     } else {
-                        scalar_index.remap(row_id_map, &new_store).await?;
+                        scalar_index.remap(row_id_map, &new_store).await?
                     }
                 }
                 _ => scalar_index.remap(row_id_map, &new_store).await?,
-            };
+            }
         }
         it if it.is_vector() => {
             remap_vector_index(
@@ -304,6 +310,13 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
+            CreatedIndex {
+                index_details: prost_types::Any::from_msg(
+                    &lance_table::format::pb::VectorIndexDetails::default(),
+                )
+                .unwrap(),
+                index_version: VECTOR_INDEX_VERSION,
+            }
         }
         _ => {
             return Err(Error::Index {
@@ -311,9 +324,14 @@ pub(crate) async fn remap_index(
                 location: location!(),
             });
         }
-    }
+    };
 
-    Ok(Some(new_id))
+    Ok(RemapResult::Remapped(RemappedIndex {
+        old_id: *index_id,
+        new_id,
+        index_details: created_index.index_details,
+        index_version: created_index.index_version,
+    }))
 }
 
 #[derive(Debug)]
@@ -586,9 +604,8 @@ impl DatasetIndexExt for Dataset {
                         let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                             bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
                         });
-                        let is_fts_index = if let Some(_details) = &idx.index_details {
-                            use crate::index::scalar::infer_index_type;
-                            matches!(infer_index_type(idx), Some(IndexType::Inverted))
+                        let is_fts_index = if let Some(details) = &idx.index_details {
+                            IndexDetails(details.clone()).supports_fts()
                         } else {
                             false
                         };
@@ -641,7 +658,7 @@ impl DatasetIndexExt for Dataset {
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(res.new_fragment_bitmap),
-                index_details: last_idx.index_details.clone(),
+                index_details: Some(Arc::new(res.new_index_details)),
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // Mew merged index file locates in the cloned dataset.
@@ -875,16 +892,23 @@ impl DatasetIndexExt for Dataset {
 
 fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
     indices.retain(|idx| {
-        let max_valid_version = infer_index_type(idx)
-            .map(|t| t.version())
+        let max_supported_version = idx
+            .index_details
+            .as_ref()
+            .map(|details| {
+                IndexDetails(details.clone())
+                    .index_version()
+                    // If we don't know how to read the index, it isn't supported
+                    .unwrap_or(i32::MAX as u32)
+            })
             .unwrap_or_default();
-        let is_valid = idx.index_version <= max_valid_version;
+        let is_valid = idx.index_version <= max_supported_version as i32;
         if !is_valid {
             log::warn!(
                 "Index {} has version {}, which is not supported (<={}), ignoring it",
                 idx.name,
                 idx.index_version,
-                max_valid_version,
+                max_supported_version,
             );
         }
         is_valid
@@ -1344,9 +1368,8 @@ impl DatasetIndexInternalExt for Dataset {
                 .any(|f| is_vector_field(f.data_type()));
 
             // Check if this is an FTS index by looking at index details
-            let is_fts_index = if let Some(_details) = &idx.index_details {
-                use crate::index::scalar::infer_index_type;
-                matches!(infer_index_type(idx), Some(IndexType::Inverted))
+            let is_fts_index = if let Some(details) = &idx.index_details {
+                IndexDetails(details.clone()).supports_fts()
             } else {
                 false
             };
@@ -1366,48 +1389,13 @@ impl DatasetIndexInternalExt for Dataset {
                 ),
                 location: location!(),
             })?;
-            let index_type = detect_scalar_index_type(self, index, &field.name).await?;
+            let index_details = IndexDetails(fetch_index_details(self, &field.name, index).await?);
+            let plugin = index_details.get_plugin()?;
+            let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
-            let query_parser = match field.data_type() {
-                DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))
-                    as Box<dyn ScalarQueryParser>,
-                DataType::Utf8 | DataType::LargeUtf8 => match index_type {
-                    ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
-                        Box::new(SargableQueryParser::new(index.name.clone(), false))
-                            as Box<dyn ScalarQueryParser>
-                    }
-                    ScalarIndexType::ZoneMap => {
-                        Box::new(SargableQueryParser::new(index.name.clone(), true))
-                            as Box<dyn ScalarQueryParser>
-                    }
-                    ScalarIndexType::NGram => {
-                        Box::new(TextQueryParser::new(index.name.clone(), true))
-                            as Box<dyn ScalarQueryParser>
-                    }
-                    ScalarIndexType::Inverted => {
-                        let fts_index =
-                            lance_index::scalar::expression::ScalarIndexLoader::load_index(
-                                self,
-                                &field.name,
-                                &index.name,
-                                &NoOpMetricsCollector,
-                            )
-                            .await?;
-                        let fts_index = fts_index.as_any().downcast_ref::<InvertedIndex>().unwrap();
-                        Box::new(FtsQueryParser::new(index.name.clone(), fts_index.clone()))
-                            as Box<dyn ScalarQueryParser>
-                    }
-                    _ => continue,
-                },
-                _ => {
-                    // inexact index filter
-                    let needs_recheck = matches!(index_type, ScalarIndexType::ZoneMap);
-                    Box::new(SargableQueryParser::new(index.name.clone(), needs_recheck))
-                        as Box<dyn ScalarQueryParser>
-                }
-            };
-
-            indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+            if let Some(query_parser) = query_parser {
+                indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+            }
         }
         let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
         for indexed_field in indexed_fields {
@@ -2350,7 +2338,7 @@ mod tests {
         let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
             .await
             .unwrap();
-        assert_eq!(new_uuid, Some(index_uuid));
+        assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
     }
 
     #[tokio::test]

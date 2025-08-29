@@ -495,7 +495,18 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
         let new_id = Uuid::parse_str(&new_id)
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
-        Ok(Self(RewrittenIndex { old_id, new_id }))
+        let new_details_type_url: String = ob.getattr("new_details_type_url")?.extract()?;
+        let new_details_value: Vec<u8> = ob.getattr("new_details_value")?.extract()?;
+        let new_index_version: u32 = ob.getattr("new_index_version")?.extract()?;
+        Ok(Self(RewrittenIndex {
+            old_id,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: new_details_type_url,
+                value: new_details_value,
+            },
+            new_index_version,
+        }))
     }
 }
 

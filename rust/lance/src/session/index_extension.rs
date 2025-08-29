@@ -311,10 +311,6 @@ mod test {
             self
         }
 
-        fn index_type(&self) -> IndexType {
-            IndexType::Vector
-        }
-
         fn index_name(&self) -> &str {
             "TEST"
         }

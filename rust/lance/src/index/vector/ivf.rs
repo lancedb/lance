@@ -1876,6 +1876,7 @@ mod tests {
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::VECTOR_INDEX_VERSION;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
@@ -2282,8 +2283,8 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
-            index_details: Some(vector_index_details()),
-            index_version: 1, // Use version 1 for IVF PQ index
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
         };
@@ -2314,11 +2315,20 @@ mod tests {
             .unwrap();
 
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
-        let prefilter = Arc::new(DatasetPreFilter::new(
-            Arc::new(dataset_mut.clone()),
-            std::slice::from_ref(&index_meta),
-            None,
-        ));
+
+        let index_meta = lance_table::format::Index {
+            uuid,
+            dataset_version: 0,
+            fields: Vec::new(),
+            name: INDEX_NAME.to_string(),
+            fragment_bitmap: None,
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
+            created_at: None, // Test index, not setting timestamp
+            base_id: None,
+        };
+
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
@@ -2377,8 +2387,8 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
-            index_details: Some(vector_index_details()),
-            index_version: index.index_type().version(),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
         };

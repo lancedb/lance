@@ -3657,6 +3657,9 @@ class LanceOperation:
 
         old_id: str
         new_id: str
+        new_details_type_url: str
+        new_details_value: bytes
+        new_index_version: int
 
     @dataclass
     class Rewrite(BaseOperation):

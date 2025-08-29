@@ -13,6 +13,7 @@ fn main() -> Result<()> {
 
     let mut prost_build = prost_build::Config::new();
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
+    prost_build.enable_type_names();
     prost_build.compile_protos(&["./protos/index.proto"], &["./protos"])?;
 
     let rust_toolchain = env::var("RUSTUP_TOOLCHAIN")

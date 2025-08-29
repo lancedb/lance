@@ -28,7 +28,6 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
-use lance_index::scalar::ScalarIndexType;
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use tracing::instrument;
@@ -215,7 +214,7 @@ impl ExecutionPlan for MatchQueryExec {
                 .load_scalar_index(
                     ScalarIndexCriteria::default()
                         .for_column(&column)
-                        .with_type(ScalarIndexType::Inverted),
+                        .supports_fts(),
                 )
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
@@ -407,7 +406,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 .load_scalar_index(
                     ScalarIndexCriteria::default()
                         .for_column(&column)
-                        .with_type(ScalarIndexType::Inverted),
+                        .supports_fts(),
                 )
                 .await?
                 .ok_or(DataFusionError::Execution(format!(
@@ -605,7 +604,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 .load_scalar_index(
                     ScalarIndexCriteria::default()
                         .for_column(&column)
-                        .with_type(ScalarIndexType::Inverted),
+                        .supports_fts(),
                 )
                 .await?
                 .ok_or(DataFusionError::Execution(format!(

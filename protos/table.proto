@@ -394,21 +394,7 @@ message ExternalFile {
   uint64 size = 3;
 }
 
-// The following messages are used for the index_details field in IndexMetadata.
-//
-// This is not an exhaustive set of index types and just lists the index types supported
-// by a base distribution of Lance.
-
-// Currently these are all empty messages because all needed details are either hard-coded (e.g.
-// filenames) or stored in the index itself.  However, we may want to add more details in the
-// future, in particular we can add details that may be useful for planning queries (e.g. don't
-// force us to load the index until we know we need it)
-message BTreeIndexDetails {}
-message BitmapIndexDetails {}
-message LabelListIndexDetails {}
-message InvertedIndexDetails {}
-message NGramIndexDetails {}
-message ZoneMapIndexDetails {}
+// Empty details messages for older indexes that don't take advantage of the details field.
 message VectorIndexDetails {}
 
 message FragmentReuseIndexDetails {

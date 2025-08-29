@@ -18,15 +18,21 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
-use super::{bitmap::train_bitmap_index, SargableQuery};
-use super::{
-    bitmap::BitmapIndex, btree::TrainingSource, AnyQuery, IndexStore, LabelListQuery, ScalarIndex,
-};
+use super::SargableQuery;
+use super::{bitmap::BitmapIndex, AnyQuery, IndexStore, LabelListQuery, ScalarIndex};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
-use crate::{Index, IndexType};
+use crate::scalar::bitmap::BitmapIndexPlugin;
+use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
+use crate::scalar::registry::{
+    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    VALUE_COLUMN_NAME,
+};
+use crate::scalar::{CreatedIndex, UpdateCriteria};
+use crate::{pb, Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
+const LABEL_LIST_INDEX_VERSION: u32 = 0;
 
 #[async_trait]
 trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
@@ -59,6 +65,16 @@ pub struct LabelListIndex {
 impl LabelListIndex {
     fn new(values_index: Arc<dyn LabelListSubIndex>) -> Self {
         Self { values_index }
+    }
+
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: LanceCache,
+    ) -> Result<Arc<Self>> {
+        BitmapIndex::load(store, frag_reuse_index, index_cache)
+            .await
+            .map(|index| Arc::new(Self::new(index)))
     }
 }
 
@@ -169,23 +185,19 @@ impl ScalarIndex for LabelListIndex {
         true
     }
 
-    async fn load(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
-    ) -> Result<Arc<Self>> {
-        BitmapIndex::load(store, frag_reuse_index, index_cache)
-            .await
-            .map(|index| Arc::new(Self::new(index)))
-    }
-
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        self.values_index.remap(mapping, dest_store).await
+    ) -> Result<CreatedIndex> {
+        self.values_index.remap(mapping, dest_store).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+                .unwrap(),
+            index_version: LABEL_LIST_INDEX_VERSION,
+        })
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
@@ -193,10 +205,20 @@ impl ScalarIndex for LabelListIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         self.values_index
             .update(unnest_chunks(new_data)?, dest_store)
-            .await
+            .await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+                .unwrap(),
+            index_version: LABEL_LIST_INDEX_VERSION,
+        })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
     }
 }
 
@@ -307,37 +329,6 @@ fn unnest_batch(
     )?)
 }
 
-struct UnnestTrainingSource {
-    source: Box<dyn TrainingSource>,
-}
-
-#[async_trait]
-impl TrainingSource for UnnestTrainingSource {
-    async fn scan_ordered_chunks(
-        self: Box<Self>,
-        chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        let source = self.source.scan_ordered_chunks(chunk_size).await?;
-        unnest_chunks(source)
-    }
-
-    async fn scan_unordered_chunks(
-        self: Box<Self>,
-        chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        let source = self.source.scan_unordered_chunks(chunk_size).await?;
-        unnest_chunks(source)
-    }
-
-    async fn scan_aligned_chunks(
-        self: Box<Self>,
-        chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        let source = self.source.scan_aligned_chunks(chunk_size).await?;
-        unnest_chunks(source)
-    }
-}
-
 fn unnest_chunks(
     source: Pin<Box<dyn RecordBatchStream + Send>>,
 ) -> Result<SendableRecordBatchStream> {
@@ -353,14 +344,109 @@ fn unnest_chunks(
     )))
 }
 
-/// Trains a new label list index
-pub async fn train_label_list_index(
-    data_source: Box<dyn TrainingSource + Send>,
-    index_store: &dyn IndexStore,
-) -> Result<()> {
-    let unnest_source = Box::new(UnnestTrainingSource {
-        source: data_source,
-    });
+#[derive(Debug, Default)]
+pub struct LabelListIndexPlugin;
 
-    train_bitmap_index(unnest_source, index_store).await
+#[async_trait]
+impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn new_training_request(
+        &self,
+        _params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        if !matches!(
+            field.data_type(),
+            DataType::List(_) | DataType::LargeList(_)
+        ) {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
+                    field.data_type()
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+
+        Ok(Box::new(DefaultTrainingRequest::new(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+        )))
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        0
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(LabelListQueryParser::new(index_name)))
+    }
+
+    /// Train a new index
+    ///
+    /// The provided data must fulfill all the criteria returned by `training_criteria`
+    /// and the plugin can rely on this fact.
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+    ) -> Result<CreatedIndex> {
+        let schema = data.schema();
+        let field = schema
+            .column_with_name(VALUE_COLUMN_NAME)
+            .ok_or_else(|| Error::InvalidInput {
+                source: "Index training data missing value column"
+                    .to_string()
+                    .into(),
+                location: location!(),
+            })?
+            .1;
+
+        if !matches!(
+            field.data_type(),
+            DataType::List(_) | DataType::LargeList(_)
+        ) {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "LabelList index can only be created on List or LargeList type columns. Column has type {:?}",
+                    field.data_type()
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+
+        let data = unnest_chunks(data)?;
+        let bitmap_plugin = BitmapIndexPlugin;
+        bitmap_plugin
+            .train_index(data, index_store, request)
+            .await?;
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+                .unwrap(),
+            index_version: LABEL_LIST_INDEX_VERSION,
+        })
+    }
+
+    /// Load an index from storage
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(
+            LabelListIndex::load(index_store, frag_reuse_index, cache).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
 }
