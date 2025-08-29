@@ -14,7 +14,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pb;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::{
-    ZoneMapIndexBuilder, ZoneMapIndexBuilderOptions, ZoneMapIndexPlugin,
+    ZoneMapIndexBuilder, ZoneMapIndexBuilderParams, ZoneMapIndexPlugin,
 };
 use lance_index::scalar::{registry::ScalarIndexPlugin, SargableQuery};
 use lance_io::object_store::ObjectStore;
@@ -69,7 +69,7 @@ fn bench_zonemap(c: &mut Criterion) {
             );
 
             let mut builder = ZoneMapIndexBuilder::try_new(
-                ZoneMapIndexBuilderOptions::default(),
+                ZoneMapIndexBuilderParams::default(),
                 batch.schema().field(0).data_type().clone(),
             )
             .unwrap();

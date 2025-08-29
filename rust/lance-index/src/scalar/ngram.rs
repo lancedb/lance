@@ -1320,19 +1320,19 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{stream, TryStreamExt};
     use itertools::Itertools;
-    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
+    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ID};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use tantivy::tokenizer::TextAnalyzer;
     use tempfile::{tempdir, TempDir};
 
-    use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::{
         lance_format::LanceIndexStore,
         ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions},
         ScalarIndex, SearchResult, TextQuery,
     };
+    use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
 
     use super::{ngram_to_token, tokenize_visitor, NGRAM_TOKENIZER};
 
@@ -1442,8 +1442,8 @@ mod tests {
         ]);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Utf8, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1528,8 +1528,8 @@ mod tests {
 
     fn test_data_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Utf8, true),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
 
@@ -1658,8 +1658,8 @@ mod tests {
         let data = StringArray::from_iter(&[Some("giraffe"), Some("cat"), None]);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64 + 100));
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Utf8, true),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1700,10 +1700,10 @@ mod tests {
     async fn test_ngram_index_with_spill() {
         let (data, schema) = lance_datagen::gen_batch()
             .col(
-                "values",
+                VALUE_COLUMN_NAME,
                 lance_datagen::array::rand_utf8(ByteCount::from(50), false),
             )
-            .col("row_ids", lance_datagen::array::step::<UInt64Type>())
+            .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
             .into_reader_stream(RowCount::from(128), BatchCount::from(32));
 
         let data = Box::pin(RecordBatchStreamAdapter::new(

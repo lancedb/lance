@@ -598,12 +598,19 @@ impl ScalarIndex for ZoneMapIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(
+            TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
+        )
     }
+}
+
+fn default_rows_per_zone() -> u64 {
+    *DEFAULT_ROWS_PER_ZONE
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneMapIndexBuilderParams {
+    #[serde(default = "default_rows_per_zone")]
     rows_per_zone: u64,
 }
 
@@ -1030,7 +1037,7 @@ mod tests {
             ));
             Ok(RecordBatch::try_new(
                 schema_with_row_addr.clone(),
-                vec![batch.column(0).clone(), row_addr.clone()],
+                vec![batch.column(0).clone(), row_addr],
             )?)
         });
         Box::pin(RecordBatchStreamAdapter::new(schema, stream))
