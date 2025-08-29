@@ -68,7 +68,7 @@ use lance_index::{
 };
 use lance_index::{
     optimize::OptimizeOptions,
-    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
+    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
         sq::builder::SQBuildParams,
@@ -1500,19 +1500,36 @@ impl Dataset {
 
         log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
-            "BTREE" => Box::<ScalarIndexParams>::default(),
+            "BTREE" => Box::new(ScalarIndexParams {
+                params: Some(
+                    prost_types::Any::from_msg(&lance_index::pb::BTreeIndexParams::default())
+                        .unwrap(),
+                ),
+            }),
             "BITMAP" => Box::new(ScalarIndexParams {
                 // Temporary workaround until we add support for auto-detection of scalar index type
-                force_index_type: Some(ScalarIndexType::Bitmap),
+                params: Some(
+                    prost_types::Any::from_msg(&lance_index::pb::BitmapIndexParams::default())
+                        .unwrap(),
+                ),
             }),
             "NGRAM" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::NGram),
+                params: Some(
+                    prost_types::Any::from_msg(&lance_index::pb::NGramIndexParams::default())
+                        .unwrap(),
+                ),
             }),
             "ZONEMAP" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::ZoneMap),
+                params: Some(
+                    prost_types::Any::from_msg(&lance_index::pb::ZoneMapIndexParams::default())
+                        .unwrap(),
+                ),
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::LabelList),
+                params: Some(
+                    prost_types::Any::from_msg(&lance_index::pb::LabelListIndexParams::default())
+                        .unwrap(),
+                ),
             }),
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();

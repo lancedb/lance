@@ -148,6 +148,17 @@ impl ScalarIndexPluginRegistry {
             .insert(L::type_url(), Box::new(P::default()));
     }
 
+    pub fn add_plugin_with_alias<P: ScalarIndexPlugin + std::default::Default + 'static>(
+        &mut self,
+        params_url: impl Into<String>,
+        details_url: impl Into<String>,
+    ) {
+        self.params_url_to_plugin
+            .insert(params_url.into(), Box::new(P::default()));
+        self.details_url_to_plugin
+            .insert(details_url.into(), Box::new(P::default()));
+    }
+
     /// Create a registry with the default plugins
     pub fn with_default_plugins() -> Self {
         let mut registry = Self {
@@ -162,6 +173,35 @@ impl ScalarIndexPluginRegistry {
             .add_plugin::<pb::ZoneMapIndexParams, pb::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
         registry
             .add_plugin::<pb::InvertedIndexParams, pb::InvertedIndexDetails, InvertedIndexPlugin>();
+
+        // Older versions of lance had the index parameters / details in the table format package
+        //
+        // No need to update this list for new plugins
+        registry.add_plugin_with_alias::<InvertedIndexPlugin>(
+            "/lance.table.InvertedIndexParams",
+            "/lance.table.InvertedIndexDetails",
+        );
+        registry.add_plugin_with_alias::<BitmapIndexPlugin>(
+            "/lance.table.BitmapIndexParams",
+            "/lance.table.BitmapIndexDetails",
+        );
+        registry.add_plugin_with_alias::<BTreeIndexPlugin>(
+            "/lance.table.BTreeIndexParams",
+            "/lance.table.BTreeIndexDetails",
+        );
+        registry.add_plugin_with_alias::<NGramIndexPlugin>(
+            "/lance.table.NGramIndexParams",
+            "/lance.table.NGramIndexDetails",
+        );
+        registry.add_plugin_with_alias::<ZoneMapIndexPlugin>(
+            "/lance.table.ZoneMapIndexParams",
+            "/lance.table.ZoneMapIndexDetails",
+        );
+        registry.add_plugin_with_alias::<LabelListIndexPlugin>(
+            "/lance.table.LabelListIndexParams",
+            "/lance.table.LabelListIndexDetails",
+        );
+
         registry
     }
 
