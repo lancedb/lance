@@ -994,7 +994,7 @@ mod tests {
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-    use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
@@ -2945,7 +2945,7 @@ mod tests {
                 &["doc"],
                 IndexType::Inverted,
                 index_name.clone(),
-                &ScalarIndexParams::default(),
+                &InvertedIndexParams::default(),
                 false,
             )
             .await
@@ -3014,7 +3014,7 @@ mod tests {
                 &["doc"],
                 IndexType::Inverted,
                 index_name.clone(),
-                &ScalarIndexParams::default(),
+                &InvertedIndexParams::default(),
                 true,
             )
             .await
