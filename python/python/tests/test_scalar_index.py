@@ -1839,3 +1839,291 @@ def test_fts_backward_v0_27_0(tmp_path: Path):
         full_text_query="new",
     )
     assert res.num_rows == 1
+
+
+def generate_multi_fragment_dataset(tmp_path, num_fragments=4, rows_per_fragment=250):
+    """
+    Generate a test dataset with multiple fragments for testing fragment-level indexing.
+    Uses coherent English text similar to "frodo was a puppy" instead of random strings.
+
+    Parameters
+    ----------
+    tmp_path : Path
+        Temporary path for the dataset
+    num_fragments : int, default 4
+        Number of fragments to create
+    rows_per_fragment : int, default 250
+        Number of rows per fragment
+
+    Returns
+    -------
+    lance.LanceDataset
+        Dataset with multiple fragments
+    """
+
+    # Collection of coherent English sentences for text indexing tests
+    # Based on the pattern used in other tests like "frodo was a puppy"
+    coherent_sentences = [
+        "frodo was a puppy",
+        "frodo was a happy puppy",
+        "frodo was a very happy puppy",
+        "frodo was a puppy with a tail",
+        "gandalf carried a staff",
+        "gandalf was a wise wizard",
+        "gandalf carried his wooden staff",
+        "gandalf wore a grey robe",
+        "aragorn became the king",
+        "aragorn was a brave ranger",
+        "aragorn carried his sword",
+        "aragorn wore a crown",
+        "legolas shot many arrows",
+        "legolas was an elf archer",
+        "legolas had keen eyes",
+        "legolas climbed tall trees",
+        "gimli swung his axe",
+        "gimli was a dwarf warrior",
+        "gimli had a long beard",
+        "gimli loved precious gems",
+        "sam cooked delicious meals",
+        "sam was a loyal friend",
+        "sam carried heavy bags",
+        "sam tended the garden",
+        "pippin played his flute",
+        "pippin was very curious",
+        "pippin loved second breakfast",
+        "pippin climbed apple trees",
+        "merry sang cheerful songs",
+        "merry was quite clever",
+        "merry rode a pony",
+        "merry studied old maps",
+        "boromir blew his horn",
+        "boromir was a proud warrior",
+        "boromir defended his city",
+        "boromir carried a shield",
+        "the ring was very powerful",
+        "the ring glowed with fire",
+        "the ring whispered secrets",
+        "the ring corrupted minds",
+        "the shire was peaceful",
+        "the shire had green hills",
+        "the shire grew fine crops",
+        "the shire welcomed visitors",
+        "eagles soared through clouds",
+        "eagles had sharp talons",
+        "eagles nested on peaks",
+        "eagles watched the valleys",
+        "dragons hoarded gold treasures",
+        "dragons breathed hot flames",
+        "dragons slept for centuries",
+        "dragons guarded ancient caves",
+    ]
+
+    def generate_coherent_text():
+        """Generate coherent English text by selecting from predefined sentences."""
+        return random.choice(coherent_sentences)
+
+    # Create first fragment
+    first_data = pa.table(
+        {
+            "id": pa.array(range(rows_per_fragment)),
+            "text": pa.array(
+                [generate_coherent_text() for _ in range(rows_per_fragment)]
+            ),
+            "value": pa.array(np.random.rand(rows_per_fragment) * 100),
+        }
+    )
+
+    ds = lance.write_dataset(first_data, tmp_path, max_rows_per_file=rows_per_fragment)
+
+    # Add additional fragments
+    for i in range(1, num_fragments):
+        start_id = i * rows_per_fragment
+        fragment_data = pa.table(
+            {
+                "id": pa.array(range(start_id, start_id + rows_per_fragment)),
+                "text": pa.array(
+                    [generate_coherent_text() for _ in range(rows_per_fragment)]
+                ),
+                "value": pa.array(np.random.rand(rows_per_fragment) * 100),
+            }
+        )
+        ds = lance.write_dataset(
+            fragment_data, tmp_path, mode="append", max_rows_per_file=rows_per_fragment
+        )
+
+    # Verify we have the expected number of fragments
+    fragments = ds.get_fragments()
+    assert len(fragments) == num_fragments, (
+        f"Expected {num_fragments} fragments, got {len(fragments)}"
+    )
+
+    return ds
+
+
+def test_distribute_fts_index_build(tmp_path):
+    """
+    This test creates indices on individual fragments
+    and then commits them as a single index.
+    """
+    # Generate test dataset with multiple fragments
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=250
+    )
+
+    import uuid
+
+    index_id = str(uuid.uuid4())
+    print(f"Using index ID: {index_id}")
+    index_name = "multiple_fragment_idx"
+
+    fragments = ds.get_fragments()
+    fragment_ids = [fragment.fragment_id for fragment in fragments]
+    print(f"Fragment IDs: {fragment_ids}")
+
+    for fragment in ds.get_fragments():
+        fragment_id = fragment.fragment_id
+        print(f"Creating index for fragment {fragment_id}")
+
+        # Use the new fragment_ids and fragment_uuid parameters
+        ds.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            name=index_name,
+            replace=False,
+            fragment_uuid=index_id,
+            fragment_ids=[fragment_id],
+            remove_stopwords=False,
+        )
+
+        # For fragment-level indexing, we expect the method to return successfully
+        # but not commit the index yet
+        print(f"Fragment {fragment_id} index created successfully")
+
+    # Merge the inverted index metadata
+    ds.merge_index_metadata(index_id)
+
+    # Create an Index object using the new dataclass format
+    from lance.dataset import Index
+
+    # Get the schema field for the indexed column
+    # Only use for non nested struct schema
+    field_id = ds.schema.get_field_index("text")
+
+    index = Index(
+        uuid=index_id,
+        name=index_name,
+        fields=[field_id],  # Use field index instead of field object
+        dataset_version=ds.version,
+        fragment_ids=set(fragment_ids),
+        index_version=0,
+    )
+
+    # Create the index operation
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+
+    # Commit the index
+    ds_committed = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    print("Successfully committed multiple fragment index")
+
+    # Verify the index was created and is functional
+    indices = ds_committed.list_indices()
+    assert len(indices) > 0, "No indices found after commit"
+
+    # Find our index
+    our_index = None
+    for idx in indices:
+        if idx["name"] == index_name:
+            our_index = idx
+            break
+
+    assert our_index is not None, f"Index '{index_name}' not found in indices list"
+    assert our_index["type"] == "Inverted", (
+        f"Expected Inverted index, got {our_index['type']}"
+    )
+
+    # Test that the index works for searching
+    # Get a sample text from the dataset to search for
+    sample_data = ds_committed.take([0], columns=["text"])
+    sample_text = sample_data.column(0)[0].as_py()
+    search_word = sample_text.split()[0] if sample_text.split() else "test"
+
+    # Perform a full-text search to verify the index works
+    results = ds_committed.scanner(
+        full_text_query=search_word,
+        columns=["id", "text"],
+    ).to_table()
+
+    print(f"Search for '{search_word}' returned {results.num_rows} results")
+    # We should get at least one result since we searched for a word from the dataset
+    assert results.num_rows > 0, f"No results found for search term '{search_word}'"
+
+
+def test_fragment_ids_parameter_validation(tmp_path):
+    """
+    Test validation of fragment_ids parameter.
+    """
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=100
+    )
+
+    # Test with valid fragment IDs
+    fragments = ds.get_fragments()
+    valid_fragment_id = fragments[0].fragment_id
+
+    # This should work without errors
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        fragment_ids=[valid_fragment_id],
+    )
+
+    # Test with invalid fragment ID (should handle gracefully)
+    # Note: The exact behavior for invalid fragment IDs may vary
+    # This test ensures the parameter is properly passed through
+    try:
+        ds.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            fragment_ids=[999999],  # Non-existent fragment ID
+        )
+    except Exception as e:
+        # It's acceptable for this to fail with an appropriate error
+        print(f"Expected error for invalid fragment ID: {e}")
+
+
+def test_backward_compatibility_no_fragment_ids(tmp_path):
+    """
+    Test that the API remains backward compatible when fragment_ids is not provided.
+    """
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=100
+    )
+
+    # This should work exactly as before (full dataset indexing)
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        name="full_dataset_idx",
+    )
+
+    # Verify the index was created
+    indices = ds.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["name"] == "full_dataset_idx"
+    assert indices[0]["type"] == "Inverted"
+
+    # Test that the index works
+    sample_data = ds.take([0], columns=["text"])
+    sample_text = sample_data.column(0)[0].as_py()
+    search_word = sample_text.split()[0] if sample_text.split() else "test"
+
+    results = ds.scanner(full_text_query=search_word).to_table()
+    assert results.num_rows > 0

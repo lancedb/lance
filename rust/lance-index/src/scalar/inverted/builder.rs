@@ -77,9 +77,9 @@ pub static LANCE_FTS_TARGET_SIZE: LazyLock<u64> = LazyLock::new(|| {
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
-    partitions: Vec<u64>,
+    pub(crate) partitions: Vec<u64>,
     new_partitions: Vec<u64>,
-
+    fragment_mask: Option<u64>,
     _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
     src_store: Arc<dyn IndexStore>,
@@ -87,13 +87,32 @@ pub struct InvertedIndexBuilder {
 
 impl InvertedIndexBuilder {
     pub fn new(params: InvertedIndexParams) -> Self {
-        Self::from_existing_index(params, None, Vec::new())
+        Self::new_with_mask(params, None)
+    }
+
+    pub fn new_with_mask(params: InvertedIndexParams, fragment_mask: Option<u64>) -> Self {
+        Self::from_existing_index_with_mask(params, None, Vec::new(), fragment_mask)
     }
 
     pub fn from_existing_index(
         params: InvertedIndexParams,
         store: Option<Arc<dyn IndexStore>>,
         partitions: Vec<u64>,
+    ) -> Self {
+        Self::from_existing_index_with_mask(params, store, partitions, None)
+    }
+
+    /// Creates an InvertedIndexBuilder from existing index with fragment filtering.
+    /// This method is used to create a builder from an existing index while applying
+    /// fragment-based filtering for distributed indexing scenarios.
+    /// fragment_mask Optional mask with fragment_id in high 32 bits for filtering.
+    /// Constructed as `(fragment_id as u64) << 32`.
+    /// When provided, ensures that generated IDs belong to the specified fragment.
+    pub fn from_existing_index_with_mask(
+        params: InvertedIndexParams,
+        store: Option<Arc<dyn IndexStore>>,
+        partitions: Vec<u64>,
+        fragment_mask: Option<u64>,
     ) -> Self {
         let tmpdir = tempdir().unwrap();
         let local_store = Arc::new(LanceIndexStore::new(
@@ -109,6 +128,7 @@ impl InvertedIndexBuilder {
             _tmpdir: tmpdir,
             local_store,
             src_store,
+            fragment_mask,
         }
     }
 
@@ -153,9 +173,11 @@ impl InvertedIndexBuilder {
             let tokenizer = tokenizer.clone();
             let receiver = receiver.clone();
             let id_alloc = id_alloc.clone();
+            let fragment_mask = self.fragment_mask;
             let task = tokio::task::spawn(async move {
                 let mut worker =
-                    IndexWorker::new(store, tokenizer, with_position, id_alloc).await?;
+                    IndexWorker::new(store, tokenizer, with_position, id_alloc, fragment_mask)
+                        .await?;
                 while let Ok(batch) = receiver.recv().await {
                     worker.process_batch(batch).await?;
                 }
@@ -225,7 +247,14 @@ impl InvertedIndexBuilder {
             builder.remap(mapping).await?;
             builder.write(dest_store).await?;
         }
-        self.write_metadata(dest_store, &self.partitions).await?;
+        if self.fragment_mask.is_none() {
+            self.write_metadata(dest_store, &self.partitions).await?;
+        } else {
+            // in distributed mode, the part_temp_metadata is written by the worker
+            for &partition_id in &self.partitions {
+                self.write_part_metadata(dest_store, partition_id).await?;
+            }
+        }
         Ok(())
     }
 
@@ -236,6 +265,29 @@ impl InvertedIndexBuilder {
         ]);
         let mut writer = dest_store
             .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
+            .await?;
+        writer.finish_with_metadata(metadata).await?;
+        Ok(())
+    }
+
+    /// Write partition metadata file for a single partition
+    ///
+    /// In a distributed environment, each worker node can write partition metadata files for the partitions it processes,
+    /// which are then merged into a final metadata file using the `merge_metadata_files` function.
+    pub(crate) async fn write_part_metadata(
+        &self,
+        dest_store: &dyn IndexStore,
+        partition: u64, // Modify parameter type
+    ) -> Result<()> {
+        let partitions = vec![partition];
+        let metadata = HashMap::from_iter(vec![
+            ("partitions".to_owned(), serde_json::to_string(&partitions)?),
+            ("params".to_owned(), serde_json::to_string(&self.params)?),
+        ]);
+        // Use partition ID to generate a unique temporary filename
+        let file_name = part_metadata_file_path(partition);
+        let mut writer = dest_store
+            .new_index_file(&file_name, Arc::new(Schema::empty()))
             .await?;
         writer.finish_with_metadata(metadata).await?;
         Ok(())
@@ -265,7 +317,14 @@ impl InvertedIndexBuilder {
         .await?;
         let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
         let partitions = merger.merge().await?;
-        self.write_metadata(dest_store, &partitions).await?;
+
+        if self.fragment_mask.is_none() {
+            self.write_metadata(dest_store, &partitions).await?;
+        } else {
+            for &partition_id in &partitions {
+                self.write_part_metadata(dest_store, partition_id).await?;
+            }
+        }
         Ok(())
     }
 }
@@ -439,6 +498,7 @@ struct IndexWorker {
     schema: SchemaRef,
     estimated_size: u64,
     total_doc_length: usize,
+    fragment_mask: Option<u64>,
 }
 
 impl IndexWorker {
@@ -447,6 +507,7 @@ impl IndexWorker {
         tokenizer: tantivy::tokenizer::TextAnalyzer,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
+        fragment_mask: Option<u64>,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
@@ -454,7 +515,8 @@ impl IndexWorker {
             store,
             tokenizer,
             builder: InnerBuilder::new(
-                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    | fragment_mask.unwrap_or(0),
                 with_position,
             ),
             partitions: Vec::new(),
@@ -462,6 +524,7 @@ impl IndexWorker {
             schema,
             estimated_size: 0,
             total_doc_length: 0,
+            fragment_mask,
         })
     }
 
@@ -539,13 +602,13 @@ impl IndexWorker {
             &mut self.builder,
             InnerBuilder::new(
                 self.id_alloc
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    | self.fragment_mask.unwrap_or(0),
                 with_position,
             ),
         );
         builder.write(self.store.as_ref()).await?;
-        self.partitions.push(builder.id);
-
+        self.partitions.push(builder.id());
         Ok(())
     }
 
@@ -727,4 +790,100 @@ pub(crate) fn posting_file_path(partition_id: u64) -> String {
 
 pub(crate) fn doc_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, DOCS_FILE)
+}
+
+pub(crate) fn part_metadata_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, METADATA_FILE)
+}
+
+/// Merge multiple partition metadata files into a complete metadata file
+///
+/// In a distributed environment, each worker node writes partition metadata files for the partitions it processes,
+/// and this function merges these files into a final metadata file.
+pub async fn merge_metadata_files(
+    store: Arc<dyn IndexStore>,
+    part_metadata_files: &[String],
+) -> Result<()> {
+    // Collect partition information from all partition metadata files
+    let mut all_partitions: Vec<u64> = Vec::new();
+    let mut params = None;
+
+    for file_name in part_metadata_files {
+        let reader = store.open_index_file(file_name).await?;
+        let metadata = &reader.schema().metadata;
+
+        // Parse partition information
+        let partitions_str = metadata.get("partitions").ok_or(Error::Index {
+            message: format!("partitions not found in metadata file {}", file_name),
+            location: location!(),
+        })?;
+
+        // Only process the new format (u64 array), properly handle JSON deserialization errors
+        let partition_ids: Vec<u64> =
+            serde_json::from_str(partitions_str).map_err(|e| Error::Index {
+                message: format!("Failed to parse partitions from file {}: {}", file_name, e),
+                location: location!(),
+            })?;
+
+        all_partitions.extend(partition_ids);
+
+        if params.is_none() {
+            let params_str = metadata.get("params").ok_or(Error::Index {
+                message: format!("params not found in metadata file {}", file_name),
+                location: location!(),
+            })?;
+            params = Some(
+                serde_json::from_str::<InvertedIndexParams>(params_str).map_err(|e| {
+                    Error::Index {
+                        message: format!("Failed to parse params from file {}: {}", file_name, e),
+                        location: location!(),
+                    }
+                })?,
+            );
+        }
+    }
+
+    // Write the merged metadata
+    // Create a temporary InvertedIndexBuilder to write the merged metadata
+    let params = params.unwrap_or_default();
+    let builder = InvertedIndexBuilder::new_with_mask(params, None);
+
+    // Write the merged metadata
+    builder.write_metadata(&*store, &all_partitions).await?;
+
+    // After successfully writing the metadata, delete all partition metadata files
+    // Only perform deletion after metadata is successfully written, ensuring debug information is not lost in case of failure
+    for file_name in part_metadata_files {
+        // Ensure we only delete files that are actually partition metadata files (safety check)
+        if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance") {
+            match store.delete_index_file(file_name).await {
+                Ok(()) => {
+                    log::debug!(
+                        "Successfully deleted partition metadata file: {}",
+                        file_name
+                    );
+                }
+                Err(e) => {
+                    // File deletion failures should not affect the overall success of the function
+                    // Log the error but continue processing other files
+                    log::warn!(
+                        "Failed to delete partition metadata file '{}': {}. \
+                     This does not affect the metadata merge operation, but may leave \
+                     partition files that should be cleaned up manually.",
+                        file_name,
+                        e
+                    );
+                }
+            }
+        } else {
+            // If the filename doesn't match the expected format, log a warning but don't attempt deletion
+            log::warn!(
+                "Skipping deletion of file '{}' as it does not match the expected \
+             partition metadata file pattern (part_*_metadata.lance)",
+                file_name
+            );
+        }
+    }
+
+    Ok(())
 }
