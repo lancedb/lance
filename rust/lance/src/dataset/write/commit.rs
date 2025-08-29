@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
+use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
 
@@ -253,6 +254,14 @@ impl<'a> CommitBuilder<'a> {
                 source: "The dataset must already exist unless the operation is Overwrite".into(),
                 location: location!(),
             });
+        }
+
+        // Validate the operation before proceeding with the commit
+        // This ensures that operations like Merge have proper validation for data integrity
+        if let Some(dataset) = dest.dataset() {
+            validate_operation(Some(&dataset.manifest), &transaction.operation)?;
+        } else {
+            validate_operation(None, &transaction.operation)?;
         }
 
         let (metadata_cache, index_cache) = match &dest {
