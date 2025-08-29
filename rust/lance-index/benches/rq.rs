@@ -20,9 +20,6 @@ use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
 use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_linalg::distance::DistanceType;
 
-#[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
-
 const DIM: usize = 128;
 const TOTAL: usize = 16 * 1000;
 
@@ -91,34 +88,33 @@ fn compute_distances(c: &mut Criterion) {
             },
         );
 
-        c.bench_function(
-            format!(
-                "RQ{}: compute_distances_single: {},DIM={}",
-                num_bits, TOTAL, DIM
-            )
-            .as_str(),
-            |b| {
-                b.iter(|| {
-                    for i in 0..TOTAL {
-                        black_box(dist_calc.distance(i as u32));
-                    }
-                })
-            },
-        );
+        // c.bench_function(
+        //     format!(
+        //         "RQ{}: compute_distances_single: {},DIM={}",
+        //         num_bits, TOTAL, DIM
+        //     )
+        //     .as_str(),
+        //     |b| {
+        //         b.iter(|| {
+        //             for i in 0..TOTAL {
+        //                 black_box(dist_calc.distance(i as u32));
+        //             }
+        //         })
+        //     },
+        // );
     }
 }
 
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default().measurement_time(Duration::from_secs(10));
     targets = construct_dist_table, compute_distances);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10);
+    config = Criterion::default().measurement_time(Duration::from_secs(10));
     targets = construct_dist_table, compute_distances);
 
 criterion_main!(benches);

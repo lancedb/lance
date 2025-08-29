@@ -32,7 +32,7 @@ use datafusion::{
     physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::futures::FinallyStreamExt;
@@ -862,7 +862,7 @@ impl ANNIvfSubIndexExec {
                             DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
                         })
                         .await?;
-                    println!("partition {} took {:?}", part_id, start.elapsed());
+                    log::info!("partition {} took {:?}", part_id, start.elapsed());
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     state.record_batch(&batch);
                     Ok(batch)

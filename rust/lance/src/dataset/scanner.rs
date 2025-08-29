@@ -3364,7 +3364,7 @@ impl Scanner {
     pub async fn analyze_plan(&self) -> Result<String> {
         let start = Instant::now();
         let plan = self.create_plan().await?;
-        println!("create plan took {:?}", start.elapsed());
+        log::info!("create plan took {:?}", start.elapsed());
 
         let start = Instant::now();
         let res = analyze_plan(
@@ -3375,7 +3375,7 @@ impl Scanner {
             },
         )
         .await;
-        println!("analyze plan took {:?}", start.elapsed());
+        log::info!("analyze plan took {:?}", start.elapsed());
         res
     }
 

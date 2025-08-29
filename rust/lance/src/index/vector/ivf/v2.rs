@@ -482,15 +482,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     ) -> Result<RecordBatch> {
         let start = Instant::now();
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        println!("partition {} load took {:?}", partition_id, start.elapsed());
+        log::info!("partition {} load took {:?}", partition_id, start.elapsed());
 
         let start = Instant::now();
         pre_filter.wait_for_ready().await?;
-        println!("partition {} wait for ready took {:?}", partition_id, start.elapsed());
+        log::info!("partition {} wait for ready took {:?}", partition_id, start.elapsed());
 
         let start = Instant::now();
         let query = self.preprocess_query(partition_id, query)?;
-        println!("partition {} preprocess query took {:?}", partition_id, start.elapsed());
+        log::info!("partition {} preprocess query took {:?}", partition_id, start.elapsed());
 
         let start = Instant::now();
         let (batch, local_metrics) = spawn_cpu(move || {
@@ -514,11 +514,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 pre_filter,
                 &local_metrics,
             )?;
-            println!("partition {} index search took {:?}", partition_id, start.elapsed());
+            log::info!("partition {} index search took {:?}", partition_id, start.elapsed());
             Ok((batch, local_metrics))
         })
         .await?;
-        println!("partition {} search took {:?}", partition_id, start.elapsed());
+        log::info!("partition {} search took {:?}", partition_id, start.elapsed());
 
         local_metrics.dump_into(metrics);
 
@@ -1400,8 +1400,10 @@ mod tests {
     // need to verify recall with real-world dataset (e.g. sift1m)
     #[rstest]
     #[case(1, DistanceType::L2, 0.65)]
+    #[case(1, DistanceType::Cosine, 0.65)]
     #[case(1, DistanceType::Dot, 0.65)]
     #[case(4, DistanceType::L2, 0.65)]
+    #[case(4, DistanceType::Cosine, 0.65)]
     #[case(4, DistanceType::Dot, 0.65)]
     #[tokio::test]
     async fn test_build_ivf_rq(

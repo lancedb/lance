@@ -290,10 +290,10 @@ impl IvfTransformer {
             vector_column,
         )));
 
-        transforms.push(Arc::new(ExtendDimensionTransformer::new(
-            vector_column,
-            rq.code_dim(),
-        )));
+        // transforms.push(Arc::new(ExtendDimensionTransformer::new(
+        //     vector_column,
+        //     rq.code_dim(),
+        // )));
 
         transforms.push(Arc::new(RQTransformer::new(
             rq,

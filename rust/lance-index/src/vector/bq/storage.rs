@@ -127,7 +127,6 @@ impl DeepSizeOf for RabitQuantizationStorage {
 }
 
 impl RabitQuantizationStorage {
-    #[inline]
     fn rotate_query_vector<T: ArrowFloatType>(
         rotate_mat: &FixedSizeListArray,
         qr: &dyn Array,
@@ -143,18 +142,12 @@ impl RabitQuantizationStorage {
             .downcast_ref::<T::ArrayType>()
             .unwrap()
             .as_slice();
-        // let rotate_mat = ndarray::ArrayView2::from_shape((code_dim, code_dim), rotate_mat).unwrap();
-        // we need only the first d rows of the rotate_mat
-        // let rotate_mat = rotate_mat.slice(s![.., 0..d]);
 
         let qr = qr
             .as_any()
             .downcast_ref::<T::ArrayType>()
             .unwrap()
             .as_slice();
-        // let qr = ndarray::ArrayView2::from_shape((d, 1), qr).unwrap();
-        // let rotated_qr = rotate_mat.dot(&qr);
-        // rotated_qr.into_raw_vec_and_offset().0
 
         rotate_mat
             .chunks_exact(code_dim)
@@ -299,7 +292,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
     }
 
-    #[inline]
+    #[inline(never)]
     fn distance_all(&self, _: usize) -> Vec<f32> {
         let code_len = self.dim * (self.num_bits as usize) / 8;
         let n = self.codes.len() / code_len;
@@ -320,7 +313,6 @@ impl DistCalculator for RabitDistCalculator<'_> {
             &quantized_dists_table,
             &mut quantized_dists,
         );
-
         if remainder > 0 {
             compute_rq_distance_flat(
                 &self.dist_table,
@@ -389,6 +381,7 @@ impl VectorStore for RabitQuantizationStorage {
     }
 
     // qr = (q-c)
+    #[inline(never)]
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
         let rotate_mat = self
@@ -407,36 +400,9 @@ impl VectorStore for RabitQuantizationStorage {
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
         let sum_q = rotated_qr.into_iter().sum();
 
-        // let (dist_table, sum_q) = match rotate_mat.value_type() {
-        //     DataType::Float16 => {
-        //         let rotated_qr = Self::rotate_query_vector::<Float16Type>(&rotate_mat, &qr);
-        //         (
-        //             build_dist_table_direct::<Float16Type>(&rotated_qr),
-        //             rotated_qr.into_iter().map(f32::from).sum(),
-        //         )
-        //     }
-        //     DataType::Float32 => {
-        //         let start = std::time::Instant::now();
-        //         let rotated_qr = Self::rotate_query_vector::<Float32Type>(&rotate_mat, &qr);
-        //         println!("rotate_query_vector time: {:?}", start.elapsed());
-        //         (
-        //             build_dist_table_direct::<Float32Type>(&rotated_qr),
-        //             rotated_qr.into_iter().sum(),
-        //         )
-        //     }
-        //     DataType::Float64 => {
-        //         let rotated_qr = Self::rotate_query_vector::<Float64Type>(&rotate_mat, &qr);
-        //         (
-        //             build_dist_table_direct::<Float64Type>(&rotated_qr),
-        //             rotated_qr.into_iter().map(|v| v as f32).sum(),
-        //         )
-        //     }
-        //     dt => unimplemented!("RabitQ does not support data type: {}", dt),
-        // };
-
         let q_factor = match self.distance_type {
             DistanceType::L2 => dist_q_c,
-            DistanceType::Dot => dist_q_c - 1.0,
+            DistanceType::Cosine | DistanceType::Dot => dist_q_c - 1.0,
             _ => unimplemented!(
                 "RabitQ does not support distance type: {}",
                 self.distance_type

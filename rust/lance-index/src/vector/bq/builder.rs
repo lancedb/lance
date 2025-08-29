@@ -81,17 +81,21 @@ impl RabitQuantizer {
         Self { metadata }
     }
 
-    fn rotate_mat<T: ArrowFloatType>(&self) -> ndarray::ArrayView2<T::Native> {
+    #[inline]
+    fn rotate_mat_flat<T: ArrowFloatType>(&self) -> &[T::Native] {
         let rotate_mat = self.metadata.rotate_mat.as_ref().unwrap();
-        let dim = rotate_mat.len();
-
-        let rotate_mat = rotate_mat
+        rotate_mat
             .values()
             .as_any()
             .downcast_ref::<T::ArrayType>()
             .unwrap()
-            .as_slice();
-        ndarray::ArrayView2::from_shape((dim, dim), rotate_mat).unwrap()
+            .as_slice()
+    }
+
+    #[inline]
+    fn rotate_mat<T: ArrowFloatType>(&self) -> ndarray::ArrayView2<T::Native> {
+        let code_dim = self.code_dim();
+        ndarray::ArrayView2::from_shape((code_dim, code_dim), self.rotate_mat_flat::<T>()).unwrap()
     }
 
     pub fn dim(&self) -> usize {
@@ -106,12 +110,13 @@ impl RabitQuantizer {
     where
         T::Native: AsPrimitive<f32>,
     {
-        if residual_vectors.value_length() as usize != self.code_dim() {
+        let dim = self.dim();
+        if residual_vectors.value_length() as usize != dim {
             return Err(Error::invalid_input(
                 format!(
                     "Vector dimension mismatch: {} != {}",
                     residual_vectors.value_length(),
-                    self.code_dim()
+                    dim
                 ),
                 location!(),
             ));
@@ -119,7 +124,7 @@ impl RabitQuantizer {
 
         // convert the vector to a dxN matrix
         let vec_mat = ndarray::ArrayView2::from_shape(
-            (residual_vectors.len(), self.code_dim()),
+            (residual_vectors.len(), dim),
             residual_vectors
                 .values()
                 .as_any()
@@ -130,8 +135,11 @@ impl RabitQuantizer {
         .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         let vec_mat = vec_mat.t();
 
-        let rotated_vectors = self.rotate_mat::<T>().dot(&vec_mat);
-        let sqrt_dim = (self.code_dim() as f32).sqrt();
+        let rotate_mat = self.rotate_mat::<T>();
+        // slice to (code_dim, dim)
+        let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
+        let rotated_vectors = rotate_mat.dot(&vec_mat);
+        let sqrt_dim = (dim as f32 * self.metadata.num_bits as f32).sqrt();
         let norm_dists = rotated_vectors.mapv(|v| v.as_().abs()).sum_axis(Axis(0)) / sqrt_dim;
         debug_assert_eq!(norm_dists.len(), residual_vectors.len());
         Ok(norm_dists.to_vec())
@@ -205,10 +213,11 @@ impl RabitQuantizer {
         // we don't need to normalize the residual vectors,
         // because the signal of P^{-1} x v_r is the same as P^{-1} x v_r / ||v_r||
         let n = residual_vectors.len();
-        debug_assert_eq!(residual_vectors.values().len(), n * self.code_dim());
+        let dim = self.dim();
+        debug_assert_eq!(residual_vectors.values().len(), n * dim);
 
         let vectors = ndarray::ArrayView2::from_shape(
-            (n, self.code_dim()),
+            (n, dim),
             residual_vectors
                 .values()
                 .as_any()
@@ -218,7 +227,9 @@ impl RabitQuantizer {
         )
         .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
         let vectors = vectors.t();
-        let rotated_vectors = self.rotate_mat::<T>().dot(&vectors);
+        let rotate_mat = self.rotate_mat::<T>();
+        let rotate_mat = rotate_mat.slice(s![.., 0..dim]);
+        let rotated_vectors = rotate_mat.dot(&vectors);
 
         let quantized_vectors = rotated_vectors.t().mapv(|v| v.as_().is_sign_positive());
         let bv: BitVec<u8, Lsb0> = BitVec::from_iter(quantized_vectors);
