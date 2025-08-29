@@ -7,7 +7,7 @@ use futures::stream::BoxStream;
 use mockall::mock;
 use object_store::{
     path::Path, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as OSResult,
 };
 use std::future::Future;
@@ -21,7 +21,7 @@ mock! {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            opts: PutMultipartOpts,
+            opts: PutMultipartOptions,
         ) -> OSResult<Box<dyn MultipartUpload>>;
         fn get_opts<'life0, 'life1, 'async_trait>(
             &'life0 self,
