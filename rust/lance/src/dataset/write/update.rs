@@ -543,6 +543,7 @@ mod tests {
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
     use tokio::sync::Barrier;
+    use crate::dataset::WriteMode::Append;
 
     /// Returns a dataset with 3 fragments, each with 10 rows.
     ///
@@ -1088,8 +1089,8 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let str_values = StringArray::from(vec!["a", "b", "c"]);
-        let vec_values = FixedSizeListArray::try_new_from_values(
+        let str_values1 = StringArray::from(vec!["a", "b", "c"]);
+        let vec_values1 = FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
             ]),
@@ -1097,14 +1098,14 @@ mod tests {
         )
         .unwrap();
 
-        let batch = RecordBatch::try_new(
+        let batch1 = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(str_values), Arc::new(vec_values)],
+            vec![Arc::new(str_values1), Arc::new(vec_values1)],
         )
         .unwrap();
 
         let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            RecordBatchIterator::new([Ok(batch1)], schema.clone()),
             test_uri,
             Some(WriteParams {
                 max_rows_per_file: 10,
@@ -1114,6 +1115,34 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let str_values2 = StringArray::from(vec!["d", "e", "f"]);
+        let vec_values2 = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+            ]),
+            4,
+        )
+            .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(str_values2), Arc::new(vec_values2)],
+        )
+            .unwrap();
+
+        dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch2)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                enable_stable_row_ids: true,
+                mode: Append,
+                ..Default::default()
+            }),
+        )
+            .await
+            .unwrap();
 
         let scalar_params = ScalarIndexParams::default();
         dataset
@@ -1143,15 +1172,17 @@ mod tests {
         let str_index = indices.iter().find(|idx| idx.name == "str_idx").unwrap();
         let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
 
-        assert_eq!(str_index.fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert_eq!(str_index.fragment_bitmap.as_ref().unwrap().len(), 2);
         assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 1);
+        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
         assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
 
         let updated_dataset = UpdateBuilder::new(Arc::new(dataset))
-            .update_where("str = 'b'")
+            .update_where("str = 'e'")
             .unwrap()
-            .set("vec", "array[13.0, 14.0, 15.0, 16.0]")
+            .set("vec", "array[25.0, 26.0, 27.0, 28.0]")
             .unwrap()
             .build()
             .unwrap()
@@ -1171,18 +1202,18 @@ mod tests {
             .unwrap();
 
         let str_bitmap = updated_str_index.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(str_bitmap.len(), 2);
-        assert_eq!(str_bitmap.iter().collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(str_bitmap.len(), 3);
+        assert_eq!(str_bitmap.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
 
         let vec_bitmap = updated_vec_index.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(vec_bitmap.len(), 1);
-        assert!(vec_bitmap.contains(0));
+        assert_eq!(vec_bitmap.len(), 2);
+        assert_eq!(vec_bitmap.iter().collect::<Vec<_>>(), vec![0, 1]);
 
         let fragments = updated_dataset.get_fragments();
-        assert!(fragments.len() > 1);
+        assert!(fragments.len() > 2);
 
-        let original_fragment = &fragments[0];
-        assert!(original_fragment
+        let second_fragment = &fragments[1];
+        assert!(second_fragment
             .get_deletion_vector()
             .await
             .unwrap()
