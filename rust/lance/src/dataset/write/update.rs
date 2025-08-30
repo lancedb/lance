@@ -5,8 +5,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::transaction::UpdateMode::VerticalPartialSchema;
 use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{io::exec::Planner, Dataset};
@@ -29,8 +31,6 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
-
-use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 
 /// Build an update operation.
 ///
@@ -400,6 +400,7 @@ impl UpdateJob {
             // This job only deletes rows, it does not modify any field values.
             fields_modified: vec![],
             mem_wal_to_flush: None,
+            update_mode: Some(VerticalPartialSchema),
         };
 
         let mut data_columns_updated = Vec::new();
@@ -524,6 +525,7 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::WriteMode::Append;
     use crate::index::vector::VectorIndexParams;
     use arrow::{array::AsArray, datatypes::UInt32Type};
     use arrow_array::{
@@ -543,7 +545,6 @@ mod tests {
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
     use tokio::sync::Barrier;
-    use crate::dataset::WriteMode::Append;
 
     /// Returns a dataset with 3 fragments, each with 10 rows.
     ///
@@ -1104,7 +1105,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut dataset = Dataset::write(
+        Dataset::write(
             RecordBatchIterator::new([Ok(batch1)], schema.clone()),
             test_uri,
             Some(WriteParams {
@@ -1123,15 +1124,15 @@ mod tests {
             ]),
             4,
         )
-            .unwrap();
+        .unwrap();
 
         let batch2 = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(str_values2), Arc::new(vec_values2)],
         )
-            .unwrap();
+        .unwrap();
 
-        dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch2)], schema.clone()),
             test_uri,
             Some(WriteParams {
@@ -1141,8 +1142,8 @@ mod tests {
                 ..Default::default()
             }),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let scalar_params = ScalarIndexParams::default();
         dataset

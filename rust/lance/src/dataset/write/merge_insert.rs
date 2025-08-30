@@ -64,6 +64,7 @@ use std::{
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::transaction::UpdateMode::VerticalFullSchema;
 use crate::dataset::utils::CapturedRowIds;
 use crate::{
     datafusion::dataframe::SessionContextExt,
@@ -1359,6 +1360,7 @@ impl MergeInsertJob {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_flush: self.params.mem_wal_to_flush,
+                update_mode: Some(VerticalFullSchema),
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1429,6 +1431,7 @@ impl MergeInsertJob {
                 // modify any field values.
                 fields_modified: vec![],
                 mem_wal_to_flush: self.params.mem_wal_to_flush,
+                update_mode: Some(VerticalFullSchema),
             };
 
             let affected_rows = Some(RowIdTreeMap::from(removed_row_addrs));
@@ -1954,6 +1957,7 @@ impl Merger {
 mod tests {
     use super::*;
     use crate::dataset::scanner::ColumnOrdering;
+    use crate::index::vector::VectorIndexParams;
     use crate::{
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
@@ -1962,18 +1966,22 @@ mod tests {
             FragmentRowCount, ThrottledStoreWrapper,
         },
     };
+    use arrow_array::types::Float32Type;
     use arrow_array::{
         types::{Int32Type, UInt32Type},
-        Int32Array, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
+        FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatchIterator,
+        RecordBatchReader, StringArray, UInt32Array,
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use lance_io::object_store::ObjectStoreParams;
+    use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
@@ -4286,5 +4294,442 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 _ => panic!("Unexpected id: {}", id_col.value(i)),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_only_fragment_bitmap_behavior() {
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::IndexType;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        ]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let key_values1 = UInt32Array::from(vec![1, 2, 3]);
+        let value_values1 = UInt32Array::from(vec![10, 20, 30]);
+        let vec_values1 = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ]),
+            4,
+        )
+        .unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(key_values1),
+                Arc::new(value_values1),
+                Arc::new(vec_values1),
+            ],
+        )
+        .unwrap();
+
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch1)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let key_values2 = UInt32Array::from(vec![4, 5, 6]);
+        let value_values2 = UInt32Array::from(vec![40, 50, 60]);
+        let vec_values2 = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+            ]),
+            4,
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(key_values2),
+                Arc::new(value_values2),
+                Arc::new(vec_values2),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch2)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                enable_stable_row_ids: true,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::Scalar,
+                Some("key_idx".to_string()),
+                &scalar_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let key_index = indices.iter().find(|idx| idx.name == "key_idx").unwrap();
+        let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
+
+        assert_eq!(key_index.fragment_bitmap.as_ref().unwrap().len(), 2);
+        assert!(key_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(key_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
+
+        let upsert_keys = UInt32Array::from(vec![2, 5, 7, 8]);
+        let upsert_values = UInt32Array::from(vec![200, 500, 70, 80]);
+        let upsert_vecs = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0, 33.0, 34.0,
+                35.0, 36.0,
+            ]),
+            4,
+        )
+        .unwrap();
+
+        let upsert_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(upsert_keys),
+                Arc::new(upsert_values),
+                Arc::new(upsert_vecs),
+            ],
+        )
+        .unwrap();
+
+        let upsert_stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::once(async { Ok(upsert_batch) }).boxed(),
+        );
+
+        let (updated_dataset, _stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+                .try_build()
+                .unwrap()
+                .execute(Box::pin(upsert_stream))
+                .await
+                .unwrap();
+
+        let fragments = updated_dataset.get_fragments();
+        assert!(fragments.len() == 3);
+
+        let updated_indices = updated_dataset.load_indices().await.unwrap();
+        let updated_key_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "key_idx")
+            .unwrap();
+        let updated_vec_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "vec_idx")
+            .unwrap();
+
+        let key_bitmap = updated_key_index.fragment_bitmap.as_ref().unwrap();
+        assert!(key_bitmap.len() == 2);
+        assert!(key_bitmap.contains(0));
+        assert!(key_bitmap.contains(1));
+
+        let vec_bitmap = updated_vec_index.fragment_bitmap.as_ref().unwrap();
+        println!("the length of vec_bitmap is {}", vec_bitmap.len());
+        assert_eq!(vec_bitmap.len(), 2);
+        assert!(vec_bitmap.contains(0));
+        assert!(vec_bitmap.contains(1));
+
+        let first_fragment = &fragments[0];
+        let second_fragment = &fragments[1];
+
+        let has_deletion_vector = first_fragment
+            .get_deletion_vector()
+            .await
+            .unwrap()
+            .is_some()
+            && second_fragment
+                .get_deletion_vector()
+                .await
+                .unwrap()
+                .is_some();
+
+        assert!(
+            has_deletion_vector,
+            "At least one fragment should have a deletion vector after upsert"
+        );
+
+        let final_data = updated_dataset
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".to_string(),
+            )]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let final_keys = final_data
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .values();
+        let final_values = final_data
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .values();
+
+        assert_eq!(final_keys, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(final_values, &[10, 200, 30, 40, 500, 60, 70, 80]);
+    }
+
+    #[tokio::test]
+    async fn test_update_only_fragment_bitmap_behavior() {
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::IndexType;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let key_values1 = UInt32Array::from(vec![1, 2, 3]);
+        let value_values1 = UInt32Array::from(vec![10, 20, 30]);
+        let vec_values1 = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 1.1, 2.0, 2.1, 3.0, 3.1]),
+            2,
+        )
+        .unwrap();
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(key_values1),
+                Arc::new(value_values1),
+                Arc::new(vec_values1),
+            ],
+        )
+        .unwrap();
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch1)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let key_values2 = UInt32Array::from(vec![4, 5, 6]);
+        let value_values2 = UInt32Array::from(vec![40, 50, 60]);
+        let vec_values2 = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![4.0, 4.1, 5.0, 5.1, 6.0, 6.1]),
+            2,
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(key_values2),
+                Arc::new(value_values2),
+                Arc::new(vec_values2),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch2)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::Scalar,
+                Some("key_idx".parse().unwrap()),
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".parse().unwrap()),
+                &vector_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let key_index = indices.iter().find(|idx| idx.name == "key_idx").unwrap();
+        let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
+
+        assert_eq!(key_index.fragment_bitmap.as_ref().unwrap().len(), 2);
+        assert!(key_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(key_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
+
+        let update_keys = UInt32Array::from(vec![2, 5]);
+        let update_values = UInt32Array::from(vec![200, 500]);
+        let update_vecs = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![2.2, 2.3, 5.2, 5.3]),
+            2,
+        )
+        .unwrap();
+
+        let update_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(update_keys),
+                Arc::new(update_values),
+                Arc::new(update_vecs),
+            ],
+        )
+        .unwrap();
+
+        let update_stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::once(async { Ok(update_batch) }).boxed(),
+        );
+
+        let (updated_dataset, _stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing) // 只更新，不插入
+                .try_build()
+                .unwrap()
+                .execute(Box::pin(update_stream))
+                .await
+                .unwrap();
+
+        let fragments = updated_dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+
+        let updated_indices = updated_dataset.load_indices().await.unwrap();
+        let updated_key_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "key_idx")
+            .unwrap();
+        let updated_vec_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "vec_idx")
+            .unwrap();
+
+        let key_bitmap = updated_key_index.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(key_bitmap.len(), 2);
+
+        let vec_bitmap = updated_vec_index.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(vec_bitmap.len(), 2);
+
+        let first_fragment = &fragments[0];
+        let second_fragment = &fragments[1];
+
+        let first_has_deletion_vector = first_fragment.metadata().deletion_file.is_some();
+        let second_has_deletion_vector = second_fragment.metadata().deletion_file.is_some();
+
+        assert!(
+            first_has_deletion_vector || second_has_deletion_vector,
+            "At least one fragment should have a deletion vector after update"
+        );
+
+        let final_data = updated_dataset
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "key".parse().unwrap(),
+            )]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let final_keys = final_data
+            .column_by_name("key")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .values();
+        let final_values = final_data
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .values();
+
+        assert_eq!(final_keys, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(final_values, &[10, 200, 30, 40, 500, 60]);
+
+        let final_vecs = final_data
+            .column_by_name("vec")
+            .unwrap()
+            .as_fixed_size_list();
+        let vec_values = final_vecs.values().as_primitive::<Float32Type>();
+
+        assert_eq!(vec_values.value(2), 2.2);
+        assert_eq!(vec_values.value(3), 2.3);
+
+        assert_eq!(vec_values.value(8), 5.2);
+        assert_eq!(vec_values.value(9), 5.3);
     }
 }

@@ -46,6 +46,7 @@
 //!
 
 use super::ManifestWriteConfig;
+use crate::dataset::transaction::UpdateMode::VerticalPartialSchema;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
@@ -212,6 +213,8 @@ pub enum Operation {
         fields_modified: Vec<u32>,
         /// The MemWAL (pre-image) that should be marked as flushed after this transaction
         mem_wal_to_flush: Option<MemWal>,
+        /// The mode of update
+        update_mode: Option<UpdateMode>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -238,6 +241,27 @@ pub enum Operation {
         ref_version: u64,
         ref_path: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub enum UpdateMode {
+    /// Vertical update with partial schema: adds new rows with only some fields
+    /// The new fragments contain a subset of the schema fields
+    /// This is used by the dataset updater when doing partial updates
+    VerticalPartialSchema,
+
+    /// Vertical update with full schema: adds new rows with all schema fields
+    /// The new fragments contain all fields from the current schema
+    /// This is used when merge_insert matches the complete schema
+    VerticalFullSchema,
+
+    /// Horizontal update: adds new columns
+    /// In this case, updated_fragments may have fields removed or added
+    /// It is even possible for a field to be tombstoned and then added back in the same update (which is a field modification)
+    /// If any fields are modified in this way then they need to be added to the fields_modified list
+    /// This way we can correctly update the indices
+    /// This is what is used by a merge insert that does not match the whole schema
+    Horizontal,
 }
 
 impl std::fmt::Display for Operation {
@@ -372,6 +396,7 @@ impl PartialEq for Operation {
                     new_fragments: a_new,
                     fields_modified: a_fields,
                     mem_wal_to_flush: a_mem_wal_to_flush,
+                    update_mode: a_update_mode,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
@@ -379,6 +404,7 @@ impl PartialEq for Operation {
                     new_fragments: b_new,
                     fields_modified: b_fields,
                     mem_wal_to_flush: b_mem_wal_to_flush,
+                    update_mode: b_update_mode,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
@@ -386,6 +412,7 @@ impl PartialEq for Operation {
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
                     && a_mem_wal_to_flush == b_mem_wal_to_flush
+                    && a_update_mode == b_update_mode
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -1390,6 +1417,7 @@ impl Transaction {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_flush,
+                update_mode,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
                     if removed_fragment_ids.contains(&f.id) {
@@ -1409,27 +1437,35 @@ impl Transaction {
                     fields_modified,
                 );
 
-                let effective_fields_modified = {
-                    let from_properties =
-                        Self::get_data_columns_updated_from_transaction_properties(
-                            &self.transaction_properties,
-                        );
-                    if from_properties.is_empty() {
-                        fields_modified.to_vec()
-                    } else {
-                        from_properties
-                    }
-                };
-
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
 
-                Self::add_new_fragments_to_unmodified_indices(
-                    &mut final_indices,
-                    &new_fragments,
-                    &effective_fields_modified,
-                );
+                if config.use_stable_row_ids
+                    && update_mode.is_some()
+                    && *update_mode == Some(VerticalPartialSchema)
+                {
+                    let effective_fields_modified = {
+                        let from_properties =
+                            Self::get_data_columns_updated_from_transaction_properties(
+                                &self.transaction_properties,
+                            );
+                        if from_properties.is_empty() {
+                            fields_modified.to_vec()
+                        } else {
+                            from_properties
+                        }
+                    };
+
+                    let pure_updated_frag_ids =
+                        Self::collect_pure_update_frags_ids(&new_fragments)?;
+
+                    Self::add_pure_update_fragments_to_unmodified_indices(
+                        &mut final_indices,
+                        &pure_updated_frag_ids,
+                        &effective_fields_modified,
+                    );
+                }
 
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
@@ -1766,12 +1802,12 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
-    fn add_new_fragments_to_unmodified_indices(
+    fn add_pure_update_fragments_to_unmodified_indices(
         indices: &mut [Index],
-        new_fragments: &[Fragment],
+        pure_update_frag_ids: &[u64],
         fields_modified: &[u32],
     ) {
-        if new_fragments.is_empty() {
+        if pure_update_frag_ids.is_empty() {
             return;
         }
 
@@ -1785,7 +1821,7 @@ impl Transaction {
 
             if !index_covers_modified_field {
                 if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    for fragment_id in new_fragments.iter().map(|f| f.id as u32) {
+                    for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
                         fragment_bitmap.insert(fragment_id);
                     }
                 }
@@ -2060,6 +2096,33 @@ impl Transaction {
         Ok(())
     }
 
+    fn collect_pure_update_frags_ids(fragments: &[Fragment]) -> Result<Vec<u64>> {
+        let mut pure_update_frag_ids = Vec::new();
+
+        for fragment in fragments {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
+                message: "Fragment does not have physical rows".into(),
+                location: location!(),
+            })? as u64;
+
+            if let Some(row_id_meta) = &fragment.row_id_meta {
+                let existing_row_count = match row_id_meta {
+                    RowIdMeta::Inline(data) => {
+                        let sequence = read_row_ids(data)?;
+                        sequence.len() as u64
+                    }
+                    _ => 0,
+                };
+
+                if existing_row_count == physical_rows {
+                    pure_update_frag_ids.push(fragment.id);
+                }
+            }
+        }
+
+        Ok(pure_update_frag_ids)
+    }
+
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
             let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
@@ -2294,6 +2357,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_flush,
+                update_mode,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2306,6 +2370,12 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
                 mem_wal_to_flush: mem_wal_to_flush.map(|m| MemWal::try_from(m).unwrap()),
+                update_mode: match update_mode {
+                    0 => Some(UpdateMode::VerticalPartialSchema),
+                    1 => Some(UpdateMode::VerticalFullSchema),
+                    2 => Some(UpdateMode::Horizontal),
+                    _ => Some(UpdateMode::VerticalPartialSchema),
+                },
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -2572,6 +2642,7 @@ impl From<&Transaction> for pb::Transaction {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_flush,
+                update_mode,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -2583,6 +2654,14 @@ impl From<&Transaction> for pb::Transaction {
                 mem_wal_to_flush: mem_wal_to_flush
                     .as_ref()
                     .map(pb::mem_wal_index_details::MemWal::from),
+                update_mode: update_mode
+                    .as_ref()
+                    .map(|mode| match mode {
+                        UpdateMode::VerticalPartialSchema => 0,
+                        UpdateMode::VerticalFullSchema => 1,
+                        UpdateMode::Horizontal => 2,
+                    })
+                    .unwrap_or(0),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {
