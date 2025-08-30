@@ -20,6 +20,7 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{stream, StreamExt};
 use roaring::RoaringTreemap;
 
+use crate::dataset::transaction::UpdateMode::VerticalFullSchema;
 use crate::dataset::utils::CapturedRowIds;
 use crate::{
     dataset::{
@@ -853,7 +854,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
+                fields_value_updated: vec![],
                 mem_wal_to_flush,
+                update_mode: Some(VerticalFullSchema),
             };
 
             // Step 5: Create and store the transaction

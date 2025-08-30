@@ -789,6 +789,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
                 mem_wal_to_flush: None,
+                update_mode: None,
             },
             read_version: 1,
             blobs_op: None,
