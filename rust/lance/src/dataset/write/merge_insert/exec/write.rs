@@ -854,6 +854,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
+                fields_value_updated: vec![],
                 mem_wal_to_flush,
                 update_mode: Some(VerticalFullSchema),
             };

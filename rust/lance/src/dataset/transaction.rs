@@ -211,6 +211,8 @@ pub enum Operation {
         new_fragments: Vec<Fragment>,
         /// The fields that have been modified
         fields_modified: Vec<u32>,
+        /// The fields that its value have been updated
+        fields_value_updated: Vec<u32>,
         /// The MemWAL (pre-image) that should be marked as flushed after this transaction
         mem_wal_to_flush: Option<MemWal>,
         /// The mode of update
@@ -395,6 +397,7 @@ impl PartialEq for Operation {
                     updated_fragments: a_updated,
                     new_fragments: a_new,
                     fields_modified: a_fields,
+                    fields_value_updated: a_fields_value_updated,
                     mem_wal_to_flush: a_mem_wal_to_flush,
                     update_mode: a_update_mode,
                 },
@@ -403,6 +406,7 @@ impl PartialEq for Operation {
                     updated_fragments: b_updated,
                     new_fragments: b_new,
                     fields_modified: b_fields,
+                    fields_value_updated: b_field_value_updated,
                     mem_wal_to_flush: b_mem_wal_to_flush,
                     update_mode: b_update_mode,
                 },
@@ -411,6 +415,7 @@ impl PartialEq for Operation {
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
+                    && compare_vec(a_fields_value_updated, b_field_value_updated)
                     && a_mem_wal_to_flush == b_mem_wal_to_flush
                     && a_update_mode == b_update_mode
             }
@@ -1416,6 +1421,7 @@ impl Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                fields_value_updated,
                 mem_wal_to_flush,
                 update_mode,
             } => {
@@ -1445,25 +1451,13 @@ impl Transaction {
                     && update_mode.is_some()
                     && *update_mode == Some(VerticalPartialSchema)
                 {
-                    let effective_fields_modified = {
-                        let from_properties =
-                            Self::get_data_columns_updated_from_transaction_properties(
-                                &self.transaction_properties,
-                            );
-                        if from_properties.is_empty() {
-                            fields_modified.to_vec()
-                        } else {
-                            from_properties
-                        }
-                    };
-
                     let pure_updated_frag_ids =
                         Self::collect_pure_update_frags_ids(&new_fragments)?;
 
                     Self::add_pure_update_fragments_to_unmodified_indices(
                         &mut final_indices,
                         &pure_updated_frag_ids,
-                        &effective_fields_modified,
+                        fields_value_updated,
                     );
                 }
 
@@ -1827,20 +1821,6 @@ impl Transaction {
                 }
             }
         }
-    }
-
-    fn get_data_columns_updated_from_transaction_properties(
-        transaction_properties: &Option<Arc<HashMap<String, String>>>,
-    ) -> Vec<u32> {
-        if let Some(properties) = transaction_properties {
-            if let Some(data_columns_str) = properties.get("data_columns_updated") {
-                return data_columns_str
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u32>().ok())
-                    .collect();
-            }
-        }
-        Vec::new()
     }
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
@@ -2357,6 +2337,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_flush,
+                fields_value_updated,
                 update_mode,
             })) => Operation::Update {
                 removed_fragment_ids,
@@ -2369,6 +2350,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
+                fields_value_updated,
                 mem_wal_to_flush: mem_wal_to_flush.map(|m| MemWal::try_from(m).unwrap()),
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::VerticalPartialSchema),
@@ -2641,6 +2623,7 @@ impl From<&Transaction> for pb::Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                fields_value_updated,
                 mem_wal_to_flush,
                 update_mode,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
@@ -2651,6 +2634,7 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 fields_modified: fields_modified.clone(),
+                fields_value_updated: fields_value_updated.clone(),
                 mem_wal_to_flush: mem_wal_to_flush
                     .as_ref()
                     .map(pb::mem_wal_index_details::MemWal::from),

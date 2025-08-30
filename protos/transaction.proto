@@ -189,8 +189,10 @@ message Transaction {
     repeated uint32 fields_modified = 4;
     /// The MemWAL (pre-image) that should be marked as flushed after this transaction
     MemWalIndexDetails.MemWal mem_wal_to_flush = 5;
+    /// The ids of the fields that its value have been updated
+    repeated uint32 fields_value_updated = 6;
     // The mode of update
-    UpdateMode update_mode = 6;
+    UpdateMode update_mode = 7;
   }
 
   // The mode of update operation

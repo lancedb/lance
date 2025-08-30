@@ -9,7 +9,7 @@ use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::VerticalPartialSchema;
-use crate::dataset::transaction::{Operation, TransactionBuilder};
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{io::exec::Planner, Dataset};
 use crate::{Error, Result};
@@ -392,17 +392,6 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
-        // Commit updated and new fragments
-        let operation = Operation::Update {
-            removed_fragment_ids: update_data.removed_fragment_ids,
-            updated_fragments: update_data.old_fragments,
-            new_fragments: update_data.new_fragments,
-            // This job only deletes rows, it does not modify any field values.
-            fields_modified: vec![],
-            mem_wal_to_flush: None,
-            update_mode: Some(VerticalPartialSchema),
-        };
-
         let mut data_columns_updated = Vec::new();
         for column_name in self.updates.keys() {
             if let Ok(field_id) = dataset.schema().field_id(column_name) {
@@ -410,19 +399,24 @@ impl UpdateJob {
             }
         }
 
-        let mut transaction_properties = HashMap::new();
-        if !data_columns_updated.is_empty() {
-            let data_columns_str = data_columns_updated
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            transaction_properties.insert("data_columns_updated".to_string(), data_columns_str);
-        }
+        // Commit updated and new fragments
+        let operation = Operation::Update {
+            removed_fragment_ids: update_data.removed_fragment_ids,
+            updated_fragments: update_data.old_fragments,
+            new_fragments: update_data.new_fragments,
+            // This job only deletes rows, it does not modify any field values.
+            fields_modified: vec![],
+            fields_value_updated: data_columns_updated,
+            mem_wal_to_flush: None,
+            update_mode: Some(VerticalPartialSchema),
+        };
 
-        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
-            .transaction_properties(Some(Arc::new(transaction_properties)))
-            .build();
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            operation,
+            /*blobs_op=*/ None,
+            None,
+        );
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)

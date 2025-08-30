@@ -1359,6 +1359,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                fields_value_updated: vec![],
                 mem_wal_to_flush: self.params.mem_wal_to_flush,
                 update_mode: Some(VerticalFullSchema),
             };
@@ -1430,6 +1431,7 @@ impl MergeInsertJob {
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
                 fields_modified: vec![],
+                fields_value_updated: vec![],
                 mem_wal_to_flush: self.params.mem_wal_to_flush,
                 update_mode: Some(VerticalFullSchema),
             };
