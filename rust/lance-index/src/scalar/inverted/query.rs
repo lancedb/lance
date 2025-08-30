@@ -331,11 +331,11 @@ impl MatchQuery {
         }
     }
 
-    fn default_boost() -> f32 {
+    pub(crate) fn default_boost() -> f32 {
         1.0
     }
 
-    fn default_max_expansions() -> usize {
+    pub(crate) fn default_max_expansions() -> usize {
         50
     }
 
