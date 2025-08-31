@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.operation;
 
+import com.lancedb.lance.util.ToStringHelper;
+
 /** Restore operation to revert a dataset to a previous version. */
 public class Restore implements Operation {
   private final long version;
@@ -37,7 +39,7 @@ public class Restore implements Operation {
 
   @Override
   public String toString() {
-    return "Restore{" + "version=" + version + '}';
+    return ToStringHelper.of(this).add("version", version).toString();
   }
 
   @Override

@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.index.vector;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.Optional;
 
@@ -25,7 +25,7 @@ public class HnswBuildParams {
   private final short maxLevel;
   private final int m;
   private final int efConstruction;
-  private final Optional<Integer> prefetchDistance;
+  private final Integer prefetchDistance;
 
   private HnswBuildParams(Builder builder) {
     this.maxLevel = builder.maxLevel;
@@ -38,7 +38,7 @@ public class HnswBuildParams {
     private short maxLevel = 7;
     private int m = 20;
     private int efConstruction = 150;
-    private Optional<Integer> prefetchDistance = Optional.of(2);
+    private Integer prefetchDistance = 2;
 
     /**
      * Create a new builder for HNSW index parameters. Each IVF partition will be built with an HNSW
@@ -78,7 +78,7 @@ public class HnswBuildParams {
      * @return Builder
      */
     public Builder setPrefetchDistance(Integer prefetchDistance) {
-      this.prefetchDistance = Optional.ofNullable(prefetchDistance);
+      this.prefetchDistance = prefetchDistance;
       return this;
     }
 
@@ -100,16 +100,16 @@ public class HnswBuildParams {
   }
 
   public Optional<Integer> getPrefetchDistance() {
-    return prefetchDistance;
+    return Optional.ofNullable(prefetchDistance);
   }
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("maxLevel", maxLevel)
-        .append("m", m)
-        .append("efConstruction", efConstruction)
-        .append("prefetchDistance", prefetchDistance.orElse(null))
+    return ToStringHelper.of(this)
+        .add("maxLevel", maxLevel)
+        .add("m", m)
+        .add("efConstruction", efConstruction)
+        .add("prefetchDistance", prefetchDistance)
         .toString();
   }
 }

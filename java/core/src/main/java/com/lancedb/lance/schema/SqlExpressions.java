@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.schema;
 
+import com.lancedb.lance.util.ToStringHelper;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -55,6 +57,11 @@ public class SqlExpressions {
 
     public void setExpression(String expression) {
       this.expression = expression;
+    }
+
+    @Override
+    public String toString() {
+      return ToStringHelper.of(this).add("name", name).add("expression", expression).toString();
     }
   }
 

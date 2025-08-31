@@ -14,8 +14,7 @@
 package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
-
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.List;
 import java.util.Objects;
@@ -57,9 +56,9 @@ public class RewriteGroup {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("oldFragments", oldFragments)
-        .append("newFragments", newFragments)
+    return ToStringHelper.of(this)
+        .add("oldFragments", oldFragments)
+        .add("newFragments", newFragments)
         .toString();
   }
 

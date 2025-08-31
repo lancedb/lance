@@ -14,6 +14,7 @@
 package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
+import com.lancedb.lance.util.ToStringHelper;
 
 import org.apache.arrow.util.Preconditions;
 
@@ -49,7 +50,7 @@ public class Append implements Operation {
 
   @Override
   public String toString() {
-    return "Append{" + "fragments=" + fragments + '}';
+    return ToStringHelper.of(this).add("fragments", fragments).toString();
   }
 
   public static Builder builder() {

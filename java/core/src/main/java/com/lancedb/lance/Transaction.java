@@ -14,6 +14,7 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.operation.Operation;
+import com.lancedb.lance.util.ToStringHelper;
 
 import org.apache.arrow.util.Preconditions;
 
@@ -95,9 +96,14 @@ public class Transaction {
 
   @Override
   public String toString() {
-    return String.format(
-        "Transaction{readVersion=%d, uuid='%s', operation=%s, blobOp=%s}",
-        readVersion, uuid, operation, blobOp);
+    return ToStringHelper.of(this)
+        .add("readVersion", readVersion)
+        .add("uuid", uuid)
+        .add("operation", operation)
+        .add("blobOp", blobOp)
+        .add("writeParams", writeParams)
+        .add("transactionProperties", transactionProperties)
+        .toString();
   }
 
   @Override

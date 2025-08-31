@@ -41,6 +41,9 @@ pub trait JNIEnvExt {
     #[allow(dead_code)]
     fn get_strings_opt(&mut self, obj: &JObject) -> Result<Option<Vec<String>>>;
 
+    /// Get Option<bool> from Java Optional<Boolean>.
+    fn get_bool_opt(&mut self, obj: &JObject) -> Result<Option<bool>>;
+
     /// Get Option<i32> from Java Optional<Integer>.
     fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>>;
 
@@ -172,6 +175,20 @@ impl JNIEnvExt for JNIEnv<'_> {
         })
     }
 
+    fn get_bool_opt(&mut self, obj: &JObject) -> Result<Option<bool>> {
+        let is_present: bool = self.call_method(obj, "isPresent", "()Z", &[])?.z()?;
+        if !is_present {
+            return Ok(None);
+        }
+        let java_bool_obj = self
+            .call_method(obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let bool_value = self
+            .call_method(&java_bool_obj, "booleanValue", "()Z", &[])?
+            .z()?;
+        Ok(Some(bool_value))
+    }
+
     fn get_int_opt(&mut self, obj: &JObject) -> Result<Option<i32>> {
         self.get_optional(obj, |env, inner_obj| {
             let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
@@ -247,6 +264,14 @@ impl JNIEnvExt for JNIEnv<'_> {
         Ok(self.call_method(obj, method_name, "()Z", &[])?.z()?)
     }
 
+    fn get_optional_usize_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<usize>> {
+        self.get_optional_integer_from_method(obj, method_name)
+    }
+
     fn get_optional_i32_from_method(
         &mut self,
         obj: &JObject,
@@ -260,14 +285,6 @@ impl JNIEnvExt for JNIEnv<'_> {
         obj: &JObject,
         method_name: &str,
     ) -> Result<Option<u32>> {
-        self.get_optional_integer_from_method(obj, method_name)
-    }
-
-    fn get_optional_usize_from_method(
-        &mut self,
-        obj: &JObject,
-        method_name: &str,
-    ) -> Result<Option<usize>> {
         self.get_optional_integer_from_method(obj, method_name)
     }
 

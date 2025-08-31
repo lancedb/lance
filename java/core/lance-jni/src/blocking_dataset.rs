@@ -1249,40 +1249,32 @@ fn create_column_alteration(
     let path_jstring: JString = path_obj.into();
     let path: String = env.get_string(&path_jstring)?.into();
 
-    let rename_obj = env
-        .get_field(&column_alteration_jobj, "rename", "Ljava/util/Optional;")?
+    let rename = env
+        .call_method(
+            &column_alteration_jobj,
+            "getRename",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
         .l()?;
-    let rename = if env.call_method(&rename_obj, "isPresent", "()Z", &[])?.z()? {
-        let jstring: JObject = env
-            .call_method(rename_obj, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let jstring: JString = jstring.into();
-        let rename_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
-        Some(rename_str)
-    } else {
-        None
-    };
-
-    let nullable_obj = env
-        .get_field(&column_alteration_jobj, "nullable", "Ljava/util/Optional;")?
+    let rename = env.get_string_opt(&rename)?;
+    let nullable = env
+        .call_method(
+            &column_alteration_jobj,
+            "getNullable",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
         .l()?;
-    let nullable = if env
-        .call_method(&nullable_obj, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let nullable_value = env
-            .call_method(nullable_obj, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        Some(
-            env.call_method(nullable_value, "booleanValue", "()Z", &[])?
-                .z()?,
-        )
-    } else {
-        None
-    };
+    let nullable = env.get_bool_opt(&nullable)?;
 
     let data_type_obj = env
-        .get_field(&column_alteration_jobj, "dataType", "Ljava/util/Optional;")?
+        .call_method(
+            &column_alteration_jobj,
+            "getDataType",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
         .l()?;
     let data_type = if env
         .call_method(&data_type_obj, "isPresent", "()Z", &[])?

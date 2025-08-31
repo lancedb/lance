@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.ipc;
 
+import com.lancedb.lance.util.ToStringHelper;
+
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
@@ -40,6 +42,6 @@ public class DataStatistics implements Serializable {
 
   @Override
   public String toString() {
-    return "DataStatistics{" + "fields=" + fields + '}';
+    return ToStringHelper.of(this).add("fields", fields).toString();
   }
 }
