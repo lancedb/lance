@@ -196,7 +196,7 @@ impl FromJObjectWithEnv<RewrittenIndex> for JObject<'_> {
 
         let new_index_details_value = env.get_field(self, "newIndexDetailsValue", "[B")?.l()?;
         let new_index_details_value =
-            env.convert_byte_array(&JByteArray::from(new_index_details_value))?;
+            env.convert_byte_array(JByteArray::from(new_index_details_value))?;
 
         let new_index_version = env.get_field(self, "newIndexVersion", "I")?.i()?;
         Ok(RewrittenIndex {
