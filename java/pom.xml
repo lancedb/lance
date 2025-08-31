@@ -28,7 +28,7 @@
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <arrow.version>15.0.0</arrow.version>
+        <arrow.version>18.3.0</arrow.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
         <spotless.version>2.30.0</spotless.version>
