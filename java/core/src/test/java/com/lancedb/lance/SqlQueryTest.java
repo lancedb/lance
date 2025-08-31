@@ -68,8 +68,8 @@ public class SqlQueryTest {
         totalSum += id;
       }
     }
-    Assertions.assertEquals(rowCount, 40);
-    Assertions.assertEquals(totalSum, 780);
+    Assertions.assertEquals(40, rowCount);
+    Assertions.assertEquals(780, totalSum);
     reader.close();
 
     // Test agg query
@@ -79,7 +79,7 @@ public class SqlQueryTest {
         reader.getVectorSchemaRoot().getSchema().toString());
     Assertions.assertTrue(reader.loadNextBatch());
     long sum = (Long) reader.getVectorSchemaRoot().getVector(0).getObject(0);
-    Assertions.assertEquals(sum, 780);
+    Assertions.assertEquals(780, sum);
     reader.close();
 
     // Test empty result
@@ -92,7 +92,7 @@ public class SqlQueryTest {
     while (reader.loadNextBatch()) {
       rowCount += reader.getVectorSchemaRoot().getRowCount();
     }
-    Assertions.assertEquals(rowCount, 0);
+    Assertions.assertEquals(0, rowCount);
     reader.close();
 
     // Test withRowId and rowAddr
