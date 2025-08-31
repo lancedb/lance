@@ -33,7 +33,7 @@ public class Project extends SchemaOperation {
 
   @Override
   public String toString() {
-    return "Project{" + "schema=" + +'}';
+    return "Project{" + "schema=" + schema() +'}';
   }
 
   public static Builder builder() {
