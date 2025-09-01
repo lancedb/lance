@@ -27,6 +27,13 @@ fn main() -> Result<(), String> {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
+    if target_os == "windows" {
+        println!(
+            "cargo:warning=fp16 kernels are not supported on Windows. Skipping compilation of kernels."
+        );
+        return Ok(());
+    }
+
     if target_arch == "aarch64" && target_os == "macos" {
         // Build a version with NEON
         build_f16_with_flags("neon", &["-mtune=apple-m1"]).unwrap();
@@ -78,14 +85,6 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
     if cfg!(not(feature = "fp16kernels")) {
         println!(
             "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
-        );
-        return Ok(());
-    }
-
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    if target_os == "windows" {
-        println!(
-            "cargo:warning=fp16 kernels are not supported on Windows. Skipping compilation of kernels."
         );
         return Ok(());
     }
