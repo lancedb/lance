@@ -84,6 +84,8 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::cleanup::CleanupPolicy;
+use crate::dataset::cleanup::CleanupPolicy::BeforeTimestamp;
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -858,11 +860,46 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
         let before = utc_now() - older_than;
+        self.cleanup_with_policy(
+            BeforeTimestamp(before),
+            delete_unverified,
+            error_if_tagged_old_versions,
+        )
+    }
+
+    /// Removes old versions of the dataset from storage
+    ///
+    /// This function will remove all versions of the dataset that satisfies the given policy.
+    /// This function will not remove the current version of the dataset.
+    ///
+    /// Once a version is removed it can no longer be checked out or restored.  Any data unique
+    /// to that version will be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - Versions satisfies this policy will be deleted.
+    /// * `delete_unverified` - If false (the default) then files will only be deleted if they are
+    ///                        not referenced and are not in progress(at least 7 days old).
+    ///                        Set to true to delete these files if you are sure there are no other
+    ///                        in-progress dataset operations.
+    /// * `error_if_tagged_old_versions` - If this argument True, an exception will be raised if any
+    ///                                    tagged versions match the parameters.
+    ///
+    /// # Returns
+    ///
+    /// * `RemovalStats` - Statistics about the removal operation
+    #[instrument(level = "debug", skip(self))]
+    pub fn cleanup_with_policy(
+        &self,
+        policy: CleanupPolicy,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+    ) -> BoxFuture<'_, Result<RemovalStats>> {
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
         cleanup::cleanup_old_versions(
             self,
-            before,
+            policy,
             delete_unverified,
             error_if_tagged_old_versions,
         )
