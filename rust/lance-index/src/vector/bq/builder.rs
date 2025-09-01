@@ -93,7 +93,7 @@ impl RabitQuantizer {
     }
 
     #[inline]
-    fn rotate_mat<T: ArrowFloatType>(&self) -> ndarray::ArrayView2<T::Native> {
+    fn rotate_mat<T: ArrowFloatType>(&'_ self) -> ndarray::ArrayView2<'_, T::Native> {
         let code_dim = self.code_dim();
         ndarray::ArrayView2::from_shape((code_dim, code_dim), self.rotate_mat_flat::<T>()).unwrap()
     }
