@@ -14,7 +14,7 @@ use lance_linalg::distance::{DistanceType, MetricType};
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
-use crate::vector::bq::transform::{ExtendDimensionTransformer, RQTransformer};
+use crate::vector::bq::transform::RQTransformer;
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array};
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};

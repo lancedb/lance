@@ -11,7 +11,7 @@ use half::{bf16, f16};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
-use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
+use lance_core::utils::cpu::SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Float, Num};
 
 /// L2 normalization
@@ -50,7 +50,7 @@ impl Normalize for u8 {
 impl Normalize for f16 {
     #[inline]
     fn norm_l2(vector: &[Self]) -> f32 {
-        match *FP16_SIMD_SUPPORT {
+        match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
                 kernel::norm_l2_f16_neon(vector.as_ptr(), vector.len() as u32)

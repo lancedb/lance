@@ -14,8 +14,8 @@ pub enum SimdSupport {
     Lasx,
 }
 
-/// Support for FP16 SIMD operations
-pub static FP16_SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
+/// Support for SIMD operations
+pub static SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
     #[cfg(target_arch = "aarch64")]
     {
         if aarch64::has_neon_f16_support() {
