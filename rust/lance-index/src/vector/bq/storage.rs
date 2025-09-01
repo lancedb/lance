@@ -391,9 +391,9 @@ impl VectorStore for RabitQuantizationStorage {
             .expect("RabitQ metadata not loaded");
 
         let rotated_qr = match rotate_mat.value_type() {
-            DataType::Float16 => Self::rotate_query_vector::<Float16Type>(&rotate_mat, &qr),
-            DataType::Float32 => Self::rotate_query_vector::<Float32Type>(&rotate_mat, &qr),
-            DataType::Float64 => Self::rotate_query_vector::<Float64Type>(&rotate_mat, &qr),
+            DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
+            DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
+            DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
             dt => unimplemented!("RabitQ does not support data type: {}", dt),
         };
 

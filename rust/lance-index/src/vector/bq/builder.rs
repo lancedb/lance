@@ -145,64 +145,6 @@ impl RabitQuantizer {
         Ok(norm_dists.to_vec())
     }
 
-    // compute the dot product of v_q * c
-    // v_q * c = v_q * (v-v_r) = v_q * v - v_q * v_r
-    // we already know v_q * v_r, so we just need to compute v_q * v
-    // this avoids copying centroids
-    // pub fn codes_dot_centroids(
-    //     &self,
-    //     codes: &FixedSizeListArray,
-    //     vectors: &FixedSizeListArray,
-    //     dot_vq_res: &PrimitiveArray<Float32Type>,
-    // ) -> Result<ArrayRef> {
-    //     // dot(v_q, v) = dot(P^{-1} * v_q, P^{-1} * v)
-    //     // P^{-1} * v_q is just the vector v_h where:
-    //     // [v_h]_i = (2*codes[i] - 1) / sqrt(dim)
-    //     let n = vectors.len();
-    //     let inv_sqrt_dim = 1.0 / (self.dim() as f32).sqrt();
-    //     // we now only support 1 bit per dimension for RQ
-    //     debug_assert_eq!(self.dim(), self.code_dim());
-    //     let mut vecs_h = Vec::with_capacity(n * self.dim());
-    //     codes
-    //         .values()
-    //         .as_primitive::<UInt8Type>()
-    //         .values()
-    //         .chunks_exact(self.code_dim() / 8)
-    //         .for_each(|vec| {
-    //             for &byte in vec.iter() {
-    //                 for j in 0..8 {
-    //                     let bit = (byte >> j) & 1;
-    //                     if bit == 1 {
-    //                         vecs_h.push(inv_sqrt_dim);
-    //                     } else {
-    //                         vecs_h.push(-inv_sqrt_dim);
-    //                     }
-    //                 }
-    //             }
-    //         });
-
-    //     debug_assert_eq!(vecs_h.len(), n * self.dim());
-    //     let mut vecs_h = ndarray::Array2::from_shape_vec((n, self.dim()), vecs_h)
-    //         .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-
-    //     let vectors = ndarray::ArrayView2::from_shape(
-    //         (n, self.dim()),
-    //         vectors.values().as_primitive::<Float32Type>().values(),
-    //     )
-    //     .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
-    //     let vectors = vectors.t();
-    //     let rotated_vectors = self.metadata.inv_p.dot(&vectors);
-    //     let rotated_vectors = rotated_vectors.t();
-
-    //     vecs_h.zip_mut_with(&rotated_vectors, |f, &v| *f = *f * v);
-    //     debug_assert_eq!(vecs_h.shape(), &[n, self.dim()]);
-    //     let dot_vq_v = vecs_h.sum_axis(Axis(1));
-    //     debug_assert_eq!(dot_vq_v.len(), n);
-    //     let dot_vq_v = Float32Array::from(dot_vq_v.to_vec());
-    //     let dot_vq_c = arrow_arith::numeric::sub(&dot_vq_v, dot_vq_res)?;
-    //     Ok(dot_vq_c)
-    // }
-
     fn transform<T: ArrowFloatType>(
         &self,
         residual_vectors: &FixedSizeListArray,
