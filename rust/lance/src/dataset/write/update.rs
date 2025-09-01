@@ -527,7 +527,6 @@ mod tests {
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::{future::try_join_all, TryStreamExt};
-    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
@@ -1069,7 +1068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_index_fragment_bitmap_behavior() {
+    async fn test_update_affects_index_fragment_bitmap() {
         let mut dataset = lance_datagen::gen_batch()
             .col(
                 "str",

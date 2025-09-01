@@ -1980,8 +1980,9 @@ mod tests {
     use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
-    use lance_datagen::{array, BatchCount, RowCount, Seed};
-    use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_datagen::{array, BatchCount, Dimension, RowCount, Seed};
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
@@ -4299,87 +4300,41 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     }
 
     #[tokio::test]
-    async fn test_upsert_only_fragment_bitmap_behavior() {
-        use lance_index::scalar::ScalarIndexParams;
-        use lance_index::IndexType;
-
+    async fn test_full_schema_upsert_fragment_bitmap_behavior() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::UInt32, false),
-            Field::new("value", DataType::UInt32, false),
+            Field::new("key", DataType::UInt32, true),
+            Field::new("value", DataType::UInt32, true),
             Field::new(
                 "vec",
                 DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
-                false,
+                true,
             ),
         ]));
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let key_values1 = UInt32Array::from(vec![1, 2, 3]);
-        let value_values1 = UInt32Array::from(vec![10, 20, 30]);
-        let vec_values1 = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![
-                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-            ]),
-            4,
-        )
-        .unwrap();
-
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(key_values1),
-                Arc::new(value_values1),
-                Arc::new(vec_values1),
-            ],
-        )
-        .unwrap();
-
-        Dataset::write(
-            RecordBatchIterator::new([Ok(batch1)], schema.clone()),
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 10,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let key_values2 = UInt32Array::from(vec![4, 5, 6]);
-        let value_values2 = UInt32Array::from(vec![40, 50, 60]);
-        let vec_values2 = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![
-                13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
-            ]),
-            4,
-        )
-        .unwrap();
-
-        let batch2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(key_values2),
-                Arc::new(value_values2),
-                Arc::new(vec_values2),
-            ],
-        )
-        .unwrap();
-
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(batch2)], schema.clone()),
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 10,
-                enable_stable_row_ids: true,
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(1, 1))
+            .col("value", array::step_custom::<UInt32Type>(10, 10))
+            .col(
+                "vec",
+                array::cycle_vec(
+                    array::cycle::<Float32Type>(vec![
+                        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+                        15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+                    ]),
+                    Dimension::from(4),
+                ),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         let scalar_params = ScalarIndexParams::default();
         dataset
@@ -4455,7 +4410,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 .unwrap();
 
         let fragments = updated_dataset.get_fragments();
-        assert!(fragments.len() == 3);
+        assert_eq!(fragments.len(), 3);
 
         let updated_indices = updated_dataset.load_indices().await.unwrap();
         let updated_key_index = updated_indices
@@ -4468,7 +4423,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             .unwrap();
 
         let key_bitmap = updated_key_index.fragment_bitmap.as_ref().unwrap();
-        assert!(key_bitmap.len() == 2);
+        assert_eq!(key_bitmap.len(), 2);
         assert!(key_bitmap.contains(0));
         assert!(key_bitmap.contains(1));
 
