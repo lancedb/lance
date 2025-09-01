@@ -7,8 +7,6 @@ pub(crate) mod future;
 pub(crate) mod temporal;
 #[cfg(test)]
 pub(crate) mod test;
-#[cfg(feature = "tensorflow")]
-pub mod tfrecord;
 
 // Re-export
 pub use lance_datafusion::sql;
