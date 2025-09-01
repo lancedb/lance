@@ -3553,9 +3553,9 @@ class LanceOperation:
             listed here so those fragments can be removed from indices covering
             those fields.
         value_updated_fields: list[int]
-            If any fields are updated in updated_fragments, then they must be
-            listed here so those fragments can be removed from indices covering
-            those fields.
+            If any fields their values are updated, then they must be
+            listed here so that we can refresh the fragment bitmaps of the
+            specified indices.
         """
 
         removed_fragment_ids: List[int]

@@ -248,21 +248,16 @@ pub enum Operation {
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub enum UpdateMode {
     /// Vertical update with partial schema: adds new rows with only some fields
-    /// The new fragments contain a subset of the schema fields
-    /// This is used by the dataset updater when doing partial updates
+    /// The update contains a subset of the schema fields
+    /// This is used by the dataset updater and merge insert(non-full schema) when doing partial updates
     VerticalPartialSchema,
 
     /// Vertical update with full schema: adds new rows with all schema fields
-    /// The new fragments contain all fields from the current schema
-    /// This is used when merge_insert matches the complete schema
+    /// The update contains all fields from the current schema
+    /// This is used when merge_insert matches the full schema
     VerticalFullSchema,
 
-    /// Horizontal update: adds new columns
-    /// In this case, updated_fragments may have fields removed or added
-    /// It is even possible for a field to be tombstoned and then added back in the same update (which is a field modification)
-    /// If any fields are modified in this way then they need to be added to the fields_modified list
-    /// This way we can correctly update the indices
-    /// This is what is used by a merge insert that does not match the whole schema
+    /// Horizontal update: adds/modify/delete columns
     Horizontal,
 }
 
