@@ -433,7 +433,13 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
-    fn new(read_version: u64, id: u64, file_type: &str, num_deleted_rows: usize) -> PyResult<Self> {
+    fn new(
+        read_version: u64,
+        id: u64,
+        file_type: &str,
+        num_deleted_rows: usize,
+        base_id: Option<u32>,
+    ) -> PyResult<Self> {
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
             "bitmap" => DeletionFileType::Bitmap,
@@ -449,6 +455,7 @@ impl PyDeletionFile {
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
+            base_id,
         }))
     }
 
@@ -462,6 +469,7 @@ impl PyDeletionFile {
             intern!(slf.py(), "num_deleted_rows"),
             slf.0.num_deleted_rows,
         )?;
+        dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
 
         Ok(dict)
     }
@@ -497,6 +505,11 @@ impl PyDeletionFile {
             DeletionFileType::Array => "array",
             DeletionFileType::Bitmap => "bitmap",
         }
+    }
+
+    #[getter]
+    fn base_id(&self) -> &Option<u32> {
+        &self.0.base_id
     }
 
     #[pyo3(signature = (fragment_id, base_uri=None))]
@@ -669,6 +682,7 @@ impl FromPyObject<'_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
+            base_id: ob.getattr("base_id")?.extract()?,
         }))
     }
 }
@@ -692,6 +706,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_major_version,
             self.0.file_minor_version,
             file_size_bytes,
+            self.0.base_id,
         ))
     }
 }

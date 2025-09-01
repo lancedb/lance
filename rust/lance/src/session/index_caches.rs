@@ -10,14 +10,10 @@
 //!     │    │
 //!     └────┴──► Index-specific cache (prefixed by index UUID and FRI UUID)
 
-use std::{borrow::Cow, ops::Deref, sync::Arc};
+use std::{borrow::Cow, ops::Deref};
 
 use lance_core::cache::{CacheKey, LanceCache};
-use lance_index::{
-    frag_reuse::FragReuseIndex,
-    scalar::{ScalarIndex, ScalarIndexType},
-    vector::{VectorIndex, VectorIndexCacheEntry},
-};
+use lance_index::{frag_reuse::FragReuseIndex, scalar::ScalarIndexType};
 use lance_table::format::Index;
 use uuid::Uuid;
 
@@ -73,46 +69,6 @@ impl DSIndexCache {
 }
 
 // Cache key types for type-safe cache access
-
-#[derive(Debug)]
-pub struct ScalarIndexKey<'a> {
-    pub uuid: &'a str,
-}
-
-impl CacheKey for ScalarIndexKey<'_> {
-    type ValueType = Arc<dyn ScalarIndex>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("scalar/{}", self.uuid))
-    }
-}
-
-#[derive(Debug)]
-pub struct VectorIndexKey<'a> {
-    pub uuid: &'a str,
-}
-
-impl CacheKey for VectorIndexKey<'_> {
-    type ValueType = Arc<dyn VectorIndex>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("vector/{}", self.uuid))
-    }
-}
-
-#[derive(Debug)]
-pub struct VectorPartitionKey<'a> {
-    pub uuid: &'a str,
-    pub partition: u32,
-}
-
-impl CacheKey for VectorPartitionKey<'_> {
-    type ValueType = Arc<dyn VectorIndexCacheEntry>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("vector_partition/{}/{}", self.uuid, self.partition))
-    }
-}
 
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {

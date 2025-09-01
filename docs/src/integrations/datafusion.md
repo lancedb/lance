@@ -90,6 +90,28 @@ let df = ctx.sql("SELECT * FROM dataset WHERE contains_tokens(text, 'cat')").awa
 let result = df.collect().await?;
 ```
 
+### JSON Functions
+
+Lance provides comprehensive JSON support through a set of built-in UDFs that are automatically registered when you use `register_functions()`. These functions enable you to query and filter JSON data efficiently.
+
+For a complete guide to JSON functions including:
+- `json_extract` - Extract values using JSONPath
+- `json_get`, `json_get_string`, `json_get_int`, `json_get_float`, `json_get_bool` - Type-safe value extraction
+- `json_exists` - Check if a path exists
+- `json_array_contains`, `json_array_length` - Array operations
+
+See the [JSON Support Guide](../guide/json.md) for detailed documentation and examples.
+
+**Example: Querying JSON in SQL**
+```rust
+// After registering functions as shown above
+let df = ctx.sql("
+    SELECT * FROM dataset 
+    WHERE json_get_string(metadata, 'category') = 'electronics'
+    AND json_array_contains(metadata, '$.tags', 'featured')
+").await?;
+```
+
 ## Python
 
 In Python, this integration is done via [Datafusion FFI](https://docs.rs/datafusion-ffi/latest/datafusion_ffi/).

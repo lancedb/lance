@@ -114,7 +114,7 @@ pub struct BinaryPageDecoder {
 }
 
 impl LogicalPageDecoder for BinaryPageDecoder {
-    fn wait_for_loaded(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, num_rows: u64) -> BoxFuture<'_, Result<()>> {
         self.inner.wait_for_loaded(num_rows)
     }
 

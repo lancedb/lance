@@ -10,6 +10,7 @@ abd = "abd"
 afe = "afe"
 typ = "typ"
 rabit = "rabit"
+flate = "flate"
 
 [files]
 extend-exclude = ["notebooks/*.ipynb"]

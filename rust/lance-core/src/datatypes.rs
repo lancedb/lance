@@ -9,9 +9,8 @@ use std::sync::{Arc, LazyLock};
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use deepsize::DeepSizeOf;
-use lance_arrow::bfloat16::{
-    is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
-};
+use lance_arrow::bfloat16::{is_bfloat16_field, BFLOAT16_EXT_NAME};
+use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use snafu::location;
 
 mod field;
@@ -202,6 +201,7 @@ impl TryFrom<&LogicalType> for DataType {
             "binary" => Some(Binary),
             "large_string" => Some(LargeUtf8),
             "large_binary" => Some(LargeBinary),
+            "json" => Some(LargeBinary),
             "date32:day" => Some(Date32),
             "date64:ms" => Some(Date64),
             "time32:s" => Some(Time32(TimeUnit::Second)),

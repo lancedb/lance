@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Utilities for remapping row ids. Necessary before move-stable row ids.
+//! Utilities for remapping row ids. Necessary before stable row ids.
 //!
 
 use crate::dataset::transaction::{Operation, Transaction};
@@ -262,32 +262,35 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         if should_remap {
             let new_index_id = index::remap_index(dataset, &curr_index_id, row_id_map).await?;
 
-            let new_index_meta = Index {
-                uuid: new_index_id,
-                name: curr_index_meta.name.clone(),
-                fields: curr_index_meta.fields.clone(),
-                dataset_version: dataset.manifest.version,
-                fragment_bitmap: bitmap_after_remap,
-                index_details: curr_index_meta.index_details.clone(),
-                index_version: curr_index_meta.index_version,
-                created_at: curr_index_meta.created_at,
-            };
+            if let Some(new_id) = new_index_id {
+                let new_index_meta = Index {
+                    uuid: new_id,
+                    name: curr_index_meta.name.clone(),
+                    fields: curr_index_meta.fields.clone(),
+                    dataset_version: dataset.manifest.version,
+                    fragment_bitmap: bitmap_after_remap,
+                    index_details: curr_index_meta.index_details.clone(),
+                    index_version: curr_index_meta.index_version,
+                    created_at: curr_index_meta.created_at,
+                    base_id: None,
+                };
 
-            let transaction = Transaction::new(
-                dataset.manifest.version,
-                Operation::CreateIndex {
-                    new_indices: vec![new_index_meta],
-                    removed_indices: vec![curr_index_meta],
-                },
-                None,
-                None,
-            );
+                let transaction = Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![new_index_meta],
+                        removed_indices: vec![curr_index_meta.clone()],
+                    },
+                    None,
+                    None,
+                );
 
-            dataset
-                .apply_commit(transaction, &Default::default(), &Default::default())
-                .await?;
+                dataset
+                    .apply_commit(transaction, &Default::default(), &Default::default())
+                    .await?;
 
-            curr_index_id = new_index_id;
+                curr_index_id = new_id;
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-## Contributing to Rust
+# Contributing to Rust
 
 To format and lint Rust code:
 
@@ -7,7 +7,7 @@ cargo fmt --all
 cargo clippy --all-features --tests --benches
 ```
 
-### Core Format
+## Core Format
 
 The core format is implemented in Rust under the `rust` directory. Once you've setup Rust you can build the core format with:
 

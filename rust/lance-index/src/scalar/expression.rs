@@ -17,16 +17,17 @@ use datafusion_expr::{
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
 };
 
+use super::{
+    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
+    TextQuery, TokenQuery,
+};
+use crate::scalar::inverted::InvertedIndex;
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
-
-use super::{
-    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult, TextQuery,
-};
 
 const MAX_DEPTH: usize = 500;
 
@@ -165,11 +166,15 @@ impl ScalarQueryParser for MultiQueryParser {
 #[derive(Debug)]
 pub struct SargableQueryParser {
     index_name: String,
+    needs_recheck: bool,
 }
 
 impl SargableQueryParser {
-    pub fn new(index_name: String) -> Self {
-        Self { index_name }
+    pub fn new(index_name: String, needs_recheck: bool) -> Self {
+        Self {
+            index_name,
+            needs_recheck,
+        }
     }
 }
 
@@ -181,35 +186,39 @@ impl ScalarQueryParser for SargableQueryParser {
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
         let query = SargableQuery::Range(low.clone(), high.clone());
-        Some(IndexedExpression::index_query(
+        Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             Arc::new(query),
+            self.needs_recheck,
         ))
     }
 
     fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
         let query = SargableQuery::IsIn(in_list.to_vec());
-        Some(IndexedExpression::index_query(
+        Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             Arc::new(query),
+            self.needs_recheck,
         ))
     }
 
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
-        Some(IndexedExpression::index_query(
+        Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             Arc::new(SargableQuery::Equals(ScalarValue::Boolean(Some(value)))),
+            self.needs_recheck,
         ))
     }
 
     fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
-        Some(IndexedExpression::index_query(
+        Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             Arc::new(SargableQuery::IsNull()),
+            self.needs_recheck,
         ))
     }
 
@@ -233,10 +242,11 @@ impl ScalarQueryParser for SargableQueryParser {
             Operator::NotEq => SargableQuery::Equals(value.clone()),
             _ => unreachable!(),
         };
-        Some(IndexedExpression::index_query(
+        Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
             self.index_name.clone(),
             Arc::new(query),
+            self.needs_recheck,
         ))
     }
 
@@ -338,11 +348,15 @@ impl ScalarQueryParser for LabelListQueryParser {
 #[derive(Debug, Clone)]
 pub struct TextQueryParser {
     index_name: String,
+    needs_recheck: bool,
 }
 
 impl TextQueryParser {
-    pub fn new(index_name: String) -> Self {
-        Self { index_name }
+    pub fn new(index_name: String, needs_recheck: bool) -> Self {
+        Self {
+            index_name,
+            needs_recheck,
+        }
     }
 }
 
@@ -392,10 +406,11 @@ impl ScalarQueryParser for TextQueryParser {
             ScalarValue::Utf8(Some(scalar_str)) | ScalarValue::LargeUtf8(Some(scalar_str)) => {
                 if func.name() == "contains" {
                     let query = TextQuery::StringContains(scalar_str);
-                    Some(IndexedExpression::index_query(
+                    Some(IndexedExpression::index_query_with_recheck(
                         column.to_string(),
                         self.index_name.clone(),
                         Arc::new(query),
+                        self.needs_recheck,
                     ))
                 } else {
                     None
@@ -413,11 +428,15 @@ impl ScalarQueryParser for TextQueryParser {
 #[derive(Debug, Clone)]
 pub struct FtsQueryParser {
     index_name: String,
+    index: InvertedIndex,
 }
 
 impl FtsQueryParser {
-    pub fn new(index_name: String) -> Self {
-        Self { index_name }
+    pub fn new(name: String, index: InvertedIndex) -> Self {
+        Self {
+            index_name: name,
+            index,
+        }
     }
 }
 
@@ -464,22 +483,18 @@ impl ScalarQueryParser for FtsQueryParser {
         }
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
-            // TODO(https://github.com/lancedb/lance/issues/3855):
-            //
-            // Create the contains_tokens UDF
             if func.name() == "contains_tokens" {
-                let query = TextQuery::StringContains(scalar_str);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    Arc::new(query),
-                ))
-            } else {
-                None
+                let query = TokenQuery::TokensContains(scalar_str);
+                if self.index.is_query_allowed(&query) {
+                    return Some(IndexedExpression::index_query(
+                        column.to_string(),
+                        self.index_name.clone(),
+                        Arc::new(query),
+                    ));
+                }
             }
-        } else {
-            None
         }
+        None
     }
 }
 
@@ -499,6 +514,25 @@ impl IndexedExpression {
                 column,
                 index_name,
                 query,
+                needs_recheck: false, // Default to false, will be set by parser
+            })),
+            refine_expr: None,
+        }
+    }
+
+    /// Create an expression that is only an index query with explicit needs_recheck
+    fn index_query_with_recheck(
+        column: String,
+        index_name: String,
+        query: Arc<dyn AnyQuery>,
+        needs_recheck: bool,
+    ) -> Self {
+        Self {
+            scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column,
+                index_name,
+                query,
+                needs_recheck,
             })),
             refine_expr: None,
         }
@@ -631,6 +665,8 @@ pub struct ScalarIndexSearch {
     pub index_name: String,
     /// The query to search for
     pub query: Arc<dyn AnyQuery>,
+    /// If true, the query results are inexact and will need a recheck
+    pub needs_recheck: bool,
 }
 
 impl PartialEq for ScalarIndexSearch {
@@ -694,6 +730,7 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+#[derive(Debug)]
 pub enum IndexExprResult {
     // The answer is exactly the rows in the allow list minus the rows in the block list
     Exact(RowIdMask),
@@ -904,7 +941,7 @@ impl ScalarIndexExpr {
         match self {
             Self::Not(inner) => inner.needs_recheck(),
             Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
-            Self::Query(search) => search.query.needs_recheck(),
+            Self::Query(search) => search.needs_recheck,
         }
     }
 }
@@ -1534,28 +1571,28 @@ mod tests {
                 "color",
                 ColInfo::new(
                     DataType::Utf8,
-                    Box::new(SargableQueryParser::new("color_idx".to_string())),
+                    Box::new(SargableQueryParser::new("color_idx".to_string(), false)),
                 ),
             ),
             (
                 "aisle",
                 ColInfo::new(
                     DataType::UInt32,
-                    Box::new(SargableQueryParser::new("aisle_idx".to_string())),
+                    Box::new(SargableQueryParser::new("aisle_idx".to_string(), false)),
                 ),
             ),
             (
                 "on_sale",
                 ColInfo::new(
                     DataType::Boolean,
-                    Box::new(SargableQueryParser::new("on_sale_idx".to_string())),
+                    Box::new(SargableQueryParser::new("on_sale_idx".to_string(), false)),
                 ),
             ),
             (
                 "price",
                 ColInfo::new(
                     DataType::Float32,
-                    Box::new(SargableQueryParser::new("price_idx".to_string())),
+                    Box::new(SargableQueryParser::new("price_idx".to_string(), false)),
                 ),
             ),
         ]);
@@ -1749,6 +1786,7 @@ mod tests {
             column: "aisle".to_string(),
             index_name: "aisle_idx".to_string(),
             query: Arc::new(SargableQuery::Equals(ScalarValue::UInt32(Some(10)))),
+            needs_recheck: false,
         }));
         let right = Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "color".to_string(),
@@ -1756,6 +1794,7 @@ mod tests {
             query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                 "blue".to_string(),
             )))),
+            needs_recheck: false,
         }));
         check(
             &index_info,

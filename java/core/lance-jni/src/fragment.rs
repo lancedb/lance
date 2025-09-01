@@ -5,7 +5,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
-use jni::objects::{JIntArray, JValueGen};
+use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
     objects::{JObject, JString},
     sys::{jint, jlong},
@@ -24,7 +24,7 @@ use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
     utils::extract_write_params,
-    RT,
+    JNIEnvExt, RT,
 };
 
 //////////////////
@@ -212,11 +212,66 @@ fn create_fragment<'a>(
     export_vec(env, &fragments)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_nativeDeleteRows<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,
+    fragment_id: jint,
+    row_indexes: JObject, // List<Integer>
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        inner_delete_rows(&mut env, jdataset, fragment_id, row_indexes)
+    )
+}
+
+fn inner_delete_rows<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jint,
+    row_indexes: JObject, // List<Integer>
+) -> Result<JObject<'local>> {
+    let fragment_id = fragment_id as usize;
+    let fragment = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let Some(fragment) = dataset.inner.get_fragment(fragment_id) else {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )));
+        };
+        fragment
+    };
+
+    let indexes: Vec<u32> = env
+        .get_integers(&row_indexes)?
+        .into_iter()
+        .map(|x| x as u32)
+        .collect();
+
+    let res = RT.block_on(async move { fragment.extend_deletions(indexes).await });
+
+    let obj = match res {
+        Ok(Some(f)) => f.metadata().into_java(env)?,
+        Ok(None) => JObject::default(),
+        Err(e) => {
+            return Err(Error::runtime_error(format!(
+                "Cannot delete rows in fragment {}: {:?}",
+                fragment_id, e
+            )))
+        }
+    };
+
+    Ok(obj)
+}
+
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
-const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[IIILjava/lang/Long;)V";
+const DATA_FILE_CONSTRUCTOR_SIG: &str =
+    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;)V";
+    "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFile;Lcom/lancedb/lance/fragment/RowIdMeta;)V";
@@ -232,6 +287,7 @@ impl IntoJava for &DataFile {
             Some(f) => JLance(u64::from(f) as i64).into_java(env)?,
             None => JObject::null(),
         };
+        let base_id = convert_to_java_integer(env, self.base_id)?;
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -242,6 +298,7 @@ impl IntoJava for &DataFile {
                 JValueGen::Int(self.file_major_version as i32),
                 JValueGen::Int(self.file_minor_version as i32),
                 JValueGen::Object(&file_size_bytes),
+                JValueGen::Object(&base_id),
             ],
         )?)
     }
@@ -272,6 +329,7 @@ impl IntoJava for &DeletionFile {
             None => JObject::null(),
         };
         let file_type = self.file_type.into_java(env)?;
+        let base_id = convert_to_java_integer(env, self.base_id)?;
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -280,6 +338,7 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
+                JValueGen::Object(&base_id),
             ],
         )?)
     }
@@ -406,11 +465,13 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             )?
             .l()?
             .extract_object(env)?;
+        let base_id = get_base_id(env, self)?;
         Ok(DeletionFile {
             read_version,
             id,
             num_deleted_rows,
             file_type,
+            base_id,
         })
     }
 }
@@ -418,7 +479,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
 impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFileType> {
         let s = env
-            .call_method(self, "toString", "()Ljava.lang.String;", &[])?
+            .call_method(self, "toString", "()Ljava/lang/String;", &[])?
             .l()?;
         let s: String = env.get_string(&JString::from(s))?.into();
         let t = if s == "ARRAY" {
@@ -454,6 +515,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             .extract_object(env)?;
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
+        let base_id = get_base_id(env, self)?;
         Ok(DataFile {
             path,
             fields,
@@ -461,6 +523,37 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
+            base_id,
         })
+    }
+}
+
+fn get_base_id(env: &mut JNIEnv, obj: &JObject) -> Result<Option<u32>> {
+    let base_id = env
+        .call_method(obj, "getBaseId", "()Ljava/util/Optional;", &[])?
+        .l()?;
+
+    if env.call_method(&base_id, "isPresent", "()Z", &[])?.z()? {
+        let inner_value = env
+            .call_method(&base_id, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let int_value = env.call_method(&inner_value, "intValue", "()I", &[])?.i()?;
+        Ok(Some(int_value as u32))
+    } else {
+        Ok(None)
+    }
+}
+
+fn convert_to_java_integer<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<u32>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Integer",
+            "(I)V",
+            &[JValue::Int(base_index as jint)],
+        )?),
+        None => Ok(JObject::null()),
     }
 }

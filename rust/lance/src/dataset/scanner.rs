@@ -72,6 +72,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
+use crate::dataset::utils::wrap_json_stream_for_reading;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
@@ -79,13 +80,14 @@ use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, LanceFilterExec, LanceScanConfig};
+use crate::io::exec::{get_physical_optimizer, AddRowOffsetExec, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 use crate::{Error, Result};
+
 use snafu::location;
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -401,6 +403,35 @@ pub struct Scanner {
 
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
+
+    // Legacy fields to help migrate some old projection behavior to new behavior
+    //
+    // There are two behaviors we are moving away from:
+    //
+    // First, the old behavior used methods like with_row_id and with_row_addr to add
+    // "system" columns.  The new behavior is to specify them in the projection like any
+    // other column.  The only difference between a system column and a regular column is
+    // that system columns are not returned in the schema and are not returned by default
+    // (i.e. "SELECT *")
+    //
+    // Second, the old behavior would _always_ add the _score or _distance columns to the
+    // output and there was no way for the user to opt out.  The new behavior treats the
+    // _score and _distance as regular output columns of the "search table function".  If
+    // the user does not specify a projection (i.e. "SELECT *") then we will add the _score
+    // and _distance columns to the end.  If the user does specify a projection then they
+    // must request those columns for them to show up.
+    //
+    // --------------------------------------------------------------------------
+    /// Whether the user wants the row id on top of the projection, will always come last
+    /// except possibly before _rowaddr
+    legacy_with_row_id: bool,
+    /// Whether the user wants the row address on top of the projection, will always come last
+    legacy_with_row_addr: bool,
+    /// Whether the user explicitly requested a projection.  If they did then we will warn them
+    /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
+    explicit_projection: bool,
+    /// Whether the user wants to use the legacy projection behavior.
+    autoproject_scoring_columns: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -570,8 +601,7 @@ impl TakeOperation {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        // By default, we only scan the local schema
-        let projection_plan = ProjectionPlan::new(dataset.clone());
+        let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
         Self {
             dataset,
@@ -597,6 +627,10 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
+            legacy_with_row_addr: false,
+            legacy_with_row_id: false,
+            explicit_projection: false,
+            autoproject_scoring_columns: true,
         }
     }
 
@@ -662,27 +696,6 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
             .collect();
 
-        let with_row_id = self.projection_plan.desires_row_id;
-        let with_row_addr = self.projection_plan.desires_row_addr;
-
-        for (col, _) in &transformed_columns {
-            if *col == ROW_ID && !with_row_id {
-                return Err(Error::invalid_input(
-                    format!("Cannot project {} without enabling with_row_id", ROW_ID),
-                    location!(),
-                ));
-            }
-            if *col == ROW_ADDR && !with_row_addr {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Cannot project {} without enabling with_row_address",
-                        ROW_ADDR
-                    ),
-                    location!(),
-                ));
-            }
-        }
-
         self.project_with_transform(&transformed_columns)
     }
 
@@ -693,19 +706,14 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let filtered_columns: Vec<_> = columns
-            .iter()
-            .filter(|(col, _)| {
-                let col_name = col.as_ref();
-                !(col_name == ROW_ID
-                    || col_name == ROW_ADDR
-                    || col_name == DIST_COL
-                    || col_name == SCORE_COL)
-            })
-            .map(|(c, t)| (c.as_ref(), t.as_ref()))
-            .collect();
-        self.projection_plan
-            .project_from_expressions(&filtered_columns)?;
+        self.explicit_projection = true;
+        self.projection_plan = ProjectionPlan::from_expressions(self.dataset.clone(), columns)?;
+        if self.legacy_with_row_id {
+            self.projection_plan.include_row_id();
+        }
+        if self.legacy_with_row_addr {
+            self.projection_plan.include_row_addr();
+        }
         Ok(self)
     }
 
@@ -1200,13 +1208,35 @@ impl Scanner {
 
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
+        self.legacy_with_row_id = true;
         self.projection_plan.include_row_id();
         self
     }
 
     /// Instruct the scanner to return the `_rowaddr` meta column from the dataset.
     pub fn with_row_address(&mut self) -> &mut Self {
+        self.legacy_with_row_addr = true;
         self.projection_plan.include_row_addr();
+        self
+    }
+
+    /// Instruct the scanner to disable automatic projection of scoring columns
+    ///
+    /// In the future, this will be the default behavior.  This method is useful for
+    /// opting in to the new behavior early to avoid breaking changes (and a warning
+    /// message)
+    ///
+    /// Once the default switches, the old autoprojection behavior will be removed.
+    ///
+    /// The autoprojection behavior (current default) includes the _score or _distance
+    /// column even if a projection is manually specified with `[project]` or
+    /// `[project_with_transform]`.
+    ///
+    /// The new behavior will only include the _score or _distance column if no projection
+    /// is specified or if the user explicitly includes the _score or _distance column
+    /// in the projection.
+    pub fn disable_scoring_autoprojection(&mut self) -> &mut Self {
+        self.autoproject_scoring_columns = false;
         self
     }
 
@@ -1275,37 +1305,68 @@ impl Scanner {
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
-    pub(crate) fn output_expr(
+    /// This takes the current output, and the user's requested projection, and calculates the
+    /// final projection expression.
+    ///
+    /// This final expression may reorder columns, drop columns, or calculate new columns
+    pub(crate) fn calculate_final_projection(
         &self,
         current_schema: &ArrowSchema,
     ) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        // Append the extra columns
+        // Select the columns from the output schema based on the user's projection (or the list
+        // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
 
-        // distance goes before the row_id column
-        if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
-            let vector_expr = expressions::col(DIST_COL, current_schema)?;
-            output_expr.push((vector_expr, DIST_COL.to_string()));
+        // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
+        // projection behavior
+        if self.autoproject_scoring_columns {
+            if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to to adopt the future behavior and avoid this warning");
+                }
+                let vector_expr = expressions::col(DIST_COL, current_schema)?;
+                output_expr.push((vector_expr, DIST_COL.to_string()));
+            }
+            if self.full_text_query.is_some()
+                && output_expr.iter().all(|(_, name)| name != SCORE_COL)
+            {
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
+                }
+                let score_expr = expressions::col(SCORE_COL, current_schema)?;
+                output_expr.push((score_expr, SCORE_COL.to_string()));
+            }
         }
 
-        if self.full_text_query.is_some() && output_expr.iter().all(|(_, name)| name != SCORE_COL) {
-            let score_expr = expressions::col(SCORE_COL, current_schema)?;
-            output_expr.push((score_expr, SCORE_COL.to_string()));
+        if self.legacy_with_row_id {
+            let row_id_pos = output_expr
+                .iter()
+                .position(|(_, name)| name == ROW_ID)
+                .ok_or_else(|| Error::Internal {
+                    message:
+                        "user specified with_row_id but the _rowid column was not in the output"
+                            .to_string(),
+                    location: location!(),
+                })?;
+            if row_id_pos != output_expr.len() - 1 {
+                // Row id is not last column.  Need to rotate it to the last spot.
+                let row_id_expr = output_expr.remove(row_id_pos);
+                output_expr.push(row_id_expr);
+            }
         }
 
-        // TODO: These output_expr.iter().all() checks seem redundant.  We should never have ROW_ID
-        // or ROW_ADDR in the output exprs.
-        if self.projection_plan.desires_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID)
-        {
-            let row_id_expr = expressions::col(ROW_ID, current_schema)?;
-            output_expr.push((row_id_expr, ROW_ID.to_string()));
-        }
-
-        if self.projection_plan.desires_row_addr
-            && output_expr.iter().all(|(_, name)| name != ROW_ADDR)
-        {
-            let row_addr_expr = expressions::col(ROW_ADDR, current_schema)?;
-            output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
+        if self.legacy_with_row_addr {
+            let row_addr_pos = output_expr.iter().position(|(_, name)| name == ROW_ADDR).ok_or_else(|| {
+                Error::Internal {
+                    message: "user specified with_row_address but the _rowaddr column was not in the output".to_string(),
+                    location: location!(),
+                }
+            })?;
+            if row_addr_pos != output_expr.len() - 1 {
+                // Row addr is not last column.  Need to rotate it to the last spot.
+                let row_addr_expr = output_expr.remove(row_addr_pos);
+                output_expr.push(row_addr_expr);
+            }
         }
 
         Ok(output_expr)
@@ -1313,7 +1374,7 @@ impl Scanner {
 
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
-    pub fn try_into_stream(&self) -> BoxFuture<Result<DatasetRecordBatchStream>> {
+    pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
@@ -1351,7 +1412,7 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    fn create_count_plan(&self) -> BoxFuture<Result<Arc<dyn ExecutionPlan>>> {
+    fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if self.projection_plan.physical_projection.is_empty() {
@@ -1409,7 +1470,7 @@ impl Scanner {
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
     /// especially if there is no filter.
     #[instrument(skip_all)]
-    pub fn count_rows(&self) -> BoxFuture<Result<u64>> {
+    pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let count_plan = self.create_count_plan().await?;
@@ -1518,7 +1579,7 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
-        if self.include_deleted_rows && !self.projection_plan.desires_row_id {
+        if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::InvalidInput {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
                 location: location!(),
@@ -1662,11 +1723,11 @@ impl Scanner {
                     // It's also possible we get here from `SELECT does_not_exist`
 
                     // Note: even though we are just going to return an error we still want to calculate the
-                    // output_expr here.  This lets us distinguish between a user doing something like:
+                    // final projection here.  This lets us distinguish between a user doing something like:
                     //
                     // SELECT 1 FROM t (not supported error)
                     // SELECT non_existent_column FROM t (column not found error)
-                    let output_expr = self.output_expr(&ArrowSchema::empty())?;
+                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
                     return Err(Error::NotSupported {
                         source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
                         location: location!(),
@@ -1767,10 +1828,15 @@ impl Scanner {
         // Stage 5: take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
-        // Stage 7: final projection
-        let output_expr = self.output_expr(plan.schema().as_ref())?;
+        // Stage 6: if requested, add the row offset column
+        if self.projection_plan.must_add_row_offset {
+            plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
+        }
 
-        plan = Arc::new(DFProjectionExec::try_new(output_expr, plan)?);
+        // Stage 7: final projection
+        let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+
+        plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
@@ -2640,11 +2706,14 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
-            let vector_scan_projection = self
+            let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
                 .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
+
+            vector_scan_projection.with_row_addr =
+                self.projection_plan.physical_projection.with_row_addr;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(
@@ -3400,6 +3469,11 @@ pub struct DatasetRecordBatchStream {
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
+        // Convert lance.json (JSONB) back to arrow.json (strings) for reading
+        //
+        // This is so bad, we need to find a way to remove this.
+        let exec_node = wrap_json_stream_for_reading(exec_node);
+
         let span = info_span!("DatasetRecordBatchStream");
         Self { exec_node, span }
     }
@@ -3532,7 +3606,7 @@ pub mod test_dataset {
                 max_rows_per_group: 10,
                 max_rows_per_file: 200,
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: stable_row_ids,
+                enable_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -3626,6 +3700,7 @@ mod test {
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
+    use arrow_schema::Fields;
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
     use half::f16;
@@ -3745,11 +3820,10 @@ mod test {
             .unwrap();
 
         let check_err_msg = |r: Result<DatasetRecordBatchStream>| {
-            let err = match r {
-                Ok(_) => panic!(
+            let Err(err) = r else {
+                panic!(
                     "Expected an error to be raised saying column y is not found but got no error"
-                ),
-                Err(e) => e,
+                )
             };
 
             assert!(
@@ -3864,6 +3938,63 @@ mod test {
             assert_eq!(batch, expected_batch);
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nested_projection() {
+        let point_fields: Fields = vec![
+            ArrowField::new("x", DataType::Float32, true),
+            ArrowField::new("y", DataType::Float32, true),
+        ]
+        .into();
+        let metadata_fields: Fields = vec![
+            ArrowField::new("location", DataType::Struct(point_fields), true),
+            ArrowField::new("age", DataType::Int32, true),
+        ]
+        .into();
+        let metadata_field = ArrowField::new("metadata", DataType::Struct(metadata_fields), true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            metadata_field,
+            ArrowField::new("idx", DataType::Int32, true),
+        ]));
+        let data = lance_datagen::rand(&schema)
+            .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
+            .await
+            .unwrap();
+
+        let mut scan = data.scan();
+        scan.project(&["metadata.location.x", "metadata.age"])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("metadata.location.x", DataType::Float32, true),
+                ArrowField::new("metadata.age", DataType::Int32, true),
+            ])
+        );
+
+        // 0 - metadata
+        // 2 - x
+        // 4 - age
+        let take_schema = data.schema().project_by_ids(&[0, 2, 4], false);
+
+        let taken = data.take_rows(&[0, 5], take_schema).await.unwrap();
+
+        // The expected schema drops y from the location field
+        let part_point_fields = Fields::from(vec![ArrowField::new("x", DataType::Float32, true)]);
+        let part_metadata_fields = Fields::from(vec![
+            ArrowField::new("location", DataType::Struct(part_point_fields), true),
+            ArrowField::new("age", DataType::Int32, true),
+        ]);
+        let part_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "metadata",
+            DataType::Struct(part_metadata_fields),
+            true,
+        )]));
+
+        assert_eq!(taken.schema(), part_schema);
     }
 
     #[rstest]
@@ -4637,7 +4768,7 @@ mod test {
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
-            enable_move_stable_row_ids: stable_row_ids,
+            enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -4932,7 +5063,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     data_storage_version: Some(data_storage_version),
-                    enable_move_stable_row_ids: stable_row_ids,
+                    enable_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -5314,7 +5445,7 @@ mod test {
                 Some(WriteParams {
                     max_rows_per_file: 500,
                     data_storage_version: Some(data_storage_version),
-                    enable_move_stable_row_ids: use_stable_row_ids,
+                    enable_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -7014,7 +7145,7 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 32)?
                     .fast_search()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
@@ -7029,7 +7160,7 @@ mod test {
                 scan.nearest("vec", &q, 33)?
                     .fast_search()
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
@@ -7044,7 +7175,7 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 34)?
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
   FilterExec: _distance@2 IS NOT NULL
@@ -7314,12 +7445,18 @@ mod test {
 
         // Test error case
         let mut scanner = dataset.scan();
-        let result = if with_row_id {
-            scanner.project(&[ROW_ID])
+        if with_row_id {
+            scanner.project(&[ROW_ID]).unwrap();
         } else {
-            scanner.project(&[ROW_ADDR])
+            scanner.project(&[ROW_ADDR]).unwrap();
         };
-        assert!(result.is_err());
+        let stream = scanner.try_into_stream().await.unwrap();
+        assert_eq!(stream.schema().fields().len(), 1);
+        if with_row_id {
+            assert!(stream.schema().field_with_name(ROW_ID).is_ok());
+        } else {
+            assert!(stream.schema().field_with_name(ROW_ADDR).is_ok());
+        }
     }
 
     async fn limit_offset_equivalency_test(scanner: &Scanner) {
@@ -7421,6 +7558,81 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    async fn test_row_offset_read_helper(
+        ds: &Dataset,
+        scan_builder: impl FnOnce(&mut Scanner) -> &mut Scanner,
+        expected_cols: &[&str],
+        expected_row_offsets: &[u64],
+    ) {
+        let mut scanner = ds.scan();
+        let scanner = scan_builder(&mut scanner);
+        let stream = scanner.try_into_stream().await.unwrap();
+
+        let schema = stream.schema();
+        let actual_cols = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(&actual_cols, expected_cols);
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
+
+        let row_offsets = batch
+            .column_by_name(ROW_OFFSET)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        assert_eq!(row_offsets.as_ref(), expected_row_offsets);
+    }
+
+    #[tokio::test]
+    async fn test_row_offset_read() {
+        let mut ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+        // [0, 1, 2], [3, 4, 5], [6, 7, 8]
+
+        // Delete [2, 3, 4, 5, 6]
+        ds.delete("idx >= 2 AND idx <= 6").await.unwrap();
+
+        // Normal read, all columns plus row offset
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| scanner.project(&["idx", ROW_OFFSET]).unwrap(),
+            &["idx", ROW_OFFSET],
+            &[0, 1, 2, 3],
+        )
+        .await;
+
+        // Read with row offset only
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| scanner.project(&[ROW_OFFSET]).unwrap(),
+            &[ROW_OFFSET],
+            &[0, 1, 2, 3],
+        )
+        .await;
+
+        // Filtered read of row offset
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| {
+                scanner
+                    .filter("idx > 1")
+                    .unwrap()
+                    .project(&[ROW_OFFSET])
+                    .unwrap()
+            },
+            &[ROW_OFFSET],
+            &[2, 3],
+        )
+        .await;
     }
 
     #[tokio::test]

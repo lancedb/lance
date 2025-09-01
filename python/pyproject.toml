@@ -60,12 +60,12 @@ tests = [
     # tensorflow is broken on 2.20.0 with macOS ARM.
     "tensorflow<=2.19.0",
     "tqdm",
-    "datafusion",
+    # Need to align with the datafusion version we use at lance rust
+    "datafusion==48.0.0",
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
-ray = ["ray[data]<2.38; python_version<'3.12'"]
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]

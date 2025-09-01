@@ -59,6 +59,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::DSMetadataCache;
 use crate::session::index_caches::IndexMetadataKey;
+use crate::session::Session;
 use crate::Dataset;
 
 mod conflict_resolver;
@@ -111,8 +112,68 @@ async fn do_commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
-    let (mut manifest, indices) =
-        transaction.build_manifest(None, vec![], &transaction_file, write_config, blob_version)?;
+    let (mut manifest, indices) = if let Operation::Clone {
+        ref_name,
+        ref_version,
+        ref_path,
+        ..
+    } = &transaction.operation
+    {
+        let source_manifest_location = commit_handler
+            .resolve_version_location(
+                &Path::parse(ref_path.as_str())?,
+                *ref_version,
+                &object_store.inner,
+            )
+            .await?;
+        let source_manifest = Dataset::load_manifest(
+            object_store,
+            &source_manifest_location,
+            base_path.to_string().as_str(),
+            &Session::default(),
+        )
+        .await?;
+
+        let new_base_id = source_manifest
+            .base_paths
+            .keys()
+            .max()
+            .map(|id| *id + 1)
+            .unwrap_or(0);
+        let new_manifest = source_manifest.shallow_clone(
+            ref_name.clone(),
+            ref_path.clone(),
+            new_base_id,
+            transaction_file,
+        );
+
+        let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
+            let reader = object_store.open(&source_manifest_location.path).await?;
+            let section: pb::IndexSection =
+                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            section
+                .indices
+                .into_iter()
+                .map(|index_pb| {
+                    let mut index = lance_table::format::Index::try_from(index_pb)?;
+                    index.base_id = Some(new_base_id);
+                    Ok(index)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        (new_manifest, updated_indices)
+    } else {
+        let (manifest, indices) = transaction.build_manifest(
+            None,
+            vec![],
+            &transaction_file,
+            write_config,
+            blob_version,
+        )?;
+        (manifest, indices)
+    };
 
     manifest.blob_dataset_version = blob_version;
 
@@ -1467,6 +1528,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version=*/ None,
+            HashMap::new(),
         );
 
         fix_schema(&mut manifest).unwrap();

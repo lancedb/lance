@@ -128,7 +128,7 @@ impl BatchStreamGrouper {
         let column = batch.column_by_name(&self.partition_column).ok_or(
             datafusion::error::DataFusionError::Execution("Partition column not found".into()),
         )?;
-        let ranges = partition(&[column.clone()])?.ranges();
+        let ranges = partition(std::slice::from_ref(column))?.ranges();
         ranges
             .into_iter()
             .rev()

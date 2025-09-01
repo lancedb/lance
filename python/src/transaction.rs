@@ -38,6 +38,10 @@ impl FromPyObject<'_> for PyLance<Index> {
                 .map(|id| id.extract::<u32>())
                 .collect::<PyResult<RoaringBitmap>>()?,
         );
+        let base_id: Option<u32> = ob
+            .getattr("base_id")?
+            .extract::<Option<i64>>()?
+            .map(|id| id as u32);
 
         Ok(Self(Index {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
@@ -48,6 +52,7 @@ impl FromPyObject<'_> for PyLance<Index> {
             index_details: None,
             index_version,
             created_at,
+            base_id,
         }))
     }
 }
@@ -78,6 +83,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
             },
         );
         let created_at = self.0.created_at;
+        let base_id = self.0.base_id.map(|id| id as i64);
 
         let cls = namespace
             .getattr("Index")
@@ -90,6 +96,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
             fragment_ids,
             index_version,
             created_at,
+            base_id,
         ))
     }
 }

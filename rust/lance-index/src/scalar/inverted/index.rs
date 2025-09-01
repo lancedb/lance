@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
-    ops::RangeInclusive,
 };
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
 
+use crate::metrics::NoOpMetricsCollector;
+use crate::prefilter::NoFilter;
 use arrow::{
     array::LargeBinaryBuilder,
     datatypes::{self, Float32Type, Int32Type, UInt64Type},
@@ -33,10 +34,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
@@ -46,6 +48,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
+use tantivy::tokenizer::Language;
 use tracing::{info, instrument};
 
 use super::{
@@ -69,7 +72,7 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
-    AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
+    AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TokenQuery,
 };
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -94,6 +97,8 @@ pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
 pub static FTS_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
+static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 #[derive(Clone)]
 pub struct InvertedIndex {
@@ -159,6 +164,7 @@ impl InvertedIndex {
             return Ok((Vec::new(), Vec::new()));
         }
         let mask = prefilter.mask();
+
         let mut candidates = BinaryHeap::new();
         let parts = self
             .partitions
@@ -184,10 +190,15 @@ impl InvertedIndex {
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         let scorer = BM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
         while let Some(res) = parts.try_next().await? {
-            for (row_id, freq, length) in res? {
+            for DocCandidate {
+                row_id,
+                freqs,
+                doc_length,
+            } in res?
+            {
                 let mut score = 0.0;
-                for token in tokens.iter() {
-                    score += scorer.score(token, freq, length);
+                for (token, freq) in freqs.into_iter() {
+                    score += scorer.score(token.as_str(), freq, doc_length);
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -320,6 +331,43 @@ impl Index for InvertedIndex {
     }
 }
 
+impl InvertedIndex {
+    /// Whether the query can use the current index.
+    pub fn is_query_allowed(&self, query: &TokenQuery) -> bool {
+        match query {
+            TokenQuery::TokensContains(_) => {
+                self.params.base_tokenizer == "simple"
+                    && self.params.max_token_length.is_none()
+                    && self.params.language == Language::English
+                    && !self.params.stem
+            }
+        }
+    }
+
+    /// Search docs match the input text.
+    async fn do_search(&self, text: &str) -> Result<RecordBatch> {
+        let params = FtsSearchParams::new();
+        let mut tokenizer = self.tokenizer.clone();
+        let tokens = collect_tokens(text, &mut tokenizer, None);
+
+        let (doc_ids, _) = self
+            .bm25_search(
+                tokens.into(),
+                params.into(),
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .boxed()
+            .await?;
+
+        Ok(RecordBatch::try_new(
+            ROW_ID_SCHEMA.clone(),
+            vec![Arc::new(UInt64Array::from(doc_ids))],
+        )?)
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
@@ -329,14 +377,23 @@ impl ScalarIndex for InvertedIndex {
         query: &dyn AnyQuery,
         _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        return Err(Error::invalid_input(
-            format!("unsupported query {:?} for inverted index", query),
-            location!(),
-        ));
+        let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
+
+        match query {
+            TokenQuery::TokensContains(text) => {
+                let records = self.do_search(text).await?;
+                let row_ids = records
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let row_ids = row_ids.iter().flatten().collect_vec();
+                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
+            }
+        }
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
     }
 
@@ -385,6 +442,7 @@ impl ScalarIndex for InvertedIndex {
                     .buffer_unordered(store.io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
+
                 let tokenizer = params.build()?;
                 Ok(Arc::new(Self {
                     params,
@@ -515,7 +573,7 @@ impl InvertedPartition {
         operator: Operator,
         mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u64, u32, u32)>> {
+    ) -> Result<Vec<DocCandidate>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
@@ -663,7 +721,7 @@ impl TokenSet {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> TokenIterator {
+    pub(crate) fn iter(&self) -> TokenIterator<'_> {
         TokenIterator::new(match &self.tokens {
             TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
             TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
@@ -1018,6 +1076,9 @@ impl PostingListReader {
         for token_id in 0..self.len() {
             let posting_range = self.posting_list_range(token_id as u32);
             let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
+            // Apply shrink_to_fit to create a deep copy with compacted buffers
+            // This ensures each cached entry has its own memory, not shared references
+            let batch = batch.shrink_to_fit()?;
             let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
             self.index_cache
                 .insert_with_key(
@@ -1170,7 +1231,7 @@ impl PostingList {
         }
     }
 
-    pub fn iter(&self) -> PostingListIterator {
+    pub fn iter(&self) -> PostingListIterator<'_> {
         PostingListIterator::new(self)
     }
 
@@ -1317,7 +1378,7 @@ impl PlainPostingList {
         self.len() == 0
     }
 
-    pub fn iter(&self) -> PlainPostingListIterator {
+    pub fn iter(&self) -> PlainPostingListIterator<'_> {
         Box::new(
             self.row_ids
                 .iter()
@@ -1730,6 +1791,9 @@ impl Ord for RawDocInfo {
 pub struct DocSet {
     row_ids: Vec<u64>,
     num_tokens: Vec<u32>,
+    // (row_id, doc_id) pairs sorted by row_id
+    inv: Vec<(u64, u32)>,
+
     total_tokens: u64,
 }
 
@@ -1751,8 +1815,19 @@ impl DocSet {
         self.row_ids[doc_id as usize]
     }
 
-    pub fn row_range(&self) -> RangeInclusive<u64> {
-        self.row_ids[0]..=self.row_ids[self.len() - 1]
+    pub fn doc_id(&self, row_id: u64) -> Option<u64> {
+        if self.inv.is_empty() {
+            // in legacy format, the row id is doc id
+            match self.row_ids.binary_search(&row_id) {
+                Ok(_) => Some(row_id),
+                Err(_) => None,
+            }
+        } else {
+            match self.inv.binary_search_by_key(&row_id, |x| x.0) {
+                Ok(idx) => Some(self.inv[idx].1 as u64),
+                Err(_) => None,
+            }
+        }
     }
 
     pub fn total_tokens_num(&self) -> u64 {
@@ -1821,25 +1896,30 @@ impl DocSet {
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-        let (row_ids, num_tokens) = match is_legacy {
+        let (row_ids, num_tokens, inv) = match is_legacy {
             // for legacy format, the row id is doc id,
             // in order to support efficient search, we need to sort the row ids,
             // so that we can use binary search to get num_tokens
-            true => row_id_col
-                .values()
-                .iter()
-                .filter_map(|id| {
-                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
-                    } else {
-                        Some(*id)
-                    }
-                })
-                .zip(num_tokens_col.values().iter())
-                .sorted_unstable_by_key(|x| x.0)
-                .unzip(),
+            true => {
+                let (row_ids, num_tokens) = row_id_col
+                    .values()
+                    .iter()
+                    .filter_map(|id| {
+                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                            frag_reuse_index_ref.remap_row_id(*id)
+                        } else {
+                            Some(*id)
+                        }
+                    })
+                    .zip(num_tokens_col.values().iter())
+                    .sorted_unstable_by_key(|x| x.0)
+                    .unzip();
+
+                // the legacy format doesn't need to store the inv
+                (row_ids, num_tokens, Vec::new())
+            }
             false => {
-                let row_ids = row_id_col
+                let row_ids: Vec<u64> = row_id_col
                     .values()
                     .iter()
                     .filter_map(|id| {
@@ -1851,7 +1931,16 @@ impl DocSet {
                     })
                     .collect();
                 let num_tokens = num_tokens_col.values().to_vec();
-                (row_ids, num_tokens)
+
+                // build the inv
+                let inv = row_ids
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .sorted_unstable()
+                    .map(|(i, row_id)| (row_id, i as u32))
+                    .collect();
+                (row_ids, num_tokens, inv)
             }
         };
 
@@ -1859,6 +1948,7 @@ impl DocSet {
         Ok(Self {
             row_ids,
             num_tokens,
+            inv,
             total_tokens,
         })
     }
@@ -1893,6 +1983,8 @@ impl DocSet {
         self.num_tokens[doc_id as usize]
     }
 
+    // this can be used only if it's a legacy format,
+    // which store the sorted row ids so that we can use binary search
     #[inline]
     pub fn num_tokens_by_row_id(&self, row_id: u64) -> u32 {
         self.row_ids
