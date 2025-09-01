@@ -52,6 +52,7 @@ use lance_table::{
     },
 };
 use object_store::path::Path;
+use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
     future,
@@ -59,9 +60,9 @@ use std::{
 };
 use tracing::{info, instrument, Span};
 
-use crate::{utils::temporal::utc_now, Dataset};
-
 use super::refs::TagContents;
+use crate::dataset::cleanup::CleanupPolicy::BeforeTimestamp;
+use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -88,8 +89,8 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 #[derive(Clone, Debug)]
 struct CleanupTask<'a> {
     dataset: &'a Dataset,
-    /// Cleanup all versions before this time
-    before: DateTime<Utc>,
+    /// The policy determines which versions should be cleanup
+    policy: CleanupPolicy,
     /// If true, delete unverified data files even if they are recent
     delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
@@ -108,6 +109,8 @@ struct CleanupInspection {
     verified_files: ReferencedFiles,
     /// Track tagged old versions in case we want to raise a `CleanupError`.
     tagged_old_versions: HashSet<u64>,
+    /// The earliest timestamp of all retained manifests.
+    earliest_retained_manifest_time: Option<DateTime<Utc>>,
 }
 
 /// If a file cannot be verified then it will only be deleted if it is at least
@@ -117,13 +120,13 @@ const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 impl<'a> CleanupTask<'a> {
     fn new(
         dataset: &'a Dataset,
-        before: DateTime<Utc>,
+        policy: CleanupPolicy,
         delete_unverified: bool,
         error_if_old_versions_tagged: bool,
     ) -> Self {
         Self {
             dataset,
-            before,
+            policy,
             delete_unverified,
             error_if_old_versions_tagged,
         }
@@ -192,7 +195,7 @@ impl<'a> CleanupTask<'a> {
         // version.  These are either in-progress or newly added since we started.
         let is_latest = dataset_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_latest || manifest.timestamp() >= self.before || is_tagged;
+        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
@@ -200,13 +203,22 @@ impl<'a> CleanupTask<'a> {
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
-        if is_tagged && !is_latest && manifest.timestamp() < self.before {
+        if is_tagged && !is_latest && self.policy.should_clean(&manifest) {
             inspection.tagged_old_versions.insert(manifest.version);
         }
 
         self.process_manifest(&manifest, &indexes, in_working_set, &mut inspection)?;
         if !in_working_set {
             inspection.old_manifests.push(location.path.clone());
+        } else {
+            let commit_ts = manifest.timestamp();
+            if let Some(ts) = inspection.earliest_retained_manifest_time {
+                if commit_ts < ts {
+                    inspection.earliest_retained_manifest_time = Some(commit_ts);
+                }
+            } else {
+                inspection.earliest_retained_manifest_time = Some(commit_ts);
+            }
         }
         Ok(())
     }
@@ -265,7 +277,10 @@ impl<'a> CleanupTask<'a> {
         let unreferenced_paths = self
             .dataset
             .object_store
-            .read_dir_all(&self.dataset.base, Some(self.before))
+            .read_dir_all(
+                &self.dataset.base,
+                inspection.earliest_retained_manifest_time,
+            )
             .try_filter_map(|obj_meta| {
                 // If a file is new-ish then it might be part of an ongoing operation and so we only
                 // delete it if we can verify it is part of an old version.
@@ -444,6 +459,32 @@ impl<'a> CleanupTask<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum CleanupPolicy {
+    /// Cleanup all versions before this time
+    BeforeTimestamp(DateTime<Utc>),
+    /// Cleanup all versions before this version
+    BeforeVersion(u64),
+}
+
+impl CleanupPolicy {
+    pub async fn retain_n_versions(dataset: &Dataset, n: usize) -> Result<Self> {
+        let versions = dataset.versions().await?;
+        if versions.len() <= n {
+            Ok(Self::BeforeVersion(versions[0].version))
+        } else {
+            Ok(Self::BeforeVersion(versions[versions.len() - n].version))
+        }
+    }
+
+    fn should_clean(&self, manifest: &Manifest) -> bool {
+        match self {
+            Self::BeforeTimestamp(ts) => manifest.timestamp() < *ts,
+            Self::BeforeVersion(version) => manifest.version < *version,
+        }
+    }
+}
+
 /// Deletes old versions of a dataset, removing files that are no longer
 /// needed.
 ///
@@ -453,18 +494,16 @@ impl<'a> CleanupTask<'a> {
 /// It will only remove files that are not referenced by any valid manifest.
 ///
 /// The latest manifest is always considered valid and will not be removed
-/// even if it is older than the `before` parameter.
-///
-/// The `before` parameter must be at least 7 days before the current date.
+/// even if it satisfied the cleanup policy.
 pub async fn cleanup_old_versions(
     dataset: &Dataset,
-    before: DateTime<Utc>,
+    policy: CleanupPolicy,
     delete_unverified: Option<bool>,
     error_if_tagged_old_versions: Option<bool>,
 ) -> Result<RemovalStats> {
     let cleanup = CleanupTask::new(
         dataset,
-        before,
+        policy,
         delete_unverified.unwrap_or(false),
         error_if_tagged_old_versions.unwrap_or(true),
     );
@@ -481,40 +520,71 @@ pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
-        if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
-            let std_older_than = match parse_duration(older_than) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Err(Error::Cleanup {
-                        message: format!(
-                        "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
-                        e
-                    ),
-                    })
-                }
-            };
-            let older_than = TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
-            let interval: u64 = match interval.parse() {
-                Ok(i) => i,
-                Err(e) => {
-                    return Err(Error::Cleanup {
-                        message: format!(
+    if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
+        let interval: u64 = match interval.parse() {
+            Ok(i) => i,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
                         "Error encountered while parsing lance.auto_cleanup.interval as u64: {}",
                         e
                     ),
-                    })
-                }
-            };
-            if manifest.version % interval == 0 {
-                return Ok(Some(
-                    dataset
-                        .cleanup_old_versions(older_than, Some(false), Some(false))
-                        .await?,
-                ));
+                })
             }
+        };
+
+        if manifest.version % interval != 0 {
+            return Ok(None);
         }
+    } else {
+        return Ok(None);
     }
+
+    if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
+        let std_older_than = match parse_duration(older_than) {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                    "Error encountered while parsing lance.auto_cleanup.older_than as std::time::Duration: {}",
+                    e
+                ),
+                })
+            }
+        };
+        let timestamp = utc_now() - TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
+
+        return Ok(Some(
+            dataset
+                .cleanup_with_policy(BeforeTimestamp(timestamp), Some(false), Some(false))
+                .await?,
+        ));
+    } else if let Some(reserved_versions) =
+        manifest.config.get("lance.auto_cleanup.reserved_versions")
+    {
+        let reserved_versions: usize = match reserved_versions.parse() {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(Error::Cleanup {
+                    message: format!(
+                    "Error encountered while parsing lance.auto_cleanup.reserved_versions as u64: {}",
+                    e
+                ),
+                })
+            }
+        };
+
+        return Ok(Some(
+            dataset
+                .cleanup_with_policy(
+                    CleanupPolicy::retain_n_versions(dataset, reserved_versions).await?,
+                    Some(false),
+                    Some(false),
+                )
+                .await?,
+        ));
+    }
+
     Ok(None)
 }
 
@@ -558,14 +628,14 @@ mod tests {
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::location;
 
+    use super::*;
+    use crate::dataset::cleanup::CleanupPolicy::BeforeTimestamp;
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
     use tempfile::{tempdir, TempDir};
-
-    use super::*;
 
     #[derive(Debug)]
     struct MockObjectStore {
@@ -771,7 +841,12 @@ mod tests {
 
         async fn run_cleanup(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
             let db = self.open().await?;
-            cleanup_old_versions(&db, before, None, None).await
+            cleanup_old_versions(&db, BeforeTimestamp(before), None, None).await
+        }
+
+        async fn run_cleanup_with_policy(&self, policy: CleanupPolicy) -> Result<RemovalStats> {
+            let db = self.open().await?;
+            cleanup_old_versions(&db, policy, None, None).await
         }
 
         async fn run_cleanup_with_override(
@@ -781,7 +856,13 @@ mod tests {
             error_if_tagged_old_versions: Option<bool>,
         ) -> Result<RemovalStats> {
             let db = self.open().await?;
-            cleanup_old_versions(&db, before, delete_unverified, error_if_tagged_old_versions).await
+            cleanup_old_versions(
+                &db,
+                BeforeTimestamp(before),
+                delete_unverified,
+                error_if_tagged_old_versions,
+            )
+            .await
         }
 
         async fn open(&self) -> Result<Box<Dataset>> {
@@ -1408,5 +1489,39 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_manifest_files, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_and_retain_3_recent_versions() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut time = 10i64;
+        for _ in 0..4 {
+            fixture
+                .clock
+                .set_system_time(TimeDelta::try_seconds(time).unwrap());
+            time += 10i64;
+            fixture.overwrite_some_data().await.unwrap();
+        }
+
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_data_files, 5);
+        assert_eq!(before_count.num_manifest_files, 5);
+
+        // Retain 3 recent versions
+        let policy = CleanupPolicy::retain_n_versions(&fixture.open().await.unwrap(), 3)
+            .await
+            .unwrap();
+        let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
+
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(removed.old_versions, 2);
+        assert_eq!(
+            removed.bytes_removed,
+            before_count.num_bytes - after_count.num_bytes
+        );
+
+        assert_eq!(after_count.num_data_files, 3);
+        assert_eq!(after_count.num_manifest_files, 3);
     }
 }
