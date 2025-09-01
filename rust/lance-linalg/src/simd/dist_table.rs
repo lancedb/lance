@@ -22,7 +22,7 @@ pub fn sum_4bit_dist_table(
 
     match *SIMD_SUPPORT {
         #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
-        SimdSupport::Avx512 => unsafe {
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
             for i in (0..n).step_by(BATCH_SIZE) {
                 let codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
                 sum_4bit_dist_table_32bytes_batch_avx512(
@@ -45,20 +45,6 @@ pub fn sum_4bit_dist_table(
         },
         _ => sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists),
     }
-
-    // #[cfg(target_arch = "x86_64")]
-    // unsafe {
-    //     for i in (0..n).step_by(BATCH_SIZE) {
-    //         sum_dist_table_32bytes_batch_avx2(
-    //             &codes[i * code_len..(i + BATCH_SIZE) * code_len],
-    //             dist_table,
-    //             &mut dists[i..i + BATCH_SIZE],
-    //         )
-    //     }
-    // }
-
-    // #[cfg(not(target_arch = "x86_64"))]
-    // sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists);
 }
 
 #[inline]

@@ -20,25 +20,12 @@ fn main() -> Result<(), String> {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/dist_table.c");
-    if cfg!(not(feature = "fp16kernels")) {
-        println!(
-            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
-        );
-        return Ok(());
-    }
 
     // Important: we don't use `cfg!(target_arch)` here because that is the target_arch
     // for the build script, not the target_arch for the library. Similar story for
     // target_os.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-
-    if target_os == "windows" {
-        println!(
-            "cargo:warning=fp16 kernels are not supported on Windows. Skipping compilation of kernels."
-        );
-        return Ok(());
-    }
 
     if target_arch == "aarch64" && target_os == "macos" {
         // Build a version with NEON
@@ -61,7 +48,7 @@ fn main() -> Result<(), String> {
             // generated the AVX512 version of the f16 kernels.
             println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
         };
-        if let Err(err) = build_dist_table_with_flags("avx512", &["-march=sapphirerapids"]) {
+        if let Err(err) = build_dist_table_with_flags("avx512", &["-march=native"]) {
             println!(
                 "cargo:warning=Skipping build of AVX-512 dist_table.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {}",
                 err
@@ -88,6 +75,21 @@ fn main() -> Result<(), String> {
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
+    if cfg!(not(feature = "fp16kernels")) {
+        println!(
+            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
+        );
+        return Ok(());
+    }
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    if target_os == "windows" {
+        println!(
+            "cargo:warning=fp16 kernels are not supported on Windows. Skipping compilation of kernels."
+        );
+        return Ok(());
+    }
+
     let mut builder = cc::Build::new();
     builder
         // We use clang #pragma to yields better vectorization
@@ -122,6 +124,7 @@ fn build_dist_table_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::E
         .flag("-O3")
         .flag("-Wall")
         .flag("-Wextra")
+        .flag("-mavx512bw")
         .flag(format!("-DSUFFIX=_{}", suffix).as_str());
     for flag in flags {
         builder.flag(flag);
