@@ -1449,7 +1449,7 @@ impl Transaction {
                     let pure_updated_frag_ids =
                         Self::collect_pure_update_frags_ids(&new_fragments)?;
 
-                    Self::add_pure_update_fragments_to_unmodified_indices(
+                    Self::register_pure_update_frags_in_indices(
                         &mut final_indices,
                         &pure_updated_frag_ids,
                         value_updated_fields,
@@ -1791,7 +1791,7 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
-    fn add_pure_update_fragments_to_unmodified_indices(
+    fn register_pure_update_frags_in_indices(
         indices: &mut [Index],
         pure_update_frag_ids: &[u64],
         fields_modified: &[u32],

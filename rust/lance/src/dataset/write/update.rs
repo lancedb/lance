@@ -519,20 +519,21 @@ mod tests {
 
     use super::*;
 
-    use crate::dataset::WriteMode::Append;
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::{array::AsArray, datatypes::UInt32Type};
-    use arrow_array::{
-        FixedSizeListArray, Float32Array, Int64Array, RecordBatchIterator, StringArray,
-        UInt32Array, UInt64Array,
-    };
+    use arrow_array::types::Float32Type;
+    use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::{future::try_join_all, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
+    use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
+    use lance_index::scalar::ScalarIndexParams;
     use lance_index::DatasetIndexExt;
+    use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
@@ -1069,75 +1070,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_index_fragment_bitmap_behavior() {
-        use lance_index::scalar::ScalarIndexParams;
-        use lance_index::IndexType;
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("str", DataType::Utf8, false),
-            Field::new(
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "str",
+                lance_datagen::array::cycle_utf8_literals(&["a", "b", "c", "d", "e", "f"]),
+            )
+            .col(
                 "vec",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
-                false,
-            ),
-        ]));
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let str_values1 = StringArray::from(vec!["a", "b", "c"]);
-        let vec_values1 = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![
-                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-            ]),
-            4,
-        )
-        .unwrap();
-
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(str_values1), Arc::new(vec_values1)],
-        )
-        .unwrap();
-
-        Dataset::write(
-            RecordBatchIterator::new([Ok(batch1)], schema.clone()),
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 10,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let str_values2 = StringArray::from(vec!["d", "e", "f"]);
-        let vec_values2 = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![
-                13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
-            ]),
-            4,
-        )
-        .unwrap();
-
-        let batch2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(str_values2), Arc::new(vec_values2)],
-        )
-        .unwrap();
-
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(batch2)], schema.clone()),
-            test_uri,
-            Some(WriteParams {
-                max_rows_per_file: 10,
-                enable_stable_row_ids: true,
-                mode: Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(4)),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         let scalar_params = ScalarIndexParams::default();
         dataset
