@@ -966,6 +966,9 @@ mod test {
                         deletion_file: None,
                         row_id_meta: None,
                         physical_rows: Some(50),
+                        row_latest_update_version_meta: None,
+                        min_latest_update_version: None,
+                        max_latest_update_version: None,
                     }))
                 } else {
                     Ok(None)

@@ -24,6 +24,7 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+bincode = "1.3"
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
