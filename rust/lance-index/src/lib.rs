@@ -218,6 +218,25 @@ impl IndexType {
             | Self::IvfHnswFlat => 1,
         }
     }
+
+    /// Returns the target partition size for the index type.
+    ///
+    /// This is used to compute the number of partitions for the index.
+    /// The partition size is optimized for the best performance of the index.
+    ///
+    /// This is for vector indices only, returns `None` for other index types.
+    pub fn target_partition_size(&self) -> Option<usize> {
+        match self {
+            Self::Vector => Some(8192),
+            Self::IvfFlat => Some(4096),
+            Self::IvfSq => Some(8192),
+            Self::IvfPq => Some(8192),
+            Self::IvfHnswFlat => Some(1 << 20),
+            Self::IvfHnswSq => Some(1 << 20),
+            Self::IvfHnswPq => Some(1 << 20),
+            _ => None,
+        }
+    }
 }
 
 pub trait IndexParams: Send + Sync {
