@@ -22,6 +22,7 @@ from lance.query import (
     Occur,
     PhraseQuery,
 )
+from lance.indices import IndexConfig
 from lance.vector import vec_to_table
 
 
@@ -1470,6 +1471,28 @@ def test_zonemap_index_remapping(tmp_path: Path):
 
     result = scanner.to_table()
     assert result.num_rows == 501  # 1000..1500 inclusive
+
+
+def test_json_index():
+    vals = [
+        '{"x": 7, "y": 10}',
+        '{"x": 11, "y": 22}',
+        '{"y": 0}',
+        '{"x": 10}'
+    ];
+    tbl = pa.table({
+        "jsons": pa.array(vals, pa.json_())
+    })
+    ds = lance.write_dataset(tbl, "memory://test", data_storage_version="2.2")
+    ds.create_scalar_index("jsons", IndexConfig(index_type="json", parameters={
+        "target_index_type": "btree",
+        "path": "x"
+    }))
+
+    filter = "json_extract(jsons, 'x') = '10'"
+    assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
+    assert ds.to_table(filter=filter) == ds.to_table(filter=filter, use_scalar_index=False)
+
 
 
 def test_null_handling(tmp_path: Path):

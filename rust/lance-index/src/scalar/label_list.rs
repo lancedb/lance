@@ -25,8 +25,7 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::bitmap::BitmapIndexPlugin;
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{pb, Index, IndexType};
