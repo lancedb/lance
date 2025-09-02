@@ -542,6 +542,9 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             deletion_file,
             physical_rows: Some(physical_rows),
             row_id_meta,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         })
     }
 }

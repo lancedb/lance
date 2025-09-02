@@ -20,6 +20,7 @@ mod encoded_array;
 mod index;
 pub mod segment;
 mod serde;
+pub mod version;
 
 use deepsize::DeepSizeOf;
 // These are the public API.

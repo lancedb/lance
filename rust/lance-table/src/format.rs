@@ -9,6 +9,9 @@ mod fragment;
 mod index;
 mod manifest;
 
+pub use crate::rowids::version::{
+    RowLatestUpdateVersionMeta, RowLatestUpdateVersionSequence, RowVersionSegment,
+};
 pub use fragment::*;
 pub use index::Index;
 pub use manifest::{
