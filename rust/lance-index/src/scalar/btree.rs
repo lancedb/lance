@@ -1523,7 +1523,6 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
     ) -> Result<CreatedIndex> {
-        println!("Training: {:#?}", data.schema());
         let request = request
             .as_any()
             .downcast_ref::<BTreeTrainingRequest>()
