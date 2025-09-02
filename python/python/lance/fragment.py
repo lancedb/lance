@@ -30,6 +30,9 @@ from .lance import (
 from .lance import (
     RowIdMeta as RowIdMeta,
 )
+from .lance import (
+    RowLatestUpdateVersionMeta as RowLatestUpdateVersionMeta,
+)
 from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
@@ -67,6 +70,8 @@ class FragmentMetadata:
         The deletion file, if any.
     row_id_meta : Optional[RowIdMeta]
         The row id metadata, if any.
+    row_latest_update_version_meta : Optional[RowLatestUpdateVersionMeta]
+        The row latest update version metadata, if any.
     """
 
     id: int
@@ -74,6 +79,7 @@ class FragmentMetadata:
     physical_rows: int
     deletion_file: Optional[DeletionFile] = None
     row_id_meta: Optional[RowIdMeta] = None
+    row_latest_update_version_meta: Optional[RowLatestUpdateVersionMeta] = None
 
     @property
     def num_deletions(self) -> int:
@@ -110,6 +116,11 @@ class FragmentMetadata:
             row_id_meta=(
                 self.row_id_meta.asdict() if self.row_id_meta is not None else None
             ),
+            row_latest_update_version_meta=(
+                self.row_latest_update_version_meta.asdict()
+                if self.row_latest_update_version_meta is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -124,12 +135,19 @@ class FragmentMetadata:
         if row_id_meta is not None:
             row_id_meta = RowIdMeta(**row_id_meta)
 
+        row_latest_update_version_meta = json_data.get("row_latest_update_version_meta")
+        if row_latest_update_version_meta is not None:
+            row_latest_update_version_meta = RowLatestUpdateVersionMeta(
+                **row_latest_update_version_meta
+            )
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
             physical_rows=json_data["physical_rows"],
             deletion_file=deletion_file,
             row_id_meta=row_id_meta,
+            row_latest_update_version_meta=row_latest_update_version_meta,
         )
 
 
