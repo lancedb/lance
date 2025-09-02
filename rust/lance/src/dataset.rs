@@ -698,7 +698,8 @@ impl Dataset {
         if !self.manifest.uses_stable_row_ids() {
             return Err(Error::NotSupported {
                 source: "Diff operation requires Stable Row ID feature to be enabled. \
-                 Please enable it when creating the dataset.".into(),
+                 Please enable it when creating the dataset."
+                    .into(),
                 location: location!(),
             });
         }
@@ -709,7 +710,8 @@ impl Dataset {
             Some(stream) => Ok(stream),
             None => {
                 let empty_schema = Arc::new(ArrowSchema::empty());
-                let empty_stream = futures::stream::empty::<std::result::Result<RecordBatch, ArrowError>>();
+                let empty_stream =
+                    futures::stream::empty::<std::result::Result<RecordBatch, ArrowError>>();
                 Ok(Box::new(lance_io::stream::RecordBatchStreamAdapter::new(
                     empty_schema,
                     empty_stream.map_err(Error::from),

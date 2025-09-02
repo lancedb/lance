@@ -53,6 +53,18 @@ impl DatasetDelta {
     pub async fn to_stream(&self) -> Result<Option<Box<dyn RecordBatchStream>>> {
         Ok(None)
     }
+
+    pub async fn to_insert_stream(&self) -> Result<Option<Box<dyn RecordBatchStream>>> {
+        Ok(None)
+    }
+
+    pub async fn to_delete_stream(&self) -> Result<Option<Box<dyn RecordBatchStream>>> {
+        Ok(None)
+    }
+
+    pub async fn to_update_stream(&self) -> Result<Option<Box<dyn RecordBatchStream>>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
