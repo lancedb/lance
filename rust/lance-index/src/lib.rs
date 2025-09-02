@@ -40,6 +40,9 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
+// Currently all vector indexes are version 1
+pub const VECTOR_INDEX_VERSION: u32 = 1;
+
 pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
@@ -189,41 +192,10 @@ impl IndexType {
     pub fn is_system(&self) -> bool {
         matches!(self, Self::FragmentReuse | Self::MemWal)
     }
-
-    /// Returns the current format version of the index type,
-    /// bump this when the index format changes.
-    /// Indices which higher version than these will be ignored for compatibility,
-    /// This would happen when creating index in a newer version of Lance,
-    /// but then opening the index in older version of Lance
-    pub fn version(&self) -> i32 {
-        match self {
-            Self::Scalar => 0,
-            Self::BTree => 0,
-            Self::Bitmap => 0,
-            Self::LabelList => 0,
-            Self::Inverted => 0,
-            Self::NGram => 0,
-            Self::FragmentReuse => 0,
-            Self::MemWal => 0,
-            Self::ZoneMap => 0,
-
-            // for now all vector indices are built by the same builder,
-            // so they share the same version.
-            Self::Vector
-            | Self::IvfFlat
-            | Self::IvfSq
-            | Self::IvfPq
-            | Self::IvfHnswSq
-            | Self::IvfHnswPq
-            | Self::IvfHnswFlat => 1,
-        }
-    }
 }
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-
-    fn index_type(&self) -> IndexType;
 
     fn index_name(&self) -> &str;
 }

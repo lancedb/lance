@@ -3,6 +3,8 @@
 
 //! Metadata for index
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
@@ -38,7 +40,7 @@ pub struct Index {
     ///
     /// This is an Option because older versions of Lance may not have this defined.  However, it should always
     /// be present in newer versions.
-    pub index_details: Option<prost_types::Any>,
+    pub index_details: Option<Arc<prost_types::Any>>,
 
     /// The index version.
     pub index_version: i32,
@@ -101,7 +103,7 @@ impl TryFrom<pb::IndexMetadata> for Index {
             fields: proto.fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
-            index_details: proto.index_details,
+            index_details: proto.index_details.map(Arc::new),
             index_version: proto.index_version.unwrap_or_default(),
             created_at: proto.created_at.map(|ts| {
                 DateTime::from_timestamp_millis(ts as i64)
@@ -130,7 +132,10 @@ impl From<&Index> for pb::IndexMetadata {
             fields: idx.fields.clone(),
             dataset_version: idx.dataset_version,
             fragment_bitmap,
-            index_details: idx.index_details.clone(),
+            index_details: idx
+                .index_details
+                .as_ref()
+                .map(|details| details.as_ref().clone()),
             index_version: Some(idx.index_version),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
