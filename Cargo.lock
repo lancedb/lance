@@ -4577,6 +4577,7 @@ dependencies = [
  "pprof",
  "prost 0.13.5",
  "prost-build 0.13.5",
+ "prost-types 0.13.5",
  "protobuf-src",
  "rand 0.9.1",
  "rayon",

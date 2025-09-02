@@ -14,6 +14,7 @@ use std::{
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
+use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::{
     array::LargeBinaryBuilder,
     datatypes::{self, Float32Type, Int32Type, UInt64Type},
@@ -48,7 +49,6 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
-use tantivy::tokenizer::Language;
 use tracing::{info, instrument};
 
 use super::{
@@ -72,10 +72,13 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
-    AnyQuery, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult, TokenQuery,
+    AnyQuery, CreatedIndex, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult,
+    TokenQuery, UpdateCriteria,
 };
-use crate::Index;
+use crate::{pb, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+
+pub const INVERTED_INDEX_VERSION: u32 = 0;
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -278,126 +281,8 @@ impl InvertedIndex {
     pub fn is_legacy(&self) -> bool {
         self.partitions.len() == 1 && self.partitions[0].is_legacy()
     }
-}
 
-#[async_trait]
-impl Index for InvertedIndex {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
-        self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::invalid_input(
-            "inverted index cannot be cast to vector index",
-            location!(),
-        ))
-    }
-
-    fn statistics(&self) -> Result<serde_json::Value> {
-        let num_tokens = self
-            .partitions
-            .iter()
-            .map(|part| part.tokens.len())
-            .sum::<usize>();
-        let num_docs = self
-            .partitions
-            .iter()
-            .map(|part| part.docs.len())
-            .sum::<usize>();
-        Ok(serde_json::json!({
-            "params": self.params,
-            "num_tokens": num_tokens,
-            "num_docs": num_docs,
-        }))
-    }
-
-    async fn prewarm(&self) -> Result<()> {
-        for part in &self.partitions {
-            part.inverted_list.prewarm().await?;
-        }
-        Ok(())
-    }
-
-    fn index_type(&self) -> crate::IndexType {
-        crate::IndexType::Inverted
-    }
-
-    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!()
-    }
-}
-
-impl InvertedIndex {
-    /// Whether the query can use the current index.
-    pub fn is_query_allowed(&self, query: &TokenQuery) -> bool {
-        match query {
-            TokenQuery::TokensContains(_) => {
-                self.params.base_tokenizer == "simple"
-                    && self.params.max_token_length.is_none()
-                    && self.params.language == Language::English
-                    && !self.params.stem
-            }
-        }
-    }
-
-    /// Search docs match the input text.
-    async fn do_search(&self, text: &str) -> Result<RecordBatch> {
-        let params = FtsSearchParams::new();
-        let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(text, &mut tokenizer, None);
-
-        let (doc_ids, _) = self
-            .bm25_search(
-                tokens.into(),
-                params.into(),
-                Operator::And,
-                Arc::new(NoFilter),
-                Arc::new(NoOpMetricsCollector),
-            )
-            .boxed()
-            .await?;
-
-        Ok(RecordBatch::try_new(
-            ROW_ID_SCHEMA.clone(),
-            vec![Arc::new(UInt64Array::from(doc_ids))],
-        )?)
-    }
-}
-
-#[async_trait]
-impl ScalarIndex for InvertedIndex {
-    // return the row ids of the documents that contain the query
-    #[instrument(level = "debug", skip_all)]
-    async fn search(
-        &self,
-        query: &dyn AnyQuery,
-        _metrics: &dyn MetricsCollector,
-    ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
-
-        match query {
-            TokenQuery::TokensContains(text) => {
-                let records = self.do_search(text).await?;
-                let row_ids = records
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .unwrap();
-                let row_ids = row_ids.iter().flatten().collect_vec();
-                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
-            }
-        }
-    }
-
-    fn can_remap(&self) -> bool {
-        true
-    }
-
-    async fn load(
+    pub async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
@@ -457,23 +342,152 @@ impl ScalarIndex for InvertedIndex {
             }
         }
     }
+}
+
+#[async_trait]
+impl Index for InvertedIndex {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::invalid_input(
+            "inverted index cannot be cast to vector index",
+            location!(),
+        ))
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        let num_tokens = self
+            .partitions
+            .iter()
+            .map(|part| part.tokens.len())
+            .sum::<usize>();
+        let num_docs = self
+            .partitions
+            .iter()
+            .map(|part| part.docs.len())
+            .sum::<usize>();
+        Ok(serde_json::json!({
+            "params": self.params,
+            "num_tokens": num_tokens,
+            "num_docs": num_docs,
+        }))
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        for part in &self.partitions {
+            part.inverted_list.prewarm().await?;
+        }
+        Ok(())
+    }
+
+    fn index_type(&self) -> crate::IndexType {
+        crate::IndexType::Inverted
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        unimplemented!()
+    }
+}
+
+impl InvertedIndex {
+    /// Search docs match the input text.
+    async fn do_search(&self, text: &str) -> Result<RecordBatch> {
+        let params = FtsSearchParams::new();
+        let mut tokenizer = self.tokenizer.clone();
+        let tokens = collect_tokens(text, &mut tokenizer, None);
+
+        let (doc_ids, _) = self
+            .bm25_search(
+                tokens.into(),
+                params.into(),
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .boxed()
+            .await?;
+
+        Ok(RecordBatch::try_new(
+            ROW_ID_SCHEMA.clone(),
+            vec![Arc::new(UInt64Array::from(doc_ids))],
+        )?)
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for InvertedIndex {
+    // return the row ids of the documents that contain the query
+    #[instrument(level = "debug", skip_all)]
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
+
+        match query {
+            TokenQuery::TokensContains(text) => {
+                let records = self.do_search(text).await?;
+                let row_ids = records
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let row_ids = row_ids.iter().flatten().collect_vec();
+                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
+            }
+        }
+    }
+
+    fn can_remap(&self) -> bool {
+        true
+    }
 
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         self.to_builder()
             .remap(mapping, self.store.clone(), dest_store)
-            .await
+            .await?;
+
+        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: INVERTED_INDEX_VERSION,
+        })
     }
 
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        self.to_builder().update(new_data, dest_store).await
+    ) -> Result<CreatedIndex> {
+        self.to_builder().update(new_data, dest_store).await?;
+
+        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: INVERTED_INDEX_VERSION,
+        })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_id();
+        if self.is_legacy() {
+            UpdateCriteria::requires_old_data(criteria)
+        } else {
+            UpdateCriteria::only_new_data(criteria)
+        }
     }
 }
 

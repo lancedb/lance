@@ -40,6 +40,9 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
+// Currently all vector indexes are version 1
+pub const VECTOR_INDEX_VERSION: u32 = 1;
+
 pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
@@ -269,8 +272,6 @@ impl IndexType {
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-
-    fn index_type(&self) -> IndexType;
 
     fn index_name(&self) -> &str;
 }

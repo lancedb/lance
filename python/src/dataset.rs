@@ -68,7 +68,7 @@ use lance_index::{
 };
 use lance_index::{
     optimize::OptimizeOptions,
-    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
+    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
         sq::builder::SQBuildParams,
@@ -1500,19 +1500,25 @@ impl Dataset {
 
         log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
-            "BTREE" => Box::<ScalarIndexParams>::default(),
+            "BTREE" => Box::new(ScalarIndexParams {
+                index_type: "btree".to_string(),
+                params: None,
+            }),
             "BITMAP" => Box::new(ScalarIndexParams {
-                // Temporary workaround until we add support for auto-detection of scalar index type
-                force_index_type: Some(ScalarIndexType::Bitmap),
+                index_type: "bitmap".to_string(),
+                params: None,
             }),
             "NGRAM" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::NGram),
+                index_type: "ngram".to_string(),
+                params: None,
             }),
             "ZONEMAP" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::ZoneMap),
+                index_type: "zonemap".to_string(),
+                params: None,
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::LabelList),
+                index_type: "label_list".to_string(),
+                params: None,
             }),
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();

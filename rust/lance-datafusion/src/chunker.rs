@@ -157,12 +157,19 @@ pub fn break_stream(
             };
             rows_already_seen = (state.rows_seen + state.rows_remaining) % state.max_rows;
 
-            futures::stream::unfold(state, move |state| std::future::ready(state.next())).boxed()
+            futures::stream::unfold(state, move |state| std::future::ready(state.next()))
+                .fuse()
+                .boxed()
         })
         .try_flatten()
         .boxed()
 }
 
+/// Given a stream of record batches, this will yield batches of a fixed size.
+///
+/// In order to avoid copying data the batches will be converted into a stream of
+/// `Vec<RecordBatch>` where each item is a `Vec` of batches whose total size is
+/// `chunk_size`.
 pub fn chunk_stream(
     stream: SendableRecordBatchStream,
     chunk_size: usize,
@@ -175,9 +182,15 @@ pub fn chunk_stream(
             None => None,
         }
     })
+    .fuse()
     .boxed()
 }
 
+/// Given a stream of record batches, this will yield batches of a fixed size.
+///
+/// This stream _will_ combine record batches and so it can be fairly expensive as it will
+/// likely force a copy of incoming data.  However, it can be useful when users require
+/// precise batch sizing.
 pub fn chunk_concat_stream(
     stream: SendableRecordBatchStream,
     chunk_size: usize,

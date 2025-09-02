@@ -236,14 +236,8 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
         }
     }
-}
 
-impl IndexParams for VectorIndexParams {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn index_type(&self) -> IndexType {
+    pub fn index_type(&self) -> IndexType {
         let len = self.stages.len();
         match (len, self.stages.get(1), self.stages.last()) {
             (0, _, _) => IndexType::Vector,
@@ -255,6 +249,12 @@ impl IndexParams for VectorIndexParams {
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
             _ => IndexType::Vector,
         }
+    }
+}
+
+impl IndexParams for VectorIndexParams {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     fn index_name(&self) -> &str {
