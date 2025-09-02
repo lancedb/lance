@@ -25,7 +25,12 @@ impl JsonParser for MatchQuery {
             .as_f64()
             .map(|v| v as f32)
             .unwrap_or(Self::default_boost());
-        let fuzziness = value["fuzziness"].as_u64().map(|v| v as u32);
+        let fuzziness = match &value["fuzziness"] {
+            Value::Number(num) if num.is_u64() => Some(num.as_u64().unwrap() as u32),
+            Value::String(s) if s.as_str() == "auto" => None,
+            Value::Null => None,
+            _ => Some(0),
+        };
         let max_expansions = value["max_expansions"]
             .as_u64()
             .map(|v| v as usize)
@@ -316,6 +321,7 @@ mod tests {
         let should_query = FtsQuery::Phrase(
             PhraseQuery::new("world".to_string()).with_column(Some("text".to_string())),
         );
+
         let expected_query = FtsQuery::Boolean(BooleanQuery::new(vec![
             (Occur::Must, must_query),
             (Occur::Should, should_query),
