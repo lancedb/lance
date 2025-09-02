@@ -43,8 +43,8 @@ use lance::dataset::{
     progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner,
     transaction::{Operation, Transaction},
-    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
-    UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
+    Dataset as LanceDataset, DeleteBuilder, MergeInsertBuilder as LanceMergeInsertBuilder,
+    ReadParams, UncommittedMergeInsert, UpdateBuilder, Version, WhenMatched, WhenNotMatched,
     WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::dataset::{
@@ -56,6 +56,7 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::v2::reader::FileReaderOptions;
@@ -362,7 +363,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&ColumnOrdering> {
             .and_then(|cls| cls.getattr(intern!(py, "ColumnOrdering")))
             .expect("Failed to get RewrittenIndex class");
 
-        let column_name = self.0.column_name.to_string();
+        let column_name = self.0.column_name.clone();
         let ascending = self.0.ascending;
         let nulls_first = self.0.nulls_first;
         cls.call1((column_name, ascending, nulls_first))
@@ -441,7 +442,10 @@ impl Dataset {
                 cache_repetition_index,
                 validate_on_decode,
             };
-            let file_reader_options = FileReaderOptions { decoder_config };
+            let file_reader_options = FileReaderOptions {
+                decoder_config,
+                ..Default::default()
+            };
             params.file_reader_options = Some(file_reader_options);
         }
 
@@ -618,13 +622,15 @@ impl Dataset {
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
+                dict.set_item("base_id", idx.base_id.map(|id| id as i64))
+                    .unwrap();
                 dict.into_py_any(py)
             })
             .collect::<PyResult<Vec<_>>>()
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -652,6 +658,7 @@ impl Dataset {
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
         strict_batch_size: Option<bool>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
+        disable_scoring_autoprojection: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -661,6 +668,10 @@ impl Dataset {
 
         if with_row_address.unwrap_or(false) {
             scanner.with_row_address();
+        }
+
+        if let Some(true) = disable_scoring_autoprojection {
+            scanner.disable_scoring_autoprojection();
         }
 
         match (columns, columns_with_transform) {
@@ -1190,11 +1201,27 @@ impl Dataset {
         Ok(())
     }
 
-    fn delete(&mut self, predicate: String) -> PyResult<()> {
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.delete(&predicate))?
+    #[pyo3(signature=(predicate, conflict_retries=None, retry_timeout=None))]
+    fn delete(
+        &mut self,
+        predicate: String,
+        conflict_retries: Option<u32>,
+        retry_timeout: Option<std::time::Duration>,
+    ) -> PyResult<()> {
+        let mut builder = DeleteBuilder::new(self.ds.clone(), predicate);
+
+        if let Some(retries) = conflict_retries {
+            builder = builder.conflict_retries(retries);
+        }
+
+        if let Some(timeout) = retry_timeout {
+            builder = builder.retry_timeout(timeout);
+        }
+
+        let new_dataset = RT
+            .block_on(None, builder.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = Arc::new(new_self);
+        self.ds = new_dataset;
         Ok(())
     }
 
@@ -1440,13 +1467,15 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, kwargs = None))]
+    #[allow(clippy::too_many_arguments)]
     fn create_index(
         &mut self,
         columns: Vec<PyBackedStr>,
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
+        train: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
@@ -1456,6 +1485,7 @@ impl Dataset {
             "BTREE" => IndexType::Scalar,
             "BITMAP" => IndexType::Bitmap,
             "NGRAM" => IndexType::NGram,
+            "ZONEMAP" => IndexType::ZoneMap,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
@@ -1477,6 +1507,9 @@ impl Dataset {
             }),
             "NGRAM" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::NGram),
+            }),
+            "ZONEMAP" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::ZoneMap),
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
@@ -1539,13 +1572,18 @@ impl Dataset {
         };
 
         let replace = replace.unwrap_or(true);
+        let train = train.unwrap_or(true); // Default to true for backward compatibility
 
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(
-            None,
-            new_self.create_index(&columns, idx_type, name, params.as_ref(), replace),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let mut builder = new_self
+            .create_index_builder(&columns, idx_type, params.as_ref())
+            .replace(replace)
+            .train(train);
+        if let Some(name) = name {
+            builder = builder.name(name);
+        }
+        use std::future::IntoFuture;
+        RT.block_on(None, builder.into_future())?.infer_error()?;
         self.ds = Arc::new(new_self);
 
         Ok(())
@@ -2020,6 +2058,22 @@ impl Dataset {
         let builder = ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
+
+    #[pyo3(signature=(compared_version))]
+    fn diff_meta(&self, compared_version: u64) -> PyResult<Vec<PyLance<Transaction>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transactions = RT
+            .block_on(None, new_self.diff_meta(compared_version))?
+            .map_err(|err: Error| match err {
+                Error::InvalidInput { source, .. } => PyValueError::new_err(source.to_string()),
+                Error::VersionNotFound { .. } => {
+                    PyValueError::new_err(format!("Version not found: {}", err))
+                }
+                _ => PyIOError::new_err(format!("Storage error: {}", err)),
+            })?;
+
+        Ok(transactions.into_iter().map(PyLance).collect())
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]
@@ -2081,19 +2135,6 @@ impl SqlQuery {
         let reader: Box<dyn RecordBatchReader + Send> =
             Box::new(LanceReader::from_stream(dataset_stream));
         Python::with_gil(|py| reader.into_pyarrow(py))
-    }
-
-    #[pyo3(signature = (verbose=false, analyze=false))]
-    fn explain_plan(&self, verbose: bool, analyze: bool) -> PyResult<String> {
-        let builder = self.builder.clone();
-        let plan = RT
-            .block_on(None, async move {
-                let query = builder.build().await?;
-                query.into_explain_plan(verbose, analyze).await
-            })
-            .map_err(|e| PyValueError::new_err(e.to_string()))?
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(plan)
     }
 }
 
@@ -2321,10 +2362,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             });
         }
 
-        if let Some(enable_move_stable_row_ids) =
-            get_dict_opt::<bool>(options, "enable_move_stable_row_ids")?
+        if let Some(enable_stable_row_ids) = get_dict_opt::<bool>(options, "enable_stable_row_ids")?
         {
-            p.enable_move_stable_row_ids = enable_move_stable_row_ids;
+            p.enable_stable_row_ids = enable_stable_row_ids;
         }
         if let Some(enable_v2_manifest_paths) =
             get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?

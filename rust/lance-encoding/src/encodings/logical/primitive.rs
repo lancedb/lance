@@ -12,12 +12,17 @@ use std::{
     vec,
 };
 
-use crate::constants::{
-    DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-    STRUCTURAL_ENCODING_MINIBLOCK,
+use crate::{
+    constants::{
+        DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        STRUCTURAL_ENCODING_MINIBLOCK,
+    },
+    format::{
+        pb21::{self, compressive_encoding::Compression, CompressiveEncoding},
+        ProtobufUtils21,
+    },
 };
-use arrow::array::AsArray;
-use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
+use arrow_array::{cast::AsArray, make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
@@ -70,7 +75,6 @@ use crate::{
     encoder::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
     },
-    format::{pb, ProtobufUtils},
     repdef::{LevelBuffer, RepDefBuilder, RepDefUnraveler},
     EncodingsIo,
 };
@@ -140,7 +144,7 @@ impl DecodeMiniBlockTask {
         num_levels: u16,
     ) -> Result<ScalarBuffer<u16>> {
         let rep = rep_decompressor.decompress(levels, num_levels as u64)?;
-        let mut rep = rep.as_fixed_width().unwrap();
+        let rep = rep.as_fixed_width().unwrap();
         debug_assert_eq!(rep.num_values, num_levels as u64);
         debug_assert_eq!(rep.bits_per_value, 16);
         Ok(rep.data.borrow_to_typed_slice::<u16>())
@@ -550,7 +554,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
             // if dictionary encoding is applied, decode indices based on their actual bit width
-            if let DataBlock::FixedWidth(mut fixed_width_data_block) = data {
+            if let DataBlock::FixedWidth(fixed_width_data_block) = data {
                 match fixed_width_data_block.bits_per_value {
                     32 => {
                         let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i32>();
@@ -608,7 +612,7 @@ impl Clone for LoadedChunk {
     fn clone(&self) -> Self {
         Self {
             // Safe as we always create borrowed buffers here
-            data: self.data.try_clone().unwrap(),
+            data: self.data.clone(),
             items_in_chunk: self.items_in_chunk,
             byte_range: self.byte_range.clone(),
             chunk_idx: self.chunk_idx,
@@ -760,7 +764,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
 
             let rep = if has_rep {
                 let rep = data_iter.next().unwrap();
-                let mut rep = LanceBuffer::from_bytes(rep, 2);
+                let rep = LanceBuffer::from_bytes(rep, 2);
                 let rep = rep.borrow_to_typed_slice::<u16>();
                 Some(rep)
             } else {
@@ -769,7 +773,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
 
             let def = if has_def {
                 let def = data_iter.next().unwrap();
-                let mut def = LanceBuffer::from_bytes(def, 2);
+                let def = LanceBuffer::from_bytes(def, 2);
                 let def = def.borrow_to_typed_slice::<u16>();
                 Some(def)
             } else {
@@ -1017,31 +1021,62 @@ impl DeepSizeOf for MiniBlockRepIndex {
 }
 
 impl MiniBlockRepIndex {
-    fn decode(rep_index: &[Vec<u64>]) -> Self {
-        let mut chunk_has_preamble = false;
-        let mut offset = 0;
-        let mut blocks = Vec::with_capacity(rep_index.len());
-        for chunk_rep in rep_index {
-            let ends_count = chunk_rep[0];
-            let partial_count = chunk_rep[1];
+    /// Decode repetition index from chunk metadata using default values.
+    ///
+    /// This creates a repetition index where each chunk has no partial values
+    /// and no trailers, suitable for simple sequential data layouts.
+    pub fn default_from_chunks(chunks: &[ChunkMeta]) -> Self {
+        let mut blocks = Vec::with_capacity(chunks.len());
+        let mut offset: u64 = 0;
 
-            let chunk_has_trailer = partial_count > 0;
-            let mut starts_including_trailer = ends_count;
-            if chunk_has_trailer {
-                starts_including_trailer += 1;
-            }
-            if chunk_has_preamble {
-                starts_including_trailer -= 1;
-            }
+        for c in chunks {
+            blocks.push(MiniBlockRepIndexBlock {
+                first_row: offset,
+                starts_including_trailer: c.num_values,
+                has_preamble: false,
+                has_trailer: false,
+            });
+
+            offset += c.num_values;
+        }
+
+        Self { blocks }
+    }
+
+    /// Decode repetition index from raw bytes in little-endian format.
+    ///
+    /// The bytes should contain u64 values arranged in groups of `stride` elements,
+    /// where the first two values of each group represent ends_count and partial_count.
+    /// Returns an empty index if no bytes are provided.
+    pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
+        // Convert bytes to u64 slice, handling alignment automatically
+        let buffer = crate::buffer::LanceBuffer::from(rep_bytes.to_vec());
+        let u64_slice = buffer.borrow_to_typed_slice::<u64>();
+        let n = u64_slice.len() / stride;
+
+        let mut blocks = Vec::with_capacity(n);
+        let mut chunk_has_preamble = false;
+        let mut offset: u64 = 0;
+
+        // Extract first two values from each block: ends_count and partial_count
+        for i in 0..n {
+            let base_idx = i * stride;
+            let ends = u64_slice[base_idx];
+            let partial = u64_slice[base_idx + 1];
+
+            let has_trailer = partial > 0;
+            // Convert branches to arithmetic for better compiler optimization
+            let starts_including_trailer =
+                ends + (has_trailer as u64) - (chunk_has_preamble as u64);
 
             blocks.push(MiniBlockRepIndexBlock {
                 first_row: offset,
                 starts_including_trailer,
                 has_preamble: chunk_has_preamble,
-                has_trailer: chunk_has_trailer,
+                has_trailer,
             });
 
-            chunk_has_preamble = chunk_has_trailer;
+            chunk_has_preamble = has_trailer;
             offset += starts_including_trailer;
         }
 
@@ -1125,7 +1160,7 @@ impl MiniBlockScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
-        layout: &pb::MiniBlockLayout,
+        layout: &pb21::MiniBlockLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         let rep_decompressor = layout
@@ -1149,7 +1184,7 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
@@ -1158,18 +1193,16 @@ impl MiniBlockScheduler {
 
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             let num_dictionary_items = layout.num_dictionary_items;
-            match dictionary_encoding.array_encoding.as_ref().unwrap() {
-                pb::array_encoding::ArrayEncoding::Variable(_) => {
-                    Some(MiniBlockSchedulerDictionary {
-                        dictionary_decompressor: decompressors
-                            .create_block_decompressor(dictionary_encoding)?
-                            .into(),
-                        dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
-                        dictionary_data_alignment: 4,
-                        num_dictionary_items,
-                    })
-                }
-                pb::array_encoding::ArrayEncoding::Flat(_) => Some(MiniBlockSchedulerDictionary {
+            match dictionary_encoding.compression.as_ref().unwrap() {
+                Compression::Variable(_) => Some(MiniBlockSchedulerDictionary {
+                    dictionary_decompressor: decompressors
+                        .create_block_decompressor(dictionary_encoding)?
+                        .into(),
+                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                    dictionary_data_alignment: 4,
+                    num_dictionary_items,
+                }),
+                Compression::Flat(_) => Some(MiniBlockSchedulerDictionary {
                     dictionary_decompressor: decompressors
                         .create_block_decompressor(dictionary_encoding)?
                         .into(),
@@ -1323,9 +1356,52 @@ impl ChunkInstructions {
             let mut to_skip = user_range.start - rep_index.blocks[block_index].first_row;
 
             while rows_needed > 0 || need_preamble {
+                // Check if we've gone past the last block (should not happen)
+                if block_index >= rep_index.blocks.len() {
+                    log::warn!("schedule_instructions inconsistency: block_index >= rep_index.blocks.len(), exiting early");
+                    break;
+                }
+
                 let chunk = &rep_index.blocks[block_index];
-                let rows_avail = chunk.starts_including_trailer - to_skip;
-                debug_assert!(rows_avail > 0);
+                let rows_avail = chunk.starts_including_trailer.saturating_sub(to_skip);
+
+                // Handle blocks that are entirely preamble (rows_avail = 0)
+                // These blocks have no rows to take but may have a preamble we need
+                // We only look for preamble if to_skip == 0 (we're not skipping rows)
+                if rows_avail == 0 && to_skip == 0 {
+                    // Only process if this chunk has a preamble we need
+                    if chunk.has_preamble && need_preamble {
+                        chunk_instructions.push(Self {
+                            chunk_idx: block_index,
+                            preamble: PreambleAction::Take,
+                            rows_to_skip: 0,
+                            rows_to_take: 0,
+                            take_trailer: false,
+                        });
+                        // Only set need_preamble = false if the chunk has at least one row,
+                        // Or we are reaching the last block,
+                        // Otherwise, the chunk is entirely preamble and we need the next chunk's preamble too
+                        if chunk.starts_including_trailer > 0
+                            || block_index == rep_index.blocks.len() - 1
+                        {
+                            need_preamble = false;
+                        }
+                    }
+                    // Move to next block
+                    block_index += 1;
+                    continue;
+                }
+
+                // Edge case: if rows_avail == 0 but to_skip > 0
+                // This theoretically shouldn't happen (binary search should avoid it)
+                // but handle it for safety
+                if rows_avail == 0 && to_skip > 0 {
+                    // This block doesn't have enough rows to skip, move to next block
+                    // Adjust to_skip by the number of rows in this block
+                    to_skip -= chunk.starts_including_trailer;
+                    block_index += 1;
+                    continue;
+                }
 
                 let rows_to_take = rows_avail.min(rows_needed);
                 rows_needed -= rows_to_take;
@@ -1489,7 +1565,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
             // Parse the metadata and build the chunk meta
             assert!(meta_bytes.len() % 2 == 0);
-            let mut bytes = LanceBuffer::from_bytes(meta_bytes, 2);
+            let bytes = LanceBuffer::from_bytes(meta_bytes, 2);
             let words = bytes.borrow_to_typed_slice::<u16>();
             let words = words.as_ref();
 
@@ -1524,29 +1600,16 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
             // Build the repetition index
             let rep_index = if let Some(rep_index_data) = rep_index_bytes {
-                // If we have a repetition index then we use that
-                // TODO: Compress the repetition index :)
                 assert!(rep_index_data.len() % 8 == 0);
-                let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
-                let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
-                // Unflatten
-                repetition_index_vals
-                    .as_ref()
-                    .chunks_exact(self.repetition_index_depth as usize + 1)
-                    .map(|c| c.to_vec())
-                    .collect::<Vec<_>>()
+                let stride = self.repetition_index_depth as usize + 1;
+                MiniBlockRepIndex::decode_from_bytes(&rep_index_data, stride)
             } else {
-                // Default rep index is just the number of items in each chunk
-                // with 0 partials/leftovers
-                chunk_meta
-                    .iter()
-                    .map(|c| vec![c.num_values, 0])
-                    .collect::<Vec<_>>()
+                MiniBlockRepIndex::default_from_chunks(&chunk_meta)
             };
 
             let mut page_meta = MiniBlockCacheableState {
                 chunk_meta,
-                rep_index: MiniBlockRepIndex::decode(&rep_index),
+                rep_index,
                 dictionary: None,
             };
 
@@ -1698,7 +1761,7 @@ impl FullZipScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         rows_in_page: u64,
-        layout: &pb::FullZipLayout,
+        layout: &pb21::FullZipLayout,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Self> {
         // We don't need the data_buf_size because either the data type is
@@ -1722,13 +1785,13 @@ impl FullZipScheduler {
         });
 
         let value_decompressor = match layout.details {
-            Some(pb::full_zip_layout::Details::BitsPerValue(_)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => {
                 let decompressor = decompressors.create_fixed_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
                 PerValueDecompressor::Fixed(decompressor.into())
             }
-            Some(pb::full_zip_layout::Details::BitsPerOffset(_)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerOffset(_)) => {
                 let decompressor = decompressors.create_variable_per_value_decompressor(
                     layout.value_compression.as_ref().unwrap(),
                 )?;
@@ -1745,7 +1808,7 @@ impl FullZipScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
 
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
@@ -1756,8 +1819,8 @@ impl FullZipScheduler {
             .sum();
 
         let bits_per_offset = match layout.details {
-            Some(pb::full_zip_layout::Details::BitsPerValue(_)) => 32,
-            Some(pb::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
+            Some(pb21::full_zip_layout::Details::BitsPerValue(_)) => 32,
+            Some(pb21::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
                 bits_per_offset as u8
             }
             None => panic!("Full-zip layout must have a `details` field"),
@@ -2418,8 +2481,8 @@ impl VariableFullZipDecoder {
         };
         self.rep = ScalarBuffer::from(rep);
         self.def = ScalarBuffer::from(def);
-        self.data = LanceBuffer::Owned(unzipped_data);
-        self.offsets = LanceBuffer::Owned(offsets_data);
+        self.data = LanceBuffer::from(unzipped_data);
+        self.offsets = LanceBuffer::from(offsets_data);
     }
 }
 
@@ -2435,7 +2498,7 @@ impl StructuralPageDecoder for VariableFullZipDecoder {
         //
         // So either we pay for a copy to normalize the offsets or we just return the entire data buffer
         // which is slightly cheaper.
-        let data = self.data.borrow_and_clone();
+        let data = self.data.clone();
 
         let offset_start = self.offset_starts[start];
         let offset_end = self.offset_starts[end] + (self.bits_per_offset as usize / 8);
@@ -2601,7 +2664,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 }
 
                 // Finally, we decompress the values and add them to our output buffer
-                let values_buf = LanceBuffer::Owned(values);
+                let values_buf = LanceBuffer::from(values);
                 let fixed_data = FixedWidthDataBlock {
                     bits_per_value: self.bytes_per_value as u64 * 8,
                     block_info: BlockInfo::new(),
@@ -2790,7 +2853,7 @@ impl StructuralPrimitiveFieldScheduler {
     ) -> Result<PageInfoAndScheduler> {
         let scheduler: Box<dyn StructuralPageScheduler> =
             match page_info.encoding.as_structural().layout.as_ref() {
-                Some(pb::page_layout::Layout::MiniBlockLayout(mini_block)) => {
+                Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) => {
                     Box::new(MiniBlockScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
@@ -2799,7 +2862,7 @@ impl StructuralPrimitiveFieldScheduler {
                         decompressors,
                     )?)
                 }
-                Some(pb::page_layout::Layout::FullZipLayout(full_zip)) => {
+                Some(pb21::page_layout::Layout::FullZipLayout(full_zip)) => {
                     let mut scheduler = FullZipScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
@@ -2810,11 +2873,11 @@ impl StructuralPrimitiveFieldScheduler {
                     scheduler.enable_cache = cache_repetition_index;
                     Box::new(scheduler)
                 }
-                Some(pb::page_layout::Layout::AllNullLayout(all_null)) => {
+                Some(pb21::page_layout::Layout::AllNullLayout(all_null)) => {
                     let def_meaning = all_null
                         .layers
                         .iter()
-                        .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+                        .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
                         .collect::<Vec<_>>();
                     if def_meaning.len() == 1
                         && def_meaning[0] == DefinitionInterpretation::NullableItem
@@ -3121,7 +3184,7 @@ struct CompressedLevelsChunk {
 
 struct CompressedLevels {
     data: Vec<CompressedLevelsChunk>,
-    compression: pb::ArrayEncoding,
+    compression: CompressiveEncoding,
     rep_index: Option<LanceBuffer>,
 }
 
@@ -3346,8 +3409,8 @@ impl PrimitiveStructuralEncoder {
             meta_buffer.extend_from_slice(&metadata.to_le_bytes());
         }
 
-        let data_buffer = LanceBuffer::Owned(data_buffer);
-        let metadata_buffer = LanceBuffer::Owned(meta_buffer);
+        let data_buffer = LanceBuffer::from(data_buffer);
+        let metadata_buffer = LanceBuffer::from(meta_buffer);
 
         SerializedMiniBlockPage {
             num_buffers: miniblocks.data.len() as u64,
@@ -3375,9 +3438,9 @@ impl PrimitiveStructuralEncoder {
         };
         // Make the levels into a FixedWidth data block
         let num_levels = levels.num_levels() as u64;
-        let mut levels_buf = levels.all_levels().try_clone().unwrap();
+        let levels_buf = levels.all_levels().clone();
         let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: levels_buf.borrow_and_clone(),
+            data: levels_buf,
             bits_per_value: 16,
             num_values: num_levels,
             block_info: BlockInfo::new(),
@@ -3392,7 +3455,7 @@ impl PrimitiveStructuralEncoder {
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let chunk_num_values = chunk.num_values(values_counter, num_elements);
             values_counter += chunk_num_values;
-            let mut chunk_levels = if chunk_idx < chunks.len() - 1 {
+            let chunk_levels = if chunk_idx < chunks.len() - 1 {
                 levels.slice_next(chunk_num_values as usize)
             } else {
                 levels.slice_rest()
@@ -3427,7 +3490,7 @@ impl PrimitiveStructuralEncoder {
                     0
                 };
 
-                if chunk_idx != 0 && rep_values[0] == max_rep {
+                if chunk_idx != 0 && rep_values.first() == Some(&max_rep) {
                     // This chunk starts with a new row and so, if we thought we had leftovers
                     // in the previous chunk, we were mistaken
                     // TODO: Can use unchecked here
@@ -3476,7 +3539,7 @@ impl PrimitiveStructuralEncoder {
         num_rows: u64,
         row_number: u64,
     ) -> Result<EncodedPage> {
-        let description = ProtobufUtils::simple_all_null_layout();
+        let description = ProtobufUtils21::simple_all_null_layout();
         Ok(EncodedPage {
             column_idx,
             data: vec![],
@@ -3510,7 +3573,7 @@ impl PrimitiveStructuralEncoder {
             LanceBuffer::empty()
         };
 
-        let description = ProtobufUtils::all_null_layout(&repdef.def_meaning);
+        let description = ProtobufUtils21::all_null_layout(&repdef.def_meaning);
         Ok(EncodedPage {
             column_idx,
             data: vec![rep_bytes, def_bytes],
@@ -3561,7 +3624,7 @@ impl PrimitiveStructuralEncoder {
 
         let (rep_index, rep_index_depth) =
             match compressed_rep.as_mut().and_then(|cr| cr.rep_index.as_mut()) {
-                Some(rep_index) => (Some(rep_index.borrow_and_clone()), 1),
+                Some(rep_index) => (Some(rep_index.clone()), 1),
                 None => (None, 0),
             };
 
@@ -3611,7 +3674,7 @@ impl PrimitiveStructuralEncoder {
                 data.push(rep_index);
             }
 
-            let description = ProtobufUtils::miniblock_layout(
+            let description = ProtobufUtils21::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -3629,7 +3692,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
             })
         } else {
-            let description = ProtobufUtils::miniblock_layout(
+            let description = ProtobufUtils21::miniblock_layout(
                 compressed_rep.map(|cr| cr.compression),
                 compressed_def.map(|cd| cd.compression),
                 value_encoding,
@@ -3640,7 +3703,7 @@ impl PrimitiveStructuralEncoder {
                 num_items,
             );
 
-            if let Some(mut rep_index) = rep_index {
+            if let Some(rep_index) = rep_index {
                 let view = rep_index.borrow_to_typed_slice::<u64>();
                 let total = view.chunks_exact(2).map(|c| c[0]).sum::<u64>();
                 debug_assert_eq!(total, num_rows);
@@ -3709,12 +3772,12 @@ impl PrimitiveStructuralEncoder {
             rep_index_builder.append(zipped_data.len() as u64);
         }
 
-        let zipped_data = LanceBuffer::Owned(zipped_data);
+        let zipped_data = LanceBuffer::from(zipped_data);
         let rep_index = rep_index_builder.into_data();
         let rep_index = if rep_index.is_empty() {
             None
         } else {
-            Some(LanceBuffer::Owned(rep_index))
+            Some(LanceBuffer::from(rep_index))
         };
         SerializedFullZip {
             values: zipped_data,
@@ -3726,7 +3789,7 @@ impl PrimitiveStructuralEncoder {
     //
     // In addition, we create a second buffer, the repetition index
     fn serialize_full_zip_variable(
-        mut variable: VariableWidthBlock,
+        variable: VariableWidthBlock,
         mut repdef: ControlWordIterator,
         num_items: u64,
     ) -> SerializedFullZip {
@@ -3805,10 +3868,10 @@ impl PrimitiveStructuralEncoder {
             rep_index_builder.append(buf.len() as u64);
         }
 
-        let zipped_data = LanceBuffer::Owned(buf);
+        let zipped_data = LanceBuffer::from(buf);
         let rep_index = rep_index_builder.into_data();
         debug_assert!(!rep_index.is_empty());
-        let rep_index = Some(LanceBuffer::Owned(rep_index));
+        let rep_index = Some(LanceBuffer::from(rep_index));
         SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
@@ -3881,7 +3944,7 @@ impl PrimitiveStructuralEncoder {
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
         let description = match &compressed_data {
-            PerValueDataBlock::Fixed(fixed) => ProtobufUtils::fixed_full_zip_layout(
+            PerValueDataBlock::Fixed(fixed) => ProtobufUtils21::fixed_full_zip_layout(
                 bits_rep,
                 bits_def,
                 fixed.bits_per_value as u32,
@@ -3890,7 +3953,7 @@ impl PrimitiveStructuralEncoder {
                 num_items as u32,
                 num_visible_items as u32,
             ),
-            PerValueDataBlock::Variable(variable) => ProtobufUtils::variable_full_zip_layout(
+            PerValueDataBlock::Variable(variable) => ProtobufUtils21::variable_full_zip_layout(
                 bits_rep,
                 bits_def,
                 variable.bits_per_offset as u32,
@@ -4323,12 +4386,16 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc};
-
+    use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
+    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+    use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_schema::DataType;
+    use std::collections::HashMap;
+    use std::{collections::VecDeque, sync::Arc};
 
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
@@ -4641,8 +4708,10 @@ mod tests {
 
     #[test]
     fn test_schedule_instructions() {
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
 
         let check = |user_ranges, expected_instructions| {
             let instructions =
@@ -4795,8 +4864,10 @@ mod tests {
             drain_instructions
         }
 
-        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        // Convert repetition index to bytes for testing
+        let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![1..7, 10..14];
 
         // First, schedule the ranges
@@ -4879,8 +4950,9 @@ mod tests {
         );
 
         // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
-        let repetition_index = vec![vec![5, 2], vec![3, 3], vec![20, 0]];
-        let repetition_index = MiniBlockRepIndex::decode(&repetition_index);
+        let rep_data: Vec<u64> = vec![5, 2, 3, 3, 20, 0];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
         let user_ranges = vec![0..28];
 
         // First, schedule the ranges
@@ -5183,5 +5255,41 @@ mod tests {
                 .is_some(),
             "With enable_cache=true, should return FullZipCacheableState"
         );
+    }
+
+    /// This test is used to reproduce fuzz test https://github.com/lancedb/lance/issues/4492
+    #[tokio::test]
+    async fn test_fuzz_issue_4492_empty_rep_values() {
+        use lance_datagen::{array, gen_batch, RowCount, Seed};
+
+        let seed = 1823859942947654717u64;
+        let num_rows = 2741usize;
+
+        // Generate the exact same data that caused the failure
+        let batch_gen = gen_batch().with_seed(Seed::from(seed));
+        let base_generator = array::rand_type(&DataType::FixedSizeBinary(32));
+        let list_generator = array::rand_list_any(base_generator, false);
+
+        let batch = batch_gen
+            .anon_col(list_generator)
+            .into_batch_rows(RowCount::from(num_rows as u64))
+            .unwrap();
+
+        let list_array = batch.column(0).clone();
+
+        // Force miniblock encoding
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_file_version(LanceFileVersion::V2_1)
+            .with_batch_size(100)
+            .with_range(0..num_rows.min(500) as u64)
+            .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
+
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
     }
 }

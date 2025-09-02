@@ -1873,7 +1873,7 @@ mod tests {
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
@@ -1881,7 +1881,7 @@ mod tests {
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
     };
-    use rand::{seq::SliceRandom, thread_rng};
+    use rand::{rng, seq::SliceRandom};
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -2183,7 +2183,7 @@ mod tests {
         if num_parts > ids.len() as u32 {
             panic!("Not enough ids to break into {num_parts} parts");
         }
-        let mut rng = thread_rng();
+        let mut rng = rng();
         ids.shuffle(&mut rng);
 
         let values_per_part = ids.len() / num_parts as usize;
@@ -2267,24 +2267,58 @@ mod tests {
         .await
         .unwrap();
 
-        let index = dataset
+        // After building the index file, we need to register the index metadata
+        // so that the dataset can find it when we try to open it
+        let field = dataset.schema().field(WellKnownIvfPqData::COLUMN).unwrap();
+        let index_meta = lance_table::format::Index {
+            uuid,
+            dataset_version: dataset.version().version,
+            fields: vec![field.id],
+            name: INDEX_NAME.to_string(),
+            fragment_bitmap: Some(
+                dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
+            index_details: Some(vector_index_details()),
+            index_version: 1, // Use version 1 for IVF PQ index
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        };
+
+        // We need to commit this index to the dataset so that it can be found
+        use crate::dataset::transaction::{Operation, Transaction};
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![index_meta.clone()],
+                removed_indices: vec![],
+            },
+            None,
+            None,
+        );
+
+        // Apply the transaction to register the index
+        // Since dataset is Arc<Dataset>, we need to create a mutable reference
+        let mut dataset_mut = (*dataset).clone();
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let index = dataset_mut
             .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid_str, &NoOpMetricsCollector)
             .await
             .unwrap();
+
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
-
-        let index_meta = lance_table::format::Index {
-            uuid,
-            dataset_version: 0,
-            fields: Vec::new(),
-            name: INDEX_NAME.to_string(),
-            fragment_bitmap: None,
-            index_details: Some(vector_index_details()),
-            index_version: index.index_type().version(),
-            created_at: None, // Test index, not setting timestamp
-        };
-
-        let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
+        let prefilter = Arc::new(DatasetPreFilter::new(
+            Arc::new(dataset_mut.clone()),
+            std::slice::from_ref(&index_meta),
+            None,
+        ));
 
         let is_not_remapped = Some;
         let is_remapped = |row_id| Some(row_id + BIG_OFFSET);
@@ -2312,10 +2346,10 @@ mod tests {
         let new_uuid_str = new_uuid.to_string();
 
         remap_index_file(
-            &dataset,
+            &dataset_mut,
             &uuid_str,
             &new_uuid_str,
-            dataset.version().version,
+            dataset_mut.version().version,
             ivf_index,
             &mapping,
             INDEX_NAME.to_string(),
@@ -2325,7 +2359,48 @@ mod tests {
         .await
         .unwrap();
 
-        let remapped = dataset
+        // After remapping the index file, we need to register the new index metadata
+        // so that the dataset can find it when we try to open it
+        let field = dataset_mut
+            .schema()
+            .field(WellKnownIvfPqData::COLUMN)
+            .unwrap();
+        let new_index_meta = lance_table::format::Index {
+            uuid: new_uuid,
+            dataset_version: dataset_mut.version().version,
+            fields: vec![field.id],
+            name: format!("{}_remapped", INDEX_NAME),
+            fragment_bitmap: Some(
+                dataset_mut
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
+            index_details: Some(vector_index_details()),
+            index_version: index.index_type().version(),
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        };
+
+        // We need to commit this new index to the dataset so it can be found
+        let transaction = Transaction::new(
+            dataset_mut.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![new_index_meta],
+                removed_indices: vec![],
+            },
+            None,
+            None,
+        );
+
+        // Apply the transaction to register the new index
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let remapped = dataset_mut
             .open_vector_index(
                 WellKnownIvfPqData::COLUMN,
                 &new_uuid.to_string(),
@@ -2455,7 +2530,7 @@ mod tests {
         index_params.version(index_version);
 
         let nrows = 2_000;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(test_case.dimension as u32)),
@@ -2509,7 +2584,7 @@ mod tests {
         // Generate random data with nulls
         let nrows = 2_000;
         let dims = 32;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),
@@ -2550,7 +2625,7 @@ mod tests {
         check_index(&dataset, num_non_null, dims).await;
 
         // Append more data
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),

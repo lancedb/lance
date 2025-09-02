@@ -34,6 +34,7 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
@@ -42,14 +43,17 @@ use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR, ROW_ID};
+use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
-    analyze_plan, execute_plan, LanceExecutionOptions, StrictBatchSizeExec,
+    analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
 };
+use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_index::scalar::expression::PlannerIndexExt;
+use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
 use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
 };
@@ -66,6 +70,8 @@ use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
+use crate::dataset::row_offsets_to_row_addresses;
+use crate::dataset::utils::wrap_json_stream_for_reading;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
@@ -73,13 +79,14 @@ use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, LanceFilterExec, LanceScanConfig};
+use crate::io::exec::{get_physical_optimizer, AddRowOffsetExec, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 use crate::{Error, Result};
+
 use snafu::location;
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -395,6 +402,35 @@ pub struct Scanner {
 
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
+
+    // Legacy fields to help migrate some old projection behavior to new behavior
+    //
+    // There are two behaviors we are moving away from:
+    //
+    // First, the old behavior used methods like with_row_id and with_row_addr to add
+    // "system" columns.  The new behavior is to specify them in the projection like any
+    // other column.  The only difference between a system column and a regular column is
+    // that system columns are not returned in the schema and are not returned by default
+    // (i.e. "SELECT *")
+    //
+    // Second, the old behavior would _always_ add the _score or _distance columns to the
+    // output and there was no way for the user to opt out.  The new behavior treats the
+    // _score and _distance as regular output columns of the "search table function".  If
+    // the user does not specify a projection (i.e. "SELECT *") then we will add the _score
+    // and _distance columns to the end.  If the user does specify a projection then they
+    // must request those columns for them to show up.
+    //
+    // --------------------------------------------------------------------------
+    /// Whether the user wants the row id on top of the projection, will always come last
+    /// except possibly before _rowaddr
+    legacy_with_row_id: bool,
+    /// Whether the user wants the row address on top of the projection, will always come last
+    legacy_with_row_addr: bool,
+    /// Whether the user explicitly requested a projection.  If they did then we will warn them
+    /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
+    explicit_projection: bool,
+    /// Whether the user wants to use the legacy projection behavior.
+    autoproject_scoring_columns: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -404,10 +440,167 @@ fn escape_column_name(name: &str) -> String {
         .join(".")
 }
 
+/// Represents a user-requested take operation
+#[derive(Debug, Clone)]
+pub enum TakeOperation {
+    /// Take rows by row id
+    RowIds(Vec<u64>),
+    /// Take rows by row address
+    RowAddrs(Vec<u64>),
+    /// Take rows by row offset
+    ///
+    /// The row offset is the offset of the row in the dataset.  This can
+    /// be converted to row addresses using the fragment sizes.
+    RowOffsets(Vec<u64>),
+}
+
+impl TakeOperation {
+    fn extract_u64_list(list: &[Expr]) -> Option<Vec<u64>> {
+        let mut u64s = Vec::with_capacity(list.len());
+        for expr in list {
+            if let Expr::Literal(lit, _) = expr {
+                if let Some(ScalarValue::UInt64(Some(val))) =
+                    safe_coerce_scalar(lit, &DataType::UInt64)
+                {
+                    u64s.push(val);
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(u64s)
+    }
+
+    fn merge(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::RowIds(mut left), Self::RowIds(right)) => {
+                left.extend(right);
+                Some(Self::RowIds(left))
+            }
+            (Self::RowAddrs(mut left), Self::RowAddrs(right)) => {
+                left.extend(right);
+                Some(Self::RowAddrs(left))
+            }
+            (Self::RowOffsets(mut left), Self::RowOffsets(right)) => {
+                left.extend(right);
+                Some(Self::RowOffsets(left))
+            }
+            _ => None,
+        }
+    }
+
+    /// Attempts to create a take operation from an expression.  This will succeed if the expression
+    /// has one of the following forms:
+    ///  - `_rowid = 10`
+    ///  - `_rowid = 10 OR _rowid = 20 OR _rowid = 30`
+    ///  - `_rowid IN (10, 20, 30)`
+    ///  - `_rowaddr = 10`
+    ///  - `_rowaddr = 10 OR _rowaddr = 20 OR _rowaddr = 30`
+    ///  - `_rowaddr IN (10, 20, 30)`
+    ///  - `_rowoffset = 10`
+    ///  - `_rowoffset = 10 OR _rowoffset = 20 OR _rowoffset = 30`
+    ///  - `_rowoffset IN (10, 20, 30)`
+    ///
+    /// The _rowid / _rowaddr / _rowoffset determine if we are taking by row id, address, or offset.
+    ///
+    /// If a take expression is combined with some other filter via an AND then the remainder will be
+    /// returned as well.  For example, `_rowid = 10` will return (take_op, None) and
+    /// `_rowid = 10 AND x > 70` will return (take_op, Some(x > 70)).
+    fn try_from_expr(expr: &Expr) -> Option<(Self, Option<Expr>)> {
+        if let Expr::BinaryExpr(binary) = expr {
+            match binary.op {
+                datafusion_expr::Operator::And => {
+                    let left_take = Self::try_from_expr(&binary.left);
+                    let right_take = Self::try_from_expr(&binary.right);
+                    match (left_take, right_take) {
+                        (Some(_), Some(_)) => {
+                            // This is something like...
+                            //
+                            // _rowid = 10 AND _rowid = 20
+                            //
+                            // ...which is kind of nonsensical.  Better to just return None.
+                            return None;
+                        }
+                        (Some((left_op, left_rem)), None) => {
+                            let remainder = match left_rem {
+                                // If there is a remainder on the left side we combine it.  This _should_
+                                // be something like converting (_rowid = 10 AND x > 70) AND y > 80
+                                // to (_rowid = 10) AND (x > 70 AND y > 80) which should be valid
+                                Some(expr) => Expr::and(expr, binary.right.as_ref().clone()),
+                                None => binary.right.as_ref().clone(),
+                            };
+                            return Some((left_op, Some(remainder)));
+                        }
+                        (None, Some((right_op, right_rem))) => {
+                            let remainder = match right_rem {
+                                Some(expr) => Expr::and(expr, binary.left.as_ref().clone()),
+                                None => binary.left.as_ref().clone(),
+                            };
+                            return Some((right_op, Some(remainder)));
+                        }
+                        (None, None) => {
+                            return None;
+                        }
+                    }
+                }
+                datafusion_expr::Operator::Eq => {
+                    // Check for _rowid = literal
+                    if let (Expr::Column(col), Expr::Literal(lit, _)) =
+                        (binary.left.as_ref(), binary.right.as_ref())
+                    {
+                        if let Some(ScalarValue::UInt64(Some(val))) =
+                            safe_coerce_scalar(lit, &DataType::UInt64)
+                        {
+                            if col.name == ROW_ID {
+                                return Some((Self::RowIds(vec![val]), None));
+                            } else if col.name == ROW_ADDR {
+                                return Some((Self::RowAddrs(vec![val]), None));
+                            } else if col.name == ROW_OFFSET {
+                                return Some((Self::RowOffsets(vec![val]), None));
+                            }
+                        }
+                    }
+                }
+                datafusion_expr::Operator::Or => {
+                    let left_take = Self::try_from_expr(&binary.left);
+                    let right_take = Self::try_from_expr(&binary.right);
+                    if let (Some(left), Some(right)) = (left_take, right_take) {
+                        if left.1.is_some() || right.1.is_some() {
+                            // This would be something like...
+                            //
+                            // (_rowid = 10 AND x > 70) OR _rowid = 20
+                            //
+                            // I don't think it's correct to convert this into a take operation
+                            // which would give us (_rowid = 10 OR _rowid = 20) AND x > 70
+                            return None;
+                        }
+                        return left.0.merge(right.0).map(|op| (op, None));
+                    }
+                }
+                _ => {}
+            }
+        } else if let Expr::InList(in_expr) = expr {
+            if let Expr::Column(col) = in_expr.expr.as_ref() {
+                if let Some(u64s) = Self::extract_u64_list(&in_expr.list) {
+                    if col.name == ROW_ID {
+                        return Some((Self::RowIds(u64s), None));
+                    } else if col.name == ROW_ADDR {
+                        return Some((Self::RowAddrs(u64s), None));
+                    } else if col.name == ROW_OFFSET {
+                        return Some((Self::RowOffsets(u64s), None));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        // By default, we only scan the local schema
-        let projection_plan = ProjectionPlan::new(dataset.clone());
+        let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
         let file_reader_options = dataset.file_reader_options.clone();
         Self {
             dataset,
@@ -433,6 +626,10 @@ impl Scanner {
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
+            legacy_with_row_addr: false,
+            legacy_with_row_id: false,
+            explicit_projection: false,
+            autoproject_scoring_columns: true,
         }
     }
 
@@ -498,27 +695,6 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
             .collect();
 
-        let with_row_id = self.projection_plan.desires_row_id;
-        let with_row_addr = self.projection_plan.desires_row_addr;
-
-        for (col, _) in &transformed_columns {
-            if *col == ROW_ID && !with_row_id {
-                return Err(Error::invalid_input(
-                    format!("Cannot project {} without enabling with_row_id", ROW_ID),
-                    location!(),
-                ));
-            }
-            if *col == ROW_ADDR && !with_row_addr {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Cannot project {} without enabling with_row_address",
-                        ROW_ADDR
-                    ),
-                    location!(),
-                ));
-            }
-        }
-
         self.project_with_transform(&transformed_columns)
     }
 
@@ -529,19 +705,14 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let filtered_columns: Vec<_> = columns
-            .iter()
-            .filter(|(col, _)| {
-                let col_name = col.as_ref();
-                !(col_name == ROW_ID
-                    || col_name == ROW_ADDR
-                    || col_name == DIST_COL
-                    || col_name == SCORE_COL)
-            })
-            .map(|(c, t)| (c.as_ref(), t.as_ref()))
-            .collect();
-        self.projection_plan
-            .project_from_expressions(&filtered_columns)?;
+        self.explicit_projection = true;
+        self.projection_plan = ProjectionPlan::from_expressions(self.dataset.clone(), columns)?;
+        if self.legacy_with_row_id {
+            self.projection_plan.include_row_id();
+        }
+        if self.legacy_with_row_addr {
+            self.projection_plan.include_row_addr();
+        }
         Ok(self)
     }
 
@@ -1035,13 +1206,35 @@ impl Scanner {
 
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
+        self.legacy_with_row_id = true;
         self.projection_plan.include_row_id();
         self
     }
 
     /// Instruct the scanner to return the `_rowaddr` meta column from the dataset.
     pub fn with_row_address(&mut self) -> &mut Self {
+        self.legacy_with_row_addr = true;
         self.projection_plan.include_row_addr();
+        self
+    }
+
+    /// Instruct the scanner to disable automatic projection of scoring columns
+    ///
+    /// In the future, this will be the default behavior.  This method is useful for
+    /// opting in to the new behavior early to avoid breaking changes (and a warning
+    /// message)
+    ///
+    /// Once the default switches, the old autoprojection behavior will be removed.
+    ///
+    /// The autoprojection behavior (current default) includes the _score or _distance
+    /// column even if a projection is manually specified with `[project]` or
+    /// `[project_with_transform]`.
+    ///
+    /// The new behavior will only include the _score or _distance column if no projection
+    /// is specified or if the user explicitly includes the _score or _distance column
+    /// in the projection.
+    pub fn disable_scoring_autoprojection(&mut self) -> &mut Self {
+        self.autoproject_scoring_columns = false;
         self
     }
 
@@ -1084,7 +1277,7 @@ impl Scanner {
     }
 
     fn add_extra_columns(&self, schema: Schema) -> Result<Schema> {
-        let mut extra_columns = vec![];
+        let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
 
         if self.nearest.as_ref().is_some() {
             extra_columns.push(ArrowField::new(DIST_COL, DataType::Float32, true));
@@ -1094,11 +1287,7 @@ impl Scanner {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
         }
 
-        if extra_columns.is_empty() {
-            Ok(schema)
-        } else {
-            schema.merge(&ArrowSchema::new(extra_columns))
-        }
+        schema.merge(&ArrowSchema::new(extra_columns))
     }
 
     /// The full schema available to filters
@@ -1110,40 +1299,72 @@ impl Scanner {
             .with_row_id()
             .with_row_addr()
             .to_schema();
+
         Ok(Arc::new(self.add_extra_columns(base_schema)?))
     }
 
-    pub(crate) fn output_expr(
+    /// This takes the current output, and the user's requested projection, and calculates the
+    /// final projection expression.
+    ///
+    /// This final expression may reorder columns, drop columns, or calculate new columns
+    pub(crate) fn calculate_final_projection(
         &self,
         current_schema: &ArrowSchema,
     ) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        // Append the extra columns
+        // Select the columns from the output schema based on the user's projection (or the list
+        // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
 
-        // distance goes before the row_id column
-        if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
-            let vector_expr = expressions::col(DIST_COL, current_schema)?;
-            output_expr.push((vector_expr, DIST_COL.to_string()));
+        // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
+        // projection behavior
+        if self.autoproject_scoring_columns {
+            if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to to adopt the future behavior and avoid this warning");
+                }
+                let vector_expr = expressions::col(DIST_COL, current_schema)?;
+                output_expr.push((vector_expr, DIST_COL.to_string()));
+            }
+            if self.full_text_query.is_some()
+                && output_expr.iter().all(|(_, name)| name != SCORE_COL)
+            {
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
+                }
+                let score_expr = expressions::col(SCORE_COL, current_schema)?;
+                output_expr.push((score_expr, SCORE_COL.to_string()));
+            }
         }
 
-        if self.full_text_query.is_some() && output_expr.iter().all(|(_, name)| name != SCORE_COL) {
-            let score_expr = expressions::col(SCORE_COL, current_schema)?;
-            output_expr.push((score_expr, SCORE_COL.to_string()));
+        if self.legacy_with_row_id {
+            let row_id_pos = output_expr
+                .iter()
+                .position(|(_, name)| name == ROW_ID)
+                .ok_or_else(|| Error::Internal {
+                    message:
+                        "user specified with_row_id but the _rowid column was not in the output"
+                            .to_string(),
+                    location: location!(),
+                })?;
+            if row_id_pos != output_expr.len() - 1 {
+                // Row id is not last column.  Need to rotate it to the last spot.
+                let row_id_expr = output_expr.remove(row_id_pos);
+                output_expr.push(row_id_expr);
+            }
         }
 
-        // TODO: These output_expr.iter().all() checks seem redundant.  We should never have ROW_ID
-        // or ROW_ADDR in the output exprs.
-        if self.projection_plan.desires_row_id && output_expr.iter().all(|(_, name)| name != ROW_ID)
-        {
-            let row_id_expr = expressions::col(ROW_ID, current_schema)?;
-            output_expr.push((row_id_expr, ROW_ID.to_string()));
-        }
-
-        if self.projection_plan.desires_row_addr
-            && output_expr.iter().all(|(_, name)| name != ROW_ADDR)
-        {
-            let row_addr_expr = expressions::col(ROW_ADDR, current_schema)?;
-            output_expr.push((row_addr_expr, ROW_ADDR.to_string()));
+        if self.legacy_with_row_addr {
+            let row_addr_pos = output_expr.iter().position(|(_, name)| name == ROW_ADDR).ok_or_else(|| {
+                Error::Internal {
+                    message: "user specified with_row_address but the _rowaddr column was not in the output".to_string(),
+                    location: location!(),
+                }
+            })?;
+            if row_addr_pos != output_expr.len() - 1 {
+                // Row addr is not last column.  Need to rotate it to the last spot.
+                let row_addr_expr = output_expr.remove(row_addr_pos);
+                output_expr.push(row_addr_expr);
+            }
         }
 
         Ok(output_expr)
@@ -1151,7 +1372,7 @@ impl Scanner {
 
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
-    pub fn try_into_stream(&self) -> BoxFuture<Result<DatasetRecordBatchStream>> {
+    pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
@@ -1189,7 +1410,7 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    fn create_count_plan(&self) -> BoxFuture<Result<Arc<dyn ExecutionPlan>>> {
+    fn create_count_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if self.projection_plan.physical_projection.is_empty() {
@@ -1247,7 +1468,7 @@ impl Scanner {
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
     /// especially if there is no filter.
     #[instrument(skip_all)]
-    pub fn count_rows(&self) -> BoxFuture<Result<u64>> {
+    pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let count_plan = self.create_count_plan().await?;
@@ -1356,7 +1577,7 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
-        if self.include_deleted_rows && !self.projection_plan.desires_row_id {
+        if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::InvalidInput {
                 source: "include_deleted_rows is set but with_row_id is false".into(),
                 location: location!(),
@@ -1500,25 +1721,38 @@ impl Scanner {
                     // It's also possible we get here from `SELECT does_not_exist`
 
                     // Note: even though we are just going to return an error we still want to calculate the
-                    // output_expr here.  This lets us distinguish between a user doing something like:
+                    // final projection here.  This lets us distinguish between a user doing something like:
                     //
                     // SELECT 1 FROM t (not supported error)
                     // SELECT non_existent_column FROM t (column not found error)
-                    let output_expr = self.output_expr(&ArrowSchema::empty())?;
+                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
                     return Err(Error::NotSupported {
                         source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
                         location: location!(),
                     });
                 }
 
-                let planned_read = self.filtered_read_source(&mut filter_plan).await?;
-                if planned_read.limit_pushed_down {
-                    use_limit_node = false;
+                let take_op = filter_plan
+                    .full_expr
+                    .as_ref()
+                    .and_then(TakeOperation::try_from_expr);
+                if let Some((take_op, remainder)) = take_op {
+                    // If there is any remainder use it as the filter (we don't even try and combine an indexed
+                    // search on the filter with a take as that seems excessive)
+                    filter_plan = remainder
+                        .map(FilterPlan::new_refine_only)
+                        .unwrap_or(FilterPlan::default());
+                    self.take_source(take_op).await?
+                } else {
+                    let planned_read = self.filtered_read_source(&mut filter_plan).await?;
+                    if planned_read.limit_pushed_down {
+                        use_limit_node = false;
+                    }
+                    if planned_read.filter_pushed_down {
+                        filter_plan = FilterPlan::default();
+                    }
+                    planned_read.plan
                 }
-                if planned_read.filter_pushed_down {
-                    filter_plan = FilterPlan::default();
-                }
-                planned_read.plan
             }
             _ => {
                 return Err(Error::InvalidInput {
@@ -1592,10 +1826,15 @@ impl Scanner {
         // Stage 5: take remaining columns required for projection
         plan = self.take(plan, self.projection_plan.physical_projection.clone())?;
 
-        // Stage 7: final projection
-        let output_expr = self.output_expr(plan.schema().as_ref())?;
+        // Stage 6: if requested, add the row offset column
+        if self.projection_plan.must_add_row_offset {
+            plan = Arc::new(AddRowOffsetExec::try_new(plan, self.dataset.clone()).await?);
+        }
 
-        plan = Arc::new(DFProjectionExec::try_new(output_expr, plan)?);
+        // Stage 7: final projection
+        let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+
+        plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
@@ -1782,6 +2021,44 @@ impl Scanner {
                 plan,
             })
         }
+    }
+
+    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_ids = RowIdTreeMap::from_iter(u64s);
+        let row_id_mask = RowIdMask::from_allowed(row_ids);
+        let index_result = IndexExprResult::Exact(row_id_mask);
+        let fragments_covered =
+            RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32));
+        let batch = index_result.serialize_to_arrow(&fragments_covered)?;
+        let stream = futures::stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            INDEX_EXPR_RESULT_SCHEMA.clone(),
+            stream,
+        ));
+        Ok(Arc::new(OneShotExec::new(stream)))
+    }
+
+    async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
+        // We generally assume that late materialization does not make sense for take operations
+        // so we can just use the physical projection
+        let projection = self.projection_plan.physical_projection.clone();
+
+        let input = match take_op {
+            TakeOperation::RowIds(ids) => self.u64s_as_take_input(ids),
+            TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
+            TakeOperation::RowOffsets(offsets) => {
+                let mut addrs =
+                    row_offsets_to_row_addresses(self.dataset.as_ref(), &offsets).await?;
+                addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
+                self.u64s_as_take_input(addrs)
+            }
+        }?;
+
+        Ok(Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            FilteredReadOptions::new(projection),
+            Some(input),
+        )?))
     }
 
     async fn filtered_read_source(
@@ -2427,11 +2704,14 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
-            let vector_scan_projection = self
+            let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
                 .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
+
+            vector_scan_projection.with_row_addr =
+                self.projection_plan.physical_projection.with_row_addr;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(
@@ -3182,6 +3462,11 @@ pub struct DatasetRecordBatchStream {
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
+        // Convert lance.json (JSONB) back to arrow.json (strings) for reading
+        //
+        // This is so bad, we need to find a way to remove this.
+        let exec_node = wrap_json_stream_for_reading(exec_node);
+
         let span = info_span!("DatasetRecordBatchStream");
         Self { exec_node, span }
     }
@@ -3314,7 +3599,7 @@ pub mod test_dataset {
                 max_rows_per_group: 10,
                 max_rows_per_file: 200,
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: stable_row_ids,
+                enable_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -3408,11 +3693,12 @@ mod test {
         RecordBatchIterator, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
+    use arrow_schema::Fields;
     use arrow_select::take;
     use datafusion::logical_expr::{col, lit};
     use half::f16;
     use lance_arrow::SchemaExt;
-    use lance_datagen::{array, gen, BatchCount, ByteCount, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, ByteCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -3493,7 +3779,7 @@ mod test {
 
     #[tokio::test]
     async fn test_strict_batch_size() {
-        let dataset = lance_datagen::gen()
+        let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .anon_col(array::step::<Int64Type>())
             .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
@@ -3520,18 +3806,17 @@ mod test {
 
     #[tokio::test]
     async fn test_column_not_exist() {
-        let dataset = lance_datagen::gen()
+        let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
             .await
             .unwrap();
 
         let check_err_msg = |r: Result<DatasetRecordBatchStream>| {
-            let err = match r {
-                Ok(_) => panic!(
+            let Err(err) = r else {
+                panic!(
                     "Expected an error to be raised saying column y is not found but got no error"
-                ),
-                Err(e) => e,
+                )
             };
 
             assert!(
@@ -3646,6 +3931,63 @@ mod test {
             assert_eq!(batch, expected_batch);
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nested_projection() {
+        let point_fields: Fields = vec![
+            ArrowField::new("x", DataType::Float32, true),
+            ArrowField::new("y", DataType::Float32, true),
+        ]
+        .into();
+        let metadata_fields: Fields = vec![
+            ArrowField::new("location", DataType::Struct(point_fields), true),
+            ArrowField::new("age", DataType::Int32, true),
+        ]
+        .into();
+        let metadata_field = ArrowField::new("metadata", DataType::Struct(metadata_fields), true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            metadata_field,
+            ArrowField::new("idx", DataType::Int32, true),
+        ]));
+        let data = lance_datagen::rand(&schema)
+            .into_ram_dataset(FragmentCount::from(7), FragmentRowCount::from(6))
+            .await
+            .unwrap();
+
+        let mut scan = data.scan();
+        scan.project(&["metadata.location.x", "metadata.age"])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("metadata.location.x", DataType::Float32, true),
+                ArrowField::new("metadata.age", DataType::Int32, true),
+            ])
+        );
+
+        // 0 - metadata
+        // 2 - x
+        // 4 - age
+        let take_schema = data.schema().project_by_ids(&[0, 2, 4], false);
+
+        let taken = data.take_rows(&[0, 5], take_schema).await.unwrap();
+
+        // The expected schema drops y from the location field
+        let part_point_fields = Fields::from(vec![ArrowField::new("x", DataType::Float32, true)]);
+        let part_metadata_fields = Fields::from(vec![
+            ArrowField::new("location", DataType::Struct(part_point_fields), true),
+            ArrowField::new("age", DataType::Int32, true),
+        ]);
+        let part_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "metadata",
+            DataType::Struct(part_metadata_fields),
+            true,
+        )]));
+
+        assert_eq!(taken.schema(), part_schema);
     }
 
     #[rstest]
@@ -4243,14 +4585,14 @@ mod test {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 2, 3]))
             .col(
                 "str",
                 array::cycle_utf8_literals(&["a", "b", "c", "e", "d"]),
             );
 
-        let sorted_by_int = gen()
+        let sorted_by_int = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![1, 2, 3, 4, 5]))
             .col(
                 "str",
@@ -4259,7 +4601,7 @@ mod test {
             .into_batch_rows(RowCount::from(5))
             .unwrap();
 
-        let sorted_by_str = gen()
+        let sorted_by_str = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 4, 1, 3, 2]))
             .col(
                 "str",
@@ -4333,14 +4675,14 @@ mod test {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![5, 5, 1, 1, 3]))
             .col(
                 "float",
                 array::cycle::<Float32Type>(vec![7.3, -f32::NAN, f32::NAN, 4.3, f32::INFINITY]),
             );
 
-        let sorted_by_int_then_float = gen()
+        let sorted_by_int_then_float = gen_batch()
             .col("int", array::cycle::<Int32Type>(vec![1, 1, 3, 5, 5]))
             .col(
                 "float",
@@ -4419,7 +4761,7 @@ mod test {
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
-            enable_move_stable_row_ids: stable_row_ids,
+            enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -4714,7 +5056,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     data_storage_version: Some(data_storage_version),
-                    enable_move_stable_row_ids: stable_row_ids,
+                    enable_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -4864,7 +5206,7 @@ mod test {
     #[tokio::test]
     async fn test_projection_order() {
         let vec_params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2);
-        let mut data = gen()
+        let mut data = gen_batch()
             .col("vec", array::rand_vec::<Float32Type>(Dimension::from(4)))
             .col("text", array::rand_utf8(ByteCount::from(10), false))
             .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
@@ -5079,7 +5421,7 @@ mod test {
             //
             // The first row where indexed == 50 is our sample query.
             // The first row where indexed == 75 is our deleted row (and delete query)
-            let data = gen()
+            let data = gen_batch()
                 .col(
                     "vector",
                     array::rand_vec::<Float32Type>(Dimension::from(32)),
@@ -5096,7 +5438,7 @@ mod test {
                 Some(WriteParams {
                     max_rows_per_file: 500,
                     data_storage_version: Some(data_storage_version),
-                    enable_move_stable_row_ids: use_stable_row_ids,
+                    enable_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -5533,7 +5875,7 @@ mod test {
 
     #[tokio::test]
     async fn can_filter_row_id() {
-        let dataset = lance_datagen::gen()
+        let dataset = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1000))
             .await
@@ -5631,7 +5973,7 @@ mod test {
 
     #[tokio::test]
     async fn test_inexact_scalar_index_plans() {
-        let data = gen()
+        let data = gen_batch()
             .col("ngram", array::rand_utf8(ByteCount::from(5), false))
             .col("exact", array::rand_type(&DataType::UInt32))
             .col("no_index", array::rand_type(&DataType::UInt32))
@@ -5709,7 +6051,7 @@ mod test {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
         use lance_table::io::commit::RenameCommitHandler;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vector",
                 array::rand_vec::<Float32Type>(Dimension::from(32)),
@@ -6796,7 +7138,7 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 32)?
                     .fast_search()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
@@ -6811,7 +7153,7 @@ mod test {
                 scan.nearest("vec", &q, 33)?
                     .fast_search()
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
@@ -6826,7 +7168,7 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 34)?
                     .with_row_id()
-                    .project(&["_rowid", "_distance"])
+                    .project(&["_distance", "_rowid"])
             },
             "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
   FilterExec: _distance@2 IS NOT NULL
@@ -6859,7 +7201,7 @@ mod test {
         // indexed column
 
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vector",
                 array::rand_vec::<Float32Type>(Dimension::from(32)),
@@ -7096,12 +7438,18 @@ mod test {
 
         // Test error case
         let mut scanner = dataset.scan();
-        let result = if with_row_id {
-            scanner.project(&[ROW_ID])
+        if with_row_id {
+            scanner.project(&[ROW_ID]).unwrap();
         } else {
-            scanner.project(&[ROW_ADDR])
+            scanner.project(&[ROW_ADDR]).unwrap();
         };
-        assert!(result.is_err());
+        let stream = scanner.try_into_stream().await.unwrap();
+        assert_eq!(stream.schema().fields().len(), 1);
+        if with_row_id {
+            assert!(stream.schema().field_with_name(ROW_ID).is_ok());
+        } else {
+            assert!(stream.schema().field_with_name(ROW_ADDR).is_ok());
+        }
     }
 
     async fn limit_offset_equivalency_test(scanner: &Scanner) {
@@ -7203,5 +7551,233 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    async fn test_row_offset_read_helper(
+        ds: &Dataset,
+        scan_builder: impl FnOnce(&mut Scanner) -> &mut Scanner,
+        expected_cols: &[&str],
+        expected_row_offsets: &[u64],
+    ) {
+        let mut scanner = ds.scan();
+        let scanner = scan_builder(&mut scanner);
+        let stream = scanner.try_into_stream().await.unwrap();
+
+        let schema = stream.schema();
+        let actual_cols = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(&actual_cols, expected_cols);
+
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = arrow_select::concat::concat_batches(&schema, &batches).unwrap();
+
+        let row_offsets = batch
+            .column_by_name(ROW_OFFSET)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values();
+        assert_eq!(row_offsets.as_ref(), expected_row_offsets);
+    }
+
+    #[tokio::test]
+    async fn test_row_offset_read() {
+        let mut ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+        // [0, 1, 2], [3, 4, 5], [6, 7, 8]
+
+        // Delete [2, 3, 4, 5, 6]
+        ds.delete("idx >= 2 AND idx <= 6").await.unwrap();
+
+        // Normal read, all columns plus row offset
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| scanner.project(&["idx", ROW_OFFSET]).unwrap(),
+            &["idx", ROW_OFFSET],
+            &[0, 1, 2, 3],
+        )
+        .await;
+
+        // Read with row offset only
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| scanner.project(&[ROW_OFFSET]).unwrap(),
+            &[ROW_OFFSET],
+            &[0, 1, 2, 3],
+        )
+        .await;
+
+        // Filtered read of row offset
+        test_row_offset_read_helper(
+            &ds,
+            |scanner| {
+                scanner
+                    .filter("idx > 1")
+                    .unwrap()
+                    .project(&[ROW_OFFSET])
+                    .unwrap()
+            },
+            &[ROW_OFFSET],
+            &[2, 3],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_filter_to_take() {
+        let mut ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let row_ids = ds
+            .scan()
+            .project(&Vec::<&str>::default())
+            .unwrap()
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = row_ids[0].schema();
+        let row_ids = concat_batches(&schema, row_ids.iter()).unwrap();
+        let row_ids = row_ids.column(0).as_primitive::<UInt64Type>().clone();
+
+        let row_addrs = ds
+            .scan()
+            .project(&Vec::<&str>::default())
+            .unwrap()
+            .with_row_address()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = row_addrs[0].schema();
+        let row_addrs = concat_batches(&schema, row_addrs.iter()).unwrap();
+        let row_addrs = row_addrs.column(0).as_primitive::<UInt64Type>().clone();
+
+        ds.delete("idx >= 190 AND idx < 210").await.unwrap();
+
+        let ds_copy = ds.clone();
+        let do_check = async move |filt: &str, expected_idx: &[i32], applies_optimization: bool| {
+            let mut scanner = ds_copy.scan();
+            scanner.filter(filt).unwrap();
+            // Verify the optimization is applied
+            let plan = scanner.explain_plan(true).await.unwrap();
+            if applies_optimization {
+                assert!(
+                    plan.contains("OneShotStream"),
+                    "expected take optimization to be applied. Filter: '{}'.  Plan:\n{}",
+                    filt,
+                    plan
+                );
+            } else {
+                assert!(
+                    !plan.contains("OneShotStream"),
+                    "expected take optimization to not be applied. Filter: '{}'.  Plan:\n{}",
+                    filt,
+                    plan
+                );
+            }
+
+            // Verify the results
+            let stream = scanner.try_into_stream().await.unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let idx = batches
+                .iter()
+                .map(|b| b.column_by_name("idx").unwrap().as_ref())
+                .collect::<Vec<_>>();
+
+            if idx.is_empty() {
+                assert!(expected_idx.is_empty());
+                return;
+            }
+
+            let idx = arrow::compute::concat(&idx).unwrap();
+            assert_eq!(idx.as_primitive::<Int32Type>().values(), expected_idx);
+        };
+        let check =
+            async |filt: &str, expected_idx: &[i32]| do_check(filt, expected_idx, true).await;
+        let check_no_opt = async |filt: &str, expected_idx: &[i32]| {
+            do_check(filt, expected_idx, false).await;
+        };
+
+        // Simple case, no deletions yet
+        check("_rowid = 50", &[50]).await;
+        check("_rowaddr = 50", &[50]).await;
+        check("_rowoffset = 50", &[50]).await;
+
+        check(
+            "_rowid = 50 OR _rowid = 51 OR _rowid = 52 OR _rowid = 49",
+            &[49, 50, 51, 52],
+        )
+        .await;
+        check(
+            "_rowaddr = 50 OR _rowaddr = 51 OR _rowaddr = 52 OR _rowaddr = 49",
+            &[49, 50, 51, 52],
+        )
+        .await;
+        check(
+            "_rowoffset = 50 OR _rowoffset = 51 OR _rowoffset = 52 OR _rowoffset = 49",
+            &[49, 50, 51, 52],
+        )
+        .await;
+
+        check("_rowid IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
+        check("_rowaddr IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
+        check("_rowoffset IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
+
+        // Taking _rowid / _rowaddr of deleted row
+
+        // When using rowid / rowaddr we get an empty
+        check(&format!("_rowid = {}", row_ids.value(190)), &[]).await;
+        check(&format!("_rowaddr = {}", row_addrs.value(190)), &[]).await;
+        // When using rowoffset it just skips the deleted rows (impossible to create an offset
+        // into a deleted row)
+        check("_rowoffset = 190", &[210]).await;
+
+        // Grabbing after the deleted rows
+        check(&format!("_rowid = {}", row_ids.value(250)), &[250]).await;
+        check(&format!("_rowaddr = {}", row_addrs.value(250)), &[250]).await;
+        check("_rowoffset = 250", &[270]).await;
+
+        // Grabbing past the end
+        check("_rowoffset = 1000", &[]).await;
+
+        // Combine take and filter
+        check("_rowid IN (5, 10, 15) AND idx > 10", &[15]).await;
+        check("_rowaddr IN (5, 10, 15) AND idx > 10", &[15]).await;
+        check("_rowoffset IN (5, 10, 15) AND idx > 10", &[15]).await;
+        check("idx > 10 AND _rowid IN (5, 10, 15)", &[15]).await;
+        check("idx > 10 AND _rowaddr IN (5, 10, 15)", &[15]).await;
+        check("idx > 10 AND _rowoffset IN (5, 10, 15)", &[15]).await;
+        // Get's simplified into _rowid = 50 and so we catch it
+        check("_rowid = 50 AND _rowid = 50", &[50]).await;
+
+        // Filters that cannot be converted into a take
+        check_no_opt("_rowid = 50 AND _rowid = 51", &[]).await;
+        check_no_opt("(_rowid = 50 AND idx < 100) OR _rowid = 51", &[50, 51]).await;
+
+        // Dynamic projection
+        let mut scanner = ds.scan();
+        scanner.filter("_rowoffset = 77").unwrap();
+        scanner
+            .project_with_transform(&[("foo", "idx * 2")])
+            .unwrap();
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches[0].schema().field(0).name(), "foo");
+        let val = batches[0].column(0).as_primitive::<Int32Type>().values()[0];
+        assert_eq!(val, 154);
     }
 }

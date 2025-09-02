@@ -14,7 +14,7 @@ use futures::{FutureExt, TryStreamExt};
 use lance::{io::ObjectStore, Dataset};
 use lance_core::{cache::LanceCache, Result};
 use lance_datafusion::utils::reader_to_stream;
-use lance_datagen::{array, gen, BatchCount, RowCount};
+use lance_datagen::{array, gen_batch, BatchCount, RowCount};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
@@ -36,7 +36,7 @@ struct BenchmarkDataSource {}
 
 impl BenchmarkDataSource {
     fn test_data() -> impl RecordBatchReader {
-        gen()
+        gen_batch()
             .col("values", array::step::<UInt32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(100 * 1024))
@@ -53,6 +53,13 @@ impl TrainingSource for BenchmarkDataSource {
     }
 
     async fn scan_unordered_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        Ok(reader_to_stream(Box::new(Self::test_data())))
+    }
+
+    async fn scan_aligned_chunks(
         self: Box<Self>,
         _chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {

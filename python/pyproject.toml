@@ -55,14 +55,17 @@ tests = [
     "pandas",
     "polars[pyarrow,pandas]",
     "pytest",
-    "tensorflow",
+    # Workardound for https://github.com/lancedb/lance/issues/4472
+    #
+    # tensorflow is broken on 2.20.0 with macOS ARM.
+    "tensorflow<=2.19.0",
     "tqdm",
-    "datafusion",
+    # Need to align with the datafusion version we use at lance rust
+    "datafusion==48.0.0",
 ]
 dev = ["maturin", "ruff==0.11.2", "pyright"]  # Updated to match dependency-groups
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
-ray = ["ray[data]<2.38; python_version<'3.12'"]
 
 [dependency-groups]
 # Core test dependencies
@@ -139,6 +142,7 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
+    "recurring: marks tests as recurring tests",
 ]
 filterwarnings = [
     'error::FutureWarning',

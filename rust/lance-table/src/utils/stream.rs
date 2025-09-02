@@ -124,10 +124,9 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     // and thus not deleted.
     let mask_buffer = NullBuffer::new(mask.values().clone());
 
-    match mask_buffer.null_count() {
+    if mask_buffer.null_count() == 0 {
         // No rows are deleted
-        0 => return Ok(batch),
-        _ => {}
+        return Ok(batch);
     }
 
     // For each column convert to data
@@ -348,13 +347,13 @@ mod tests {
     #[tokio::test]
     async fn test_basic_zip() {
         let left = batch_task_stream(
-            lance_datagen::gen()
+            lance_datagen::gen_batch()
                 .col("x", lance_datagen::array::step::<Int32Type>())
                 .into_reader_stream(RowCount::from(100), BatchCount::from(10))
                 .0,
         );
         let right = batch_task_stream(
-            lance_datagen::gen()
+            lance_datagen::gen_batch()
                 .col("y", lance_datagen::array::step::<Int32Type>())
                 .into_reader_stream(RowCount::from(100), BatchCount::from(10))
                 .0,
@@ -367,7 +366,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = lance_datagen::gen()
+        let expected = lance_datagen::gen_batch()
             .col("x", lance_datagen::array::step::<Int32Type>())
             .col("y", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(10))
@@ -382,7 +381,7 @@ mod tests {
         for has_columns in [false, true] {
             for fragment_id in [0, 10] {
                 // 100 rows across 10 batches of 10 rows
-                let mut datagen = lance_datagen::gen();
+                let mut datagen = lance_datagen::gen_batch();
                 if has_columns {
                     datagen = datagen.col("x", lance_datagen::array::rand::<Int32Type>());
                 }
@@ -476,7 +475,7 @@ mod tests {
                                 continue;
                             }
 
-                            let mut datagen = lance_datagen::gen();
+                            let mut datagen = lance_datagen::gen_batch();
                             if has_columns {
                                 datagen =
                                     datagen.col("x", lance_datagen::array::rand::<Int32Type>());

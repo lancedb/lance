@@ -63,6 +63,23 @@ impl RowIdMask {
         }
     }
 
+    // If there is both a block list and an allow list then collapse into just an allow list
+    pub fn normalize(self) -> Self {
+        if let Self {
+            allow_list: Some(mut allow_list),
+            block_list: Some(block_list),
+        } = self
+        {
+            allow_list -= &block_list;
+            Self {
+                allow_list: Some(allow_list),
+                block_list: None,
+            }
+        } else {
+            self
+        }
+    }
+
     /// True if the row_id is selected by the mask, false otherwise
     pub fn selected(&self, row_id: u64) -> bool {
         match (&self.allow_list, &self.block_list) {
@@ -301,13 +318,34 @@ impl std::ops::BitOr for RowIdMask {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
-        let block_list = match (self.block_list, rhs.block_list) {
-            (None, None) => None,
-            (Some(lhs), None) => Some(lhs),
-            (None, Some(rhs)) => Some(rhs),
-            (Some(lhs), Some(rhs)) => Some(lhs & rhs),
+        let this = self.normalize();
+        let rhs = rhs.normalize();
+        let block_list = if let Some(mut self_block_list) = this.block_list {
+            match (&rhs.allow_list, rhs.block_list) {
+                // If RHS is allow all, then our block list disappears
+                (None, None) => None,
+                // If RHS is allow list, remove allowed from our block list
+                (Some(allow_list), None) => {
+                    self_block_list -= allow_list;
+                    Some(self_block_list)
+                }
+                // If RHS is block list, intersect
+                (None, Some(block_list)) => Some(self_block_list & block_list),
+                // We normalized to avoid this path
+                (Some(_), Some(_)) => unreachable!(),
+            }
+        } else if let Some(mut rhs_block_list) = rhs.block_list {
+            if let Some(allow_list) = &this.allow_list {
+                rhs_block_list -= allow_list;
+                Some(rhs_block_list)
+            } else {
+                Some(rhs_block_list)
+            }
+        } else {
+            None
         };
-        let allow_list = match (self.allow_list, rhs.allow_list) {
+
+        let allow_list = match (this.allow_list, rhs.allow_list) {
             (None, None) => None,
             // Remember that an allow list of None means "all rows" and
             // so "all rows" | "some rows" is always "all rows"
@@ -745,6 +783,15 @@ impl std::ops::BitAndAssign<&Self> for RowIdTreeMap {
     }
 }
 
+impl std::ops::Sub<Self> for RowIdTreeMap {
+    type Output = Self;
+
+    fn sub(mut self, rhs: Self) -> Self {
+        self -= &rhs;
+        self
+    }
+}
+
 impl std::ops::SubAssign<&Self> for RowIdTreeMap {
     fn sub_assign(&mut self, rhs: &Self) {
         for (fragment, rhs_set) in &rhs.inner {
@@ -913,6 +960,52 @@ mod tests {
         let allow_list = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[3]));
         let combined = block_list | allow_list;
         assert!(combined.selected(1));
+    }
+
+    #[test]
+    fn test_logical_or() {
+        let allow1 = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[5, 6, 7, 8, 9]));
+        let block1 = RowIdMask::from_block(RowIdTreeMap::from_iter(&[5, 6]));
+        let mixed1 = allow1
+            .clone()
+            .also_block(block1.block_list.as_ref().unwrap().clone());
+        let allow2 = RowIdMask::from_allowed(RowIdTreeMap::from_iter(&[2, 3, 4, 5, 6, 7, 8]));
+        let block2 = RowIdMask::from_block(RowIdTreeMap::from_iter(&[4, 5]));
+        let mixed2 = allow2
+            .clone()
+            .also_block(block2.block_list.as_ref().unwrap().clone());
+
+        fn check(lhs: &RowIdMask, rhs: &RowIdMask, expected: &[u64]) {
+            for mask in [lhs.clone() | rhs.clone(), rhs.clone() | lhs.clone()] {
+                let values = (0..10)
+                    .filter(|val| mask.selected(*val))
+                    .collect::<Vec<_>>();
+                assert_eq!(&values, expected);
+            }
+        }
+
+        check(&allow1, &allow1, &[5, 6, 7, 8, 9]);
+        check(&block1, &block1, &[0, 1, 2, 3, 4, 7, 8, 9]);
+        check(&mixed1, &mixed1, &[7, 8, 9]);
+        check(&allow2, &allow2, &[2, 3, 4, 5, 6, 7, 8]);
+        check(&block2, &block2, &[0, 1, 2, 3, 6, 7, 8, 9]);
+        check(&mixed2, &mixed2, &[2, 3, 6, 7, 8]);
+
+        check(&allow1, &block1, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        check(&allow1, &mixed1, &[5, 6, 7, 8, 9]);
+        check(&allow1, &allow2, &[2, 3, 4, 5, 6, 7, 8, 9]);
+        check(&allow1, &block2, &[0, 1, 2, 3, 5, 6, 7, 8, 9]);
+        check(&allow1, &mixed2, &[2, 3, 5, 6, 7, 8, 9]);
+        check(&block1, &mixed1, &[0, 1, 2, 3, 4, 7, 8, 9]);
+        check(&block1, &allow2, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        check(&block1, &block2, &[0, 1, 2, 3, 4, 6, 7, 8, 9]);
+        check(&block1, &mixed2, &[0, 1, 2, 3, 4, 6, 7, 8, 9]);
+        check(&mixed1, &allow2, &[2, 3, 4, 5, 6, 7, 8, 9]);
+        check(&mixed1, &block2, &[0, 1, 2, 3, 6, 7, 8, 9]);
+        check(&mixed1, &mixed2, &[2, 3, 6, 7, 8, 9]);
+        check(&allow2, &block2, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        check(&allow2, &mixed2, &[2, 3, 4, 5, 6, 7, 8]);
+        check(&block2, &mixed2, &[0, 1, 2, 3, 6, 7, 8, 9]);
     }
 
     #[test]

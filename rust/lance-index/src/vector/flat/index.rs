@@ -4,14 +4,13 @@
 //! Flat Vector Index.
 //!
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
-use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
@@ -22,7 +21,7 @@ use crate::{
     metrics::MetricsCollector,
     prefilter::PreFilter,
     vector::{
-        graph::{OrderedFloat, OrderedNode},
+        graph::OrderedNode,
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
         storage::{DistCalculator, VectorStore},
         v3::subindex::IvfSubIndex,
@@ -88,48 +87,85 @@ impl IvfSubIndex for FlatIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
+        let row_ids = storage.row_ids();
         let dist_calc = storage.dist_calculator(query);
+        let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
 
-        let res = match prefilter.is_empty() {
+        match prefilter.is_empty() {
             true => {
-                let iter = dist_calc
-                    .distance_all(k)
-                    .into_iter()
-                    .zip(0..storage.len() as u32)
-                    .map(|(dist, id)| OrderedNode::new(id, dist.into()));
+                let dists = dist_calc.distance_all(k);
+
                 if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
-                    iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
-                        .sorted_unstable()
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+
+                    for (&row_id, dist) in row_ids.zip(dists) {
+                        let dist = dist.into();
+                        if dist < lower_bound || dist >= upper_bound {
+                            continue;
+                        }
+                        if res.len() < k {
+                            res.push(OrderedNode::new(row_id, dist));
+                        } else if res.peek().unwrap().dist > dist {
+                            res.pop();
+                            res.push(OrderedNode::new(row_id, dist));
+                        }
+                    }
                 } else {
-                    iter.sorted_unstable()
+                    for (&row_id, dist) in row_ids.zip(dists) {
+                        let dist = dist.into();
+                        if res.len() < k {
+                            res.push(OrderedNode::new(row_id, dist));
+                        } else if res.peek().unwrap().dist > dist {
+                            res.pop();
+                            res.push(OrderedNode::new(row_id, dist));
+                        }
+                    }
                 }
             }
             false => {
                 let row_id_mask = prefilter.mask();
-                let iter = (0..storage.len())
-                    .filter(|&id| row_id_mask.selected(storage.row_id(id as u32)))
-                    .map(|id| OrderedNode {
-                        id: id as u32,
-                        dist: OrderedFloat(dist_calc.distance(id as u32)),
-                    });
                 if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
-                    iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
-                        .sorted_unstable()
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+                    for (id, &row_id) in row_ids.enumerate() {
+                        if !row_id_mask.selected(row_id) {
+                            continue;
+                        }
+                        let dist = dist_calc.distance(id as u32).into();
+                        if dist < lower_bound || dist >= upper_bound {
+                            continue;
+                        }
+
+                        if res.len() < k {
+                            res.push(OrderedNode::new(row_id, dist));
+                        } else if res.peek().unwrap().dist > dist {
+                            res.pop();
+                            res.push(OrderedNode::new(row_id, dist));
+                        }
+                    }
                 } else {
-                    iter.sorted_unstable()
+                    for (id, &row_id) in row_ids.enumerate() {
+                        if !row_id_mask.selected(row_id) {
+                            continue;
+                        }
+
+                        let dist = dist_calc.distance(id as u32).into();
+                        if res.len() < k {
+                            res.push(OrderedNode::new(row_id, dist));
+                        } else if res.peek().unwrap().dist > dist {
+                            res.pop();
+                            res.push(OrderedNode::new(row_id, dist));
+                        }
+                    }
                 }
             }
         };
 
-        let (row_ids, dists): (Vec<_>, Vec<_>) = res
-            .take(k)
-            .map(|r| (storage.row_id(r.id), r.dist.0))
-            .unzip();
+        // we don't need to sort the results by distances here
+        // because there's a SortExec node in the query plan which sorts the results from all partitions
+        let (row_ids, dists): (Vec<_>, Vec<_>) = res.into_iter().map(|r| (r.id, r.dist.0)).unzip();
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
         Ok(RecordBatch::try_new(

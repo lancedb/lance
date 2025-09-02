@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
-
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
@@ -11,6 +9,8 @@ use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
+use std::collections::HashMap;
+use std::{ops::Range, sync::Arc};
 use tracing::instrument;
 
 use lance_core::{datatypes::Schema, Error, Result};
@@ -227,6 +227,7 @@ impl ManifestProvider for ManifestDescribing {
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
             /*blob_dataset_version= */ None,
+            HashMap::new(),
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
@@ -242,7 +243,7 @@ mod test {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::{reader::FileReader, writer::FileWriter};
-    use rand::{distributions::Alphanumeric, Rng};
+    use rand::{distr::Alphanumeric, Rng};
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -254,13 +255,13 @@ mod test {
         let mut writer = store.create(&path).await.unwrap();
 
         // Write prefix we should ignore
-        let prefix: Vec<u8> = rand::thread_rng()
+        let prefix: Vec<u8> = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(prefix_size)
             .collect();
         writer.write_all(&prefix).await.unwrap();
 
-        let long_name: String = rand::thread_rng()
+        let long_name: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(manifest_min_size)
             .map(char::from)
@@ -278,6 +279,7 @@ mod test {
             Arc::new(vec![]),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            HashMap::new(),
         );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
@@ -323,9 +325,11 @@ mod test {
         .unwrap();
 
         let array = Int32Array::from_iter_values(0..10);
-        let batch =
-            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         let mut metadata = HashMap::new();
         metadata.insert(String::from("lance:extra"), String::from("for_test"));
         file_writer.finish_with_metadata(&metadata).await.unwrap();

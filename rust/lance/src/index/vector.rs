@@ -36,7 +36,9 @@ use lance_index::vector::{
     sq::{builder::SQBuildParams, ScalarQuantizer},
     VectorIndex,
 };
-use lance_index::{IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{
+    DatasetIndexExt, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -487,6 +489,28 @@ pub(crate) async fn build_vector_index(
     Ok(())
 }
 
+/// Build an empty vector index without training on data
+#[instrument(level = "debug", skip_all)]
+pub(crate) async fn build_empty_vector_index(
+    _dataset: &Dataset,
+    column: &str,
+    name: &str,
+    _uuid: &str,
+    _params: &VectorIndexParams,
+) -> Result<()> {
+    // For now, return a NotImplementedError to indicate this functionality
+    // is still being developed
+    Err(Error::NotSupported {
+        source: format!(
+            "Creating empty vector indices with train=False is not yet implemented. \
+            Index '{}' for column '{}' cannot be created without training.",
+            name, column
+        )
+        .into(),
+        location: location!(),
+    })
+}
+
 #[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
 pub(crate) async fn remap_vector_index(
     dataset: Arc<Dataset>,
@@ -630,13 +654,19 @@ pub(crate) async fn open_vector_index_v2(
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
     let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
+    // Load the index metadata to get the correct index directory
+    let index_meta = dataset
+        .load_index(uuid)
+        .await?
+        .ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+    let index_dir = dataset.indice_files_dir(&index_meta)?;
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
-            let aux_path = dataset
-                .indices_dir()
-                .child(uuid)
-                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
@@ -663,10 +693,7 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
-            let aux_path = dataset
-                .indices_dir()
-                .child(uuid)
-                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;

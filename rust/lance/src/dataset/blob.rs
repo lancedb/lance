@@ -59,8 +59,8 @@ impl BlobFile {
     ) -> Self {
         let frag_id = RowAddress::from(row_addr).fragment_id();
         let frag = dataset.get_fragment(frag_id as usize).unwrap();
-        let data_file = frag.data_file_for_field(field_id).unwrap().path.clone();
-        let data_file = dataset.data_dir().child(data_file);
+        let data_file = frag.data_file_for_field(field_id).unwrap();
+        let data_file = dataset.data_dir().child(data_file.path.as_str());
         Self {
             dataset,
             data_file,
@@ -311,7 +311,7 @@ mod tests {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
-            let data = lance_datagen::gen()
+            let data = lance_datagen::gen_batch()
                 .col("filterme", array::step::<UInt64Type>())
                 .col("blobs", array::blob())
                 .into_reader_rows(RowCount::from(10), BatchCount::from(10))

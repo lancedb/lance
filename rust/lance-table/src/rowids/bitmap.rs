@@ -56,7 +56,7 @@ impl Bitmap {
         self.len
     }
 
-    pub fn slice(&self, start: usize, len: usize) -> BitmapSlice {
+    pub fn slice(&self, start: usize, len: usize) -> BitmapSlice<'_> {
         BitmapSlice {
             bitmap: self,
             start,

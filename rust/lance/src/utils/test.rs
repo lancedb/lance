@@ -84,7 +84,7 @@ impl TestDatasetGenerator {
     ///    consistent across fragments.
     ///
     pub async fn make_hostile(&self, uri: &str) -> Dataset {
-        let seed = self.seed.unwrap_or_else(|| rand::thread_rng().gen());
+        let seed = self.seed.unwrap_or_else(|| rand::rng().random());
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
         let schema = self.make_schema(&mut rng);
 
@@ -147,7 +147,7 @@ impl TestDatasetGenerator {
         let mut new_ids = field_ids.clone();
         // Add a hole
         if new_ids.len() > 2 {
-            let hole_pos = rng.gen_range(1..new_ids.len() - 1);
+            let hole_pos = rng.random_range(1..new_ids.len() - 1);
             for id in new_ids.iter_mut().skip(hole_pos) {
                 *id += 1;
             }
@@ -180,7 +180,7 @@ impl TestDatasetGenerator {
         let num_files = if batch.num_columns() == 1 {
             1
         } else {
-            rng.gen_range(min_num_files..=batch.num_columns())
+            rng.random_range(min_num_files..=batch.num_columns())
         };
 
         // Randomly assign top level fields to files.
@@ -325,7 +325,11 @@ impl StatsHolder {
 }
 
 impl WrappingObjectStore for StatsHolder {
-    fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+    fn wrap(
+        &self,
+        target: Arc<dyn ObjectStore>,
+        _storage_options: Option<&std::collections::HashMap<String, String>>,
+    ) -> Arc<dyn ObjectStore> {
         Arc::new(IoTrackingStore {
             target,
             stats: self.0.clone(),
@@ -701,7 +705,7 @@ impl NoContextTestFixture {
         runtime.block_on(async move {
             let tempdir = tempdir().unwrap();
             let tmppath = tempdir.path().to_str().unwrap();
-            let dataset = lance_datagen::gen()
+            let dataset = lance_datagen::gen_batch()
                 .col(
                     "text",
                     lance_datagen::array::rand_utf8(ByteCount::from(10), false),
@@ -863,7 +867,7 @@ mod tests {
         let data = vec![RecordBatch::new_empty(arrow_schema.clone())];
 
         let generator = TestDatasetGenerator::new(data, data_storage_version);
-        let schema = generator.make_schema(&mut rand::thread_rng());
+        let schema = generator.make_schema(&mut rand::rng());
 
         let roundtripped_schema = ArrowSchema::from(&schema);
         assert_eq!(&roundtripped_schema, arrow_schema.as_ref());
@@ -920,7 +924,7 @@ mod tests {
         .unwrap();
 
         let generator = TestDatasetGenerator::new(vec![data.clone()], data_storage_version);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 1..50 {
             let schema = generator.make_schema(&mut rng);
             let fragment = generator

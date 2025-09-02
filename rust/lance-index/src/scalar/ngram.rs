@@ -465,8 +465,8 @@ impl ScalarIndex for NGramIndex {
         }
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
-        false
+    fn can_remap(&self) -> bool {
+        true
     }
 
     async fn load(
@@ -989,9 +989,9 @@ impl NGramIndexBuilder {
             NGramIndexSpillState { tokens, bitmaps }
         };
 
-        if left_token.is_some() {
+        if let Some(left_token) = left_token {
             *left_opt = Some(collect_remaining(
-                left_token.unwrap(),
+                left_token,
                 left_tokens,
                 left_bitmap.unwrap(),
                 left_bitmaps,
@@ -999,9 +999,9 @@ impl NGramIndexBuilder {
         } else {
             *left_opt = None;
         }
-        if right_token.is_some() {
+        if let Some(right_token) = right_token {
             *right_opt = Some(collect_remaining(
-                right_token.unwrap(),
+                right_token,
                 right_tokens,
                 right_bitmap.unwrap(),
                 right_bitmaps,
@@ -1604,7 +1604,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_ngram_index_with_spill() {
-        let (data, schema) = lance_datagen::gen()
+        let (data, schema) = lance_datagen::gen_batch()
             .col(
                 "values",
                 lance_datagen::array::rand_utf8(ByteCount::from(50), false),

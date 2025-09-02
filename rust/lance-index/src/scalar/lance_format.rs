@@ -10,6 +10,7 @@ use std::{any::Any, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
@@ -331,19 +332,9 @@ pub mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::utils::mask::RowIdTreeMap;
-    use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
+    use lance_core::ROW_ADDR;
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
-
-    fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path: &Path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
-                .now_or_never()
-                .unwrap()
-                .unwrap();
-        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
-        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
-    }
 
     pub struct MockTrainingSource {
         data: SendableRecordBatchStream,
@@ -378,6 +369,62 @@ pub mod tests {
         ) -> Result<SendableRecordBatchStream> {
             Ok(self.data)
         }
+
+        async fn scan_aligned_chunks(
+            self: Box<Self>,
+            _chunk_size: u32,
+        ) -> Result<SendableRecordBatchStream> {
+            // Implement similar functionality to TrainingRequest's scan_aligned_chunks
+            // Add _rowaddr column to the data with proper fragment_id and local_offset
+
+            let schema = self.data.schema();
+            let mut new_fields = schema.fields().to_vec();
+            new_fields.push(Arc::new(Field::new(ROW_ADDR, DataType::UInt64, false)));
+
+            let new_schema = Arc::new(Schema::new(new_fields));
+            let schema_for_stream = new_schema.clone();
+
+            // Create a stream that adds proper _rowaddr values
+            // For MockTrainingSource, we'll treat each batch as a separate fragment
+            let mut fragment_id = 0;
+            let data_with_rowaddr = self.data.map_ok(move |batch| {
+                let num_rows = batch.num_rows();
+                let current_fragment_id = fragment_id;
+
+                // Calculate _rowaddr as (fragment_id << 32) | local_offset
+                let rowaddrs = UInt64Array::from_iter_values((0..num_rows).map(|local_offset| {
+                    let fragment_id_u64 = current_fragment_id as u64;
+                    let local_offset_u64 = local_offset as u64;
+                    (fragment_id_u64 << 32) | local_offset_u64
+                }));
+
+                let mut new_columns = batch.columns().to_vec();
+                new_columns.push(Arc::new(rowaddrs));
+
+                // Increment fragment_id for the next batch
+                fragment_id += 1;
+
+                RecordBatch::try_new(schema_for_stream.clone(), new_columns).unwrap()
+            });
+
+            Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    new_schema,
+                    data_with_rowaddr,
+                ),
+            ))
+        }
+    }
+
+    fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
+        let test_path: &Path = tempdir.path();
+        let (object_store, test_path) =
+            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
     async fn train_index(
@@ -404,7 +451,7 @@ pub mod tests {
     async fn test_basic_btree() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -463,7 +510,7 @@ pub mod tests {
     async fn test_btree_update() {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -472,7 +519,7 @@ pub mod tests {
             .await
             .unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step_custom::<Int32Type>(4096 * 100, 1))
             .col("row_ids", array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -530,22 +577,22 @@ pub mod tests {
     async fn test_btree_with_gaps() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch_one = gen()
+        let batch_one = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
-        let batch_two = gen()
+        let batch_two = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
-        let batch_three = gen()
+        let batch_three = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
             .col(
                 "row_ids",
                 array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
             )
             .into_batch_rows(RowCount::from(4));
-        let batch_four = gen()
+        let batch_four = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
             .col(
                 "row_ids",
@@ -758,7 +805,7 @@ pub mod tests {
         ] {
             let tempdir = tempdir().unwrap();
             let index_store = test_store(&tempdir);
-            let data: RecordBatch = gen()
+            let data: RecordBatch = gen_batch()
                 .col("values", array::rand_type(data_type))
                 .col("row_ids", array::step::<UInt64Type>())
                 .into_batch_rows(RowCount::from(4096 * 3))
@@ -821,7 +868,7 @@ pub mod tests {
     async fn btree_entire_null_page() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch = gen()
+        let batch = gen_batch()
             .col(
                 "values",
                 array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
@@ -956,7 +1003,7 @@ pub mod tests {
     async fn test_basic_bitmap() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
@@ -1020,22 +1067,22 @@ pub mod tests {
     async fn test_bitmap_with_gaps() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch_one = gen()
+        let batch_one = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
-        let batch_two = gen()
+        let batch_two = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![10, 11, 11, 15]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
-        let batch_three = gen()
+        let batch_three = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 15, 15, 15]))
             .col(
                 "row_ids",
                 array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
             )
             .into_batch_rows(RowCount::from(4));
-        let batch_four = gen()
+        let batch_four = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![15, 16, 20, 20]))
             .col(
                 "row_ids",
@@ -1232,7 +1279,7 @@ pub mod tests {
     async fn test_bitmap_update() {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
@@ -1241,7 +1288,7 @@ pub mod tests {
             .await
             .unwrap();
 
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step_custom::<Int32Type>(4096, 1))
             .col("row_ids", array::step_custom::<UInt64Type>(4096, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
@@ -1277,7 +1324,7 @@ pub mod tests {
     async fn test_bitmap_remap() {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
-        let data = gen()
+        let data = gen_batch()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
@@ -1355,7 +1402,7 @@ pub mod tests {
     async fn test_label_list_index() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "values",
                 array::rand_type(&DataType::List(Arc::new(Field::new(
@@ -1415,14 +1462,14 @@ pub mod tests {
         // Simple check for 1 value (doesn't matter intersection vs union)
         check(
             LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]),
-            Box::new(|vals| vals.iter().any(|val| *val == 1)),
-            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
         )
         .await;
         check(
             LabelListQuery::HasAllLabels(vec![ScalarValue::UInt8(Some(1))]),
-            Box::new(|vals| vals.iter().any(|val| *val == 1)),
-            Box::new(|vals| vals.iter().all(|val| *val != 1)),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
         )
         .await;
         // Set intersection
@@ -1432,9 +1479,9 @@ pub mod tests {
                 ScalarValue::UInt8(Some(2)),
             ]),
             // Match must have 1 and 2
-            Box::new(|vals| vals.iter().any(|val| *val == 1) && vals.iter().any(|val| *val == 2)),
+            Box::new(|vals| vals.contains(&1) && vals.contains(&2)),
             // No-match must either not have 1 or not have 2
-            Box::new(|vals| vals.iter().all(|val| *val != 1) || vals.iter().all(|val| *val != 2)),
+            Box::new(|vals| !vals.contains(&1) || !vals.contains(&2)),
         )
         .await;
         // Set union
@@ -1444,9 +1491,9 @@ pub mod tests {
                 ScalarValue::UInt8(Some(2)),
             ]),
             // Match either have 1 or have 2
-            Box::new(|vals| vals.iter().any(|val| *val == 1) || vals.iter().any(|val| *val == 2)),
+            Box::new(|vals| vals.contains(&1) || vals.contains(&2)),
             // No-match must not have 1 and not have 2
-            Box::new(|vals| vals.iter().all(|val| *val != 1) && vals.iter().all(|val| *val != 2)),
+            Box::new(|vals| !vals.contains(&1) && !vals.contains(&2)),
         )
         .await;
     }

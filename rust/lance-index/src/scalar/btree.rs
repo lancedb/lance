@@ -15,6 +15,7 @@ use super::{
     SargableQuery, ScalarIndex, SearchResult,
 };
 use crate::frag_reuse::FragReuseIndex;
+use crate::metrics::NoOpMetricsCollector;
 use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
@@ -782,19 +783,33 @@ impl BTreeIndex {
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.index_cache.get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
-            metrics.record_part_load();
-            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
-            let index_reader = index_reader.get().await?;
-            let mut serialized_page = index_reader
-                .read_record_batch(page_number as u64, self.batch_size)
-                .await?;
-            if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-                serialized_page = frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
-            }
-            let result = self.sub_index.load_subindex(serialized_page).await?;
-            Ok(CachedScalarIndex::new(result))
-        }).await.map(|v| v.as_ref().clone().into_inner())
+        self.index_cache
+            .get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
+                let result = self.read_page(page_number, index_reader, metrics).await?;
+                Ok(CachedScalarIndex::new(result))
+            })
+            .await
+            .map(|v| v.as_ref().clone().into_inner())
+    }
+
+    async fn read_page(
+        &self,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        metrics.record_part_load();
+        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
+        let index_reader = index_reader.get().await?;
+        let mut serialized_page = index_reader
+            .read_record_batch(page_number as u64, self.batch_size)
+            .await?;
+        if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+            serialized_page =
+                frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+        }
+        let result = self.sub_index.load_subindex(serialized_page).await?;
+        Ok(result)
     }
 
     async fn search_page(
@@ -807,7 +822,7 @@ impl BTreeIndex {
         let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
+        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
         // to search for X IN [5, 3]
         match subindex.search(query, metrics).await? {
             SearchResult::Exact(map) => Ok(map),
@@ -951,36 +966,35 @@ impl Index for BTreeIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let reader = LazyIndexReader::new(self.store.clone());
-        let reader = reader.get().await?;
+        let index_reader = LazyIndexReader::new(self.store.clone());
+        let reader = index_reader.get().await?;
         let num_rows = reader.num_rows();
-        let all_pages = reader.read_range(0..reader.num_rows(), None).await?;
-
         let batch_size = self.batch_size as usize;
         let num_pages = num_rows.div_ceil(batch_size);
         let mut pages = stream::iter(0..num_pages)
             .map(|page_idx| {
-                let sub_index = self.sub_index.clone();
-                let offset = page_idx * batch_size;
-                let end = std::cmp::min(num_rows, (page_idx + 1) * batch_size);
-                let page = all_pages.slice(offset, end - offset);
+                let index_reader = index_reader.clone();
+                let page_idx = page_idx as u32;
                 async move {
-                    let sub_idx = sub_index.load_subindex(page).await?;
-                    Result::Ok((page_idx as u32, sub_idx))
+                    let page = self
+                        .read_page(page_idx, index_reader, &NoOpMetricsCollector)
+                        .await?;
+                    Result::Ok((page_idx, page))
                 }
             })
             .buffer_unordered(get_num_compute_intensive_cpus());
 
-        while let Some((page_idx, sub_idx)) = pages.try_next().await? {
+        while let Some((page_idx, page)) = pages.try_next().await? {
             self.index_cache
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
                     },
-                    Arc::new(CachedScalarIndex::new(sub_idx)),
+                    Arc::new(CachedScalarIndex::new(page)),
                 )
                 .await;
         }
+
         Ok(())
     }
 
@@ -1065,7 +1079,7 @@ impl ScalarIndex for BTreeIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
     }
 
@@ -1274,6 +1288,19 @@ pub trait TrainingSource: Send {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream>;
+
+    /// Returns a stream of batches, ordered by the row_address (in ascending order)
+    ///
+    /// Each batch should have chunk_size rows
+    ///
+    /// The schema for the batch is slightly flexible.
+    /// The first column may have any name or type, these are the values to index
+    /// The second column must be the fragment id which must be UInt32Type
+    /// The third column must be the row address which must be UInt64Type
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
@@ -1388,6 +1415,14 @@ impl TrainingSource for BTreeUpdater {
         // BTree indices will never use unordered scans
         unimplemented!()
     }
+
+    async fn scan_aligned_chunks(
+        self: Box<Self>,
+        _chunk_size: u32,
+    ) -> Result<SendableRecordBatchStream> {
+        // BTree indices will never use aligned scans
+        unimplemented!()
+    }
 }
 
 /// A stream that reads the original training data back out of the index
@@ -1455,7 +1490,7 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
-    use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use tempfile::tempdir;
@@ -1499,7 +1534,7 @@ mod tests {
         ));
 
         // Generate 50,000 rows of random data with 80% nulls
-        let stream = gen()
+        let stream = gen_batch()
             .col(
                 "value",
                 array::rand::<Float32Type>().with_nulls(&[true, false, false, false, false]),
@@ -1582,7 +1617,7 @@ mod tests {
         // This is a bit overkill but we've had bugs in the past where DF's sort
         // didn't agree with Arrow's sort so we do an end-to-end test here
         // and use DF to sort the data like we would in a real dataset.
-        let data = gen()
+        let data = gen_batch()
             .col("value", array::cycle::<Float64Type>(values.clone()))
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(10), BatchCount::from(100));
@@ -1625,7 +1660,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let data = gen()
+        let data = gen_batch()
             .col("value", array::step::<Float32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(1000), BatchCount::from(10));

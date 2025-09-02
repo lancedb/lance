@@ -36,9 +36,11 @@ pub mod inverted;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;
+pub mod zonemap;
 
 use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
+use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
@@ -48,6 +50,7 @@ pub enum ScalarIndexType {
     Bitmap,
     LabelList,
     NGram,
+    ZoneMap,
     Inverted,
 }
 
@@ -60,6 +63,7 @@ impl TryFrom<IndexType> for ScalarIndexType {
             IndexType::Bitmap => Ok(Self::Bitmap),
             IndexType::LabelList => Ok(Self::LabelList),
             IndexType::NGram => Ok(Self::NGram),
+            IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
             _ => Err(Error::InvalidInput {
                 source: format!("Index type {:?} is not a scalar index", value).into(),
@@ -76,6 +80,7 @@ impl From<ScalarIndexType> for IndexType {
             ScalarIndexType::Bitmap => Self::Bitmap,
             ScalarIndexType::LabelList => Self::LabelList,
             ScalarIndexType::NGram => Self::NGram,
+            ScalarIndexType::ZoneMap => Self::ZoneMap,
             ScalarIndexType::Inverted => Self::Inverted,
         }
     }
@@ -107,6 +112,7 @@ impl IndexParams for ScalarIndexParams {
             Some(ScalarIndexType::LabelList) => IndexType::LabelList,
             Some(ScalarIndexType::Inverted) => IndexType::Inverted,
             Some(ScalarIndexType::NGram) => IndexType::NGram,
+            Some(ScalarIndexType::ZoneMap) => IndexType::ZoneMap,
         }
     }
 
@@ -214,10 +220,6 @@ pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     fn to_expr(&self, col: String) -> Expr;
     /// Compare this query to another query
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool;
-    /// If true, the query results are inexact and will need rechecked
-    fn needs_recheck(&self) -> bool {
-        false
-    }
 }
 
 impl PartialEq for dyn AnyQuery {
@@ -551,9 +553,42 @@ impl AnyQuery for TextQuery {
             None => false,
         }
     }
+}
 
-    fn needs_recheck(&self) -> bool {
-        true
+/// A query that a InvertedIndex can satisfy
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenQuery {
+    /// Retrieve all row ids where the text contains all tokens parsed from given string. The tokens
+    /// are separated by punctuations and white spaces.
+    TokensContains(String),
+}
+
+impl AnyQuery for TokenQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        format!("{}", self.to_expr(col.to_string()))
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        match self {
+            Self::TokensContains(substr) => Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(CONTAINS_TOKENS_UDF.clone()),
+                args: vec![
+                    Expr::Column(Column::new_unqualified(col)),
+                    Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
+                ],
+            }),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
     }
 }
 
@@ -599,12 +634,6 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
 
-    /// Returns true if the query can be answered exactly
-    ///
-    /// If false is returned then the query still may be answered exactly but if true is returned
-    /// then the query must be answered exactly
-    fn can_answer_exact(&self, query: &dyn AnyQuery) -> bool;
-
     /// Load the scalar index from storage
     async fn load(
         store: Arc<dyn IndexStore>,
@@ -613,6 +642,9 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     ) -> Result<Arc<Self>>
     where
         Self: Sized;
+
+    /// Returns true if the remap operation is supported
+    fn can_remap(&self) -> bool;
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(

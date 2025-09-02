@@ -40,16 +40,11 @@ pub use lance_index::IndexParams;
 use lance_index::{
     is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
-    scalar::inverted::tokenizer::InvertedIndexParams,
+    ScalarIndexCriteria,
 };
 use lance_index::{optimize::OptimizeOptions, scalar::inverted::train_inverted_index};
-use lance_index::{
-    pb,
-    scalar::{ScalarIndexParams, LANCE_SCALAR_INDEX},
-    vector::VectorIndex,
-    DatasetIndexExt, Index, IndexType, INDEX_FILE_NAME,
-};
-use lance_index::{ScalarIndexCriteria, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{pb, vector::VectorIndex, Index, IndexType, INDEX_FILE_NAME};
+use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
@@ -60,10 +55,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::{
-    build_inverted_index, detect_scalar_index_type, index_matches_criteria, infer_index_type,
-    inverted_index_details, TrainingRequest,
-};
+use scalar::{detect_scalar_index_type, index_matches_criteria, infer_index_type, TrainingRequest};
 use serde_json::json;
 use snafu::location;
 use tracing::{info, instrument};
@@ -72,24 +64,24 @@ use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
 pub(crate) mod append;
+mod create;
 pub mod frag_reuse;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
 pub mod vector;
 
-use crate::dataset::index::LanceIndexStoreExt;
-pub use crate::index::prefilter::{FilterLoader, PreFilter};
-
 use self::append::merge_indices;
-use self::scalar::build_scalar_index;
-use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
+use self::vector::remap_vector_index;
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
-use crate::index::vector::remap_vector_index;
+pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{dataset::Dataset, Error, Result};
+pub use create::CreateIndexBuilder;
+use lance_index::scalar::inverted::InvertedIndex;
 
 // Cache keys for different index types
 #[derive(Debug, Clone)]
@@ -211,7 +203,7 @@ pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &HashMap<u64, Option<u64>>,
-) -> Result<Uuid> {
+) -> Result<Option<Uuid>> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
     let matched = indices
@@ -232,8 +224,8 @@ pub(crate) async fn remap_index(
     if row_id_map.values().all(|v| v.is_none()) {
         let deleted_bitmap = RoaringBitmap::from_iter(
             row_id_map
-                .iter()
-                .map(|(row_id, _)| RowAddress::new_from_u64(*row_id))
+                .keys()
+                .map(|row_id| RowAddress::new_from_u64(*row_id))
                 .map(|addr| addr.fragment_id()),
         );
         if Some(deleted_bitmap) == matched.fragment_bitmap {
@@ -241,7 +233,7 @@ pub(crate) async fn remap_index(
             // This can happen if there is a bug where the index is covering empty
             // fragment that haven't been cleaned up. They should be cleaned up
             // outside of this function.
-            return Ok(*index_id);
+            return Ok(Some(*index_id));
         }
     }
 
@@ -265,6 +257,9 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
+            if !scalar_index.can_remap() {
+                return Ok(None);
+            }
 
             match scalar_index.index_type() {
                 IndexType::Inverted => {
@@ -284,6 +279,7 @@ pub(crate) async fn remap_index(
                         let training_request = Box::new(TrainingRequest::new(
                             Arc::new(dataset.clone()),
                             field.name.clone(),
+                            true, // Legacy reindexing should always train
                         ));
                         train_inverted_index(
                             training_request,
@@ -317,7 +313,7 @@ pub(crate) async fn remap_index(
         }
     }
 
-    Ok(new_id)
+    Ok(Some(new_id))
 }
 
 #[derive(Debug)]
@@ -354,6 +350,52 @@ fn vector_index_details() -> prost_types::Any {
 
 #[async_trait]
 impl DatasetIndexExt for Dataset {
+    type IndexBuilder<'a> = CreateIndexBuilder<'a>;
+
+    /// Create a builder for creating an index on columns.
+    ///
+    /// This returns a builder that can be configured with additional options
+    /// before awaiting to execute.
+    ///
+    /// # Examples
+    ///
+    /// Create a scalar BTREE index:
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let params = ScalarIndexParams::default();
+    /// dataset
+    ///     .create_index_builder(&["id"], IndexType::BTree, &params)
+    ///     .name("id_index".to_string())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Create an empty index that will be populated later:
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::{DatasetIndexExt, IndexType, scalar::ScalarIndexParams};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let params = ScalarIndexParams::default();
+    /// dataset
+    ///     .create_index_builder(&["category"], IndexType::Bitmap, &params)
+    ///     .train(false)  // Create empty index
+    ///     .replace(true)  // Replace if exists
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn create_index_builder<'a>(
+        &'a mut self,
+        columns: &[&str],
+        index_type: IndexType,
+        params: &'a dyn IndexParams,
+    ) -> CreateIndexBuilder<'a> {
+        CreateIndexBuilder::new(self, columns, index_type, params)
+    }
+
     #[instrument(skip_all)]
     async fn create_index(
         &mut self,
@@ -363,171 +405,14 @@ impl DatasetIndexExt for Dataset {
         params: &dyn IndexParams,
         replace: bool,
     ) -> Result<()> {
-        if columns.len() != 1 {
-            return Err(Error::Index {
-                message: "Only support building index on 1 column at the moment".to_string(),
-                location: location!(),
-            });
-        }
-        let column = columns[0];
-        let Some(field) = self.schema().field(column) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
-                location: location!(),
-            });
-        };
+        // Use the builder pattern with default train=true for backward compatibility
+        let mut builder = self.create_index_builder(columns, index_type, params);
 
-        // Load indices from the disk.
-        let indices = self.load_indices().await?;
-        let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-        let index_name = name.unwrap_or(format!("{column}_idx"));
-        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
-            if idx.fields == [field.id] && !replace {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists, \
-                        please specify a different name or use replace=True"
-                    ),
-                    location: location!(),
-                });
-            };
-            if idx.fields != [field.id] {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index name '{index_name} already exists with different fields, \
-                        please specify a different name"
-                    ),
-                    location: location!(),
-                });
-            }
+        if let Some(name) = name {
+            builder = builder.name(name);
         }
 
-        let index_id = Uuid::new_v4();
-        let index_details = match (index_type, params.index_name()) {
-            (
-                IndexType::Bitmap
-                | IndexType::BTree
-                | IndexType::Inverted
-                | IndexType::NGram
-                | IndexType::LabelList,
-                LANCE_SCALAR_INDEX,
-            ) => {
-                let params = ScalarIndexParams::new(index_type.try_into()?);
-                build_scalar_index(self, column, &index_id.to_string(), &params).await?
-            }
-            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
-                // Guess the index type
-                let params = params
-                    .as_any()
-                    .downcast_ref::<ScalarIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-                build_scalar_index(self, column, &index_id.to_string(), params).await?
-            }
-            (IndexType::Inverted, _) => {
-                // Inverted index params.
-                let inverted_params = params
-                    .as_any()
-                    .downcast_ref::<InvertedIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-
-                build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
-                inverted_index_details()
-            }
-            (IndexType::Vector, LANCE_VECTOR_INDEX) => {
-                // Vector index params.
-                let vec_params = params
-                    .as_any()
-                    .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Vector index type must take a VectorIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-
-                // this is a large future so move it to heap
-                Box::pin(build_vector_index(
-                    self,
-                    column,
-                    &index_name,
-                    &index_id.to_string(),
-                    vec_params,
-                    frag_reuse_index,
-                ))
-                .await?;
-                vector_index_details()
-            }
-            // Can't use if let Some(...) here because it's not stable yet.
-            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
-            (IndexType::Vector, name)
-                if self
-                    .session
-                    .index_extensions
-                    .contains_key(&(IndexType::Vector, name.to_string())) =>
-            {
-                let ext = self
-                    .session
-                    .index_extensions
-                    .get(&(IndexType::Vector, name.to_string()))
-                    .expect("already checked")
-                    .clone()
-                    .to_vector()
-                    // this should never happen because we control the registration
-                    // if this fails, the registration logic has a bug
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?;
-
-                ext.create_index(self, column, &index_id.to_string(), params)
-                    .await?;
-                vector_index_details()
-            }
-            (IndexType::FragmentReuse, _) => {
-                return Err(Error::Index {
-                    message: "Fragment reuse index can only be created through compaction"
-                        .to_string(),
-                    location: location!(),
-                })
-            }
-            (index_type, index_name) => {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index type {index_type} with name {index_name} is not supported"
-                    ),
-                    location: location!(),
-                });
-            }
-        };
-
-        let new_idx = IndexMetadata {
-            uuid: index_id,
-            name: index_name,
-            fields: vec![field.id],
-            dataset_version: self.manifest.version,
-            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
-            index_details: Some(index_details),
-            index_version: index_type.version(),
-            created_at: Some(chrono::Utc::now()),
-        };
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices: vec![],
-            },
-            /*blobs_op= */ None,
-            None,
-        );
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+        builder.replace(replace).await
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {
@@ -644,6 +529,7 @@ impl DatasetIndexExt for Dataset {
             index_details: None,
             index_version: 0,
             created_at: Some(chrono::Utc::now()),
+            base_id: None, // New indices don't have base_id (they're not from shallow clone)
         };
 
         let transaction = Transaction::new(
@@ -697,7 +583,22 @@ impl DatasetIndexExt for Dataset {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
                     if index_matches_criteria(idx, &criteria, field, has_multiple)? {
-                        return Ok(Some(idx.clone()));
+                        let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                            bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
+                        });
+                        let is_fts_index = if let Some(_details) = &idx.index_details {
+                            use crate::index::scalar::infer_index_type;
+                            matches!(infer_index_type(idx), Some(IndexType::Inverted))
+                        } else {
+                            false
+                        };
+                        // FTS indices must always be returned even if empty, because FTS queries
+                        // require an index to exist. The query execution will handle the empty
+                        // bitmap appropriately and fall back to scanning unindexed data.
+                        // Other index types can be skipped if empty since they're optional optimizations.
+                        if non_empty || is_fts_index {
+                            return Ok(Some(idx.clone()));
+                        }
                     }
                 }
             }
@@ -743,6 +644,7 @@ impl DatasetIndexExt for Dataset {
                 index_details: last_idx.index_details.clone(),
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
+                base_id: None, // Mew merged index file locates in the cloned dataset.
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             if deltas.len() > removed_indices.len() {
@@ -1078,8 +980,12 @@ impl DatasetIndexInternalExt for Dataset {
         // scalar indices, we may start having this file with scalar indices too.  Once that happens
         // we can just read this file and look at the `implementation` or `index_type` fields to
         // determine what kind of index it is.
-        let index_dir = self.indices_dir().child(uuid);
-        let index_file = index_dir.child(INDEX_FILE_NAME);
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+        let index_dir = self.indice_files_dir(&index_meta)?;
+        let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         if self.object_store.exists(&index_file).await? {
             let index = self.open_vector_index(column, uuid, metrics).await?;
             Ok(index.as_index())
@@ -1132,8 +1038,12 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
-        let index_dir = self.indices_dir().child(uuid);
-        let index_file = index_dir.child(INDEX_FILE_NAME);
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+        let index_dir = self.indice_files_dir(&index_meta)?;
+        let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
         let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
@@ -1224,7 +1134,7 @@ impl DatasetIndexInternalExt for Dataset {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
                                 self.object_store.clone(),
-                                self.indices_dir(),
+                                index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
@@ -1236,7 +1146,7 @@ impl DatasetIndexInternalExt for Dataset {
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
                                 self.object_store.clone(),
-                                self.indices_dir(),
+                                index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
@@ -1257,7 +1167,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_PQ" => {
                         let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -1270,7 +1180,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_SQ" => {
                         let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -1281,12 +1191,12 @@ impl DatasetIndexInternalExt for Dataset {
                     }
 
                     "IVF_HNSW_FLAT" => {
-                        let uri = self.indices_dir().child(uuid).child("index.pb");
+                        let uri = index_dir.child(uuid).child("index.pb");
                         let file_metadata_cache =
                             self.session.metadata_cache.file_metadata_cache(&uri);
                         let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             &file_metadata_cache,
@@ -1299,7 +1209,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -1312,7 +1222,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_HNSW_PQ" => {
                         let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
                             self.object_store.clone(),
-                            self.indices_dir(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -1433,7 +1343,21 @@ impl DatasetIndexInternalExt for Dataset {
                 .iter()
                 .any(|f| is_vector_field(f.data_type()));
 
-            idx.fields.len() == 1 && !is_vector_index
+            // Check if this is an FTS index by looking at index details
+            let is_fts_index = if let Some(_details) = &idx.index_details {
+                use crate::index::scalar::infer_index_type;
+                matches!(infer_index_type(idx), Some(IndexType::Inverted))
+            } else {
+                false
+            };
+
+            // Only include indices with non-empty fragment bitmaps, except for FTS indices
+            // which need to be discoverable even when empty
+            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
+            });
+
+            idx.fields.len() == 1 && !is_vector_index && (has_non_empty_bitmap || is_fts_index)
         }) {
             let field = index.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
@@ -1442,30 +1366,45 @@ impl DatasetIndexInternalExt for Dataset {
                 ),
                 location: location!(),
             })?;
+            let index_type = detect_scalar_index_type(self, index, &field.name).await?;
 
             let query_parser = match field.data_type() {
                 DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))
                     as Box<dyn ScalarQueryParser>,
-                DataType::Utf8 | DataType::LargeUtf8 => {
-                    let index_type = detect_scalar_index_type(self, index, &field.name).await?;
-                    match index_type {
-                        ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
-                            Box::new(SargableQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        ScalarIndexType::NGram => {
-                            Box::new(TextQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        ScalarIndexType::Inverted => {
-                            Box::new(FtsQueryParser::new(index.name.clone()))
-                                as Box<dyn ScalarQueryParser>
-                        }
-                        _ => continue,
+                DataType::Utf8 | DataType::LargeUtf8 => match index_type {
+                    ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
+                        Box::new(SargableQueryParser::new(index.name.clone(), false))
+                            as Box<dyn ScalarQueryParser>
                     }
+                    ScalarIndexType::ZoneMap => {
+                        Box::new(SargableQueryParser::new(index.name.clone(), true))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                    ScalarIndexType::NGram => {
+                        Box::new(TextQueryParser::new(index.name.clone(), true))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                    ScalarIndexType::Inverted => {
+                        let fts_index =
+                            lance_index::scalar::expression::ScalarIndexLoader::load_index(
+                                self,
+                                &field.name,
+                                &index.name,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?;
+                        let fts_index = fts_index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+                        Box::new(FtsQueryParser::new(index.name.clone(), fts_index.clone()))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                    _ => continue,
+                },
+                _ => {
+                    // inexact index filter
+                    let needs_recheck = matches!(index_type, ScalarIndexType::ZoneMap);
+                    Box::new(SargableQueryParser::new(index.name.clone(), needs_recheck))
+                        as Box<dyn ScalarQueryParser>
                 }
-                _ => Box::new(SargableQueryParser::new(index.name.clone()))
-                    as Box<dyn ScalarQueryParser>,
             };
 
             indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
@@ -1549,7 +1488,8 @@ fn is_vector_field(data_type: DataType) -> bool {
 mod tests {
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::{ReadParams, WriteParams};
+    use crate::dataset::{ReadParams, WriteMode, WriteParams};
+    use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{
         copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount, StatsHolder,
@@ -1563,9 +1503,9 @@ mod tests {
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
-    use lance_datagen::r#gen;
+    use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
-    use lance_index::scalar::FullTextSearchQuery;
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -2388,7 +2328,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remap_empty() {
-        let data = gen()
+        let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
                 "vector",
@@ -2410,7 +2350,7 @@ mod tests {
         let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
             .await
             .unwrap();
-        assert_eq!(new_uuid, index_uuid);
+        assert_eq!(new_uuid, Some(index_uuid));
     }
 
     #[tokio::test]
@@ -2722,5 +2662,820 @@ mod tests {
             stats["updated_at_timestamp_ms"].is_null(),
             "updated_at_timestamp_ms should be null when no indices have created_at timestamps"
         );
+    }
+    #[rstest]
+    #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
+    #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]
+    #[case::inverted("text", IndexType::Inverted, Box::new(InvertedIndexParams::default()))]
+    #[tokio::test]
+    async fn test_create_empty_scalar_index(
+        #[case] column_name: &str,
+        #[case] index_type: IndexType,
+        #[case] params: Box<dyn IndexParams>,
+    ) {
+        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+
+        // Create dataset with scalar and text columns (no vector column needed)
+        let reader = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://test", None).await.unwrap();
+
+        // Create an empty index with train=false
+        // Test using IntoFuture - can await directly without calling .execute()
+        dataset
+            .create_index_builder(&[column_name], index_type, params.as_ref())
+            .name("index".to_string())
+            .train(false)
+            .await
+            .unwrap();
+
+        // Verify we can get index statistics
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Empty index should have zero indexed rows"
+        );
+
+        // Append new data using lance_datagen
+        let append_reader = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+
+        dataset.append(append_reader, None).await.unwrap();
+
+        // Critical test: Verify the empty index is still present after append
+        let indices_after_append = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_append.len(),
+            1,
+            "Index should be retained after append for index type {:?}",
+            index_type
+        );
+
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Empty index should still have zero indexed rows after append"
+        );
+
+        // Test optimize_indices with empty index
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        // Verify the index still exists after optimization
+        let indices_after_optimize = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_optimize.len(),
+            1,
+            "Index should still exist after optimization"
+        );
+
+        // Check index statistics after optimization
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_unindexed_rows"], 0,
+            "Empty index should indexed all rows"
+        );
+    }
+
+    /// Helper function to check if an index is being used in a query plan
+    fn assert_index_usage(plan: &str, column_name: &str, should_use_index: bool, context: &str) {
+        let index_used = if column_name == "text" {
+            // For inverted index, look for MatchQuery which indicates FTS index usage
+            plan.contains("MatchQuery")
+        } else {
+            // For btree/bitmap, look for MaterializeIndex which indicates scalar index usage
+            plan.contains("ScalarIndexQuery")
+        };
+
+        if should_use_index {
+            assert!(
+                index_used,
+                "Query plan should use index {}: {}",
+                context, plan
+            );
+        } else {
+            assert!(
+                !index_used,
+                "Query plan should NOT use index {}: {}",
+                context, plan
+            );
+        }
+    }
+
+    /// Test that scalar indices are retained after deleting all data from a table.
+    ///
+    /// This test verifies that when we:
+    /// 1. Create a table with data
+    /// 2. Add a scalar index with train=true
+    /// 3. Delete all data in the table
+    /// The index remains available on the table.
+    #[rstest]
+    #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
+    #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]
+    #[case::inverted("text", IndexType::Inverted, Box::new(InvertedIndexParams::default()))]
+    #[tokio::test]
+    async fn test_scalar_index_retained_after_delete_all(
+        #[case] column_name: &str,
+        #[case] index_type: IndexType,
+        #[case] params: Box<dyn IndexParams>,
+    ) {
+        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+
+        // Create dataset with initial data
+        let reader = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://test", None).await.unwrap();
+
+        // Create index with train=true (normal index with data)
+        dataset
+            .create_index_builder(&[column_name], index_type, params.as_ref())
+            .name("index".to_string())
+            .train(true)
+            .await
+            .unwrap();
+
+        // Verify index was created and has indexed rows
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 100,
+            "Index should have indexed all 100 rows"
+        );
+
+        // Verify index is being used in queries before delete
+        let plan = if column_name == "text" {
+            // Use full-text search for inverted index
+            dataset
+                .scan()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        } else {
+            // Use equality filter for btree/bitmap indices
+            dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        };
+        // Verify index is being used before delete
+        assert_index_usage(&plan, column_name, true, "before delete");
+
+        let indexes = dataset.load_indices().await.unwrap();
+        let original_index = indexes[0].clone();
+
+        // Delete all rows from the table
+        dataset.delete("true").await.unwrap();
+
+        // Verify table is empty
+        let row_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(row_count, 0, "Table should be empty after delete all");
+
+        // Critical test: Verify the index still exists after deleting all data
+        let indices_after_delete = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_delete.len(),
+            1,
+            "Index should be retained after deleting all data"
+        );
+        assert_eq!(
+            indices_after_delete[0].name, "index",
+            "Index name should remain the same after delete"
+        );
+
+        // Critical test: Verify the fragment bitmap is empty after delete
+        let index_after_delete = &indices_after_delete[0];
+        let effective_bitmap = index_after_delete
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap();
+        assert!(
+            effective_bitmap.is_empty(),
+            "Effective bitmap should be empty after deleting all data"
+        );
+        assert_eq!(
+            index_after_delete.fragment_bitmap, original_index.fragment_bitmap,
+            "Fragment bitmap should remain the same after delete"
+        );
+
+        // Verify we can still get index statistics
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Index should now report zero indexed rows after delete all"
+        );
+        assert_eq!(
+            stats["num_unindexed_rows"], 0,
+            "Index should report zero unindexed rows after delete all"
+        );
+        assert_eq!(
+            stats["num_indexed_fragments"], 0,
+            "Index should report zero indexed fragments after delete all"
+        );
+        assert_eq!(
+            stats["num_unindexed_fragments"], 0,
+            "Index should report zero unindexed fragments after delete all"
+        );
+
+        // Verify index is NOT being used in queries after delete (empty bitmap)
+        if column_name == "text" {
+            // Inverted indexes will still appear to be used in FTS queries.
+            // TODO: once metrics are working on FTS queries, we can check the
+            // analyze plan output instead for index usage.
+            let _plan_after_delete = dataset
+                .scan()
+                .project(&[column_name])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert_index_usage(
+                &_plan_after_delete,
+                column_name,
+                true,
+                "after delete (empty bitmap)",
+            );
+        } else {
+            // Use equality filter for btree/bitmap indices
+            let _plan_after_delete = dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            // Verify index is NOT being used after delete (empty bitmap)
+            assert_index_usage(
+                &_plan_after_delete,
+                column_name,
+                false,
+                "after delete (empty bitmap)",
+            );
+        }
+
+        // Test that we can append new data and the index is still there
+        let append_reader = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+
+        dataset.append(append_reader, None).await.unwrap();
+
+        // Verify index still exists after append
+        let indices_after_append = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_append.len(),
+            1,
+            "Index should still exist after appending to empty table"
+        );
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 0,
+            "Index should now report zero indexed rows after data is added"
+        );
+
+        // Test optimize_indices after delete all
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        // Verify index still exists after optimization
+        let indices_after_optimize = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_optimize.len(),
+            1,
+            "Index should still exist after optimization following delete all"
+        );
+
+        // Verify we can still get index statistics after optimization
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"],
+            dataset.count_rows(None).await.unwrap(),
+            "Index should now cover all newly added rows after optimization"
+        );
+    }
+
+    /// Test that scalar indices are retained after updating rows in a table.
+    ///
+    /// This test verifies that when we:
+    /// 1. Create a table with data
+    /// 2. Add a scalar index with train=true  
+    /// 3. Update rows in the table
+    /// The index remains available on the table.
+    #[rstest]
+    #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
+    #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]
+    #[case::inverted("text", IndexType::Inverted, Box::new(InvertedIndexParams::default()))]
+    #[tokio::test]
+    async fn test_scalar_index_retained_after_update(
+        #[case] column_name: &str,
+        #[case] index_type: IndexType,
+        #[case] params: Box<dyn IndexParams>,
+    ) {
+        use crate::dataset::UpdateBuilder;
+        use lance_datagen::{array, BatchCount, ByteCount, RowCount};
+
+        // Create dataset with initial data
+        let reader = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://test", None).await.unwrap();
+
+        // Create index with train=true (normal index with data)
+        dataset
+            .create_index_builder(&[column_name], index_type, params.as_ref())
+            .name("index".to_string())
+            .train(true)
+            .await
+            .unwrap();
+
+        // Verify index was created and has indexed rows
+        let stats = dataset.index_statistics("index").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(
+            stats["num_indexed_rows"], 100,
+            "Index should have indexed all 100 rows"
+        );
+
+        // Verify index is being used in queries before update
+        let plan = if column_name == "text" {
+            // Use full-text search for inverted index
+            dataset
+                .scan()
+                .project(&[column_name])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        } else {
+            // Use equality filter for btree/bitmap indices
+            dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap()
+        };
+        // Verify index is being used before update
+        assert_index_usage(&plan, column_name, true, "before update");
+
+        // Update some rows - update first 50 rows
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
+            .set("i", "i + 1000")
+            .unwrap()
+            .set("text", "'updated_' || text")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        let mut dataset = update_result.new_dataset.as_ref().clone();
+
+        // Verify row count remains the same
+        let row_count = dataset.count_rows(None).await.unwrap();
+        assert_eq!(row_count, 100, "Row count should remain 100 after update");
+
+        // Critical test: Verify the index still exists after updating data
+        let indices_after_update = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_update.len(),
+            1,
+            "Index should be retained after updating rows"
+        );
+
+        // Critical test: Verify the effective fragment bitmap is empty after update
+        let indices = dataset.load_indices().await.unwrap();
+        let index = &indices[0];
+        let effective_bitmap = index
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap();
+        assert!(
+            effective_bitmap.is_empty(),
+            "Effective fragment bitmap should be empty after updating all data"
+        );
+
+        // Verify we can still get index statistics
+        let stats_after_update = dataset.index_statistics("index").await.unwrap();
+        let stats_after_update: serde_json::Value =
+            serde_json::from_str(&stats_after_update).unwrap();
+
+        // The index should still be available
+        assert_eq!(
+            stats_after_update["num_indexed_rows"], 0,
+            "Index statistics should be zero after update, as it is not re-trained"
+        );
+
+        // Verify index behavior in queries after update (empty bitmap)
+        if column_name == "text" {
+            // Inverted indexes will still appear to be used in FTS queries even with empty bitmaps.
+            // This is because FTS queries require an index to exist, and the query execution
+            // will handle the empty bitmap appropriately by falling back to scanning unindexed data.
+            // TODO: once metrics are working on FTS queries, we can check the
+            // analyze plan output instead for actual index usage statistics.
+            let _plan_after_update = dataset
+                .scan()
+                .project(&[column_name])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("test".to_string()))
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert_index_usage(
+                &_plan_after_update,
+                column_name,
+                true, // FTS indices always appear in the plan, even with empty bitmaps
+                "after update (empty bitmap)",
+            );
+        } else {
+            // Use equality filter for btree/bitmap indices
+            let _plan_after_update = dataset
+                .scan()
+                .filter(format!("{} = 50", column_name).as_str())
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            // With immutable bitmaps, index is still used even with empty effective bitmap
+            // The prefilter will handle non-existent fragments
+            assert_index_usage(
+                &_plan_after_update,
+                column_name,
+                false,
+                "after update (empty effective bitmap)",
+            );
+        }
+
+        // Test that we can optimize indices after update
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        // Verify index still exists after optimization
+        let indices_after_optimize = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices_after_optimize.len(),
+            1,
+            "Index should still exist after optimization following update"
+        );
+
+        let stats_after_optimization = dataset.index_statistics("index").await.unwrap();
+        let stats_after_optimization: serde_json::Value =
+            serde_json::from_str(&stats_after_optimization).unwrap();
+
+        // The index should still be available
+        assert_eq!(
+            stats_after_optimization["num_unindexed_rows"], 0,
+            "Index should have zero unindexed rows after optimization"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shallow_clone_with_index() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let clone_dir = test_dir.path().join("clone");
+        let cloned_uri = clone_dir.to_str().unwrap();
+
+        // Create a schema with both vector and scalar columns
+        let dimensions = 16u32;
+        // Generate test data using lance_datagen (300 rows to satisfy PQ training requirements)
+        let data = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("category", array::fill_utf8("category_0".to_string()))
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(dimensions)),
+            )
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+
+        // Create initial dataset
+        let mut dataset = Dataset::write(data, test_uri, None).await.unwrap();
+        // Create vector index (IVF_PQ)
+        let vector_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 10);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Create scalar index (BTree)
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::BTree,
+                Some("category_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify indices were created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2, "Should have 2 indices");
+        let index_names: HashSet<String> = indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(index_names.contains("vector_idx"));
+        assert!(index_names.contains("category_idx"));
+
+        // Test scalar query on source dataset
+        let scalar_results = dataset
+            .scan()
+            .filter("category = 'category_0'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let source_scalar_query_rows = scalar_results.num_rows();
+        assert!(
+            scalar_results.num_rows() > 0,
+            "Scalar query should return results"
+        );
+
+        // Create tag for shallow cloning
+        dataset
+            .tags
+            .create("test_tag", dataset.version().version)
+            .await
+            .unwrap();
+
+        // Perform shallow clone
+        let cloned_dataset = dataset
+            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .await
+            .unwrap();
+
+        // Verify cloned dataset has indices
+        let cloned_indices = cloned_dataset.load_indices().await.unwrap();
+        assert_eq!(
+            cloned_indices.len(),
+            2,
+            "Cloned dataset should have 2 indices"
+        );
+        let cloned_index_names: HashSet<String> =
+            cloned_indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(cloned_index_names.contains("vector_idx"));
+        assert!(cloned_index_names.contains("category_idx"));
+
+        // Test vector search on cloned dataset
+        let query_vector = generate_random_array(dimensions as usize);
+        let search_results = cloned_dataset
+            .scan()
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .limit(Some(5), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(
+            search_results.num_rows() > 0,
+            "Vector search should return results"
+        );
+
+        // Test scalar query on cloned dataset
+        let scalar_results = cloned_dataset
+            .scan()
+            .filter("category = 'category_0'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            source_scalar_query_rows,
+            scalar_results.num_rows(),
+            "Scalar query should return results"
+        );
+
+        // Append new data to cloned dataset using lance_datagen
+        let new_data = gen_batch()
+            .col("id", array::step_custom::<Int32Type>(300, 1))
+            .col("category", array::fill_utf8("category_1".to_string()))
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(dimensions)),
+            )
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+
+        let mut updated_cloned_dataset = Dataset::write(
+            new_data,
+            cloned_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Test scalar query on cloned dataset after appending
+        let scalar_results = cloned_dataset
+            .scan()
+            .filter("category = 'category_1'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            0,
+            scalar_results.num_rows(),
+            "Scalar query should return results 0 before optimizing index"
+        );
+
+        // Test scalar query on cloned dataset after appending
+        let scalar_results = cloned_dataset
+            .scan()
+            .filter("category = 'category_0'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            source_scalar_query_rows,
+            scalar_results.num_rows(),
+            "Scalar query should return {} results after cloning",
+            source_scalar_query_rows
+        );
+
+        // Verify row count increased
+        let total_rows = updated_cloned_dataset.count_rows(None).await.unwrap();
+        assert_eq!(total_rows, 350, "Should have 350 rows after append");
+
+        // Store indices before optimization for comparison
+        let indices_before_optimize = updated_cloned_dataset.load_indices().await.unwrap();
+        let vector_idx_before = indices_before_optimize
+            .iter()
+            .find(|idx| idx.name == "vector_idx")
+            .unwrap();
+        let category_idx_before = indices_before_optimize
+            .iter()
+            .find(|idx| idx.name == "category_idx")
+            .unwrap();
+
+        // Call optimize_indices
+        updated_cloned_dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        // Critical test: Verify new indices are created in the cloned dataset location
+        let optimized_indices = updated_cloned_dataset.load_indices().await.unwrap();
+
+        // Find the new index metadata after optimization
+        let new_vector_idx = optimized_indices
+            .iter()
+            .find(|idx| idx.name == "vector_idx")
+            .unwrap();
+        let new_category_idx = optimized_indices
+            .iter()
+            .find(|idx| idx.name == "category_idx")
+            .unwrap();
+
+        // The UUIDs should be different after optimization (new indices were created)
+        assert_ne!(
+            new_vector_idx.uuid, vector_idx_before.uuid,
+            "Vector index should have a new UUID after optimization"
+        );
+        assert_ne!(
+            new_category_idx.uuid, category_idx_before.uuid,
+            "Category index should have a new UUID after optimization"
+        );
+
+        // Verify the new index files are in the cloned dataset's directory
+        use std::path::PathBuf;
+        let clone_indices_dir = PathBuf::from(cloned_uri).join("_indices");
+        let vector_index_dir = clone_indices_dir.join(new_vector_idx.uuid.to_string());
+        let category_index_dir = clone_indices_dir.join(new_category_idx.uuid.to_string());
+
+        assert!(
+            vector_index_dir.exists(),
+            "New vector index directory should exist in cloned dataset location: {:?}",
+            vector_index_dir
+        );
+        assert!(
+            category_index_dir.exists(),
+            "New category index directory should exist in cloned dataset location: {:?}",
+            category_index_dir
+        );
+
+        // Verify that the new indices do NOT have base_id set (they're local to the cloned dataset)
+        assert!(
+            new_vector_idx.base_id.is_none(),
+            "New vector index should not have base_id after optimization in cloned dataset"
+        );
+        assert!(
+            new_category_idx.base_id.is_none(),
+            "New category index should not have base_id after optimization in cloned dataset"
+        );
+
+        // Also verify the original dataset's index directories are NOT modified
+        let original_indices_dir = PathBuf::from(test_uri).join("_indices");
+
+        // The new index UUIDs should NOT exist in the original dataset's directory
+        let wrong_vector_dir = original_indices_dir.join(new_vector_idx.uuid.to_string());
+        let wrong_category_dir = original_indices_dir.join(new_category_idx.uuid.to_string());
+
+        assert!(
+            !wrong_vector_dir.exists(),
+            "New vector index should NOT be in original dataset location: {:?}",
+            wrong_vector_dir
+        );
+        assert!(
+            !wrong_category_dir.exists(),
+            "New category index should NOT be in original dataset location: {:?}",
+            wrong_category_dir
+        );
+
+        // Test vector search after optimization (should find both old and new data)
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let optimized_search_results = updated_cloned_dataset
+            .scan()
+            .nearest("vector", &query_vector, 10)
+            .unwrap()
+            .limit(Some(10), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert!(
+            optimized_search_results.num_rows() > 0,
+            "Vector search should work after optimization"
+        );
+
+        // Test scalar query after optimization (should find both old and new data)
+        let old_category_results = updated_cloned_dataset
+            .scan()
+            .filter("category = 'category_0'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let new_category_results = updated_cloned_dataset
+            .scan()
+            .filter("category = 'category_1'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            source_scalar_query_rows,
+            old_category_results.num_rows(),
+            "Should find old category data with {} rows",
+            source_scalar_query_rows
+        );
+        assert!(
+            new_category_results.num_rows() > 0,
+            "Should find new category data"
+        );
+
+        // Verify index statistics
+        let vector_stats: serde_json::Value = serde_json::from_str(
+            &updated_cloned_dataset
+                .index_statistics("vector_idx")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let category_stats: serde_json::Value = serde_json::from_str(
+            &updated_cloned_dataset
+                .index_statistics("category_idx")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(vector_stats["num_indexed_rows"].as_u64().unwrap(), 350);
+        assert_eq!(category_stats["num_indexed_rows"].as_u64().unwrap(), 350);
     }
 }

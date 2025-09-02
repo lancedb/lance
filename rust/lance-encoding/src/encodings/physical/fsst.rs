@@ -27,8 +27,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressor},
     },
     format::{
-        pb::{self},
-        ProtobufUtils,
+        pb21::{self, CompressiveEncoding},
+        ProtobufUtils21,
     },
 };
 
@@ -42,7 +42,7 @@ struct FsstCompressed {
 impl FsstCompressed {
     fn fsst_compress(data: DataBlock) -> Result<Self> {
         match data {
-            DataBlock::VariableWidth(mut variable_width) => {
+            DataBlock::VariableWidth(variable_width) => {
                 match variable_width.bits_per_offset {
                     32 => {
                         let offsets = variable_width.offsets.borrow_to_typed_slice::<i32>();
@@ -132,10 +132,7 @@ impl FsstCompressed {
 pub struct FsstMiniBlockEncoder {}
 
 impl MiniBlockCompressor for FsstMiniBlockEncoder {
-    fn compress(
-        &self,
-        data: DataBlock,
-    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let compressed = FsstCompressed::fsst_compress(data)?;
 
         let data_block = DataBlock::VariableWidth(compressed.data);
@@ -149,7 +146,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
 
         Ok((
             binary_miniblock_compressed,
-            ProtobufUtils::fsst(binary_array_encoding, compressed.symbol_table),
+            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -166,7 +163,7 @@ impl FsstPerValueEncoder {
 }
 
 impl PerValueCompressor for FsstPerValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let compressed = FsstCompressed::fsst_compress(data)?;
 
         let data_block = DataBlock::VariableWidth(compressed.data);
@@ -175,7 +172,7 @@ impl PerValueCompressor for FsstPerValueEncoder {
 
         Ok((
             binary_compressed,
-            ProtobufUtils::fsst(binary_array_encoding, compressed.symbol_table),
+            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -201,7 +198,7 @@ impl FsstPerValueDecompressor {
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         // Step 1. Run inner decompressor
-        let mut compressed_variable_data = self
+        let compressed_variable_data = self
             .inner_decompressor
             .decompress(data)?
             .as_variable_width()
@@ -235,7 +232,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data: LanceBuffer::Owned(decompress_bytes_buf),
+                    data: LanceBuffer::from(decompress_bytes_buf),
                     offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
                     bits_per_offset: 32,
                     num_values,
@@ -265,7 +262,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data: LanceBuffer::Owned(decompress_bytes_buf),
+                    data: LanceBuffer::from(decompress_bytes_buf),
                     offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
                     bits_per_offset: 64,
                     num_values,
@@ -287,7 +284,10 @@ pub struct FsstMiniBlockDecompressor {
 }
 
 impl FsstMiniBlockDecompressor {
-    pub fn new(description: &pb::Fsst, inner_decompressor: Box<dyn MiniBlockDecompressor>) -> Self {
+    pub fn new(
+        description: &pb21::Fsst,
+        inner_decompressor: Box<dyn MiniBlockDecompressor>,
+    ) -> Self {
         Self {
             symbol_table: LanceBuffer::from_bytes(description.symbol_table.clone(), 1),
             inner_decompressor,
@@ -300,12 +300,12 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding
         let compressed_data_block = self.inner_decompressor.decompress(data, num_values)?;
-        let DataBlock::VariableWidth(mut compressed_data_block) = compressed_data_block else {
+        let DataBlock::VariableWidth(compressed_data_block) = compressed_data_block else {
             panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
         };
 
         // Step 2. FSST decompress
-        let bytes = compressed_data_block.data.borrow_and_clone();
+        let bytes = &compressed_data_block.data;
         let (decompress_bytes_buf, decompress_offset_buf) =
             if compressed_data_block.bits_per_offset == 64 {
                 let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i64>();
@@ -356,7 +356,7 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
             };
 
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::Owned(decompress_bytes_buf),
+            data: LanceBuffer::from(decompress_bytes_buf),
             offsets: decompress_offset_buf,
             bits_per_offset: compressed_data_block.bits_per_offset,
             num_values,
@@ -384,7 +384,7 @@ mod tests {
             .with_file_version(LanceFileVersion::V2_1);
 
         // Generate data suitable for FSST (large strings, total size > 32KB)
-        let arr = lance_datagen::gen()
+        let arr = lance_datagen::gen_batch()
             .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(100), false))
             .into_batch_rows(RowCount::from(5000))
             .unwrap()

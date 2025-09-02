@@ -15,9 +15,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance_arrow::{fixed_size_list_type, ArrowFloatType, FixedSizeListArrayExt};
 use num_traits::{real::Real, FromPrimitive};
-use rand::distributions::uniform::SampleUniform;
+use rand::distr::uniform::SampleUniform;
 use rand::{
-    distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::SliceRandom, Rng, SeedableRng,
+    distr::Uniform, prelude::Distribution, rngs::StdRng, seq::SliceRandom, Rng, SeedableRng,
 };
 
 pub trait ArrayGenerator {
@@ -146,18 +146,18 @@ impl BatchGenerator {
         Default::default()
     }
 
-    pub fn col(mut self, gen: Box<dyn ArrayGenerator>) -> Self {
-        self.generators.push(gen);
+    pub fn col(mut self, genn: Box<dyn ArrayGenerator>) -> Self {
+        self.generators.push(genn);
         self
     }
 
     fn gen_batch(&mut self, num_rows: u32) -> RecordBatch {
         let mut fields = Vec::with_capacity(self.generators.len());
         let mut arrays = Vec::with_capacity(self.generators.len());
-        for (field_index, gen) in self.generators.iter_mut().enumerate() {
-            let arr = gen.generate(num_rows as usize);
+        for (field_index, genn) in self.generators.iter_mut().enumerate() {
+            let arr = genn.generate(num_rows as usize);
             let default_name = format!("field_{}", field_index);
-            let name = gen.name().unwrap_or(&default_name);
+            let name = genn.name().unwrap_or(&default_name);
             fields.push(Field::new(name, arr.data_type().clone(), true));
             arrays.push(arr);
         }
@@ -210,7 +210,7 @@ where
     let mut rng = StdRng::from_seed(seed);
 
     T::ArrayType::from(
-        repeat_with(|| T::Native::from_f32(rng.gen::<f32>()).unwrap())
+        repeat_with(|| T::Native::from_f32(rng.random::<f32>()).unwrap())
             .take(n)
             .collect::<Vec<_>>(),
     )
@@ -219,15 +219,15 @@ where
 /// Create a random float32 array where each element is uniformly
 /// distributed between [0..1]
 pub fn generate_random_array(n: usize) -> Float32Array {
-    let mut rng = rand::thread_rng();
-    Float32Array::from_iter_values(repeat_with(|| rng.gen::<f32>()).take(n))
+    let mut rng = rand::rng();
+    Float32Array::from_iter_values(repeat_with(|| rng.random::<f32>()).take(n))
 }
 
 /// Create a random float32 array where each element is uniformly
 /// distributed between [0..1]
 pub fn generate_random_int8_array(n: usize) -> Int8Array {
-    let mut rng = rand::thread_rng();
-    Int8Array::from_iter_values(repeat_with(|| rng.gen::<i8>()).take(n))
+    let mut rng = rand::rng();
+    Int8Array::from_iter_values(repeat_with(|| rng.random::<i8>()).take(n))
 }
 
 /// Create a random primitive array where each element is uniformly distributed a
@@ -240,21 +240,21 @@ where
     T::Native: SampleUniform,
 {
     let mut rng = StdRng::from_seed([13; 32]);
-    let distribution = Uniform::new(range.start, range.end);
+    let distribution = Uniform::new(range.start, range.end).unwrap();
     PrimitiveArray::<T>::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
 }
 
 /// Create a random float32 array where each element is uniformly
 /// distributed across the given range
 pub fn generate_scaled_random_array(n: usize, min: f32, max: f32) -> Float32Array {
-    let mut rng = rand::thread_rng();
-    let distribution = Uniform::new(min, max);
+    let mut rng = rand::rng();
+    let distribution = Uniform::new(min, max).unwrap();
     Float32Array::from_iter_values(repeat_with(|| distribution.sample(&mut rng)).take(n))
 }
 
 pub fn sample_indices(range: Range<usize>, num_picks: u32) -> Vec<usize> {
-    let mut rng = rand::thread_rng();
-    let dist = Uniform::new(range.start, range.end);
+    let mut rng = rand::rng();
+    let dist = Uniform::new(range.start, range.end).unwrap();
     let ratio = num_picks as f32 / range.len() as f32;
     if ratio < 0.1_f32 && num_picks > 1000 {
         // We want to pick a large number of values from a big range.  Better to
@@ -279,7 +279,7 @@ pub fn sample_indices(range: Range<usize>, num_picks: u32) -> Vec<usize> {
 }
 
 pub fn sample_without_replacement<T: Copy>(choices: &[T], num_picks: u32) -> Vec<T> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut shuffled = Vec::from(choices);
     shuffled.partial_shuffle(&mut rng, num_picks as usize);
     shuffled.truncate(num_picks as usize);

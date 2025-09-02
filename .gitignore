@@ -101,3 +101,7 @@ test_data/.venv
 
 # Pytest benchmarks
 .benchmarks/
+
+# Auto-built docs
+docs/src/format/namespace/**
+docs/src/integrations/spark/**

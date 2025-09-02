@@ -6,7 +6,7 @@
 
     <groupId>com.lancedb</groupId>
     <artifactId>lance-parent</artifactId>
-    <version>0.32.2</version>
+    <version>0.34.0</version>
     <packaging>pom</packaging>
 
     <name>Lance Parent</name>
@@ -324,11 +324,12 @@
                     <plugin>
                         <groupId>org.sonatype.central</groupId>
                         <artifactId>central-publishing-maven-plugin</artifactId>
-                        <version>0.4.0</version>
+                        <version>0.8.0</version>
                         <extensions>true</extensions>
                         <configuration>
                             <publishingServerId>ossrh</publishingServerId>
                             <tokenAuth>true</tokenAuth>
+                            <autoPublish>true</autoPublish>
                         </configuration>
                     </plugin>
                     <plugin>

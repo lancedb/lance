@@ -83,8 +83,14 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use super::fragment::FileFragment;
+use super::index::DatasetIndexRemapperOptions;
+use super::rowids::load_row_id_sequences;
+use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use super::utils::make_rowid_capture_stream;
+use super::{write_fragments_internal, WriteMode, WriteParams};
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use crate::Dataset;
 use crate::Result;
@@ -93,18 +99,13 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::Error;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-
-use super::fragment::FileFragment;
-use super::index::DatasetIndexRemapperOptions;
-use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
-use super::utils::make_rowaddr_capture_stream;
-use super::{write_fragments_internal, WriteMode, WriteParams};
+use snafu::location;
 use tracing::info;
 
 pub mod remapping;
@@ -671,8 +672,8 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
+    // If we aren't using stable row ids, then we need to remap indices.
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut scanner = dataset.scan();
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
@@ -688,12 +689,12 @@ async fn rewrite_files(
     scanner
         .with_fragments(fragments.clone())
         .scan_in_order(true);
-    let (row_ids, reader) = if needs_remapping {
-        let row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-        scanner.with_row_address();
+    let (row_ids_rx, reader) = if needs_remapping {
+        scanner.with_row_id();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let data_no_row_ids = make_rowaddr_capture_stream(row_ids.clone(), data)?;
-        (Some(row_ids), data_no_row_ids)
+        let (data_no_row_ids, row_id_rx) =
+            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
+        (Some(row_id_rx), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         (None, data)
@@ -722,8 +723,8 @@ async fn rewrite_files(
         params.max_bytes_per_file = max_bytes_per_file;
     }
 
-    if dataset.manifest.uses_move_stable_row_ids() {
-        params.enable_move_stable_row_ids = true;
+    if dataset.manifest.uses_stable_row_ids() {
+        params.enable_stable_row_ids = true;
     }
 
     let new_fragments = write_fragments_internal(
@@ -742,11 +743,13 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let (row_id_map, changed_row_addrs) = if let Some(row_ids) = row_ids {
-        let row_ids = Arc::try_unwrap(row_ids)
-            .expect("Row ids lock still owned")
-            .into_inner()
-            .expect("Row ids mutex still locked");
+    let (row_id_map, changed_row_addrs) = if let Some(row_ids_rx) = row_ids_rx {
+        let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
+            message: format!("Failed to receive row ids: {}", err),
+            location: location!(),
+        })?;
+        // This code path is only when we use address style ids.
+        let row_addrs = captured_ids.row_addrs(None).into_owned();
 
         log::info!(
             "Compaction task {}: reserving fragment ids and transposing row ids",
@@ -755,11 +758,11 @@ async fn rewrite_files(
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
         if options.defer_index_remap {
-            let mut changed_row_addrs = Vec::with_capacity(row_ids.serialized_size());
-            row_ids.serialize_into(&mut changed_row_addrs)?;
+            let mut changed_row_addrs = Vec::with_capacity(row_addrs.serialized_size());
+            row_addrs.serialize_into(&mut changed_row_addrs)?;
             (None, Some(changed_row_addrs))
         } else {
-            let row_id_map = remapping::transpose_row_ids(row_ids, &fragments, &new_fragments);
+            let row_id_map = remapping::transpose_row_ids(row_addrs, &fragments, &new_fragments);
             (Some(row_id_map), None)
         }
     } else {
@@ -850,6 +853,7 @@ async fn rechunk_stable_row_ids(
         new_fragments
             .iter()
             .map(|frag| frag.physical_rows.unwrap() as u64),
+        false,
     )?;
 
     for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
@@ -877,9 +881,8 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping =
-        !dataset.manifest.uses_move_stable_row_ids() && !options.defer_index_remap;
+    // If we aren't using stable row ids, then we need to remap indices.
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
@@ -1594,7 +1597,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 1000,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1667,36 +1670,33 @@ mod tests {
             assert_eq!(dataset.manifest.version, 6);
         }
 
-        assert_eq!(
-            dataset.manifest.uses_move_stable_row_ids(),
-            use_stable_row_id,
-        );
+        assert_eq!(dataset.manifest.uses_stable_row_ids(), use_stable_row_id,);
     }
 
     #[tokio::test]
     async fn test_stable_row_indices() {
-        // Validate behavior of indices after compaction with move-stable row ids.
+        // Validate behavior of indices after compaction with stable row ids.
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
-                RandomVector::new().vec_width(128).named("vec".to_owned()),
+                RandomVector::new().vec_width(16).named("vec".to_owned()),
             ))
             .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
         let mut dataset = Dataset::write(
-            data_gen.batch(5_000),
+            data_gen.batch(500),
             "memory://test/table",
             Some(WriteParams {
-                enable_move_stable_row_ids: true,
-                max_rows_per_file: 1_000, // 5 files
+                enable_stable_row_ids: true,
+                max_rows_per_file: 100, // 5 files
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
 
-        // Delete first 1,100 rows so rowids != final rowaddrs
-        // First 1,000 rows deletes first file. Next 100 deletes part of second
+        // Delete first 110 rows so rowids != final rowaddrs
+        // First 100 rows deletes first file. Next 10 deletes part of second
         // file, so we will trigger the with deletions code path.
-        dataset.delete("i < 1100").await.unwrap();
+        dataset.delete("i < 110").await.unwrap();
 
         dataset
             .create_index(
@@ -1708,7 +1708,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let params = VectorIndexParams::ivf_pq(1, 8, 8, MetricType::L2, 50);
+        let params = VectorIndexParams::ivf_pq(1, 8, 1, MetricType::L2, 50);
         dataset
             .create_index(
                 &["vec"],
@@ -1734,7 +1734,7 @@ mod tests {
         async fn vector_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
 
-            let query = Float32Array::from(vec![0.0f32; 128]);
+            let query = Float32Array::from(vec![0.0f32; 16]);
             scanner
                 .nearest("vec", &query, 10)
                 .unwrap()
@@ -1747,7 +1747,7 @@ mod tests {
         async fn scalar_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
 
-            scanner.filter("i = 1000").unwrap().project(&["i"]).unwrap();
+            scanner.filter("i = 100").unwrap().project(&["i"]).unwrap();
 
             scanner.try_into_batch().await.unwrap()
         }
@@ -1756,13 +1756,13 @@ mod tests {
         let before_scalar_result = scalar_query(&dataset).await;
 
         let options = CompactionOptions {
-            target_rows_per_fragment: 1_800,
+            target_rows_per_fragment: 180,
             ..Default::default()
         };
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
         // The indices should be unchanged after compaction, since we are using
-        // move-stable row ids.
+        // stable row ids.
         let current_indices = index_set(&dataset).await;
         assert_eq!(indices, current_indices);
 
@@ -2401,7 +2401,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_cleanup_and_compaction_rebase_cleanup() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2527,7 +2527,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_cleanup_and_compaction_rebase_compaction() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2640,7 +2640,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_compactions_with_defer_index_remap() {
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2706,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_bitmap_index_with_defer_index_remap() {
         // Create a dataset with categorical values
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2806,7 +2806,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_btree_index_with_defer_index_remap() {
         // Create a dataset with an incremental ID column
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -2971,19 +2971,19 @@ mod tests {
         // Initial scan
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count1 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word2.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count2 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word3.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count3 = scanner.count_rows().await.unwrap();
@@ -2991,7 +2991,7 @@ mod tests {
         // Verify that after index creation and compaction, scan uses inverted index scan
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(true).await.unwrap();
@@ -3021,19 +3021,19 @@ mod tests {
         // Verify that scans still work correctly and return the same counts
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count1);
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word2.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count2);
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word3.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count3);
@@ -3164,7 +3164,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_label_list_index_with_defer_index_remap() {
         // Create a dataset with list data for labels
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
@@ -3262,7 +3262,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_ivf_pq_index_v3_with_defer_index_remap() {
         // Create a dataset with vector data
-        let mut dataset = lance_datagen::gen()
+        let mut dataset = lance_datagen::gen_batch()
             .col(
                 "vec",
                 lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),

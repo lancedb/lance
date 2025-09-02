@@ -8,7 +8,39 @@
 
 use std::collections::HashMap;
 
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
+
+/// Byte stream split encoding mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BssMode {
+    /// Never use BSS
+    Off,
+    /// Always use BSS for floating point data
+    On,
+    /// Automatically decide based on data characteristics
+    Auto,
+}
+
+impl BssMode {
+    /// Convert to internal sensitivity value
+    pub fn to_sensitivity(&self) -> f32 {
+        match self {
+            Self::Off => 0.0,
+            Self::On => 1.0,
+            Self::Auto => 0.5, // Default sensitivity for auto mode
+        }
+    }
+
+    /// Parse from string
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "on" => Some(Self::On),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
 
 /// Compression parameter configuration
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +64,9 @@ pub struct CompressionFieldParams {
 
     /// Compression level (only for schemes that support it, e.g., zstd)
     pub compression_level: Option<i32>,
+
+    /// Byte stream split mode for floating point data
+    pub bss: Option<BssMode>,
 }
 
 impl CompressionParams {
@@ -93,6 +128,9 @@ impl CompressionFieldParams {
         if other.compression_level.is_some() {
             self.compression_level = other.compression_level;
         }
+        if other.bss.is_some() {
+            self.bss = other.bss;
+        }
     }
 }
 
@@ -152,28 +190,33 @@ mod tests {
         assert_eq!(params.rle_threshold, None);
         assert_eq!(params.compression, None);
         assert_eq!(params.compression_level, None);
+        assert_eq!(params.bss, None);
 
         let other = CompressionFieldParams {
             rle_threshold: Some(0.3),
             compression: Some("lz4".to_string()),
             compression_level: None,
+            bss: Some(BssMode::On),
         };
 
         params.merge(&other);
         assert_eq!(params.rle_threshold, Some(0.3));
         assert_eq!(params.compression, Some("lz4".to_string()));
         assert_eq!(params.compression_level, None);
+        assert_eq!(params.bss, Some(BssMode::On));
 
         let another = CompressionFieldParams {
             rle_threshold: None,
             compression: Some("zstd".to_string()),
             compression_level: Some(3),
+            bss: Some(BssMode::Auto),
         };
 
         params.merge(&another);
         assert_eq!(params.rle_threshold, Some(0.3)); // Not overridden
         assert_eq!(params.compression, Some("zstd".to_string())); // Overridden
         assert_eq!(params.compression_level, Some(3)); // New value
+        assert_eq!(params.bss, Some(BssMode::Auto)); // Overridden
     }
 
     #[test]
@@ -197,6 +240,7 @@ mod tests {
                 rle_threshold: Some(0.3),
                 compression: Some("zstd".to_string()),
                 compression_level: Some(3),
+                bss: None,
             },
         );
 

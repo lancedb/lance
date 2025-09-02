@@ -29,8 +29,15 @@ pub mod bfloat16;
 pub mod floats;
 pub use floats::*;
 pub mod cast;
+pub mod json;
 pub mod list;
 pub mod memory;
+
+/// Arrow extension metadata key for extension name
+pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
+
+/// Arrow extension metadata key for extension metadata  
+pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -260,7 +267,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         if n >= self.len() {
             return Ok(self.clone());
         }
-        let mut rng = SmallRng::from_entropy();
+        let mut rng = SmallRng::from_os_rng();
         let chosen = (0..self.len() as u32).choose_multiple(&mut rng, n);
         take(self, &UInt32Array::from(chosen), None).map(|arr| arr.as_fixed_size_list().clone())
     }
@@ -585,6 +592,9 @@ pub trait RecordBatchExt {
 
     /// Take selected rows from the [RecordBatch].
     fn take(&self, indices: &UInt32Array) -> Result<RecordBatch>;
+
+    /// Create a new RecordBatch with compacted memory after slicing.
+    fn shrink_to_fit(&self) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -753,6 +763,11 @@ impl RecordBatchExt for RecordBatch {
         let struct_array: StructArray = self.clone().into();
         let taken = take(&struct_array, indices, None)?;
         self.try_new_from_struct_array(taken.as_struct().clone())
+    }
+
+    fn shrink_to_fit(&self) -> Result<Self> {
+        // Deep copy the sliced record batch, instead of whole batch
+        crate::deepcopy::deep_copy_batch_sliced(self)
     }
 }
 
@@ -1309,6 +1324,11 @@ impl BufferExt for arrow_buffer::Buffer {
         let to_fill = size_bytes - bytes.len();
         buf.extend(bytes);
         buf.extend(std::iter::repeat_n(0_u8, to_fill));
+
+        // FIX for issue #4512: Shrink buffer to actual size before converting to immutable
+        // This reduces memory overhead from capacity over-allocation
+        buf.shrink_to_fit();
+
         Self::from(buf)
     }
 }

@@ -33,3 +33,9 @@ pub const STRUCTURAL_ENCODING_META_KEY: &str = "lance-encoding:structural-encodi
 pub const STRUCTURAL_ENCODING_MINIBLOCK: &str = "miniblock";
 /// Value for fullzip structural encoding
 pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
+
+// Byte stream split metadata keys
+/// Metadata key for byte stream split encoding configuration
+pub const BSS_META_KEY: &str = "lance-encoding:bss";
+/// Default BSS mode
+pub const DEFAULT_BSS_MODE: &str = "auto";

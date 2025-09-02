@@ -28,6 +28,7 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
 use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
+use crate::encodings::logical::blob::BlobStructuralEncoder;
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
@@ -364,6 +365,31 @@ impl StructuralEncodingStrategy {
         root_field_metadata: &HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>> {
         let data_type = field.data_type();
+
+        // Check if field is marked as blob
+        if field.is_blob() {
+            match data_type {
+                DataType::Binary | DataType::LargeBinary => {
+                    return Ok(Box::new(BlobStructuralEncoder::new(
+                        field,
+                        column_index.next_column_index(field.id as u32),
+                        options,
+                        self.compression_strategy.clone(),
+                    )?));
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!(
+                            "Blob encoding only supports Binary/LargeBinary, got {}",
+                            data_type
+                        )
+                        .into(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+
         if Self::is_primitive_type(&data_type) {
             Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                 options,
@@ -648,6 +674,7 @@ mod tests {
                 rle_threshold: Some(0.5),
                 compression: Some("lz4".to_string()),
                 compression_level: None,
+                bss: None,
             },
         );
 

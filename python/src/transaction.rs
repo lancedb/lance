@@ -12,12 +12,94 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
+use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::schema::LanceSchema;
 use crate::utils::{class_name, export_vec, extract_vec, PyLance};
+
+// Add Index bindings
+impl FromPyObject<'_> for PyLance<Index> {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let uuid = ob.getattr("uuid")?.to_string();
+        let name = ob.getattr("name")?.extract()?;
+        let fields = ob.getattr("fields")?.extract()?;
+        let dataset_version = ob.getattr("dataset_version")?.extract()?;
+        let index_version = ob.getattr("index_version")?.extract()?;
+        let fragment_ids = ob.getattr("fragment_ids")?;
+        let created_at = ob.getattr("created_at")?.extract()?;
+
+        let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
+        let fragment_bitmap = Some(
+            fragment_ids_ref
+                .into_iter()
+                .map(|id| id.extract::<u32>())
+                .collect::<PyResult<RoaringBitmap>>()?,
+        );
+        let base_id: Option<u32> = ob
+            .getattr("base_id")?
+            .extract::<Option<i64>>()?
+            .map(|id| id as u32);
+
+        Ok(Self(Index {
+            uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
+            name,
+            fields,
+            dataset_version,
+            fragment_bitmap,
+            index_details: None,
+            index_version,
+            created_at,
+            base_id,
+        }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&Index> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .expect("Failed to import lance module");
+
+        let uuid = self.0.uuid.to_string();
+        let name = &self.0.name;
+        let fields = &self.0.fields;
+        let dataset_version = self.0.dataset_version;
+        let index_version = self.0.index_version;
+        let fragment_ids = self.0.fragment_bitmap.as_ref().map_or_else(
+            || PySet::empty(py).unwrap(),
+            |bitmap| {
+                let set = PySet::empty(py).unwrap();
+                for id in bitmap.iter() {
+                    set.add(id).unwrap();
+                }
+                set
+            },
+        );
+        let created_at = self.0.created_at;
+        let base_id = self.0.base_id.map(|id| id as i64);
+
+        let cls = namespace
+            .getattr("Index")
+            .expect("Failed to get Index class");
+        cls.call1((
+            uuid,
+            name.clone(),
+            fields.clone(),
+            dataset_version,
+            fragment_ids,
+            index_version,
+            created_at,
+            base_id,
+        ))
+    }
+}
 
 impl FromPyObject<'_> for PyLance<DataReplacementGroup> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
@@ -127,37 +209,15 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 Ok(Self(op))
             }
             "CreateIndex" => {
-                let uuid = ob.getattr("uuid")?.to_string();
-                let name = ob.getattr("name")?.extract()?;
-                let fields = ob.getattr("fields")?.extract()?;
-                let dataset_version = ob.getattr("dataset_version")?.extract()?;
-                let index_version = ob.getattr("index_version")?.extract()?;
-                let fragment_ids = ob.getattr("fragment_ids")?;
-                let created_at = ob.getattr("created_at")?.extract()?;
-                let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
-                let fragment_ids = fragment_ids_ref
-                    .into_iter()
-                    .map(|id| id.extract())
-                    .collect::<PyResult<Vec<u32>>>()?;
-                let fragment_bitmap = Some(fragment_ids.into_iter().collect());
+                let new_indices_py = ob.getattr("new_indices")?;
+                let removed_indices_py = ob.getattr("removed_indices")?;
 
-                let new_indices = vec![Index {
-                    uuid: Uuid::parse_str(&uuid)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                    name,
-                    fields,
-                    dataset_version,
-                    fragment_bitmap,
-                    // TODO: we should use lance::dataset::Dataset::commit_existing_index once
-                    // we have a way to determine index details from an existing index.
-                    index_details: None,
-                    index_version,
-                    created_at,
-                }];
+                let new_indices = extract_vec(&new_indices_py)?;
+                let removed_indices = extract_vec(&removed_indices_py)?;
 
                 let op = Operation::CreateIndex {
-                    removed_indices: Vec::new(),
                     new_indices,
+                    removed_indices,
                 };
                 Ok(Self(op))
             }
@@ -285,52 +345,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 cls.call1((groups_py, rewritten_indices_py))
             }
             Operation::CreateIndex {
-                ref new_indices, ..
+                ref new_indices,
+                ref removed_indices,
             } => {
-                if let Some(index) = new_indices.first() {
-                    let uuid = index.uuid.to_string();
-                    let name = &index.name;
-                    let fields = &index.fields;
-                    let dataset_version = index.dataset_version;
-                    let index_version = index.index_version;
-                    let fragment_ids = index.fragment_bitmap.as_ref().map_or_else(
-                        || PySet::empty(py).unwrap(),
-                        |bitmap| {
-                            let set = PySet::empty(py).unwrap();
-                            for id in bitmap.iter() {
-                                set.add(id).unwrap();
-                            }
-                            set
-                        },
-                    );
-                    let created_at = index.created_at;
+                let new_indices_py = export_vec(py, new_indices.as_slice())?;
+                let removed_indices_py = export_vec(py, removed_indices.as_slice())?;
 
-                    let cls = namespace
-                        .getattr("CreateIndex")
-                        .expect("Failed to get CreateIndex class");
-                    cls.call1((
-                        uuid,
-                        name,
-                        fields,
-                        dataset_version,
-                        fragment_ids,
-                        index_version,
-                        created_at,
-                    ))
-                } else {
-                    let cls = namespace
-                        .getattr("CreateIndex")
-                        .expect("Failed to get CreateIndex class");
-                    cls.call1((
-                        "",
-                        "",
-                        Vec::<i32>::new(),
-                        0,
-                        PySet::empty(py).unwrap(),
-                        0,
-                        None::<Option<i64>>,
-                    ))
-                }
+                let cls = namespace
+                    .getattr("CreateIndex")
+                    .expect("Failed to get CreateIndex class");
+                cls.call1((new_indices_py, removed_indices_py))
             }
             Operation::Project { ref schema } => {
                 let schema_py = LanceSchema(schema.clone());

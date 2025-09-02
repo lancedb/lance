@@ -304,7 +304,7 @@ impl ScalarIndex for FlatIndex {
         )))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
     }
 
@@ -361,10 +361,10 @@ mod tests {
     use super::*;
     use arrow_array::types::Int32Type;
     use datafusion_common::ScalarValue;
-    use lance_datagen::{array, gen, RowCount};
+    use lance_datagen::{array, gen_batch, RowCount};
 
     fn example_index() -> FlatIndex {
-        let batch = gen()
+        let batch = gen_batch()
             .col(
                 "values",
                 array::cycle::<Int32Type>(vec![10, 100, 1000, 1234]),
@@ -449,7 +449,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = gen()
+        let expected = gen_batch()
             .col("values", array::cycle::<Int32Type>(vec![10, 100, 1234]))
             .col("ids", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
             .into_batch_rows(RowCount::from(3))

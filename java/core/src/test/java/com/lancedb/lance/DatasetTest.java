@@ -43,14 +43,24 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.ZonedDateTime;
-import java.util.*;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 public class DatasetTest {
   private static Dataset dataset;
@@ -346,7 +356,7 @@ public class DatasetTest {
       assertThrows(
           IllegalArgumentException.class,
           () -> {
-            testDataset.createEmptyDataset();
+            testDataset.createEmptyDataset().close();
           });
     }
   }

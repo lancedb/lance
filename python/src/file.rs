@@ -271,7 +271,7 @@ impl LanceFileWriter {
         })
     }
 
-    fn inner_lock(&self) -> PyResult<MutexGuard<Box<FileWriter>>> {
+    fn inner_lock(&self) -> PyResult<MutexGuard<'_, Box<FileWriter>>> {
         self.inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -326,6 +326,14 @@ impl LanceFileWriter {
     pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
         self.inner_lock()?.add_schema_metadata(key, value);
         Ok(())
+    }
+}
+
+impl Drop for LanceFileWriter {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner_lock() {
+            RT.runtime.block_on(inner.abort());
+        }
     }
 }
 
@@ -430,7 +438,7 @@ impl LanceFileReader {
         }
 
         let inner = FileReader::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(file.clone())),
+            Arc::new(LanceEncodingsIo::new(file.clone())),
             path,
             base_projection,
             Arc::<DecoderPlugins>::default(),

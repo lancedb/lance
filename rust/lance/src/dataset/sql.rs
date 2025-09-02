@@ -3,7 +3,7 @@
 
 use crate::datafusion::LanceTableProvider;
 use crate::Dataset;
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
@@ -107,41 +107,19 @@ impl SqlQuery {
     pub fn into_dataframe(self) -> DataFrame {
         self.dataframe
     }
-
-    pub async fn into_explain_plan(
-        self,
-        verbose: bool,
-        analyze: bool,
-    ) -> lance_core::Result<String> {
-        let explained_df = self.dataframe.explain(verbose, analyze)?;
-        let batches = explained_df.collect().await?;
-        let mut lines = Vec::new();
-        for batch in &batches {
-            let column = batch.column(0);
-            let array = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Expected StringArray in 'plan' column for DataFrame.explain");
-            for i in 0..array.len() {
-                lines.push(array.value(i).to_string());
-            }
-        }
-
-        Ok(lines.join("\n"))
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{assert_string_matches, DatagenExt, FragmentCount, FragmentRowCount};
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
-    use lance_datagen::{array, gen};
+    use lance_datagen::{array, gen_batch};
 
     #[tokio::test]
     async fn test_sql_execute() {
-        let mut ds = gen()
+        let mut ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -190,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_count() {
-        let mut ds = gen()
+        let mut ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
@@ -233,27 +211,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sql_explain_plan() {
-        let mut ds = gen()
+    async fn test_explain() {
+        let mut ds = gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(
-                "memory://test_sql_explain_plan",
-                FragmentCount::from(2),
-                FragmentRowCount::from(5),
+                "memory://test_sql_dataset",
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
             )
             .await
             .unwrap();
 
-        let builder = ds
-            .sql("SELECT SUM(x) FROM foo WHERE y > 2")
+        let results = ds
+            .sql("EXPLAIN SELECT * FROM foo where y >= 100")
             .table_name("foo")
             .build()
             .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let results = results.into_iter().next().unwrap();
+
+        let plan = format!("{:?}", results);
+        let expected_pattern = r#"...columns: [StringArray
+[
+  "logical_plan",
+  "physical_plan",
+], StringArray
+[
+  "TableScan: foo projection=[x, y], full_filters=[foo.y >= Int32(100)]",
+  "ProjectionExec: expr=[x@0 as x, y@1 as y]\n  LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=10, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100)\n",
+]], row_count: 2 }"#;
+        assert_string_matches(&plan, expected_pattern).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_analyze() {
+        let mut ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                "memory://test_sql_dataset",
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
             .unwrap();
 
-        let plan = builder.into_explain_plan(true, false).await.unwrap();
+        let results = ds
+            .sql("EXPLAIN ANALYZE SELECT * FROM foo where y >= 100")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let results = results.into_iter().next().unwrap();
 
-        assert!(plan.contains("Aggregate") || plan.contains("SUM"));
+        let plan = format!("{:?}", results);
+        let expected_pattern = r#"...columns: [StringArray
+[
+  "Plan with Metrics",
+], StringArray
+[
+  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., bytes_read=..., fragments_scanned=..., iops=..., ranges_scanned=..., requests=..., rows_scanned=..., task_wait_time=...]\n",
+]], row_count: 1 }"#;
+        assert_string_matches(&plan, expected_pattern).unwrap();
     }
 }

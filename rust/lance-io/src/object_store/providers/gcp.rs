@@ -44,7 +44,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
         let token_key = "google_storage_token";
         if let Some(storage_token) = storage_options.get(token_key) {
             let credential = GcpCredential {
-                bearer: storage_token.to_string(),
+                bearer: storage_token.clone(),
             };
             let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
             builder = builder.with_credentials(credential_provider);
@@ -107,7 +107,7 @@ mod tests {
         let provider = GcsStoreProvider;
 
         let url = Url::parse("gs://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url).unwrap();
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
     }
