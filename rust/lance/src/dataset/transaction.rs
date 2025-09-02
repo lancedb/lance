@@ -57,6 +57,7 @@ use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::rowids::read_row_ids;
+use lance_table::rowids::version::set_version_metadata_for_fragments;
 use lance_table::{
     format::{pb, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta},
     io::{
@@ -1552,6 +1553,9 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
+                if config.use_stable_row_ids {
+                    set_version_metadata_for_fragments(&mut final_fragments, self.read_version + 1);
+                }
             }
             Operation::Delete {
                 ref updated_fragments,
@@ -1627,6 +1631,9 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
+                if config.use_stable_row_ids {
+                    set_version_metadata_for_fragments(&mut final_fragments, self.read_version + 1);
+                }
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
                 if let Some(mem_wal_to_merge) = mem_wal_to_merge {
@@ -1651,6 +1658,9 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
+                if config.use_stable_row_ids {
+                    set_version_metadata_for_fragments(&mut final_fragments, self.read_version + 1);
+                }
                 final_indices = Vec::new();
             }
             Operation::Rewrite {
@@ -3390,6 +3400,7 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
         }];
         let mut next_row_id = 0;
 
@@ -3420,6 +3431,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3450,6 +3462,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3483,6 +3496,7 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
         }];
         let mut next_row_id = 100;
 
@@ -3509,6 +3523,7 @@ mod tests {
                 row_id_meta: None,
                 files: vec![],
                 deletion_file: None,
+                row_latest_update_version_meta: None,
             },
             Fragment {
                 id: 2,
@@ -3516,6 +3531,7 @@ mod tests {
                 row_id_meta: Some(RowIdMeta::Inline(serialized)),
                 files: vec![],
                 deletion_file: None,
+                row_latest_update_version_meta: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -3558,6 +3574,7 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
         }];
         let mut next_row_id = 0;
 

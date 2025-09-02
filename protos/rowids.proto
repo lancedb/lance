@@ -96,3 +96,17 @@ message EncodedU64Array {
         U64Array u64_array = 3;
     }
 }
+
+/// A sequence of row latest update versions. Similar to RowIdSequence but tracks
+/// the latest update version runs. It uses RLE (Run-Length Encoding) to efficiently
+// represent consecutive rows with the same version.
+message RowLatestUpdateVersionSequence {
+    repeated RowVersionRun runs = 1;
+}
+
+/// Different ways to encode row version information, optimized for common patterns.
+message RowVersionRun {
+    U64Segment span = 1;
+
+    uint64 version = 2;
+}
