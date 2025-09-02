@@ -259,6 +259,6 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
       - name: Install dependencies
         run: |
-          uv --no-project sync --group ray
+          uv sync --no-project --group ray
           uv pip install torch --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cpu
       - uses: ./.github/workflows/run_integtests
