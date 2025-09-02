@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
@@ -1055,6 +1056,7 @@ impl Scanner {
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
+            dist_q_c: 0.0,
         });
         Ok(self)
     }
@@ -3429,16 +3431,21 @@ impl Scanner {
 
     #[instrument(level = "info", skip(self))]
     pub async fn analyze_plan(&self) -> Result<String> {
+        let start = Instant::now();
         let plan = self.create_plan().await?;
+        log::info!("create plan took {:?}", start.elapsed());
 
-        analyze_plan(
+        let start = Instant::now();
+        let res = analyze_plan(
             plan,
             LanceExecutionOptions {
                 batch_size: self.batch_size,
                 ..Default::default()
             },
         )
-        .await
+        .await;
+        log::info!("analyze plan took {:?}", start.elapsed());
+        res
     }
 
     #[instrument(level = "info", skip(self))]
