@@ -48,7 +48,8 @@ lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
 log = "0.4"
-prost = "0.13.2"
+prost = "0.13"
+prost-types = "0.13"
 pyo3 = { version = "0.24.1", features = [
     "extension-module",
     "abi3-py39",

@@ -10,10 +10,11 @@
 //!     │    │
 //!     └────┴──► Index-specific cache (prefixed by index UUID and FRI UUID)
 
-use std::{borrow::Cow, ops::Deref};
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
+use deepsize::{Context, DeepSizeOf};
 use lance_core::cache::{CacheKey, LanceCache};
-use lance_index::{frag_reuse::FragReuseIndex, scalar::ScalarIndexType};
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_table::format::Index;
 use uuid::Uuid;
 
@@ -96,13 +97,27 @@ impl CacheKey for IndexMetadataKey {
     }
 }
 
+pub struct ProstAny(pub Arc<prost_types::Any>);
+
+impl DeepSizeOf for ProstAny {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.0.type_url.deep_size_of_children(context) + self.0.value.deep_size_of_children(context)
+    }
+}
+
+/// Cache key for scalar index details
+///
+/// Typically we don't use the cache for scalar index details because they are stored
+/// in the manifest and readily available.  However, old versions of Lance didn't store
+/// details in the manifest, and we have to perform an expensive inference process to determine
+/// what they are.  These we cache.
 #[derive(Debug)]
-pub struct ScalarIndexTypeKey<'a> {
+pub struct ScalarIndexDetailsKey<'a> {
     pub uuid: &'a str,
 }
 
-impl CacheKey for ScalarIndexTypeKey<'_> {
-    type ValueType = ScalarIndexType;
+impl CacheKey for ScalarIndexDetailsKey<'_> {
+    type ValueType = ProstAny;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("type/{}", self.uuid))

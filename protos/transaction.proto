@@ -5,6 +5,7 @@ syntax = "proto3";
 
 import "file.proto";
 import "table.proto";
+import "google/protobuf/any.proto";
 
 package lance.table;
 
@@ -103,6 +104,10 @@ message Transaction {
       UUID old_id = 1;
       // the id of the new index
       UUID new_id = 2;
+      // the new index details
+      google.protobuf.Any new_index_details = 3;
+      // the version of the new index
+      uint32 new_index_version = 4;
     }
 
     // A group of rewrite files that are all part of the same rewrite.

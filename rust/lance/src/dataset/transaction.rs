@@ -1004,11 +1004,16 @@ impl PartialEq for Operation {
 pub struct RewrittenIndex {
     pub old_id: Uuid,
     pub new_id: Uuid,
+    pub new_index_details: prost_types::Any,
+    pub new_index_version: u32,
 }
 
 impl DeepSizeOf for RewrittenIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        0
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.new_index_details
+            .type_url
+            .deep_size_of_children(context)
+            + self.new_index_details.value.deep_size_of_children(context)
     }
 }
 
@@ -2401,6 +2406,17 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                         location!(),
                     )
                 })??,
+            new_index_details: message
+                .new_index_details
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "new_index_details is a required field".to_string(),
+                        location!(),
+                    )
+                })?
+                .clone(),
+            new_index_version: message.new_index_version,
         })
     }
 }
@@ -2629,6 +2645,8 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
         Self {
             old_id: Some((&value.old_id).into()),
             new_id: Some((&value.new_id).into()),
+            new_index_details: Some(value.new_index_details.clone()),
+            new_index_version: value.new_index_version,
         }
     }
 }

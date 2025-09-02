@@ -11,9 +11,12 @@ use itertools::Itertools;
 use lance_core::cache::LanceCache;
 use lance_core::ROW_ADDR;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::pb;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexBuilder, ZoneMapIndexBuilderOptions};
-use lance_index::scalar::{SargableQuery, ScalarIndex};
+use lance_index::scalar::zonemap::{
+    ZoneMapIndexBuilder, ZoneMapIndexBuilderParams, ZoneMapIndexPlugin,
+};
+use lance_index::scalar::{registry::ScalarIndexPlugin, SargableQuery};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
@@ -66,7 +69,7 @@ fn bench_zonemap(c: &mut Criterion) {
             );
 
             let mut builder = ZoneMapIndexBuilder::try_new(
-                ZoneMapIndexBuilderOptions::default(),
+                ZoneMapIndexBuilderParams::default(),
                 batch.schema().field(0).data_type().clone(),
             )
             .unwrap();
@@ -83,8 +86,9 @@ fn bench_zonemap(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
+    let details = prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(ZoneMapIndex::load(store, None, LanceCache::no_cache()))
+        .block_on(ZoneMapIndexPlugin.load_index(store, &details, None, LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("zonemap_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
