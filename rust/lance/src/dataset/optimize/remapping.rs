@@ -19,18 +19,27 @@ use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RemappedIndex {
-    pub original: Uuid,
-    pub new: Uuid,
+/// The result of remapping an index
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemapResult {
+    // Index could not be remapped, drop it
+    Drop,
+    // No remapping is needed, keep the index as-is
+    Keep(Uuid),
+    // Index was remapped, return the new index
+    Remapped(RemappedIndex),
 }
 
-impl RemappedIndex {
-    pub fn new(original: Uuid, new: Uuid) -> Self {
-        Self { original, new }
-    }
+/// A remapped index
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemappedIndex {
+    pub old_id: Uuid,
+    pub new_id: Uuid,
+    pub index_details: prost_types::Any,
+    pub index_version: u32,
 }
 
 /// When compaction runs the row ids will change.  This typically means that
@@ -260,10 +269,11 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         };
 
         if should_remap {
-            let new_index_id = index::remap_index(dataset, &curr_index_id, row_id_map).await?;
+            let remap_result = index::remap_index(dataset, &curr_index_id, row_id_map).await?;
 
-            if let Some(new_id) = new_index_id {
-                let new_index_meta = Index {
+            let new_index_meta = match remap_result {
+                RemapResult::Drop => continue,
+                RemapResult::Keep(new_id) => Index {
                     uuid: new_id,
                     name: curr_index_meta.name.clone(),
                     fields: curr_index_meta.fields.clone(),
@@ -273,24 +283,37 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     index_version: curr_index_meta.index_version,
                     created_at: curr_index_meta.created_at,
                     base_id: None,
-                };
+                },
+                RemapResult::Remapped(remapped_index) => Index {
+                    uuid: remapped_index.new_id,
+                    name: curr_index_meta.name.clone(),
+                    fields: curr_index_meta.fields.clone(),
+                    dataset_version: dataset.manifest.version,
+                    fragment_bitmap: bitmap_after_remap,
+                    index_details: Some(Arc::new(remapped_index.index_details)),
+                    index_version: remapped_index.index_version as i32,
+                    created_at: curr_index_meta.created_at,
+                    base_id: None,
+                },
+            };
 
-                let transaction = Transaction::new(
-                    dataset.manifest.version,
-                    Operation::CreateIndex {
-                        new_indices: vec![new_index_meta],
-                        removed_indices: vec![curr_index_meta.clone()],
-                    },
-                    None,
-                    None,
-                );
+            let new_id = new_index_meta.uuid;
 
-                dataset
-                    .apply_commit(transaction, &Default::default(), &Default::default())
-                    .await?;
+            let transaction = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![new_index_meta],
+                    removed_indices: vec![curr_index_meta.clone()],
+                },
+                None,
+                None,
+            );
 
-                curr_index_id = new_id;
-            }
+            dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await?;
+
+            curr_index_id = new_id;
         }
     }
 

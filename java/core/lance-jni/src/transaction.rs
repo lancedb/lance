@@ -47,10 +47,19 @@ impl IntoJava for RewrittenIndex {
         let old_id = self.old_id.into_java(env)?;
         let new_id = self.new_id.into_java(env)?;
 
+        let new_index_details_type_url = env.new_string(self.new_index_details.type_url)?;
+        let new_index_details_value = env.byte_array_from_slice(&self.new_index_details.value)?;
+
         Ok(env.new_object(
             "com/lancedb/lance/operation/RewrittenIndex",
-            "(Ljava/util/UUID;Ljava/util/UUID;)V",
-            &[JValue::Object(&old_id), JValue::Object(&new_id)],
+            "(Ljava/util/UUID;Ljava/util/UUID;Ljava/lang/String;[BII)V",
+            &[
+                JValue::Object(&old_id),
+                JValue::Object(&new_id),
+                JValue::Object(&new_index_details_type_url),
+                JValue::Object(&new_index_details_value),
+                JValue::Int(self.new_index_version as i32),
+            ],
         )?)
     }
 }
@@ -176,9 +185,28 @@ impl FromJObjectWithEnv<RewrittenIndex> for JObject<'_> {
         let java_new_id = env.get_field(self, "newId", "Ljava/util/UUID;")?.l()?;
         let java_old_id = java_old_id.extract_object(env)?;
         let java_new_id = java_new_id.extract_object(env)?;
+
+        let new_index_details_type_url = env
+            .get_field(self, "newIndexDetailsTypeUrl", "Ljava/lang/String;")?
+            .l()?;
+        let new_index_details_type_url: String = env
+            .get_string(&JString::from(new_index_details_type_url))?
+            .to_str()?
+            .to_string();
+
+        let new_index_details_value = env.get_field(self, "newIndexDetailsValue", "[B")?.l()?;
+        let new_index_details_value =
+            env.convert_byte_array(JByteArray::from(new_index_details_value))?;
+
+        let new_index_version = env.get_field(self, "newIndexVersion", "I")?.i()?;
         Ok(RewrittenIndex {
             old_id: java_old_id,
             new_id: java_new_id,
+            new_index_details: prost_types::Any {
+                type_url: new_index_details_type_url,
+                value: new_index_details_value,
+            },
+            new_index_version: new_index_version as u32,
         })
     }
 }
@@ -221,7 +249,7 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
             let bytes = env.convert_byte_array(&byte_array)?;
             let any = Any::decode(&bytes[..])
                 .map_err(|e| Error::input_error(format!("Invalid index_details data: {}", e)))?;
-            Some(any)
+            Some(Arc::new(any))
         };
 
         let index_version = env.get_field(self, "indexVersion", "I")?.i()?;

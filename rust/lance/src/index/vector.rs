@@ -233,10 +233,6 @@ impl IndexParams for VectorIndexParams {
         self
     }
 
-    fn index_type(&self) -> IndexType {
-        IndexType::Vector
-    }
-
     fn index_name(&self) -> &str {
         LANCE_VECTOR_INDEX
     }
