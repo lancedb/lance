@@ -262,6 +262,25 @@ message DataFragment {
     ExternalFile external_row_ids = 6;
   } // row_id_sequence
 
+  oneof row_latest_updated_version_sequence {
+    // If small (< 200KB), the row latest updated versions are stored inline.
+    bytes inline_row_latest_updated_versions = 7;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_row_latest_updated_versions = 8;
+  } // row_latest_updated_version_sequence
+
+  // Optimization field: minimum latest update version in this fragment
+  //
+  // This allows for fragment-level filtering during diff operations.
+  // If all rows in the fragment have versions <= compared_version,
+  // the fragment can be skipped entirely.
+  optional uint64 min_latest_update_version = 9;
+
+  // Optimization field: maximum latest update version in this fragment
+  //
+  // This allows for fragment-level filtering during diff operations.
+  optional uint64 max_latest_update_version = 10;
+
   // Number of original rows in the fragment, this includes rows that are now marked with
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.

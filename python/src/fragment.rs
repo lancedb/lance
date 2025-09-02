@@ -26,7 +26,9 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
+use lance_table::format::{
+    DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta, RowLatestUpdateVersionMeta,
+};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
@@ -593,6 +595,9 @@ impl PyDeletionFile {
 #[pyclass(name = "RowIdMeta", module = "lance.fragment")]
 pub struct PyRowIdMeta(pub RowIdMeta);
 
+#[pyclass(name = "RowLatestUpdateVersionMeta", module = "lance.fragment")]
+pub struct PyRowLatestUpdateVersionMeta(pub RowLatestUpdateVersionMeta);
+
 #[pymethods]
 impl PyRowIdMeta {
     fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
@@ -670,6 +675,13 @@ impl FromPyObject<'_> for PyLance<Fragment> {
 
         let row_id_meta: Option<PyRef<PyRowIdMeta>> = ob.getattr("row_id_meta")?.extract()?;
         let row_id_meta = row_id_meta.map(|r| r.0.clone());
+        let row_latest_update_version_meta: Option<PyRef<PyRowLatestUpdateVersionMeta>> =
+            ob.getattr("row_latest_update_version_meta")?.extract()?;
+        let row_latest_update_version_meta = row_latest_update_version_meta.map(|r| r.0.clone());
+        let min_latest_update_version: Option<u64> =
+            ob.getattr("min_latest_update_version")?.extract()?;
+        let max_latest_update_version: Option<u64> =
+            ob.getattr("max_latest_update_version")?.extract()?;
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
@@ -677,6 +689,9 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             deletion_file,
             physical_rows: ob.getattr("physical_rows")?.extract()?,
             row_id_meta,
+            row_latest_update_version_meta,
+            min_latest_update_version,
+            max_latest_update_version,
         }))
     }
 }

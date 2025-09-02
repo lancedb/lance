@@ -3041,6 +3041,9 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         }];
         let mut next_row_id = 0;
 
@@ -3071,6 +3074,9 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         }];
         let mut next_row_id = 100;
 
@@ -3101,6 +3107,9 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         }];
         let mut next_row_id = 100;
 
@@ -3134,6 +3143,9 @@ mod tests {
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         }];
         let mut next_row_id = 100;
 
@@ -3160,6 +3172,9 @@ mod tests {
                 row_id_meta: None,
                 files: vec![],
                 deletion_file: None,
+                row_latest_update_version_meta: None,
+                min_latest_update_version: None,
+                max_latest_update_version: None,
             },
             Fragment {
                 id: 2,
@@ -3167,6 +3182,9 @@ mod tests {
                 row_id_meta: Some(RowIdMeta::Inline(serialized)),
                 files: vec![],
                 deletion_file: None,
+                row_latest_update_version_meta: None,
+                min_latest_update_version: None,
+                max_latest_update_version: None,
             },
         ];
         let mut next_row_id = 1000;
@@ -3209,6 +3227,9 @@ mod tests {
             row_id_meta: None,
             files: vec![],
             deletion_file: None,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         }];
         let mut next_row_id = 0;
 

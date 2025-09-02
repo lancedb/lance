@@ -1101,6 +1101,15 @@ dependencies = [
 
 [[package]]
 name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
@@ -4215,6 +4224,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "bincode 1.3.3",
  "byteorder",
  "bytes",
  "chrono",
@@ -4415,7 +4425,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50aba4ef41052280722f2120f65606b9218e8718032a3c752b953c4d8091f02e"
 dependencies = [
  "anyhow",
- "bincode",
+ "bincode 2.0.1",
  "byteorder",
  "csv",
  "kanaria",
@@ -4444,7 +4454,7 @@ version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d77e7a0830fd60f23828ad914439997288c1d2cdd9e269be67f967c27b56350"
 dependencies = [
- "bincode",
+ "bincode 2.0.1",
  "byteorder",
  "lindera-dictionary",
  "once_cell",
@@ -4458,7 +4468,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "489cc70922782af3fd397c0e130846caefe1c15b27c2211aac8f88a9f4590aaf"
 dependencies = [
  "anyhow",
- "bincode",
+ "bincode 2.0.1",
  "byteorder",
  "csv",
  "derive_builder",
@@ -4486,7 +4496,7 @@ version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78870521431dfaf0f94ddd3484fa08367e9d354fc8c708572f2f00007225ddfa"
 dependencies = [
- "bincode",
+ "bincode 2.0.1",
  "byteorder",
  "lindera-dictionary",
  "once_cell",
@@ -4499,7 +4509,7 @@ version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "abcb3dc3056e5c683e12c2c5e8d40076f7ecfd7bd46f5fc0e4ae9e58152b5d85"
 dependencies = [
- "bincode",
+ "bincode 2.0.1",
  "byteorder",
  "lindera-dictionary",
  "once_cell",
@@ -4512,7 +4522,7 @@ version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e99316158bab14f0256d912055521ca784f76c63e7460db8a74775c5dc1f8bc2"
 dependencies = [
- "bincode",
+ "bincode 2.0.1",
  "byteorder",
  "lindera-dictionary",
  "once_cell",
@@ -4536,7 +4546,7 @@ version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52672945166c14276bbba25e4ec79d7e126db1b503c0a6aa07ffc0141ae15cfa"
 dependencies = [
- "bincode",
+ "bincode 2.0.1",
  "byteorder",
  "lindera-dictionary",
  "once_cell",

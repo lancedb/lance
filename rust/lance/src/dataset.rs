@@ -5,6 +5,7 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::{ArrowError, Schema as ArrowSchema};
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
 use deepsize::DeepSizeOf;
@@ -85,7 +86,7 @@ use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::delta::DatasetDelta;
+use crate::dataset::delta::{DatasetDelta, DatasetDiffBuilder, DiffRecordStream};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -99,6 +100,7 @@ use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
+use lance_io::stream::RecordBatchStream;
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -667,6 +669,42 @@ impl Dataset {
             end_version,
             base_dataset: self.clone(),
         })
+    }
+
+    /// Diff a specified version and return the changed records.
+    /// This API depends on the Stable-RowID feature, which is not enabled by default.
+    /// Make sure to enable it when creating the dataset.
+    /// If not, an error will be returned.
+    pub async fn diff(&self, compared_version: u64) -> Result<Box<dyn RecordBatchStream>> {
+        if !self.manifest.uses_stable_row_ids() {
+            return Err(Error::NotSupported {
+                source: "Diff operation requires Stable Row ID feature to be enabled. \
+                 Please enable it when creating the dataset."
+                    .into(),
+                location: location!(),
+            });
+        }
+
+        self.validate_compared_version(compared_version).await?;
+        let ds_delta = self.build_dataset_delta(compared_version).await?;
+        match ds_delta.to_stream().await? {
+            Some(stream) => Ok(stream),
+            None => {
+                let empty_schema = Arc::new(ArrowSchema::empty());
+                let empty_stream =
+                    futures::stream::empty::<std::result::Result<RecordBatch, ArrowError>>();
+                Ok(Box::new(lance_io::stream::RecordBatchStreamAdapter::new(
+                    empty_schema,
+                    empty_stream.map_err(Error::from),
+                )))
+            }
+        }
+    }
+
+    pub async fn diff_new(&self, compared_version: u64) -> Result<DiffRecordStream> {
+        DatasetDiffBuilder::new(Arc::new(self.clone()), compared_version)
+            .execute()
+            .await
     }
 
     /// Diff with a specified version and return a list of transactions between (begin_version, end_version].

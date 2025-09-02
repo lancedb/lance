@@ -14,6 +14,7 @@ use snafu::location;
 
 use crate::format::pb;
 
+use crate::format::row_version::RowLatestUpdateVersionMeta;
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
 
@@ -281,6 +282,24 @@ pub struct Fragment {
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
     pub physical_rows: Option<usize>,
+
+    /// Row latest update version's metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_latest_update_version_meta: Option<RowLatestUpdateVersionMeta>,
+
+    /// Optimization field: minimum latest update version in this fragment
+    ///
+    /// This allows for fragment-level filtering during diff operations.
+    /// If all rows in the fragment have versions <= compared_version,
+    /// the fragment can be skipped entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_latest_update_version: Option<u64>,
+
+    /// Optimization field: maximum latest update version in this fragment
+    ///
+    /// This allows for fragment-level filtering during diff operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_latest_update_version: Option<u64>,
 }
 
 impl Fragment {
@@ -291,6 +310,9 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         }
     }
 
@@ -328,6 +350,9 @@ impl Fragment {
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
+            row_latest_update_version_meta: None,
+            min_latest_update_version: None,
+            max_latest_update_version: None,
         }
     }
 
@@ -446,6 +471,12 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
+            row_latest_update_version_meta: p
+                .row_latest_updated_version_sequence
+                .map(RowLatestUpdateVersionMeta::try_from)
+                .transpose()?,
+            min_latest_update_version: p.min_latest_update_version,
+            max_latest_update_version: p.max_latest_update_version,
         })
     }
 }
@@ -477,12 +508,26 @@ impl From<&Fragment> for pb::DataFragment {
             }
         });
 
+        let row_latest_updated_version_sequence = f.row_latest_update_version_meta.as_ref().map(|m| match m {
+            RowLatestUpdateVersionMeta::Inline(data) => pb::data_fragment::RowLatestUpdatedVersionSequence::InlineRowLatestUpdatedVersions(data.clone()),
+            RowLatestUpdateVersionMeta::External(file) => {
+                pb::data_fragment::RowLatestUpdatedVersionSequence::ExternalRowLatestUpdatedVersions(pb::ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                })
+            }
+        });
+
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            row_latest_updated_version_sequence,
+            min_latest_update_version: f.min_latest_update_version,
+            max_latest_update_version: f.max_latest_update_version,
         }
     }
 }
