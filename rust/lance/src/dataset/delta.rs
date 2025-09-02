@@ -7,6 +7,7 @@ use crate::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
+use lance_io::stream::RecordBatchStream;
 
 /// The delta dataset between two versions of a dataset.
 pub struct DatasetDelta {
@@ -47,6 +48,10 @@ impl DatasetDelta {
             .try_filter_map(|result| async move { Ok(result) })
             .try_collect()
             .await
+    }
+
+    pub async fn to_stream(&self) -> Result<Option<Box<dyn RecordBatchStream>>> {
+        Ok(None)
     }
 }
 
