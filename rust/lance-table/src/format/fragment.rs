@@ -14,6 +14,7 @@ use snafu::location;
 
 use crate::format::pb;
 
+use crate::rowids::segment::U64Segment;
 use lance_core::datatypes::Schema;
 use lance_core::error::Result;
 
@@ -240,6 +241,17 @@ pub enum RowIdMeta {
     External(ExternalFile),
 }
 
+/// Metadata about location of the latest update version sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub enum RowLatestUpdateVersionMeta {
+    Inline(Vec<u8>),
+    External(ExternalFile),
+}
+
+/// Sequence of latest update versions for rows in a fragment.
+#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq, Default)]
+pub struct RowLatestUpdateVersionSequence(Vec<U64Segment>);
+
 impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
     type Error = Error;
 
@@ -247,6 +259,23 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
         match value {
             pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data)),
             pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
+                Ok(Self::External(ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                }))
+            }
+        }
+    }
+}
+
+impl TryFrom<pb::data_fragment::RowLatestUpdatedVersionSequence> for RowLatestUpdateVersionMeta {
+    type Error = Error;
+
+    fn try_from(value: pb::data_fragment::RowLatestUpdatedVersionSequence) -> Result<Self> {
+        match value {
+            pb::data_fragment::RowLatestUpdatedVersionSequence::InlineRowLatestUpdatedVersions(data) => Ok(Self::Inline(data)),
+            pb::data_fragment::RowLatestUpdatedVersionSequence::ExternalRowLatestUpdatedVersions(file) => {
                 Ok(Self::External(ExternalFile {
                     path: file.path.clone(),
                     offset: file.offset,
@@ -281,6 +310,10 @@ pub struct Fragment {
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
     pub physical_rows: Option<usize>,
+
+    /// Row latest update version's metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_latest_update_version_meta: Option<RowLatestUpdateVersionMeta>,
 }
 
 impl Fragment {
@@ -291,6 +324,7 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
+            row_latest_update_version_meta: None,
         }
     }
 
@@ -328,6 +362,7 @@ impl Fragment {
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
+            row_latest_update_version_meta: None,
         }
     }
 
@@ -446,6 +481,10 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
+            row_latest_update_version_meta: p
+                .row_latest_updated_version_sequence
+                .map(RowLatestUpdateVersionMeta::try_from)
+                .transpose()?,
         })
     }
 }
@@ -477,12 +516,24 @@ impl From<&Fragment> for pb::DataFragment {
             }
         });
 
+        let row_latest_updated_version_sequence = f.row_latest_update_version_meta.as_ref().map(|m| match m {
+            RowLatestUpdateVersionMeta::Inline(data) => pb::data_fragment::RowLatestUpdatedVersionSequence::InlineRowLatestUpdatedVersions(data.clone()),
+            RowLatestUpdateVersionMeta::External(file) => {
+                pb::data_fragment::RowLatestUpdatedVersionSequence::ExternalRowLatestUpdatedVersions(pb::ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                })
+            }
+        });
+
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            row_latest_updated_version_sequence,
         }
     }
 }
