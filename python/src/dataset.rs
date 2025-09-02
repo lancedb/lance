@@ -2445,7 +2445,11 @@ fn prepare_vector_index_params(
 
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
-            ivf_params.num_partitions = n.extract()?
+            ivf_params.num_partitions = Some(n.extract()?)
+        };
+
+        if let Some(n) = kwargs.get_item("target_partition_size")? {
+            ivf_params.target_partition_size = Some(n.extract()?)
         };
 
         if let Some(n) = kwargs.get_item("shuffle_partition_concurrency")? {
@@ -2552,9 +2556,8 @@ fn prepare_vector_index_params(
     }
 
     let mut params = match index_type {
-        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::ivf_flat(
-            ivf_params.num_partitions,
-            m_type,
+        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::with_ivf_flat_params(
+            m_type, ivf_params,
         ))),
 
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(

@@ -115,6 +115,15 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn with_ivf_flat_params(metric_type: MetricType, ivf: IvfBuildParams) -> Self {
+        let stages = vec![StageParams::Ivf(ivf)];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
     /// Create index parameters for `IVF_PQ` index.
     ///
     /// Parameters

@@ -159,6 +159,34 @@ impl TryFrom<i32> for IndexType {
     }
 }
 
+impl TryFrom<&str> for IndexType {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "BTree" => Ok(Self::BTree),
+            "Bitmap" => Ok(Self::Bitmap),
+            "LabelList" => Ok(Self::LabelList),
+            "Inverted" => Ok(Self::Inverted),
+            "NGram" => Ok(Self::NGram),
+            "FragmentReuse" => Ok(Self::FragmentReuse),
+            "MemWal" => Ok(Self::MemWal),
+            "ZoneMap" => Ok(Self::ZoneMap),
+            "Vector" => Ok(Self::Vector),
+            "IVF_FLAT" => Ok(Self::IvfFlat),
+            "IVF_SQ" => Ok(Self::IvfSq),
+            "IVF_PQ" => Ok(Self::IvfPq),
+            "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
+            "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
+            "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            _ => Err(Error::invalid_input(
+                format!("invalid index type: {}", value),
+                location!(),
+            )),
+        }
+    }
+}
+
 impl IndexType {
     pub fn is_scalar(&self) -> bool {
         matches!(
