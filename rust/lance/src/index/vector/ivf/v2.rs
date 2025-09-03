@@ -667,7 +667,7 @@ mod tests {
     use lance_index::{metrics::NoOpMetricsCollector, INDEX_AUXILIARY_FILE_NAME};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
-    use lance_index::{DatasetIndexExt, IndexParams, IndexType};
+    use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
