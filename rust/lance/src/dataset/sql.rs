@@ -281,4 +281,139 @@ mod tests {
 ]], row_count: 1 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
     }
+
+    #[tokio::test]
+    async fn test_anti_join_not_exists_sql() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+        use tempfile::tempdir;
+        use crate::Dataset;
+
+        // Create test directory
+        let test_dir = tempdir().unwrap();
+        let large_table_uri = format!("{}/large_table", test_dir.path().to_str().unwrap());
+        let small_table_uri = format!("{}/small_table", test_dir.path().to_str().unwrap());
+
+        // Create schema for both tables
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Utf8, false),
+        ]));
+
+        // Create large table (20 rows - simulating 600M)
+        let large_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter(0..20)),
+                Arc::new(StringArray::from((0..20).map(|i| format!("large_{}", i)).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(large_batch)], schema.clone());
+        let large_dataset = Dataset::write(reader, &large_table_uri, None)
+            .await
+            .unwrap();
+
+        // Create small exclusion table (5 rows - simulating 1M)
+        // Exclude IDs: 2, 5, 8, 11, 14
+        let small_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 5, 8, 11, 14])),
+                Arc::new(StringArray::from(vec!["excl_2", "excl_5", "excl_8", "excl_11", "excl_14"])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(small_batch)], schema);
+        let small_dataset = Dataset::write(reader, &small_table_uri, None)
+            .await
+            .unwrap();
+
+        // Register both tables in DataFusion context
+        let ctx = datafusion::prelude::SessionContext::new();
+        let large_provider = Arc::new(crate::datafusion::LanceTableProvider::new(Arc::new(large_dataset.clone()), false, false));
+        let small_provider = Arc::new(crate::datafusion::LanceTableProvider::new(Arc::new(small_dataset.clone()), false, false));
+
+        ctx.register_table("large_table", large_provider).unwrap();
+        ctx.register_table("small_table", small_provider).unwrap();
+
+        // SQL query with NOT EXISTS (anti-join pattern)
+        let sql = r#"
+            EXPLAIN ANALYZE SELECT *
+            FROM large_table lt
+            WHERE NOT EXISTS (
+                SELECT 1 FROM small_table st WHERE st.id = lt.id
+            )
+            LIMIT 10
+        "#;
+
+        println!("\n=== SQL NOT EXISTS Test ===");
+        println!("Query: {}", sql);
+        println!("Large table: 20 rows, Small exclusion table: 5 rows");
+
+        // Execute EXPLAIN ANALYZE to get the plan
+        let df = ctx.sql(sql).await.unwrap();
+        let results = df.collect().await.unwrap();
+        
+        // Print the EXPLAIN ANALYZE output
+        println!("\nEXPLAIN ANALYZE Output:");
+        for batch in &results {
+            println!("Batch: {} columns, {} rows", batch.num_columns(), batch.num_rows());
+            // EXPLAIN ANALYZE returns two columns: plan type and plan details
+            if batch.num_columns() >= 2 && batch.num_rows() > 0 {
+                let plan_details = batch.column(1);  // Second column has the actual plan
+                if let Some(string_array) = plan_details.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..batch.num_rows() {
+                        let plan_text = string_array.value(i);
+                        println!("{}", plan_text);
+                    }
+                }
+            }
+        }
+        
+        // Now run the actual query (without EXPLAIN ANALYZE) to get results
+        let actual_sql = r#"
+            SELECT *
+            FROM large_table lt
+            WHERE NOT EXISTS (
+                SELECT 1 FROM small_table st WHERE st.id = lt.id
+            )
+            LIMIT 10
+        "#;
+        
+        let df = ctx.sql(actual_sql).await.unwrap();
+        let results = df.collect().await.unwrap();
+
+        let mut result_ids = Vec::new();
+        let excluded_ids = vec![2, 5, 8, 11, 14];
+
+        for batch in &results {
+            let id_array = batch.column(0).as_primitive::<Int32Type>();
+            for i in 0..id_array.len() {
+                let id = id_array.value(i);
+                result_ids.push(id);
+
+                // Verify excluded IDs are not in results
+                assert!(!excluded_ids.contains(&id),
+                        "Found excluded ID {} in NOT EXISTS results", id);
+            }
+        }
+
+        // Should return exactly 10 rows due to LIMIT
+        assert_eq!(result_ids.len(), 10, "Should return exactly 10 rows due to LIMIT");
+
+        // Expected: first 10 non-excluded IDs
+        let expected: Vec<i32> = (0..20)
+            .filter(|i| !excluded_ids.contains(i))
+            .take(10)
+            .collect();
+        assert_eq!(result_ids, expected, "NOT EXISTS results should match expected");
+
+        println!("✅ SQL NOT EXISTS test passed: {} rows returned", result_ids.len());
+        println!("Returned IDs: {:?}", result_ids);
+        println!("Successfully filtered out: {:?}", excluded_ids);
+    }
 }
