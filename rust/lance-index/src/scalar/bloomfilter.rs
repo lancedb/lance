@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//!Bloom Filter Index
+//! Bloom Filter Index
 //!
 //! Bloom Filter is a probabilistic data structure that allows for fast membership testing.
 //! It is a space-efficient data structure that can be used to test whether an element is a member of a set.
@@ -11,21 +11,12 @@ use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{pb, Any};
-use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion_expr::Accumulator;
-use futures::TryStreamExt;
-use lance_core::cache::LanceCache;
-use lance_core::ROW_ADDR;
-use lance_datafusion::chunker::chunk_concat_stream;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 
-use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field};
+use arrow_schema::Field;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion_common::ScalarValue;
 use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
@@ -34,8 +25,9 @@ use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::cache::LanceCache;
+use lance_core::Error;
 use lance_core::Result;
-use lance_core::{utils::mask::RowIdTreeMap, Error};
 use roaring::RoaringBitmap;
 use snafu::location;
 
@@ -43,33 +35,23 @@ pub struct BloomFilterIndex {}
 
 impl std::fmt::Debug for BloomFilterIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BloomFilterIndex")
+        f.debug_struct("BloomFilterIndex").finish()
     }
 }
 
 impl DeepSizeOf for BloomFilterIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         0
     }
 }
 
 impl BloomFilterIndex {
     async fn load(
-        store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        _store: Arc<dyn IndexStore>,
+        _fri: Option<Arc<FragReuseIndex>>,
+        _index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {}))
-    }
-
-    fn try_from_serialized(
-        data: RecordBatch,
-        store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
-        max_zonemap_size: u64,
-    ) -> Result<Self> {
-        Ok(Self {})
     }
 }
 
@@ -107,7 +89,7 @@ impl Index for BloomFilterIndex {
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         // TODO: fix me
-        Ok(())
+        Ok(RoaringBitmap::new())
     }
 }
 
@@ -115,8 +97,8 @@ impl Index for BloomFilterIndex {
 impl ScalarIndex for BloomFilterIndex {
     async fn search(
         &self,
-        query: &dyn AnyQuery,
-        metrics: &dyn MetricsCollector,
+        _query: &dyn AnyQuery,
+        _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         Ok(SearchResult::AtMost(Default::default()))
     }
@@ -140,11 +122,14 @@ impl ScalarIndex for BloomFilterIndex {
     /// Add the new data , creating an updated version of the index in `dest_store`
     async fn update(
         &self,
-        new_data: SendableRecordBatchStream,
-        dest_store: &dyn IndexStore,
+        _new_data: SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // TODO: Support me
-        Ok(())
+        Err(Error::InvalidInput {
+            source: "BloomFilter update not yet implemented".into(),
+            location: location!(),
+        })
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
@@ -154,3 +139,84 @@ impl ScalarIndex for BloomFilterIndex {
 }
 #[derive(Debug, Default)]
 pub struct BloomFilterIndexPlugin;
+
+#[async_trait]
+impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        _field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        let params = if params.is_empty() {
+            BloomFilterIndexBuilderParams::default()
+        } else {
+            serde_json::from_str::<BloomFilterIndexBuilderParams>(params)?
+        };
+
+        Ok(Box::new(BloomFilterIndexTrainingRequest {
+            params,
+            criteria: TrainingCriteria::new(TrainingOrdering::None),
+        }))
+    }
+
+    async fn train_index(
+        &self,
+        _data: SendableRecordBatchStream,
+        _index_store: &dyn IndexStore,
+        _request: Box<dyn TrainingRequest>,
+    ) -> Result<CreatedIndex> {
+        // Dummy implementation for now
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
+                .unwrap(),
+            index_version: 0,
+        })
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        0
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(index_name, false)))
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct BloomFilterIndexTrainingRequest {
+    pub params: BloomFilterIndexBuilderParams,
+    pub criteria: TrainingCriteria,
+}
+
+impl TrainingRequest for BloomFilterIndexTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct BloomFilterIndexBuilderParams {
+    // Add fields as needed for real implementation
+}
