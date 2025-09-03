@@ -201,20 +201,17 @@ impl Manifest {
             .iter()
             .map(|fragment| {
                 let mut cloned_fragment = fragment.clone();
-                cloned_fragment.files = cloned_fragment
-                    .files
-                    .into_iter()
-                    .map(|mut file| {
+                for file in &mut cloned_fragment.files {
+                    if file.base_id.is_none() {
                         file.base_id = Some(ref_base_id);
-                        file
-                    })
-                    .collect();
-
-                if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
-                    deletion.base_id = Some(ref_base_id);
-                    cloned_fragment.deletion_file = Some(deletion);
+                    }
                 }
 
+                if let Some(deletion) = &mut cloned_fragment.deletion_file {
+                    if deletion.base_id.is_none() {
+                        deletion.base_id = Some(ref_base_id);
+                    }
+                }
                 cloned_fragment
             })
             .collect::<Vec<_>>();

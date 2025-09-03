@@ -2978,16 +2978,21 @@ mod tests {
         )
         .await;
 
+        let test_round = 3;
         // Generate clone paths
-        let clone_paths = (1..=1)
+        let clone_paths = (1..=test_round)
             .map(|i| test_dir.path().join(format!("clone{}", i)))
             .collect::<Vec<_>>();
-        let mut cloned_datasets = Vec::with_capacity(1);
+        let mut cloned_datasets = Vec::with_capacity(test_round);
 
         // Unified cloning procedure, write a fragment to each cloned dataset.
         for path in clone_paths.iter() {
             let clone_path = path.to_str().unwrap();
-            current_dataset.tags.create("v1", 1).await.unwrap();
+            current_dataset
+                .tags
+                .create("v1", current_dataset.latest_version_id().await.unwrap())
+                .await
+                .unwrap();
 
             current_dataset = current_dataset
                 .shallow_clone(clone_path, "v1", ObjectStoreParams::default())
