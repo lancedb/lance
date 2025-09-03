@@ -32,7 +32,8 @@ use crate::{
     scalar::{
         expression::SargableQueryParser,
         registry::{
-            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME
+            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME,
         },
         CreatedIndex, UpdateCriteria,
     },

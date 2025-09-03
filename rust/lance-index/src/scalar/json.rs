@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    collections::HashMap, ops::Bound, sync::{Arc, Mutex}
+    collections::HashMap,
+    ops::Bound,
+    sync::{Arc, Mutex},
 };
 
 use arrow_schema::{DataType, Field};
@@ -27,12 +29,17 @@ use snafu::location;
 use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
 
 use crate::{
-    frag_reuse::FragReuseIndex, metrics::MetricsCollector, scalar::{
-        expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser}, registry::{
+    frag_reuse::FragReuseIndex,
+    metrics::MetricsCollector,
+    scalar::{
+        expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
+        registry::{
             ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingRequest,
             VALUE_COLUMN_NAME,
-        }, AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria
-    }, Index, IndexType
+        },
+        AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
+    },
+    Index, IndexType,
 };
 
 const JSON_INDEX_VERSION: u32 = 0;
@@ -93,17 +100,26 @@ impl Index for JsonIndex {
 
 #[async_trait]
 impl ScalarIndex for JsonIndex {
-
-    async fn search(&self, query: &dyn AnyQuery, metrics: &dyn MetricsCollector) -> Result<SearchResult> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<JsonQuery>().unwrap();
-        self.target_index.search(query.target_query.as_ref(), metrics).await
+        self.target_index
+            .search(query.target_query.as_ref(), metrics)
+            .await
     }
 
     fn can_remap(&self) -> bool {
         self.target_index.can_remap()
     }
 
-    async fn remap(&self, mapping: &HashMap<u64, Option<u64>>, dest_store: &dyn IndexStore) -> Result<CreatedIndex> {
+    async fn remap(
+        &self,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
@@ -116,7 +132,11 @@ impl ScalarIndex for JsonIndex {
         })
     }
 
-    async fn update(&self, new_data: SendableRecordBatchStream, dest_store: &dyn IndexStore) -> Result<CreatedIndex> {
+    async fn update(
+        &self,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
         let target_created = self.target_index.update(new_data, dest_store).await?;
         let json_details = crate::pb::JsonIndexDetails {
             path: self.path.clone(),
@@ -168,15 +188,15 @@ impl AnyQuery for JsonQuery {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    
+
     fn format(&self, col: &str) -> String {
         format!("Json({}->{})", self.target_query.format(col), self.path)
     }
-    
+
     fn to_expr(&self, _col: String) -> Expr {
         todo!()
     }
-    
+
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
         match other.as_any().downcast_ref::<Self>() {
             Some(o) => self == o,
@@ -202,14 +222,17 @@ impl JsonQueryParser {
     fn wrap_search(&self, target_expr: IndexedExpression) -> IndexedExpression {
         if let Some(scalar_query) = target_expr.scalar_query {
             let scalar_query = match scalar_query {
-                ScalarIndexExpr::Query(ScalarIndexSearch { column, index_name, query, needs_recheck }) => {
-                    ScalarIndexExpr::Query(ScalarIndexSearch {
-                        column,
-                        index_name,
-                        query: Arc::new(JsonQuery::new(query, self.path.clone())),
-                        needs_recheck,
-                    })
-                }
+                ScalarIndexExpr::Query(ScalarIndexSearch {
+                    column,
+                    index_name,
+                    query,
+                    needs_recheck,
+                }) => ScalarIndexExpr::Query(ScalarIndexSearch {
+                    column,
+                    index_name,
+                    query: Arc::new(JsonQuery::new(query, self.path.clone())),
+                    needs_recheck,
+                }),
                 // This code path should only be hit on leaf expr
                 _ => unreachable!(),
             };
@@ -230,16 +253,24 @@ impl ScalarQueryParser for JsonQueryParser {
         low: &Bound<ScalarValue>,
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
-        self.target_parser.visit_between(column, &low, &high).map(|target_expr |self.wrap_search(target_expr))
+        self.target_parser
+            .visit_between(column, low, high)
+            .map(|target_expr| self.wrap_search(target_expr))
     }
     fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
-        self.target_parser.visit_in_list(column, &in_list).map(|target_expr| self.wrap_search(target_expr))
+        self.target_parser
+            .visit_in_list(column, in_list)
+            .map(|target_expr| self.wrap_search(target_expr))
     }
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
-        self.target_parser.visit_is_bool(column, value).map(|target_expr| self.wrap_search(target_expr))
+        self.target_parser
+            .visit_is_bool(column, value)
+            .map(|target_expr| self.wrap_search(target_expr))
     }
     fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
-        self.target_parser.visit_is_null(column).map(|target_expr| self.wrap_search(target_expr))
+        self.target_parser
+            .visit_is_null(column)
+            .map(|target_expr| self.wrap_search(target_expr))
     }
     fn visit_comparison(
         &self,
@@ -247,7 +278,9 @@ impl ScalarQueryParser for JsonQueryParser {
         value: &ScalarValue,
         op: &Operator,
     ) -> Option<IndexedExpression> {
-        self.target_parser.visit_comparison(column, &value, op).map(|target_expr| self.wrap_search(target_expr))
+        self.target_parser
+            .visit_comparison(column, value, op)
+            .map(|target_expr| self.wrap_search(target_expr))
     }
     fn visit_scalar_function(
         &self,
@@ -256,7 +289,9 @@ impl ScalarQueryParser for JsonQueryParser {
         func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression> {
-        self.target_parser.visit_scalar_function(column, data_type, func, &args).map(|target_expr| self.wrap_search(target_expr))
+        self.target_parser
+            .visit_scalar_function(column, data_type, func, args)
+            .map(|target_expr| self.wrap_search(target_expr))
     }
 
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
@@ -333,9 +368,9 @@ impl JsonIndexPlugin {
         path: String,
     ) -> Result<SendableRecordBatchStream> {
         let input = Arc::new(OneShotExec::new(data));
-        let input_schema = input.schema().clone();
+        let input_schema = input.schema();
         let value_column_idx = input_schema
-            .column_with_name(&VALUE_COLUMN_NAME)
+            .column_with_name(VALUE_COLUMN_NAME)
             .expect_ok()?
             .0;
         // TODO: We should just copy over all non-value columns, not cherry-pick row id
@@ -385,11 +420,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
         let target_request = target_plugin.new_training_request(
-            &params
-                .target_index_parameters
-                .as_deref()
-                .unwrap_or("{}")
-                .to_string(),
+            params.target_index_parameters.as_deref().unwrap_or("{}"),
             &Field::new("", target_type, true),
         )?;
 
@@ -417,12 +448,16 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
     ) -> Option<Box<dyn ScalarQueryParser>> {
         // TODO: Allow return Result here
         let registry = self.registry().unwrap();
-        let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
+        let json_details =
+            crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).unwrap();
         let target_details = json_details.target_details.as_ref().expect_ok().unwrap();
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
         // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
-        let target_parser = target_plugin.new_query_parser(index_name.clone(), index_details)?;
-        Some(Box::new(JsonQueryParser::new(json_details.path.clone(), target_parser)) as Box<dyn ScalarQueryParser>)
+        let target_parser = target_plugin.new_query_parser(index_name, index_details)?;
+        Some(Box::new(JsonQueryParser::new(
+            json_details.path.clone(),
+            target_parser,
+        )) as Box<dyn ScalarQueryParser>)
     }
 
     async fn train_index(
@@ -463,7 +498,9 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        let target_index = target_plugin.load_index(index_store, target_details, frag_reuse_index, cache).await?;
+        let target_index = target_plugin
+            .load_index(index_store, target_details, frag_reuse_index, cache)
+            .await?;
         Ok(Arc::new(JsonIndex::new(target_index, json_details.path)))
     }
 }

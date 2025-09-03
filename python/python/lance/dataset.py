@@ -1883,7 +1883,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
-            IndexConfig
+            IndexConfig,
         ],
         name: Optional[str] = None,
         *,
@@ -2120,7 +2120,6 @@ class LanceDataset(pa.dataset.Dataset):
             index_type = "scalar"
         else:
             raise Exception("index_type must be str or IndexConfig")
-
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 

@@ -67,7 +67,7 @@ pub struct IndexedExpression {
 
 pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// Visit a between expression
-    /// 
+    ///
     /// Returns an IndexedExpression if the index can accelerate between expressions
     fn visit_between(
         &self,
@@ -76,19 +76,19 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression>;
     /// Visit an in list expression
-    /// 
+    ///
     /// Returns an IndexedExpression if the index can accelerate in list expressions
     fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression>;
     /// Visit an is bool expression
-    /// 
+    ///
     /// Returns an IndexedExpression if the index can accelerate is bool expressions
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression>;
     /// Visit an is null expression
-    /// 
+    ///
     /// Returns an IndexedExpression if the index can accelerate is null expressions
     fn visit_is_null(&self, column: &str) -> Option<IndexedExpression>;
     /// Visit a comparison expression
-    /// 
+    ///
     /// Returns an IndexedExpression if the index can accelerate comparison expressions
     fn visit_comparison(
         &self,
@@ -97,7 +97,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
         op: &Operator,
     ) -> Option<IndexedExpression>;
     /// Visit a scalar function expression
-    /// 
+    ///
     /// Returns an IndexedExpression if the index can accelerate the given scalar function.
     /// For example, an ngram index can accelerate the contains function.
     fn visit_scalar_function(
@@ -109,25 +109,25 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     ) -> Option<IndexedExpression>;
 
     /// Visits a potential reference to a column
-    /// 
+    ///
     /// This function is a little different from the other visitors.  It is used to test if a potential
     /// column reference is a reference the index handles.
-    /// 
+    ///
     /// Most indexes are designed to run on references to the indexed column.  For example, if a query
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
-    /// 
+    ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
     /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
-    /// 
+    ///
     /// This function is used to test if a potential column reference is a reference the index handles.
     /// The default implementation matches column references but this can be overridden by indexes that
     /// handle projections.
-    /// 
+    ///
     /// The function is also passed in the data type of the column and should return the data type of the
     /// reference.  Normally this is the same as the input for a direct column reference and possibly something
     /// different for a projection.  E.g. a JSON column (LargeBinary) might be projected to a string or float
-    /// 
+    ///
     /// Note: higher logic in the expression parser already limits references to either Expr::Column or Expr::ScalarFunction
     /// where the first argument is an Expr::Column.  If your projection doesn't fit that mold then the
     /// expression parser will need to be modified.
@@ -211,7 +211,7 @@ impl ScalarQueryParser for MultiQueryParser {
     /// TODO(low-priority): This is maybe not quite right.  We should filter down the list of parsers based
     /// on those that consider the reference valid.  Instead what we are doing is checking all parsers if any one
     /// parser considers the reference valid.
-    /// 
+    ///
     /// This will be a problem if the user creates two indexes (e.g. btree and json) on the same column and those two
     /// indexes have different reference schemes.
     fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
@@ -1025,7 +1025,7 @@ fn maybe_indexed_column<'a, 'b>(
             } else {
                 None
             }
-        },
+        }
         Expr::ScalarFunction(udf) => {
             if udf.args.is_empty() {
                 return None;
@@ -1037,7 +1037,7 @@ fn maybe_indexed_column<'a, 'b>(
             } else {
                 None
             }
-        },
+        }
         _ => None,
     }
 }
@@ -1680,16 +1680,24 @@ mod tests {
                 "json",
                 ColInfo::new(
                     DataType::LargeBinary,
-                    Box::new(JsonQueryParser::new("$.name".to_string(), Box::new(SargableQueryParser::new("json_idx".to_string(), false)))),
+                    Box::new(JsonQueryParser::new(
+                        "$.name".to_string(),
+                        Box::new(SargableQueryParser::new("json_idx".to_string(), false)),
+                    )),
                 ),
-            )
+            ),
         ]);
 
         check_simple(
             &index_info,
             "json_extract(json, '$.name') = 'foo'",
             "json",
-            JsonQuery::new(Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some("foo".to_string())))), "$.name".to_string()),
+            JsonQuery::new(
+                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "foo".to_string(),
+                )))),
+                "$.name".to_string(),
+            ),
         );
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");

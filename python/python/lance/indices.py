@@ -634,7 +634,8 @@ class IndicesBuilder:
 
         return column
 
+
 @dataclass
 class IndexConfig:
-    index_type: str # The type of index to create (e.g. btree, zonemap, json)
-    parameters: dict # Parameters to configure the index
+    index_type: str  # The type of index to create (e.g. btree, zonemap, json)
+    parameters: dict  # Parameters to configure the index

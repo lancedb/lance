@@ -13,7 +13,10 @@ use crate::{
     frag_reuse::FragReuseIndex,
     pb,
     scalar::{
-        bitmap::BitmapIndexPlugin, btree::BTreeIndexPlugin, expression::ScalarQueryParser, inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore, ScalarIndex
+        bitmap::BitmapIndexPlugin, btree::BTreeIndexPlugin, expression::ScalarQueryParser,
+        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
+        ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore,
+        ScalarIndex,
     },
 };
 
