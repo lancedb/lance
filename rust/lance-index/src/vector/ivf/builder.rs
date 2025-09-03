@@ -120,9 +120,7 @@ pub fn recommended_num_partitions(num_rows: usize, target_partition_size: usize)
     // The maximum number of partitions is 4096 to avoid slow KMeans clustering,
     // bump it once we have better clustering algorithms.
     const MAX_PARTITIONS: usize = 4096;
-    (num_rows / target_partition_size)
-        .max(1)
-        .min(MAX_PARTITIONS)
+    (num_rows / target_partition_size).clamp(1, MAX_PARTITIONS)
 }
 
 /// Load precomputed partitions from disk.
