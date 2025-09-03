@@ -388,6 +388,25 @@ def test_create_index_using_cuda(tmp_path, nullify):
     )["id"].to_numpy()
     assert len(expected) == 10
 
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="cosine",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator="cuda",
+    )
+    q = np.random.randn(128)
+    expected = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,  # Use non-default k
+        },
+    )["id"].to_numpy()
+    assert len(expected) == 10
+
 
 def test_create_index_unsupported_accelerator(tmp_path):
     # Even attempting to use an accelerator will trigger torch import
