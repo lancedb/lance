@@ -119,7 +119,7 @@ impl Tags {
         Ok(tag_contents.version)
     }
 
-    pub async fn create(&mut self, tag: &str, version: u64) -> Result<()> {
+    pub async fn create(&self, tag: &str, version: u64) -> Result<()> {
         check_valid_ref(tag)?;
 
         let tag_file = tag_path(&self.base, tag);
