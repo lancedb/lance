@@ -1484,7 +1484,7 @@ def test_json_index():
         ),
     )
 
-    # TODO: I changed this into `json_get_int` for strong typed fitler, should be
+    # TODO: I changed this into `json_get_int` for strong typed filter, should be
     # refactored into JSON Path compare.
     filter = "json_get_int(jsons, 'x') = 10"
     assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
