@@ -34,6 +34,7 @@ pub mod btree;
 pub mod expression;
 pub mod flat;
 pub mod inverted;
+pub mod json;
 pub mod label_list;
 pub mod lance_format;
 pub mod ngram;

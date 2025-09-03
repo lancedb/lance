@@ -4559,6 +4559,7 @@ dependencies = [
  "half",
  "itertools 0.13.0",
  "jieba-rs",
+ "jsonb",
  "lance-arrow",
  "lance-core",
  "lance-datafusion",
