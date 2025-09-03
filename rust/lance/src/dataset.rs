@@ -84,8 +84,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::dataset::cleanup::CleanupPolicy;
-use crate::dataset::cleanup::CleanupPolicy::BeforeTimestamp;
+use crate::dataset::cleanup::{BeforeTimestamp, CleanupPolicy};
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -862,7 +861,7 @@ impl Dataset {
     ) -> BoxFuture<'_, Result<RemovalStats>> {
         let before = utc_now() - older_than;
         self.cleanup_with_policy(
-            BeforeTimestamp(before),
+            Box::new(BeforeTimestamp(before)),
             delete_unverified,
             error_if_tagged_old_versions,
         )
@@ -892,7 +891,7 @@ impl Dataset {
     #[instrument(level = "debug", skip(self))]
     pub fn cleanup_with_policy(
         &self,
-        policy: CleanupPolicy,
+        policy: Box<dyn CleanupPolicy>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
