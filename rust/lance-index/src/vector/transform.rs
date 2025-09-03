@@ -61,10 +61,11 @@ impl Transformer for NormalizeTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let arr = batch
             .column_by_name(&self.input_column)
-            .ok_or(Error::Index {
+            .ok_or_else(|| Error::Index {
                 message: format!(
-                    "Normalize Transform: column {} not found in RecordBatch",
-                    self.input_column
+                    "Normalize Transform: column {} not found in RecordBatch {}",
+                    self.input_column,
+                    batch.schema(),
                 ),
                 location: location!(),
             })?;

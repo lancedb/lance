@@ -527,6 +527,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
+        let code_column = quantizer.column();
+
         let transformer = Arc::new(
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 ivf.centroids.clone().unwrap(),
@@ -580,7 +582,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             batch = batch.take(&indices)?;
                         }
                     }
-                    ivf_transformer.transform(&batch)
+                    match batch.schema().column_with_name(code_column) {
+                        Some(_) => {
+                            // this batch is already transformed (in case of GPU training)
+                            Ok(batch)
+                        }
+                        None => ivf_transformer.transform(&batch),
+                    }
                 })
             })
             .buffered(get_num_compute_intensive_cpus())
