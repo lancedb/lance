@@ -61,7 +61,6 @@ use std::{
 use tracing::{info, instrument, Span};
 
 use super::refs::TagContents;
-use crate::dataset::cleanup::CleanupPolicy::BeforeTimestamp;
 use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
@@ -90,7 +89,7 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 struct CleanupTask<'a> {
     dataset: &'a Dataset,
     /// The policy determines which versions should be cleanup
-    policy: CleanupPolicy,
+    policy: Box<dyn CleanupPolicy>,
     /// If true, delete unverified data files even if they are recent
     delete_unverified: bool,
     /// If true, return an Error if a tagged version is old
@@ -120,7 +119,7 @@ const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 impl<'a> CleanupTask<'a> {
     fn new(
         dataset: &'a Dataset,
-        policy: CleanupPolicy,
+        policy: Box<dyn CleanupPolicy>,
         delete_unverified: bool,
         error_if_old_versions_tagged: bool,
     ) -> Self {
@@ -459,29 +458,93 @@ impl<'a> CleanupTask<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum CleanupPolicy {
-    /// Cleanup all versions before this time
-    BeforeTimestamp(DateTime<Utc>),
-    /// Cleanup all versions before this version
-    BeforeVersion(u64),
+/// Determine whether the manifest should be cleaned up
+pub trait CleanupPolicy: Sync + Send + Debug {
+    fn should_clean(&self, manifest: &Manifest) -> bool;
+
+    fn clone_box(&self) -> Box<dyn CleanupPolicy>;
 }
 
-impl CleanupPolicy {
-    pub async fn retain_n_versions(dataset: &Dataset, n: usize) -> Result<Self> {
-        let versions = dataset.versions().await?;
-        if versions.len() <= n {
-            Ok(Self::BeforeVersion(versions[0].version))
-        } else {
-            Ok(Self::BeforeVersion(versions[versions.len() - n].version))
-        }
+impl Clone for Box<dyn CleanupPolicy> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
+/// Cleanup all versions before this time
+#[derive(Debug, Clone)]
+pub struct BeforeTimestamp(pub DateTime<Utc>);
+
+impl CleanupPolicy for BeforeTimestamp {
+    fn should_clean(&self, manifest: &Manifest) -> bool {
+        manifest.timestamp() < self.0
     }
 
+    fn clone_box(&self) -> Box<dyn CleanupPolicy> {
+        Box::new(self.clone())
+    }
+}
+
+/// Cleanup all versions before this version
+#[derive(Debug, Clone)]
+pub struct BeforeVersion(pub u64);
+
+impl CleanupPolicy for BeforeVersion {
     fn should_clean(&self, manifest: &Manifest) -> bool {
-        match self {
-            Self::BeforeTimestamp(ts) => manifest.timestamp() < *ts,
-            Self::BeforeVersion(version) => manifest.version < *version,
+        manifest.version < self.0
+    }
+
+    fn clone_box(&self) -> Box<dyn CleanupPolicy> {
+        Box::new(self.clone())
+    }
+}
+
+/// A composite policy that combines multiple cleanup policies.
+///
+/// If a manifest should be cleanup, it must satisfy the following rules:
+/// 1. All must policies must return true
+/// 2. At least one should policy returns true
+/// 3. No must_not policy returns true
+#[derive(Debug, Clone)]
+pub struct CompositePolicy {
+    must: Vec<Box<dyn CleanupPolicy>>,
+    should: Vec<Box<dyn CleanupPolicy>>,
+    must_not: Vec<Box<dyn CleanupPolicy>>,
+}
+
+impl CleanupPolicy for CompositePolicy {
+    fn should_clean(&self, manifest: &Manifest) -> bool {
+        let mut must = true;
+        let mut should = matches!(&self.should.len(), 0);
+        let mut must_not = false;
+
+        for policy in &self.must {
+            must &= policy.should_clean(manifest);
         }
+        for policy in &self.should {
+            should |= policy.should_clean(manifest);
+        }
+        for policy in &self.must_not {
+            must_not |= policy.should_clean(manifest);
+        }
+
+        must && should && !must_not
+    }
+
+    fn clone_box(&self) -> Box<dyn CleanupPolicy> {
+        Box::new(self.clone())
+    }
+}
+
+/// Create a cleanup policy that retains the last `n` versions of the dataset.
+async fn retain_n_versions(dataset: &Dataset, n: usize) -> Result<Box<dyn CleanupPolicy>> {
+    let versions = dataset.versions().await?;
+    if versions.len() <= n {
+        Ok(Box::new(BeforeVersion(versions[0].version)))
+    } else {
+        Ok(Box::new(BeforeVersion(
+            versions[versions.len() - n].version,
+        )))
     }
 }
 
@@ -497,7 +560,7 @@ impl CleanupPolicy {
 /// even if it satisfied the cleanup policy.
 pub async fn cleanup_old_versions(
     dataset: &Dataset,
-    policy: CleanupPolicy,
+    policy: Box<dyn CleanupPolicy>,
     delete_unverified: Option<bool>,
     error_if_tagged_old_versions: Option<bool>,
 ) -> Result<RemovalStats> {
@@ -540,6 +603,8 @@ pub async fn auto_cleanup_hook(
         return Ok(None);
     }
 
+    // TODO: Support complex composite policies.
+    let mut must: Vec<Box<dyn CleanupPolicy>> = vec![];
     if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
         let std_older_than = match parse_duration(older_than) {
             Ok(t) => t,
@@ -553,39 +618,38 @@ pub async fn auto_cleanup_hook(
             }
         };
         let timestamp = utc_now() - TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
-
-        return Ok(Some(
-            dataset
-                .cleanup_with_policy(BeforeTimestamp(timestamp), Some(false), Some(false))
-                .await?,
-        ));
-    } else if let Some(reserved_versions) =
-        manifest.config.get("lance.auto_cleanup.reserved_versions")
-    {
-        let reserved_versions: usize = match reserved_versions.parse() {
+        must.push(Box::new(BeforeTimestamp(timestamp)));
+    }
+    if let Some(retain_versions) = manifest.config.get("lance.auto_cleanup.retain_versions") {
+        let retain_versions: usize = match retain_versions.parse() {
             Ok(n) => n,
             Err(e) => {
                 return Err(Error::Cleanup {
                     message: format!(
-                    "Error encountered while parsing lance.auto_cleanup.reserved_versions as u64: {}",
+                    "Error encountered while parsing lance.auto_cleanup.retain_versions as u64: {}",
                     e
                 ),
                 })
             }
         };
 
-        return Ok(Some(
-            dataset
-                .cleanup_with_policy(
-                    CleanupPolicy::retain_n_versions(dataset, reserved_versions).await?,
-                    Some(false),
-                    Some(false),
-                )
-                .await?,
-        ));
+        must.push(retain_n_versions(dataset, retain_versions).await?);
     }
 
-    Ok(None)
+    if must.is_empty() {
+        Ok(None)
+    } else {
+        let policy = Box::new(CompositePolicy {
+            must,
+            should: vec![],
+            must_not: vec![],
+        });
+        Ok(Some(
+            dataset
+                .cleanup_with_policy(policy, Some(false), Some(false))
+                .await?,
+        ))
+    }
 }
 
 fn tagged_old_versions_cleanup_error(
@@ -629,12 +693,13 @@ mod tests {
     use snafu::location;
 
     use super::*;
-    use crate::dataset::cleanup::CleanupPolicy::BeforeTimestamp;
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
+    use lance_core::datatypes::Schema;
+    use lance_table::format::DataStorageFormat;
     use tempfile::{tempdir, TempDir};
 
     #[derive(Debug)]
@@ -841,10 +906,13 @@ mod tests {
 
         async fn run_cleanup(&self, before: DateTime<Utc>) -> Result<RemovalStats> {
             let db = self.open().await?;
-            cleanup_old_versions(&db, BeforeTimestamp(before), None, None).await
+            cleanup_old_versions(&db, Box::new(BeforeTimestamp(before)), None, None).await
         }
 
-        async fn run_cleanup_with_policy(&self, policy: CleanupPolicy) -> Result<RemovalStats> {
+        async fn run_cleanup_with_policy(
+            &self,
+            policy: Box<dyn CleanupPolicy>,
+        ) -> Result<RemovalStats> {
             let db = self.open().await?;
             cleanup_old_versions(&db, policy, None, None).await
         }
@@ -858,7 +926,7 @@ mod tests {
             let db = self.open().await?;
             cleanup_old_versions(
                 &db,
-                BeforeTimestamp(before),
+                Box::new(BeforeTimestamp(before)),
                 delete_unverified,
                 error_if_tagged_old_versions,
             )
@@ -1509,7 +1577,7 @@ mod tests {
         assert_eq!(before_count.num_manifest_files, 5);
 
         // Retain 3 recent versions
-        let policy = CleanupPolicy::retain_n_versions(&fixture.open().await.unwrap(), 3)
+        let policy = retain_n_versions(&fixture.open().await.unwrap(), 3)
             .await
             .unwrap();
         let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
@@ -1523,5 +1591,66 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 3);
         assert_eq!(after_count.num_manifest_files, 3);
+    }
+
+    #[derive(Debug, Clone)]
+    struct BoolPolicy(bool);
+
+    impl CleanupPolicy for BoolPolicy {
+        fn should_clean(&self, _manifest: &Manifest) -> bool {
+            self.0
+        }
+
+        fn clone_box(&self) -> Box<dyn CleanupPolicy> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn composite_policy(
+        must: Vec<bool>,
+        should: Vec<bool>,
+        must_not: Vec<bool>,
+    ) -> CompositePolicy {
+        CompositePolicy {
+            must: must
+                .into_iter()
+                .map(|b| Box::new(BoolPolicy(b)) as Box<dyn CleanupPolicy>)
+                .collect(),
+            should: should
+                .into_iter()
+                .map(|b| Box::new(BoolPolicy(b)) as Box<dyn CleanupPolicy>)
+                .collect(),
+            must_not: must_not
+                .into_iter()
+                .map(|b| Box::new(BoolPolicy(b)) as Box<dyn CleanupPolicy>)
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_composite_policy() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            None,
+            HashMap::new(),
+        );
+
+        // Test all conditions satisfied
+        let policy = composite_policy(vec![true, true], vec![true, false], vec![false, false]);
+        assert!(policy.should_clean(&manifest));
+
+        // Test should condition not satisfied
+        let policy = composite_policy(vec![true], vec![false, false], vec![false]);
+        assert!(!policy.should_clean(&manifest));
+
+        // Test must condition not satisfied
+        let policy = composite_policy(vec![true, false], vec![true, false], vec![false]);
+        assert!(!policy.should_clean(&manifest));
+
+        // Test must_not condition not satisfied
+        let policy = composite_policy(vec![true], vec![true, false], vec![true, false]);
+        assert!(!policy.should_clean(&manifest));
     }
 }
