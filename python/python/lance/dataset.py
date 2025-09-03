@@ -58,10 +58,10 @@ from .lance import (
     _MergeInsertBuilder,
     _Scanner,
     _write_dataset,
+    indices,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .lance import indices
 from .query import FullTextQuery
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform

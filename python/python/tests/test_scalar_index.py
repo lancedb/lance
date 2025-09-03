@@ -14,6 +14,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
     BoostQuery,
@@ -22,7 +23,6 @@ from lance.query import (
     Occur,
     PhraseQuery,
 )
-from lance.indices import IndexConfig
 from lance.vector import vec_to_table
 
 
