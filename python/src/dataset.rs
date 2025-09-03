@@ -1524,15 +1524,19 @@ impl Dataset {
             }),
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
-                    return Err(PyValueError::new_err("SCALAR index type specified by no kwargs provided"));
+                    return Err(PyValueError::new_err(
+                        "SCALAR index type specified by no kwargs provided",
+                    ));
                 };
                 let Some(config) = kwargs.get_item("config")? else {
-                    return Err(PyValueError::new_err("SCALAR index type specified by no `config` in kwargs"));
+                    return Err(PyValueError::new_err(
+                        "SCALAR index type specified by no `config` in kwargs",
+                    ));
                 };
                 let config: PyIndexConfig = config.extract()?;
                 Box::new(ScalarIndexParams {
                     index_type: config.index_type.clone(),
-                    params: Some(config.config.clone())
+                    params: Some(config.config.clone()),
                 })
             }
             "INVERTED" | "FTS" => {

@@ -41,12 +41,11 @@ pub struct PyIndexConfig {
 
 #[pymethods]
 impl PyIndexConfig {
-
     #[new]
     fn new(index_type: &str, config: &str) -> PyResult<Self> {
         Ok(Self {
             index_type: index_type.to_string(),
-            config: config.to_string()
+            config: config.to_string(),
         })
     }
 }
