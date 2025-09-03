@@ -298,10 +298,19 @@ impl ScalarQueryParser for JsonQueryParser {
             .map(|target_expr| self.wrap_search(target_expr))
     }
 
+    // TODO: maybe we should address it by https://github.com/lancedb/lance/issues/4624
     fn is_valid_reference(&self, func: &Expr, _data_type: &DataType) -> Option<DataType> {
         match func {
             Expr::ScalarFunction(udf) => {
-                if udf.name() != "json_extract" {
+                // Support multiple JSON extraction functions
+                let json_functions = [
+                    "json_get",
+                    "json_get_int",
+                    "json_get_float",
+                    "json_get_bool",
+                    "json_get_string",
+                ];
+                if !json_functions.contains(&udf.name()) {
                     return None;
                 }
                 if udf.args.len() != 2 {
@@ -312,8 +321,14 @@ impl ScalarQueryParser for JsonQueryParser {
                 match &udf.args[1] {
                     Expr::Literal(ScalarValue::Utf8(Some(path)), _) => {
                         if path == &self.path {
-                            // TODO: This may need to be flexible
-                            Some(DataType::Utf8)
+                            // Return the appropriate type based on the function
+                            match udf.name() {
+                                "json_get_int" => Some(DataType::Int64),
+                                "json_get_float" => Some(DataType::Float64),
+                                "json_get_bool" => Some(DataType::Boolean),
+                                "json_get_string" => Some(DataType::Utf8),
+                                _ => None,
+                            }
                         } else {
                             None
                         }

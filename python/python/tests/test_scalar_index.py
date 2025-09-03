@@ -1484,7 +1484,9 @@ def test_json_index():
         ),
     )
 
-    filter = "json_extract(jsons, 'x') = '10'"
+    # TODO: I changed this into `json_get_int` for strong typed fitler, should be
+    # refactored into JSON Path compare.
+    filter = "json_get_int(jsons, 'x') = 10"
     assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
     assert ds.to_table(filter=filter) == ds.to_table(
         filter=filter, use_scalar_index=False
