@@ -1020,7 +1020,7 @@ fn maybe_indexed_column<'a, 'b>(
         Expr::Column(col) => {
             let col = col.name.as_str();
             let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, &data_type) {
+            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
                 Some((col, data_type, parser))
             } else {
                 None
@@ -1032,7 +1032,7 @@ fn maybe_indexed_column<'a, 'b>(
             }
             let col = maybe_column(&udf.args[0])?;
             let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, &data_type) {
+            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
                 Some((col, data_type, parser))
             } else {
                 None
