@@ -318,13 +318,6 @@ pub fn apply_row_id_and_deletes(
 /// 2. `unwrap()` calls on `JoinHandle` results caused system-wide panics when tasks failed
 /// 3. Arrow array overflow errors (>2GB) were not handled gracefully
 ///
-/// These issues led to the error pattern:
-/// ```
-/// thread 'lance_background_thread' panicked at arrow-array/.../generic_bytes_builder.rs:86:57:
-/// byte array offset overflow
-/// thread 'lance_background_thread' panicked at .../stream.rs:310:46:
-/// called Result::unwrap() on an Err value: JoinError::Panic(...)
-/// ```
 pub fn wrap_with_row_id_and_delete(
     stream: ReadBatchTaskStream,
     fragment_id: u32,
