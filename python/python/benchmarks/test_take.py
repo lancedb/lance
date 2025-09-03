@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import os
+import platform
+import subprocess
 import tempfile
 import uuid
 
@@ -16,6 +18,24 @@ ENV_OBJECT_STORAGE_TEST_DATASET_URI_PREFIX = (
 )
 
 
+def clear_page_cache():
+    """Clear the OS page cache to minimize caching effects between benchmark runs."""
+    try:
+        system = platform.system()
+        if system == "Darwin":  # macOS
+            subprocess.run(["purge"], check=True)
+        elif system == "Linux":
+            subprocess.run(["sync"], check=True)
+            subprocess.run(
+                ["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True
+            )
+        else:
+            # other OSes are not supported currently
+            pass
+    except subprocess.CalledProcessError:
+        pass
+
+
 def get_path_prefixes():
     temp_dir = tempfile.mkdtemp()
     prefixes = ["memory://", f"file://{temp_dir}"]
@@ -25,20 +45,33 @@ def get_path_prefixes():
     return prefixes
 
 
+def get_scheme_from_path(path: str) -> str:
+    if "://" in path:
+        return path.split("://")[0]
+    return "file"
+
+
 def create_dataset(
     path: str,
     data_storage_version,
     num_batches: int,
     file_size: int,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    compression: str = None,
 ) -> LanceDataset:
+    metadata = {}
+    if compression:
+        metadata["lance-encoding:compression"] = compression
+
     schema = pa.schema(
         [
-            pa.field("i", pa.int32(), nullable=False),
-            pa.field("f", pa.float32(), nullable=False),
-            pa.field("s", pa.binary(), nullable=False),
-            pa.field("fsl", pa.list_(pa.float32(), 2), nullable=False),
-            pa.field("blob", pa.binary(), nullable=False),
+            pa.field("i", pa.int32(), nullable=False, metadata=metadata),
+            pa.field("f", pa.float32(), nullable=False, metadata=metadata),
+            pa.field("s", pa.binary(), nullable=False, metadata=metadata),
+            pa.field(
+                "fsl", pa.list_(pa.float32(), 2), nullable=False, metadata=metadata
+            ),
+            pa.field("blob", pa.binary(), nullable=False, metadata=metadata),
         ]
     )
 
@@ -92,11 +125,18 @@ def gen_ranges(total_rows, num_rows):
 
 
 @pytest.mark.benchmark()
-@pytest.mark.parametrize("file_size", (1024 * 1024, 1024))
-@pytest.mark.parametrize("lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")])
-@pytest.mark.parametrize("num_rows", [1, 10, 100, 1000])
-@pytest.mark.parametrize("batch_size", [512, 1024, 2048])
-@pytest.mark.parametrize("path_prefix", get_path_prefixes())
+@pytest.mark.parametrize("file_size", [1024 * 1024], ids=["1MB"])
+@pytest.mark.parametrize(
+    "lance_format_version", [("2.0", "V2_0"), ("2.1", "V2_1")], ids=["V2_0", "V2_1"]
+)
+@pytest.mark.parametrize("num_rows", [100, 1000], ids=["100rows", "1000rows"])
+@pytest.mark.parametrize(
+    "batch_size", [512, 1024, 2048], ids=["batch512", "batch1024", "batch2048"]
+)
+@pytest.mark.parametrize("compression", [None, "zstd"], ids=["no_compression", "zstd"])
+@pytest.mark.parametrize(
+    "path_prefix", get_path_prefixes(), ids=lambda x: get_scheme_from_path(x)
+)
 def test_dataset_take(
     benchmark,
     tmp_path,
@@ -104,6 +144,7 @@ def test_dataset_take(
     lance_format_version,
     num_rows,
     batch_size,
+    compression,
     path_prefix,
 ):
     data_storage_version, version_name = lance_format_version
@@ -112,7 +153,9 @@ def test_dataset_take(
     path = f"{path_prefix.rstrip('/')}/{random_uuid}.lance/"
 
     num_batches = 1024
-    ds = create_dataset(path, data_storage_version, num_batches, file_size, batch_size)
+    ds = create_dataset(
+        path, data_storage_version, num_batches, file_size, batch_size, compression
+    )
     total_rows = ds.count_rows()
     rows = gen_ranges(total_rows, num_rows)
 
@@ -121,8 +164,10 @@ def test_dataset_take(
         assert batch.num_rows == num_rows
 
     benchmark.group = (
-        f"{version_name} Random Take Dataset({file_size} file size, "
+        f"Random Take Dataset({file_size} file size, "
         f"{num_batches} batches, {num_rows} rows per take, "
-        f"{batch_size} batch size, {path} path)"
+        f"{batch_size} batch size, {get_scheme_from_path(path_prefix)} scheme)"
     )
-    benchmark(dataset_take_rows_bench)
+    benchmark.pedantic(
+        dataset_take_rows_bench, setup=clear_page_cache, rounds=5, iterations=1
+    )
