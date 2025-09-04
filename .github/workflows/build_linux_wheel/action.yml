@@ -82,5 +82,7 @@ runs:
     - name: Strip wheels for PyPI
       shell: bash
       run: |
-        chmod +x ci/strip_wheel.sh
-        ci/strip_wheel.sh python/target/wheels/*.whl
+        # Use Docker to run strip command with same permissions as build
+        docker run --rm -v $(pwd):/workspace -w /workspace \
+          quay.io/pypa/manylinux${{ inputs.manylinux }}_${{ inputs.arm-build == 'true' && 'aarch64' || 'x86_64' }} \
+          bash -c "chmod +x ci/strip_wheel.sh && ci/strip_wheel.sh python/target/wheels/*.whl"
