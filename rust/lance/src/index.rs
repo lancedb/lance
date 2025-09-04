@@ -3287,7 +3287,7 @@ mod tests {
             let tag_name = format!("shallow_clone_test_{}", round);
 
             // Create tag for this round (use current dataset for chain cloning)
-            let test_uri = current_dataset.uri();
+            let test_uri = current_dataset.uri().clone();
             let current_version = current_dataset.version().version;
             current_dataset
                 .tags
@@ -3297,7 +3297,6 @@ mod tests {
 
             // Perform shallow clone for this round (chain cloning from current dataset)
             let mut round_cloned_dataset = current_dataset
-                .clone()
                 .shallow_clone(
                     round_cloned_uri,
                     tag_name.as_str(),
@@ -3519,9 +3518,6 @@ mod tests {
 
         // Use the final cloned dataset for any remaining tests
         let final_cloned_dataset = current_dataset;
-        let cloned_dir_path = test_dir
-            .path()
-            .join(format!("clone_round_{}", clone_rounds));
 
         // Verify cloned dataset has indices
         let cloned_indices = final_cloned_dataset.load_indices().await.unwrap();
