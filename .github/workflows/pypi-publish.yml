@@ -54,9 +54,15 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip ${{ matrix.config.extra_args }}"
+        args: "--release ${{ matrix.config.extra_args }}"
         arm-build: ${{ matrix.config.platform == 'aarch64' }}
         manylinux: ${{ matrix.config.manylinux }}
+    - name: Upload debug wheels to release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: python/target/debug-wheels/*.whl
+        fail_on_unmatched_files: false
     - uses: ./.github/workflows/upload_wheel
       with:
         pypi_token: ${{ secrets.PYPI_TOKEN }}
