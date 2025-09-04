@@ -74,7 +74,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
     async fn execute(self) -> Result<()> {
         if self.columns.len() != 1 {
-            if self.columns.len() == 0 || self.index_type != IndexType::Inverted {
+            if self.columns.is_empty() || self.index_type != IndexType::Inverted {
                 return Err(Error::Index {
                     message: "Only support building index on 1 column at the moment".to_string(),
                     location: location!(),
