@@ -3287,10 +3287,8 @@ mod tests {
             let tag_name = format!("shallow_clone_test_{}", round);
 
             // Create tag for this round (use current dataset for chain cloning)
-            let test_uri = current_dataset.uri().clone();
             let current_version = current_dataset.version().version;
             current_dataset
-                .clone()
                 .tags
                 .create(&tag_name, current_version)
                 .await
@@ -3417,7 +3415,7 @@ mod tests {
             );
 
             // Verify the source location does NOT contain new data
-            let original_indices_dir = PathBuf::from(test_uri).join("_indices");
+            let original_indices_dir = PathBuf::from(current_dataset.uri()).join("_indices");
             let wrong_vector_dir = original_indices_dir.join(new_vector_idx.uuid.to_string());
             let wrong_category_dir = original_indices_dir.join(new_category_idx.uuid.to_string());
 
