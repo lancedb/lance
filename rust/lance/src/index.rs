@@ -3290,6 +3290,7 @@ mod tests {
             let test_uri = current_dataset.uri().clone();
             let current_version = current_dataset.version().version;
             current_dataset
+                .clone()
                 .tags
                 .create(&tag_name, current_version)
                 .await
