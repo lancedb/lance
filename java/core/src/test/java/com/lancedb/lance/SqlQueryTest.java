@@ -55,7 +55,7 @@ public class SqlQueryTest {
   @Test
   public void testToRecordBatches() throws IOException {
     // Test normal query
-    ArrowReader reader = dataset.sql("select * from " + NAME).tableName(NAME).intoBatchRecords();
+    ArrowReader reader = dataset.sql("select * from {{DATASET}}").intoBatchRecords();
     Assertions.assertEquals(
         "Schema<id: Int(32, true), name: Utf8>",
         reader.getVectorSchemaRoot().getSchema().toString());
@@ -73,18 +73,14 @@ public class SqlQueryTest {
     reader.close();
 
     // Test agg query
-    reader = dataset.sql("select sum(id) from " + NAME).tableName(NAME).intoBatchRecords();
-    Assertions.assertEquals(
-        "Schema<sum(sqlquery_test_dataset.id): Int(64, true)>",
-        reader.getVectorSchemaRoot().getSchema().toString());
+    reader = dataset.sql("select sum(id) from {{DATASET}}").intoBatchRecords();
     Assertions.assertTrue(reader.loadNextBatch());
     long sum = (Long) reader.getVectorSchemaRoot().getVector(0).getObject(0);
     Assertions.assertEquals(780, sum);
     reader.close();
 
     // Test empty result
-    reader =
-        dataset.sql("select * from " + NAME + " where id < 0").tableName(NAME).intoBatchRecords();
+    reader = dataset.sql("select * from {{DATASET}} where id < 0").intoBatchRecords();
     Assertions.assertEquals(
         "Schema<id: Int(32, true), name: Utf8>",
         reader.getVectorSchemaRoot().getSchema().toString());
@@ -98,8 +94,7 @@ public class SqlQueryTest {
     // Test withRowId and rowAddr
     reader =
         dataset
-            .sql("select id, name, _rowid, _rowaddr from " + NAME)
-            .tableName(NAME)
+            .sql("select id, name, _rowid, _rowaddr from {{DATASET}}")
             .withRowId(true)
             .withRowAddr(true)
             .intoBatchRecords();

@@ -21,11 +21,9 @@ import java.io.IOException;
 import java.util.Optional;
 
 public class SqlQuery {
-  private static final String DEFAULT_TABLE_NAME = "dataset";
-
   private Dataset dataset;
   private String sql;
-  private String table = DEFAULT_TABLE_NAME;
+  private Optional<String> table = Optional.empty();
   private boolean withRowId = false;
   private boolean withRowAddr = false;
 
@@ -34,8 +32,22 @@ public class SqlQuery {
     this.sql = sql;
   }
 
+  /**
+   * Specify a "table name" for the dataset, so that you can run SQL queries against it. In most
+   * cases, we should not directly set the table_name. Instead, use {{DATASET}} as a placeholder for
+   * the table name.
+   *
+   * <p>Example
+   *
+   * <pre>
+   * String sql = "SELECT * FROM {{DATASET}} WHERE age > 20";
+   * </pre>
+   *
+   * If you must set a table name, try to use a name that is unlikely to conflict, otherwise we may
+   * encounter a 'table already exists' error.
+   */
   public SqlQuery tableName(String tableName) {
-    this.table = tableName;
+    this.table = Optional.ofNullable(tableName);
     return this;
   }
 
@@ -51,8 +63,7 @@ public class SqlQuery {
 
   public ArrowReader intoBatchRecords() throws IOException {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
-      intoBatchRecords(
-          dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, s.memoryAddress());
+      intoBatchRecords(dataset, sql, table, withRowId, withRowAddr, s.memoryAddress());
       return Data.importArrayStream(dataset.allocator(), s);
     }
   }
