@@ -2989,6 +2989,7 @@ mod tests {
         for path in clone_paths.iter() {
             let clone_path = path.to_str().unwrap();
             current_dataset
+                .clone()
                 .tags
                 .create("v1", current_dataset.latest_version_id().await.unwrap())
                 .await
