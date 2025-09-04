@@ -4615,6 +4615,7 @@ dependencies = [
  "log",
  "num-traits",
  "object_store",
+ "parquet",
  "pprof",
  "prost 0.13.5",
  "prost-build 0.13.5",
@@ -4632,6 +4633,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "twox-hash 2.1.0",
  "uuid",
 ]
 
@@ -8598,6 +8600,9 @@ name = "twox-hash"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7b17f197b3050ba473acf9181f7b1d3b66d1cf7356c6cc57886662276e65908"
+dependencies = [
+ "rand 0.8.5",
+]
 
 [[package]]
 name = "typenum"
