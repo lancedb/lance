@@ -2386,10 +2386,11 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
             LOGGER.info("Doing one-pass ivfpq accelerated computations")
-            num_rows = self.count_rows()
-            num_partitions = _target_partition_size_to_num_partitions(
-                num_rows, target_partition_size
-            )
+            if num_partitions is None:
+                num_rows = self.count_rows()
+                num_partitions = _target_partition_size_to_num_partitions(
+                    num_rows, target_partition_size
+                )
             timers["ivf+pq_train:start"] = time.time()
             (
                 ivf_centroids,
@@ -2496,10 +2497,11 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
                 timers["ivf_train:start"] = time.time()
-                num_rows = self.count_rows()
-                num_partitions = _target_partition_size_to_num_partitions(
-                    num_rows, target_partition_size
-                )
+                if num_partitions is None:
+                    num_rows = self.count_rows()
+                    num_partitions = _target_partition_size_to_num_partitions(
+                        num_rows, target_partition_size
+                    )
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
