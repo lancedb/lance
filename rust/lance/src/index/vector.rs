@@ -302,7 +302,12 @@ pub(crate) async fn build_vector_index(
     let num_rows = dataset.count_rows(None).await?;
     let index_type = params.index_type();
     let num_partitions = ivf_params.num_partitions.unwrap_or_else(|| {
-        recommended_num_partitions(num_rows, index_type.target_partition_size().unwrap_or(8192))
+        recommended_num_partitions(
+            num_rows,
+            ivf_params
+                .target_partition_size
+                .unwrap_or(index_type.target_partition_size()),
+        )
     });
     let mut ivf_params = ivf_params.clone();
     ivf_params.num_partitions = Some(num_partitions);

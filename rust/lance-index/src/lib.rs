@@ -255,17 +255,17 @@ impl IndexType {
     /// This is used to compute the number of partitions for the index.
     /// The partition size is optimized for the best performance of the index.
     ///
-    /// This is for vector indices only, returns `None` for other index types.
-    pub fn target_partition_size(&self) -> Option<usize> {
+    /// This is for vector indices only.
+    pub fn target_partition_size(&self) -> usize {
         match self {
-            Self::Vector => Some(8192),
-            Self::IvfFlat => Some(4096),
-            Self::IvfSq => Some(8192),
-            Self::IvfPq => Some(8192),
-            Self::IvfHnswFlat => Some(1 << 20),
-            Self::IvfHnswSq => Some(1 << 20),
-            Self::IvfHnswPq => Some(1 << 20),
-            _ => None,
+            Self::Vector => 8192,
+            Self::IvfFlat => 4096,
+            Self::IvfSq => 8192,
+            Self::IvfPq => 8192,
+            Self::IvfHnswFlat => 1 << 20,
+            Self::IvfHnswSq => 1 << 20,
+            Self::IvfHnswPq => 1 << 20,
+            _ => 8192,
         }
     }
 }

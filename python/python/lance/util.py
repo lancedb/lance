@@ -246,3 +246,10 @@ class HNSW:
 
     def vectors(self) -> pa.Array:
         return self._hnsw.vectors()
+
+
+def _target_partition_size_to_num_partitions(
+    num_rows: int, target_partition_size: int
+) -> int:
+    num_partitions = num_rows // target_partition_size
+    return max(1, num_partitions, 4096)

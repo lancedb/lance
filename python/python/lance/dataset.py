@@ -65,7 +65,7 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import td_to_micros
+from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -2137,6 +2137,8 @@ class LanceDataset(pa.dataset.Dataset):
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
         train: bool = True,
+        *,
+        target_partition_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -2160,6 +2162,7 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
+            Deprecated. Use target_partition_size instead.
         ivf_centroids : optional
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
@@ -2207,6 +2210,10 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        target_partition_size: int, optional
+            The target partition size. If set, the number of partitions will be computed
+            based on the target partition size.
+            Otherwise, the target partition size will be set by index type.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2379,7 +2386,10 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
             LOGGER.info("Doing one-pass ivfpq accelerated computations")
-
+            num_rows = self.count_rows()
+            num_partitions = _target_partition_size_to_num_partitions(
+                num_rows, target_partition_size
+            )
             timers["ivf+pq_train:start"] = time.time()
             (
                 ivf_centroids,
@@ -2435,18 +2445,17 @@ class LanceDataset(pa.dataset.Dataset):
                     ivf_centroids = np.load(f)
                 num_partitions = ivf_centroids.shape[0]
 
-            if num_partitions is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
                 num_partitions = int(num_partitions)
-            elif not isinstance(num_partitions, int):
+            elif num_partitions is not None and not isinstance(num_partitions, int):
                 raise TypeError(
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
-            kwargs["num_partitions"] = num_partitions
+            if num_partitions is not None:
+                kwargs["num_partitions"] = num_partitions
+            if target_partition_size is not None:
+                kwargs["target_partition_size"] = target_partition_size
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -2487,6 +2496,10 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
                 timers["ivf_train:start"] = time.time()
+                num_rows = self.count_rows()
+                num_partitions = _target_partition_size_to_num_partitions(
+                    num_rows, target_partition_size
+                )
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
