@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use futures::future::BoxFuture;
+use lance_core::datatypes::Field;
 use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
 use lance_table::format::Index as IndexMetadata;
 use snafu::location;
@@ -71,21 +72,22 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    #[instrument(skip_all)]
     async fn execute(self) -> Result<()> {
         if self.columns.len() != 1 {
-            return Err(Error::Index {
-                message: "Only support building index on 1 column at the moment".to_string(),
-                location: location!(),
-            });
+            if self.columns.len() == 0 || self.index_type != IndexType::Inverted {
+                return Err(Error::Index {
+                    message: "Only support building index on 1 column at the moment".to_string(),
+                    location: location!(),
+                });
+            }
+            if self.name.is_some() {
+                return Err(Error::Index {
+                    message: "Only allow to specify name when building index on single column"
+                        .to_string(),
+                    location: location!(),
+                });
+            }
         }
-        let column = &self.columns[0];
-        let Some(field) = self.dataset.schema().field(column) else {
-            return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
-                location: location!(),
-            });
-        };
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {
@@ -94,13 +96,75 @@ impl<'a> CreateIndexBuilder<'a> {
             false
         };
 
+        let mut created_indices = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let field = self.dataset.schema().field(column).ok_or(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
+            })?;
+            let index_name = self.name.clone().unwrap_or(format!("{column}_idx"));
+            let index_id = Uuid::new_v4();
+            let created_index = self
+                .execute_impl(column, field, index_name.clone(), index_id, train)
+                .await?;
+
+            let new_idx = IndexMetadata {
+                uuid: index_id,
+                name: index_name,
+                fields: vec![field.id],
+                dataset_version: self.dataset.manifest.version,
+                fragment_bitmap: if train {
+                    // Include all fragments if training occurred
+                    Some(
+                        self.dataset
+                            .get_fragments()
+                            .iter()
+                            .map(|f| f.id() as u32)
+                            .collect(),
+                    )
+                } else {
+                    // Empty bitmap for untrained indices
+                    Some(roaring::RoaringBitmap::new())
+                },
+                index_details: Some(Arc::new(created_index.index_details)),
+                index_version: created_index.index_version as i32,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
+            };
+            created_indices.push(new_idx);
+        }
+
+        let transaction = Transaction::new(
+            self.dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: created_indices,
+                removed_indices: vec![],
+            },
+            /*blobs_op= */ None,
+            None,
+        );
+
+        self.dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn execute_impl(
+        &self,
+        column: &str,
+        field: &Field,
+        index_name: String,
+        index_id: Uuid,
+        train: bool,
+    ) -> Result<CreatedIndex> {
         // Load indices from the disk.
         let indices = self.dataset.load_indices().await?;
         let fri = self
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.unwrap_or(format!("{column}_idx"));
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
@@ -122,7 +186,6 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         }
 
-        let index_id = Uuid::new_v4();
         let created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
@@ -260,44 +323,7 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
-        let new_idx = IndexMetadata {
-            uuid: index_id,
-            name: index_name,
-            fields: vec![field.id],
-            dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: if train {
-                // Include all fragments if training occurred
-                Some(
-                    self.dataset
-                        .get_fragments()
-                        .iter()
-                        .map(|f| f.id() as u32)
-                        .collect(),
-                )
-            } else {
-                // Empty bitmap for untrained indices
-                Some(roaring::RoaringBitmap::new())
-            },
-            index_details: Some(Arc::new(created_index.index_details)),
-            index_version: created_index.index_version as i32,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None,
-        };
-        let transaction = Transaction::new(
-            self.dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices: vec![],
-            },
-            /*blobs_op= */ None,
-            None,
-        );
-
-        self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+        Ok(created_index)
     }
 }
 
