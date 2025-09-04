@@ -10,6 +10,14 @@ on:
         required: false
         default: ''
         type: string
+  pull_request:
+    paths:
+      - '.github/workflows/pypi-publish.yml'
+      - '.github/workflows/build_linux_wheel/**'
+      - '.github/workflows/build_mac_wheel/**'
+      - '.github/workflows/build_windows_wheel/**'
+      - '.github/workflows/upload_wheel/**'
+      - 'ci/strip_wheel.sh'
 
 jobs:
   linux:
@@ -72,7 +80,7 @@ jobs:
         files: python/target/debug-wheels/*.whl
         fail_on_unmatched_files: false
     - uses: ./.github/workflows/upload_wheel
-      if: github.event_name != 'workflow_dispatch'
+      if: github.event_name == 'release'
       with:
         pypi_token: ${{ secrets.PYPI_TOKEN }}
         fury_token: ${{ secrets.FURY_TOKEN }}
@@ -118,7 +126,7 @@ jobs:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels"
     - uses: ./.github/workflows/upload_wheel
-      if: github.event_name != 'workflow_dispatch'
+      if: github.event_name == 'release'
       with:
         pypi_token: ${{ secrets.PYPI_TOKEN }}
         fury_token: ${{ secrets.FURY_TOKEN }}
@@ -159,6 +167,7 @@ jobs:
           args: "--release --strip"
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
       - uses: ./.github/workflows/upload_wheel
+        if: github.event_name == 'release'
         with:
           pypi_token: ${{ secrets.PYPI_TOKEN }}
           fury_token: ${{ secrets.FURY_TOKEN }}
