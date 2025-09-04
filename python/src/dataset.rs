@@ -83,6 +83,7 @@ use lance_table::io::commit::CommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::indices::PyIndexConfig;
 use crate::scanner::ScanStatistics;
 use crate::schema::LanceSchema;
 use crate::session::Session;
@@ -1491,6 +1492,7 @@ impl Dataset {
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
                 IndexType::Vector
             }
+            "SCALAR" => IndexType::Scalar,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -1520,6 +1522,23 @@ impl Dataset {
                 index_type: "label_list".to_string(),
                 params: None,
             }),
+            "SCALAR" => {
+                let Some(kwargs) = kwargs else {
+                    return Err(PyValueError::new_err(
+                        "SCALAR index type specified by no kwargs provided",
+                    ));
+                };
+                let Some(config) = kwargs.get_item("config")? else {
+                    return Err(PyValueError::new_err(
+                        "SCALAR index type specified by no `config` in kwargs",
+                    ));
+                };
+                let config: PyIndexConfig = config.extract()?;
+                Box::new(ScalarIndexParams {
+                    index_type: config.index_type.clone(),
+                    params: Some(config.config.clone()),
+                })
+            }
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {

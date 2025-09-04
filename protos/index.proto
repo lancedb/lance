@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package lance.index.pb;
 
+import "google/protobuf/any.proto";
+
 // The type of an index.
 enum IndexType {
   // Vector index
@@ -205,4 +207,8 @@ message InvertedIndexDetails {
   uint32 min_ngram_length = 9;
   uint32 max_ngram_length = 10;
   bool prefix_only = 11;
+}
+message JsonIndexDetails {
+  string path = 1;
+  google.protobuf.Any target_details = 2;
 }

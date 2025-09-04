@@ -441,6 +441,28 @@ class LanceFragment(pa.dataset.Fragment):
 
         return LanceScanner(s, self._ds)
 
+    def open_session(
+        self,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        with_row_address: Optional[bool] = None,
+    ) -> "FragmentSession":
+        """Open a FragmentSession, which manages a short-lived session of LanceFragment.
+         This API works well for users making repeated requests over the same columns.
+
+        Parameters
+        ----------
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
+        with_row_address: enable returns with row addresses.
+
+        Returns
+        -------
+        session : FragmentSession
+        """
+        return FragmentSession(self._fragment.open_session(columns, with_row_address))
+
     def take(
         self,
         indices,
@@ -848,3 +870,23 @@ def write_fragments(
         storage_options=storage_options,
         enable_stable_row_ids=enable_stable_row_ids,
     )
+
+
+class FragmentSession:
+    def __init__(self, session):
+        self._session = session
+
+    def take(self, indices):
+        """
+        Take rows from this fragment based on the offset in the fragment.
+
+        Parameters
+        ----------
+        indices : Array or array-like
+            indices of rows to select in the fragment.
+
+        Returns
+        -------
+        table : pyarrow.Table
+        """
+        return pa.Table.from_batches([self._session.take(indices)])

@@ -14,6 +14,10 @@
 
 import pyarrow as pa
 
+class IndexConfig:
+    index_type: str
+    config: str
+
 def train_ivf_model(
     dataset,
     column: str,

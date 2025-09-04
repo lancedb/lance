@@ -14,8 +14,9 @@ use crate::{
     pb,
     scalar::{
         bitmap::BitmapIndexPlugin, btree::BTreeIndexPlugin, expression::ScalarQueryParser,
-        inverted::InvertedIndexPlugin, label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin,
-        zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore, ScalarIndex,
+        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
+        ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore,
+        ScalarIndex,
     },
 };
 
@@ -149,17 +150,14 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Optional hook that plugins can use if they need to be aware of the registry
+    fn attach_registry(&self, _registry: Arc<ScalarIndexPluginRegistry>) {}
 }
 
 /// A registry of scalar index plugins
 pub struct ScalarIndexPluginRegistry {
     plugins: HashMap<String, Box<dyn ScalarIndexPlugin>>,
-}
-
-impl Default for ScalarIndexPluginRegistry {
-    fn default() -> Self {
-        Self::with_default_plugins()
-    }
 }
 
 impl ScalarIndexPluginRegistry {
@@ -192,7 +190,7 @@ impl ScalarIndexPluginRegistry {
     }
 
     /// Create a registry with the default plugins
-    pub fn with_default_plugins() -> Self {
+    pub fn with_default_plugins() -> Arc<Self> {
         let mut registry = Self {
             plugins: HashMap::new(),
         };
@@ -202,6 +200,12 @@ impl ScalarIndexPluginRegistry {
         registry.add_plugin::<pb::NGramIndexDetails, NGramIndexPlugin>();
         registry.add_plugin::<pb::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
         registry.add_plugin::<pb::InvertedIndexDetails, InvertedIndexPlugin>();
+        registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
+
+        let registry = Arc::new(registry);
+        for plugin in registry.plugins.values() {
+            plugin.attach_registry(registry.clone());
+        }
 
         registry
     }

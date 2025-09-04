@@ -173,7 +173,7 @@ pub(crate) async fn load_training_data(
 }
 
 // TODO: Allow users to register their own plugins
-static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<ScalarIndexPluginRegistry> =
+static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<ScalarIndexPluginRegistry>> =
     LazyLock::new(ScalarIndexPluginRegistry::with_default_plugins);
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);

@@ -859,6 +859,7 @@ impl Scanner {
     }
 
     /// Set the prefetch size.
+    /// Ignored in v2 and newer format
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
         self.batch_readahead = nbatches;
         self
