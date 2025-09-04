@@ -237,6 +237,7 @@ pub enum Operation {
         ref_name: Option<String>,
         ref_version: u64,
         ref_path: String,
+        branch_name: Option<String>,
     },
 }
 
@@ -279,18 +280,21 @@ impl PartialEq for Operation {
                     ref_name: a_ref_name,
                     ref_version: a_ref_version,
                     ref_path: a_source_path,
+                    branch_name: a_branch_name,
                 },
                 Self::Clone {
                     is_shallow: b_is_shallow,
                     ref_name: b_ref_name,
                     ref_version: b_ref_version,
                     ref_path: b_source_path,
+                    branch_name: b_branch_name,
                 },
             ) => {
                 a_is_shallow == b_is_shallow
                     && a_ref_name == b_ref_name
                     && a_ref_version == b_ref_version
                     && a_source_path == b_source_path
+                    && a_branch_name == b_branch_name
             }
             (
                 Self::Delete {
@@ -2130,11 +2134,13 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ref_name,
                 ref_version,
                 ref_path,
+                branch_name,
             })) => Operation::Clone {
                 is_shallow,
                 ref_name,
                 ref_version,
                 ref_path,
+                branch_name,
             },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
@@ -2453,11 +2459,13 @@ impl From<&Transaction> for pb::Transaction {
                 ref_name,
                 ref_version,
                 ref_path,
+                branch_name,
             } => pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow: *is_shallow,
                 ref_name: ref_name.clone(),
                 ref_version: *ref_version,
                 ref_path: ref_path.clone(),
+                branch_name: branch_name.clone(),
             }),
             Operation::Delete {
                 updated_fragments,
