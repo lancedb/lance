@@ -82,7 +82,7 @@ runs:
     - name: Strip wheels for PyPI
       shell: bash
       run: |
-        # Use Docker to run strip command with same permissions as build
-        docker run --rm -v $(pwd):/workspace -w /workspace \
-          quay.io/pypa/manylinux${{ inputs.manylinux }}_${{ inputs.arm-build == 'true' && 'aarch64' || 'x86_64' }} \
-          bash -c "chmod +x ci/strip_wheel.sh && ci/strip_wheel.sh python/target/wheels/*.whl"
+        # Fix permissions on wheel files created in container
+        sudo chown -R $(id -u):$(id -g) python/target/wheels/
+        chmod +x ci/strip_wheel.sh
+        ci/strip_wheel.sh python/target/wheels/*.whl
