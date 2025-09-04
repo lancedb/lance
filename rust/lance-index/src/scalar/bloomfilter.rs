@@ -13,6 +13,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{pb, Any};
+mod sbbf;
 use serde::{Deserialize, Serialize};
 
 use arrow_schema::Field;
