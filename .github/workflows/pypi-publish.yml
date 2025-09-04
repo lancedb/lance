@@ -3,6 +3,13 @@ name: Build and upload python wheels
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout (branch, tag, or SHA)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   linux:
@@ -32,6 +39,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
+        ref: ${{ inputs.ref || github.ref }}
         fetch-depth: 0
         lfs: true
     - name: Set up Python
@@ -64,6 +72,7 @@ jobs:
         files: python/target/debug-wheels/*.whl
         fail_on_unmatched_files: false
     - uses: ./.github/workflows/upload_wheel
+      if: github.event_name != 'workflow_dispatch'
       with:
         pypi_token: ${{ secrets.PYPI_TOKEN }}
         fury_token: ${{ secrets.FURY_TOKEN }}
@@ -84,7 +93,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref || github.ref }}
         fetch-depth: 0
         lfs: true
     - name: Set up Python
@@ -109,6 +118,7 @@ jobs:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels"
     - uses: ./.github/workflows/upload_wheel
+      if: github.event_name != 'workflow_dispatch'
       with:
         pypi_token: ${{ secrets.PYPI_TOKEN }}
         fury_token: ${{ secrets.FURY_TOKEN }}
