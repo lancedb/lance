@@ -17,6 +17,7 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(CONTAINS_TOKENS_UDF.clone());
     // JSON functions
     ctx.register_udf(json::json_extract_udf());
+    ctx.register_udf(json::json_extract_with_type_udf());
     ctx.register_udf(json::json_exists_udf());
     ctx.register_udf(json::json_get_udf());
     ctx.register_udf(json::json_get_string_udf());
