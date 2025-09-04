@@ -19,8 +19,8 @@ use arrow_schema::Field;
 use datafusion::execution::SendableRecordBatchStream;
 use std::{collections::HashMap, sync::Arc};
 
-use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::FragReuseIndex;
+use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
