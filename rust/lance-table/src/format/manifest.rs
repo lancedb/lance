@@ -837,7 +837,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            HashMap::new(),
         );
 
         let actual = manifest.fragments_by_offset_range(0..10);
@@ -905,7 +905,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            HashMap::new(),
         );
 
         assert_eq!(manifest.max_field_id(), 43);
@@ -929,7 +929,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            HashMap::new(),
         );
 
         let mut config = manifest.config.clone();

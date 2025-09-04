@@ -3137,12 +3137,84 @@ mod tests {
         );
     }
 
+    // Helper function to validate indices after each clone iteration
+    async fn validate_indices_after_clone(
+        dataset: &Dataset,
+        round: usize,
+        expected_scalar_rows: usize,
+        dimensions: u32,
+    ) {
+        // Verify cloned dataset has indices
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices.len(),
+            2,
+            "Round {}: Cloned dataset should have 2 indices",
+            round
+        );
+        let index_names: HashSet<String> = indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(
+            index_names.contains("vector_idx"),
+            "Round {}: Should contain vector_idx",
+            round
+        );
+        assert!(
+            index_names.contains("category_idx"),
+            "Round {}: Should contain category_idx",
+            round
+        );
+
+        // Test basic data access without using indices for now
+        // This ensures the dataset is accessible and data is intact
+        // In chain cloning, each round adds 50 rows to the previous dataset
+        // Round 1: 300 (original), Round 2: 350 (300 + 50 from round 1), Round 3: 400 (350 + 50 from round 2)
+        let expected_total_rows = 300 + (round - 1) * 50;
+        let total_rows = dataset.count_rows(None).await.unwrap();
+        assert_eq!(
+            total_rows, expected_total_rows,
+            "Round {}: Should have {} rows after clone (chain cloning accumulates data)",
+            round, expected_total_rows
+        );
+
+        // Verify vector search
+        let query_vector = generate_random_array(dimensions as usize);
+        let search_results = dataset
+            .scan()
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .limit(Some(5), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(
+            search_results.num_rows() > 0,
+            "Round {}: Vector search should return results immediately after clone",
+            round
+        );
+
+        // Test basic scalar query to verify data integrity
+        let scalar_results = dataset
+            .scan()
+            .filter("category = 'category_0'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            expected_scalar_rows,
+            scalar_results.num_rows(),
+            "Round {}: Scalar query should return {} results",
+            round,
+            expected_scalar_rows
+        );
+    }
+
     #[tokio::test]
     async fn test_shallow_clone_with_index() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let clone_dir = test_dir.path().join("clone");
-        let cloned_uri = clone_dir.to_str().unwrap();
 
         // Create a schema with both vector and scalar columns
         let dimensions = 16u32;
@@ -3205,34 +3277,262 @@ mod tests {
             "Scalar query should return results"
         );
 
-        // Create tag for shallow cloning
-        dataset
-            .tags
-            .create("test_tag", dataset.version().version)
+        // Multiple shallow clone iterations test with chain cloning
+        let clone_rounds = 3;
+        let mut current_dataset = dataset;
+
+        for round in 1..=clone_rounds {
+            let round_clone_dir = test_dir.path().join(format!("clone_round_{}", round));
+            let round_cloned_uri = round_clone_dir.to_str().unwrap();
+            let tag_name = format!("shallow_clone_test_{}", round);
+
+            // Create tag for this round (use current dataset for chain cloning)
+            let current_version = current_dataset.version().version;
+            current_dataset
+                .tags
+                .create(&tag_name, current_version)
+                .await
+                .unwrap();
+
+            // Perform shallow clone for this round (chain cloning from current dataset)
+            let mut round_cloned_dataset = current_dataset
+                .shallow_clone(
+                    round_cloned_uri,
+                    tag_name.as_str(),
+                    ObjectStoreParams::default(),
+                )
+                .await
+                .unwrap();
+
+            // Immediately validate indices after each clone
+            validate_indices_after_clone(
+                &round_cloned_dataset,
+                round,
+                source_scalar_query_rows,
+                dimensions,
+            )
+            .await;
+
+            // Complete validation cycle after each clone: append data, optimize index, validate
+            // Append new data to the cloned dataset
+            let new_data = gen_batch()
+                .col(
+                    "id",
+                    array::step_custom::<Int32Type>(300 + (round * 50) as i32, 1),
+                )
+                .col("category", array::fill_utf8(format!("category_{}", round)))
+                .col(
+                    "vector",
+                    array::rand_vec::<Float32Type>(Dimension::from(dimensions)),
+                )
+                .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+
+            round_cloned_dataset = Dataset::write(
+                new_data,
+                round_cloned_uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap();
 
-        // Perform shallow clone
-        let cloned_dataset = dataset
-            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
-            .await
+            // Verify row count increased
+            let expected_rows = 300 + round * 50;
+            let total_rows = round_cloned_dataset.count_rows(None).await.unwrap();
+            assert_eq!(
+                total_rows, expected_rows,
+                "Round {}: Should have {} rows after append",
+                round, expected_rows
+            );
+
+            let indices_before_optimize = round_cloned_dataset.load_indices().await.unwrap();
+            let vector_idx_before = indices_before_optimize
+                .iter()
+                .find(|idx| idx.name == "vector_idx")
+                .unwrap();
+            let category_idx_before = indices_before_optimize
+                .iter()
+                .find(|idx| idx.name == "category_idx")
+                .unwrap();
+
+            // Optimize indices
+            round_cloned_dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+
+            // Verify index UUID has changed
+            let optimized_indices = round_cloned_dataset.load_indices().await.unwrap();
+            let new_vector_idx = optimized_indices
+                .iter()
+                .find(|idx| idx.name == "vector_idx")
+                .unwrap();
+            let new_category_idx = optimized_indices
+                .iter()
+                .find(|idx| idx.name == "category_idx")
+                .unwrap();
+
+            assert_ne!(
+                new_vector_idx.uuid, vector_idx_before.uuid,
+                "Round {}: Vector index should have a new UUID after optimization",
+                round
+            );
+            assert_ne!(
+                new_category_idx.uuid, category_idx_before.uuid,
+                "Round {}: Category index should have a new UUID after optimization",
+                round
+            );
+
+            // Verify the location of index files
+            use std::path::PathBuf;
+            let clone_indices_dir = PathBuf::from(round_cloned_uri).join("_indices");
+            let vector_index_dir = clone_indices_dir.join(new_vector_idx.uuid.to_string());
+            let category_index_dir = clone_indices_dir.join(new_category_idx.uuid.to_string());
+
+            assert!(
+                vector_index_dir.exists(),
+                "Round {}: New vector index directory should exist in cloned dataset location: {:?}",
+                round, vector_index_dir
+            );
+            assert!(
+                category_index_dir.exists(),
+                "Round {}: New category index directory should exist in cloned dataset location: {:?}",
+                round, category_index_dir
+            );
+
+            // Verify base id
+            assert!(
+                new_vector_idx.base_id.is_none(),
+                "Round {}: New vector index should not have base_id after optimization in cloned dataset",
+                round
+            );
+            assert!(
+                new_category_idx.base_id.is_none(),
+                "Round {}: New category index should not have base_id after optimization in cloned dataset",
+                round
+            );
+
+            // Verify the source location does NOT contain new data
+            let original_indices_dir = PathBuf::from(current_dataset.uri()).join("_indices");
+            let wrong_vector_dir = original_indices_dir.join(new_vector_idx.uuid.to_string());
+            let wrong_category_dir = original_indices_dir.join(new_category_idx.uuid.to_string());
+
+            assert!(
+                !wrong_vector_dir.exists(),
+                "Round {}: New vector index should NOT be in original dataset location: {:?}",
+                round,
+                wrong_vector_dir
+            );
+            assert!(
+                !wrong_category_dir.exists(),
+                "Round {}: New category index should NOT be in original dataset location: {:?}",
+                round,
+                wrong_category_dir
+            );
+
+            // Validate data integrity and index functionality after optimization
+            let old_category_results = round_cloned_dataset
+                .scan()
+                .filter("category = 'category_0'")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let new_category_results = round_cloned_dataset
+                .scan()
+                .filter(&format!("category = 'category_{}'", round))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                source_scalar_query_rows,
+                old_category_results.num_rows(),
+                "Round {}: Should find old category data with {} rows",
+                round,
+                source_scalar_query_rows
+            );
+            assert!(
+                new_category_results.num_rows() > 0,
+                "Round {}: Should find new category data",
+                round
+            );
+
+            // Test vector search functionality
+            let query_vector = generate_random_array(dimensions as usize);
+            let search_results = round_cloned_dataset
+                .scan()
+                .nearest("vector", &query_vector, 10)
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            assert!(
+                search_results.num_rows() > 0,
+                "Round {}: Vector search should return results after optimization",
+                round
+            );
+
+            // Verify statistic of indexes
+            let vector_stats: serde_json::Value = serde_json::from_str(
+                &round_cloned_dataset
+                    .index_statistics("vector_idx")
+                    .await
+                    .unwrap(),
+            )
             .unwrap();
+            let category_stats: serde_json::Value = serde_json::from_str(
+                &round_cloned_dataset
+                    .index_statistics("category_idx")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                vector_stats["num_indexed_rows"].as_u64().unwrap(),
+                expected_rows as u64,
+                "Round {}: Vector index should have {} indexed rows",
+                round,
+                expected_rows
+            );
+            assert_eq!(
+                category_stats["num_indexed_rows"].as_u64().unwrap(),
+                expected_rows as u64,
+                "Round {}: Category index should have {} indexed rows",
+                round,
+                expected_rows
+            );
+
+            // Prepare for next round: use the cloned dataset as the source for next clone
+            current_dataset = round_cloned_dataset;
+        }
+
+        // Use the final cloned dataset for any remaining tests
+        let final_cloned_dataset = current_dataset;
 
         // Verify cloned dataset has indices
-        let cloned_indices = cloned_dataset.load_indices().await.unwrap();
+        let cloned_indices = final_cloned_dataset.load_indices().await.unwrap();
         assert_eq!(
             cloned_indices.len(),
             2,
-            "Cloned dataset should have 2 indices"
+            "Final cloned dataset should have 2 indices"
         );
         let cloned_index_names: HashSet<String> =
             cloned_indices.iter().map(|idx| idx.name.clone()).collect();
         assert!(cloned_index_names.contains("vector_idx"));
         assert!(cloned_index_names.contains("category_idx"));
 
-        // Test vector search on cloned dataset
+        // Test vector search on final cloned dataset
         let query_vector = generate_random_array(dimensions as usize);
-        let search_results = cloned_dataset
+        let search_results = final_cloned_dataset
             .scan()
             .nearest("vector", &query_vector, 5)
             .unwrap()
@@ -3244,11 +3544,11 @@ mod tests {
 
         assert!(
             search_results.num_rows() > 0,
-            "Vector search should return results"
+            "Vector search should return results on final dataset"
         );
 
-        // Test scalar query on cloned dataset
-        let scalar_results = cloned_dataset
+        // Test scalar query on final cloned dataset
+        let scalar_results = final_cloned_dataset
             .scan()
             .filter("category = 'category_0'")
             .unwrap()
@@ -3259,211 +3559,7 @@ mod tests {
         assert_eq!(
             source_scalar_query_rows,
             scalar_results.num_rows(),
-            "Scalar query should return results"
+            "Scalar query should return results on final dataset"
         );
-
-        // Append new data to cloned dataset using lance_datagen
-        let new_data = gen_batch()
-            .col("id", array::step_custom::<Int32Type>(300, 1))
-            .col("category", array::fill_utf8("category_1".to_string()))
-            .col(
-                "vector",
-                array::rand_vec::<Float32Type>(Dimension::from(dimensions)),
-            )
-            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
-
-        let mut updated_cloned_dataset = Dataset::write(
-            new_data,
-            cloned_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Test scalar query on cloned dataset after appending
-        let scalar_results = cloned_dataset
-            .scan()
-            .filter("category = 'category_1'")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert_eq!(
-            0,
-            scalar_results.num_rows(),
-            "Scalar query should return results 0 before optimizing index"
-        );
-
-        // Test scalar query on cloned dataset after appending
-        let scalar_results = cloned_dataset
-            .scan()
-            .filter("category = 'category_0'")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert_eq!(
-            source_scalar_query_rows,
-            scalar_results.num_rows(),
-            "Scalar query should return {} results after cloning",
-            source_scalar_query_rows
-        );
-
-        // Verify row count increased
-        let total_rows = updated_cloned_dataset.count_rows(None).await.unwrap();
-        assert_eq!(total_rows, 350, "Should have 350 rows after append");
-
-        // Store indices before optimization for comparison
-        let indices_before_optimize = updated_cloned_dataset.load_indices().await.unwrap();
-        let vector_idx_before = indices_before_optimize
-            .iter()
-            .find(|idx| idx.name == "vector_idx")
-            .unwrap();
-        let category_idx_before = indices_before_optimize
-            .iter()
-            .find(|idx| idx.name == "category_idx")
-            .unwrap();
-
-        // Call optimize_indices
-        updated_cloned_dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
-
-        // Critical test: Verify new indices are created in the cloned dataset location
-        let optimized_indices = updated_cloned_dataset.load_indices().await.unwrap();
-
-        // Find the new index metadata after optimization
-        let new_vector_idx = optimized_indices
-            .iter()
-            .find(|idx| idx.name == "vector_idx")
-            .unwrap();
-        let new_category_idx = optimized_indices
-            .iter()
-            .find(|idx| idx.name == "category_idx")
-            .unwrap();
-
-        // The UUIDs should be different after optimization (new indices were created)
-        assert_ne!(
-            new_vector_idx.uuid, vector_idx_before.uuid,
-            "Vector index should have a new UUID after optimization"
-        );
-        assert_ne!(
-            new_category_idx.uuid, category_idx_before.uuid,
-            "Category index should have a new UUID after optimization"
-        );
-
-        // Verify the new index files are in the cloned dataset's directory
-        use std::path::PathBuf;
-        let clone_indices_dir = PathBuf::from(cloned_uri).join("_indices");
-        let vector_index_dir = clone_indices_dir.join(new_vector_idx.uuid.to_string());
-        let category_index_dir = clone_indices_dir.join(new_category_idx.uuid.to_string());
-
-        assert!(
-            vector_index_dir.exists(),
-            "New vector index directory should exist in cloned dataset location: {:?}",
-            vector_index_dir
-        );
-        assert!(
-            category_index_dir.exists(),
-            "New category index directory should exist in cloned dataset location: {:?}",
-            category_index_dir
-        );
-
-        // Verify that the new indices do NOT have base_id set (they're local to the cloned dataset)
-        assert!(
-            new_vector_idx.base_id.is_none(),
-            "New vector index should not have base_id after optimization in cloned dataset"
-        );
-        assert!(
-            new_category_idx.base_id.is_none(),
-            "New category index should not have base_id after optimization in cloned dataset"
-        );
-
-        // Also verify the original dataset's index directories are NOT modified
-        let original_indices_dir = PathBuf::from(test_uri).join("_indices");
-
-        // The new index UUIDs should NOT exist in the original dataset's directory
-        let wrong_vector_dir = original_indices_dir.join(new_vector_idx.uuid.to_string());
-        let wrong_category_dir = original_indices_dir.join(new_category_idx.uuid.to_string());
-
-        assert!(
-            !wrong_vector_dir.exists(),
-            "New vector index should NOT be in original dataset location: {:?}",
-            wrong_vector_dir
-        );
-        assert!(
-            !wrong_category_dir.exists(),
-            "New category index should NOT be in original dataset location: {:?}",
-            wrong_category_dir
-        );
-
-        // Test vector search after optimization (should find both old and new data)
-        let query_vector = generate_random_array(dimensions as usize);
-
-        let optimized_search_results = updated_cloned_dataset
-            .scan()
-            .nearest("vector", &query_vector, 10)
-            .unwrap()
-            .limit(Some(10), None)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        assert!(
-            optimized_search_results.num_rows() > 0,
-            "Vector search should work after optimization"
-        );
-
-        // Test scalar query after optimization (should find both old and new data)
-        let old_category_results = updated_cloned_dataset
-            .scan()
-            .filter("category = 'category_0'")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        let new_category_results = updated_cloned_dataset
-            .scan()
-            .filter("category = 'category_1'")
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            source_scalar_query_rows,
-            old_category_results.num_rows(),
-            "Should find old category data with {} rows",
-            source_scalar_query_rows
-        );
-        assert!(
-            new_category_results.num_rows() > 0,
-            "Should find new category data"
-        );
-
-        // Verify index statistics
-        let vector_stats: serde_json::Value = serde_json::from_str(
-            &updated_cloned_dataset
-                .index_statistics("vector_idx")
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let category_stats: serde_json::Value = serde_json::from_str(
-            &updated_cloned_dataset
-                .index_statistics("category_idx")
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(vector_stats["num_indexed_rows"].as_u64().unwrap(), 350);
-        assert_eq!(category_stats["num_indexed_rows"].as_u64().unwrap(), 350);
     }
 }
