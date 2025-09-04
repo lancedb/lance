@@ -552,7 +552,6 @@ impl Dataset {
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
     ) -> Result<Self> {
-
         let tags = Tags::new(
             object_store.clone(),
             commit_handler.clone(),

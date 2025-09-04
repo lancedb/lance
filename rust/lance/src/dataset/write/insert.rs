@@ -363,7 +363,6 @@ impl<'a> InsertBuilder<'a> {
             context.params.enable_stable_row_ids = true;
         }
 
-
         // Feature flags
         if let WriteDestination::Dataset(dataset) = &context.dest {
             if !can_write_dataset(dataset.manifest.writer_feature_flags) {
