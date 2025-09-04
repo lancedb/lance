@@ -77,7 +77,7 @@ jobs:
       if: github.event_name == 'release'
       uses: softprops/action-gh-release@v1
       with:
-        files: python/target/debug-wheels/*.whl
+        files: python/target/wheels/*.whl
         fail_on_unmatched_files: false
     - uses: ./.github/workflows/upload_wheel
       if: github.event_name == 'release'

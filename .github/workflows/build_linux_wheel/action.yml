@@ -73,16 +73,11 @@ runs:
             && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-aarch_64.zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip
-    - name: Copy wheels for debug artifacts
-      shell: bash
-      run: |
-        mkdir -p python/target/debug-wheels
-        cp python/target/wheels/*.whl python/target/debug-wheels/
     - name: Upload debug wheels as artifacts
       uses: actions/upload-artifact@v4
       with:
         name: debug-wheels-linux-${{ inputs.manylinux }}-${{ inputs.arm-build == 'true' && 'arm64' || 'x86_64' }}
-        path: python/target/debug-wheels/*.whl
+        path: python/target/wheels/*.whl
         retention-days: 90
     - name: Strip wheels for PyPI
       shell: bash
