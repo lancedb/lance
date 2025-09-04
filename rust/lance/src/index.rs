@@ -3176,7 +3176,7 @@ mod tests {
             round, expected_total_rows
         );
 
-        // ✅ 补充缺失的验证1: 克隆后立即的向量搜索测试
+        // Verify vector search
         let query_vector = generate_random_array(dimensions as usize);
         let search_results = dataset
             .scan()
