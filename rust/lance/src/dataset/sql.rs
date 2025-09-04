@@ -63,7 +63,23 @@ impl SqlQueryBuilder {
     }
 
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
-        let ctx = SessionContext::new();
+        // Create SessionContext with Lance physical optimizers
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use std::sync::Arc;
+
+        // Get the optimizer rules from the get_physical_optimizer function
+        let optimizer = crate::io::exec::get_physical_optimizer();
+        let mut builder = SessionStateBuilder::new().with_default_features();
+
+        // Add each Lance physical optimizer rule to the session
+        for rule in optimizer.rules {
+            builder = builder.with_physical_optimizer_rule(rule);
+        }
+
+        let state = builder.build();
+
+        let ctx = SessionContext::new_with_state(state);
+
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
         ctx.register_table(
@@ -284,11 +300,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_anti_join_not_exists_sql() {
+        use crate::Dataset;
         use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use std::sync::Arc;
         use tempfile::tempdir;
-        use crate::Dataset;
 
         // Create test directory
         let test_dir = tempdir().unwrap();
@@ -306,7 +322,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from_iter(0..20)),
-                Arc::new(StringArray::from((0..20).map(|i| format!("large_{}", i)).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..20).map(|i| format!("large_{}", i)).collect::<Vec<_>>(),
+                )),
             ],
         )
         .unwrap();
@@ -322,7 +340,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![2, 5, 8, 11, 14])),
-                Arc::new(StringArray::from(vec!["excl_2", "excl_5", "excl_8", "excl_11", "excl_14"])),
+                Arc::new(StringArray::from(vec![
+                    "excl_2", "excl_5", "excl_8", "excl_11", "excl_14",
+                ])),
             ],
         )
         .unwrap();
@@ -334,8 +354,16 @@ mod tests {
 
         // Register both tables in DataFusion context
         let ctx = datafusion::prelude::SessionContext::new();
-        let large_provider = Arc::new(crate::datafusion::LanceTableProvider::new(Arc::new(large_dataset.clone()), false, false));
-        let small_provider = Arc::new(crate::datafusion::LanceTableProvider::new(Arc::new(small_dataset.clone()), false, false));
+        let large_provider = Arc::new(crate::datafusion::LanceTableProvider::new(
+            Arc::new(large_dataset.clone()),
+            false,
+            false,
+        ));
+        let small_provider = Arc::new(crate::datafusion::LanceTableProvider::new(
+            Arc::new(small_dataset.clone()),
+            false,
+            false,
+        ));
 
         ctx.register_table("large_table", large_provider).unwrap();
         ctx.register_table("small_table", small_provider).unwrap();
@@ -357,14 +385,18 @@ mod tests {
         // Execute EXPLAIN ANALYZE to get the plan
         let df = ctx.sql(sql).await.unwrap();
         let results = df.collect().await.unwrap();
-        
+
         // Print the EXPLAIN ANALYZE output
         println!("\nEXPLAIN ANALYZE Output:");
         for batch in &results {
-            println!("Batch: {} columns, {} rows", batch.num_columns(), batch.num_rows());
+            println!(
+                "Batch: {} columns, {} rows",
+                batch.num_columns(),
+                batch.num_rows()
+            );
             // EXPLAIN ANALYZE returns two columns: plan type and plan details
             if batch.num_columns() >= 2 && batch.num_rows() > 0 {
-                let plan_details = batch.column(1);  // Second column has the actual plan
+                let plan_details = batch.column(1); // Second column has the actual plan
                 if let Some(string_array) = plan_details.as_any().downcast_ref::<StringArray>() {
                     for i in 0..batch.num_rows() {
                         let plan_text = string_array.value(i);
@@ -373,7 +405,7 @@ mod tests {
                 }
             }
         }
-        
+
         // Now run the actual query (without EXPLAIN ANALYZE) to get results
         let actual_sql = r#"
             SELECT *
@@ -383,7 +415,7 @@ mod tests {
             )
             LIMIT 10
         "#;
-        
+
         let df = ctx.sql(actual_sql).await.unwrap();
         let results = df.collect().await.unwrap();
 
@@ -397,22 +429,35 @@ mod tests {
                 result_ids.push(id);
 
                 // Verify excluded IDs are not in results
-                assert!(!excluded_ids.contains(&id),
-                        "Found excluded ID {} in NOT EXISTS results", id);
+                assert!(
+                    !excluded_ids.contains(&id),
+                    "Found excluded ID {} in NOT EXISTS results",
+                    id
+                );
             }
         }
 
         // Should return exactly 10 rows due to LIMIT
-        assert_eq!(result_ids.len(), 10, "Should return exactly 10 rows due to LIMIT");
+        assert_eq!(
+            result_ids.len(),
+            10,
+            "Should return exactly 10 rows due to LIMIT"
+        );
 
         // Expected: first 10 non-excluded IDs
         let expected: Vec<i32> = (0..20)
             .filter(|i| !excluded_ids.contains(i))
             .take(10)
             .collect();
-        assert_eq!(result_ids, expected, "NOT EXISTS results should match expected");
+        assert_eq!(
+            result_ids, expected,
+            "NOT EXISTS results should match expected"
+        );
 
-        println!("✅ SQL NOT EXISTS test passed: {} rows returned", result_ids.len());
+        println!(
+            "✅ SQL NOT EXISTS test passed: {} rows returned",
+            result_ids.len()
+        );
         println!("Returned IDs: {:?}", result_ids);
         println!("Successfully filtered out: {:?}", excluded_ids);
     }

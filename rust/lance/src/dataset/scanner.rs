@@ -7796,7 +7796,9 @@ mod test {
             schema.clone(),
             vec![
                 Arc::new(Int32Array::from_iter(0..20)),
-                Arc::new(StringArray::from((0..20).map(|i| format!("value_{}", i)).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..20).map(|i| format!("value_{}", i)).collect::<Vec<_>>(),
+                )),
             ],
         )
         .unwrap();
@@ -7807,11 +7809,11 @@ mod test {
         // Create a scanner with NOT IN filter (5 excluded values) and LIMIT
         // This simulates: SELECT * FROM table WHERE id NOT IN (2, 5, 8, 11, 14) LIMIT 10
         let mut scanner = dataset.scan();
-        
+
         // Create NOT IN filter as a string
         let excluded_ids = vec![2i32, 5, 8, 11, 14];
         let not_in_filter = "id NOT IN (2, 5, 8, 11, 14)";
-        
+
         scanner
             .filter(not_in_filter)
             .unwrap()
@@ -7820,50 +7822,63 @@ mod test {
 
         // Create the execution plan
         let plan = scanner.create_plan().await.unwrap();
-        
+
         // Get the plan string to verify optimization
         let plan_string = format!("{}", displayable(plan.as_ref()).indent(true));
-        
+
         println!("\n=== Scanner NOT IN Test ===");
         println!("Query: WHERE id NOT IN (2, 5, 8, 11, 14) LIMIT 10");
         println!("Large table: 20 rows, Exclusion list: 5 rows");
         println!("\nExecution Plan:");
         println!("{}", plan_string);
-        
+
         // Check if optimization was applied
         if plan_string.contains("EarlyStopAntiJoinExec") {
             println!("✅ EarlyStopAntiJoinExec optimization applied!");
         } else if plan_string.contains("HashJoinExec") && plan_string.contains("LeftAnti") {
             println!("ℹ️ Using standard HashJoinExec(LeftAnti)");
         }
-        
+
         // Execute and verify results
         let stream = scanner.try_into_stream().await.unwrap();
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-        
+
         let mut result_ids = Vec::new();
         for batch in &batches {
             let id_array = batch.column(0).as_primitive::<Int32Type>();
             for i in 0..id_array.len() {
                 let id = id_array.value(i);
                 result_ids.push(id);
-                
+
                 // Verify excluded IDs are not in results
-                assert!(!excluded_ids.contains(&id), 
-                        "Found excluded ID {} in results", id);
+                assert!(
+                    !excluded_ids.contains(&id),
+                    "Found excluded ID {} in results",
+                    id
+                );
             }
         }
-        
+
         // Should return exactly 10 rows due to limit
-        assert_eq!(result_ids.len(), 10, "Should return exactly 10 rows due to LIMIT");
-        
+        assert_eq!(
+            result_ids.len(),
+            10,
+            "Should return exactly 10 rows due to LIMIT"
+        );
+
         // Expected: first 10 non-excluded IDs
         let expected: Vec<i32> = (0..20)
             .filter(|i| !excluded_ids.contains(i))
             .take(10)
             .collect();
-        assert_eq!(result_ids, expected, "Results should match expected non-excluded IDs");
-        
-        println!("✅ Test passed: {} rows returned, exclusions filtered correctly", result_ids.len());
+        assert_eq!(
+            result_ids, expected,
+            "Results should match expected non-excluded IDs"
+        );
+
+        println!(
+            "✅ Test passed: {} rows returned, exclusions filtered correctly",
+            result_ids.len()
+        );
     }
 }

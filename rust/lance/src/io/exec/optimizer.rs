@@ -172,6 +172,6 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
         Arc::new(crate::io::exec::optimizer::CoalesceTake),
         Arc::new(crate::io::exec::optimizer::SimplifyProjection),
-        Arc::new(crate::io::exec::anti_join_optimizer::AntiJoinOptimizer::default()),
+        Arc::new(crate::io::exec::early_stop_anti_join::AntiJoinOptimizer::default()),
     ])
 }

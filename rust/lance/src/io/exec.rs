@@ -5,7 +5,6 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
-mod anti_join_optimizer;
 mod early_stop_anti_join;
 mod filter;
 pub mod filtered_read;
@@ -22,8 +21,7 @@ mod take;
 pub mod testing;
 pub mod utils;
 
-pub use anti_join_optimizer::AntiJoinOptimizer;
-pub use early_stop_anti_join::EarlyStopAntiJoinExec;
+pub use early_stop_anti_join::{AntiJoinOptimizer, EarlyStopAntiJoinExec};
 pub use filter::LanceFilterExec;
 pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
 pub use lance_datafusion::planner::Planner;
