@@ -3279,7 +3279,7 @@ mod tests {
 
         // Multiple shallow clone iterations test with chain cloning
         let clone_rounds = 3;
-        let mut current_dataset = dataset.clone();
+        let mut current_dataset = dataset;
 
         for round in 1..=clone_rounds {
             let round_clone_dir = test_dir.path().join(format!("clone_round_{}", round));
