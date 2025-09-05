@@ -27,12 +27,21 @@ use crate::io::exec::scan::LanceScanExec;
 fn get_exact_row_count(plan: Arc<dyn ExecutionPlan>) -> Option<usize> {
     use datafusion::common::stats::Precision;
 
-    // Try to get statistics - use statistics() not partition_statistics()
-    // because LanceScanExec implements statistics() but not partition_statistics()
-    if let Ok(stats) = plan.statistics() {
-        if let Precision::Exact(n) = stats.num_rows {
-            return Some(n);
+    // Try partition_statistics first (newer API), then fall back to statistics()
+    // LanceScanExec doesn't implement partition_statistics but does implement statistics()
+    let stats = match plan.partition_statistics(None) {
+        Ok(stats) => stats,
+        Err(_) => {
+            // Fall back to statistics() for nodes that don't support partition_statistics
+            match plan.statistics() {
+                Ok(stats) => stats,
+                Err(_) => return None,
+            }
         }
+    };
+
+    if let Precision::Exact(n) = stats.num_rows {
+        return Some(n);
     }
 
     // If no exact statistics, try children (for wrapper nodes like CoalesceBatchesExec)
