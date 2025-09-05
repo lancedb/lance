@@ -76,6 +76,7 @@ pub(crate) mod session;
 pub(crate) mod tracing;
 pub(crate) mod transaction;
 pub(crate) mod utils;
+pub(crate) mod cli;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{write_fragments, write_fragments_transaction};
@@ -89,6 +90,7 @@ use fragment::{FileFragment, PyDeletionFile, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
+pub use cli::lance_tools_cli;
 
 use crate::executor::BackgroundExecutor;
 
@@ -177,6 +179,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(lance_tools_cli))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;

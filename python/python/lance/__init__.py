@@ -22,6 +22,7 @@ from .dataset import (
     batch_udf,
     write_dataset,
 )
+from .cli import lance_tools_cli
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     FFILanceTableProvider,
@@ -59,6 +60,7 @@ __all__ = [
     "bytes_read_counter",
     "iops_counter",
     "write_dataset",
+    "lance_tools_cli",
     "schema_to_json",
     "json_to_schema",
     "dataset",
