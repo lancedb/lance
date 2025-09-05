@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from . import log
 from .blob import BlobColumn, BlobFile
+from .cli import lance_tools_cli
 from .dataset import (
     DataStatistics,
     FieldStatistics,
@@ -22,7 +23,6 @@ from .dataset import (
     batch_udf,
     write_dataset,
 )
-from .cli import lance_tools_cli
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     FFILanceTableProvider,

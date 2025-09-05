@@ -60,6 +60,7 @@ use scanner::ScanStatistics;
 use session::Session;
 
 pub(crate) mod arrow;
+pub(crate) mod cli;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -76,7 +77,6 @@ pub(crate) mod session;
 pub(crate) mod tracing;
 pub(crate) mod transaction;
 pub(crate) mod utils;
-pub(crate) mod cli;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
 use crate::fragment::{write_fragments, write_fragments_transaction};
@@ -84,13 +84,13 @@ use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
+pub use cli::lance_tools_cli;
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
-pub use cli::lance_tools_cli;
 
 use crate::executor::BackgroundExecutor;
 
