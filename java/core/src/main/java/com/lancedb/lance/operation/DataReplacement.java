@@ -14,6 +14,7 @@
 package com.lancedb.lance.operation;
 
 import com.lancedb.lance.fragment.DataFile;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.List;
 import java.util.Objects;
@@ -53,7 +54,7 @@ public class DataReplacement implements Operation {
 
   @Override
   public String toString() {
-    return "DataReplacement{" + "replacements=" + replacements + '}';
+    return ToStringHelper.of(this).add("replacements", replacements).toString();
   }
 
   @Override

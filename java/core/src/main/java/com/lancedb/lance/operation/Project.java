@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.operation;
 
+import com.lancedb.lance.util.ToStringHelper;
+
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -33,7 +35,7 @@ public class Project extends SchemaOperation {
 
   @Override
   public String toString() {
-    return "Project{" + "schema=" + +'}';
+    return ToStringHelper.of(this).add("schema", schema()).toString();
   }
 
   public static Builder builder() {

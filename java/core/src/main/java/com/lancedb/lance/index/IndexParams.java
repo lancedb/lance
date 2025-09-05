@@ -14,24 +14,23 @@
 package com.lancedb.lance.index;
 
 import com.lancedb.lance.index.vector.VectorIndexParams;
-
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.Optional;
 
 /** Parameters for creating an index. */
 public class IndexParams {
   private final DistanceType distanceType;
-  private final Optional<VectorIndexParams> vectorIndexParams;
+  private final VectorIndexParams vectorIndexParams;
 
-  private IndexParams(Builder builder) {
-    this.distanceType = builder.distanceType;
-    this.vectorIndexParams = builder.vectorIndexParams;
+  private IndexParams(DistanceType distanceType, VectorIndexParams vectorIndexParams) {
+    this.distanceType = distanceType;
+    this.vectorIndexParams = vectorIndexParams;
   }
 
   public static class Builder {
     private DistanceType distanceType = DistanceType.L2;
-    private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
+    private VectorIndexParams vectorIndexParams;
 
     public Builder() {}
 
@@ -53,12 +52,12 @@ public class IndexParams {
      * @return this builder
      */
     public Builder setVectorIndexParams(VectorIndexParams vectorIndexParams) {
-      this.vectorIndexParams = Optional.of(vectorIndexParams);
+      this.vectorIndexParams = vectorIndexParams;
       return this;
     }
 
     public IndexParams build() {
-      return new IndexParams(this);
+      return new IndexParams(distanceType, vectorIndexParams);
     }
   }
 
@@ -67,14 +66,14 @@ public class IndexParams {
   }
 
   public Optional<VectorIndexParams> getVectorIndexParams() {
-    return vectorIndexParams;
+    return Optional.ofNullable(vectorIndexParams);
   }
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("distanceType", distanceType)
-        .append("vectorIndexParams", vectorIndexParams.orElse(null))
+    return ToStringHelper.of(this)
+        .add("distanceType", distanceType)
+        .add("vectorIndexParams", vectorIndexParams)
         .toString();
   }
 }

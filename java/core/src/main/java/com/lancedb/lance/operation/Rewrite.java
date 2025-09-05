@@ -14,8 +14,7 @@
 package com.lancedb.lance.operation;
 
 import com.lancedb.lance.index.Index;
-
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -88,10 +87,10 @@ public class Rewrite implements Operation {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("groups", groups)
-        .append("rewrittenIndices", rewrittenIndices)
-        .append("fragReuseIndex", fragReuseIndex)
+    return ToStringHelper.of(this)
+        .add("groups", groups)
+        .add("rewrittenIndices", rewrittenIndices)
+        .add("fragReuseIndex", fragReuseIndex)
         .toString();
   }
 

@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.index.vector;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.lancedb.lance.util.ToStringHelper;
 
 /**
  * Parameters for building an IVF index. Train IVF centroids for the given vector column. This will
@@ -156,13 +156,13 @@ public class IvfBuildParams {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("numPartitions", numPartitions)
-        .append("maxIters", maxIters)
-        .append("sampleRate", sampleRate)
-        .append("shufflePartitionBatches", shufflePartitionBatches)
-        .append("shufflePartitionConcurrency", shufflePartitionConcurrency)
-        .append("useResidual", useResidual)
+    return ToStringHelper.of(this)
+        .add("numPartitions", numPartitions)
+        .add("maxIters", maxIters)
+        .add("sampleRate", sampleRate)
+        .add("shufflePartitionBatches", shufflePartitionBatches)
+        .add("shufflePartitionConcurrency", shufflePartitionConcurrency)
+        .add("useResidual", useResidual)
         .toString();
   }
 }

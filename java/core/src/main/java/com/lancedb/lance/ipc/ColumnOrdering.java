@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.ipc;
 
+import com.lancedb.lance.util.ToStringHelper;
+
 import org.apache.arrow.util.Preconditions;
 
 import java.io.Serializable;
@@ -44,15 +46,11 @@ public class ColumnOrdering implements Serializable {
 
   @Override
   public String toString() {
-    return "ColumnOrdering{"
-        + "columnName='"
-        + columnName
-        + '\''
-        + ", nullFirst="
-        + nullFirst
-        + ", ascending="
-        + ascending
-        + '}';
+    return ToStringHelper.of(this)
+        .add("columnName", columnName)
+        .add("nullFirst", nullFirst)
+        .add("ascending", ascending)
+        .toString();
   }
 
   public static class Builder {

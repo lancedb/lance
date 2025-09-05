@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -22,8 +22,8 @@ import java.util.Optional;
 /** Read options for reading from a dataset. */
 public class ReadOptions {
 
-  private final Optional<Integer> version;
-  private final Optional<Integer> blockSize;
+  private final Integer version;
+  private final Integer blockSize;
   private final long indexCacheSizeBytes;
   private final long metadataCacheSizeBytes;
   private final Map<String, String> storageOptions;
@@ -37,11 +37,11 @@ public class ReadOptions {
   }
 
   public Optional<Integer> getVersion() {
-    return version;
+    return Optional.ofNullable(version);
   }
 
   public Optional<Integer> getBlockSize() {
-    return blockSize;
+    return Optional.ofNullable(blockSize);
   }
 
   public long getIndexCacheSizeBytes() {
@@ -58,19 +58,19 @@ public class ReadOptions {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("version", version.orElse(null))
-        .append("blockSize", blockSize.orElse(null))
-        .append("indexCacheSizeBytes", indexCacheSizeBytes)
-        .append("metadataCacheSizeBytes", metadataCacheSizeBytes)
-        .append("storageOptions", storageOptions)
+    return ToStringHelper.of(this)
+        .add("version", version)
+        .add("blockSize", blockSize)
+        .add("indexCacheSizeBytes", indexCacheSizeBytes)
+        .add("metadataCacheSizeBytes", metadataCacheSizeBytes)
+        .add("storageOptions", storageOptions)
         .toString();
   }
 
   public static class Builder {
 
-    private Optional<Integer> version = Optional.empty();
-    private Optional<Integer> blockSize = Optional.empty();
+    private Integer version = null;
+    private Integer blockSize = null;
     private long indexCacheSizeBytes = 6 * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
     private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
@@ -82,7 +82,7 @@ public class ReadOptions {
      * @return this builder
      */
     public Builder setVersion(int version) {
-      this.version = Optional.of(version);
+      this.version = version;
       return this;
     }
 
@@ -94,7 +94,7 @@ public class ReadOptions {
      * @return this builder
      */
     public Builder setBlockSize(int blockSize) {
-      this.blockSize = Optional.of(blockSize);
+      this.blockSize = blockSize;
       return this;
     }
 

@@ -14,6 +14,7 @@
 package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
+import com.lancedb.lance.util.ToStringHelper;
 
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -45,7 +46,7 @@ public class Merge extends SchemaOperation {
 
   @Override
   public String toString() {
-    return "Merge{" + "fragments=" + fragments + ", schema=" + schema() + '}';
+    return ToStringHelper.of(this).add("fragments", fragments).add("schema", schema()).toString();
   }
 
   @Override

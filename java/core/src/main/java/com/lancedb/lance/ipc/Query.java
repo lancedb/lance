@@ -14,9 +14,9 @@
 package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.index.DistanceType;
+import com.lancedb.lance.util.ToStringHelper;
 
 import org.apache.arrow.util.Preconditions;
-import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.util.Optional;
 
@@ -26,9 +26,9 @@ public class Query {
   private final float[] key;
   private final int k;
   private final int minimumNprobes;
-  private final Optional<Integer> maximumNprobes;
-  private final Optional<Integer> ef;
-  private final Optional<Integer> refineFactor;
+  private final Integer maximumNprobes;
+  private final Integer ef;
+  private final Integer refineFactor;
   private final DistanceType distanceType;
   private final boolean useIndex;
 
@@ -40,8 +40,7 @@ public class Query {
     Preconditions.checkArgument(
         builder.minimumNprobes > 0, "Minimum Nprobes must be greater than 0");
     Preconditions.checkArgument(
-        !builder.maximumNprobes.isPresent()
-            || builder.maximumNprobes.get() >= builder.minimumNprobes,
+        builder.maximumNprobes == null || builder.maximumNprobes >= builder.minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
     this.minimumNprobes = builder.minimumNprobes;
@@ -69,15 +68,15 @@ public class Query {
   }
 
   public Optional<Integer> getMaximumNprobes() {
-    return maximumNprobes;
+    return Optional.of(maximumNprobes);
   }
 
   public Optional<Integer> getEf() {
-    return ef;
+    return Optional.of(ef);
   }
 
   public Optional<Integer> getRefineFactor() {
-    return refineFactor;
+    return Optional.of(refineFactor);
   }
 
   public String getDistanceType() {
@@ -90,16 +89,16 @@ public class Query {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("column", column)
-        .append("key", key)
-        .append("k", k)
-        .append("minimumNprobes", minimumNprobes)
-        .append("maximumNprobes", maximumNprobes.orElse(null))
-        .append("ef", ef.orElse(null))
-        .append("refineFactor", refineFactor.orElse(null))
-        .append("distanceType", distanceType)
-        .append("useIndex", useIndex)
+    return ToStringHelper.of(this)
+        .add("column", column)
+        .add("key", key)
+        .add("k", k)
+        .add("minimumNprobes", minimumNprobes)
+        .add("maximumNprobes", maximumNprobes)
+        .add("ef", ef)
+        .add("refineFactor", refineFactor)
+        .add("distanceType", distanceType)
+        .add("useIndex", useIndex)
         .toString();
   }
 
@@ -108,9 +107,9 @@ public class Query {
     private float[] key;
     private int k = 10;
     private int minimumNprobes = 20;
-    private Optional<Integer> maximumNprobes = Optional.empty();
-    private Optional<Integer> ef = Optional.empty();
-    private Optional<Integer> refineFactor = Optional.empty();
+    private Integer maximumNprobes;
+    private Integer ef;
+    private Integer refineFactor;
     private DistanceType distanceType = DistanceType.L2;
     private boolean useIndex = true;
 
@@ -158,7 +157,7 @@ public class Query {
      */
     public Builder setNprobes(int nprobes) {
       this.minimumNprobes = nprobes;
-      this.maximumNprobes = Optional.of(nprobes);
+      this.maximumNprobes = nprobes;
       return this;
     }
 
@@ -189,7 +188,7 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setMaximumNprobes(int maximumNprobes) {
-      this.maximumNprobes = Optional.of(maximumNprobes);
+      this.maximumNprobes = maximumNprobes;
       return this;
     }
 
@@ -201,7 +200,7 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setEf(int ef) {
-      this.ef = Optional.of(ef);
+      this.ef = ef;
       return this;
     }
 
@@ -212,7 +211,7 @@ public class Query {
      * @return The Builder instance for method chaining.
      */
     public Builder setRefineFactor(int refineFactor) {
-      this.refineFactor = Optional.of(refineFactor);
+      this.refineFactor = refineFactor;
       return this;
     }
 

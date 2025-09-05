@@ -14,6 +14,7 @@
 package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.Collections;
 import java.util.List;
@@ -21,9 +22,9 @@ import java.util.Objects;
 import java.util.Optional;
 
 public class Delete implements Operation {
-  private List<FragmentMetadata> updatedFragments;
-  private List<Long> deletedFragmentIds;
-  private String predicate;
+  private final List<FragmentMetadata> updatedFragments;
+  private final List<Long> deletedFragmentIds;
+  private final String predicate;
 
   private Delete(
       List<FragmentMetadata> updatedFragments, List<Long> deletedFragmentIds, String predicate) {
@@ -44,7 +45,7 @@ public class Delete implements Operation {
     return deletedFragmentIds;
   }
 
-  public Optional predicate() {
+  public Optional<String> predicate() {
     return Optional.ofNullable(predicate);
   }
 
@@ -54,9 +55,11 @@ public class Delete implements Operation {
   }
 
   public String toString() {
-    return String.format(
-        "Delete{updatedFragments=%s, deletedFragmentIds=%s, predicate=%s}",
-        updatedFragments, deletedFragmentIds, predicate);
+    return ToStringHelper.of(this)
+        .add("updatedFragments", updatedFragments)
+        .add("deletedFragmentIds", deletedFragmentIds)
+        .add("predicate", predicate)
+        .toString();
   }
 
   @Override

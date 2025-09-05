@@ -14,8 +14,7 @@
 package com.lancedb.lance.index.vector;
 
 import com.lancedb.lance.index.DistanceType;
-
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.lancedb.lance.util.ToStringHelper;
 
 import java.util.Optional;
 
@@ -23,9 +22,9 @@ import java.util.Optional;
 public class VectorIndexParams {
   private final DistanceType distanceType;
   private final IvfBuildParams ivfParams;
-  private final Optional<PQBuildParams> pqParams;
-  private final Optional<HnswBuildParams> hnswParams;
-  private final Optional<SQBuildParams> sqParams;
+  private final PQBuildParams pqParams;
+  private final HnswBuildParams hnswParams;
+  private final SQBuildParams sqParams;
 
   private VectorIndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
@@ -37,13 +36,13 @@ public class VectorIndexParams {
   }
 
   private void validate() {
-    if (pqParams.isPresent() && sqParams.isPresent()) {
+    if (pqParams != null && sqParams != null) {
       throw new IllegalArgumentException("PQ and SQ cannot coexist");
     }
-    if (hnswParams.isPresent() && !pqParams.isPresent() && !sqParams.isPresent()) {
+    if (hnswParams != null && pqParams == null && sqParams == null) {
       throw new IllegalArgumentException("HNSW must be combined with either PQ or SQ");
     }
-    if (sqParams.isPresent() && !hnswParams.isPresent()) {
+    if (sqParams != null && hnswParams == null) {
       throw new IllegalArgumentException("IVF + SQ is not supported");
     }
   }
@@ -144,9 +143,9 @@ public class VectorIndexParams {
   public static class Builder {
     private DistanceType distanceType = DistanceType.L2;
     private final IvfBuildParams ivfParams;
-    private Optional<PQBuildParams> pqParams = Optional.empty();
-    private Optional<HnswBuildParams> hnswParams = Optional.empty();
-    private Optional<SQBuildParams> sqParams = Optional.empty();
+    private PQBuildParams pqParams;
+    private HnswBuildParams hnswParams;
+    private SQBuildParams sqParams;
 
     /**
      * Create a new builder to create a vector index.
@@ -171,7 +170,7 @@ public class VectorIndexParams {
      * @return Builder
      */
     public Builder setPqParams(PQBuildParams pqParams) {
-      this.pqParams = Optional.of(pqParams);
+      this.pqParams = pqParams;
       return this;
     }
 
@@ -181,7 +180,7 @@ public class VectorIndexParams {
      * @return Builder
      */
     public Builder setHnswParams(HnswBuildParams hnswParams) {
-      this.hnswParams = Optional.of(hnswParams);
+      this.hnswParams = hnswParams;
       return this;
     }
 
@@ -190,7 +189,7 @@ public class VectorIndexParams {
      * @return Builder
      */
     public Builder setSqParams(SQBuildParams sqParams) {
-      this.sqParams = Optional.of(sqParams);
+      this.sqParams = sqParams;
       return this;
     }
 
@@ -208,25 +207,25 @@ public class VectorIndexParams {
   }
 
   public Optional<PQBuildParams> getPqParams() {
-    return pqParams;
+    return Optional.ofNullable(pqParams);
   }
 
   public Optional<HnswBuildParams> getHnswParams() {
-    return hnswParams;
+    return Optional.ofNullable(hnswParams);
   }
 
   public Optional<SQBuildParams> getSqParams() {
-    return sqParams;
+    return Optional.ofNullable(sqParams);
   }
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("distanceType", distanceType)
-        .append("ivfParams", ivfParams)
-        .append("pqParams", pqParams.orElse(null))
-        .append("hnswParams", hnswParams.orElse(null))
-        .append("sqParams", sqParams.orElse(null))
+    return ToStringHelper.of(this)
+        .add("distanceType", distanceType)
+        .add("ivfParams", ivfParams)
+        .add("pqParams", pqParams)
+        .add("hnswParams", hnswParams)
+        .add("sqParams", sqParams)
         .toString();
   }
 }

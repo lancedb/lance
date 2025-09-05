@@ -13,8 +13,9 @@
  */
 package com.lancedb.lance.ipc;
 
+import com.lancedb.lance.util.ToStringHelper;
+
 import org.apache.arrow.util.Preconditions;
-import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -22,18 +23,18 @@ import java.util.Optional;
 
 /** Lance scan options. */
 public class ScanOptions {
-  private final Optional<List<Integer>> fragmentIds;
-  private final Optional<Long> batchSize;
-  private final Optional<List<String>> columns;
-  private final Optional<String> filter;
-  private final Optional<ByteBuffer> substraitFilter;
-  private final Optional<Long> limit;
-  private final Optional<Long> offset;
-  private final Optional<Query> nearest;
+  private final List<Integer> fragmentIds;
+  private final Long batchSize;
+  private final List<String> columns;
+  private final String filter;
+  private final ByteBuffer substraitFilter;
+  private final Long limit;
+  private final Long offset;
+  private final Query nearest;
   private final boolean withRowId;
   private final boolean withRowAddress;
   private final int batchReadahead;
-  private final Optional<List<ColumnOrdering>> columnOrderings;
+  private final List<ColumnOrdering> columnOrderings;
 
   /**
    * Constructor for LanceScanOptions.
@@ -52,21 +53,21 @@ public class ScanOptions {
    * @param nearest (Optional) Nearest neighbor query.
    * @param batchReadahead Number of batches to read ahead.
    */
-  public ScanOptions(
-      Optional<List<Integer>> fragmentIds,
-      Optional<Long> batchSize,
-      Optional<List<String>> columns,
-      Optional<String> filter,
-      Optional<ByteBuffer> substraitFilter,
-      Optional<Long> limit,
-      Optional<Long> offset,
-      Optional<Query> nearest,
+  private ScanOptions(
+      List<Integer> fragmentIds,
+      Long batchSize,
+      List<String> columns,
+      String filter,
+      ByteBuffer substraitFilter,
+      Long limit,
+      Long offset,
+      Query nearest,
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
-      Optional<List<ColumnOrdering>> columnOrderings) {
+      List<ColumnOrdering> columnOrderings) {
     Preconditions.checkArgument(
-        !(filter.isPresent() && substraitFilter.isPresent()),
+        !(filter != null && substraitFilter != null),
         "cannot set both substrait filter and string filter");
     this.fragmentIds = fragmentIds;
     this.batchSize = batchSize;
@@ -88,7 +89,7 @@ public class ScanOptions {
    * @return Optional containing the fragment ids if specified, otherwise empty.
    */
   public Optional<List<Integer>> getFragmentIds() {
-    return fragmentIds;
+    return Optional.ofNullable(fragmentIds);
   }
 
   /**
@@ -97,7 +98,7 @@ public class ScanOptions {
    * @return Optional containing the batch size if specified, otherwise empty.
    */
   public Optional<Long> getBatchSize() {
-    return batchSize;
+    return Optional.ofNullable(batchSize);
   }
 
   /**
@@ -106,7 +107,7 @@ public class ScanOptions {
    * @return Optional containing the columns if specified, otherwise empty.
    */
   public Optional<List<String>> getColumns() {
-    return columns;
+    return Optional.ofNullable(columns);
   }
 
   /**
@@ -115,7 +116,7 @@ public class ScanOptions {
    * @return Optional containing the filter if specified, otherwise empty.
    */
   public Optional<String> getFilter() {
-    return filter;
+    return Optional.ofNullable(filter);
   }
 
   /**
@@ -124,7 +125,7 @@ public class ScanOptions {
    * @return Optional containing the substrait filter if specified, otherwise empty.
    */
   public Optional<ByteBuffer> getSubstraitFilter() {
-    return substraitFilter;
+    return Optional.ofNullable(substraitFilter);
   }
 
   /**
@@ -133,7 +134,7 @@ public class ScanOptions {
    * @return Optional containing the limit if specified, otherwise empty.
    */
   public Optional<Long> getLimit() {
-    return limit;
+    return Optional.ofNullable(limit);
   }
 
   /**
@@ -142,7 +143,7 @@ public class ScanOptions {
    * @return Optional containing the offset if specified, otherwise empty.
    */
   public Optional<Long> getOffset() {
-    return offset;
+    return Optional.ofNullable(offset);
   }
 
   /**
@@ -151,7 +152,7 @@ public class ScanOptions {
    * @return Optional containing the nearest neighbor query if specified, otherwise empty.
    */
   public Optional<Query> getNearest() {
-    return nearest;
+    return Optional.ofNullable(nearest);
   }
 
   /**
@@ -182,43 +183,43 @@ public class ScanOptions {
   }
 
   public Optional<List<ColumnOrdering>> getColumnOrderings() {
-    return columnOrderings;
+    return Optional.ofNullable(columnOrderings);
   }
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("fragmentIds", fragmentIds.orElse(null))
-        .append("batchSize", batchSize.orElse(null))
-        .append("columns", columns.orElse(null))
-        .append("filter", filter.orElse(null))
-        .append(
+    return ToStringHelper.of(this)
+        .add("fragmentIds", fragmentIds)
+        .add("batchSize", batchSize)
+        .add("columns", columns)
+        .add("filter", filter)
+        .add(
             "substraitFilter",
-            substraitFilter.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
-        .append("limit", limit.orElse(null))
-        .append("offset", offset.orElse(null))
-        .append("nearest", nearest.orElse(null))
-        .append("withRowId", withRowId)
-        .append("WithRowAddress", withRowAddress)
-        .append("batchReadahead", batchReadahead)
-        .append("columnOrdering", columnOrderings)
+            getSubstraitFilter().map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]"))
+        .add("limit", limit)
+        .add("offset", offset)
+        .add("nearest", nearest)
+        .add("withRowId", withRowId)
+        .add("WithRowAddress", withRowAddress)
+        .add("batchReadahead", batchReadahead)
+        .add("columnOrdering", columnOrderings)
         .toString();
   }
 
   /** Builder for constructing LanceScanOptions. */
   public static class Builder {
-    private Optional<List<Integer>> fragmentIds = Optional.empty();
-    private Optional<Long> batchSize = Optional.empty();
-    private Optional<List<String>> columns = Optional.empty();
-    private Optional<String> filter = Optional.empty();
-    private Optional<ByteBuffer> substraitFilter = Optional.empty();
-    private Optional<Long> limit = Optional.empty();
-    private Optional<Long> offset = Optional.empty();
-    private Optional<Query> nearest = Optional.empty();
+    private List<Integer> fragmentIds;
+    private Long batchSize;
+    private List<String> columns;
+    private String filter;
+    private ByteBuffer substraitFilter;
+    private Long limit;
+    private Long offset;
+    private Query nearest;
     private boolean withRowId = false;
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
-    private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
+    private List<ColumnOrdering> columnOrderings;
 
     public Builder() {}
 
@@ -228,18 +229,18 @@ public class ScanOptions {
      * @param options another scan options
      */
     public Builder(ScanOptions options) {
-      this.fragmentIds = options.getFragmentIds();
-      this.batchSize = options.getBatchSize();
-      this.columns = options.getColumns();
-      this.filter = options.getFilter();
-      this.substraitFilter = options.getSubstraitFilter();
-      this.limit = options.getLimit();
-      this.offset = options.getOffset();
-      this.nearest = options.getNearest();
-      this.withRowId = options.isWithRowId();
-      this.withRowAddress = options.isWithRowAddress();
-      this.batchReadahead = options.getBatchReadahead();
-      this.columnOrderings = options.getColumnOrderings();
+      this.fragmentIds = options.fragmentIds;
+      this.batchSize = options.batchSize;
+      this.columns = options.columns;
+      this.filter = options.filter;
+      this.substraitFilter = options.substraitFilter;
+      this.limit = options.limit;
+      this.offset = options.offset;
+      this.nearest = options.nearest;
+      this.withRowId = options.withRowId;
+      this.withRowAddress = options.withRowAddress;
+      this.batchReadahead = options.batchReadahead;
+      this.columnOrderings = options.columnOrderings;
     }
 
     /**
@@ -249,7 +250,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder fragmentIds(List<Integer> fragmentIds) {
-      this.fragmentIds = Optional.of(fragmentIds);
+      this.fragmentIds = fragmentIds;
       return this;
     }
 
@@ -260,7 +261,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder batchSize(long batchSize) {
-      this.batchSize = Optional.of(batchSize);
+      this.batchSize = batchSize;
       return this;
     }
 
@@ -271,7 +272,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder columns(List<String> columns) {
-      this.columns = Optional.of(columns);
+      this.columns = columns;
       return this;
     }
 
@@ -282,7 +283,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder filter(String filter) {
-      this.filter = Optional.of(filter);
+      this.filter = filter;
       return this;
     }
 
@@ -293,7 +294,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder substraitFilter(ByteBuffer substraitFilter) {
-      this.substraitFilter = Optional.of(substraitFilter);
+      this.substraitFilter = substraitFilter;
       return this;
     }
 
@@ -304,7 +305,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder limit(long limit) {
-      this.limit = Optional.of(limit);
+      this.limit = limit;
       return this;
     }
 
@@ -315,7 +316,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder offset(long offset) {
-      this.offset = Optional.of(offset);
+      this.offset = offset;
       return this;
     }
 
@@ -326,7 +327,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder nearest(Query nearest) {
-      this.nearest = Optional.of(nearest);
+      this.nearest = nearest;
       return this;
     }
 
@@ -364,7 +365,7 @@ public class ScanOptions {
     }
 
     public Builder setColumnOrderings(List<ColumnOrdering> columnOrderings) {
-      this.columnOrderings = Optional.of(columnOrderings);
+      this.columnOrderings = columnOrderings;
       return this;
     }
 

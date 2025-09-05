@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.schema;
 
+import com.lancedb.lance.util.ToStringHelper;
+
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.Collections;
@@ -41,6 +43,10 @@ public class LanceSchema {
   public Schema asArrowSchema() {
     return new Schema(
         fields.stream().map(LanceField::asArrowField).collect(Collectors.toList()), metadata);
+  }
+
+  public String toString() {
+    return ToStringHelper.of(this).add("fields", fields).add("metadata", metadata).toString();
   }
 
   // Builder class for LanceSchema
