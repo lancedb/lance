@@ -6,6 +6,7 @@ mod encoding;
 mod index;
 mod iter;
 mod merger;
+pub mod parser;
 pub mod query;
 mod scorer;
 pub mod tokenizer;
