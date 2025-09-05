@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 
 from . import log
 from .blob import BlobColumn, BlobFile
+from .cli import lance_tools_cli
 from .dataset import (
     DataStatistics,
     FieldStatistics,
@@ -59,6 +60,7 @@ __all__ = [
     "bytes_read_counter",
     "iops_counter",
     "write_dataset",
+    "lance_tools_cli",
     "schema_to_json",
     "json_to_schema",
     "dataset",
