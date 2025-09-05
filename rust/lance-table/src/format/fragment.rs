@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::num::NonZero;
+use std::ops::Range;
 
 use deepsize::DeepSizeOf;
 use lance_core::Error;
@@ -240,6 +241,231 @@ pub enum RowIdMeta {
     External(ExternalFile),
 }
 
+/// Metadata about location of the latest update version sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+pub enum RowLatestUpdateVersionMeta {
+    Inline(Vec<u8>),
+    External(ExternalFile),
+}
+
+/// Sequence of latest update versions for rows in a fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLatestUpdateVersionSequence(Vec<RowVersionSegment>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowVersionSegment {
+    UniformRange {
+        row_range: Range<u64>,
+        version: u64,
+    },
+
+    IncrementalRange {
+        row_range: Range<u64>,
+        version_start: u64,
+    },
+
+    Sparse(Vec<(u64, u64)>),
+}
+
+impl RowLatestUpdateVersionSequence {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn from_pairs(pairs: &[(u64, u64)]) -> Self {
+        if pairs.is_empty() {
+            return Self::new();
+        }
+
+        let mut segments = Vec::new();
+        let mut current_pairs = Vec::new();
+
+        for &(row_id, version) in pairs {
+            current_pairs.push((row_id, version));
+
+            if let Some(segment) = Self::try_optimize_pairs(&current_pairs) {
+                segments.push(segment);
+                current_pairs.clear();
+            }
+        }
+
+        if !current_pairs.is_empty() {
+            segments.push(RowVersionSegment::Sparse(current_pairs));
+        }
+
+        Self(segments)
+    }
+
+    fn try_optimize_pairs(pairs: &[(u64, u64)]) -> Option<RowVersionSegment> {
+        if pairs.len() < 3 {
+            return None;
+        }
+
+        let first_row = pairs[0].0;
+        let first_version = pairs[0].1;
+
+        if pairs.iter().all(|(_, v)| *v == first_version)
+            && pairs
+                .iter()
+                .enumerate()
+                .all(|(i, (r, _))| *r == first_row + i as u64)
+        {
+            return Some(RowVersionSegment::UniformRange {
+                row_range: first_row..(first_row + pairs.len() as u64),
+                version: first_version,
+            });
+        }
+
+        if pairs
+            .iter()
+            .enumerate()
+            .all(|(i, (r, v))| *r == first_row + i as u64 && *v == first_version + i as u64)
+        {
+            return Some(RowVersionSegment::IncrementalRange {
+                row_range: first_row..(first_row + pairs.len() as u64),
+                version_start: first_version,
+            });
+        }
+
+        None
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.0.iter().flat_map(|segment| segment.iter())
+    }
+
+    pub fn get_version(&self, row_id: u64) -> Option<u64> {
+        for segment in &self.0 {
+            if let Some(version) = segment.get_version(row_id) {
+                return Some(version);
+            }
+        }
+        None
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.iter().map(|segment| segment.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty() || self.0.iter().all(|s| s.is_empty())
+    }
+
+    pub fn push(&mut self, row_id: u64, version: u64) {
+        if let Some(last_segment) = self.0.last_mut() {
+            if last_segment.try_extend(row_id, version) {
+                return;
+            }
+        }
+
+        self.0
+            .push(RowVersionSegment::Sparse(vec![(row_id, version)]));
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+}
+
+impl RowVersionSegment {
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (u64, u64)> + '_> {
+        match self {
+            Self::UniformRange { row_range, version } => {
+                Box::new(row_range.clone().map(move |row_id| (row_id, *version)))
+            }
+            Self::IncrementalRange {
+                row_range,
+                version_start,
+            } => Box::new(
+                row_range
+                    .clone()
+                    .enumerate()
+                    .map(move |(i, row_id)| (row_id, *version_start + i as u64)),
+            ),
+            Self::Sparse(pairs) => Box::new(pairs.iter().copied()),
+        }
+    }
+
+    pub fn get_version(&self, row_id: u64) -> Option<u64> {
+        match self {
+            Self::UniformRange { row_range, version } => {
+                if row_range.contains(&row_id) {
+                    Some(*version)
+                } else {
+                    None
+                }
+            }
+            Self::IncrementalRange {
+                row_range,
+                version_start,
+            } => {
+                if row_range.contains(&row_id) {
+                    Some(*version_start + (row_id - row_range.start))
+                } else {
+                    None
+                }
+            }
+            Self::Sparse(pairs) => pairs.iter().find(|(r, _)| *r == row_id).map(|(_, v)| *v),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::UniformRange { row_range, .. } => (row_range.end - row_range.start) as usize,
+            Self::IncrementalRange { row_range, .. } => (row_range.end - row_range.start) as usize,
+            Self::Sparse(pairs) => pairs.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn try_extend(&mut self, row_id: u64, version: u64) -> bool {
+        match self {
+            Self::UniformRange {
+                row_range,
+                version: seg_version,
+            } => {
+                if row_id == row_range.end && version == *seg_version {
+                    row_range.end += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::IncrementalRange {
+                row_range,
+                version_start,
+            } => {
+                let expected_version = *version_start + (row_range.end - row_range.start);
+                if row_id == row_range.end && version == expected_version {
+                    row_range.end += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Sparse(pairs) => {
+                pairs.push((row_id, version));
+                true
+            }
+        }
+    }
+}
+
+impl Default for RowLatestUpdateVersionSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Vec<(u64, u64)>> for RowLatestUpdateVersionSequence {
+    fn from(pairs: Vec<(u64, u64)>) -> Self {
+        Self::from_pairs(&pairs)
+    }
+}
+
 impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
     type Error = Error;
 
@@ -247,6 +473,23 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
         match value {
             pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data)),
             pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
+                Ok(Self::External(ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                }))
+            }
+        }
+    }
+}
+
+impl TryFrom<pb::data_fragment::RowLatestUpdatedVersionSequence> for RowLatestUpdateVersionMeta {
+    type Error = Error;
+
+    fn try_from(value: pb::data_fragment::RowLatestUpdatedVersionSequence) -> Result<Self> {
+        match value {
+            pb::data_fragment::RowLatestUpdatedVersionSequence::InlineRowLatestUpdatedVersions(data) => Ok(Self::Inline(data)),
+            pb::data_fragment::RowLatestUpdatedVersionSequence::ExternalRowLatestUpdatedVersions(file) => {
                 Ok(Self::External(ExternalFile {
                     path: file.path.clone(),
                     offset: file.offset,
@@ -281,6 +524,10 @@ pub struct Fragment {
     /// unknown. This is only optional for legacy reasons. All new tables should
     /// have this set.
     pub physical_rows: Option<usize>,
+
+    /// Row latest update version's metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_latest_update_version_meta: Option<RowLatestUpdateVersionMeta>,
 }
 
 impl Fragment {
@@ -291,6 +538,7 @@ impl Fragment {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
+            row_latest_update_version_meta: None,
         }
     }
 
@@ -328,6 +576,7 @@ impl Fragment {
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
+            row_latest_update_version_meta: None,
         }
     }
 
@@ -446,6 +695,10 @@ impl TryFrom<pb::DataFragment> for Fragment {
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
+            row_latest_update_version_meta: p
+                .row_latest_updated_version_sequence
+                .map(RowLatestUpdateVersionMeta::try_from)
+                .transpose()?,
         })
     }
 }
@@ -477,12 +730,24 @@ impl From<&Fragment> for pb::DataFragment {
             }
         });
 
+        let row_latest_updated_version_sequence = f.row_latest_update_version_meta.as_ref().map(|m| match m {
+            RowLatestUpdateVersionMeta::Inline(data) => pb::data_fragment::RowLatestUpdatedVersionSequence::InlineRowLatestUpdatedVersions(data.clone()),
+            RowLatestUpdateVersionMeta::External(file) => {
+                pb::data_fragment::RowLatestUpdatedVersionSequence::ExternalRowLatestUpdatedVersions(pb::ExternalFile {
+                    path: file.path.clone(),
+                    offset: file.offset,
+                    size: file.size,
+                })
+            }
+        });
+
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            row_latest_updated_version_sequence,
         }
     }
 }
