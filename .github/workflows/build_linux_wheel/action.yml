@@ -18,10 +18,6 @@ inputs:
     description: "The manylinux version to build for"
     required: false
     default: "2_17"
-  upload_debug_wheel:
-    description: "Upload debug wheels as artifacts"
-    required: false
-    default: "false"
 runs:
   using: "composite"
   steps:
@@ -77,24 +73,3 @@ runs:
             && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-aarch_64.zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip
-    - name: Upload debug wheels as artifacts
-      if: ${{ inputs.upload_debug_wheel == 'true' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: debug-wheels-linux-${{ inputs.manylinux }}-${{ inputs.arm-build == 'true' && 'arm64' || 'x86_64' }}
-        path: python/target/wheels/*.whl
-        retention-days: 90
-    - name: Upload debug wheels to release
-      if: ${{ inputs.upload_debug_wheel == 'true' && github.event_name == 'release' }}
-      uses: softprops/action-gh-release@v1
-      with:
-        files: python/target/wheels/*.whl
-        fail_on_unmatched_files: false
-    - name: Strip wheels for PyPI
-      if: ${{ inputs.upload_debug_wheel == 'true' }}
-      shell: bash
-      run: |
-        # Fix permissions on wheel files created in container
-        sudo chown -R $(id -u):$(id -g) python/target/wheels/
-        chmod +x ci/strip_wheel.sh
-        ci/strip_wheel.sh python/target/wheels/*.whl

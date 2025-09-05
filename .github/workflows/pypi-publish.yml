@@ -73,7 +73,26 @@ jobs:
         args: "--release ${{ matrix.config.extra_args }}"
         arm-build: ${{ matrix.config.platform == 'aarch64' }}
         manylinux: ${{ matrix.config.manylinux }}
-        upload_debug_wheel: "true"
+    - name: Upload debug wheels to release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: python/target/wheels/*.whl
+        fail_on_unmatched_files: false
+    - name: Upload debug wheels as artifacts
+      if: github.event_name != 'release'
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-wheels-linux-${{ matrix.config.manylinux }}-${{ matrix.config.platform }}
+        path: python/target/wheels/*.whl
+        retention-days: 90
+    - name: Strip wheels for PyPI
+      shell: bash
+      run: |
+        # Fix permissions on wheel files created in container
+        sudo chown -R $(id -u):$(id -g) python/target/wheels/
+        chmod +x ci/strip_wheel.sh
+        ci/strip_wheel.sh python/target/wheels/*.whl
     - uses: ./.github/workflows/upload_wheel
       if: github.event_name == 'release'
       with:
