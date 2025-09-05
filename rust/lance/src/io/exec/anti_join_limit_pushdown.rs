@@ -27,8 +27,9 @@ use crate::io::exec::scan::LanceScanExec;
 fn get_exact_row_count(plan: Arc<dyn ExecutionPlan>) -> Option<usize> {
     use datafusion::common::stats::Precision;
 
-    // First try direct statistics
-    if let Ok(stats) = plan.partition_statistics(None) {
+    // Try to get statistics - use statistics() not partition_statistics()
+    // because LanceScanExec implements statistics() but not partition_statistics()
+    if let Ok(stats) = plan.statistics() {
         if let Precision::Exact(n) = stats.num_rows {
             return Some(n);
         }

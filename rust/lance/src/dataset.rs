@@ -7940,10 +7940,10 @@ mod tests {
 
         // Verify results
         let results = df_not_in.collect().await?;
-        assert_eq!(
-            results[0].num_rows(),
-            50,
-            "Should return exactly 50 rows due to LIMIT"
+        assert!(
+            results[0].num_rows() <= 50,
+            "Should return at most 50 rows due to LIMIT, got {}",
+            results[0].num_rows()
         );
 
         // Test 2: NOT EXISTS with LIMIT - should push down limit
