@@ -152,6 +152,7 @@ public class Fragment {
           params.getMaxRowsPerGroup(),
           params.getMaxBytesPerFile(),
           params.getMode(),
+          params.getDataStorageVersion(),
           params.getStorageOptions());
     }
   }
@@ -176,6 +177,7 @@ public class Fragment {
         params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(),
         params.getMode(),
+        params.getDataStorageVersion(),
         params.getStorageOptions());
   }
 
@@ -192,6 +194,7 @@ public class Fragment {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
+      Optional<String> dataStorageVersion,
       Map<String, String> storageOptions);
 
   /**
@@ -206,5 +209,6 @@ public class Fragment {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
+      Optional<String> dataStorageVersion,
       Map<String, String> storageOptions);
 }
