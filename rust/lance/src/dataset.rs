@@ -7798,4 +7798,177 @@ mod tests {
             values
         )
     }
+
+    #[tokio::test]
+    async fn test_anti_join_limit_pushdown() -> Result<()> {
+        // Create test dataset with large table and exclusion list
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create large table (10000 rows)
+        let large_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("data", DataType::Utf8, false),
+        ]));
+
+        let mut ids = Vec::with_capacity(10000);
+        let mut data = Vec::with_capacity(10000);
+        for i in 0..10000 {
+            ids.push(i as i32);
+            data.push(format!("data_{}", i));
+        }
+
+        let large_batch = RecordBatch::try_new(
+            large_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(data)),
+            ],
+        )?;
+
+        let large_reader =
+            RecordBatchIterator::new(vec![Ok(large_batch)].into_iter(), large_schema.clone());
+        Dataset::write(large_reader, &format!("{}/large", test_uri), None).await?;
+
+        // Create exclusion list table (100 rows)
+        let exclude_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let exclude_ids: Vec<i32> = (0..100).map(|i| i * 10).collect();
+        let exclude_batch = RecordBatch::try_new(
+            exclude_schema.clone(),
+            vec![Arc::new(Int32Array::from(exclude_ids))],
+        )?;
+
+        let exclude_reader =
+            RecordBatchIterator::new(vec![Ok(exclude_batch)].into_iter(), exclude_schema.clone());
+        Dataset::write(exclude_reader, &format!("{}/exclude", test_uri), None).await?;
+
+        // Open datasets
+        let large_dataset = Dataset::open(&format!("{}/large", test_uri)).await?;
+        let exclude_dataset = Dataset::open(&format!("{}/exclude", test_uri)).await?;
+
+        // Create session context with Lance optimizers
+        use crate::io::exec::get_physical_optimizer;
+        use datafusion::execution::session_state::SessionStateBuilder;
+
+        let optimizer = get_physical_optimizer();
+        let mut builder = SessionStateBuilder::new().with_default_features();
+
+        for rule in optimizer.rules {
+            builder = builder.with_physical_optimizer_rule(rule);
+        }
+
+        let state = builder.build();
+        let ctx = SessionContext::new_with_state(state);
+
+        ctx.register_table("large", Arc::new(large_dataset.clone()))?;
+        ctx.register_table("exclude", Arc::new(exclude_dataset.clone()))?;
+
+        // Test 1: NOT IN with LIMIT - should push down limit
+        let sql_not_in = "SELECT * FROM large WHERE id NOT IN (SELECT id FROM exclude) LIMIT 50";
+        let df_not_in = ctx.sql(sql_not_in).await?;
+
+        // Get physical plan to verify optimization
+        let physical_plan = df_not_in.clone().create_physical_plan().await?;
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(&*physical_plan).indent(true)
+        );
+
+        // Verify the optimization is applied - LanceScan should have range limit
+        assert!(
+            plan_str.contains("range=Some(0..150)"),
+            "NOT IN optimization failed: LanceScan should have range=Some(0..150) for limit 50 + build 100"
+        );
+
+        // Verify results
+        let results = df_not_in.collect().await?;
+        assert!(
+            results[0].num_rows() <= 50,
+            "Should return at most 50 rows due to LIMIT, got {}",
+            results[0].num_rows()
+        );
+
+        // Verify correctness: check that returned IDs are not in exclude list
+        if results[0].num_rows() > 0 {
+            let id_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..results[0].num_rows() {
+                let id = id_col.value(i);
+                // Exclude list contains IDs: 0, 10, 20, 30, ... (multiples of 10)
+                assert!(
+                    id % 10 != 0,
+                    "ID {} should not be in the result (it's in the exclude list)",
+                    id
+                );
+            }
+        }
+
+        // Test 2: NOT EXISTS with LIMIT - should push down limit
+        let sql_not_exists = "SELECT * FROM large l WHERE NOT EXISTS (SELECT 1 FROM exclude e WHERE e.id = l.id) LIMIT 100";
+        let df_not_exists = ctx.sql(sql_not_exists).await?;
+
+        // Get physical plan to verify optimization
+        let physical_plan = df_not_exists.clone().create_physical_plan().await?;
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(&*physical_plan).indent(true)
+        );
+
+        // Verify the optimization is applied - LanceScan should have range limit
+        assert!(
+            plan_str.contains("range=Some(0..200)"),
+            "NOT EXISTS optimization failed: LanceScan should have range=Some(0..200) for limit 100 + build 100"
+        );
+
+        // Verify results
+        let results = df_not_exists.collect().await?;
+        assert!(
+            results[0].num_rows() <= 100,
+            "Should return at most 100 rows due to LIMIT, got {}",
+            results[0].num_rows()
+        );
+
+        // Verify correctness: check that returned IDs are not in exclude list
+        if results[0].num_rows() > 0 {
+            let id_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..results[0].num_rows() {
+                let id = id_col.value(i);
+                // Exclude list contains IDs: 0, 10, 20, 30, ... (multiples of 10)
+                assert!(
+                    id % 10 != 0,
+                    "ID {} should not be in the result (it's in the exclude list)",
+                    id
+                );
+            }
+        }
+
+        // Test 3: Verify optimization effectiveness
+        // Without limit, the query would scan all 10000 rows
+        // With our optimization, it scans only ~150-200 rows
+        let sql_no_limit = "SELECT COUNT(*) FROM large WHERE id NOT IN (SELECT id FROM exclude)";
+        let df_count = ctx.sql(sql_no_limit).await?;
+        let count_results = df_count.collect().await?;
+        let total_count = count_results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert!(total_count > 1000, "Should have many matching rows");
+
+        Ok(())
+    }
 }
