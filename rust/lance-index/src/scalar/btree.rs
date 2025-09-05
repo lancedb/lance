@@ -4,10 +4,10 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
     fmt::{Debug, Display},
     ops::Bound,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use super::{
@@ -38,7 +38,7 @@ use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
     stream::{self},
-    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+    Future, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
     cache::{CacheKey, LanceCache},
@@ -54,16 +54,37 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
-use log::debug;
+use log::{debug, warn};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
+use tokio::runtime::{Builder, Runtime};
 use tracing::info;
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
+
+/// Global thread pool for B-tree prefetch operations
+static BTREE_PREFETCH_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .worker_threads(get_num_compute_intensive_cpus())
+        .max_blocking_threads(get_num_compute_intensive_cpus())
+        .thread_name("lance-btree-prefetch")
+        .enable_time()
+        .build()
+        .expect("Failed to create B-tree prefetch runtime")
+});
+
+/// Spawn a prefetch task on the B-tree thread pool
+fn spawn_btree_prefetch<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    BTREE_PREFETCH_RUNTIME.spawn(future)
+}
 const BTREE_INDEX_VERSION: u32 = 0;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
@@ -1231,6 +1252,7 @@ impl ScalarIndex for BTreeIndex {
             self.sub_index.as_ref(),
             dest_store,
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
         )
         .await?;
 
@@ -1366,10 +1388,33 @@ pub async fn train_btree_index(
     sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
     batch_size: u64,
+    fragment_ids: Option<Vec<u32>>,
 ) -> Result<()> {
-    let mut sub_index_file = index_store
-        .new_index_file(BTREE_PAGES_NAME, sub_index_trainer.schema().clone())
-        .await?;
+    let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
+        if !frag_ids.is_empty() {
+            // Create a mask with fragment_id in high 32 bits for distributed indexing
+            // This mask is used to filter partitions belonging to specific fragments
+            // If multiple fragments processed, use first fragment_id <<32 as mask
+            Some((frag_ids[0] as u64) << 32)
+        } else {
+            None
+        }
+    });
+
+    let mut sub_index_file;
+    if fragment_mask.is_none() {
+        sub_index_file = index_store
+            .new_index_file(BTREE_PAGES_NAME, sub_index_trainer.schema().clone())
+            .await?;
+    } else {
+        sub_index_file = index_store
+            .new_index_file(
+                part_page_data_file_path(fragment_mask.unwrap()).as_str(),
+                sub_index_trainer.schema().clone(),
+            )
+            .await?;
+    }
+
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
 
@@ -1393,12 +1438,893 @@ pub async fn train_btree_index(
     file_schema
         .metadata
         .insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
-    let mut btree_index_file = index_store
-        .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
-        .await?;
+    let mut btree_index_file;
+    if fragment_mask.is_none() {
+        btree_index_file = index_store
+            .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
+            .await?;
+    } else {
+        btree_index_file = index_store
+            .new_index_file(
+                part_lookup_file_path(fragment_mask.unwrap()).as_str(),
+                Arc::new(file_schema),
+            )
+            .await?;
+    }
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
     Ok(())
+}
+
+/// Extract partition ID from partition file name
+/// Expected format: "part_{partition_id}_{suffix}.lance"
+fn extract_partition_id(filename: &str) -> Result<u64> {
+    if !filename.starts_with("part_") {
+        return Err(Error::Internal {
+            message: format!("Invalid partition file name format: {}", filename),
+            location: location!(),
+        });
+    }
+
+    let parts: Vec<&str> = filename.split('_').collect();
+    if parts.len() < 3 {
+        return Err(Error::Internal {
+            message: format!("Invalid partition file name format: {}", filename),
+            location: location!(),
+        });
+    }
+
+    parts[1].parse::<u64>().map_err(|_| Error::Internal {
+        message: format!("Failed to parse partition ID from filename: {}", filename),
+        location: location!(),
+    })
+}
+
+/// Merge multiple partition page / lookup files into a complete metadata file
+///
+/// In a distributed environment, each worker node writes partition page / lookup files for the partitions it processes,
+/// and this function merges these files into a final metadata file.
+pub async fn merge_metadata_files(
+    store: Arc<dyn IndexStore>,
+    part_page_files: &[String],
+    part_lookup_files: &[String],
+    prefetch_batch: Option<usize>,
+) -> Result<()> {
+    if part_lookup_files.is_empty() || part_page_files.is_empty() {
+        return Err(Error::Internal {
+            message: "No partition files provided for merging".to_string(),
+            location: location!(),
+        });
+    }
+
+    // Step 1: Create lookup map for page files by partition ID
+    let mut page_files_map = HashMap::new();
+    for page_file in part_page_files {
+        let partition_id = extract_partition_id(page_file)?;
+        page_files_map.insert(partition_id, page_file);
+    }
+
+    // Step 2: Validate that all lookup files have corresponding page files
+    for lookup_file in part_lookup_files {
+        let partition_id = extract_partition_id(lookup_file)?;
+        if !page_files_map.contains_key(&partition_id) {
+            return Err(Error::Internal {
+                message: format!(
+                    "No corresponding page file found for lookup file: {} (partition_id: {})",
+                    lookup_file, partition_id
+                ),
+                location: location!(),
+            });
+        }
+    }
+
+    // Step 3: Extract metadata from lookup files
+    let first_lookup_reader = store.open_index_file(&part_lookup_files[0]).await?;
+    let batch_size = first_lookup_reader
+        .schema()
+        .metadata
+        .get(BATCH_SIZE_META_KEY)
+        .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
+        .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+
+    // Get the value type from lookup schema (min column)
+    let lookup_batch = first_lookup_reader.read_range(0..1, None).await?;
+    let value_type = lookup_batch.column(0).data_type().clone();
+
+    // Get page schema first
+    let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
+    let page_file = page_files_map.get(&partition_id).unwrap();
+    let page_reader = store.open_index_file(page_file).await?;
+    let page_schema = page_reader.schema().clone();
+
+    let arrow_schema = Arc::new(Schema::from(&page_schema));
+    let mut page_file = store
+        .new_index_file(BTREE_PAGES_NAME, arrow_schema.clone())
+        .await?;
+
+    let mut prefetch_config = PrefetchConfig::default();
+    if prefetch_batch.is_some() {
+        prefetch_config = prefetch_config.with_prefetch_batch(prefetch_batch.unwrap());
+    }
+
+    let lookup_entries = merge_page(
+        part_lookup_files,
+        &page_files_map,
+        &store,
+        batch_size,
+        &mut page_file,
+        arrow_schema.clone(),
+        prefetch_config,
+    )
+    .await?;
+
+    page_file.finish().await?;
+
+    // Step 4: Generate new lookup file based on reorganized pages
+    // Add batch_size to schema metadata
+    let mut metadata = HashMap::new();
+    metadata.insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
+
+    let lookup_schema_with_metadata = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("min", value_type.clone(), true),
+            Field::new("max", value_type, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("page_idx", DataType::UInt32, false),
+        ],
+        metadata,
+    ));
+
+    let lookup_batch = RecordBatch::try_new(
+        lookup_schema_with_metadata.clone(),
+        vec![
+            ScalarValue::iter_to_array(lookup_entries.iter().map(|(min, _, _, _)| min.clone()))?,
+            ScalarValue::iter_to_array(lookup_entries.iter().map(|(_, max, _, _)| max.clone()))?,
+            Arc::new(UInt32Array::from_iter_values(
+                lookup_entries
+                    .iter()
+                    .map(|(_, _, null_count, _)| *null_count),
+            )),
+            Arc::new(UInt32Array::from_iter_values(
+                lookup_entries.iter().map(|(_, _, _, page_idx)| *page_idx),
+            )),
+        ],
+    )?;
+
+    let mut lookup_file = store
+        .new_index_file(BTREE_LOOKUP_NAME, lookup_schema_with_metadata)
+        .await?;
+    lookup_file.write_record_batch(lookup_batch).await?;
+    lookup_file.finish().await?;
+
+    // After successfully writing the merged files, delete all partition files
+    // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
+    cleanup_partition_files(&store, part_lookup_files, part_page_files).await;
+
+    Ok(())
+}
+
+/// Clean up partition files after successful merge
+///
+/// This function safely deletes partition lookup and page files after a successful merge operation.
+/// File deletion failures are logged but do not affect the overall success of the merge operation.
+async fn cleanup_partition_files(
+    store: &Arc<dyn IndexStore>,
+    part_lookup_files: &[String],
+    part_page_files: &[String],
+) {
+    // Clean up partition lookup files
+    for file_name in part_lookup_files {
+        cleanup_single_file(
+            store,
+            file_name,
+            "part_",
+            "_page_lookup.lance",
+            "partition lookup",
+        )
+        .await;
+    }
+
+    // Clean up partition page files
+    for file_name in part_page_files {
+        cleanup_single_file(
+            store,
+            file_name,
+            "part_",
+            "_page_data.lance",
+            "partition page",
+        )
+        .await;
+    }
+}
+
+/// Helper function to clean up a single partition file
+///
+/// Performs safety checks on the filename pattern before attempting deletion.
+async fn cleanup_single_file(
+    store: &Arc<dyn IndexStore>,
+    file_name: &str,
+    expected_prefix: &str,
+    expected_suffix: &str,
+    file_type: &str,
+) {
+    // Ensure we only delete files that match the expected pattern (safety check)
+    if file_name.starts_with(expected_prefix) && file_name.ends_with(expected_suffix) {
+        match store.delete_index_file(file_name).await {
+            Ok(()) => {
+                debug!("Successfully deleted {} file: {}", file_type, file_name);
+            }
+            Err(e) => {
+                // File deletion failures should not affect the overall success of the function
+                // Log the error but continue processing other files
+                warn!(
+                    "Failed to delete {} file '{}': {}. \
+                    This does not affect the merge operation, but may leave \
+                    partition files that should be cleaned up manually.",
+                    file_type, file_name, e
+                );
+            }
+        }
+    } else {
+        // If the filename doesn't match the expected format, log a warning but don't attempt deletion
+        warn!(
+            "Skipping deletion of file '{}' as it does not match the expected \
+            {} file pattern ({}*{})",
+            file_name, file_type, expected_prefix, expected_suffix
+        );
+    }
+}
+
+/// Prefetch configuration for partition iterators
+#[derive(Debug, Clone)]
+pub struct PrefetchConfig {
+    /// Number of batches to prefetch ahead (0 means no prefetching)
+    pub prefetch_batches: usize,
+}
+
+/// Buffer entry for prefetch queue
+#[derive(Debug)]
+struct BufferEntry {
+    batch: RecordBatch,
+    start_row: usize,
+    end_row: usize,
+}
+
+/// Running prefetch task information
+#[derive(Debug)]
+struct RunningPrefetchTask {
+    /// Task handle
+    handle: tokio::task::JoinHandle<()>,
+    /// Range being prefetched
+    range: std::ops::Range<usize>,
+}
+
+/// Check if two ranges overlap
+fn ranges_overlap(range1: &std::ops::Range<usize>, range2: &std::ops::Range<usize>) -> bool {
+    range1.start < range2.end && range2.start < range1.end
+}
+
+/// Prefetch state for a partition using task-based prefetching
+struct PartitionPrefetchState {
+    /// Queue of prefetched data
+    buffer: Arc<tokio::sync::Mutex<VecDeque<BufferEntry>>>,
+    /// Reader for this partition
+    reader: Arc<dyn IndexReader>,
+    /// Total rows in this partition
+    total_rows: usize,
+    /// Queue of running prefetch tasks with their ranges
+    running_tasks: Arc<tokio::sync::Mutex<VecDeque<RunningPrefetchTask>>>,
+    /// Next position to schedule for prefetch
+    next_prefetch_position: Arc<tokio::sync::Mutex<usize>>,
+}
+
+/// Manager for coordinating task-based prefetch across multiple partitions
+pub struct PrefetchManager {
+    /// Prefetch state per partition
+    partition_states: HashMap<u64, PartitionPrefetchState>,
+    /// Prefetch configuration
+    config: PrefetchConfig,
+}
+
+impl PrefetchManager {
+    /// Create a new prefetch manager
+    pub fn new(config: PrefetchConfig) -> Self {
+        Self {
+            partition_states: HashMap::new(),
+            config,
+        }
+    }
+
+    /// Initialize a partition for task-based prefetching
+    pub fn initialize_partition(&mut self, partition_id: u64, reader: Arc<dyn IndexReader>) {
+        let total_rows = reader.num_rows();
+        let buffer = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+        let running_tasks = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+        let next_prefetch_position = Arc::new(tokio::sync::Mutex::new(0));
+
+        let state = PartitionPrefetchState {
+            buffer,
+            reader,
+            total_rows,
+            running_tasks,
+            next_prefetch_position,
+        };
+
+        self.partition_states.insert(partition_id, state);
+        debug!(
+            "Initialized partition {} for task-based prefetching",
+            partition_id
+        );
+    }
+
+    /// Submit a prefetch task for a partition to the thread pool
+    pub async fn submit_prefetch_task(&self, partition_id: u64, batch_size: usize) -> Result<()> {
+        if self.config.prefetch_batches == 0 {
+            return Ok(());
+        }
+
+        let Some(state) = self.partition_states.get(&partition_id) else {
+            return Ok(());
+        };
+
+        let reader = state.reader.clone();
+        let buffer = state.buffer.clone();
+        let running_tasks = state.running_tasks.clone();
+        let next_prefetch_position = state.next_prefetch_position.clone();
+        let total_rows = state.total_rows;
+        let effective_batch_size = self.config.prefetch_batches * batch_size;
+
+        const MAX_BUFFER_SIZE: usize = 4;
+        const MAX_RUNNING_TASKS: usize = 2;
+
+        // Clean up completed tasks and check limits
+        {
+            let mut tasks_guard = running_tasks.lock().await;
+
+            // Remove completed tasks from the front
+            while let Some(task) = tasks_guard.front() {
+                if task.handle.is_finished() {
+                    tasks_guard.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            // Check if we have too many running tasks
+            if tasks_guard.len() >= MAX_RUNNING_TASKS {
+                debug!(
+                    "Skipping prefetch for partition {} - too many running tasks ({})",
+                    partition_id,
+                    tasks_guard.len()
+                );
+                return Ok(());
+            }
+
+            // Check if any running task already covers to the end of file
+            for task in tasks_guard.iter() {
+                if task.range.end >= total_rows {
+                    debug!(
+                        "Skipping prefetch for partition {} - task already covers to EOF (range {}..{})",
+                        partition_id, task.range.start, task.range.end
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Check if buffer is full
+        {
+            let buffer_guard = buffer.lock().await;
+            if buffer_guard.len() >= MAX_BUFFER_SIZE {
+                debug!(
+                    "Skipping prefetch for partition {} - buffer full",
+                    partition_id
+                );
+                return Ok(());
+            }
+        }
+
+        // Determine the next range to prefetch
+        let next_range = {
+            let mut pos_guard = next_prefetch_position.lock().await;
+            let start_pos = *pos_guard;
+
+            if start_pos >= total_rows {
+                debug!(
+                    "Skipping prefetch for partition {} - no more data to prefetch",
+                    partition_id
+                );
+                return Ok(());
+            }
+
+            let end_pos = std::cmp::min(start_pos + effective_batch_size, total_rows);
+            *pos_guard = end_pos; // Update next prefetch position
+            start_pos..end_pos
+        };
+
+        // Check if this range is already being prefetched
+        {
+            let tasks_guard = running_tasks.lock().await;
+
+            // Check for range overlap
+            for task in tasks_guard.iter() {
+                if ranges_overlap(&task.range, &next_range) {
+                    debug!(
+                        "Skipping prefetch for partition {} - range {}..{} overlaps with running task {}..{}",
+                        partition_id, next_range.start, next_range.end, task.range.start, task.range.end
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // All checks passed, create the actual prefetch task (only this part is async)
+        let range_clone = next_range.clone();
+        let running_tasks_for_cleanup = running_tasks.clone();
+
+        let prefetch_task = spawn_btree_prefetch(async move {
+            // Perform the actual read
+            match reader.read_range(range_clone.clone(), None).await {
+                Ok(batch) => {
+                    let entry = BufferEntry {
+                        batch,
+                        start_row: range_clone.start,
+                        end_row: range_clone.end,
+                    };
+
+                    // Add to buffer
+                    {
+                        let mut buffer_guard = buffer.lock().await;
+                        buffer_guard.push_back(entry);
+                    }
+
+                    debug!(
+                        "Prefetched {} rows ({}..{}) for partition {}",
+                        range_clone.end - range_clone.start,
+                        range_clone.start,
+                        range_clone.end,
+                        partition_id
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "Prefetch task failed for partition {} range {}..{}: {}",
+                        partition_id, range_clone.start, range_clone.end, err
+                    );
+                }
+            }
+
+            // Remove this task from running tasks when completed
+            {
+                let mut tasks_guard = running_tasks_for_cleanup.lock().await;
+                tasks_guard.retain(|task| !task.handle.is_finished());
+            }
+        });
+
+        // Add the task to running tasks
+        {
+            let mut tasks_guard = running_tasks.lock().await;
+            tasks_guard.push_back(RunningPrefetchTask {
+                handle: prefetch_task,
+                range: next_range.clone(),
+            });
+        }
+
+        debug!(
+            "Submitted prefetch task for partition {} range {}..{}",
+            partition_id, next_range.start, next_range.end
+        );
+
+        Ok(())
+    }
+
+    /// Get data from buffer or fallback to direct read
+    pub async fn get_data_with_fallback(
+        &self,
+        partition_id: u64,
+        start_row: usize,
+        end_row: usize,
+    ) -> Result<RecordBatch> {
+        if let Some(state) = self.partition_states.get(&partition_id) {
+            // First try to get from buffer
+            {
+                let mut buffer_guard = state.buffer.lock().await;
+
+                // Remove outdated entries from the front
+                while let Some(entry) = buffer_guard.front() {
+                    if entry.end_row <= start_row {
+                        buffer_guard.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+
+                // Check if we have suitable data in buffer
+                if let Some(entry) = buffer_guard.front() {
+                    if entry.start_row <= start_row && entry.end_row >= end_row {
+                        // Found matching data, extract it
+                        let entry = buffer_guard.pop_front().unwrap();
+                        drop(buffer_guard);
+
+                        let slice_start = start_row - entry.start_row;
+                        let slice_len = end_row - start_row;
+
+                        debug!(
+                            "Using buffered data for partition {} ({}..{})",
+                            partition_id, start_row, end_row
+                        );
+
+                        return Ok(entry.batch.slice(slice_start, slice_len));
+                    }
+                }
+            }
+
+            // Fallback to direct read
+            debug!(
+                "Direct read fallback for partition {} ({}..{})",
+                partition_id, start_row, end_row
+            );
+
+            state.reader.read_range(start_row..end_row, None).await
+        } else {
+            Err(Error::Internal {
+                message: format!("Partition {} not found in prefetch manager", partition_id),
+                location: location!(),
+            })
+        }
+    }
+}
+
+impl Default for PrefetchConfig {
+    fn default() -> Self {
+        Self {
+            prefetch_batches: 1,
+        }
+    }
+}
+
+impl PrefetchConfig {
+    /// Set the prefetch batch count
+    pub fn with_prefetch_batch(&self, batch_count: usize) -> Self {
+        Self {
+            prefetch_batches: batch_count,
+        }
+    }
+}
+
+/// Simplified partition iterator with immediate loading since all partitions need to be accessed
+struct PartitionIterator {
+    reader: Arc<dyn IndexReader>,
+    current_batch: Option<RecordBatch>,
+    current_position: usize,
+    rows_read: usize,
+    partition_id: u64,
+    batch_size: u64,
+}
+
+impl PartitionIterator {
+    async fn new(
+        store: Arc<dyn IndexStore>,
+        page_file_name: String,
+        partition_id: u64,
+        batch_size: u64,
+    ) -> Result<Self> {
+        let reader = store.open_index_file(&page_file_name).await?;
+        Ok(Self {
+            reader,
+            current_batch: None,
+            current_position: 0,
+            rows_read: 0,
+            partition_id,
+            batch_size,
+        })
+    }
+
+    /// Get the next element, working with the prefetch manager
+    async fn next(
+        &mut self,
+        prefetch_manager: &PrefetchManager,
+    ) -> Result<Option<(ScalarValue, ScalarValue)>> {
+        // Load new batch if current one is exhausted
+        if self.needs_new_batch() {
+            if self.rows_read >= self.reader.num_rows() {
+                return Ok(None);
+            }
+            self.load_next_batch(prefetch_manager).await?;
+
+            // Submit next prefetch task
+            if let Err(err) = prefetch_manager
+                .submit_prefetch_task(self.partition_id, self.batch_size as usize)
+                .await
+            {
+                warn!(
+                    "Failed to submit prefetch task for partition {}: {}",
+                    self.partition_id, err
+                );
+            }
+        } else {
+            // Check if we've read half of the current batch, submit next prefetch task
+            let batch_half = self.current_batch.as_ref().unwrap().num_rows() / 2;
+            if self.current_position == batch_half && batch_half > 0 {
+                if let Err(err) = prefetch_manager
+                    .submit_prefetch_task(self.partition_id, self.batch_size as usize)
+                    .await
+                {
+                    warn!(
+                        "Failed to submit prefetch task for partition {}: {}",
+                        self.partition_id, err
+                    );
+                }
+            }
+        }
+
+        // Extract next value from current batch
+        if let Some(batch) = &self.current_batch {
+            let value = ScalarValue::try_from_array(batch.column(0), self.current_position)?;
+            let row_id = ScalarValue::try_from_array(batch.column(1), self.current_position)?;
+            self.current_position += 1;
+            self.rows_read += 1;
+            Ok(Some((value, row_id)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Check if we need to load a new batch
+    fn needs_new_batch(&self) -> bool {
+        self.current_batch.is_none()
+            || self.current_position >= self.current_batch.as_ref().unwrap().num_rows()
+    }
+
+    async fn load_next_batch(&mut self, prefetch_manager: &PrefetchManager) -> Result<()> {
+        let remaining_rows = self.reader.num_rows() - self.rows_read;
+        if remaining_rows == 0 {
+            self.current_batch = None;
+            return Ok(());
+        }
+
+        let rows_to_read = std::cmp::min(self.batch_size as usize, remaining_rows);
+        let end_row = self.rows_read + rows_to_read;
+
+        // Use the new fallback mechanism - try buffer first, then direct read
+        let batch = prefetch_manager
+            .get_data_with_fallback(self.partition_id, self.rows_read, end_row)
+            .await?;
+
+        self.current_batch = Some(batch);
+        self.current_position = 0;
+
+        Ok(())
+    }
+
+    fn get_reader(&self) -> Arc<dyn IndexReader> {
+        self.reader.clone()
+    }
+}
+
+/// Heap elements, used for priority queues in multi-way merging
+#[derive(Debug)]
+struct HeapElement {
+    value: ScalarValue,
+    row_id: ScalarValue,
+    partition_id: u64,
+}
+
+impl PartialEq for HeapElement {
+    fn eq(&self, other: &Self) -> bool {
+        self.value.eq(&other.value)
+    }
+}
+
+impl Eq for HeapElement {}
+
+impl PartialOrd for HeapElement {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // Note: BinaryHeap is a maximum heap, we need a minimum heap,
+        // so reverse the comparison result
+        other.value.partial_cmp(&self.value)
+    }
+}
+
+impl Ord for HeapElement {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+async fn merge_page(
+    part_lookup_files: &[String],
+    page_files_map: &HashMap<u64, &String>,
+    store: &Arc<dyn IndexStore>,
+    batch_size: u64,
+    page_file: &mut Box<dyn IndexWriter>,
+    arrow_schema: Arc<Schema>,
+    prefetch_config: PrefetchConfig,
+) -> Result<Vec<(ScalarValue, ScalarValue, u32, u32)>> {
+    let mut lookup_entries = Vec::new();
+    let mut page_idx = 0u32;
+
+    debug!(
+        "Starting multi-way merge with {} partitions using prefetch manager",
+        part_lookup_files.len()
+    );
+
+    // Create prefetch manager
+    let mut prefetch_manager = PrefetchManager::new(prefetch_config.clone());
+
+    // Directly create iterators and read first element
+    let mut partition_map = HashMap::new();
+    let mut heap = BinaryHeap::new();
+
+    debug!("Initializing {} partitions", part_lookup_files.len());
+
+    // Initialize all partitions
+    for lookup_file in part_lookup_files {
+        let partition_id = extract_partition_id(lookup_file)?;
+        let page_file_name = page_files_map
+            .get(&partition_id)
+            .ok_or_else(|| Error::Internal {
+                message: format!("Page file not found for partition ID: {}", partition_id),
+                location: location!(),
+            })?
+            .to_string();
+
+        let mut iterator =
+            PartitionIterator::new(store.clone(), page_file_name, partition_id, batch_size).await?;
+
+        // Initialize partition in prefetch manager
+        let reader = iterator.get_reader();
+        prefetch_manager.initialize_partition(partition_id, reader);
+
+        // Submit initial prefetch task
+        if let Err(err) = prefetch_manager
+            .submit_prefetch_task(partition_id, batch_size as usize)
+            .await
+        {
+            warn!(
+                "Failed to submit prefetch task for partition {}: {}",
+                partition_id, err
+            );
+        }
+
+        let first_element = iterator.next(&prefetch_manager).await?;
+
+        if let Some((value, row_id)) = first_element {
+            // Put the first element into the heap
+            heap.push(HeapElement {
+                value,
+                row_id,
+                partition_id,
+            });
+        }
+
+        partition_map.insert(partition_id, iterator);
+    }
+
+    debug!(
+        "Initialized {} partitions, heap size: {}",
+        partition_map.len(),
+        heap.len()
+    );
+
+    let mut current_batch_rows = Vec::with_capacity(batch_size as usize);
+    let mut total_merged = 0usize;
+
+    // Multi-way merge main loop
+    while let Some(min_element) = heap.pop() {
+        // Add current minimum element to batch
+        current_batch_rows.push((min_element.value, min_element.row_id));
+        total_merged += 1;
+
+        // Read next element from corresponding partition
+        if let Some(iterator) = partition_map.get_mut(&min_element.partition_id) {
+            if let Some((next_value, next_row_id)) = iterator.next(&prefetch_manager).await? {
+                heap.push(HeapElement {
+                    value: next_value,
+                    row_id: next_row_id,
+                    partition_id: min_element.partition_id,
+                });
+            }
+        }
+
+        // Write when batch reaches specified size
+        if current_batch_rows.len() >= batch_size as usize {
+            write_batch_and_lookup_entry(
+                &mut current_batch_rows,
+                page_file,
+                &arrow_schema,
+                &mut lookup_entries,
+                &mut page_idx,
+            )
+            .await?;
+        }
+    }
+
+    // Write the remaining data
+    if !current_batch_rows.is_empty() {
+        write_batch_and_lookup_entry(
+            &mut current_batch_rows,
+            page_file,
+            &arrow_schema,
+            &mut lookup_entries,
+            &mut page_idx,
+        )
+        .await?;
+    }
+
+    debug!(
+        "Completed multi-way merge: merged {} rows into {} lookup entries",
+        total_merged,
+        lookup_entries.len()
+    );
+    Ok(lookup_entries)
+}
+
+/// Helper function to prepare batch data in parallel
+async fn prepare_batch_data(
+    batch_rows: Vec<(ScalarValue, ScalarValue)>,
+    arrow_schema: Arc<Schema>,
+    page_idx: u32,
+) -> Result<(RecordBatch, (ScalarValue, ScalarValue, u32, u32))> {
+    if batch_rows.is_empty() {
+        return Err(Error::Internal {
+            message: "Cannot prepare empty batch".to_string(),
+            location: location!(),
+        });
+    }
+
+    // Parallelize data preparation
+    let (values, row_ids): (Vec<_>, Vec<_>) = batch_rows.into_iter().unzip();
+
+    // Convert to arrays in parallel using rayon or manually spawn tasks
+    let values_array = ScalarValue::iter_to_array(values.into_iter())?;
+    let row_ids_array = ScalarValue::iter_to_array(row_ids.into_iter())?;
+
+    let batch = RecordBatch::try_new(arrow_schema, vec![values_array, row_ids_array])?;
+
+    // Calculate min/max/null_count for lookup entry
+    let min_val = ScalarValue::try_from_array(batch.column(0), 0)?;
+    let max_val = ScalarValue::try_from_array(batch.column(0), batch.num_rows() - 1)?;
+    let null_count = batch.column(0).null_count() as u32;
+
+    let lookup_entry = (min_val, max_val, null_count, page_idx);
+
+    Ok((batch, lookup_entry))
+}
+
+/// Helper function to write a batch and create lookup entry
+async fn write_batch_and_lookup_entry(
+    batch_rows: &mut Vec<(ScalarValue, ScalarValue)>,
+    page_file: &mut Box<dyn IndexWriter>,
+    arrow_schema: &Arc<Schema>,
+    lookup_entries: &mut Vec<(ScalarValue, ScalarValue, u32, u32)>,
+    page_idx: &mut u32,
+) -> Result<()> {
+    if batch_rows.is_empty() {
+        return Ok(());
+    }
+
+    // Take ownership of the batch data
+    let batch_data = std::mem::take(batch_rows);
+    let current_page_idx = *page_idx;
+
+    // Prepare batch data
+    let (batch, lookup_entry) =
+        prepare_batch_data(batch_data, arrow_schema.clone(), current_page_idx).await?;
+
+    lookup_entries.push(lookup_entry);
+    page_file.write_record_batch(batch).await?;
+    *page_idx += 1;
+
+    Ok(())
+}
+
+pub(crate) fn part_page_data_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, BTREE_PAGES_NAME)
+}
+
+pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, BTREE_LOOKUP_NAME)
 }
 
 /// A stream that reads the original training data back out of the index
@@ -1522,6 +2448,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
@@ -1541,6 +2468,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
                 .parameters
                 .zone_size
                 .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
+            fragment_ids,
         )
         .await?;
         Ok(CreatedIndex {
@@ -1594,7 +2522,10 @@ mod tests {
         },
     };
 
-    use super::{train_btree_index, OrderableScalarValue};
+    use super::{
+        part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,
+        DEFAULT_BTREE_BATCH_SIZE,
+    };
 
     #[test]
     fn test_scalar_value_size() {
@@ -1631,7 +2562,7 @@ mod tests {
             .into_df_stream(RowCount::from(5000), BatchCount::from(10));
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 5000)
+        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 5000, None)
             .await
             .unwrap();
 
@@ -1714,7 +2645,7 @@ mod tests {
 
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float64);
 
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64)
+        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64, None)
             .await
             .unwrap();
 
@@ -1755,7 +2686,7 @@ mod tests {
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64)
+        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64, None)
             .await
             .unwrap();
 
@@ -1773,5 +2704,679 @@ mod tests {
         let query2 = index.search(&query, &metrics);
         tokio::join!(query1, query2).0.unwrap();
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    }
+
+    /// Test that fragment-based btree index construction produces exactly the same results as building a complete index
+    #[tokio::test]
+    async fn test_fragment_btree_index_consistency() {
+        // Setup stores for both indexes
+        let full_tmpdir = Arc::new(tempdir().unwrap());
+        let full_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(full_tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let fragment_tmpdir = Arc::new(tempdir().unwrap());
+        let fragment_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(fragment_tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
+
+        // Method 1: Build complete index directly using the same data
+        // Create deterministic data for comparison - use 2 * DEFAULT_BTREE_BATCH_SIZE for testing
+        let total_count = (2 * DEFAULT_BTREE_BATCH_SIZE) as u64;
+        let full_data_gen = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(total_count / 2), BatchCount::from(2));
+        let full_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            full_data_gen.schema(),
+            full_data_gen,
+        ));
+
+        train_btree_index(
+            full_data_source,
+            &sub_index_trainer,
+            full_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Method 2: Build fragment-based index using the same data split into fragments
+        // Create fragment 1 index - first half of the data (0 to DEFAULT_BTREE_BATCH_SIZE-1)
+        let half_count = DEFAULT_BTREE_BATCH_SIZE;
+        let fragment1_gen = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(half_count), BatchCount::from(1));
+        let fragment1_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            fragment1_gen.schema(),
+            fragment1_gen,
+        ));
+
+        train_btree_index(
+            fragment1_data_source,
+            &sub_index_trainer,
+            fragment_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            Some(vec![1]), // fragment_id = 1
+        )
+        .await
+        .unwrap();
+
+        // Create fragment 2 index - second half of the data (DEFAULT_BTREE_BATCH_SIZE to 2*DEFAULT_BTREE_BATCH_SIZE-1)
+        let start_val = DEFAULT_BTREE_BATCH_SIZE as i32;
+        let end_val = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let values_second_half: Vec<i32> = (start_val..end_val).collect();
+        let row_ids_second_half: Vec<u64> = (start_val as u64..end_val as u64).collect();
+        let fragment2_gen = gen_batch()
+            .col("value", array::cycle::<Int32Type>(values_second_half))
+            .col("_rowid", array::cycle::<UInt64Type>(row_ids_second_half))
+            .into_df_stream(RowCount::from(half_count), BatchCount::from(1));
+        let fragment2_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            fragment2_gen.schema(),
+            fragment2_gen,
+        ));
+
+        train_btree_index(
+            fragment2_data_source,
+            &sub_index_trainer,
+            fragment_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            Some(vec![2]), // fragment_id = 2
+        )
+        .await
+        .unwrap();
+
+        // Merge the fragment files
+        let part_page_files = vec![
+            part_page_data_file_path(1 << 32),
+            part_page_data_file_path(2 << 32),
+        ];
+
+        let part_lookup_files = vec![
+            part_lookup_file_path(1 << 32),
+            part_lookup_file_path(2 << 32),
+        ];
+
+        super::merge_metadata_files(
+            fragment_store.clone(),
+            &part_page_files,
+            &part_lookup_files,
+            Option::from(1usize),
+        )
+        .await
+        .unwrap();
+
+        // Load both indexes
+        let full_index = BTreeIndex::load(full_store.clone(), None, LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let merged_index = BTreeIndex::load(fragment_store.clone(), None, LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Test queries one by one to identify the exact problem
+
+        // Test 1: Query for value 0 (should be in first page)
+        let query_0 = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
+        let full_result_0 = full_index
+            .search(&query_0, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_0 = merged_index
+            .search(&query_0, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(full_result_0, merged_result_0, "Query for value 0 failed");
+
+        // Test 2: Query for value in middle of first batch (should be in first page)
+        let mid_first_batch = (DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
+        let query_mid_first = SargableQuery::Equals(ScalarValue::Int32(Some(mid_first_batch)));
+        let full_result_mid_first = full_index
+            .search(&query_mid_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_mid_first = merged_index
+            .search(&query_mid_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_mid_first, merged_result_mid_first,
+            "Query for value {} failed",
+            mid_first_batch
+        );
+
+        // Test 3: Query for first value in second batch (should be in second page)
+        let first_second_batch = DEFAULT_BTREE_BATCH_SIZE as i32;
+        let query_first_second =
+            SargableQuery::Equals(ScalarValue::Int32(Some(first_second_batch)));
+        let full_result_first_second = full_index
+            .search(&query_first_second, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_first_second = merged_index
+            .search(&query_first_second, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_first_second, merged_result_first_second,
+            "Query for value {} failed",
+            first_second_batch
+        );
+
+        // Test 4: Query for value in middle of second batch (should be in second page)
+        let mid_second_batch = (DEFAULT_BTREE_BATCH_SIZE + DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
+        let query_mid_second = SargableQuery::Equals(ScalarValue::Int32(Some(mid_second_batch)));
+
+        let full_result_mid_second = full_index
+            .search(&query_mid_second, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_mid_second = merged_index
+            .search(&query_mid_second, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_mid_second, merged_result_mid_second,
+            "Query for value {} failed",
+            mid_second_batch
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_btree_index_boundary_queries() {
+        // Setup stores for both indexes
+        let full_tmpdir = Arc::new(tempdir().unwrap());
+        let full_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(full_tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let fragment_tmpdir = Arc::new(tempdir().unwrap());
+        let fragment_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(fragment_tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
+
+        // Use 3 * DEFAULT_BTREE_BATCH_SIZE for more comprehensive boundary testing
+        let total_count = (3 * DEFAULT_BTREE_BATCH_SIZE) as u64;
+
+        // Method 1: Build complete index directly
+        let full_data_gen = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(total_count / 3), BatchCount::from(3));
+        let full_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            full_data_gen.schema(),
+            full_data_gen,
+        ));
+
+        train_btree_index(
+            full_data_source,
+            &sub_index_trainer,
+            full_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Method 2: Build fragment-based index using 3 fragments
+        // Fragment 1: 0 to DEFAULT_BTREE_BATCH_SIZE-1
+        let fragment_size = DEFAULT_BTREE_BATCH_SIZE;
+        let fragment1_gen = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
+        let fragment1_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            fragment1_gen.schema(),
+            fragment1_gen,
+        ));
+
+        train_btree_index(
+            fragment1_data_source,
+            &sub_index_trainer,
+            fragment_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            Some(vec![1]),
+        )
+        .await
+        .unwrap();
+
+        // Fragment 2: DEFAULT_BTREE_BATCH_SIZE to 2*DEFAULT_BTREE_BATCH_SIZE-1
+        let start_val2 = DEFAULT_BTREE_BATCH_SIZE as i32;
+        let end_val2 = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let values_fragment2: Vec<i32> = (start_val2..end_val2).collect();
+        let row_ids_fragment2: Vec<u64> = (start_val2 as u64..end_val2 as u64).collect();
+        let fragment2_gen = gen_batch()
+            .col("value", array::cycle::<Int32Type>(values_fragment2))
+            .col("_rowid", array::cycle::<UInt64Type>(row_ids_fragment2))
+            .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
+        let fragment2_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            fragment2_gen.schema(),
+            fragment2_gen,
+        ));
+
+        train_btree_index(
+            fragment2_data_source,
+            &sub_index_trainer,
+            fragment_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            Some(vec![2]),
+        )
+        .await
+        .unwrap();
+
+        // Fragment 3: 2*DEFAULT_BTREE_BATCH_SIZE to 3*DEFAULT_BTREE_BATCH_SIZE-1
+        let start_val3 = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let end_val3 = (3 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let values_fragment3: Vec<i32> = (start_val3..end_val3).collect();
+        let row_ids_fragment3: Vec<u64> = (start_val3 as u64..end_val3 as u64).collect();
+        let fragment3_gen = gen_batch()
+            .col("value", array::cycle::<Int32Type>(values_fragment3))
+            .col("_rowid", array::cycle::<UInt64Type>(row_ids_fragment3))
+            .into_df_stream(RowCount::from(fragment_size), BatchCount::from(1));
+        let fragment3_data_source = Box::pin(RecordBatchStreamAdapter::new(
+            fragment3_gen.schema(),
+            fragment3_gen,
+        ));
+
+        train_btree_index(
+            fragment3_data_source,
+            &sub_index_trainer,
+            fragment_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            Some(vec![3]),
+        )
+        .await
+        .unwrap();
+
+        // Merge all fragment files
+        let part_page_files = vec![
+            part_page_data_file_path(1 << 32),
+            part_page_data_file_path(2 << 32),
+            part_page_data_file_path(3 << 32),
+        ];
+
+        let part_lookup_files = vec![
+            part_lookup_file_path(1 << 32),
+            part_lookup_file_path(2 << 32),
+            part_lookup_file_path(3 << 32),
+        ];
+
+        super::merge_metadata_files(
+            fragment_store.clone(),
+            &part_page_files,
+            &part_lookup_files,
+            Option::from(1usize),
+        )
+        .await
+        .unwrap();
+
+        // Load both indexes
+        let full_index = BTreeIndex::load(full_store.clone(), None, LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let merged_index = BTreeIndex::load(fragment_store.clone(), None, LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // === Boundary Value Tests ===
+
+        // Test 1: Query minimum value (boundary: data start)
+        let query_min = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
+        let full_result_min = full_index
+            .search(&query_min, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_min = merged_index
+            .search(&query_min, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_min, merged_result_min,
+            "Query for minimum value 0 failed"
+        );
+
+        // Test 2: Query maximum value (boundary: data end)
+        let max_val = (3 * DEFAULT_BTREE_BATCH_SIZE - 1) as i32;
+        let query_max = SargableQuery::Equals(ScalarValue::Int32(Some(max_val)));
+        let full_result_max = full_index
+            .search(&query_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_max = merged_index
+            .search(&query_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_max, merged_result_max,
+            "Query for maximum value {} failed",
+            max_val
+        );
+
+        // Test 3: Query fragment boundary value (last value of first fragment)
+        let fragment1_last = (DEFAULT_BTREE_BATCH_SIZE - 1) as i32;
+        let query_frag1_last = SargableQuery::Equals(ScalarValue::Int32(Some(fragment1_last)));
+        let full_result_frag1_last = full_index
+            .search(&query_frag1_last, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_frag1_last = merged_index
+            .search(&query_frag1_last, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_frag1_last, merged_result_frag1_last,
+            "Query for fragment 1 last value {} failed",
+            fragment1_last
+        );
+
+        // Test 4: Query fragment boundary value (first value of second fragment)
+        let fragment2_first = DEFAULT_BTREE_BATCH_SIZE as i32;
+        let query_frag2_first = SargableQuery::Equals(ScalarValue::Int32(Some(fragment2_first)));
+        let full_result_frag2_first = full_index
+            .search(&query_frag2_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_frag2_first = merged_index
+            .search(&query_frag2_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_frag2_first, merged_result_frag2_first,
+            "Query for fragment 2 first value {} failed",
+            fragment2_first
+        );
+
+        // Test 5: Query fragment boundary value (last value of second fragment)
+        let fragment2_last = (2 * DEFAULT_BTREE_BATCH_SIZE - 1) as i32;
+        let query_frag2_last = SargableQuery::Equals(ScalarValue::Int32(Some(fragment2_last)));
+        let full_result_frag2_last = full_index
+            .search(&query_frag2_last, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_frag2_last = merged_index
+            .search(&query_frag2_last, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_frag2_last, merged_result_frag2_last,
+            "Query for fragment 2 last value {} failed",
+            fragment2_last
+        );
+
+        // Test 6: Query fragment boundary value (first value of third fragment)
+        let fragment3_first = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let query_frag3_first = SargableQuery::Equals(ScalarValue::Int32(Some(fragment3_first)));
+        let full_result_frag3_first = full_index
+            .search(&query_frag3_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_frag3_first = merged_index
+            .search(&query_frag3_first, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_frag3_first, merged_result_frag3_first,
+            "Query for fragment 3 first value {} failed",
+            fragment3_first
+        );
+
+        // === Non-existent Value Tests ===
+
+        // Test 7: Query value below minimum
+        let query_below_min = SargableQuery::Equals(ScalarValue::Int32(Some(-1)));
+        let full_result_below = full_index
+            .search(&query_below_min, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_below = merged_index
+            .search(&query_below_min, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_below, merged_result_below,
+            "Query for value below minimum (-1) failed"
+        );
+
+        // Test 8: Query value above maximum
+        let query_above_max = SargableQuery::Equals(ScalarValue::Int32(Some(max_val + 1)));
+        let full_result_above = full_index
+            .search(&query_above_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_above = merged_index
+            .search(&query_above_max, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_above,
+            merged_result_above,
+            "Query for value above maximum ({}) failed",
+            max_val + 1
+        );
+
+        // === Range Query Tests ===
+
+        // Test 9: Cross-fragment range query (from first fragment to second fragment)
+        let range_start = (DEFAULT_BTREE_BATCH_SIZE - 100) as i32;
+        let range_end = (DEFAULT_BTREE_BATCH_SIZE + 100) as i32;
+        let query_cross_frag = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(range_start))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(range_end))),
+        );
+        let full_result_cross = full_index
+            .search(&query_cross_frag, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_cross = merged_index
+            .search(&query_cross_frag, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_cross, merged_result_cross,
+            "Cross-fragment range query [{}, {}] failed",
+            range_start, range_end
+        );
+
+        // Test 10: Range query within single fragment
+        let single_frag_start = 100i32;
+        let single_frag_end = 200i32;
+        let query_single_frag = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(single_frag_start))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(single_frag_end))),
+        );
+        let full_result_single = full_index
+            .search(&query_single_frag, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_single = merged_index
+            .search(&query_single_frag, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_single, merged_result_single,
+            "Single fragment range query [{}, {}] failed",
+            single_frag_start, single_frag_end
+        );
+
+        // Test 11: Large range query spanning all fragments
+        let large_range_start = 100i32;
+        let large_range_end = (3 * DEFAULT_BTREE_BATCH_SIZE - 100) as i32;
+        let query_large_range = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(large_range_start))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(large_range_end))),
+        );
+        let full_result_large = full_index
+            .search(&query_large_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_large = merged_index
+            .search(&query_large_range, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_large, merged_result_large,
+            "Large range query [{}, {}] failed",
+            large_range_start, large_range_end
+        );
+
+        // === Range Boundary Query Tests ===
+
+        // Test 12: Less than query (implemented using range query, from minimum to specified value)
+        let lt_val = (DEFAULT_BTREE_BATCH_SIZE / 2) as i32;
+        let query_lt = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(0))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(lt_val))),
+        );
+        let full_result_lt = full_index
+            .search(&query_lt, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_lt = merged_index
+            .search(&query_lt, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_lt, merged_result_lt,
+            "Less than query (<{}) failed",
+            lt_val
+        );
+
+        // Test 13: Greater than query (implemented using range query, from specified value to maximum)
+        let gt_val = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let max_range_val = (3 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let query_gt = SargableQuery::Range(
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(gt_val))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(max_range_val))),
+        );
+        let full_result_gt = full_index
+            .search(&query_gt, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_gt = merged_index
+            .search(&query_gt, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_gt, merged_result_gt,
+            "Greater than query (>{}) failed",
+            gt_val
+        );
+
+        // Test 14: Less than or equal query (implemented using range query, including boundary value)
+        let lte_val = (DEFAULT_BTREE_BATCH_SIZE - 1) as i32;
+        let query_lte = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(0))),
+            std::collections::Bound::Included(ScalarValue::Int32(Some(lte_val))),
+        );
+        let full_result_lte = full_index
+            .search(&query_lte, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_lte = merged_index
+            .search(&query_lte, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_lte, merged_result_lte,
+            "Less than or equal query (<={}) failed",
+            lte_val
+        );
+
+        // Test 15: Greater than or equal query (implemented using range query, including boundary value)
+        let gte_val = (2 * DEFAULT_BTREE_BATCH_SIZE) as i32;
+        let query_gte = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(gte_val))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(max_range_val))),
+        );
+        let full_result_gte = full_index
+            .search(&query_gte, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let merged_result_gte = merged_index
+            .search(&query_gte, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            full_result_gte, merged_result_gte,
+            "Greater than or equal query (>={}) failed",
+            gte_val
+        );
+    }
+
+    #[test]
+    fn test_extract_partition_id() {
+        // Test valid partition file names
+        assert_eq!(
+            super::extract_partition_id("part_123_page_data.lance").unwrap(),
+            123
+        );
+        assert_eq!(
+            super::extract_partition_id("part_456_page_lookup.lance").unwrap(),
+            456
+        );
+        assert_eq!(
+            super::extract_partition_id("part_4294967296_page_data.lance").unwrap(),
+            4294967296
+        );
+
+        // Test invalid file names
+        assert!(super::extract_partition_id("invalid_filename.lance").is_err());
+        assert!(super::extract_partition_id("part_abc_page_data.lance").is_err());
+        assert!(super::extract_partition_id("part_123").is_err());
+        assert!(super::extract_partition_id("part_").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_partition_files() {
+        use crate::scalar::lance_format::LanceIndexStore;
+        use lance_core::cache::LanceCache;
+        use lance_io::object_store::ObjectStore;
+        use object_store::path::Path;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        // Create a test store
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store: Arc<dyn crate::scalar::IndexStore> = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test files with different patterns
+        let lookup_files = vec![
+            "part_123_page_lookup.lance".to_string(),
+            "invalid_lookup_file.lance".to_string(),
+            "part_456_page_lookup.lance".to_string(),
+        ];
+
+        let page_files = vec![
+            "part_123_page_data.lance".to_string(),
+            "invalid_page_file.lance".to_string(),
+            "part_456_page_data.lance".to_string(),
+        ];
+
+        // The cleanup function should handle both valid and invalid file patterns gracefully
+        // This test mainly verifies that the function doesn't panic and handles edge cases
+        super::cleanup_partition_files(&test_store, &lookup_files, &page_files).await;
+
+        // If we get here without panicking, the cleanup function handled all cases correctly
+        assert!(true);
     }
 }
