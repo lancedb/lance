@@ -73,6 +73,7 @@ jobs:
         args: "--release ${{ matrix.config.extra_args }}"
         arm-build: ${{ matrix.config.platform == 'aarch64' }}
         manylinux: ${{ matrix.config.manylinux }}
+        upload_debug_wheel: "true"
     - name: Upload debug wheels to release
       if: github.event_name == 'release'
       uses: softprops/action-gh-release@v1
