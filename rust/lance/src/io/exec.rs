@@ -5,6 +5,7 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
+mod anti_join_limit_pushdown;
 mod filter;
 pub mod filtered_read;
 pub mod fts;

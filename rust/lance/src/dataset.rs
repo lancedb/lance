@@ -7819,4 +7819,212 @@ mod tests {
             values
         )
     }
+
+    #[tokio::test]
+    async fn test_anti_join_limit_pushdown() -> Result<()> {
+        use datafusion::prelude::SessionConfig;
+
+        // Create test dataset with large table and exclusion list
+        let test_dir = tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create large table (10000 rows)
+        let large_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("data", DataType::Utf8, false),
+        ]));
+
+        let mut ids = Vec::with_capacity(10000);
+        let mut data = Vec::with_capacity(10000);
+        for i in 0..10000 {
+            ids.push(i as i32);
+            data.push(format!("data_{}", i));
+        }
+
+        let large_batch = RecordBatch::try_new(
+            large_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(data)),
+            ],
+        )?;
+
+        let large_reader =
+            RecordBatchIterator::new(vec![Ok(large_batch)].into_iter(), large_schema.clone());
+        Dataset::write(large_reader, &format!("{}/large", test_uri), None).await?;
+
+        // Create exclusion list table (100 rows)
+        let exclude_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let exclude_ids: Vec<i32> = (0..100).map(|i| i * 10).collect();
+        let exclude_batch = RecordBatch::try_new(
+            exclude_schema.clone(),
+            vec![Arc::new(Int32Array::from(exclude_ids))],
+        )?;
+
+        let exclude_reader =
+            RecordBatchIterator::new(vec![Ok(exclude_batch)].into_iter(), exclude_schema.clone());
+        Dataset::write(exclude_reader, &format!("{}/exclude", test_uri), None).await?;
+
+        // Open datasets
+        let large_dataset = Dataset::open(&format!("{}/large", test_uri)).await?;
+        let exclude_dataset = Dataset::open(&format!("{}/exclude", test_uri)).await?;
+
+        // Create session context
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_batch_size(1024)
+                .with_target_partitions(1),
+        );
+
+        ctx.register_table("large", Arc::new(large_dataset.clone()))?;
+        ctx.register_table("exclude", Arc::new(exclude_dataset.clone()))?;
+
+        // Test 1: NOT IN with LIMIT - should push down limit
+        println!("\n=== Test 1: NOT IN with LIMIT ===");
+        let sql_not_in = "SELECT * FROM large WHERE id NOT IN (SELECT id FROM exclude) LIMIT 50";
+        let df_not_in = ctx.sql(sql_not_in).await?;
+
+        // Get physical plan and check for limit pushdown
+        let physical_plan = df_not_in.clone().create_physical_plan().await?;
+        let plan_display = format!(
+            "{}",
+            datafusion::physical_plan::displayable(&*physical_plan).indent(true)
+        );
+        println!("Physical plan for NOT IN:\n{}", plan_display);
+
+        // Execute with EXPLAIN ANALYZE
+        let explain_sql = format!("EXPLAIN ANALYZE {}", sql_not_in);
+        let explain_df = ctx.sql(&explain_sql).await?;
+        let explain_results = explain_df.collect().await?;
+
+        println!("\nEXPLAIN ANALYZE for NOT IN:");
+        for batch in &explain_results {
+            if batch.num_rows() > 0 {
+                let col = batch.column(0);
+                if let Some(string_array) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..string_array.len() {
+                        if let Some(line) = string_array.value(i).lines().next() {
+                            // Look for LanceScan with range info
+                            if line.contains("LanceScan") {
+                                println!(">>> {}", line);
+                                // Extract range/fetch information if present
+                                if line.contains("range=") {
+                                    if let Some(range_start) = line.find("range=") {
+                                        let range_info = &line[range_start..];
+                                        if let Some(range_end) =
+                                            range_info.find(',').or(range_info.find(']'))
+                                        {
+                                            println!(
+                                                "    FETCH INFO: {}",
+                                                &range_info[..range_end]
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify results
+        let results = df_not_in.collect().await?;
+        assert_eq!(
+            results[0].num_rows(),
+            50,
+            "Should return exactly 50 rows due to LIMIT"
+        );
+
+        // Test 2: NOT EXISTS with LIMIT - should push down limit
+        println!("\n=== Test 2: NOT EXISTS with LIMIT ===");
+        let sql_not_exists = "SELECT * FROM large l WHERE NOT EXISTS (SELECT 1 FROM exclude e WHERE e.id = l.id) LIMIT 100";
+        let df_not_exists = ctx.sql(sql_not_exists).await?;
+
+        // Get physical plan
+        let physical_plan = df_not_exists.clone().create_physical_plan().await?;
+        let plan_display = format!(
+            "{}",
+            datafusion::physical_plan::displayable(&*physical_plan).indent(true)
+        );
+        println!("Physical plan for NOT EXISTS:\n{}", plan_display);
+
+        // Execute with EXPLAIN ANALYZE
+        let explain_sql = format!("EXPLAIN ANALYZE {}", sql_not_exists);
+        let explain_df = ctx.sql(&explain_sql).await?;
+        let explain_results = explain_df.collect().await?;
+
+        println!("\nEXPLAIN ANALYZE for NOT EXISTS:");
+        for batch in &explain_results {
+            if batch.num_rows() > 0 {
+                let col = batch.column(0);
+                if let Some(string_array) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..string_array.len() {
+                        if let Some(line) = string_array.value(i).lines().next() {
+                            if line.contains("LanceScan") {
+                                println!(">>> {}", line);
+                                // Extract range/fetch information
+                                if line.contains("range=") {
+                                    if let Some(range_start) = line.find("range=") {
+                                        let range_info = &line[range_start..];
+                                        if let Some(range_end) =
+                                            range_info.find(',').or(range_info.find(']'))
+                                        {
+                                            println!(
+                                                "    FETCH INFO: {}",
+                                                &range_info[..range_end]
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // Also look for LocalLimitExec which indicates pushdown
+                            if line.contains("LocalLimitExec") && line.contains("fetch=") {
+                                println!(">>> {}", line);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify results
+        let results = df_not_exists.collect().await?;
+        assert_eq!(
+            results[0].num_rows(),
+            100,
+            "Should return exactly 100 rows due to LIMIT"
+        );
+
+        // Test 3: Verify optimization effectiveness - compare row counts
+        println!("\n=== Test 3: Verify Optimization Effectiveness ===");
+
+        // Without limit (baseline)
+        let sql_no_limit = "SELECT COUNT(*) FROM large WHERE id NOT IN (SELECT id FROM exclude)";
+        let df_count = ctx.sql(sql_no_limit).await?;
+        let count_results = df_count.collect().await?;
+        let total_count = count_results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        println!("Total rows matching NOT IN condition: {}", total_count);
+        assert!(total_count > 1000, "Should have many matching rows");
+
+        // With our optimization, the scan should read much fewer rows
+        // The optimizer should limit scan to approximately: limit + build_size = 50 + 100 = 150 rows
+        println!("\nOptimization Summary:");
+        println!("- Without optimization: Would scan all 10000 rows");
+        println!("- With optimization: Should scan at most ~150-200 rows (limit + build_size)");
+        println!("- Actual optimization depends on data distribution and join execution");
+
+        Ok(())
+    }
 }

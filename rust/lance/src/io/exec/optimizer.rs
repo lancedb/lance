@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use super::anti_join_limit_pushdown::AntiJoinLimitPushdown;
 use super::TakeExec;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
@@ -170,7 +171,8 @@ impl PhysicalOptimizerRule for SimplifyProjection {
 
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
-        Arc::new(crate::io::exec::optimizer::CoalesceTake),
-        Arc::new(crate::io::exec::optimizer::SimplifyProjection),
+        Arc::new(CoalesceTake),
+        Arc::new(SimplifyProjection),
+        Arc::new(AntiJoinLimitPushdown::new()),
     ])
 }

@@ -605,9 +605,23 @@ impl LanceScanExec {
         &self.projection
     }
 
-    // Get the scan config for this scan.
+    /// Get the scan config for this scan.
     pub fn config(&self) -> &LanceScanConfig {
         &self.config
+    }
+
+    /// Create a new LanceScanExec with a fetch limit
+    pub fn with_fetch(self, fetch: usize) -> Self {
+        let new_range = if let Some(existing) = self.range {
+            Some(existing.start..existing.end.min(existing.start + fetch as u64))
+        } else {
+            Some(0..fetch as u64)
+        };
+
+        Self {
+            range: new_range,
+            ..self
+        }
     }
 }
 
