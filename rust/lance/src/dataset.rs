@@ -7890,53 +7890,21 @@ mod tests {
         ctx.register_table("exclude", Arc::new(exclude_dataset.clone()))?;
 
         // Test 1: NOT IN with LIMIT - should push down limit
-        println!("\n=== Test 1: NOT IN with LIMIT ===");
         let sql_not_in = "SELECT * FROM large WHERE id NOT IN (SELECT id FROM exclude) LIMIT 50";
         let df_not_in = ctx.sql(sql_not_in).await?;
 
-        // Get physical plan (optimization is automatic via SessionContext)
+        // Get physical plan to verify optimization
         let physical_plan = df_not_in.clone().create_physical_plan().await?;
-
-        // Also show what the plan looks like using EXPLAIN
-        let explain_sql = format!("EXPLAIN {}", sql_not_in);
-        let explain_df = ctx.sql(&explain_sql).await?;
-        let explain_results = explain_df.collect().await?;
-
-        println!("EXPLAIN output for NOT IN:");
-        for batch in &explain_results {
-            if batch.num_rows() > 0 {
-                let col = batch.column(0);
-                if let Some(string_array) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..string_array.len() {
-                        println!("{}", string_array.value(i));
-                    }
-                }
-            }
-        }
-
-        let plan_display = format!(
+        let plan_str = format!(
             "{}",
             datafusion::physical_plan::displayable(&*physical_plan).indent(true)
         );
-        println!("\nActual physical plan for NOT IN:\n{}", plan_display);
 
-        // Execute with EXPLAIN ANALYZE
-        let explain_sql = format!("EXPLAIN ANALYZE {}", sql_not_in);
-        let explain_df = ctx.sql(&explain_sql).await?;
-        let explain_results = explain_df.collect().await?;
-
-        println!("\nEXPLAIN ANALYZE for NOT IN:");
-        for batch in &explain_results {
-            if batch.num_rows() > 0 {
-                let col = batch.column(0);
-                if let Some(string_array) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..string_array.len() {
-                        let full_line = string_array.value(i);
-                        println!("{}", full_line);
-                    }
-                }
-            }
-        }
+        // Verify the optimization is applied - LanceScan should have range limit
+        assert!(
+            plan_str.contains("range=Some(0..150)"),
+            "NOT IN optimization failed: LanceScan should have range=Some(0..150) for limit 50 + build 100"
+        );
 
         // Verify results
         let results = df_not_in.collect().await?;
@@ -7946,40 +7914,40 @@ mod tests {
             results[0].num_rows()
         );
 
+        // Verify correctness: check that returned IDs are not in exclude list
+        if results[0].num_rows() > 0 {
+            let id_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..results[0].num_rows() {
+                let id = id_col.value(i);
+                // Exclude list contains IDs: 0, 10, 20, 30, ... (multiples of 10)
+                assert!(
+                    id % 10 != 0,
+                    "ID {} should not be in the result (it's in the exclude list)",
+                    id
+                );
+            }
+        }
+
         // Test 2: NOT EXISTS with LIMIT - should push down limit
-        println!("\n=== Test 2: NOT EXISTS with LIMIT ===");
         let sql_not_exists = "SELECT * FROM large l WHERE NOT EXISTS (SELECT 1 FROM exclude e WHERE e.id = l.id) LIMIT 100";
         let df_not_exists = ctx.sql(sql_not_exists).await?;
 
-        // Get physical plan (optimization is automatic via SessionContext)
+        // Get physical plan to verify optimization
         let physical_plan = df_not_exists.clone().create_physical_plan().await?;
-
-        let plan_display = format!(
+        let plan_str = format!(
             "{}",
             datafusion::physical_plan::displayable(&*physical_plan).indent(true)
         );
-        println!(
-            "Physical plan for NOT EXISTS (with automatic optimization):\n{}",
-            plan_display
+
+        // Verify the optimization is applied - LanceScan should have range limit
+        assert!(
+            plan_str.contains("range=Some(0..200)"),
+            "NOT EXISTS optimization failed: LanceScan should have range=Some(0..200) for limit 100 + build 100"
         );
-
-        // Execute with EXPLAIN ANALYZE
-        let explain_sql = format!("EXPLAIN ANALYZE {}", sql_not_exists);
-        let explain_df = ctx.sql(&explain_sql).await?;
-        let explain_results = explain_df.collect().await?;
-
-        println!("\nEXPLAIN ANALYZE for NOT EXISTS:");
-        for batch in &explain_results {
-            if batch.num_rows() > 0 {
-                let col = batch.column(0);
-                if let Some(string_array) = col.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..string_array.len() {
-                        let full_line = string_array.value(i);
-                        println!("{}", full_line);
-                    }
-                }
-            }
-        }
 
         // Verify results
         let results = df_not_exists.collect().await?;
@@ -7989,10 +7957,27 @@ mod tests {
             results[0].num_rows()
         );
 
-        // Test 3: Verify optimization effectiveness - compare row counts
-        println!("\n=== Test 3: Verify Optimization Effectiveness ===");
+        // Verify correctness: check that returned IDs are not in exclude list
+        if results[0].num_rows() > 0 {
+            let id_col = results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..results[0].num_rows() {
+                let id = id_col.value(i);
+                // Exclude list contains IDs: 0, 10, 20, 30, ... (multiples of 10)
+                assert!(
+                    id % 10 != 0,
+                    "ID {} should not be in the result (it's in the exclude list)",
+                    id
+                );
+            }
+        }
 
-        // Without limit (baseline)
+        // Test 3: Verify optimization effectiveness
+        // Without limit, the query would scan all 10000 rows
+        // With our optimization, it scans only ~150-200 rows
         let sql_no_limit = "SELECT COUNT(*) FROM large WHERE id NOT IN (SELECT id FROM exclude)";
         let df_count = ctx.sql(sql_no_limit).await?;
         let count_results = df_count.collect().await?;
@@ -8003,15 +7988,7 @@ mod tests {
             .unwrap()
             .value(0);
 
-        println!("Total rows matching NOT IN condition: {}", total_count);
         assert!(total_count > 1000, "Should have many matching rows");
-
-        // With our optimization, the scan should read much fewer rows
-        // The optimizer should limit scan to approximately: limit + build_size = 50 + 100 = 150 rows
-        println!("\nOptimization Summary:");
-        println!("- Without optimization: Would scan all 10000 rows");
-        println!("- With optimization: Should scan at most ~150-200 rows (limit + build_size)");
-        println!("- Actual optimization depends on data distribution and join execution");
 
         Ok(())
     }
