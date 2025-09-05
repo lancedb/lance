@@ -17,6 +17,7 @@ import com.google.common.base.MoreObjects;
 
 /** ReserveFragments operation to reserve fragment IDs for future use. */
 public class ReserveFragments implements Operation {
+
   private final int numFragments;
 
   private ReserveFragments(int numFragments) {

@@ -22,7 +22,6 @@ import java.util.Objects;
 
 /** Schema related base operation. */
 public abstract class SchemaOperation implements Operation {
-
   private final Schema schema;
   private ArrowSchema cSchema;
 

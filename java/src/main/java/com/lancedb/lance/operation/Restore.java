@@ -17,6 +17,7 @@ import com.google.common.base.MoreObjects;
 
 /** Restore operation to revert a dataset to a previous version. */
 public class Restore implements Operation {
+
   private final long version;
 
   private Restore(long version) {

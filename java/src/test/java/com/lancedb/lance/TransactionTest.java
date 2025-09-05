@@ -56,7 +56,7 @@ public class TransactionTest {
           assertNotNull(appendTxn.uuid());
 
           // Verify transaction properties
-          Map<String, String> txnProps = appendTxn.transactionProperties();
+          Map<String, String> txnProps = appendTxn.transactionProperties().orElse(new HashMap<>());
           assertEquals("APPEND", txnProps.get("transactionType"));
           assertEquals("testUser", txnProps.get("createdBy"));
         }

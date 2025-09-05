@@ -22,7 +22,6 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 public class LanceSchema {
-
   private final List<LanceField> fields;
   private final Map<String, String> metadata;
 

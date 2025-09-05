@@ -22,7 +22,6 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * positions, not ids(a.k.a. field id)
  */
 public class Project extends SchemaOperation {
-
   private Project(Schema schema) {
     super(schema);
   }

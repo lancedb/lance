@@ -20,12 +20,11 @@ import com.google.common.base.MoreObjects;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 
 public class Delete implements Operation {
-  private List<FragmentMetadata> updatedFragments;
-  private List<Long> deletedFragmentIds;
-  private String predicate;
+  private final List<FragmentMetadata> updatedFragments;
+  private final List<Long> deletedFragmentIds;
+  private final String predicate;
 
   private Delete(
       List<FragmentMetadata> updatedFragments, List<Long> deletedFragmentIds, String predicate) {
@@ -46,8 +45,8 @@ public class Delete implements Operation {
     return deletedFragmentIds;
   }
 
-  public Optional predicate() {
-    return Optional.ofNullable(predicate);
+  public String predicate() {
+    return predicate;
   }
 
   @Override
@@ -80,7 +79,7 @@ public class Delete implements Operation {
   public static class Builder {
     private List<FragmentMetadata> updatedFragments = Collections.emptyList();
     private List<Long> deletedFragmentIds = Collections.emptyList();
-    private String predicate;
+    private String predicate = "";
 
     private Builder() {}
 

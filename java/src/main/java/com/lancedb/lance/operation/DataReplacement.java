@@ -32,7 +32,6 @@ import java.util.Objects;
  * columns all have the same datafile layout across the fragments being replaced.
  */
 public class DataReplacement implements Operation {
-
   private final List<DataReplacementGroup> replacements;
 
   private DataReplacement(List<DataReplacementGroup> replacements) {
