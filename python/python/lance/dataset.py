@@ -2731,8 +2731,40 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.prewarm_index(name)
 
-    def merge_index_metadata(self, index_uuid: str):
-        return self._ds.merge_index_metadata(index_uuid)
+    def merge_index_metadata(
+        self,
+        index_uuid: str,
+        index_type: Union[
+            Literal["BTREE"],
+            Literal["INVERTED"],
+        ],
+        prefetch_batch: Optional[int] = None,
+    ):
+        """
+        Merge an index which not commit at present.
+
+        Parameters
+        ----------
+        index_uuid: str
+            The uuid of the index which want to merge.
+        index_type: Literal["BTREE", "INVERTED"]
+            The type of the index.
+        prefetch_batch: int, optional
+            The number of prefetch batches of sub-page files for merging.
+            Default 1.
+        """
+        index_type = index_type.upper()
+        if index_type not in [
+            "BTREE",
+            "INVERTED",
+        ]:
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" or "INVERTED" are supported for '
+                    f"merge index metadata.  Received {index_type}",
+                )
+            )
+        return self._ds.merge_index_metadata(index_uuid, index_type, prefetch_batch)
 
     def session(self) -> Session:
         """

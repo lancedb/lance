@@ -368,7 +368,7 @@ pub mod tests {
             )
             .unwrap();
         btree_plugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
@@ -866,6 +866,7 @@ pub mod tests {
             &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
         )
         .await
         .unwrap();
@@ -911,7 +912,7 @@ pub mod tests {
             .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
             .unwrap();
         BitmapIndexPlugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
@@ -1399,7 +1400,7 @@ pub mod tests {
             )
             .unwrap();
         LabelListIndexPlugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
