@@ -640,15 +640,12 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
-    use crate::index::{vector::is_ivf_hnsw, DatasetIndexInternalExt};
+    use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexInternalExt;
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         dataset::optimize::{compact_files, CompactionOptions},
-        index::vector::{is_ivf_pq, IndexFileVersion},
-    };
-    use crate::{
-        dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams},
-        index::vector::is_ivf_flat,
+        index::vector::IndexFileVersion,
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
@@ -872,9 +869,10 @@ mod tests {
                 )
                 .await;
 
+                let index_type = params.index_type();
                 // *_FLAT doesn't support float16/float64
-                if !(is_ivf_flat(&params.stages) // IVF_FLAT
-                    || (is_ivf_hnsw(&params.stages) && params.stages.len() == 2)) // IVF_HNSW_FLAT
+                if !(index_type == IndexType::IvfFlat
+                    || (index_type == IndexType::IvfHnswFlat && params.stages.len() == 2)) // IVF_HNSW_FLAT
                     && dataset.is_none()
                 // if dataset is provided, it has been created, so the data type is already determined, no need to test float64
                 {
@@ -925,7 +923,7 @@ mod tests {
 
         if params.stages.len() > 1
             && matches!(params.version, IndexFileVersion::V3)
-            && is_ivf_pq(&params.stages)
+            && params.index_type() == IndexType::IvfPq
         {
             let index = dataset.load_indices().await.unwrap();
             assert_eq!(index.len(), 1);

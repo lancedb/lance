@@ -127,7 +127,7 @@ async fn do_train_ivf_model(
     let params = IvfBuildParams {
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
-        num_partitions: num_partitions as usize,
+        num_partitions: Some(num_partitions as usize),
         ..Default::default()
     };
     let ivf_model = lance::index::vector::ivf::build_ivf_model(
