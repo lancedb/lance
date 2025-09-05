@@ -7,13 +7,15 @@
 //! It is a space-efficient data structure that can be used to test whether an element is a member of a set.
 //! It's an inexact filter - they may include false positives that require rechecking.
 
+use crate::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
 use crate::{pb, Any};
-use arrow_array::{new_empty_array, UInt64Array};
+use arrow_array::{new_empty_array, Array, UInt64Array};
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
 mod sbbf;
@@ -24,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use datafusion::execution::SendableRecordBatchStream;
+use parquet::data_type::AsBytes;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::scalar::FragReuseIndex;
@@ -51,6 +54,8 @@ struct BloomFilterStatistics {
     // as local row offset
     block_start: u64,
     block_size: usize,
+    // Serialized bloom filter data (SBBF bytes)
+    bloom_filter_data: Vec<u8>,
 }
 
 pub struct BloomFilterIndex {
@@ -140,9 +145,7 @@ impl BloomFilterIndex {
             });
         }
 
-        // For now, create a simple structure - this would be expanded for actual bloom filter data
-        // The RecordBatch should have columns: data_type_placeholder, fragment_id, block_start, block_size
-        let data_type_col = data.column(0); // data_type_placeholder column
+        let data_type_col = data.column(0);
         let data_type = data_type_col.data_type().clone();
 
         let fragment_id_col = data
@@ -193,14 +196,38 @@ impl BloomFilterIndex {
                 )
             })?;
 
+        let bloom_filter_data_col = data
+            .column_by_name("bloom_filter_data")
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "BloomFilterIndex: missing 'bloom_filter_data' column",
+                    location!(),
+                )
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "BloomFilterIndex: 'bloom_filter_data' column is not Binary",
+                    location!(),
+                )
+            })?;
+
         let num_blocks = data.num_rows();
         let mut blocks = Vec::with_capacity(num_blocks);
 
         for i in 0..num_blocks {
+            let bloom_filter_data = if bloom_filter_data_col.is_valid(i) {
+                bloom_filter_data_col.value(i).to_vec()
+            } else {
+                Vec::new()
+            };
+
             blocks.push(BloomFilterStatistics {
                 fragment_id: fragment_id_col.value(i),
                 block_start: block_start_col.value(i),
                 block_size: block_size_col.value(i) as usize,
+                bloom_filter_data,
             });
         }
 
@@ -215,34 +242,96 @@ impl BloomFilterIndex {
         })
     }
 
-    /// Evaluates whether a block could potentially contain values matching the query
-    /// For now, this is a conservative implementation that returns true for most queries
-    /// In a real bloom filter implementation, this would check the actual bloom filter
     fn evaluate_block_against_query(
         &self,
-        _block: &BloomFilterStatistics,
+        block: &BloomFilterStatistics,
         query: &SargableQuery,
     ) -> Result<bool> {
+        // If no bloom filter data is available, be conservative and return true
+        if block.bloom_filter_data.is_empty() {
+            return Ok(true);
+        }
+
+        // Try to reconstruct the bloom filter from the stored data
+        let sbbf = match Sbbf::new(&block.bloom_filter_data) {
+            Ok(sbbf) => sbbf,
+            Err(_) => {
+                // If we can't reconstruct the bloom filter, be conservative
+                return Ok(true);
+            }
+        };
+
         match query {
+            // TODO: Shall we care about null here?
             SargableQuery::IsNull() => {
-                // Bloom filters can track nulls separately or as special values
+                // For null values, we could use a special marker in the bloom filter
                 // For now, conservatively assume blocks might contain nulls
                 Ok(true)
             }
-            SargableQuery::Equals(_target) => {
-                // In a real implementation, this would check if the target value
-                // is in the block's bloom filter
-                Ok(true)
+            SargableQuery::Equals(target) => {
+                if target.is_null() {
+                    // Handle null values - conservatively return true for now
+                    return Ok(true);
+                }
+
+                // Check the bloom filter for the target value
+                match target {
+                    datafusion_common::ScalarValue::Int32(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Int64(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Float32(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Float64(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Utf8(Some(val)) => Ok(sbbf.check(val.as_str())),
+                    datafusion_common::ScalarValue::LargeUtf8(Some(val)) => {
+                        Ok(sbbf.check(val.as_str()))
+                    }
+                    datafusion_common::ScalarValue::Binary(Some(val)) => {
+                        Ok(sbbf.check(val.as_slice()))
+                    }
+                    datafusion_common::ScalarValue::LargeBinary(Some(val)) => {
+                        Ok(sbbf.check(val.as_slice()))
+                    }
+                    _ => {
+                        // For unsupported types, be conservative
+                        Ok(true)
+                    }
+                }
             }
             SargableQuery::Range(_, _) => {
                 // Bloom filters are not great for range queries
                 // but we can conservatively return true
                 Ok(true)
             }
-            SargableQuery::IsIn(_values) => {
-                // In a real implementation, this would check each value
-                // against the block's bloom filter
-                Ok(true)
+            SargableQuery::IsIn(values) => {
+                // Check if any value in the set is in the bloom filter
+                for value in values {
+                    if value.is_null() {
+                        // Handle null values - conservatively assume they might exist
+                        return Ok(true);
+                    }
+
+                    let found = match value {
+                        datafusion_common::ScalarValue::Int32(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Int64(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Float32(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Float64(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Utf8(Some(val)) => sbbf.check(val.as_str()),
+                        datafusion_common::ScalarValue::LargeUtf8(Some(val)) => {
+                            sbbf.check(val.as_str())
+                        }
+                        datafusion_common::ScalarValue::Binary(Some(val)) => {
+                            sbbf.check(val.as_slice())
+                        }
+                        datafusion_common::ScalarValue::LargeBinary(Some(val)) => {
+                            sbbf.check(val.as_slice())
+                        }
+                        _ => true, // Conservative for unsupported types
+                    };
+
+                    if found {
+                        return Ok(true);
+                    }
+                }
+                Ok(false) // None of the values were found
             }
             SargableQuery::FullTextSearch(_) => Err(Error::NotSupported {
                 source: "full text search is not supported for bloom filter indexes".into(),
@@ -270,13 +359,14 @@ impl Index for BloomFilterIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        // Not much to prewarm
         Ok(())
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
             "type": "BloomFilter",
+            "number_of_items": self.number_of_items,
+            "number_of_bytes": self.number_of_bytes,
         }))
     }
 
@@ -303,8 +393,6 @@ impl ScalarIndex for BloomFilterIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        use lance_core::utils::mask::RowIdTreeMap;
-
         metrics.record_comparisons(self.blocks.len());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
@@ -424,24 +512,147 @@ pub struct BloomFilterIndexBuilder {
     cur_block_offset: usize,
     cur_fragment_id: u64,
     // TODO: sbbf data
+    sbbf: Option<Sbbf>,
 }
 
 impl BloomFilterIndexBuilder {
     pub fn try_new(params: BloomFilterIndexBuilderParams, value_type: DataType) -> Result<Self> {
+        let sbbf = SbbfBuilder::new()
+            .expected_items(params.number_of_items)
+            .num_bytes(params.number_of_bytes)
+            .build()
+            .map_err(|e| Error::InvalidInput {
+                source: format!("Failed to build SBBF: {:?}", e).into(),
+                location: location!(),
+            })?;
+
         Ok(Self {
             params,
             value_type,
             blocks: Vec::new(),
             cur_block_offset: 0,
             cur_fragment_id: 0,
+            sbbf: Some(sbbf),
         })
     }
 
+    fn process_primitive_array<T>(sbbf: &mut Sbbf, array: &arrow_array::PrimitiveArray<T>)
+    where
+        T: arrow_array::ArrowPrimitiveType,
+        T::Native: parquet::data_type::AsBytes,
+    {
+        for i in 0..array.len() {
+            if array.is_valid(i) {
+                sbbf.insert(&array.value(i));
+            }
+        }
+    }
+
+    fn process_string_array(sbbf: &mut Sbbf, array: &arrow_array::StringArray) {
+        for i in 0..array.len() {
+            if array.is_valid(i) {
+                sbbf.insert(array.value(i));
+            }
+        }
+    }
+
+    fn process_large_string_array(sbbf: &mut Sbbf, array: &arrow_array::LargeStringArray) {
+        for i in 0..array.len() {
+            if array.is_valid(i) {
+                sbbf.insert(array.value(i));
+            }
+        }
+    }
+
+    fn process_binary_array(sbbf: &mut Sbbf, array: &arrow_array::BinaryArray) {
+        for i in 0..array.len() {
+            if array.is_valid(i) {
+                sbbf.insert(array.value(i));
+            }
+        }
+    }
+
+    fn process_large_binary_array(sbbf: &mut Sbbf, array: &arrow_array::LargeBinaryArray) {
+        for i in 0..array.len() {
+            if array.is_valid(i) {
+                sbbf.insert(array.value(i));
+            }
+        }
+    }
+
     fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
-        // TODO
-        // For now, just track that we processed some items
-        // In a real implementation, this would add the array values to a bloom filter
-        //self.cur_block_offset += array.len();
+        if let Some(ref mut sbbf) = self.sbbf {
+            // TODO: is there a more efficient way to do this?
+            match array.data_type() {
+                DataType::Int32 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int32Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array);
+                }
+                DataType::Int64 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array);
+                }
+                DataType::Float32 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Float32Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array);
+                }
+                DataType::Float64 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Float64Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array);
+                }
+                DataType::Utf8 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .unwrap();
+                    Self::process_string_array(sbbf, typed_array);
+                }
+                DataType::LargeUtf8 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeStringArray>()
+                        .unwrap();
+                    Self::process_large_string_array(sbbf, typed_array);
+                }
+                DataType::Binary => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::BinaryArray>()
+                        .unwrap();
+                    Self::process_binary_array(sbbf, typed_array);
+                }
+                DataType::LargeBinary => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeBinaryArray>()
+                        .unwrap();
+                    Self::process_large_binary_array(sbbf, typed_array);
+                }
+                _ => {
+                    return Err(Error::InvalidInput {
+                        source: format!(
+                            "Bloom filter does not support data type: {:?}",
+                            array.data_type()
+                        )
+                        .into(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -454,14 +665,35 @@ impl BloomFilterIndexBuilder {
             .map(|block| block.block_size as u64)
             .sum::<u64>();
 
+        // Store the current bloom filter data
+        let bloom_filter_data = if let Some(ref sbbf) = self.sbbf {
+            sbbf.to_bytes()
+        } else {
+            Vec::new()
+        };
+
         let new_block = BloomFilterStatistics {
             fragment_id,
             block_start,
             block_size: self.cur_block_offset,
+            bloom_filter_data,
         };
 
         self.blocks.push(new_block);
         self.cur_block_offset = 0;
+
+        // Reset sbbf for the next block
+        self.sbbf = Some(
+            SbbfBuilder::new()
+                .expected_items(self.params.number_of_items)
+                .num_bytes(self.params.number_of_bytes)
+                .build()
+                .map_err(|e| Error::InvalidInput {
+                    source: format!("Failed to build SBBF: {:?}", e).into(),
+                    location: location!(),
+                })?,
+        );
+
         Ok(())
     }
 
@@ -568,6 +800,22 @@ impl BloomFilterIndexBuilder {
                     let nulls = vec![None; self.blocks.len()];
                     Arc::new(arrow_array::Float64Array::from(nulls)) as ArrayRef
                 }
+                DataType::Utf8 => {
+                    let nulls: Vec<Option<&str>> = vec![None; self.blocks.len()];
+                    Arc::new(arrow_array::StringArray::from(nulls)) as ArrayRef
+                }
+                DataType::LargeUtf8 => {
+                    let nulls: Vec<Option<&str>> = vec![None; self.blocks.len()];
+                    Arc::new(arrow_array::LargeStringArray::from(nulls)) as ArrayRef
+                }
+                DataType::Binary => {
+                    let nulls: Vec<Option<&[u8]>> = vec![None; self.blocks.len()];
+                    Arc::new(arrow_array::BinaryArray::from(nulls)) as ArrayRef
+                }
+                DataType::LargeBinary => {
+                    let nulls: Vec<Option<&[u8]>> = vec![None; self.blocks.len()];
+                    Arc::new(arrow_array::LargeBinaryArray::from(nulls)) as ArrayRef
+                }
                 _ => {
                     // For other types, create empty array and handle mismatch
                     new_empty_array(&self.value_type)
@@ -584,11 +832,24 @@ impl BloomFilterIndexBuilder {
         let block_sizes =
             UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.block_size as u64));
 
+        // Store bloom filter data as binary array
+        let bloom_filter_data = if self.blocks.is_empty() {
+            Arc::new(arrow_array::BinaryArray::new_null(0)) as ArrayRef
+        } else {
+            let binary_data: Vec<Option<&[u8]>> = self
+                .blocks
+                .iter()
+                .map(|block| Some(block.bloom_filter_data.as_slice()))
+                .collect();
+            Arc::new(arrow_array::BinaryArray::from_opt_vec(binary_data)) as ArrayRef
+        };
+
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             Field::new("data_type_placeholder", self.value_type.clone(), true),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("block_start", DataType::UInt64, false),
             Field::new("block_size", DataType::UInt64, false),
+            Field::new("bloom_filter_data", DataType::Binary, false),
         ]));
 
         let columns: Vec<ArrayRef> = vec![
@@ -596,6 +857,7 @@ impl BloomFilterIndexBuilder {
             Arc::new(fragment_ids) as ArrayRef,
             Arc::new(block_starts) as ArrayRef,
             Arc::new(block_sizes) as ArrayRef,
+            bloom_filter_data,
         ];
 
         Ok(RecordBatch::try_new(schema, columns)?)
@@ -889,14 +1151,21 @@ mod tests {
         assert_eq!(index.blocks[0].block_size, 100);
 
         // Test search functionality
-        // Since our bloom filter implementation is conservative, it should match all blocks
+        // The bloom filter should work correctly and find the value
         let query = SargableQuery::Equals(ScalarValue::Int32(Some(50)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match all blocks since we conservatively return true
+        // Should match the block since value 50 is in the range [0, 100)
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(0..100);
         assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value that shouldn't exist
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(500))); // Value not in [0, 100)
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should return empty result since bloom filter correctly filters out this value
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
 
         // Test calculate_included_frags
         assert_eq!(
@@ -986,10 +1255,10 @@ mod tests {
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(150)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match all blocks since we conservatively return true
+        // Should only match fragment 1 blocks since bloom filter correctly filters
+        // Value 150 is only in fragment 1 (values 100-199), not in fragment 0 (values 0-99)
         let mut expected = RowIdTreeMap::new();
-        expected.insert_range(0..100); // Fragment 0
-        expected.insert_range((1u64 << 32)..((1u64 << 32) + 100)); // Fragment 1
+        expected.insert_range((1u64 << 32) + 50..((1u64 << 32) + 100)); // Only the block containing 150
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test calculate_included_frags
@@ -997,5 +1266,490 @@ mod tests {
             index.calculate_included_frags().await.unwrap(),
             RoaringBitmap::from_iter(0..2)
         );
+    }
+
+    #[tokio::test]
+    async fn test_nan_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create deterministic data with NaN values
+        // Pattern: [1.0, 2.0, NaN, 3.0, 4.0, 5.0, NaN, 6.0, 7.0, 8.0, ...]
+        let mut values = Vec::new();
+        for i in 0..500 {
+            if i % 5 == 2 {
+                values.push(f32::NAN);
+            } else {
+                values.push(i as f32);
+            }
+        }
+
+        let float_data = arrow_array::Float32Array::from(values);
+        let row_ids = UInt64Array::from_iter_values((0..float_data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Float32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(float_data.clone()), Arc::new(row_ids)],
+        )
+        .unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(100, 1024)),
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load BloomFilterIndex");
+
+        // Should have 5 blocks since we have 500 rows and block size is 100
+        assert_eq!(index.blocks.len(), 5);
+
+        // Test search for NaN values using Equals with NaN
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match all blocks since they all contain NaN values
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500); // All rows since NaN is in every block
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a specific finite value that exists in the data
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(5.0)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match only the first block since 5.0 only exists in rows 0-99
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..100);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value that doesn't exist but is within expected range
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(250.0)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match the third block since 250.0 would be in that range if it existed
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(200..300);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value way outside the range
+        let query = SargableQuery::Equals(ScalarValue::Float32(Some(10000.0)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should return empty since bloom filter correctly filters out this value
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+
+        // Test IsIn query with NaN and finite values
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Float32(Some(f32::NAN)),
+            ScalarValue::Float32(Some(5.0)),
+            ScalarValue::Float32(Some(150.0)), // This value exists in the second block
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match all blocks since they all contain NaN values
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..500);
+        assert_eq!(result, SearchResult::AtMost(expected));
+    }
+
+    #[tokio::test]
+    async fn test_complex_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create data that will produce multiple blocks
+        let data_size = 10000;
+        let data = arrow_array::Int64Array::from_iter_values(0..data_size as i64);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(1000, 2048)), // 10 blocks total
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load BloomFilterIndex");
+
+        // Should have 10 blocks since we have 10000 rows and block size is 1000
+        assert_eq!(index.blocks.len(), 10);
+        assert_eq!(index.data_type, DataType::Int64);
+        assert_eq!(index.number_of_items, 1000);
+        assert_eq!(index.number_of_bytes, 2048);
+
+        // Verify block structure
+        for (i, block) in index.blocks.iter().enumerate() {
+            assert_eq!(block.fragment_id, 0);
+            assert_eq!(block.block_start, (i * 1000) as u64);
+            assert_eq!(block.block_size, 1000);
+            assert!(!block.bloom_filter_data.is_empty());
+        }
+
+        // Test search for a value in a specific block
+        let query = SargableQuery::Equals(ScalarValue::Int64(Some(2500))); // In block 2 (2000-2999)
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match block 2
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(2000..3000);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value way outside the range
+        let query = SargableQuery::Equals(ScalarValue::Int64(Some(50000)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should return empty since bloom filter correctly filters out this value
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+
+        // Test IsIn query with values from different blocks
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Int64(Some(500)),   // Block 0 (0-999)
+            ScalarValue::Int64(Some(2500)),  // Block 2 (2000-2999)
+            ScalarValue::Int64(Some(7500)),  // Block 7 (7000-7999)
+            ScalarValue::Int64(Some(50000)), // Not in any block
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match blocks 0, 2, and 7
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..1000); // Block 0
+        expected.insert_range(2000..3000); // Block 2
+        expected.insert_range(7000..8000); // Block 7
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test calculate_included_frags
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter(0..1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_string_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create string data
+        let string_values: Vec<String> = (0..200).map(|i| format!("value_{:03}", i)).collect();
+        let string_data = arrow_array::StringArray::from_iter_values(string_values.iter());
+        let row_ids = UInt64Array::from_iter_values((0..string_data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(string_data), Arc::new(row_ids)],
+        )
+        .unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(100, 1024)),
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load BloomFilterIndex");
+
+        // Should have 2 blocks since we have 200 rows and block size is 100
+        assert_eq!(index.blocks.len(), 2);
+        assert_eq!(index.data_type, DataType::Utf8);
+
+        // Test search for a value in the first block
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_050".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match the first block
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..100);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value in the second block
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_150".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match the second block
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(100..200);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value that doesn't exist
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("nonexistent_value".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should return empty since bloom filter correctly filters out this value
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+
+        // Test IsIn query with string values
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Utf8(Some("value_025".to_string())), // First block
+            ScalarValue::Utf8(Some("value_175".to_string())), // Second block
+            ScalarValue::Utf8(Some("nonexistent".to_string())), // Not present
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match both blocks
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..200);
+        assert_eq!(result, SearchResult::AtMost(expected));
+    }
+
+    #[tokio::test]
+    async fn test_binary_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create binary data
+        let binary_values: Vec<Vec<u8>> = (0..100)
+            .map(|i| vec![i as u8, (i + 1) as u8, (i + 2) as u8])
+            .collect();
+        let binary_data = arrow_array::BinaryArray::from_iter_values(binary_values.iter());
+        let row_ids = UInt64Array::from_iter_values((0..binary_data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Binary, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(binary_data), Arc::new(row_ids)],
+        )
+        .unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(50, 1024)),
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load BloomFilterIndex");
+
+        // Should have 2 blocks since we have 100 rows and block size is 50
+        assert_eq!(index.blocks.len(), 2);
+        assert_eq!(index.data_type, DataType::Binary);
+
+        // Test search for a value in the first block
+        let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![25, 26, 27])));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match the first block
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..50);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value in the second block
+        let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![75, 76, 77])));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match the second block
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(50..100);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value that doesn't exist
+        let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![255, 254, 253])));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should return empty since bloom filter correctly filters out this value
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn test_large_data_types_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test LargeUtf8 data type
+        let large_string_values: Vec<String> =
+            (0..100).map(|i| format!("large_value_{:05}", i)).collect();
+        let large_string_data =
+            arrow_array::LargeStringArray::from_iter_values(large_string_values.iter());
+        let row_ids = UInt64Array::from_iter_values((0..large_string_data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::LargeUtf8, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(large_string_data), Arc::new(row_ids)],
+        )
+        .unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(50, 1024)),
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load BloomFilterIndex");
+
+        assert_eq!(index.blocks.len(), 2);
+        assert_eq!(index.data_type, DataType::LargeUtf8);
+
+        // Test search functionality
+        let query = SargableQuery::Equals(ScalarValue::LargeUtf8(Some(
+            "large_value_00025".to_string(),
+        )));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should match the first block
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..50);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for a value that doesn't exist
+        let query = SargableQuery::Equals(ScalarValue::LargeUtf8(Some(
+            "nonexistent_large_value".to_string(),
+        )));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should return empty since bloom filter correctly filters out this value
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_range_queries() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = arrow_array::Int32Array::from_iter_values(0..1000);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(250, 1024)), // 4 blocks total
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load BloomFilterIndex");
+
+        assert_eq!(index.blocks.len(), 4);
+
+        // Test range query - bloom filters are conservative for ranges, should return all blocks
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(100))),
+            Bound::Included(ScalarValue::Int32(Some(300))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Bloom filters are conservative for range queries - should include all blocks
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..1000);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test range query with unbounded start
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Included(ScalarValue::Int32(Some(300))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should include all blocks (conservative)
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..1000);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test range query with unbounded end
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(500))),
+            Bound::Unbounded,
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        // Should include all blocks (conservative)
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..1000);
+        assert_eq!(result, SearchResult::AtMost(expected));
     }
 }
