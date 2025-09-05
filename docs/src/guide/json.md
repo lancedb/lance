@@ -2,9 +2,7 @@
 
 Lance provides comprehensive support for storing and querying JSON data, enabling you to work with semi-structured data efficiently. This guide covers how to store JSON data in Lance datasets and use JSON functions to query and filter your data.
 
-## Prerequisites
-
-JSON support requires Lance data storage version 2.2 or later:
+## Getting Started
 
 ```python
 import lance
@@ -16,8 +14,8 @@ json_data = {"name": "Alice", "age": 30, "city": "New York"}
 json_arr = pa.array([json.dumps(json_data)], type=pa.json_())
 table = pa.table({"id": [1], "data": json_arr})
 
-# Write with version 2.2 (required for JSON support)
-lance.write_dataset(table, "dataset.lance", data_storage_version="2.2")
+# Write the dataset
+lance.write_dataset(table, "dataset.lance")
 ```
 
 ## Storage Format
@@ -282,7 +280,7 @@ table = pa.table({
     "data": pa.array(json_strings, type=pa.json_())
 })
 
-lance.write_dataset(table, "nested.lance", data_storage_version="2.2")
+lance.write_dataset(table, "nested.lance")
 dataset = lance.dataset("nested.lance")
 
 # Query nested fields using JSONPath
@@ -311,7 +309,7 @@ products = pa.table({
     ], type=pa.json_())
 })
 
-lance.write_dataset(products, "products.lance", data_storage_version="2.2")
+lance.write_dataset(products, "products.lance")
 dataset = lance.dataset("products.lance")
 
 # Find products with specific specs
@@ -333,7 +331,7 @@ records = pa.table({
     ], type=pa.json_())
 })
 
-lance.write_dataset(records, "projects.lance", data_storage_version="2.2")
+lance.write_dataset(records, "projects.lance")
 dataset = lance.dataset("projects.lance")
 
 # Find projects with Python
@@ -361,7 +359,6 @@ All JSON functions are available when using Lance with Apache DataFusion for SQL
 
 ## Limitations
 
-- JSON support requires data storage version 2.2 or later
 - JSONPath support follows standard JSONPath syntax but may not support all advanced features
 - Large JSON documents may impact query performance
 - JSON functions are currently only available for filtering, not for projection in query results

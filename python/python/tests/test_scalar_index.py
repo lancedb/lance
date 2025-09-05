@@ -1476,7 +1476,7 @@ def test_zonemap_index_remapping(tmp_path: Path):
 def test_json_index():
     vals = ['{"x": 7, "y": 10}', '{"x": 11, "y": 22}', '{"y": 0}', '{"x": 10}']
     tbl = pa.table({"jsons": pa.array(vals, pa.json_())})
-    ds = lance.write_dataset(tbl, "memory://test", data_storage_version="2.2")
+    ds = lance.write_dataset(tbl, "memory://test")
     ds.create_scalar_index(
         "jsons",
         IndexConfig(
