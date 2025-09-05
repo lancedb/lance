@@ -84,6 +84,12 @@ runs:
         name: debug-wheels-linux-${{ inputs.manylinux }}-${{ inputs.arm-build == 'true' && 'arm64' || 'x86_64' }}
         path: python/target/wheels/*.whl
         retention-days: 90
+    - name: Upload debug wheels to release
+      if: ${{ inputs.upload_debug_wheel == 'true' && github.event_name == 'release' }}
+      uses: softprops/action-gh-release@v1
+      with:
+        files: python/target/wheels/*.whl
+        fail_on_unmatched_files: false
     - name: Strip wheels for PyPI
       if: ${{ inputs.upload_debug_wheel == 'true' }}
       shell: bash
