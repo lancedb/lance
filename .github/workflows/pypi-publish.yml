@@ -10,6 +10,11 @@ on:
         required: false
         default: ''
         type: string
+      debug:
+        description: 'Build debug wheels (with debug symbols)'
+        required: false
+        default: true
+        type: boolean
   pull_request:
     paths:
       - '.github/workflows/pypi-publish.yml'
@@ -17,7 +22,6 @@ on:
       - '.github/workflows/build_mac_wheel/**'
       - '.github/workflows/build_windows_wheel/**'
       - '.github/workflows/upload_wheel/**'
-      - 'ci/strip_wheel.sh'
 
 jobs:
   linux:
@@ -70,29 +74,16 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release ${{ matrix.config.extra_args }}"
+        args: "--release ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.debug)) && '--strip' || '' }} ${{ matrix.config.extra_args }}"
         arm-build: ${{ matrix.config.platform == 'aarch64' }}
         manylinux: ${{ matrix.config.manylinux }}
-    - name: Upload debug wheels to release
-      if: github.event_name == 'release'
-      uses: softprops/action-gh-release@v1
-      with:
-        files: python/target/wheels/*.whl
-        fail_on_unmatched_files: false
-    - name: Upload debug wheels as artifacts
-      if: github.event_name != 'release'
+    - name: Upload wheels as artifacts
+      if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v4
       with:
-        name: debug-wheels-linux-${{ matrix.config.manylinux }}-${{ matrix.config.platform }}
+        name: pylance-manylinux_${{ matrix.config.manylinux }}_${{ matrix.config.platform }}
         path: python/target/wheels/*.whl
         retention-days: 90
-    - name: Strip wheels for PyPI
-      shell: bash
-      run: |
-        # Fix permissions on wheel files created in container
-        sudo chown -R $(id -u):$(id -g) python/target/wheels/
-        chmod +x ci/strip_wheel.sh
-        ci/strip_wheel.sh python/target/wheels/*.whl
     - uses: ./.github/workflows/upload_wheel
       if: github.event_name == 'release'
       with:
@@ -138,7 +129,14 @@ jobs:
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels"
+        args: "--release ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.debug)) && '--strip' || '' }} --target ${{ matrix.config.target }} --features fp16kernels"
+    - name: Upload wheels as artifacts
+      if: github.event_name == 'workflow_dispatch'
+      uses: actions/upload-artifact@v4
+      with:
+        name: pylance-macosx_${{ matrix.config.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
+        path: python/target/wheels/*.whl
+        retention-days: 90
     - uses: ./.github/workflows/upload_wheel
       if: github.event_name == 'release'
       with:
@@ -178,8 +176,15 @@ jobs:
       - uses: ./.github/workflows/build_windows_wheel
         with:
           python-minor-version: ${{ matrix.python-minor-version }}
-          args: "--release --strip"
+          args: "--release ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.debug)) && '--strip' || '' }}"
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
+      - name: Upload wheels as artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pylance-win_amd64
+          path: python/target/wheels/*.whl
+          retention-days: 90
       - uses: ./.github/workflows/upload_wheel
         if: github.event_name == 'release'
         with:
