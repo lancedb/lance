@@ -1889,6 +1889,8 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         replace: bool = True,
         train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        fragment_uuid: Optional[str] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1973,6 +1975,17 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data to determine optimal
             structure. If False, an empty index will be created that can be
             populated later.
+        fragment_ids : List[int], optional
+            If provided, the index will be created only on the specified fragments.
+            This enables distributed/fragment-level indexing. When provided, the
+            method returns an IndexMetadata object but does not commit the index
+            to the dataset. The index can be committed later using the commit API.
+            This parameter is passed via kwargs internally.
+        fragment_uuid : str, optional
+            A UUID to use for fragment-level distributed indexing
+            multiple fragment-level indices need to share UUID for later merging.
+            If not provided, a new UUID will be generated. This parameter is passed via
+            kwargs internally.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2120,6 +2133,12 @@ class LanceDataset(pa.dataset.Dataset):
             index_type = "scalar"
         else:
             raise Exception("index_type must be str or IndexConfig")
+
+        # Add fragment_ids and fragment_uuid to kwargs if provided
+        if fragment_ids is not None:
+            kwargs["fragment_ids"] = fragment_ids
+        if fragment_uuid is not None:
+            kwargs["fragment_uuid"] = fragment_uuid
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
@@ -2696,6 +2715,9 @@ class LanceDataset(pa.dataset.Dataset):
             The name of the index to prewarm.
         """
         return self._ds.prewarm_index(name)
+
+    def merge_index_metadata(self, index_uuid: str):
+        return self._ds.merge_index_metadata(index_uuid)
 
     def session(self) -> Session:
         """

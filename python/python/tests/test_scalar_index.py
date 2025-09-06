@@ -721,6 +721,15 @@ def test_fts_score(tmp_path):
     assert results.num_rows == 3
     assert results["id"].to_pylist() == [3, 2, 1]
 
+    # Assert distributed FTS produces the same BM25 scores as single-machine
+    assert_distributed_fts_consistency(
+        data,
+        "text",
+        "lance search text",
+        tmp_path,
+        index_params={"with_position": False},
+    )
+
 
 def test_fts_with_filter(tmp_path):
     data = pa.table(
@@ -763,6 +772,16 @@ def test_fts_with_filter(tmp_path):
         full_text_query="lance search text", filter="id <= 1", prefilter=True
     ).analyze_plan()
     assert "index_comparisons=1" in plan
+
+    # Assert distributed FTS with prefilter produces consistent results
+    assert_distributed_fts_consistency(
+        data,
+        "text",
+        "lance search text",
+        tmp_path,
+        index_params={"with_position": False},
+        query_params={"filter": "id <= 1", "prefilter": True},
+    )
 
 
 def test_fts_on_list(tmp_path):
@@ -831,6 +850,15 @@ def test_fts_fuzzy_query(tmp_path):
         "food",
     }
 
+    # Assert distributed FTS produces consistent fuzzy query results
+    assert_distributed_fts_consistency(
+        data,
+        "text",
+        MatchQuery("foo", "text", fuzziness=1),
+        tmp_path,
+        index_params={"with_position": False},
+    )
+
 
 def test_fts_phrase_query(tmp_path):
     data = pa.table(
@@ -880,6 +908,15 @@ def test_fts_phrase_query(tmp_path):
     )
     assert results.num_rows == 2
 
+    # Assert distributed FTS produces consistent phrase query results
+    assert_distributed_fts_consistency(
+        data,
+        "text",
+        PhraseQuery("frodo was a puppy", "text"),
+        tmp_path,
+        index_params={"with_position": True, "remove_stop_words": False},
+    )
+
 
 def test_fts_boost_query(tmp_path):
     data = pa.table(
@@ -927,6 +964,15 @@ def test_fts_multi_match_query(tmp_path):
     assert set(results["title"].to_pylist()) == {"title common", "title vector"}
     assert set(results["content"].to_pylist()) == {"content world", "content common"}
 
+    # Assert distributed FTS produces consistent multi-match query results
+    assert_distributed_fts_consistency(
+        data,
+        ["title", "content"],
+        MultiMatchQuery("common", ["title", "content"]),
+        tmp_path,
+        index_params={"with_position": False},
+    )
+
 
 def test_fts_boolean_query(tmp_path):
     data = pa.table(
@@ -972,6 +1018,12 @@ def test_fts_boolean_query(tmp_path):
         "frodo was a puppy",
         "frodo was a puppy with a tail",
     }
+
+    # Assert distributed FTS produces consistent boolean query results
+    query_and = MatchQuery("puppy", "text") & MatchQuery("happy", "text")
+    assert_distributed_fts_consistency(
+        data, "text", query_and, tmp_path, index_params={"with_position": False}
+    )
 
 
 def test_fts_with_postfilter(tmp_path):
@@ -1860,3 +1912,1074 @@ def test_fts_backward_v0_27_0(tmp_path: Path):
         full_text_query="new",
     )
     assert res.num_rows == 1
+
+
+# ============================================================================
+# Distributed FTS Index Helper Functions
+# ============================================================================
+
+
+def build_distributed_fts_index(
+    dataset: lance.LanceDataset, column: str, index_name: str = None, **index_params
+) -> lance.LanceDataset:
+    """
+    Build FTS index in distributed way and return the committed dataset.
+
+    This helper function builds the FTS index on individual fragments
+    and then commits them as a single index, ensuring the distributed
+    approach produces the same results as single-machine indexing.
+
+    Parameters
+    ----------
+    dataset : lance.LanceDataset
+        The dataset to build index on
+    column : str
+        The column name to build FTS index on
+    index_name : str, optional
+        Name for the index. If not provided, will use f"{column}_distributed_idx"
+    **index_params
+        Additional parameters to pass to create_scalar_index()
+        (e.g., with_position, remove_stop_words, base_tokenizer, etc.)
+
+    Returns
+    -------
+    lance.LanceDataset
+        Dataset with committed distributed FTS index
+
+    Examples
+    --------
+    >>> ds_distributed = build_distributed_fts_index(
+    ...     dataset,
+    ...     "text",
+    ...     with_position=True,
+    ...     remove_stop_words=False
+    ... )
+    >>> # Now compare with single-machine index results
+    >>> results_distributed = ds_distributed.scanner(full_text_query="test").to_table()
+    """
+    import uuid
+
+    from lance.dataset import Index
+
+    # Generate unique index ID for distributed indexing
+    index_id = str(uuid.uuid4())
+    index_name = index_name or f"{column}_distributed_idx"
+
+    # Get all fragments from the dataset
+    fragments = dataset.get_fragments()
+    fragment_ids = [fragment.fragment_id for fragment in fragments]
+
+    # Build index on each fragment individually
+    for fragment_id in fragment_ids:
+        dataset.create_scalar_index(
+            column=column,
+            index_type="INVERTED",
+            name=index_name,
+            replace=False,
+            fragment_uuid=index_id,
+            fragment_ids=[fragment_id],
+            **index_params,
+        )
+
+    # Merge the inverted index metadata
+    dataset.merge_index_metadata(index_id)
+
+    # Create Index object for commit
+    field_id = dataset.schema.get_field_index(column)
+    index = Index(
+        uuid=index_id,
+        name=index_name,
+        fields=[field_id],
+        dataset_version=dataset.version,
+        fragment_ids=set(fragment_ids),
+        index_version=0,
+    )
+
+    # Create and commit the index operation
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+
+    # Commit the distributed index
+    committed_dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        create_index_op,
+        read_version=dataset.version,
+    )
+
+    return committed_dataset
+
+
+def compare_fts_results(
+    single_machine_results: pa.Table,
+    distributed_results: pa.Table,
+    tolerance: float = 1e-6,
+) -> bool:
+    """
+    Compare FTS search results from single-machine and distributed indexing.
+
+    Parameters
+    ----------
+    single_machine_results : pa.Table
+        Results from single-machine FTS index
+    distributed_results : pa.Table
+        Results from distributed FTS index
+    tolerance : float, default 1e-6
+        Tolerance for floating point score comparison
+
+    Returns
+    -------
+    bool
+        True if results are equivalent, False otherwise
+
+    Raises
+    ------
+    AssertionError
+        If results don't match with detailed error message
+    """
+    # Check row count
+    assert single_machine_results.num_rows == distributed_results.num_rows, (
+        f"Row count mismatch: single={single_machine_results.num_rows}, "
+        f"distributed={distributed_results.num_rows}"
+    )
+
+    # If no results, both should be empty
+    if single_machine_results.num_rows == 0:
+        return True
+
+    # Convert to pandas for easier comparison
+    single_df = single_machine_results.to_pandas()
+    distributed_df = distributed_results.to_pandas()
+
+    # Sort both by row_id to ensure consistent ordering
+    if "_rowid" in single_df.columns:
+        single_df = single_df.sort_values("_rowid").reset_index(drop=True)
+        distributed_df = distributed_df.sort_values("_rowid").reset_index(drop=True)
+
+    # Compare row IDs (most important)
+    if "_rowid" in single_df.columns:
+        single_rowids = set(single_df["_rowid"])
+        distributed_rowids = set(distributed_df["_rowid"])
+        assert single_rowids == distributed_rowids, (
+            f"Row ID mismatch: single={single_rowids}, distributed={distributed_rowids}"
+        )
+
+    # Compare scores with tolerance
+    if "_score" in single_df.columns:
+        single_scores = single_df["_score"].values
+        distributed_scores = distributed_df["_score"].values
+        score_diff = np.abs(single_scores - distributed_scores)
+        max_diff = np.max(score_diff)
+        assert max_diff <= tolerance, (
+            f"Score difference exceeds tolerance: max_diff={max_diff}, "
+            f"tolerance={tolerance}"
+        )
+
+    # Compare other columns (exact match for non-score columns)
+    for col in single_df.columns:
+        if col not in ["_score"]:  # Skip score column (already compared with tolerance)
+            single_values = (
+                set(single_df[col])
+                if single_df[col].dtype == "object"
+                else single_df[col].values
+            )
+            distributed_values = (
+                set(distributed_df[col])
+                if distributed_df[col].dtype == "object"
+                else distributed_df[col].values
+            )
+
+            if isinstance(single_values, set):
+                assert single_values == distributed_values, (
+                    f"Column {col} content mismatch"
+                )
+            else:
+                np.testing.assert_array_equal(
+                    single_values,
+                    distributed_values,
+                    err_msg=f"Column {col} values don't match",
+                )
+
+    return True
+
+
+def validate_distributed_fts(
+    dataset: lance.LanceDataset,
+    columns_to_index,
+    query,
+    index_params: dict = None,
+    query_params: dict = None,
+    tolerance: float = 1e-6,
+) -> dict:
+    """
+    Validate that distributed FTS indexing produces the same results as
+    single-machine indexing.
+
+    Parameters
+    ----------
+    dataset : lance.LanceDataset
+        The dataset to test on
+    columns_to_index : str or list of str
+        The column name(s) to build FTS index on. Can be a single column name
+        or a list of column names for multi-column indexing.
+    query : str or query object
+        The full text query to test with
+    index_params : dict, optional
+        Parameters for index creation
+    query_params : dict, optional
+        Parameters for query execution
+    tolerance : float, default 1e-6
+        Tolerance for score comparison
+
+    Returns
+    -------
+    dict
+        Dictionary with 'single_machine' and 'distributed' results
+
+    Raises
+    ------
+    AssertionError
+        If results don't match
+    """
+    index_params = index_params or {}
+    query_params = query_params or {}
+
+    # Normalize columns_to_index to a list
+    if isinstance(columns_to_index, str):
+        columns_list = [columns_to_index]
+    else:
+        columns_list = list(columns_to_index)
+
+    # Build single-machine indices for all required columns
+    for column in columns_list:
+        dataset.create_scalar_index(
+            column=column,
+            index_type="INVERTED",
+            name=f"{column}_single_idx",
+            **index_params,
+        )
+
+    # Build distributed indices for all required columns
+    distributed_ds = dataset  # Start with the original dataset
+    for column in columns_list:
+        distributed_ds = build_distributed_fts_index(
+            distributed_ds,
+            column,
+            index_name=f"{column}_distributed_idx",
+            **index_params,
+        )
+
+    # Execute queries
+    single_results = dataset.scanner(full_text_query=query, **query_params).to_table()
+
+    distributed_results = distributed_ds.scanner(
+        full_text_query=query, **query_params
+    ).to_table()
+
+    # Compare results
+    compare_fts_results(single_results, distributed_results, tolerance)
+
+    return {"single_machine": single_results, "distributed": distributed_results}
+
+
+def assert_distributed_fts_consistency(
+    data: pa.Table,
+    columns_to_index,
+    query,
+    tmp_path,
+    index_params: dict = None,
+    query_params: dict = None,
+    tolerance: float = 1e-6,
+):
+    """
+    Assert that distributed FTS indexing produces the same results as
+    single-machine indexing.
+
+    This is a streamlined version that eliminates repetitive dataset creation and
+    try-catch-print patterns. Uses direct assertions instead of exception handling.
+
+    Parameters
+    ----------
+    data : pa.Table
+        The data to test with
+    columns_to_index : str or list of str
+        The column name(s) to build FTS index on. Can be a single column name
+        or a list of column names for multi-column indexing.
+    query : str or query object
+        The full text query to test with
+    tmp_path : Path
+        Temporary path for datasets
+    index_params : dict, optional
+        Parameters for index creation
+    query_params : dict, optional
+        Parameters for query execution
+    tolerance : float, default 1e-6
+        Tolerance for score comparison
+
+    Raises
+    ------
+    AssertionError
+        If distributed and single-machine results don't match
+    """
+    index_params = index_params or {}
+    query_params = query_params or {}
+
+    # Normalize columns_to_index to a list
+    if isinstance(columns_to_index, str):
+        columns_list = [columns_to_index]
+    else:
+        columns_list = list(columns_to_index)
+
+    # Create datasets for single-machine and distributed testing
+    single_ds = lance.write_dataset(data, tmp_path / "single")
+    distributed_ds = lance.write_dataset(data, tmp_path / "distributed")
+
+    # Build single-machine indices for all required columns
+    for column in columns_list:
+        single_ds.create_scalar_index(
+            column=column,
+            index_type="INVERTED",
+            name=f"{column}_single_idx",
+            **index_params,
+        )
+
+    # Build distributed indices for all required columns
+    distributed_ds_indexed = distributed_ds  # Start with the original dataset
+    for column in columns_list:
+        distributed_ds_indexed = build_distributed_fts_index(
+            distributed_ds_indexed,
+            column,
+            index_name=f"{column}_distributed_idx",
+            **index_params,
+        )
+
+    # Execute queries
+    single_results = single_ds.scanner(full_text_query=query, **query_params).to_table()
+
+    distributed_results = distributed_ds_indexed.scanner(
+        full_text_query=query, **query_params
+    ).to_table()
+
+    # Assert results are identical
+    compare_fts_results(single_results, distributed_results, tolerance)
+
+
+def run_fts_distributed_validation_suite(
+    test_functions: list, tmp_path_factory, verbose: bool = True
+) -> dict:
+    """
+    Run distributed validation for a suite of FTS test functions.
+
+    Parameters
+    ----------
+    test_functions : list
+        List of FTS test functions to validate
+    tmp_path_factory : pytest.TempPathFactory
+        Pytest temp path factory for creating test directories
+    verbose : bool, default True
+        Whether to print detailed progress information
+
+    Returns
+    -------
+    dict
+        Dictionary mapping test function names to validation results
+    """
+    results = {}
+
+    for test_func in test_functions:
+        test_name = test_func.__name__
+        if verbose:
+            print(f"Running distributed validation for {test_name}...")
+
+        try:
+            tmp_path = tmp_path_factory.mktemp(f"distributed_{test_name}")
+
+            # Run the test with distributed validation
+            # Note: This is a simplified version - actual implementation would
+            # need to extract the test logic and run both single-machine and
+            # distributed versions
+            test_func(tmp_path)
+
+            results[test_name] = True
+            if verbose:
+                print(f"✓ {test_name} passed distributed validation")
+
+        except Exception as e:
+            results[test_name] = False
+            if verbose:
+                print(f"✗ {test_name} failed distributed validation: {e}")
+
+    return results
+
+
+# ============================================================================
+# Test Data Generation Functions
+# ============================================================================
+
+
+def generate_multi_fragment_dataset(tmp_path, num_fragments=4, rows_per_fragment=250):
+    """
+    Generate a test dataset with multiple fragments for testing fragment-level indexing.
+    Uses coherent English text similar to "frodo was a puppy" instead of random strings.
+
+    Parameters
+    ----------
+    tmp_path : Path
+        Temporary path for the dataset
+    num_fragments : int, default 4
+        Number of fragments to create
+    rows_per_fragment : int, default 250
+        Number of rows per fragment
+
+    Returns
+    -------
+    lance.LanceDataset
+        Dataset with multiple fragments
+    """
+
+    # Collection of coherent English sentences for text indexing tests
+    # Based on the pattern used in other tests like "frodo was a puppy"
+    coherent_sentences = [
+        "frodo was a puppy",
+        "frodo was a happy puppy",
+        "frodo was a very happy puppy",
+        "frodo was a puppy with a tail",
+        "gandalf carried a staff",
+        "gandalf was a wise wizard",
+        "gandalf carried his wooden staff",
+        "gandalf wore a grey robe",
+        "aragorn became the king",
+        "aragorn was a brave ranger",
+        "aragorn carried his sword",
+        "aragorn wore a crown",
+        "legolas shot many arrows",
+        "legolas was an elf archer",
+        "legolas had keen eyes",
+        "legolas climbed tall trees",
+        "gimli swung his axe",
+        "gimli was a dwarf warrior",
+        "gimli had a long beard",
+        "gimli loved precious gems",
+        "sam cooked delicious meals",
+        "sam was a loyal friend",
+        "sam carried heavy bags",
+        "sam tended the garden",
+        "pippin played his flute",
+        "pippin was very curious",
+        "pippin loved second breakfast",
+        "pippin climbed apple trees",
+        "merry sang cheerful songs",
+        "merry was quite clever",
+        "merry rode a pony",
+        "merry studied old maps",
+        "boromir blew his horn",
+        "boromir was a proud warrior",
+        "boromir defended his city",
+        "boromir carried a shield",
+        "the ring was very powerful",
+        "the ring glowed with fire",
+        "the ring whispered secrets",
+        "the ring corrupted minds",
+        "the shire was peaceful",
+        "the shire had green hills",
+        "the shire grew fine crops",
+        "the shire welcomed visitors",
+        "eagles soared through clouds",
+        "eagles had sharp talons",
+        "eagles nested on peaks",
+        "eagles watched the valleys",
+        "dragons hoarded gold treasures",
+        "dragons breathed hot flames",
+        "dragons slept for centuries",
+        "dragons guarded ancient caves",
+    ]
+
+    def generate_coherent_text():
+        """Generate coherent English text by selecting from predefined sentences."""
+        return random.choice(coherent_sentences)
+
+    # Create first fragment
+    first_data = pa.table(
+        {
+            "id": pa.array(range(rows_per_fragment)),
+            "text": pa.array(
+                [generate_coherent_text() for _ in range(rows_per_fragment)]
+            ),
+            "value": pa.array(np.random.rand(rows_per_fragment) * 100),
+        }
+    )
+
+    ds = lance.write_dataset(first_data, tmp_path, max_rows_per_file=rows_per_fragment)
+
+    # Add additional fragments
+    for i in range(1, num_fragments):
+        start_id = i * rows_per_fragment
+        fragment_data = pa.table(
+            {
+                "id": pa.array(range(start_id, start_id + rows_per_fragment)),
+                "text": pa.array(
+                    [generate_coherent_text() for _ in range(rows_per_fragment)]
+                ),
+                "value": pa.array(np.random.rand(rows_per_fragment) * 100),
+            }
+        )
+        ds = lance.write_dataset(
+            fragment_data, tmp_path, mode="append", max_rows_per_file=rows_per_fragment
+        )
+
+    # Verify we have the expected number of fragments
+    fragments = ds.get_fragments()
+    assert len(fragments) == num_fragments, (
+        f"Expected {num_fragments} fragments, got {len(fragments)}"
+    )
+
+    return ds
+
+
+# ============================================================================
+# Distributed FTS Index Unit Tests
+# ============================================================================
+
+
+def test_build_distributed_fts_index_basic(tmp_path):
+    """
+    Test basic functionality of build_distributed_fts_index helper function.
+    """
+    # Generate test dataset with multiple fragments
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    # Build distributed FTS index
+    distributed_ds = build_distributed_fts_index(
+        ds, "text", with_position=False, remove_stop_words=False
+    )
+
+    # Verify the index was created
+    indices = distributed_ds.list_indices()
+    assert len(indices) > 0, "No indices found after distributed index creation"
+
+    # Find our distributed index
+    distributed_index = None
+    for idx in indices:
+        if "distributed" in idx["name"]:
+            distributed_index = idx
+            break
+
+    assert distributed_index is not None, "Distributed index not found"
+    assert distributed_index["type"] == "Inverted", (
+        f"Expected Inverted index, got {distributed_index['type']}"
+    )
+
+    # Test that the index works for searching
+    results = distributed_ds.scanner(
+        full_text_query="frodo",
+        columns=["id", "text"],
+    ).to_table()
+
+    assert results.num_rows > 0, "No results found for search term 'frodo'"
+
+
+def test_compare_fts_results_identical(tmp_path):
+    """
+    Test compare_fts_results function with identical results.
+    """
+    # Create identical test results
+    data = {
+        "id": [1, 2, 3],
+        "text": ["frodo was a puppy", "gandalf was wise", "aragorn became king"],
+        "_score": [0.95, 0.85, 0.75],
+        "_rowid": [0, 1, 2],
+    }
+
+    table1 = pa.table(data)
+    table2 = pa.table(data)
+
+    # Should return True for identical results
+    result = compare_fts_results(table1, table2)
+    assert result is True, "Identical results should be considered equal"
+
+
+def test_compare_fts_results_different_scores(tmp_path):
+    """
+    Test compare_fts_results function with different scores (should fail).
+    """
+    data1 = {
+        "id": [1, 2, 3],
+        "text": ["frodo was a puppy", "gandalf was wise", "aragorn became king"],
+        "_score": [0.95, 0.85, 0.75],
+        "_rowid": [0, 1, 2],
+    }
+
+    data2 = {
+        "id": [1, 2, 3],
+        "text": ["frodo was a puppy", "gandalf was wise", "aragorn became king"],
+        "_score": [0.90, 0.80, 0.70],  # Different scores
+        "_rowid": [0, 1, 2],
+    }
+
+    table1 = pa.table(data1)
+    table2 = pa.table(data2)
+
+    # Should raise AssertionError for different scores
+    with pytest.raises(AssertionError, match="Score difference exceeds tolerance"):
+        compare_fts_results(table1, table2)
+
+
+def test_compare_fts_results_different_rowids(tmp_path):
+    """
+    Test compare_fts_results function with different row IDs (should fail).
+    """
+    data1 = {
+        "id": [1, 2, 3],
+        "text": ["frodo was a puppy", "gandalf was wise", "aragorn became king"],
+        "_score": [0.95, 0.85, 0.75],
+        "_rowid": [0, 1, 2],
+    }
+
+    data2 = {
+        "id": [1, 2, 3],
+        "text": ["frodo was a puppy", "gandalf was wise", "aragorn became king"],
+        "_score": [0.95, 0.85, 0.75],
+        "_rowid": [0, 1, 3],  # Different row ID
+    }
+
+    table1 = pa.table(data1)
+    table2 = pa.table(data2)
+
+    # Should raise AssertionError for different row IDs
+    with pytest.raises(AssertionError, match="Row ID mismatch"):
+        compare_fts_results(table1, table2)
+
+
+def test_validate_distributed_fts_basic_search(tmp_path):
+    """
+    Test validate_distributed_fts function with basic search.
+    """
+    # Generate test dataset with multiple fragments
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    # Validate distributed FTS with basic search
+    results = validate_distributed_fts(
+        ds,
+        "text",
+        "frodo",
+        index_params={"with_position": False, "remove_stop_words": False},
+    )
+
+    # Check that we got both results
+    assert "single_machine" in results, "Missing single_machine results"
+    assert "distributed" in results, "Missing distributed results"
+
+    # Both should have the same number of rows
+    single_rows = results["single_machine"].num_rows
+    distributed_rows = results["distributed"].num_rows
+    assert single_rows == distributed_rows, (
+        f"Row count mismatch: {single_rows} vs {distributed_rows}"
+    )
+
+    # Should have found some results for 'frodo'
+    assert single_rows > 0, "No results found for search term 'frodo'"
+
+
+def test_validate_distributed_fts_score_consistency(tmp_path):
+    """
+    Test that distributed FTS produces consistent BM25 scores.
+    """
+    # Create a dataset with known content for scoring tests
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "text": ["lance database test", "full text search", "lance search text"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Validate distributed FTS with scoring query
+    results = validate_distributed_fts(
+        ds, "text", "lance search text", index_params={"with_position": False}
+    )
+
+    # Check that scores are present and consistent
+    single_results = results["single_machine"]
+    distributed_results = results["distributed"]
+
+    assert "_score" in single_results.column_names, (
+        "Missing _score in single machine results"
+    )
+    assert "_score" in distributed_results.column_names, (
+        "Missing _score in distributed results"
+    )
+
+    # Scores should be very close (within 1e-6 tolerance)
+    single_scores = single_results.column("_score").to_pylist()
+    distributed_scores = distributed_results.column("_score").to_pylist()
+
+    for i, (s_score, d_score) in enumerate(zip(single_scores, distributed_scores)):
+        score_diff = abs(s_score - d_score)
+        assert score_diff <= 1e-6, f"Score difference at index {i}: {score_diff} > 1e-6"
+
+
+def test_validate_distributed_fts_empty_results(tmp_path):
+    """
+    Test validate_distributed_fts function with query that returns no results.
+    """
+    # Generate test dataset
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=50
+    )
+
+    # Search for something that doesn't exist
+    results = validate_distributed_fts(
+        ds, "text", "nonexistent_term_xyz", index_params={"with_position": False}
+    )
+
+    # Both should return empty results
+    assert results["single_machine"].num_rows == 0, (
+        "Single machine should return 0 results"
+    )
+    assert results["distributed"].num_rows == 0, "Distributed should return 0 results"
+
+
+def test_validate_distributed_fts_large_dataset(tmp_path):
+    """
+    Test validate_distributed_fts function with larger dataset.
+    """
+    # Generate larger test dataset
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=5, rows_per_fragment=200
+    )
+
+    # Validate distributed FTS
+    results = validate_distributed_fts(
+        ds,
+        "text",
+        "gandalf",
+        index_params={"with_position": False, "remove_stop_words": False},
+    )
+
+    # Should find results and they should match
+    single_rows = results["single_machine"].num_rows
+    distributed_rows = results["distributed"].num_rows
+
+    assert single_rows > 0, "Should find results for 'gandalf'"
+    assert single_rows == distributed_rows, (
+        f"Row count mismatch: {single_rows} vs {distributed_rows}"
+    )
+
+
+# ============================================================================
+# Advanced Query Tests for Distributed FTS
+# ============================================================================
+
+
+def test_distributed_fts_phrase_query_validation(tmp_path):
+    """
+    Test distributed FTS validation with phrase queries.
+    """
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a very happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Test phrase query validation
+    results = validate_distributed_fts(
+        ds,
+        "text",
+        PhraseQuery("frodo was a puppy", "text"),
+        index_params={"with_position": True, "remove_stop_words": False},
+    )
+
+    # Should find matching phrase results
+    assert results["single_machine"].num_rows == results["distributed"].num_rows
+    assert results["single_machine"].num_rows == 2  # Two exact matches
+
+
+def test_distributed_fts_boolean_query_validation(tmp_path):
+    """
+    Test distributed FTS validation with boolean queries.
+    """
+    data = pa.table(
+        {
+            "text": [
+                "frodo was a puppy",
+                "frodo was a happy puppy",
+                "frodo was a puppy with a tail",
+            ]
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Test boolean query validation
+    query = MatchQuery("puppy", "text") & MatchQuery("happy", "text")
+    results = validate_distributed_fts(
+        ds, "text", query, index_params={"with_position": False}
+    )
+
+    # Should find only the happy puppy
+    assert results["single_machine"].num_rows == results["distributed"].num_rows
+    assert results["single_machine"].num_rows == 1
+
+
+def test_distributed_fts_fuzzy_query_validation(tmp_path):
+    """
+    Test distributed FTS validation with fuzzy queries.
+    """
+    data = pa.table({"text": ["foo", "food", "fob", "focus", "foul"]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Test fuzzy query validation
+    results = validate_distributed_fts(
+        ds,
+        "text",
+        MatchQuery("foo", "text", fuzziness=1),
+        index_params={"with_position": False},
+    )
+
+    # Should find fuzzy matches
+    assert results["single_machine"].num_rows == results["distributed"].num_rows
+    assert results["single_machine"].num_rows > 1  # Multiple fuzzy matches
+
+
+def test_distributed_fts_with_filter_validation(tmp_path):
+    """
+    Test distributed FTS validation with filters.
+    """
+    data = pa.table(
+        {
+            "id": [1, 2, 3, 4, 5],
+            "text": [
+                "lance database test",
+                "full text search",
+                "lance search text",
+                "some other content",
+                "more lance content",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Create BTREE index for filtering
+    ds.create_scalar_index("id", "BTREE")
+
+    # Test FTS with filter validation
+    results = validate_distributed_fts(
+        ds,
+        "text",
+        "lance",
+        index_params={"with_position": False},
+        query_params={"filter": "id <= 3", "prefilter": True},
+    )
+
+    # Should find filtered results
+    assert results["single_machine"].num_rows == results["distributed"].num_rows
+    assert results["single_machine"].num_rows == 2  # Only id 1 and 3 have "lance"
+
+
+def test_distributed_fts_multi_match_validation(tmp_path):
+    """
+    Test distributed FTS validation with multi-field matching.
+    """
+    data = pa.table(
+        {
+            "title": ["title common", "title hello", "title vector"],
+            "content": ["content world", "content database", "content common"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    # Test multi-match query validation
+    results = validate_distributed_fts(
+        ds,
+        ["title", "content"],  # Index both fields for multi-match query
+        MultiMatchQuery("common", ["title", "content"]),
+        index_params={"with_position": False},
+    )
+
+    # Note: For multi-match, we need to create indices on both fields
+    # This is a simplified test - in practice, we'd need more complex setup
+    assert results["single_machine"].num_rows == results["distributed"].num_rows
+
+
+# ============================================================================
+# Integration with Existing High-Priority FTS Tests
+# ============================================================================
+
+
+def test_distribute_fts_index_build(tmp_path):
+    """
+    This test creates indices on individual fragments
+    and then commits them as a single index.
+    """
+    # Generate test dataset with multiple fragments
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=250
+    )
+
+    import uuid
+
+    index_id = str(uuid.uuid4())
+    print(f"Using index ID: {index_id}")
+    index_name = "multiple_fragment_idx"
+
+    fragments = ds.get_fragments()
+    fragment_ids = [fragment.fragment_id for fragment in fragments]
+    print(f"Fragment IDs: {fragment_ids}")
+
+    for fragment in ds.get_fragments():
+        fragment_id = fragment.fragment_id
+        print(f"Creating index for fragment {fragment_id}")
+
+        # Use the new fragment_ids and fragment_uuid parameters
+        ds.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            name=index_name,
+            replace=False,
+            fragment_uuid=index_id,
+            fragment_ids=[fragment_id],
+            remove_stop_words=False,
+        )
+
+        # For fragment-level indexing, we expect the method to return successfully
+        # but not commit the index yet
+        print(f"Fragment {fragment_id} index created successfully")
+
+    # Merge the inverted index metadata
+    ds.merge_index_metadata(index_id)
+
+    # Create an Index object using the new dataclass format
+    from lance.dataset import Index
+
+    # Get the schema field for the indexed column
+    # Only use for non nested struct schema
+    field_id = ds.schema.get_field_index("text")
+
+    index = Index(
+        uuid=index_id,
+        name=index_name,
+        fields=[field_id],  # Use field index instead of field object
+        dataset_version=ds.version,
+        fragment_ids=set(fragment_ids),
+        index_version=0,
+    )
+
+    # Create the index operation
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+
+    # Commit the index
+    ds_committed = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    print("Successfully committed multiple fragment index")
+
+    # Verify the index was created and is functional
+    indices = ds_committed.list_indices()
+    assert len(indices) > 0, "No indices found after commit"
+
+    # Find our index
+    our_index = None
+    for idx in indices:
+        if idx["name"] == index_name:
+            our_index = idx
+            break
+    assert our_index is not None, f"Index '{index_name}' not found in indices list"
+    assert our_index["type"] == "Inverted", (
+        f"Expected Inverted index, got {our_index['type']}"
+    )
+
+    # Test that the index works for searching
+    # Get a sample text from the dataset to search for
+    sample_data = ds_committed.take([0], columns=["text"])
+    sample_text = sample_data.column(0)[0].as_py()
+    search_word = sample_text.split()[0] if sample_text.split() else "test"
+
+    # Perform a full-text search to verify the index works
+    results = ds_committed.scanner(
+        full_text_query=search_word,
+        columns=["id", "text"],
+    ).to_table()
+
+    print(f"Search for '{search_word}' returned {results.num_rows} results")
+    # We should get at least one result since we searched for a word from the dataset
+    assert results.num_rows > 0, f"No results found for search term '{search_word}'"
+
+
+def test_fragment_ids_parameter_validation(tmp_path):
+    """
+    Test validation of fragment_ids parameter.
+    """
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=100
+    )
+
+    # Test with valid fragment IDs
+    fragments = ds.get_fragments()
+    valid_fragment_id = fragments[0].fragment_id
+
+    # This should work without errors
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        fragment_ids=[valid_fragment_id],
+    )
+
+    # Test with invalid fragment ID (should handle gracefully)
+    # Note: The exact behavior for invalid fragment IDs may vary
+    # This test ensures the parameter is properly passed through
+    try:
+        ds.create_scalar_index(
+            column="text",
+            index_type="INVERTED",
+            fragment_ids=[999999],  # Non-existent fragment ID
+        )
+    except Exception as e:
+        # It's acceptable for this to fail with an appropriate error
+        print(f"Expected error for invalid fragment ID: {e}")
+
+
+def test_backward_compatibility_no_fragment_ids(tmp_path):
+    """
+    Test that the API remains backward compatible when fragment_ids is not provided.
+    """
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=100
+    )
+
+    # This should work exactly as before (full dataset indexing)
+    ds.create_scalar_index(
+        column="text",
+        index_type="INVERTED",
+        name="full_dataset_idx",
+        remove_stop_words=False,
+    )
+
+    # Verify the index was created
+    indices = ds.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["name"] == "full_dataset_idx"
+    assert indices[0]["type"] == "Inverted"
+
+    # Test that the index works
+    sample_data = ds.take([0], columns=["text"])
+    sample_text = sample_data.column(0)[0].as_py()
+    search_word = sample_text.split()[0] if sample_text.split() else "test"
+
+    results = ds.scanner(full_text_query=search_word).to_table()
+    assert results.num_rows > 0

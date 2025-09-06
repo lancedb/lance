@@ -101,6 +101,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
     }
 }
 
+impl<'py> IntoPyObject<'py> for PyLance<Index> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
+    }
+}
+
 impl FromPyObject<'_> for PyLance<DataReplacementGroup> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let fragment_id = ob.getattr("fragment_id")?.extract::<u64>()?;
