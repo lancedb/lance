@@ -202,10 +202,6 @@ impl BlockingDataset {
         Ok(rows)
     }
 
-    pub fn get_max_field_id(&self) -> Result<i32> {
-        Ok(self.inner.manifest().max_field_id())
-    }
-
     pub fn calculate_data_stats(&self) -> Result<DataStatistics> {
         let stats = RT.block_on(Arc::new(self.clone().inner).calculate_data_stats())?;
         Ok(stats)

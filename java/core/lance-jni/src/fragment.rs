@@ -311,7 +311,7 @@ fn inner_merge_column<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         (
             dataset.inner.get_fragment(fragment_id as usize),
-            dataset.get_max_field_id(),
+            dataset.inner.manifest().max_field_id(),
         )
     };
     let mut fragment = match fragment_opt {
@@ -329,7 +329,7 @@ fn inner_merge_column<'local>(
     let right_on_str: String = right_on.extract(env)?;
 
     let (new_frag, new_schema) =
-        RT.block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id?))?;
+        RT.block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
     let result = FragmentMergeResult {
         fragment: new_frag,
         schema: new_schema,
