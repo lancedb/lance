@@ -14,12 +14,12 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
 use crate::{pb, Any};
-use arrow_array::{new_empty_array, Array, UInt64Array};
+use arrow_array::{Array, UInt64Array};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
 mod sbbf;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field};
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -60,8 +60,6 @@ struct BloomFilterStatistics {
 
 pub struct BloomFilterIndex {
     blocks: Vec<BloomFilterStatistics>,
-    data_type: DataType,
-
     number_of_items: u64,
     number_of_bytes: usize,
 
@@ -74,7 +72,6 @@ impl std::fmt::Debug for BloomFilterIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BloomFilterIndex")
             .field("blocks", &self.blocks)
-            .field("data_type", &self.data_type)
             .field("number_of_items", &self.number_of_items)
             .field("number_of_bytes", &self.number_of_bytes)
             .field("store", &self.store)
@@ -136,7 +133,6 @@ impl BloomFilterIndex {
             // Return empty index for empty data
             return Ok(Self {
                 blocks: Vec::new(),
-                data_type: DataType::Int32, // Default type
                 number_of_items,
                 number_of_bytes,
                 store,
@@ -144,9 +140,6 @@ impl BloomFilterIndex {
                 index_cache,
             });
         }
-
-        let data_type_col = data.column(0);
-        let data_type = data_type_col.data_type().clone();
 
         let fragment_id_col = data
             .column_by_name("fragment_id")
@@ -233,7 +226,6 @@ impl BloomFilterIndex {
 
         Ok(Self {
             blocks,
-            data_type,
             number_of_items,
             number_of_bytes,
             store,
@@ -247,11 +239,6 @@ impl BloomFilterIndex {
         block: &BloomFilterStatistics,
         query: &SargableQuery,
     ) -> Result<bool> {
-        // If no bloom filter data is available, be conservative and return true
-        if block.bloom_filter_data.is_empty() {
-            return Ok(true);
-        }
-
         // Try to reconstruct the bloom filter from the stored data
         let sbbf = match Sbbf::new(&block.bloom_filter_data) {
             Ok(sbbf) => sbbf,
@@ -262,7 +249,6 @@ impl BloomFilterIndex {
         };
 
         match query {
-            // TODO: Shall we care about null here?
             SargableQuery::IsNull() => {
                 // For null values, we could use a special marker in the bloom filter
                 // For now, conservatively assume blocks might contain nulls
@@ -364,7 +350,6 @@ impl Index for BloomFilterIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "type": "BloomFilter",
             "number_of_items": self.number_of_items,
             "number_of_bytes": self.number_of_bytes,
         }))
@@ -436,13 +421,41 @@ impl ScalarIndex for BloomFilterIndex {
     /// Add the new data , creating an updated version of the index in `dest_store`
     async fn update(
         &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // TODO: Support me
-        Err(Error::InvalidInput {
-            source: "BloomFilter update not yet implemented".into(),
-            location: location!(),
+        // 1. Prepare the builder for new bloom filters
+        let batches_source = new_data;
+
+        let mut builder = BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
+            number_of_items: self.number_of_items,
+            number_of_bytes: self.number_of_bytes,
+        })?;
+
+        builder.train(batches_source).await?;
+
+        // Get the new blocks from the builder
+        let new_blocks = builder.blocks;
+
+        // Combine existing blocks with new blocks
+        let mut all_blocks = self.blocks.clone();
+        all_blocks.extend(new_blocks);
+
+        // Create a new builder with all blocks to write them out
+        let mut combined_builder =
+            BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
+                number_of_items: self.number_of_items,
+                number_of_bytes: self.number_of_bytes,
+            })?;
+        combined_builder.blocks = all_blocks;
+
+        // Write the updated index to dest_store
+        combined_builder.write_index(dest_store).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
+                .unwrap(),
+            index_version: BLOOMFILTER_INDEX_VERSION,
         })
     }
 
@@ -461,8 +474,8 @@ fn default_number_of_bytes() -> usize {
     *DEFAULT_NUMBER_OF_BYTES
 }
 
-// NumberOfItems: 8192 + NumberOfBytes: 524288 -> Probability of false positive: 1.0E-5
-// reference: https://hur.st/bloomfilter/?n=8192&p=1.0E-5&m=524288&k=
+// NumberOfItems: 8192 + NumberOfBytes: 16384(16KiB) + 8 SALT values -> Probability of false positive: 0.00057(1 in 1754)
+// reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
 static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_ITEMS")
         .unwrap_or_else(|_| "8192".to_string())
@@ -472,8 +485,8 @@ static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
 
 static DEFAULT_NUMBER_OF_BYTES: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_BYTES")
-        // 524288 = 64KiB
-        .unwrap_or_else(|_| "524288".to_string())
+        // 16384 = 16KiB
+        .unwrap_or_else(|_| "16384".to_string())
         .parse()
         .expect("failed to parse Lance_BLOOMFILTER_DEFAULT_NUMBER_OF_BYTES")
 });
@@ -506,17 +519,15 @@ impl BloomFilterIndexBuilderParams {
 
 pub struct BloomFilterIndexBuilder {
     params: BloomFilterIndexBuilderParams,
-    value_type: DataType,
     blocks: Vec<BloomFilterStatistics>,
     // The local offset within the current blocks
     cur_block_offset: usize,
     cur_fragment_id: u64,
-    // TODO: sbbf data
     sbbf: Option<Sbbf>,
 }
 
 impl BloomFilterIndexBuilder {
-    pub fn try_new(params: BloomFilterIndexBuilderParams, value_type: DataType) -> Result<Self> {
+    pub fn try_new(params: BloomFilterIndexBuilderParams) -> Result<Self> {
         let sbbf = SbbfBuilder::new()
             .expected_items(params.number_of_items)
             .num_bytes(params.number_of_bytes)
@@ -528,7 +539,6 @@ impl BloomFilterIndexBuilder {
 
         Ok(Self {
             params,
-            value_type,
             blocks: Vec::new(),
             cur_block_offset: 0,
             cur_fragment_id: 0,
@@ -777,52 +787,6 @@ impl BloomFilterIndexBuilder {
     }
 
     fn bloomfilter_stats_as_batch(&self) -> Result<RecordBatch> {
-        // Create placeholder array for the indexed data type with same length as other columns
-        let data_type_placeholder = if self.blocks.is_empty() {
-            new_empty_array(&self.value_type)
-        } else {
-            // Create array with same length as the number of blocks
-            // Fill with null values since this is just a placeholder
-            match &self.value_type {
-                DataType::Int32 => {
-                    let nulls = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::Int32Array::from(nulls)) as ArrayRef
-                }
-                DataType::Int64 => {
-                    let nulls = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::Int64Array::from(nulls)) as ArrayRef
-                }
-                DataType::Float32 => {
-                    let nulls = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::Float32Array::from(nulls)) as ArrayRef
-                }
-                DataType::Float64 => {
-                    let nulls = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::Float64Array::from(nulls)) as ArrayRef
-                }
-                DataType::Utf8 => {
-                    let nulls: Vec<Option<&str>> = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::StringArray::from(nulls)) as ArrayRef
-                }
-                DataType::LargeUtf8 => {
-                    let nulls: Vec<Option<&str>> = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::LargeStringArray::from(nulls)) as ArrayRef
-                }
-                DataType::Binary => {
-                    let nulls: Vec<Option<&[u8]>> = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::BinaryArray::from(nulls)) as ArrayRef
-                }
-                DataType::LargeBinary => {
-                    let nulls: Vec<Option<&[u8]>> = vec![None; self.blocks.len()];
-                    Arc::new(arrow_array::LargeBinaryArray::from(nulls)) as ArrayRef
-                }
-                _ => {
-                    // For other types, create empty array and handle mismatch
-                    new_empty_array(&self.value_type)
-                }
-            }
-        };
-
         let fragment_ids =
             UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.fragment_id));
 
@@ -845,7 +809,6 @@ impl BloomFilterIndexBuilder {
         };
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("data_type_placeholder", self.value_type.clone(), true),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("block_start", DataType::UInt64, false),
             Field::new("block_size", DataType::UInt64, false),
@@ -853,7 +816,6 @@ impl BloomFilterIndexBuilder {
         ]));
 
         let columns: Vec<ArrayRef> = vec![
-            data_type_placeholder,
             Arc::new(fragment_ids) as ArrayRef,
             Arc::new(block_starts) as ArrayRef,
             Arc::new(block_sizes) as ArrayRef,
@@ -895,10 +857,7 @@ impl BloomFilterIndexPlugin {
         index_store: &dyn IndexStore,
         options: Option<BloomFilterIndexBuilderParams>,
     ) -> Result<()> {
-        let value_type = batches_source.schema().field(0).data_type().clone();
-
-        let mut builder =
-            BloomFilterIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
+        let mut builder = BloomFilterIndexBuilder::try_new(options.unwrap_or_default())?;
 
         builder.train(batches_source).await?;
 
@@ -1032,7 +991,6 @@ mod tests {
         SargableQuery, ScalarIndex, SearchResult,
     };
 
-    // Add missing imports for the tests
     use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
@@ -1093,9 +1051,8 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
         assert_eq!(index.blocks.len(), 0);
-        assert_eq!(index.data_type, DataType::Int32);
         assert_eq!(index.number_of_items, 8192);
-        assert_eq!(index.number_of_bytes, 524288); // 64kib
+        assert_eq!(index.number_of_bytes, 16384); // 16kib
 
         // Equals query: null (should match nothing, as there are no nulls in empty index)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
@@ -1141,7 +1098,6 @@ mod tests {
             .expect("Failed to load BloomFilterIndex");
 
         assert_eq!(index.blocks.len(), 1);
-        assert_eq!(index.data_type, DataType::Int32);
         assert_eq!(index.number_of_items, 100);
         assert_eq!(index.number_of_bytes, 1024);
 
@@ -1231,7 +1187,6 @@ mod tests {
 
         // Should have 4 blocks total (2 blocks per fragment)
         assert_eq!(index.blocks.len(), 4);
-        assert_eq!(index.data_type, DataType::Int64);
 
         // Check fragment 0 blocks
         assert_eq!(index.blocks[0].fragment_id, 0);
@@ -1407,7 +1362,6 @@ mod tests {
 
         // Should have 10 blocks since we have 10000 rows and block size is 1000
         assert_eq!(index.blocks.len(), 10);
-        assert_eq!(index.data_type, DataType::Int64);
         assert_eq!(index.number_of_items, 1000);
         assert_eq!(index.number_of_bytes, 2048);
 
@@ -1500,7 +1454,6 @@ mod tests {
 
         // Should have 2 blocks since we have 200 rows and block size is 100
         assert_eq!(index.blocks.len(), 2);
-        assert_eq!(index.data_type, DataType::Utf8);
 
         // Test search for a value in the first block
         let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_050".to_string())));
@@ -1585,7 +1538,6 @@ mod tests {
 
         // Should have 2 blocks since we have 100 rows and block size is 50
         assert_eq!(index.blocks.len(), 2);
-        assert_eq!(index.data_type, DataType::Binary);
 
         // Test search for a value in the first block
         let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![25, 26, 27])));
@@ -1656,7 +1608,6 @@ mod tests {
             .expect("Failed to load BloomFilterIndex");
 
         assert_eq!(index.blocks.len(), 2);
-        assert_eq!(index.data_type, DataType::LargeUtf8);
 
         // Test search functionality
         let query = SargableQuery::Equals(ScalarValue::LargeUtf8(Some(
