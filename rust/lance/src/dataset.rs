@@ -84,7 +84,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::dataset::cleanup::{BeforeTimestamp, CleanupPolicy};
+use crate::dataset::cleanup::{CleanupBuilder, CleanupPolicy};
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -859,12 +859,16 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        let before = utc_now() - older_than;
-        self.cleanup_with_policy(
-            Box::new(BeforeTimestamp(before)),
-            delete_unverified,
-            error_if_tagged_old_versions,
-        )
+        let mut builder = CleanupBuilder::default();
+        builder = builder.before_timestamp(utc_now() - older_than);
+        if let Some(v) = delete_unverified {
+            builder = builder.delete_unverified(v);
+        }
+        if let Some(v) = error_if_tagged_old_versions {
+            builder = builder.error_if_tagged_old_versions(v);
+        }
+
+        self.cleanup_with_policy(builder.build())
     }
 
     /// Removes old versions of the dataset from storage
@@ -877,13 +881,7 @@ impl Dataset {
     ///
     /// # Arguments
     ///
-    /// * `policy` - Versions satisfies this policy will be deleted.
-    /// * `delete_unverified` - If false (the default) then files will only be deleted if they are
-    ///                        not referenced and are not in progress(at least 7 days old).
-    ///                        Set to true to delete these files if you are sure there are no other
-    ///                        in-progress dataset operations.
-    /// * `error_if_tagged_old_versions` - If this argument True, an exception will be raised if any
-    ///                                    tagged versions match the parameters.
+    /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
     ///
     /// # Returns
     ///
@@ -891,18 +889,10 @@ impl Dataset {
     #[instrument(level = "debug", skip(self))]
     pub fn cleanup_with_policy(
         &self,
-        policy: Box<dyn CleanupPolicy>,
-        delete_unverified: Option<bool>,
-        error_if_tagged_old_versions: Option<bool>,
+        policy: CleanupPolicy,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        cleanup::cleanup_old_versions(
-            self,
-            policy,
-            delete_unverified,
-            error_if_tagged_old_versions,
-        )
-        .boxed()
+        cleanup::cleanup_old_versions(self, policy).boxed()
     }
 
     #[allow(clippy::too_many_arguments)]
