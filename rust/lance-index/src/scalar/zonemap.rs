@@ -82,6 +82,20 @@ impl DeepSizeOf for ZoneMapStatistics {
 /// This is an inexact filter, similar to a bloom filter. It can return false positives that require rechecking.
 ///
 /// Note that it cannot return false negatives.
+/// Input:
+/// * Fragment 1: - 10 rows   -> 0  -> 9
+/// * Fragment 2: - 7 rows    -> 10 -> 16
+/// * Fragment 3: - 4 rows    -> 20 -> 23
+/// * Zone size AKA “rows_per_zone” (from user) - 5
+///
+/// Output:
+/// fragment id | min | max | zone_size
+/// 1           | 0   |  4  | 5
+/// 1           | 5   |  9  | 5
+/// 2           | 10  | 14  | 5
+/// 2           | 15  | 16  | 2
+/// 3           | 20  | 23  | 4
+
 pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
