@@ -70,7 +70,7 @@ use crate::{
     dataset::{
         fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
-        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+        write::open_writer,
     },
     index::DatasetIndexInternalExt,
     io::exec::{
@@ -1150,8 +1150,7 @@ impl MergeInsertJob {
         //       projection pushdown for us.
         // Goal: we shouldn't have to add new branches in this code to handle
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
-        let session_config = SessionConfig::default();
-        let session_ctx = SessionContext::new_with_config(session_config);
+        let session_ctx = get_session_context(&Default::default());
         let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
         let on_cols = self
             .params
@@ -1161,19 +1160,94 @@ impl MergeInsertJob {
             .collect::<Vec<_>>();
         let source_df = session_ctx.read_one_shot(source)?;
         let source_df_aliased = source_df.alias("source")?;
-        let scan_aliased = scan.alias("target")?;
         let join_type = if self.params.insert_not_matched {
             JoinType::Right
         } else {
             JoinType::Inner
         };
         let dataset_schema: Schema = self.dataset.schema().into();
-        let df = scan_aliased
-            .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
-            .with_column(
-                MERGE_ACTION_COLUMN,
+
+        // Check if we can use a scalar index for the join
+        let df = if let Some(index) = self.join_key_as_scalar_index().await? {
+            // Use scalar index join - this avoids loading all columns from target table
+            use crate::dataset::write::merge_insert::logical_plan::ScalarIndexJoinNode;
+            use datafusion_expr::{Extension, LogicalPlan};
+
+            // Get the source logical plan
+            let (source_session_state, source_logical_plan) = source_df_aliased.into_parts();
+
+            // Create ScalarIndexJoinNode for indexed data
+            let scalar_index_join_node = ScalarIndexJoinNode::try_new(
+                source_logical_plan.clone(),
+                self.dataset.clone(),
+                self.params.on[0].clone(), // We know it's a single column from join_key_as_scalar_index
+                index.name.clone(),
+                join_type,
+                Some(datafusion::common::TableReference::bare("target")), // Qualify _rowid as target._rowid
+            )?;
+
+            let indexed_join_plan = LogicalPlan::Extension(Extension {
+                node: Arc::new(scalar_index_join_node),
+            });
+
+            // Add AddRowAddrNode to translate the _rowid to _rowaddr with proper table qualification
+            let with_rowaddr_node = logical_plan::AddRowAddrNode::try_new(
+                indexed_join_plan.clone(),
+                self.dataset.clone(),
+                indexed_join_plan.schema().fields().len(), // Add _rowaddr at the end
+            )?;
+            let with_rowaddr_plan = LogicalPlan::Extension(Extension {
+                node: Arc::new(with_rowaddr_node),
+            });
+
+            // Convert back to DataFrame for action column processing
+            let indexed_joined_df = datafusion::dataframe::DataFrame::new(
+                source_session_state.clone(),
+                with_rowaddr_plan,
+            );
+
+            // Add the action column
+            let indexed_joined_with_action_df = indexed_joined_df.with_column(
+                "action",
                 merge_insert_action(&self.params, Some(&dataset_schema))?,
             )?;
+
+            // Check for unindexed fragments (out-of-date index case)
+            let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+
+            if !unindexed_fragments.is_empty() {
+                // Handle out-of-date index: need to union indexed data with unindexed data
+                // This is more complex with ScalarIndexJoin, so for now, fall back to regular join
+                // when there are unindexed fragments (out-of-date index case)
+
+                // TODO: Implement proper union of ScalarIndexJoin with regular join for unindexed data
+                // For now, fall back to regular join when index is out of date
+                let scan_aliased = scan.alias("target")?;
+                let source_df_for_fallback = datafusion::dataframe::DataFrame::new(
+                    source_session_state,
+                    source_logical_plan,
+                )
+                .alias("source")?;
+                scan_aliased
+                    .join(source_df_for_fallback, join_type, &on_cols, &on_cols, None)?
+                    .with_column(
+                        "action",
+                        merge_insert_action(&self.params, Some(&dataset_schema))?,
+                    )?
+            } else {
+                // Index is up-to-date, use only indexed data
+                indexed_joined_with_action_df
+            }
+        } else {
+            // Fallback to regular join when no suitable scalar index exists
+            let scan_aliased = scan.alias("target")?;
+            scan_aliased
+                .join(source_df_aliased, join_type, &on_cols, &on_cols, None)?
+                .with_column(
+                    "action",
+                    merge_insert_action(&self.params, Some(&dataset_schema))?,
+                )?
+        };
 
         let (session_state, logical_plan) = df.into_parts();
 
@@ -1188,8 +1262,11 @@ impl MergeInsertJob {
 
         let logical_plan = session_state.optimize(&logical_plan)?;
 
-        let planner =
-            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(MergeInsertPlanner {})]);
+        let planner = DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(logical_plan::MergeInsertPlanner {}),
+            Arc::new(logical_plan::ScalarIndexJoinPlanner {}),
+            Arc::new(logical_plan::AddRowAddrPlanner {}),
+        ]);
         // This method already does the optimization for us.
         let physical_plan = planner
             .create_physical_plan(&logical_plan, &session_state)
@@ -1269,7 +1346,6 @@ impl MergeInsertJob {
     ///
     /// The fast path is only available for specific conditions:
     /// - when_matched is UpdateAll or UpdateIf
-    /// - No scalar index on join key
     /// - Source schema matches dataset schema exactly
     /// - when_not_matched_by_source is Keep
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
@@ -1284,13 +1360,10 @@ impl MergeInsertJob {
             },
         );
 
-        let has_scalar_index = self.join_key_as_scalar_index().await?.is_some();
-
         Ok(matches!(
             self.params.when_matched,
             WhenMatched::UpdateAll | WhenMatched::UpdateIf(_)
-        ) && !has_scalar_index
-            && is_full_schema
+        ) && is_full_schema
             && matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -3908,6 +3981,284 @@ mod tests {
       CoalesceBatchesExec...
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
           LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+          RepartitionExec...
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_join_plan() {
+        // Test that when a scalar index exists, the query plan uses ScalarIndexJoinExec
+        // instead of HashJoinExec, avoiding loading unnecessary columns from target table
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(100), BatchCount::from(4));
+
+        // Create dataset with initial data
+        let mut ds = Dataset::write(data, test_uri, None).await.unwrap();
+
+        // Create a BTree scalar index on the key column
+        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+        let index_params = ScalarIndexParams::default();
+        ds.create_index(
+            &["key"],
+            IndexType::BTree,
+            Some("key_btree".to_string()),
+            &index_params,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Create merge insert job
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+        // Create new data for merge insert
+        let new_data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(50), BatchCount::from(2));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The optimized plan should use ScalarIndexJoinExec instead of HashJoinExec
+        // and avoid loading target table columns by using the scalar index with AddRowAddrExec for conversion
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[value@0 as value, key@1 as key, _rowaddr@3 as _rowaddr, CASE WHEN key@1 IS NOT NULL AND _rowaddr@3 IS NOT NULL THEN 1 ELSE 0 END as action]
+      RepartitionExec...
+        AddRowAddrExec
+          ScalarIndexJoinExec: on=[key], index=[key_btree], type=[Inner]
+            RepartitionExec...
+              StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_join_plan_upsert() {
+        // Test that when a scalar index exists and insert_not_matched=true (upsert),
+        // the system uses ScalarIndexJoinExec with Right join
+        let test_uri = "memory://test_scalar_index_join_plan_upsert";
+
+        // Create initial table data
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        // Create dataset with initial data
+        let mut ds = Dataset::write(data, test_uri, None).await.unwrap();
+
+        // Create a BTree scalar index on the key column
+        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+        let index_params = ScalarIndexParams::default();
+        ds.create_index(
+            &["key"],
+            IndexType::BTree,
+            Some("key_btree".to_string()),
+            &index_params,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Create merge insert job with insert_not_matched=true (upsert)
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        // Create new data for merge insert
+        let new_data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(50), BatchCount::from(2));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The optimized plan should use ScalarIndexJoinExec with Right join for upsert and AddRowAddrExec for conversion
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[value@1 as value, key@2 as key, _rowaddr@3 as _rowaddr, CASE WHEN __common_expr_1@0 AND _rowaddr@3 IS NULL THEN 2 WHEN __common_expr_1@0 AND _rowaddr@3 IS NOT NULL THEN 1 ELSE 0 END as action]
+      ProjectionExec: expr=[key@1 IS NOT NULL as __common_expr_1, value@0 as value, key@1 as key, _rowaddr@3 as _rowaddr]
+        RepartitionExec...
+          AddRowAddrExec
+            ScalarIndexJoinExec: on=[key], index=[key_btree], type=[Right]
+              RepartitionExec...
+                StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_join_plan_update_if() {
+        // Test that when a scalar index exists with UpdateIf condition,
+        // the system uses ScalarIndexJoinExec with the condition in the action expression
+        let test_uri = "memory://test_scalar_index_join_plan_update_if";
+
+        // Create initial table data
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(100), BatchCount::from(1));
+
+        // Create dataset with initial data
+        let mut ds = Dataset::write(data, test_uri, None).await.unwrap();
+
+        // Create a BTree scalar index on the key column
+        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+        let index_params = ScalarIndexParams::default();
+        ds.create_index(
+            &["key"],
+            IndexType::BTree,
+            Some("key_btree".to_string()),
+            &index_params,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Create merge insert job with UpdateIf condition
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(
+                    crate::dataset::WhenMatched::update_if(&ds, "source.value > 20").unwrap(),
+                )
+                .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+        // Create new data for merge insert
+        let new_data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(50), BatchCount::from(2));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The optimized plan should use ScalarIndexJoinExec with the UpdateIf condition in action expression and AddRowAddrExec for conversion
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateIf(source.value > 20), when_not_matched=DoNothing, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[value@0 as value, key@1 as key, _rowaddr@3 as _rowaddr, CASE WHEN key@1 IS NOT NULL AND _rowaddr@3 IS NOT NULL AND value@0 > 20 THEN 1 ELSE 0 END as action]
+      RepartitionExec...
+        AddRowAddrExec
+          ScalarIndexJoinExec: on=[key], index=[key_btree], type=[Inner]
+            RepartitionExec...
+              StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        ).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_out_of_date_fallback() {
+        // Test that when a scalar index exists but is out of date (has unindexed fragments),
+        // the system falls back to regular join instead of using ScalarIndexJoinExec
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(100), BatchCount::from(4));
+
+        // Create dataset with initial data
+        let mut ds = Dataset::write(data, test_uri, None).await.unwrap();
+
+        // Create a BTree scalar index on the key column
+        use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+        let index_params = ScalarIndexParams::default();
+        ds.create_index(
+            &["key"],
+            IndexType::BTree,
+            Some("key_btree".to_string()),
+            &index_params,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Add more data after creating the index to make it out-of-date
+        let additional_data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(10))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let additional_data =
+            additional_data.into_reader_rows(RowCount::from(50), BatchCount::from(2));
+
+        ds.append(additional_data, None).await.unwrap();
+
+        let ds = Arc::new(ds);
+
+        // Verify there are unindexed fragments
+        let unindexed_fragments = ds.unindexed_fragments("key_btree").await.unwrap();
+        assert!(
+            !unindexed_fragments.is_empty(),
+            "Should have unindexed fragments"
+        );
+
+        // Create merge insert job
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+        // Create new data for merge insert
+        let new_data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(30), BatchCount::from(2));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // With out-of-date index, should fall back to regular HashJoinExec
+        // and load target table columns since the scalar index cannot be trusted
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=UpdateAll, when_not_matched=DoNothing, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowaddr@0 as _rowaddr, value@1 as value, key@2 as key, CASE WHEN key@2 IS NOT NULL AND _rowaddr@0 IS NOT NULL THEN 1 ELSE 0 END as action]
+      CoalesceBatchesExec...
+        HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowaddr@1, value@2, key@3]
+          LanceRead: uri=..., projection=[key], num_fragments=..., range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
