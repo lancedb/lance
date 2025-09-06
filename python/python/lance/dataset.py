@@ -1874,7 +1874,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def create_scalar_index(
         self,
-        column: str,
+        column: Union[str, List[str]],
         index_type: Union[
             Literal["BTREE"],
             Literal["BITMAP"],
@@ -1958,9 +1958,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        column : str
-            The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
+        column : str, list[str]
+            The column(s) to be indexed.  Must be a boolean, integer, float,
+            or string column. Only support to index multiple columns
+            when the index type is ``"INVERTED"`` or ``"FTS"``.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"`` or ``"INVERTED"``.
@@ -2039,17 +2040,20 @@ class LanceDataset(pa.dataset.Dataset):
         ``MaterializeIndex`` operator.
 
         """
+        columns = column
         if isinstance(column, str):
-            column = [column]
+            columns = [column]
 
-        if len(column) > 1:
+        if len(columns) > 1 and index_type not in ["INVERTED", "FTS"]:
             raise NotImplementedError(
                 "Scalar indices currently only support a single column"
             )
 
-        column = column[0]
-        if column not in self.schema.names:
-            raise KeyError(f"{column} not found in schema")
+        for c in columns:
+            if c not in self.schema.names:
+                raise KeyError(f"{c} not found in schema")
+
+        column = columns[0]
 
         # TODO: Add documentation of IndexConfig approach for creating
         # indexes that need parameterization
@@ -2062,6 +2066,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "ZONEMAP",
                 "LABEL_LIST",
                 "INVERTED",
+                "FTS",
             ]:
                 raise NotImplementedError(
                     (
@@ -2121,7 +2126,7 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
-        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
+        self._ds.create_index(columns, index_type, name, replace, train, None, kwargs)
 
     def create_index(
         self,
