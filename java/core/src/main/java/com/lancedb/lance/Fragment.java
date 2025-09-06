@@ -145,19 +145,11 @@ public class Fragment {
    * @param stream the input data stream
    * @param leftOn column name of current fragment to be joined on.
    * @param rightOn column name of new data to be joined on.
-   * @param maxFieldId max field id.
    * @return the fragment metadata and new schema.
    */
-  public FragmentMergeResult mergeColumns(
-      ArrowArrayStream stream, String leftOn, String rightOn, int maxFieldId) {
-    return nativeMergeColumns(
-        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn, maxFieldId);
-  }
-
-  /** Automatically get max_field_id from DataSet. */
   public FragmentMergeResult mergeColumns(ArrowArrayStream stream, String leftOn, String rightOn) {
-    int maxFieldId = dataset.getMaxFieldId();
-    return mergeColumns(stream, leftOn, rightOn, maxFieldId);
+    return nativeMergeColumns(
+        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
   }
 
   private native FragmentMergeResult nativeMergeColumns(
@@ -165,8 +157,7 @@ public class Fragment {
       long fragmentId,
       long arrowStreamMemoryAddress,
       String leftOn,
-      String rightOn,
-      int maxFieldId);
+      String rightOn);
 
   /**
    * Create a fragment from the given data.

@@ -282,7 +282,6 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_nativeMergeColumns<'a>(
     arrow_array_stream_addr: jlong, // memoryAddress of ArrowStream
     left_on: JString,               // left column name to join on
     right_on: JString,              // right column name to join on
-    max_field_id: jint,
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -292,8 +291,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_nativeMergeColumns<'a>(
             fragment_id,
             arrow_array_stream_addr,
             left_on,
-            right_on,
-            max_field_id
+            right_on
         ),
         JObject::null()
     )
@@ -307,12 +305,14 @@ fn inner_merge_column<'local>(
     arrow_array_stream_addr: jlong,
     left_on: JString,
     right_on: JString,
-    max_field_id: jint,
 ) -> Result<JObject<'local>> {
-    let fragment_opt = {
+    let (fragment_opt, max_field_id) = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.inner.get_fragment(fragment_id as usize)
+        (
+            dataset.inner.get_fragment(fragment_id as usize),
+            dataset.get_max_field_id(),
+        )
     };
     let mut fragment = match fragment_opt {
         Some(fragment) => fragment,
@@ -322,13 +322,14 @@ fn inner_merge_column<'local>(
             )))
         }
     };
+
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
 
     let (new_frag, new_schema) =
-        RT.block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
+        RT.block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id?))?;
     let result = FragmentMergeResult {
         fragment: new_frag,
         schema: new_schema,

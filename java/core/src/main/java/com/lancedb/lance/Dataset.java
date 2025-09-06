@@ -676,22 +676,6 @@ public class Dataset implements Closeable {
   private native DataStatistics nativeGetDataStatistics();
 
   /**
-   * Get the max field id of all fields. Note that it will traverse all DataFiles as well as current
-   * Manifest Schema. If some columns are dropped from this schema, we can restore the used field
-   * ids from DataFiles.
-   *
-   * @return maxFieldId
-   */
-  public int getMaxFieldId() {
-    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeGetMaxFieldId();
-    }
-  }
-
-  private native int nativeGetMaxFieldId();
-
-  /**
    * Get all fragments in this dataset.
    *
    * @return A list of {@link Fragment}.

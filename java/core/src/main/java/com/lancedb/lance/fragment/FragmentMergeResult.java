@@ -19,7 +19,7 @@ import com.lancedb.lance.schema.LanceSchema;
 import org.apache.arrow.c.ArrowArrayStream;
 
 /**
- * Result of {@link com.lancedb.lance.Fragment#mergeColumns(ArrowArrayStream, String, String, int)
+ * Result of {@link com.lancedb.lance.Fragment#mergeColumns(ArrowArrayStream, String, String)
  * Fragment.mergeColumns()}.
  */
 public class FragmentMergeResult {
