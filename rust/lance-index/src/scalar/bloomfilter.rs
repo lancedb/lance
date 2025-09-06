@@ -14,6 +14,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
 use crate::{pb, Any};
+use arrow_array::types::ByteArrayType;
 use arrow_array::{new_empty_array, Array, UInt64Array};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::ROW_ADDR;
@@ -436,13 +437,47 @@ impl ScalarIndex for BloomFilterIndex {
     /// Add the new data , creating an updated version of the index in `dest_store`
     async fn update(
         &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // TODO: Support me
-        Err(Error::InvalidInput {
-            source: "BloomFilter update not yet implemented".into(),
-            location: location!(),
+        // 1. Prepare the builder for new bloom filters
+        let batches_source = new_data;
+        let value_type = batches_source.schema().field(0).data_type().clone();
+
+        let mut builder = BloomFilterIndexBuilder::try_new(
+            BloomFilterIndexBuilderParams {
+                number_of_items: self.number_of_items,
+                number_of_bytes: self.number_of_bytes,
+            },
+            value_type,
+        )?;
+
+        builder.train(batches_source).await?;
+
+        // Get the new blocks from the builder
+        let new_blocks = builder.blocks;
+
+        // Combine existing blocks with new blocks
+        let mut all_blocks = self.blocks.clone();
+        all_blocks.extend(new_blocks);
+
+        // Create a new builder with all blocks to write them out
+        let mut combined_builder = BloomFilterIndexBuilder::try_new(
+            BloomFilterIndexBuilderParams {
+                number_of_items: self.number_of_items,
+                number_of_bytes: self.number_of_bytes,
+            },
+            self.data_type.clone(),
+        )?;
+        combined_builder.blocks = all_blocks;
+
+        // Write the updated index to dest_store
+        combined_builder.write_index(dest_store).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
+                .unwrap(),
+            index_version: BLOOMFILTER_INDEX_VERSION,
         })
     }
 
@@ -461,8 +496,8 @@ fn default_number_of_bytes() -> usize {
     *DEFAULT_NUMBER_OF_BYTES
 }
 
-// NumberOfItems: 8192 + NumberOfBytes: 524288 -> Probability of false positive: 1.0E-5
-// reference: https://hur.st/bloomfilter/?n=8192&p=1.0E-5&m=524288&k=
+// NumberOfItems: 8192 + NumberOfBytes: 16384(16KiB) + 8 SALT values -> Probability of false positive: 0.00057(1 in 1754)
+// reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
 static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_ITEMS")
         .unwrap_or_else(|_| "8192".to_string())
@@ -472,8 +507,8 @@ static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
 
 static DEFAULT_NUMBER_OF_BYTES: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_BYTES")
-        // 524288 = 64KiB
-        .unwrap_or_else(|_| "524288".to_string())
+        // 16384 = 16KiB
+        .unwrap_or_else(|_| "16384".to_string())
         .parse()
         .expect("failed to parse Lance_BLOOMFILTER_DEFAULT_NUMBER_OF_BYTES")
 });
@@ -511,7 +546,6 @@ pub struct BloomFilterIndexBuilder {
     // The local offset within the current blocks
     cur_block_offset: usize,
     cur_fragment_id: u64,
-    // TODO: sbbf data
     sbbf: Option<Sbbf>,
 }
 
@@ -548,31 +582,11 @@ impl BloomFilterIndexBuilder {
         }
     }
 
-    fn process_string_array(sbbf: &mut Sbbf, array: &arrow_array::StringArray) {
-        for i in 0..array.len() {
-            if array.is_valid(i) {
-                sbbf.insert(array.value(i));
-            }
-        }
-    }
-
-    fn process_large_string_array(sbbf: &mut Sbbf, array: &arrow_array::LargeStringArray) {
-        for i in 0..array.len() {
-            if array.is_valid(i) {
-                sbbf.insert(array.value(i));
-            }
-        }
-    }
-
-    fn process_binary_array(sbbf: &mut Sbbf, array: &arrow_array::BinaryArray) {
-        for i in 0..array.len() {
-            if array.is_valid(i) {
-                sbbf.insert(array.value(i));
-            }
-        }
-    }
-
-    fn process_large_binary_array(sbbf: &mut Sbbf, array: &arrow_array::LargeBinaryArray) {
+    fn process_byte_array<T>(sbbf: &mut Sbbf, array: &arrow_array::GenericByteArray<T>)
+    where
+        T: arrow_array::types::ByteArrayType,
+        <T as arrow_array::types::ByteArrayType>::Native: parquet::data_type::AsBytes,
+    {
         for i in 0..array.len() {
             if array.is_valid(i) {
                 sbbf.insert(array.value(i));
@@ -617,28 +631,28 @@ impl BloomFilterIndexBuilder {
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
                         .unwrap();
-                    Self::process_string_array(sbbf, typed_array);
+                    Self::process_byte_array(sbbf, typed_array);
                 }
                 DataType::LargeUtf8 => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::LargeStringArray>()
                         .unwrap();
-                    Self::process_large_string_array(sbbf, typed_array);
+                    Self::process_byte_array(sbbf, typed_array);
                 }
                 DataType::Binary => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::BinaryArray>()
                         .unwrap();
-                    Self::process_binary_array(sbbf, typed_array);
+                    Self::process_byte_array(sbbf, typed_array);
                 }
                 DataType::LargeBinary => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::LargeBinaryArray>()
                         .unwrap();
-                    Self::process_large_binary_array(sbbf, typed_array);
+                    Self::process_byte_array(sbbf, typed_array);
                 }
                 _ => {
                     return Err(Error::InvalidInput {
@@ -1095,7 +1109,7 @@ mod tests {
         assert_eq!(index.blocks.len(), 0);
         assert_eq!(index.data_type, DataType::Int32);
         assert_eq!(index.number_of_items, 8192);
-        assert_eq!(index.number_of_bytes, 524288); // 64kib
+        assert_eq!(index.number_of_bytes, 16384); // 16KiB
 
         // Equals query: null (should match nothing, as there are no nulls in empty index)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
