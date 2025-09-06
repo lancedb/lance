@@ -13,16 +13,21 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.fragment.FragmentMergeResult;
+
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowFileReader;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.ipc.SeekableReadChannel;
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -33,6 +38,8 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
@@ -52,7 +59,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestUtils {
   private abstract static class TestDataset {
-    private final BufferAllocator allocator;
+    protected final BufferAllocator allocator;
     private final String datasetPath;
 
     public TestDataset(BufferAllocator allocator, String datasetPath) {
@@ -347,6 +354,79 @@ public class TestUtils {
     @Override
     public Schema getSchema() {
       return COMPLETE_SCHEMA;
+    }
+  }
+
+  public static class MergeColumnTestDataset extends TestDataset {
+    private static final Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8())),
+            null);
+
+    private static final Schema mergeColumnSchema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("_rowid", new ArrowType.Int(64, false)),
+                Field.nullable("new_col1", new ArrowType.Utf8()),
+                Field.nullable("new_col2", new ArrowType.Utf8())),
+            null);
+
+    public MergeColumnTestDataset(BufferAllocator allocator, String datasetPath) {
+      super(allocator, datasetPath);
+    }
+
+    @Override
+    public Schema getSchema() {
+      return schema;
+    }
+
+    public Schema getMergeColumnSchema() {
+      return mergeColumnSchema;
+    }
+
+    /**
+     * Test method to merge columns. Note that for simplicity, the merged column rowid is fixed with
+     * [0, mergeNum). Please only use this method to test the first fragment.
+     *
+     * @param fragment fragment to merge.
+     * @param mergeNum number of new rows.
+     * @return merge result
+     */
+    public FragmentMergeResult mergeColumn(Fragment fragment, int mergeNum) {
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(getMergeColumnSchema(), allocator)) {
+        root.allocateNew();
+        UInt8Vector rowidVec = (UInt8Vector) root.getVector("_rowid");
+        VarCharVector newCol1Vec = (VarCharVector) root.getVector("new_col1");
+        VarCharVector newCol2Vec = (VarCharVector) root.getVector("new_col2");
+        for (int i = 0; i < mergeNum; i++) {
+          rowidVec.setSafe(i, i);
+          newCol1Vec.setSafe(i, String.format("new_col1_%s", i).getBytes(StandardCharsets.UTF_8));
+          newCol2Vec.setSafe(i, String.format("new_col2_%s", i).getBytes(StandardCharsets.UTF_8));
+        }
+        root.setRowCount(mergeNum);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+          writer.start();
+          writer.writeBatch();
+          writer.end();
+        } catch (IOException e) {
+          throw new RuntimeException("Cannot write schema root", e);
+        }
+
+        byte[] arrowData = out.toByteArray();
+        ByteArrayInputStream in = new ByteArrayInputStream(arrowData);
+
+        try (ArrowStreamReader reader = new ArrowStreamReader(in, allocator);
+            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          Data.exportArrayStream(allocator, reader, stream);
+          return fragment.mergeColumns(stream, "_rowid", "_rowid");
+        } catch (Exception e) {
+          throw new RuntimeException("Cannot read arrow stream.", e);
+        }
+      }
     }
   }
 }

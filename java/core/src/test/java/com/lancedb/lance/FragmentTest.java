@@ -13,12 +13,15 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.fragment.FragmentMergeResult;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import com.lancedb.lance.operation.Merge;
 import com.lancedb.lance.operation.Update;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -38,6 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FragmentTest {
   @Test
@@ -260,5 +264,76 @@ public class FragmentTest {
     }
 
     return rowAddrs.stream().map(RowAddress::rowIndex).collect(Collectors.toList());
+  }
+
+  @Test
+  void testMergeColumns(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testMergeColumns").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.MergeColumnTestDataset testDataset =
+          new TestUtils.MergeColumnTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      int rowCount = 21;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+
+      // Commit fragment
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
+      Transaction transaction;
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        assertEquals(2, dataset.version());
+        assertEquals(2, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+        Fragment fragment = dataset.getFragments().get(0);
+
+        try (LanceScanner scanner = fragment.newScan()) {
+          Schema schemaRes = scanner.schema();
+          assertEquals(testDataset.getSchema(), schemaRes);
+        }
+
+        FragmentMergeResult mergeResult = testDataset.mergeColumn(fragment, 10);
+
+        Transaction.Builder builder = new Transaction.Builder(dataset);
+        transaction =
+            builder
+                .operation(
+                    Merge.builder()
+                        .fragments(Collections.singletonList(mergeResult.getFragmentMetadata()))
+                        .schema(mergeResult.getSchema().asArrowSchema())
+                        .build())
+                .readVersion(dataset.version())
+                .build();
+
+        assertNotNull(transaction);
+
+        try (Dataset newDs = transaction.commit()) {
+          assertEquals(3, newDs.version());
+          assertEquals(3, newDs.latestVersion());
+          Fragment newFrag = newDs.getFragments().get(0);
+          try (LanceScanner scanner = newFrag.newScan()) {
+            Schema schemaRes = scanner.schema();
+            assertTrue(
+                schemaRes.getFields().stream()
+                    .anyMatch(field -> field.getName().equals("new_col1")));
+            assertTrue(
+                schemaRes.getFields().stream()
+                    .anyMatch(field -> field.getName().equals("new_col2")));
+
+            try (ArrowReader reader = scanner.scanBatches()) {
+              assertTrue(reader.loadNextBatch());
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              VarCharVector newCol1Vec = (VarCharVector) root.getVector("new_col1");
+              VarCharVector newCol2Vec = (VarCharVector) root.getVector("new_col2");
+              assertEquals(21, newCol2Vec.getValueCount());
+
+              // The first 10 rows are not null
+              assertNotNull(newCol1Vec.get(9));
+              // Remaining rows are null
+              assertNull(newCol1Vec.get(10));
+            }
+          }
+        }
+      }
+    }
   }
 }

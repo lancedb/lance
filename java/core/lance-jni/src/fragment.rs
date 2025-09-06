@@ -11,6 +11,7 @@ use jni::{
     sys::{jint, jlong},
     JNIEnv,
 };
+use lance::datatypes::Schema;
 use lance::table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use lance_io::utils::CachedFileSize;
 use std::iter::once;
@@ -26,6 +27,12 @@ use crate::{
     utils::extract_write_params,
     JNIEnvExt, RT,
 };
+
+#[derive(Debug, Clone)]
+pub(crate) struct FragmentMergeResult {
+    fragment: Fragment,
+    schema: Schema,
+}
 
 //////////////////
 // Read Methods //
@@ -266,6 +273,70 @@ fn inner_delete_rows<'local>(
     Ok(obj)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Fragment_nativeMergeColumns<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,              // Java DataSet
+    fragment_id: jlong,             // FragmentID
+    arrow_array_stream_addr: jlong, // memoryAddress of ArrowStream
+    left_on: JString,               // left column name to join on
+    right_on: JString,              // right column name to join on
+) -> JObject<'a> {
+    ok_or_throw_with_return!(
+        env,
+        inner_merge_column(
+            &mut env,
+            jdataset,
+            fragment_id,
+            arrow_array_stream_addr,
+            left_on,
+            right_on
+        ),
+        JObject::null()
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_merge_column<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jlong,
+    arrow_array_stream_addr: jlong,
+    left_on: JString,
+    right_on: JString,
+) -> Result<JObject<'local>> {
+    let (fragment_opt, max_field_id) = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        (
+            dataset.inner.get_fragment(fragment_id as usize),
+            dataset.inner.manifest().max_field_id(),
+        )
+    };
+    let mut fragment = match fragment_opt {
+        Some(fragment) => fragment,
+        None => {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )))
+        }
+    };
+
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let left_on_str: String = left_on.extract(env)?;
+    let right_on_str: String = right_on.extract(env)?;
+
+    let (new_frag, new_schema) =
+        RT.block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
+    let result = FragmentMergeResult {
+        fragment: new_frag,
+        schema: new_schema,
+    };
+    result.into_java(env)
+}
+
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
     "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
@@ -277,6 +348,24 @@ const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFile;Lcom/lancedb/lance/fragment/RowIdMeta;)V";
 const ROW_ID_META_CLASS: &str = "com/lancedb/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
+const FRAGMENT_MERGE_RESULT_CLASS: &str = "com/lancedb/lance/fragment/FragmentMergeResult";
+const FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
+    "(Lcom/lancedb/lance/FragmentMetadata;Lcom/lancedb/lance/schema/LanceSchema;)V";
+
+impl IntoJava for &FragmentMergeResult {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let java_fragment_meta_data = self.fragment.into_java(env)?;
+        let java_lance_schema = self.schema.clone().into_java(env)?;
+        Ok(env.new_object(
+            FRAGMENT_MERGE_RESULT_CLASS,
+            FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG,
+            &[
+                JValueGen::Object(&java_fragment_meta_data),
+                JValueGen::Object(&java_lance_schema),
+            ],
+        )?)
+    }
+}
 
 impl IntoJava for &DataFile {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
