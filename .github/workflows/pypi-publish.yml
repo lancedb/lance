@@ -182,7 +182,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: pylance-win_amd64
+          name: pylance-debug-win_amd64
           path: python/target/wheels/*.whl
           retention-days: 90
       - uses: ./.github/workflows/upload_wheel
