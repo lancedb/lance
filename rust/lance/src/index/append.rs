@@ -58,17 +58,6 @@ pub async fn merge_indices<'a>(
 
 /// Merge in-inflight unindexed data with a known list of unindexed fragments,
 /// with a specific number of previous indices into a new index.
-///
-/// This is a helper function that allows callers to provide the unindexed fragments
-/// directly when they're already known (e.g., right after a commit).
-///
-/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
-///
-/// Returns
-/// -------
-/// - the UUID of the new index
-/// - merged indices,
-/// - Bitmap of the fragments that covered in the newly created index.
 pub async fn merge_indices_with_unindexed_frags<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
@@ -228,7 +217,9 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt32Type;
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
+    use arrow_array::{
+        FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
@@ -552,12 +543,13 @@ mod tests {
         .unwrap();
 
         // Execute merge insert operation
-        let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll)
-            .try_build()
-            .unwrap();
+        let merge_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
 
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
@@ -565,7 +557,7 @@ mod tests {
 
         // Check merge stats
         assert_eq!(merge_stats.num_updated_rows, 500); // Updates for rows 500-999
-        assert_eq!(merge_stats.num_inserted_rows, 0);  // No new inserts in this case
+        assert_eq!(merge_stats.num_inserted_rows, 0); // No new inserts in this case
 
         // Get the newly added fragments from the transaction
         // In a real scenario, you'd get this from the transaction itself
@@ -577,7 +569,7 @@ mod tests {
             .unwrap()
             .iter()
             .collect();
-        
+
         let unindexed_fragments: Vec<Fragment> = all_fragments
             .into_iter()
             .filter(|f| !indexed_fragment_ids.contains(&(f.id() as u32)))
@@ -585,7 +577,10 @@ mod tests {
             .collect();
 
         // Now use the new helper function with known unindexed fragments
-        let old_indices = updated_dataset.load_indices_by_name(&index_name).await.unwrap();
+        let old_indices = updated_dataset
+            .load_indices_by_name(&index_name)
+            .await
+            .unwrap();
         let old_indices_refs: Vec<&IndexMetadata> = old_indices.iter().collect();
 
         let merge_result = merge_indices_with_unindexed_frags(
@@ -602,7 +597,7 @@ mod tests {
 
         // Verify that the new index covers all fragments
         let new_fragment_bitmap = &merge_result.new_fragment_bitmap;
-        
+
         // Check that unindexed fragments are now included
         for fragment in &unindexed_fragments {
             assert!(new_fragment_bitmap.contains(fragment.id as u32));
@@ -616,7 +611,7 @@ mod tests {
         // Verify the index can be used for search
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        
+
         // There should still be indices (old one might be kept plus new one)
         assert!(!indices.is_empty());
 
