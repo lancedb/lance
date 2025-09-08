@@ -536,7 +536,6 @@ pub struct BloomFilterIndexBuilder {
     // The local offset within the current blocks
     cur_block_offset: usize,
     cur_fragment_id: u64,
-    // Track whether the current block has null values
     cur_block_has_null: bool,
     sbbf: Option<Sbbf>,
 }
@@ -628,7 +627,6 @@ impl BloomFilterIndexBuilder {
 
     fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
         if let Some(ref mut sbbf) = self.sbbf {
-            // TODO: is there a more efficient way to do this?
             let has_null = match array.data_type() {
                 DataType::Int32 => {
                     let typed_array = array
@@ -1077,18 +1075,18 @@ mod tests {
         ));
 
         let data = arrow_array::Int32Array::from(Vec::<i32>::new());
-        let row_ids = arrow_array::UInt64Array::from(Vec::<u64>::new());
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Int32,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
 
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(data_stream, test_store.as_ref(), None)
             .await
@@ -1120,17 +1118,17 @@ mod tests {
         ));
 
         let data = arrow_array::Int32Array::from_iter_values(0..100);
-        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Int32,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1189,29 +1187,22 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Int64, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Int64,
+            false,
+        )]));
 
         // Create multiple fragments with data
         // Fragment 0: values 0-99
         let fragment0_data = arrow_array::Int64Array::from_iter_values(0..100);
-        let fragment0_row_ids = UInt64Array::from_iter_values(0..100);
-        let fragment0_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(fragment0_data), Arc::new(fragment0_row_ids)],
-        )
-        .unwrap();
+        let fragment0_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(fragment0_data)]).unwrap();
 
         // Fragment 1: values 100-199
         let fragment1_data = arrow_array::Int64Array::from_iter_values(100..200);
-        let fragment1_row_ids = UInt64Array::from_iter_values((0..100).map(|i| i + (1 << 32)));
-        let fragment1_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],
-        )
-        .unwrap();
+        let fragment1_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(fragment1_data)]).unwrap();
 
         // Create a stream with multiple batches (fragments)
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -1221,6 +1212,7 @@ mod tests {
                 Ok(fragment1_batch.clone()),
             ]),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1294,20 +1286,18 @@ mod tests {
         }
 
         let float_data = arrow_array::Float32Array::from(values);
-        let row_ids = UInt64Array::from_iter_values((0..float_data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Float32, true),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(float_data.clone()), Arc::new(row_ids)],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Float32,
+            true,
+        )]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(float_data.clone())]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1385,17 +1375,17 @@ mod tests {
         // Create data that will produce multiple blocks
         let data_size = 10000;
         let data = arrow_array::Int64Array::from_iter_values(0..data_size as i64);
-        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Int64, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1474,20 +1464,17 @@ mod tests {
         // Create string data
         let string_values: Vec<String> = (0..200).map(|i| format!("value_{:03}", i)).collect();
         let string_data = arrow_array::StringArray::from_iter_values(string_values.iter());
-        let row_ids = UInt64Array::from_iter_values((0..string_data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(string_data), Arc::new(row_ids)],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Utf8,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(string_data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1558,20 +1545,17 @@ mod tests {
             .map(|i| vec![i as u8, (i + 1) as u8, (i + 2) as u8])
             .collect();
         let binary_data = arrow_array::BinaryArray::from_iter_values(binary_values.iter());
-        let row_ids = UInt64Array::from_iter_values((0..binary_data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Binary, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(binary_data), Arc::new(row_ids)],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Binary,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(binary_data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1629,20 +1613,17 @@ mod tests {
             (0..100).map(|i| format!("large_value_{:05}", i)).collect();
         let large_string_data =
             arrow_array::LargeStringArray::from_iter_values(large_string_values.iter());
-        let row_ids = UInt64Array::from_iter_values((0..large_string_data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::LargeUtf8, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(large_string_data), Arc::new(row_ids)],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(large_string_data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1690,17 +1671,17 @@ mod tests {
         ));
 
         let data = arrow_array::Int32Array::from_iter_values(0..1000);
-        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ADDR, DataType::UInt64, false),
-        ]));
-        let data =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Int32,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
         let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::once(std::future::ready(Ok(data))),
         ));
+        let data_stream = add_row_addr(data_stream);
 
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
@@ -1717,40 +1698,40 @@ mod tests {
 
         assert_eq!(index.blocks.len(), 4);
 
-        // Test range query - bloom filters are conservative for ranges, should return all blocks
+        // Test range query - bloom filters should return NotSupported error for range queries
         let query = SargableQuery::Range(
             Bound::Included(ScalarValue::Int32(Some(100))),
             Bound::Included(ScalarValue::Int32(Some(300))),
         );
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let result = index.search(&query, &NoOpMetricsCollector).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            lance_core::Error::NotSupported { .. }
+        ));
 
-        // Bloom filters are conservative for range queries - should include all blocks
-        let mut expected = RowIdTreeMap::new();
-        expected.insert_range(0..1000);
-        assert_eq!(result, SearchResult::AtMost(expected));
-
-        // Test range query with unbounded start
+        // Test range query with unbounded start - should also return NotSupported
         let query = SargableQuery::Range(
             Bound::Unbounded,
             Bound::Included(ScalarValue::Int32(Some(300))),
         );
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let result = index.search(&query, &NoOpMetricsCollector).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            lance_core::Error::NotSupported { .. }
+        ));
 
-        // Should include all blocks (conservative)
-        let mut expected = RowIdTreeMap::new();
-        expected.insert_range(0..1000);
-        assert_eq!(result, SearchResult::AtMost(expected));
-
-        // Test range query with unbounded end
+        // Test range query with unbounded end - should also return NotSupported
         let query = SargableQuery::Range(
             Bound::Included(ScalarValue::Int32(Some(500))),
             Bound::Unbounded,
         );
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-
-        // Should include all blocks (conservative)
-        let mut expected = RowIdTreeMap::new();
-        expected.insert_range(0..1000);
-        assert_eq!(result, SearchResult::AtMost(expected));
+        let result = index.search(&query, &NoOpMetricsCollector).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            lance_core::Error::NotSupported { .. }
+        ));
     }
 }
