@@ -1208,23 +1208,24 @@ pub async fn build_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<IvfModel> {
+    let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
     if centroids.is_some() && !params.retrain {
         let centroids = centroids.unwrap();
         info!("Pre-computed IVF centroids is provided, skip IVF training");
-        if centroids.values().len() != params.num_partitions * dim {
+        if centroids.values().len() != num_partitions * dim {
             return Err(Error::Index {
                 message: format!(
                     "IVF centroids length mismatch: {} != {}",
                     centroids.len(),
-                    params.num_partitions * dim,
+                    num_partitions * dim,
                 ),
                 location: location!(),
             });
         }
         return Ok(IvfModel::new(centroids.as_ref().clone(), None));
     }
-    let sample_size_hint = params.num_partitions * params.sample_rate;
+    let sample_size_hint = num_partitions * params.sample_rate;
 
     let start = std::time::Instant::now();
     info!(
@@ -1269,9 +1270,13 @@ async fn build_ivf_model_and_pq(
 ) -> Result<(IvfModel, ProductQuantizer)> {
     sanity_check_params(ivf_params, pq_params)?;
 
+    // `num_partitions` should be set before building the IVF model,
+    // we use 32 as the default to avoid panicking, 32 is the default value
+    // before we make `num_partitions` optional.
+    let num_partitions = ivf_params.num_partitions.unwrap_or(32);
     info!(
         "Building vector index: IVF{},PQ{}, metric={}",
-        ivf_params.num_partitions, pq_params.num_sub_vectors, metric_type,
+        num_partitions, pq_params.num_sub_vectors, metric_type,
     );
 
     // sanity check

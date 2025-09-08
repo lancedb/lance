@@ -3330,7 +3330,7 @@ mod tests {
                     stages: vec![
                         StageParams::Ivf(IvfBuildParams {
                             max_iters: 2,
-                            num_partitions: 2,
+                            num_partitions: Some(2),
                             sample_rate: 2,
                             ..Default::default()
                         }),

@@ -67,7 +67,7 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import td_to_micros
+from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -1889,6 +1889,8 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         replace: bool = True,
         train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        fragment_uuid: Optional[str] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1973,6 +1975,17 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data to determine optimal
             structure. If False, an empty index will be created that can be
             populated later.
+        fragment_ids : List[int], optional
+            If provided, the index will be created only on the specified fragments.
+            This enables distributed/fragment-level indexing. When provided, the
+            method returns an IndexMetadata object but does not commit the index
+            to the dataset. The index can be committed later using the commit API.
+            This parameter is passed via kwargs internally.
+        fragment_uuid : str, optional
+            A UUID to use for fragment-level distributed indexing
+            multiple fragment-level indices need to share UUID for later merging.
+            If not provided, a new UUID will be generated. This parameter is passed via
+            kwargs internally.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2121,6 +2134,12 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
+        # Add fragment_ids and fragment_uuid to kwargs if provided
+        if fragment_ids is not None:
+            kwargs["fragment_ids"] = fragment_ids
+        if fragment_uuid is not None:
+            kwargs["fragment_uuid"] = fragment_uuid
+
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def create_index(
@@ -2149,6 +2168,8 @@ class LanceDataset(pa.dataset.Dataset):
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
         train: bool = True,
+        *,
+        target_partition_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -2172,6 +2193,7 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
+            Deprecated. Use target_partition_size instead.
         ivf_centroids : optional
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
@@ -2219,6 +2241,10 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        target_partition_size: int, optional
+            The target partition size. If set, the number of partitions will be computed
+            based on the target partition size.
+            Otherwise, the target partition size will be set by index type.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2391,7 +2417,11 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
             LOGGER.info("Doing one-pass ivfpq accelerated computations")
-
+            if num_partitions is None:
+                num_rows = self.count_rows()
+                num_partitions = _target_partition_size_to_num_partitions(
+                    num_rows, target_partition_size
+                )
             timers["ivf+pq_train:start"] = time.time()
             (
                 ivf_centroids,
@@ -2447,18 +2477,17 @@ class LanceDataset(pa.dataset.Dataset):
                     ivf_centroids = np.load(f)
                 num_partitions = ivf_centroids.shape[0]
 
-            if num_partitions is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
                 num_partitions = int(num_partitions)
-            elif not isinstance(num_partitions, int):
+            elif num_partitions is not None and not isinstance(num_partitions, int):
                 raise TypeError(
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
-            kwargs["num_partitions"] = num_partitions
+            if num_partitions is not None:
+                kwargs["num_partitions"] = num_partitions
+            if target_partition_size is not None:
+                kwargs["target_partition_size"] = target_partition_size
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -2499,6 +2528,11 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
                 timers["ivf_train:start"] = time.time()
+                if num_partitions is None:
+                    num_rows = self.count_rows()
+                    num_partitions = _target_partition_size_to_num_partitions(
+                        num_rows, target_partition_size
+                    )
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
@@ -2696,6 +2730,9 @@ class LanceDataset(pa.dataset.Dataset):
             The name of the index to prewarm.
         """
         return self._ds.prewarm_index(name)
+
+    def merge_index_metadata(self, index_uuid: str):
+        return self._ds.merge_index_metadata(index_uuid)
 
     def session(self) -> Session:
         """
