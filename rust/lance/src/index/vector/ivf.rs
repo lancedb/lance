@@ -1772,7 +1772,7 @@ where
         data,
         kmeans_params,
         dimension,
-        params.num_partitions,
+        params.num_partitions.unwrap_or(32),
         params.sample_rate,
     )?;
     Ok(IvfModel::new(
