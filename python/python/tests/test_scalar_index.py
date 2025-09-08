@@ -1468,6 +1468,40 @@ def test_zonemap_index(tmp_path: Path):
     assert result.num_rows == 8142  # 51..8192
 
 
+def test_bloomfilter_index(tmp_path: Path):
+    """Test create bloomfilter index"""
+    tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("values", index_type="BLOOMFILTER")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "BloomFilter"
+
+    # Get detailed index statistics
+    index_stats = dataset.stats.index_stats("values_idx")
+    assert index_stats["index_type"] == "BloomFilter"
+    assert "indices" in index_stats
+    assert len(index_stats["indices"]) == 1
+
+    # Verify bloomfilter statistics
+    bloom_stats = index_stats["indices"][0]
+    assert bloom_stats["type"] == "BloomFilter"
+    assert "num_blocks" in bloom_stats
+    assert bloom_stats["num_blocks"] == 2
+    assert bloom_stats["number_of_items"] == 8192
+    assert bloom_stats["number_of_bytes"] == 16384
+
+    # Test that the bloomfilter index is being used in the query plan
+    scanner = dataset.scanner(filter="values == 1234", prefilter=True)
+    plan = scanner.explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+    # Verify the query returns correct results
+    result = scanner.to_table()
+    assert result.num_rows == 1
+    assert result["values"][0].as_py() == 1234
+
+
 def test_zonemap_index_remapping(tmp_path: Path):
     """Test zonemap index remapping after compaction and optimization"""
     # Create a dataset with 5 fragments by writing data in chunks

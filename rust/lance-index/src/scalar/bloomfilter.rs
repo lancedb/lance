@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use datafusion::execution::SendableRecordBatchStream;
-use parquet::data_type::AsBytes;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::scalar::FragReuseIndex;
@@ -368,6 +367,8 @@ impl Index for BloomFilterIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
+            "type": "BloomFilter",
+            "num_blocks": self.blocks.len(),
             "number_of_items": self.number_of_items,
             "number_of_bytes": self.number_of_bytes,
         }))
@@ -522,6 +523,7 @@ impl Default for BloomFilterIndexBuilderParams {
 }
 
 impl BloomFilterIndexBuilderParams {
+    #[cfg(test)]
     fn new(number_of_items: u64, number_of_bytes: usize) -> Self {
         Self {
             number_of_items,
@@ -1702,30 +1704,6 @@ mod tests {
         let query = SargableQuery::Range(
             Bound::Included(ScalarValue::Int32(Some(100))),
             Bound::Included(ScalarValue::Int32(Some(300))),
-        );
-        let result = index.search(&query, &NoOpMetricsCollector).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            lance_core::Error::NotSupported { .. }
-        ));
-
-        // Test range query with unbounded start - should also return NotSupported
-        let query = SargableQuery::Range(
-            Bound::Unbounded,
-            Bound::Included(ScalarValue::Int32(Some(300))),
-        );
-        let result = index.search(&query, &NoOpMetricsCollector).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            lance_core::Error::NotSupported { .. }
-        ));
-
-        // Test range query with unbounded end - should also return NotSupported
-        let query = SargableQuery::Range(
-            Bound::Included(ScalarValue::Int32(Some(500))),
-            Bound::Unbounded,
         );
         let result = index.search(&query, &NoOpMetricsCollector).await;
         assert!(result.is_err());

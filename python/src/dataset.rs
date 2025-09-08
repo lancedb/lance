@@ -1525,6 +1525,10 @@ impl Dataset {
                 index_type: "label_list".to_string(),
                 params: None,
             }),
+            "BLOOMFILTER" => Box::new(ScalarIndexParams {
+                index_type: "bloomfilter".to_string(),
+                params: None,
+            }),
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
                     return Err(PyValueError::new_err(

@@ -242,6 +242,7 @@ impl IndexType {
             Self::FragmentReuse => 0,
             Self::MemWal => 0,
             Self::ZoneMap => 0,
+            Self::BloomFilter => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.
