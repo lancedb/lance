@@ -409,11 +409,11 @@ impl LanceFileSession {
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
-        let (object_store, path) =
+        let (object_store, base_path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
         Ok(Self {
-            object_store: object_store,
-            base_path: path,
+            object_store,
+            base_path,
         })
     }
 }
