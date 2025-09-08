@@ -125,12 +125,39 @@ pub fn init_logging(mut log_builder: Builder) {
     log::set_max_level(max_level);
 }
 
+fn set_timestamp_precision(builder: &mut env_logger::Builder) {
+    if let Ok(timestamp_precision) = env::var("LANCE_LOG_TS_PRECISION") {
+        match timestamp_precision.as_str() {
+            "ns" => {
+                builder.format_timestamp_nanos();
+            }
+            "us" => {
+                builder.format_timestamp_micros();
+            }
+            "ms" => {
+                builder.format_timestamp_millis();
+            }
+            "s" => {
+                builder.format_timestamp_secs();
+            }
+            _ => {
+                // Can't log here because logging is not initialized yet
+                println!(
+                    "Invalid timestamp precision (valid values: ns, us, ms, s): {}, using default",
+                    timestamp_precision
+                );
+            }
+        };
+    }
+}
+
 #[pymodule]
 fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
-    let log_builder = env_logger::Builder::from_env(env);
+    let mut log_builder = env_logger::Builder::from_env(env);
+    set_timestamp_precision(&mut log_builder);
     init_logging(log_builder);
 
     m.add_class::<FFILanceTableProvider>()?;
