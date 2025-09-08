@@ -516,13 +516,7 @@ mod tests {
             .unwrap();
 
         // Record the maximum fragment ID before merge insert
-        let max_fragment_id_before = dataset
-            .get_fragments()
-            .into_iter()
-            .map(|f| f.id())
-            .max()
-            .unwrap_or(0);
-        dataset.manifest
+        let max_fragment_id_before = dataset.manifest.max_fragment_id().unwrap_or(0);
 
         // Execute merge insert operation
         let merge_job =
@@ -546,7 +540,7 @@ mod tests {
         let unindexed_fragments: Vec<Fragment> = updated_dataset
             .get_fragments()
             .into_iter()
-            .filter(|f| f.id() > max_fragment_id_before)
+            .filter(|f| f.id() as u64 > max_fragment_id_before)
             .map(|f| f.metadata().clone())
             .collect();
 
