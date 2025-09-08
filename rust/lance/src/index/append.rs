@@ -542,6 +542,14 @@ mod tests {
         )
         .unwrap();
 
+        // Record the maximum fragment ID before merge insert
+        let max_fragment_id_before = dataset
+            .get_fragments()
+            .into_iter()
+            .map(|f| f.id())
+            .max()
+            .unwrap_or(0);
+
         // Execute merge insert operation
         let merge_job =
             MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
@@ -559,20 +567,11 @@ mod tests {
         assert_eq!(merge_stats.num_updated_rows, 500); // Updates for rows 500-999
         assert_eq!(merge_stats.num_inserted_rows, 0); // No new inserts in this case
 
-        // Get the newly added fragments from the transaction
-        // In a real scenario, you'd get this from the transaction itself
-        // For this test, we'll identify unindexed fragments
-        let all_fragments = updated_dataset.get_fragments();
-        let indexed_fragment_ids: Vec<u32> = initial_indices[0]
-            .fragment_bitmap
-            .as_ref()
-            .unwrap()
-            .iter()
-            .collect();
-
-        let unindexed_fragments: Vec<Fragment> = all_fragments
+        // Get the newly added fragments by comparing fragment IDs
+        let unindexed_fragments: Vec<Fragment> = updated_dataset
+            .get_fragments()
             .into_iter()
-            .filter(|f| !indexed_fragment_ids.contains(&(f.id() as u32)))
+            .filter(|f| f.id() > max_fragment_id_before)
             .map(|f| f.metadata().clone())
             .collect();
 
@@ -604,7 +603,8 @@ mod tests {
         }
 
         // Check that old indexed fragments are still included
-        for frag_id in indexed_fragment_ids {
+        // All fragments with ID <= max_fragment_id_before should be included
+        for frag_id in 0..=max_fragment_id_before as u32 {
             assert!(new_fragment_bitmap.contains(frag_id));
         }
 
