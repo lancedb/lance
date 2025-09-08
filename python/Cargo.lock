@@ -4123,7 +4123,6 @@ dependencies = [
  "log",
  "num-traits",
  "object_store",
- "parquet",
  "prost 0.13.5",
  "prost-build 0.13.5",
  "prost-types 0.13.5",

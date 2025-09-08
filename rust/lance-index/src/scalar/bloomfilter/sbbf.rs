@@ -28,7 +28,7 @@
 //! removed from Lance.
 //! https://github.com/apache/arrow-rs/issues/8277
 
-use parquet::data_type::AsBytes;
+use crate::scalar::bloomfilter::as_bytes::AsBytes;
 use std::error::Error;
 use std::fmt;
 use std::io::Write;

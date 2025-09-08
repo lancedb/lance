@@ -18,6 +18,7 @@ use arrow_array::{Array, UInt64Array};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
+mod as_bytes;
 mod sbbf;
 use arrow_schema::{DataType, Field};
 use futures::TryStreamExt;
@@ -566,7 +567,7 @@ impl BloomFilterIndexBuilder {
     fn process_primitive_array<T>(sbbf: &mut Sbbf, array: &arrow_array::PrimitiveArray<T>) -> bool
     where
         T: arrow_array::ArrowPrimitiveType,
-        T::Native: parquet::data_type::AsBytes,
+        T::Native: as_bytes::AsBytes,
     {
         let mut has_null = false;
         for i in 0..array.len() {
