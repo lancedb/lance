@@ -54,6 +54,8 @@ struct BloomFilterStatistics {
     // as local row offset
     block_start: u64,
     block_size: usize,
+    // Whether this block contains any null values
+    has_null: bool,
     // Serialized bloom filter data (SBBF bytes)
     bloom_filter_data: Vec<u8>,
 }
@@ -206,6 +208,20 @@ impl BloomFilterIndex {
                 )
             })?;
 
+        let has_null_col = data
+            .column_by_name("has_null")
+            .ok_or_else(|| {
+                Error::invalid_input("BloomFilterIndex: missing 'has_null' column", location!())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "BloomFilterIndex: 'has_null' column is not Boolean",
+                    location!(),
+                )
+            })?;
+
         let num_blocks = data.num_rows();
         let mut blocks = Vec::with_capacity(num_blocks);
 
@@ -220,6 +236,7 @@ impl BloomFilterIndex {
                 fragment_id: fragment_id_col.value(i),
                 block_start: block_start_col.value(i),
                 block_size: block_size_col.value(i) as usize,
+                has_null: has_null_col.value(i),
                 bloom_filter_data,
             });
         }
@@ -250,14 +267,13 @@ impl BloomFilterIndex {
 
         match query {
             SargableQuery::IsNull() => {
-                // For null values, we could use a special marker in the bloom filter
-                // For now, conservatively assume blocks might contain nulls
-                Ok(true)
+                // Use the has_null information to determine if this block contains nulls
+                Ok(block.has_null)
             }
             SargableQuery::Equals(target) => {
                 if target.is_null() {
-                    // Handle null values - conservatively return true for now
-                    return Ok(true);
+                    // Handle null values using has_null information
+                    return Ok(block.has_null);
                 }
 
                 // Check the bloom filter for the target value
@@ -282,17 +298,19 @@ impl BloomFilterIndex {
                     }
                 }
             }
-            SargableQuery::Range(_, _) => {
-                // Bloom filters are not great for range queries
-                // but we can conservatively return true
-                Ok(true)
-            }
+            SargableQuery::Range(_, _) => Err(Error::NotSupported {
+                source: "range queries are not supported for bloom filter indexes".into(),
+                location: location!(),
+            }),
             SargableQuery::IsIn(values) => {
                 // Check if any value in the set is in the bloom filter
                 for value in values {
                     if value.is_null() {
-                        // Handle null values - conservatively assume they might exist
-                        return Ok(true);
+                        // Handle null values using has_null information
+                        if block.has_null {
+                            return Ok(true);
+                        }
+                        continue;
                     }
 
                     let found = match value {
@@ -385,9 +403,6 @@ impl ScalarIndex for BloomFilterIndex {
 
         // For each block, check if it might contain the queried value
         for block in self.blocks.iter() {
-            // In a real bloom filter implementation, this would check the actual bloom filter
-            // For now, we conservatively assume all blocks might contain the value
-            // This is safe but not optimal - it means we never have false negatives
             if self.evaluate_block_against_query(block, query)? {
                 // Calculate the range of row addresses for this block
                 // Row addresses are: (fragment_id << 32) + block_start
@@ -406,7 +421,6 @@ impl ScalarIndex for BloomFilterIndex {
         false
     }
 
-    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
         _mapping: &HashMap<u64, Option<u64>>,
@@ -418,7 +432,6 @@ impl ScalarIndex for BloomFilterIndex {
         })
     }
 
-    /// Add the new data , creating an updated version of the index in `dest_store`
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
@@ -523,6 +536,8 @@ pub struct BloomFilterIndexBuilder {
     // The local offset within the current blocks
     cur_block_offset: usize,
     cur_fragment_id: u64,
+    // Track whether the current block has null values
+    cur_block_has_null: bool,
     sbbf: Option<Sbbf>,
 }
 
@@ -542,113 +557,134 @@ impl BloomFilterIndexBuilder {
             blocks: Vec::new(),
             cur_block_offset: 0,
             cur_fragment_id: 0,
+            cur_block_has_null: false,
             sbbf: Some(sbbf),
         })
     }
 
-    fn process_primitive_array<T>(sbbf: &mut Sbbf, array: &arrow_array::PrimitiveArray<T>)
+    fn process_primitive_array<T>(sbbf: &mut Sbbf, array: &arrow_array::PrimitiveArray<T>) -> bool
     where
         T: arrow_array::ArrowPrimitiveType,
         T::Native: parquet::data_type::AsBytes,
     {
+        let mut has_null = false;
         for i in 0..array.len() {
             if array.is_valid(i) {
                 sbbf.insert(&array.value(i));
+            } else {
+                has_null = true;
             }
         }
+        has_null
     }
 
-    fn process_string_array(sbbf: &mut Sbbf, array: &arrow_array::StringArray) {
+    fn process_string_array(sbbf: &mut Sbbf, array: &arrow_array::StringArray) -> bool {
+        let mut has_null = false;
         for i in 0..array.len() {
             if array.is_valid(i) {
                 sbbf.insert(array.value(i));
+            } else {
+                has_null = true;
             }
         }
+        has_null
     }
 
-    fn process_large_string_array(sbbf: &mut Sbbf, array: &arrow_array::LargeStringArray) {
+    fn process_large_string_array(sbbf: &mut Sbbf, array: &arrow_array::LargeStringArray) -> bool {
+        let mut has_null = false;
         for i in 0..array.len() {
             if array.is_valid(i) {
                 sbbf.insert(array.value(i));
+            } else {
+                has_null = true;
             }
         }
+        has_null
     }
 
-    fn process_binary_array(sbbf: &mut Sbbf, array: &arrow_array::BinaryArray) {
+    fn process_binary_array(sbbf: &mut Sbbf, array: &arrow_array::BinaryArray) -> bool {
+        let mut has_null = false;
         for i in 0..array.len() {
             if array.is_valid(i) {
                 sbbf.insert(array.value(i));
+            } else {
+                has_null = true;
             }
         }
+        has_null
     }
 
-    fn process_large_binary_array(sbbf: &mut Sbbf, array: &arrow_array::LargeBinaryArray) {
+    fn process_large_binary_array(sbbf: &mut Sbbf, array: &arrow_array::LargeBinaryArray) -> bool {
+        let mut has_null = false;
         for i in 0..array.len() {
             if array.is_valid(i) {
                 sbbf.insert(array.value(i));
+            } else {
+                has_null = true;
             }
         }
+        has_null
     }
 
     fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
         if let Some(ref mut sbbf) = self.sbbf {
             // TODO: is there a more efficient way to do this?
-            match array.data_type() {
+            let has_null = match array.data_type() {
                 DataType::Int32 => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::Int32Array>()
                         .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array);
+                    Self::process_primitive_array(sbbf, typed_array)
                 }
                 DataType::Int64 => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::Int64Array>()
                         .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array);
+                    Self::process_primitive_array(sbbf, typed_array)
                 }
                 DataType::Float32 => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::Float32Array>()
                         .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array);
+                    Self::process_primitive_array(sbbf, typed_array)
                 }
                 DataType::Float64 => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::Float64Array>()
                         .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array);
+                    Self::process_primitive_array(sbbf, typed_array)
                 }
                 DataType::Utf8 => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
                         .unwrap();
-                    Self::process_string_array(sbbf, typed_array);
+                    Self::process_string_array(sbbf, typed_array)
                 }
                 DataType::LargeUtf8 => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::LargeStringArray>()
                         .unwrap();
-                    Self::process_large_string_array(sbbf, typed_array);
+                    Self::process_large_string_array(sbbf, typed_array)
                 }
                 DataType::Binary => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::BinaryArray>()
                         .unwrap();
-                    Self::process_binary_array(sbbf, typed_array);
+                    Self::process_binary_array(sbbf, typed_array)
                 }
                 DataType::LargeBinary => {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::LargeBinaryArray>()
                         .unwrap();
-                    Self::process_large_binary_array(sbbf, typed_array);
+                    Self::process_large_binary_array(sbbf, typed_array)
                 }
                 _ => {
                     return Err(Error::InvalidInput {
@@ -660,7 +696,10 @@ impl BloomFilterIndexBuilder {
                         location: location!(),
                     });
                 }
-            }
+            };
+
+            // Update the current block's null tracking
+            self.cur_block_has_null = self.cur_block_has_null || has_null;
         }
 
         Ok(())
@@ -686,11 +725,13 @@ impl BloomFilterIndexBuilder {
             fragment_id,
             block_start,
             block_size: self.cur_block_offset,
+            has_null: self.cur_block_has_null,
             bloom_filter_data,
         };
 
         self.blocks.push(new_block);
         self.cur_block_offset = 0;
+        self.cur_block_has_null = false;
 
         // Reset sbbf for the next block
         self.sbbf = Some(
@@ -796,6 +837,13 @@ impl BloomFilterIndexBuilder {
         let block_sizes =
             UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.block_size as u64));
 
+        let has_nulls = arrow_array::BooleanArray::from(
+            self.blocks
+                .iter()
+                .map(|block| block.has_null)
+                .collect::<Vec<bool>>(),
+        );
+
         // Store bloom filter data as binary array
         let bloom_filter_data = if self.blocks.is_empty() {
             Arc::new(arrow_array::BinaryArray::new_null(0)) as ArrayRef
@@ -812,6 +860,7 @@ impl BloomFilterIndexBuilder {
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("block_start", DataType::UInt64, false),
             Field::new("block_size", DataType::UInt64, false),
+            Field::new("has_null", DataType::Boolean, false),
             Field::new("bloom_filter_data", DataType::Binary, false),
         ]));
 
@@ -819,6 +868,7 @@ impl BloomFilterIndexBuilder {
             Arc::new(fragment_ids) as ArrayRef,
             Arc::new(block_starts) as ArrayRef,
             Arc::new(block_sizes) as ArrayRef,
+            Arc::new(has_nulls) as ArrayRef,
             bloom_filter_data,
         ];
 
