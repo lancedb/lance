@@ -53,7 +53,7 @@ pub async fn merge_indices<'a>(
     };
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
-    merge_indices_with_unindexed_frags(dataset, old_indices, unindexed, options).await
+    merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
 }
 
 /// Merge in-inflight unindexed data with a known list of unindexed fragments,
@@ -72,7 +72,7 @@ pub async fn merge_indices<'a>(
 pub async fn merge_indices_with_unindexed_frags<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
-    unindexed: Vec<Fragment>,
+    unindexed: &[Fragment],
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
@@ -138,7 +138,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let fragments = if update_criteria.requires_old_data {
                 None
             } else {
-                Some(unindexed.clone())
+                Some(unindexed.to_vec())
             };
             let new_data_stream = load_training_data(
                 dataset.as_ref(),
@@ -171,7 +171,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             } else {
                 let mut scanner = dataset.scan();
                 scanner
-                    .with_fragments(unindexed)
+                    .with_fragments(unindexed.to_vec())
                     .with_row_id()
                     .project(&[&column.name])?;
                 if column.nullable {
@@ -591,7 +591,7 @@ mod tests {
         let merge_result = merge_indices_with_unindexed_frags(
             updated_dataset.clone(),
             &old_indices_refs,
-            unindexed_fragments.clone(),
+            &unindexed_fragments,
             &OptimizeOptions::default(),
         )
         .await
