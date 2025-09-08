@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
     fmt::{Debug, Display},
     ops::Bound,
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use super::{
@@ -38,7 +38,7 @@ use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
     stream::{self},
-    Future, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
+    FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
     cache::{CacheKey, LanceCache},
@@ -58,7 +58,6 @@ use log::{debug, warn};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
-use tokio::runtime::{Builder, Runtime};
 use tracing::info;
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
@@ -66,25 +65,6 @@ const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
 
-/// Global thread pool for B-tree prefetch operations
-static BTREE_PREFETCH_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    Builder::new_multi_thread()
-        .worker_threads(get_num_compute_intensive_cpus())
-        .max_blocking_threads(get_num_compute_intensive_cpus())
-        .thread_name("lance-btree-prefetch")
-        .enable_time()
-        .build()
-        .expect("Failed to create B-tree prefetch runtime")
-});
-
-/// Spawn a prefetch task on the B-tree thread pool
-fn spawn_btree_prefetch<F>(future: F) -> tokio::task::JoinHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    BTREE_PREFETCH_RUNTIME.spawn(future)
-}
 const BTREE_INDEX_VERSION: u32 = 0;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
@@ -1543,8 +1523,8 @@ pub async fn merge_metadata_files(
         .await?;
 
     let mut prefetch_config = PrefetchConfig::default();
-    if prefetch_batch.is_some() {
-        prefetch_config = prefetch_config.with_prefetch_batch(prefetch_batch.unwrap());
+    if let Some(batch) = prefetch_batch {
+        prefetch_config = prefetch_config.with_prefetch_batch(batch);
     }
 
     let lookup_entries = merge_page(
@@ -1707,355 +1687,101 @@ struct BufferEntry {
     end_row: usize,
 }
 
-/// Running prefetch task information
-#[derive(Debug)]
-struct RunningPrefetchTask {
-    /// Task handle
-    handle: tokio::task::JoinHandle<()>,
-    /// Range being prefetched
-    range: std::ops::Range<usize>,
-}
-
-/// Check if two ranges overlap
-fn ranges_overlap(range1: &std::ops::Range<usize>, range2: &std::ops::Range<usize>) -> bool {
-    range1.start < range2.end && range2.start < range1.end
-}
-
-/// Prefetch state for a partition using task-based prefetching
-struct PartitionPrefetchState {
-    /// Queue of prefetched data
-    buffer: Arc<tokio::sync::Mutex<VecDeque<BufferEntry>>>,
-    /// Reader for this partition
-    reader: Arc<dyn IndexReader>,
-    /// Total rows in this partition
-    total_rows: usize,
-    /// Queue of running prefetch tasks with their ranges
-    running_tasks: Arc<tokio::sync::Mutex<VecDeque<RunningPrefetchTask>>>,
-    /// Next position to schedule for prefetch
-    next_prefetch_position: Arc<tokio::sync::Mutex<usize>>,
-}
-
-/// Manager for coordinating task-based prefetch across multiple partitions
-pub struct PrefetchManager {
-    /// Prefetch state per partition
-    partition_states: HashMap<u64, PartitionPrefetchState>,
-    /// Prefetch configuration
-    config: PrefetchConfig,
-}
-
-impl PrefetchManager {
-    /// Create a new prefetch manager
-    pub fn new(config: PrefetchConfig) -> Self {
-        Self {
-            partition_states: HashMap::new(),
-            config,
-        }
-    }
-
-    /// Initialize a partition for task-based prefetching
-    pub fn initialize_partition(&mut self, partition_id: u64, reader: Arc<dyn IndexReader>) {
-        let total_rows = reader.num_rows();
-        let buffer = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
-        let running_tasks = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
-        let next_prefetch_position = Arc::new(tokio::sync::Mutex::new(0));
-
-        let state = PartitionPrefetchState {
-            buffer,
-            reader,
-            total_rows,
-            running_tasks,
-            next_prefetch_position,
-        };
-
-        self.partition_states.insert(partition_id, state);
-        debug!(
-            "Initialized partition {} for task-based prefetching",
-            partition_id
-        );
-    }
-
-    /// Submit a prefetch task for a partition to the thread pool
-    pub async fn submit_prefetch_task(&self, partition_id: u64, batch_size: usize) -> Result<()> {
-        if self.config.prefetch_batches == 0 {
-            return Ok(());
-        }
-
-        let Some(state) = self.partition_states.get(&partition_id) else {
-            return Ok(());
-        };
-
-        let reader = state.reader.clone();
-        let buffer = state.buffer.clone();
-        let running_tasks = state.running_tasks.clone();
-        let next_prefetch_position = state.next_prefetch_position.clone();
-        let total_rows = state.total_rows;
-        let effective_batch_size = self.config.prefetch_batches * batch_size;
-
-        const MAX_BUFFER_SIZE: usize = 4;
-        const MAX_RUNNING_TASKS: usize = 2;
-
-        // Clean up completed tasks and check limits
-        {
-            let mut tasks_guard = running_tasks.lock().await;
-
-            // Remove completed tasks from the front
-            while let Some(task) = tasks_guard.front() {
-                if task.handle.is_finished() {
-                    tasks_guard.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            // Check if we have too many running tasks
-            if tasks_guard.len() >= MAX_RUNNING_TASKS {
-                debug!(
-                    "Skipping prefetch for partition {} - too many running tasks ({})",
-                    partition_id,
-                    tasks_guard.len()
-                );
-                return Ok(());
-            }
-
-            // Check if any running task already covers to the end of file
-            for task in tasks_guard.iter() {
-                if task.range.end >= total_rows {
-                    debug!(
-                        "Skipping prefetch for partition {} - task already covers to EOF (range {}..{})",
-                        partition_id, task.range.start, task.range.end
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        // Check if buffer is full
-        {
-            let buffer_guard = buffer.lock().await;
-            if buffer_guard.len() >= MAX_BUFFER_SIZE {
-                debug!(
-                    "Skipping prefetch for partition {} - buffer full",
-                    partition_id
-                );
-                return Ok(());
-            }
-        }
-
-        // Determine the next range to prefetch
-        let next_range = {
-            let mut pos_guard = next_prefetch_position.lock().await;
-            let start_pos = *pos_guard;
-
-            if start_pos >= total_rows {
-                debug!(
-                    "Skipping prefetch for partition {} - no more data to prefetch",
-                    partition_id
-                );
-                return Ok(());
-            }
-
-            let end_pos = std::cmp::min(start_pos + effective_batch_size, total_rows);
-            *pos_guard = end_pos; // Update next prefetch position
-            start_pos..end_pos
-        };
-
-        // Check if this range is already being prefetched
-        {
-            let tasks_guard = running_tasks.lock().await;
-
-            // Check for range overlap
-            for task in tasks_guard.iter() {
-                if ranges_overlap(&task.range, &next_range) {
-                    debug!(
-                        "Skipping prefetch for partition {} - range {}..{} overlaps with running task {}..{}",
-                        partition_id, next_range.start, next_range.end, task.range.start, task.range.end
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        // All checks passed, create the actual prefetch task (only this part is async)
-        let range_clone = next_range.clone();
-        let running_tasks_for_cleanup = running_tasks.clone();
-
-        let prefetch_task = spawn_btree_prefetch(async move {
-            // Perform the actual read
-            match reader.read_range(range_clone.clone(), None).await {
-                Ok(batch) => {
-                    let entry = BufferEntry {
-                        batch,
-                        start_row: range_clone.start,
-                        end_row: range_clone.end,
-                    };
-
-                    // Add to buffer
-                    {
-                        let mut buffer_guard = buffer.lock().await;
-                        buffer_guard.push_back(entry);
-                    }
-
-                    debug!(
-                        "Prefetched {} rows ({}..{}) for partition {}",
-                        range_clone.end - range_clone.start,
-                        range_clone.start,
-                        range_clone.end,
-                        partition_id
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        "Prefetch task failed for partition {} range {}..{}: {}",
-                        partition_id, range_clone.start, range_clone.end, err
-                    );
-                }
-            }
-
-            // Remove this task from running tasks when completed
-            {
-                let mut tasks_guard = running_tasks_for_cleanup.lock().await;
-                tasks_guard.retain(|task| !task.handle.is_finished());
-            }
-        });
-
-        // Add the task to running tasks
-        {
-            let mut tasks_guard = running_tasks.lock().await;
-            tasks_guard.push_back(RunningPrefetchTask {
-                handle: prefetch_task,
-                range: next_range.clone(),
-            });
-        }
-
-        debug!(
-            "Submitted prefetch task for partition {} range {}..{}",
-            partition_id, next_range.start, next_range.end
-        );
-
-        Ok(())
-    }
-
-    /// Get data from buffer or fallback to direct read
-    pub async fn get_data_with_fallback(
-        &self,
-        partition_id: u64,
-        start_row: usize,
-        end_row: usize,
-    ) -> Result<RecordBatch> {
-        if let Some(state) = self.partition_states.get(&partition_id) {
-            // First try to get from buffer
-            {
-                let mut buffer_guard = state.buffer.lock().await;
-
-                // Remove outdated entries from the front
-                while let Some(entry) = buffer_guard.front() {
-                    if entry.end_row <= start_row {
-                        buffer_guard.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-
-                // Check if we have suitable data in buffer
-                if let Some(entry) = buffer_guard.front() {
-                    if entry.start_row <= start_row && entry.end_row >= end_row {
-                        // Found matching data, extract it
-                        let entry = buffer_guard.pop_front().unwrap();
-                        drop(buffer_guard);
-
-                        let slice_start = start_row - entry.start_row;
-                        let slice_len = end_row - start_row;
-
-                        debug!(
-                            "Using buffered data for partition {} ({}..{})",
-                            partition_id, start_row, end_row
-                        );
-
-                        return Ok(entry.batch.slice(slice_start, slice_len));
-                    }
-                }
-            }
-
-            // Fallback to direct read
-            debug!(
-                "Direct read fallback for partition {} ({}..{})",
-                partition_id, start_row, end_row
-            );
-
-            state.reader.read_range(start_row..end_row, None).await
-        } else {
-            Err(Error::Internal {
-                message: format!("Partition {} not found in prefetch manager", partition_id),
-                location: location!(),
-            })
-        }
-    }
-}
-
-/// Simplified partition iterator with immediate loading since all partitions need to be accessed
+/// Partition iterator for loading partition data in batches with integrated prefetching
 struct PartitionIterator {
     reader: Arc<dyn IndexReader>,
     current_batch: Option<RecordBatch>,
     current_position: usize,
     rows_read: usize,
-    partition_id: u64,
     batch_size: u64,
+    prefetch_buffer: Arc<tokio::sync::Mutex<VecDeque<BufferEntry>>>,
+    prefetch_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl PartitionIterator {
     async fn new(
         store: Arc<dyn IndexStore>,
         page_file_name: String,
-        partition_id: u64,
         batch_size: u64,
+        prefetch_config: PrefetchConfig,
     ) -> Result<Self> {
         let reader = store.open_index_file(&page_file_name).await?;
+        let total_rows = reader.num_rows();
+
+        // Create shared prefetch buffer
+        let prefetch_buffer = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+
+        // Start prefetch task
+        let prefetch_task = if prefetch_config.prefetch_batches > 0 {
+            let reader_clone = reader.clone();
+            let buffer_clone = prefetch_buffer.clone();
+            let batch_size_clone = batch_size as usize;
+            let prefetch_batches = prefetch_config.prefetch_batches;
+
+            Some(tokio::spawn(async move {
+                let mut current_pos = 0;
+
+                while current_pos < total_rows {
+                    let effective_batch_size = prefetch_batches * batch_size_clone;
+                    let end_pos = std::cmp::min(current_pos + effective_batch_size, total_rows);
+
+                    match reader_clone.read_range(current_pos..end_pos, None).await {
+                        Ok(batch) => {
+                            let entry = BufferEntry {
+                                start_row: current_pos,
+                                end_row: current_pos + batch.num_rows(),
+                                batch,
+                            };
+
+                            // Add data to buffer with size control
+                            {
+                                let mut buffer_guard = buffer_clone.lock().await;
+                                const MAX_BUFFER_SIZE: usize = 4;
+
+                                // Only add if buffer is not full
+                                if buffer_guard.len() < MAX_BUFFER_SIZE {
+                                    buffer_guard.push_back(entry);
+                                } else {
+                                    // Buffer is full, skip this prefetch to avoid memory bloat
+                                    break;
+                                }
+                            }
+
+                            current_pos = end_pos;
+                        }
+                        Err(_) => {
+                            // Read failed, wait before retry
+                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        }
+                    }
+
+                    // Add some delay to avoid excessive resource consumption
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
+            }))
+        } else {
+            None
+        };
+
         Ok(Self {
             reader,
             current_batch: None,
             current_position: 0,
             rows_read: 0,
-            partition_id,
             batch_size,
+            prefetch_buffer,
+            prefetch_task,
         })
     }
 
-    /// Get the next element, working with the prefetch manager
-    async fn next(
-        &mut self,
-        prefetch_manager: &PrefetchManager,
-    ) -> Result<Option<(ScalarValue, ScalarValue)>> {
+    /// Get the next element with integrated prefetching
+    async fn next(&mut self) -> Result<Option<(ScalarValue, ScalarValue)>> {
         // Load new batch if current one is exhausted
         if self.needs_new_batch() {
             if self.rows_read >= self.reader.num_rows() {
                 return Ok(None);
             }
-            self.load_next_batch(prefetch_manager).await?;
-
-            // Submit next prefetch task
-            if let Err(err) = prefetch_manager
-                .submit_prefetch_task(self.partition_id, self.batch_size as usize)
-                .await
-            {
-                warn!(
-                    "Failed to submit prefetch task for partition {}: {}",
-                    self.partition_id, err
-                );
-            }
-        } else {
-            // Check if we've read half of the current batch, submit next prefetch task
-            let batch_half = self.current_batch.as_ref().unwrap().num_rows() / 2;
-            if self.current_position == batch_half && batch_half > 0 {
-                if let Err(err) = prefetch_manager
-                    .submit_prefetch_task(self.partition_id, self.batch_size as usize)
-                    .await
-                {
-                    warn!(
-                        "Failed to submit prefetch task for partition {}: {}",
-                        self.partition_id, err
-                    );
-                }
-            }
+            self.load_next_batch().await?;
         }
 
         // Extract next value from current batch
@@ -2076,7 +1802,7 @@ impl PartitionIterator {
             || self.current_position >= self.current_batch.as_ref().unwrap().num_rows()
     }
 
-    async fn load_next_batch(&mut self, prefetch_manager: &PrefetchManager) -> Result<()> {
+    async fn load_next_batch(&mut self) -> Result<()> {
         let remaining_rows = self.reader.num_rows() - self.rows_read;
         if remaining_rows == 0 {
             self.current_batch = None;
@@ -2086,10 +1812,18 @@ impl PartitionIterator {
         let rows_to_read = std::cmp::min(self.batch_size as usize, remaining_rows);
         let end_row = self.rows_read + rows_to_read;
 
-        // Use the new fallback mechanism - try buffer first, then direct read
-        let batch = prefetch_manager
-            .get_data_with_fallback(self.partition_id, self.rows_read, end_row)
-            .await?;
+        // First try to get data from prefetch buffer
+        let batch = if let Some(entry) = self.try_get_from_buffer(self.rows_read, end_row).await {
+            // Get required data by slicing from prefetch buffer
+            let slice_start = self.rows_read - entry.start_row;
+            let slice_len = rows_to_read;
+            entry.batch.slice(slice_start, slice_len)
+        } else {
+            // Fallback to direct read
+            self.reader
+                .read_range(self.rows_read..end_row, None)
+                .await?
+        };
 
         self.current_batch = Some(batch);
         self.current_position = 0;
@@ -2097,8 +1831,42 @@ impl PartitionIterator {
         Ok(())
     }
 
+    /// Try to get data from prefetch buffer
+    async fn try_get_from_buffer(&self, start_row: usize, end_row: usize) -> Option<BufferEntry> {
+        let mut buffer_guard = self.prefetch_buffer.lock().await;
+
+        // Clean up expired buffer entries (entries that are no longer needed)
+        while let Some(entry) = buffer_guard.front() {
+            if entry.end_row <= start_row {
+                buffer_guard.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Find entry that contains the required data range
+        if let Some(index) = buffer_guard
+            .iter()
+            .position(|entry| entry.start_row <= start_row && entry.end_row >= end_row)
+        {
+            buffer_guard.remove(index)
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
     fn get_reader(&self) -> Arc<dyn IndexReader> {
         self.reader.clone()
+    }
+}
+
+impl Drop for PartitionIterator {
+    fn drop(&mut self) {
+        // Cancel the prefetch task when the iterator is dropped
+        if let Some(task) = &self.prefetch_task {
+            task.abort();
+        }
     }
 }
 
@@ -2108,11 +1876,12 @@ struct HeapElement {
     value: ScalarValue,
     row_id: ScalarValue,
     partition_id: u64,
+    orderable_value: OrderableScalarValue,
 }
 
 impl PartialEq for HeapElement {
     fn eq(&self, other: &Self) -> bool {
-        self.value.eq(&other.value)
+        self.orderable_value.eq(&other.orderable_value)
     }
 }
 
@@ -2122,13 +1891,15 @@ impl PartialOrd for HeapElement {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         // Note: BinaryHeap is a maximum heap, we need a minimum heap,
         // so reverse the comparison result
-        other.value.partial_cmp(&self.value)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for HeapElement {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // Note: BinaryHeap is a maximum heap, we need a minimum heap,
+        // so reverse the comparison result
+        other.orderable_value.cmp(&self.orderable_value)
     }
 }
 
@@ -2144,13 +1915,11 @@ async fn merge_page(
     let mut lookup_entries = Vec::new();
     let mut page_idx = 0u32;
 
+    let start_time = std::time::Instant::now();
     debug!(
         "Starting multi-way merge with {} partitions using prefetch manager",
         part_lookup_files.len()
     );
-
-    // Create prefetch manager
-    let mut prefetch_manager = PrefetchManager::new(prefetch_config.clone());
 
     // Directly create iterators and read first element
     let mut partition_map = HashMap::new();
@@ -2161,40 +1930,33 @@ async fn merge_page(
     // Initialize all partitions
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
-        let page_file_name = page_files_map
-            .get(&partition_id)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Page file not found for partition ID: {}", partition_id),
-                location: location!(),
-            })?
-            .to_string();
+        let page_file_name =
+            (*page_files_map
+                .get(&partition_id)
+                .ok_or_else(|| Error::Internal {
+                    message: format!("Page file not found for partition ID: {}", partition_id),
+                    location: location!(),
+                })?)
+            .clone();
 
-        let mut iterator =
-            PartitionIterator::new(store.clone(), page_file_name, partition_id, batch_size).await?;
+        let mut iterator = PartitionIterator::new(
+            store.clone(),
+            page_file_name,
+            batch_size,
+            prefetch_config.clone(),
+        )
+        .await?;
 
-        // Initialize partition in prefetch manager
-        let reader = iterator.get_reader();
-        prefetch_manager.initialize_partition(partition_id, reader);
-
-        // Submit initial prefetch task
-        if let Err(err) = prefetch_manager
-            .submit_prefetch_task(partition_id, batch_size as usize)
-            .await
-        {
-            warn!(
-                "Failed to submit prefetch task for partition {}: {}",
-                partition_id, err
-            );
-        }
-
-        let first_element = iterator.next(&prefetch_manager).await?;
+        let first_element = iterator.next().await?;
 
         if let Some((value, row_id)) = first_element {
-            // Put the first element into the heap
+            // Put the first element into the heap with cached orderable value
+            let orderable_value = OrderableScalarValue(value.clone());
             heap.push(HeapElement {
                 value,
                 row_id,
                 partition_id,
+                orderable_value,
             });
         }
 
@@ -2218,11 +1980,13 @@ async fn merge_page(
 
         // Read next element from corresponding partition
         if let Some(iterator) = partition_map.get_mut(&min_element.partition_id) {
-            if let Some((next_value, next_row_id)) = iterator.next(&prefetch_manager).await? {
+            if let Some((next_value, next_row_id)) = iterator.next().await? {
+                let orderable_value = OrderableScalarValue(next_value.clone());
                 heap.push(HeapElement {
                     value: next_value,
                     row_id: next_row_id,
                     partition_id: min_element.partition_id,
+                    orderable_value,
                 });
             }
         }
@@ -2252,15 +2016,24 @@ async fn merge_page(
         .await?;
     }
 
+    let elapsed = start_time.elapsed();
+    let rows_per_second = if elapsed.as_secs_f64() > 0.0 {
+        total_merged as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
     debug!(
-        "Completed multi-way merge: merged {} rows into {} lookup entries",
+        "Completed multi-way merge: merged {} rows into {} lookup entries in {:.2}s ({:.0} rows/s)",
         total_merged,
-        lookup_entries.len()
+        lookup_entries.len(),
+        elapsed.as_secs_f64(),
+        rows_per_second
     );
     Ok(lookup_entries)
 }
 
-/// Helper function to prepare batch data in parallel
+/// Helper function to prepare batch data with optimized memory usage
 async fn prepare_batch_data(
     batch_rows: Vec<(ScalarValue, ScalarValue)>,
     arrow_schema: Arc<Schema>,
@@ -2273,12 +2046,25 @@ async fn prepare_batch_data(
         });
     }
 
-    // Parallelize data preparation
-    let (values, row_ids): (Vec<_>, Vec<_>) = batch_rows.into_iter().unzip();
+    // Pre-allocate vectors with exact capacity to avoid reallocations
+    let capacity = batch_rows.len();
+    let mut values = Vec::with_capacity(capacity);
+    let mut row_ids = Vec::with_capacity(capacity);
 
-    // Convert to arrays in parallel using rayon or manually spawn tasks
-    let values_array = ScalarValue::iter_to_array(values.into_iter())?;
-    let row_ids_array = ScalarValue::iter_to_array(row_ids.into_iter())?;
+    // Unzip with pre-allocated vectors
+    for (value, row_id) in batch_rows.into_iter() {
+        values.push(value);
+        row_ids.push(row_id);
+    }
+
+    // Convert to arrays in parallel
+    let (values_array, row_ids_array) = rayon::join(
+        || ScalarValue::iter_to_array(values.into_iter()),
+        || ScalarValue::iter_to_array(row_ids.into_iter()),
+    );
+
+    let values_array = values_array?;
+    let row_ids_array = row_ids_array?;
 
     let batch = RecordBatch::try_new(arrow_schema, vec![values_array, row_ids_array])?;
 
@@ -2304,11 +2090,9 @@ async fn write_batch_and_lookup_entry(
         return Ok(());
     }
 
-    // Take ownership of the batch data
     let batch_data = std::mem::take(batch_rows);
     let current_page_idx = *page_idx;
 
-    // Prepare batch data
     let (batch, lookup_entry) =
         prepare_batch_data(batch_data, arrow_schema.clone(), current_page_idx).await?;
 
@@ -2523,9 +2307,16 @@ mod tests {
     };
 
     use super::{
-        part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,
-        DEFAULT_BTREE_BATCH_SIZE,
+        part_lookup_file_path, part_page_data_file_path, train_btree_index, HeapElement,
+        OrderableScalarValue, DEFAULT_BTREE_BATCH_SIZE,
     };
+
+    // Additional imports for new tests
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::cmp::Ordering as CmpOrdering;
+    use std::collections::BinaryHeap;
 
     #[test]
     fn test_scalar_value_size() {
@@ -3344,13 +3135,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_partition_files() {
-        use crate::scalar::lance_format::LanceIndexStore;
-        use lance_core::cache::LanceCache;
-        use lance_io::object_store::ObjectStore;
-        use object_store::path::Path;
-        use std::sync::Arc;
-        use tempfile::tempdir;
-
         // Create a test store
         let tmpdir = Arc::new(tempdir().unwrap());
         let test_store: Arc<dyn crate::scalar::IndexStore> = Arc::new(LanceIndexStore::new(
@@ -3378,5 +3162,189 @@ mod tests {
 
         // If we get here without panicking, the cleanup function handled all cases correctly
         assert!(true);
+    }
+
+    #[test]
+    fn test_heap_element_comparison() {
+        // Create HeapElements with different values
+        let element1 = HeapElement {
+            value: ScalarValue::Int32(Some(10)),
+            row_id: ScalarValue::UInt64(Some(1)),
+            partition_id: 0,
+            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(10))),
+        };
+
+        let element2 = HeapElement {
+            value: ScalarValue::Int32(Some(5)),
+            row_id: ScalarValue::UInt64(Some(2)),
+            partition_id: 0,
+            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(5))),
+        };
+
+        let element3 = HeapElement {
+            value: ScalarValue::Int32(Some(15)),
+            row_id: ScalarValue::UInt64(Some(3)),
+            partition_id: 0,
+            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(15))),
+        };
+
+        // Test direct comparison - note that BinaryHeap is a max heap,
+        // but we want min heap behavior, so smaller values should be "greater"
+        assert_eq!(element1.cmp(&element2), CmpOrdering::Less); // 10 < 5 in min heap (5 should come first)
+        assert_eq!(element2.cmp(&element1), CmpOrdering::Greater); // 5 > 10 in min heap
+        assert_eq!(element1.cmp(&element3), CmpOrdering::Greater); // 10 > 15 in min heap (10 should come first)
+
+        // Test with BinaryHeap to ensure min heap behavior
+        let mut heap = BinaryHeap::new();
+        heap.push(element1);
+        heap.push(element2);
+        heap.push(element3);
+
+        // Should pop in ascending order (min heap behavior)
+        let first = heap.pop().unwrap();
+        assert_eq!(first.value, ScalarValue::Int32(Some(5)));
+
+        let second = heap.pop().unwrap();
+        assert_eq!(second.value, ScalarValue::Int32(Some(10)));
+
+        let third = heap.pop().unwrap();
+        assert_eq!(third.value, ScalarValue::Int32(Some(15)));
+
+        // Test with null values
+        let null_element = HeapElement {
+            value: ScalarValue::Int32(None),
+            row_id: ScalarValue::UInt64(Some(4)),
+            partition_id: 0,
+            orderable_value: OrderableScalarValue(ScalarValue::Int32(None)),
+        };
+
+        let non_null_element = HeapElement {
+            value: ScalarValue::Int32(Some(1)),
+            row_id: ScalarValue::UInt64(Some(5)),
+            partition_id: 0,
+            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(1))),
+        };
+
+        // Null values should come before non-null values in min heap
+        assert_eq!(null_element.cmp(&non_null_element), CmpOrdering::Greater);
+        assert_eq!(non_null_element.cmp(&null_element), CmpOrdering::Less);
+
+        // Test heap with null values
+        let mut heap_with_null = BinaryHeap::new();
+        heap_with_null.push(non_null_element);
+        heap_with_null.push(null_element);
+
+        // Null should come first
+        let first_with_null = heap_with_null.pop().unwrap();
+        assert_eq!(first_with_null.value, ScalarValue::Int32(None));
+
+        let second_with_null = heap_with_null.pop().unwrap();
+        assert_eq!(second_with_null.value, ScalarValue::Int32(Some(1)));
+    }
+    #[tokio::test]
+    async fn test_partition_iterator() {
+        // Create test environment
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data with more rows to test iteration
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new("row_id", DataType::UInt64, false),
+        ]));
+
+        let values = Int32Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        let row_ids = arrow::array::UInt64Array::from(vec![1u64, 2, 3, 4, 5, 6, 7, 8]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
+            .unwrap();
+
+        // Write test data to index file
+        let page_file_name = "test_partition_pages.lance".to_string();
+        let mut index_writer = test_store
+            .new_index_file(&page_file_name, schema.clone())
+            .await
+            .unwrap();
+        index_writer.write_record_batch(batch).await.unwrap();
+        index_writer.finish().await.unwrap();
+
+        // Test PartitionIterator creation and basic methods
+        let batch_size = 3u64; // Small batch size to test multiple iterations
+
+        // Create PartitionIterator
+        let mut partition_iterator = super::PartitionIterator::new(
+            test_store.clone(),
+            page_file_name,
+            batch_size,
+            super::PrefetchConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        // Test that iterator was created with correct initial state
+        assert_eq!(partition_iterator.batch_size, batch_size);
+        assert_eq!(partition_iterator.current_position, 0);
+        assert_eq!(partition_iterator.rows_read, 0);
+        assert!(partition_iterator.current_batch.is_none());
+
+        // Test get_reader method
+        let reader = partition_iterator.get_reader();
+        assert_eq!(reader.num_rows(), 8); // We wrote 8 rows
+
+        // Test iteration through data
+        let mut collected_values = Vec::new();
+        let mut collected_row_ids = Vec::new();
+        let mut iteration_count = 0;
+
+        // Iterate through all data
+        while let Some((value, row_id)) = partition_iterator.next().await.unwrap() {
+            collected_values.push(value);
+            collected_row_ids.push(row_id);
+            iteration_count += 1;
+
+            // Prevent infinite loop in case of bugs
+            if iteration_count > 20 {
+                panic!("Too many iterations, possible infinite loop");
+            }
+        }
+
+        // Verify we got all the data
+        assert_eq!(collected_values.len(), 8);
+        assert_eq!(collected_row_ids.len(), 8);
+
+        // Verify the actual values (they should match what we wrote)
+        let expected_values = vec![
+            ScalarValue::Int32(Some(10)),
+            ScalarValue::Int32(Some(20)),
+            ScalarValue::Int32(Some(30)),
+            ScalarValue::Int32(Some(40)),
+            ScalarValue::Int32(Some(50)),
+            ScalarValue::Int32(Some(60)),
+            ScalarValue::Int32(Some(70)),
+            ScalarValue::Int32(Some(80)),
+        ];
+
+        let expected_row_ids = vec![
+            ScalarValue::UInt64(Some(1)),
+            ScalarValue::UInt64(Some(2)),
+            ScalarValue::UInt64(Some(3)),
+            ScalarValue::UInt64(Some(4)),
+            ScalarValue::UInt64(Some(5)),
+            ScalarValue::UInt64(Some(6)),
+            ScalarValue::UInt64(Some(7)),
+            ScalarValue::UInt64(Some(8)),
+        ];
+
+        assert_eq!(collected_values, expected_values);
+        assert_eq!(collected_row_ids, expected_row_ids);
+
+        // Test that iterator is exhausted
+        assert!(partition_iterator.next().await.unwrap().is_none());
+
+        // Verify final state
+        assert_eq!(partition_iterator.rows_read, 8);
     }
 }

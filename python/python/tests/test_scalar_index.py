@@ -3330,13 +3330,9 @@ def test_btree_precise_query_comparison(tmp_path):
                 f" {complete_ids[:10]}{'...' if len(complete_ids) > 10 else ''}"
             )
 
-        print(f"      ✓ Passed ({fragment_results.num_rows} rows)")
+        print(f"Passed ({fragment_results.num_rows} rows)")
 
-    print(f"\n✅ All {len(test_cases)} precision tests passed!")
-    print(
-        "Fragment-level B-tree index produces identical results"
-        " to complete B-tree index."
-    )
+    print(f"All {len(test_cases)} precision tests passed.")
 
 
 def test_btree_fragment_ids_parameter_validation(tmp_path):
