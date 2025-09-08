@@ -17,7 +17,7 @@ members = [
     "rust/compression/fsst",
     "rust/compression/bitpacking",
 ]
-exclude = ["python", "java/core/lance-jni"]
+exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
