@@ -26,7 +26,9 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::IvfShuffler;
+use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
     hnsw::{
         builder::HnswBuildParams,
@@ -500,6 +502,206 @@ pub(crate) async fn build_vector_index(
     Ok(())
 }
 
+/// Build a Vector Index incrementally using an existing index's IVF model and quantizer
+/// This creates a delta index that shares centroids with the source index
+#[instrument(level = "debug", skip(dataset, existing_index, frag_reuse_index))]
+pub(crate) async fn build_vector_index_incremental(
+    dataset: &Dataset,
+    column: &str,
+    uuid: &str,
+    params: &VectorIndexParams,
+    existing_index: Arc<dyn VectorIndex>,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+) -> Result<()> {
+    let stages = &params.stages;
+
+    if stages.is_empty() {
+        return Err(Error::Index {
+            message: "Build Vector Index: must have at least 1 stage".to_string(),
+            location: location!(),
+        });
+    };
+
+    let StageParams::Ivf(ivf_params) = &stages[0] else {
+        return Err(Error::Index {
+            message: format!("Build Vector Index: invalid stages: {:?}", stages),
+            location: location!(),
+        });
+    };
+
+    let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
+    if let DataType::List(_) = vector_type {
+        if params.metric_type != DistanceType::Cosine {
+            return Err(Error::Index {
+                message: "Build Vector Index: multivector type supports only cosine distance"
+                    .to_string(),
+                location: location!(),
+            });
+        }
+    }
+
+    // Extract IVF model and quantizer from existing index
+    let ivf_model = existing_index.ivf_model().clone();
+    let quantizer = existing_index.quantizer();
+
+    // Ensure the number of partitions matches
+    if ivf_model.num_partitions() != ivf_params.num_partitions {
+        return Err(Error::Index {
+            message: format!(
+                "Number of partitions mismatch: existing index has {} partitions, but params specify {}",
+                ivf_model.num_partitions(),
+                ivf_params.num_partitions
+            ),
+            location: location!(),
+        });
+    }
+
+    let temp_dir = tempdir()?;
+    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, ivf_params.num_partitions));
+
+    let index_dir = dataset.indices_dir().child(uuid);
+
+    // Determine the index type and build incrementally
+    let (sub_index_type, quantization_type) = existing_index.sub_index_type();
+
+    match (sub_index_type, quantization_type) {
+        // IVF_FLAT
+        (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+                    dataset.clone(),
+                    column.to_owned(),
+                    index_dir,
+                    params.metric_type,
+                    shuffler,
+                    (),
+                    frag_reuse_index,
+                )?
+                .with_ivf(ivf_model)
+                .with_quantizer(quantizer.try_into()?)
+                .build()
+                .await?;
+            }
+            DataType::UInt8 => {
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+                    dataset.clone(),
+                    column.to_owned(),
+                    index_dir,
+                    params.metric_type,
+                    shuffler,
+                    (),
+                    frag_reuse_index,
+                )?
+                .with_ivf(ivf_model)
+                .with_quantizer(quantizer.try_into()?)
+                .build()
+                .await?;
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid data type: {:?}", element_type),
+                    location: location!(),
+                });
+            }
+        },
+        // IVF_PQ
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_incremental(
+                dataset.clone(),
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .build()
+            .await?;
+        }
+        // IVF_SQ
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+                dataset.clone(),
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .build()
+            .await?;
+        }
+        // IVF_HNSW variants
+        (SubIndexType::Hnsw, quantization_type) => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!(
+                        "Build Vector Index: HNSW index missing HNSW params in stages: {:?}",
+                        stages
+                    ),
+                    location: location!(),
+                });
+            };
+
+            match quantization_type {
+                QuantizationType::Flat => {
+                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                        dataset.clone(),
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        shuffler,
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(quantizer.try_into()?)
+                    .build()
+                    .await?;
+                }
+                QuantizationType::Product => {
+                    IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                        dataset.clone(),
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        shuffler,
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(quantizer.try_into()?)
+                    .build()
+                    .await?;
+                }
+                QuantizationType::Scalar => {
+                    IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
+                        dataset.clone(),
+                        column.to_owned(),
+                        index_dir,
+                        params.metric_type,
+                        shuffler,
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_ivf(ivf_model)
+                    .with_quantizer(quantizer.try_into()?)
+                    .build()
+                    .await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Build an empty vector index without training on data
 #[instrument(level = "debug", skip_all)]
 pub(crate) async fn build_empty_vector_index(
@@ -855,17 +1057,83 @@ pub async fn initialize_vector_index(
             }
         };
 
-        // Create the index using the extracted parameters
-        // Note: This will train new centroids on the current dataset
-        // TODO: In the future, we should extract and reuse centroids from source
-        target_dataset
-            .create_index(
-                &[column_name],
-                IndexType::Vector,
-                Some(source_index.name.clone()),
-                &params,
-                false, // Don't replace if exists
+        // Always use incremental builder to reuse centroids from source index
+        // This ensures both empty and non-empty datasets share the same centroids
+        log::info!(
+            "Creating vector index '{}' with shared centroids from source index",
+            source_index.name
+        );
+
+        let new_uuid = Uuid::new_v4();
+        let frag_reuse_index = target_dataset
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await?;
+
+        // Build the index incrementally using the source index's IVF model
+        // This works for both empty and non-empty datasets
+        build_vector_index_incremental(
+            target_dataset,
+            column_name,
+            &new_uuid.to_string(),
+            &params,
+            source_vector_index,
+            frag_reuse_index,
+        )
+        .await?;
+
+        // Register the new index in the dataset manifest
+        use crate::index::vector_index_details;
+        use lance_index::VECTOR_INDEX_VERSION;
+        use lance_table::format::Index as IndexMetadata;
+
+        let field = target_dataset
+            .schema()
+            .field(column_name)
+            .ok_or_else(|| Error::Index {
+                message: format!("Column '{}' not found in target dataset", column_name),
+                location: location!(),
+            })?;
+
+        // Get fragment bitmap - will be empty for empty dataset
+        let fragment_bitmap = if target_dataset.get_fragments().is_empty() {
+            // Empty bitmap for empty dataset
+            Some(roaring::RoaringBitmap::new())
+        } else {
+            // Include all fragments for non-empty dataset
+            Some(
+                target_dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
             )
+        };
+
+        let new_idx = IndexMetadata {
+            uuid: new_uuid,
+            name: source_index.name.clone(),
+            fields: vec![field.id],
+            dataset_version: target_dataset.manifest.version,
+            fragment_bitmap,
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        };
+
+        use crate::dataset::transaction::{Operation, Transaction};
+        let transaction = Transaction::new(
+            target_dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices: vec![],
+            },
+            None,
+            None,
+        );
+
+        target_dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
     } else {
         log::warn!(
@@ -882,6 +1150,7 @@ mod tests {
     use super::*;
     use crate::dataset::Dataset;
     use arrow_array::types::{Float32Type, Int32Type};
+    use arrow_array::Array;
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::DatasetIndexExt;
@@ -983,12 +1252,69 @@ mod tests {
             "Should have 10 partitions"
         );
 
-        // The index should have the expected number of centroids
-        let centroids = stats
-            .get("centroids")
-            .and_then(|v| v.as_array())
-            .expect("IVF_PQ index should have centroids");
-        assert_eq!(centroids.len(), 10, "Should have 10 centroids");
+        // Verify centroids are shared between source and target indices
+        let source_vector_index = source_dataset
+            .open_vector_index(
+                "vector",
+                &source_index.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Get IVF models from both indices to compare centroids
+        let source_ivf_model = source_vector_index.ivf_model();
+        let target_ivf_model = target_vector_index.ivf_model();
+
+        // Verify they have the same number of partitions
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            target_ivf_model.num_partitions(),
+            "Source and target should have same number of partitions"
+        );
+
+        // Verify the centroids are exactly the same (key verification for delta indices)
+        if let (Some(source_centroids), Some(target_centroids)) =
+            (&source_ivf_model.centroids, &target_ivf_model.centroids)
+        {
+            assert_eq!(
+                source_centroids.len(),
+                target_centroids.len(),
+                "Centroids arrays should have same length"
+            );
+
+            // Compare actual centroid values
+            // Since value() returns Arc<dyn Array>, we need to compare the data directly
+            for i in 0..source_centroids.len() {
+                let source_centroid = source_centroids.value(i);
+                let target_centroid = target_centroids.value(i);
+
+                // Convert to the same type for comparison
+                let source_data = source_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+                let target_data = target_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+
+                assert_eq!(
+                    source_data.values(),
+                    target_data.values(),
+                    "Centroid {} values should be identical between source and target",
+                    i
+                );
+            }
+        } else {
+            panic!("Both source and target should have centroids");
+        }
+
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            10,
+            "Should have 10 partitions as configured"
+        );
 
         // Check PQ parameters in sub_index
         let sub_index = stats
@@ -1136,12 +1462,69 @@ mod tests {
             "Should have 8 partitions"
         );
 
-        // The index should have the expected number of centroids
-        let centroids = stats
-            .get("centroids")
-            .and_then(|v| v.as_array())
-            .expect("IVF_FLAT index should have centroids");
-        assert_eq!(centroids.len(), 8, "Should have 8 centroids");
+        // Verify centroids are shared between source and target indices
+        let source_vector_index = source_dataset
+            .open_vector_index(
+                "vector",
+                &source_index.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Get IVF models from both indices to compare centroids
+        let source_ivf_model = source_vector_index.ivf_model();
+        let target_ivf_model = target_vector_index.ivf_model();
+
+        // Verify they have the same number of partitions
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            target_ivf_model.num_partitions(),
+            "Source and target should have same number of partitions"
+        );
+
+        // Verify the centroids are exactly the same (key verification for delta indices)
+        if let (Some(source_centroids), Some(target_centroids)) =
+            (&source_ivf_model.centroids, &target_ivf_model.centroids)
+        {
+            assert_eq!(
+                source_centroids.len(),
+                target_centroids.len(),
+                "Centroids arrays should have same length"
+            );
+
+            // Compare actual centroid values
+            // Since value() returns Arc<dyn Array>, we need to compare the data directly
+            for i in 0..source_centroids.len() {
+                let source_centroid = source_centroids.value(i);
+                let target_centroid = target_centroids.value(i);
+
+                // Convert to the same type for comparison
+                let source_data = source_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+                let target_data = target_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+
+                assert_eq!(
+                    source_data.values(),
+                    target_data.values(),
+                    "Centroid {} values should be identical between source and target",
+                    i
+                );
+            }
+        } else {
+            panic!("Both source and target should have centroids");
+        }
+
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            8,
+            "Should have 8 partitions as configured"
+        );
 
         // Verify the index is functional
         let query_vector = lance_datagen::gen_batch()
@@ -1162,6 +1545,234 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 5, "Should return 5 nearest neighbors");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_vector_index_empty_dataset() {
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset with vector column
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create IVF_PQ index on source
+        let params = VectorIndexParams::ivf_pq(10, 8, 16, MetricType::L2, 50);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_pq".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload to get updated metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_indices = source_dataset.load_indices().await.unwrap();
+        let source_index = source_indices
+            .iter()
+            .find(|idx| idx.name == "vector_ivf_pq")
+            .unwrap();
+
+        // Create EMPTY target dataset with same schema
+        let empty_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(0), BatchCount::from(1)); // Empty dataset
+        let mut target_dataset = Dataset::write(empty_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize IVF_PQ index on empty target
+        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
+            .await
+            .unwrap();
+
+        // Verify index was created even though dataset is empty
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1, "Empty target should have 1 index");
+        assert_eq!(
+            target_indices[0].name, "vector_ivf_pq",
+            "Index name should match"
+        );
+
+        // Open both indices to compare centroids
+        let source_vector_index = source_dataset
+            .open_vector_index(
+                "vector",
+                &source_index.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        let target_vector_index = target_dataset
+            .open_vector_index(
+                "vector",
+                &target_indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Get IVF models from both indices
+        let source_ivf_model = source_vector_index.ivf_model();
+        let target_ivf_model = target_vector_index.ivf_model();
+
+        // Verify they have the same number of partitions
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            target_ivf_model.num_partitions(),
+            "Empty dataset should still have same number of partitions as source"
+        );
+
+        // Verify the centroids are exactly the same even for empty dataset
+        if let (Some(source_centroids), Some(target_centroids)) =
+            (&source_ivf_model.centroids, &target_ivf_model.centroids)
+        {
+            assert_eq!(
+                source_centroids.len(),
+                target_centroids.len(),
+                "Centroids arrays should have same length even for empty dataset"
+            );
+
+            // Compare actual centroid values
+            for i in 0..source_centroids.len() {
+                let source_centroid = source_centroids.value(i);
+                let target_centroid = target_centroids.value(i);
+
+                let source_data = source_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+                let target_data = target_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+
+                assert_eq!(
+                    source_data.values(),
+                    target_data.values(),
+                    "Empty dataset should have identical centroids from source"
+                );
+            }
+        } else {
+            panic!("Both source and empty target should have centroids");
+        }
+
+        // Now add data to the target dataset
+        let new_data_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        target_dataset.append(new_data_reader, None).await.unwrap();
+
+        // Run optimize_indices to index the newly added data and merge indices
+        // We set num_indices_to_merge to a high value to force merging all indices into one
+        use lance_index::optimize::OptimizeOptions;
+        let optimize_options = OptimizeOptions {
+            num_indices_to_merge: 10, // High value to ensure all indices are merged
+            index_names: None,
+            retrain: false, // Don't retrain, just merge with existing centroids
+        };
+        target_dataset
+            .optimize_indices(&optimize_options)
+            .await
+            .unwrap();
+
+        // Reload dataset to get updated index metadata
+        let target_dataset = Dataset::open(&target_uri).await.unwrap();
+
+        // Verify we have only one merged index after optimization
+        let index_stats = target_dataset
+            .index_statistics("vector_ivf_pq")
+            .await
+            .unwrap();
+        let stats_json: serde_json::Value = serde_json::from_str(&index_stats).unwrap();
+        assert_eq!(
+            stats_json["num_indices"], 1,
+            "Should have only 1 merged index after optimize with high num_indices_to_merge"
+        );
+        assert_eq!(
+            stats_json["num_indexed_fragments"], 1,
+            "Should have indexed the appended fragment (empty dataset has no fragments)"
+        );
+        assert_eq!(
+            stats_json["num_unindexed_fragments"], 0,
+            "All fragments should be indexed after optimization"
+        );
+
+        // The index should now work with the new data
+        let query_vector = lance_datagen::gen_batch()
+            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        let query_vector = query_vector
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap();
+
+        let results = target_dataset
+            .scan()
+            .nearest("vector", &query_vector.value(0), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            results.num_rows(),
+            5,
+            "Should return 5 nearest neighbors after optimizing index"
+        );
+
+        // Verify that the optimized index still shares centroids with the source
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        let target_vector_index = target_dataset
+            .open_vector_index(
+                "vector",
+                &target_indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        let target_ivf_model = target_vector_index.ivf_model();
+
+        // Verify centroids are still the same after optimization
+        if let (Some(source_centroids), Some(target_centroids)) =
+            (&source_ivf_model.centroids, &target_ivf_model.centroids)
+        {
+            for i in 0..source_centroids.len() {
+                let source_centroid = source_centroids.value(i);
+                let target_centroid = target_centroids.value(i);
+
+                let source_data = source_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+                let target_data = target_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+
+                assert_eq!(
+                    source_data.values(),
+                    target_data.values(),
+                    "Centroids should remain identical after optimize_indices"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1267,12 +1878,69 @@ mod tests {
             "Should have 6 partitions"
         );
 
-        // The index should have the expected number of centroids
-        let centroids = stats
-            .get("centroids")
-            .and_then(|v| v.as_array())
-            .expect("IVF_SQ index should have centroids");
-        assert_eq!(centroids.len(), 6, "Should have 6 centroids");
+        // Verify centroids are shared between source and target indices
+        let source_vector_index = source_dataset
+            .open_vector_index(
+                "vector",
+                &source_index.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Get IVF models from both indices to compare centroids
+        let source_ivf_model = source_vector_index.ivf_model();
+        let target_ivf_model = target_vector_index.ivf_model();
+
+        // Verify they have the same number of partitions
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            target_ivf_model.num_partitions(),
+            "Source and target should have same number of partitions"
+        );
+
+        // Verify the centroids are exactly the same (key verification for delta indices)
+        if let (Some(source_centroids), Some(target_centroids)) =
+            (&source_ivf_model.centroids, &target_ivf_model.centroids)
+        {
+            assert_eq!(
+                source_centroids.len(),
+                target_centroids.len(),
+                "Centroids arrays should have same length"
+            );
+
+            // Compare actual centroid values
+            // Since value() returns Arc<dyn Array>, we need to compare the data directly
+            for i in 0..source_centroids.len() {
+                let source_centroid = source_centroids.value(i);
+                let target_centroid = target_centroids.value(i);
+
+                // Convert to the same type for comparison
+                let source_data = source_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+                let target_data = target_centroid
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                    .expect("Centroid should be Float32Array");
+
+                assert_eq!(
+                    source_data.values(),
+                    target_data.values(),
+                    "Centroid {} values should be identical between source and target",
+                    i
+                );
+            }
+        } else {
+            panic!("Both source and target should have centroids");
+        }
+
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            6,
+            "Should have 6 partitions as configured"
+        );
 
         // Check SQ parameters in sub_index
         let sub_index = stats

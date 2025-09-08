@@ -1035,9 +1035,8 @@ mod tests {
             "whitespace",
             "Base tokenizer should be whitespace"
         );
-        assert_eq!(
+        assert!(
             params["with_position"].as_bool().unwrap(),
-            true,
             "with_position should be true"
         );
         assert_eq!(
@@ -1045,24 +1044,20 @@ mod tests {
             128,
             "max_token_length should be 128"
         );
-        assert_eq!(
-            params["lower_case"].as_bool().unwrap(),
-            false,
+        assert!(
+            !params["lower_case"].as_bool().unwrap(),
             "lower_case should be false"
         );
-        assert_eq!(
-            params["stem"].as_bool().unwrap(),
-            false,
+        assert!(
+            !params["stem"].as_bool().unwrap(),
             "stem should be false"
         );
-        assert_eq!(
-            params["remove_stop_words"].as_bool().unwrap(),
-            false,
+        assert!(
+            !params["remove_stop_words"].as_bool().unwrap(),
             "remove_stop_words should be false"
         );
-        assert_eq!(
-            params["ascii_folding"].as_bool().unwrap(),
-            false,
+        assert!(
+            !params["ascii_folding"].as_bool().unwrap(),
             "ascii_folding should be false"
         );
     }
