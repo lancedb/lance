@@ -190,12 +190,6 @@ fn compute_cluster_sizes(membership: &[Option<u32>], cluster_sizes: &mut [usize]
     });
 }
 
-/// Std deviation of the histogram / cluster distribution.
-fn balance_loss(n: usize, k: usize, cluster_sizes: &[usize]) -> f32 {
-    let square_sum = cluster_sizes.iter().map(|s| s.pow(2)).sum::<usize>() as f32;
-    square_sum - (n as f32).powi(2) / k as f32
-}
-
 pub trait KMeansAlgo<T: Num> {
     /// Recompute the membership of each vector.
     ///
@@ -294,9 +288,7 @@ where
                                 .enumerate()
                                 .map(|(id, dist)| {
                                     dist + balance_factor
-                                        * cluster_sizes
-                                            .map(|sizes| sizes[id as usize] as f32)
-                                            .unwrap_or(0.0)
+                                        * cluster_sizes.map(|sizes| sizes[id] as f32).unwrap_or(0.0)
                                 }),
                         )
                     })
@@ -309,9 +301,7 @@ where
                                 .enumerate()
                                 .map(|(id, dist)| {
                                     dist + balance_factor
-                                        * cluster_sizes
-                                            .map(|sizes| sizes[id as usize] as f32)
-                                            .unwrap_or(0.0)
+                                        * cluster_sizes.map(|sizes| sizes[id] as f32).unwrap_or(0.0)
                                 }),
                         )
                     })
@@ -425,9 +415,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                         .map(|(id, c)| {
                             hamming(vec, c)
                                 + balance_factor
-                                    * cluster_sizes
-                                        .map(|sizes| sizes[id as usize] as f32)
-                                        .unwrap_or(0.0)
+                                    * cluster_sizes.map(|sizes| sizes[id] as f32).unwrap_or(0.0)
                         }),
                 )
             })
@@ -440,7 +428,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         dimension: usize,
         k: usize,
         membership: &[Option<u32>],
-        cluster_sizes: &mut [usize],
+        _cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
