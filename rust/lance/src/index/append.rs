@@ -216,9 +216,7 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
-    use arrow_array::{
-        FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array,
-    };
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
@@ -476,7 +474,10 @@ mod tests {
         let mut dataset = lance_datagen::gen_batch()
             .col("id", array::step::<UInt32Type>())
             .col("value", array::cycle_utf8_literals(&["a", "b", "c"]))
-            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(64)))
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(64)),
+            )
             .into_dataset_with_params(
                 test_uri,
                 FragmentCount(1),
@@ -509,9 +510,12 @@ mod tests {
 
         // Prepare new data for merge insert (updates to existing rows)
         let new_batch = lance_datagen::gen_batch()
-            .col("id", array::step_custom::<UInt32Type>(500, 1))  // IDs 500-999
-            .col("value", array::cycle_utf8_literals(&["d", "e", "f"]))  // Different values
-            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(64)))
+            .col("id", array::step_custom::<UInt32Type>(500, 1)) // IDs 500-999
+            .col("value", array::cycle_utf8_literals(&["d", "e", "f"])) // Different values
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(64)),
+            )
             .into_batch_rows(RowCount::from(500))
             .unwrap();
 
@@ -544,7 +548,7 @@ mod tests {
             .map(|f| f.metadata().clone())
             .collect();
 
-        // Now use the new helper function with known unindexed fragments
+        // Now run merge with known unindexed fragments
         let old_indices = updated_dataset
             .load_indices_by_name(&index_name)
             .await
@@ -589,7 +593,7 @@ mod tests {
             .col("query", array::rand_vec::<Float32Type>(Dimension::from(64)))
             .into_batch_rows(RowCount::from(1))
             .unwrap();
-        
+
         let q = query_batch.column(0).as_fixed_size_list();
         let mut scanner = dataset.scan();
         scanner
