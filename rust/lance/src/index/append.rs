@@ -469,10 +469,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_indices_after_merge_insert() {
-        const DIM: usize = 64;
-        const IVF_PARTITIONS: usize = 2;
-        const INITIAL_ROWS: usize = 1000;
-
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -480,13 +476,13 @@ mod tests {
         let mut dataset = lance_datagen::gen_batch()
             .col("id", array::step::<UInt32Type>())
             .col("value", array::cycle_utf8_literals(&["a", "b", "c"]))
-            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)))
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(64)))
             .into_dataset_with_params(
                 test_uri,
                 FragmentCount(1),
-                FragmentRowCount(INITIAL_ROWS as u32),
+                FragmentRowCount(1000),
                 Some(WriteParams {
-                    max_rows_per_file: INITIAL_ROWS,
+                    max_rows_per_file: 1000,
                     ..Default::default()
                 }),
             )
@@ -494,7 +490,7 @@ mod tests {
             .unwrap();
 
         // Create initial index
-        let ivf_params = IvfBuildParams::new(IVF_PARTITIONS);
+        let ivf_params = IvfBuildParams::new(2);
         let pq_params = PQBuildParams {
             num_sub_vectors: 2,
             ..Default::default()
@@ -515,7 +511,7 @@ mod tests {
         let new_batch = lance_datagen::gen_batch()
             .col("id", array::step_custom::<UInt32Type>(500, 1))  // IDs 500-999
             .col("value", array::cycle_utf8_literals(&["d", "e", "f"]))  // Different values
-            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)))
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(64)))
             .into_batch_rows(RowCount::from(500))
             .unwrap();
 
@@ -526,6 +522,7 @@ mod tests {
             .map(|f| f.id())
             .max()
             .unwrap_or(0);
+        dataset.manifest
 
         // Execute merge insert operation
         let merge_job =
@@ -595,7 +592,7 @@ mod tests {
 
         // Test that search works by querying for nearest neighbors
         let query_batch = lance_datagen::gen_batch()
-            .col("query", array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)))
+            .col("query", array::rand_vec::<Float32Type>(Dimension::from(64)))
             .into_batch_rows(RowCount::from(1))
             .unwrap();
         
