@@ -194,12 +194,3 @@ filename = "java/pom.xml"
 search = "<version>{current_version}</version>"
 replace = "<version>{new_version}</version>"
 
-[[tool.bumpversion.files]]
-filename = "java/core/pom.xml"
-search = "<version>{current_version}</version>"
-replace = "<version>{new_version}</version>"
-
-[[tool.bumpversion.files]]
-filename = "java/spark/pom.xml"
-search = "<version>{current_version}</version>"
-replace = "<version>{new_version}</version>"
