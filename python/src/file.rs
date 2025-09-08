@@ -399,6 +399,51 @@ pub async fn object_store_from_uri_or_path(
 }
 
 #[pyclass]
+pub struct LanceFileSession {
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
+}
+
+impl LanceFileSession {
+    pub async fn try_new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let (object_store, path) =
+            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        Ok(Self {
+            object_store: object_store,
+            base_path: path,
+        })
+    }
+}
+
+#[pymethods]
+impl LanceFileSession {
+    #[new]
+    #[pyo3(signature=(uri_or_path, storage_options=None))]
+    pub fn new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        RT.block_on(None, Self::try_new(uri_or_path, storage_options))?
+    }
+
+    #[pyo3(signature=(path, columns=None))]
+    pub fn open_reader(
+        &self,
+        path: String,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<LanceFileReader> {
+        let path = self.base_path.child(path);
+        RT.block_on(
+            None,
+            LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+        )?
+    }
+}
+
+#[pyclass]
 pub struct LanceFileReader {
     inner: Arc<FileReader>,
 }
@@ -411,6 +456,14 @@ impl LanceFileReader {
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        Self::open_with_store(object_store, path, columns).await
+    }
+
+    async fn open_with_store(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Self> {
         let scheduler = ScanScheduler::new(
             object_store,
             SchedulerConfig {
