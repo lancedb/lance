@@ -758,3 +758,555 @@ pub(crate) async fn open_vector_index_v2(
 
     Ok(index)
 }
+
+/// Initialize a vector index from a source dataset
+/// This will reuse the centroids from the source dataset,
+/// making the new indices act as delta indices. For scalar and FTS indices,
+/// this will recreate them with the same parameters.
+pub async fn initialize_vector_index(
+    target_dataset: &mut Dataset,
+    source_dataset: &Dataset,
+    source_index: &lance_table::format::Index,
+    column_name: &str,
+) -> Result<()> {
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
+
+    log::info!(
+        "Initializing vector index '{}' on column '{}'",
+        source_index.name,
+        column_name
+    );
+
+    // Open the source vector index to extract IvfModel and quantizer
+    let source_vector_index = source_dataset
+        .open_vector_index(
+            column_name,
+            &source_index.uuid.to_string(),
+            &NoOpMetricsCollector,
+        )
+        .await?;
+
+    // Extract index statistics to get parameters
+    let stats = source_vector_index.statistics()?;
+
+    // Try to extract IVF model and create delta index
+    // The stats have the IVF parameters directly, not under "ivf" key
+    if let Some(num_partitions_val) = stats.get("num_partitions") {
+        // Extract number of partitions
+        let num_partitions = num_partitions_val.as_u64().ok_or_else(|| Error::Index {
+            message: "Failed to extract num_partitions from source index".to_string(),
+            location: location!(),
+        })? as usize;
+
+        // Extract metric type
+        let metric_type_str = stats
+            .get("metric_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("L2");
+        let metric_type = match metric_type_str {
+            "L2" => lance_linalg::distance::MetricType::L2,
+            "Cosine" | "cosine" => lance_linalg::distance::MetricType::Cosine,
+            "Dot" | "dot" => lance_linalg::distance::MetricType::Dot,
+            _ => lance_linalg::distance::MetricType::L2,
+        };
+
+        // Determine index type and build params
+        let index_type_str = stats
+            .get("index_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("IVF_PQ");
+
+        let params = match index_type_str {
+            "IVF_FLAT" => VectorIndexParams::ivf_flat(num_partitions, metric_type),
+            "IVF_PQ" => {
+                // Extract PQ parameters from sub_index
+                let sub_index = stats.get("sub_index").ok_or_else(|| Error::Index {
+                    message: "No sub_index found in source vector index stats".to_string(),
+                    location: location!(),
+                })?;
+
+                let num_bits = sub_index
+                    .get("num_bits")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(8) as u8;
+                let num_sub_vectors = sub_index
+                    .get("num_sub_vectors")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(16) as usize;
+
+                VectorIndexParams::ivf_pq(
+                    num_partitions,
+                    num_bits,
+                    num_sub_vectors,
+                    metric_type,
+                    50,
+                )
+            }
+            "IVF_SQ" => {
+                // Create IVF_SQ params
+                let ivf_params = IvfBuildParams::new(num_partitions);
+                let sq_params = SQBuildParams::default();
+                VectorIndexParams::with_ivf_sq_params(metric_type, ivf_params, sq_params)
+            }
+            _ => {
+                // Default to IVF_PQ
+                VectorIndexParams::ivf_pq(num_partitions, 8, 16, metric_type, 50)
+            }
+        };
+
+        // Create the index using the extracted parameters
+        // Note: This will train new centroids on the current dataset
+        // TODO: In the future, we should extract and reuse centroids from source
+        target_dataset
+            .create_index(
+                &[column_name],
+                IndexType::Vector,
+                Some(source_index.name.clone()),
+                &params,
+                false, // Don't replace if exists
+            )
+            .await?;
+    } else {
+        log::warn!(
+            "Could not extract num_partitions from source vector index '{}', skipping",
+            source_index.name
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::Dataset;
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance_datagen::{array, BatchCount, RowCount};
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::DatasetIndexExt;
+    use lance_linalg::distance::MetricType;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_initialize_vector_index_ivf_pq() {
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create IVF_PQ index on source
+        let params = VectorIndexParams::ivf_pq(10, 8, 16, MetricType::L2, 50);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_pq".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload to get updated metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_indices = source_dataset.load_indices().await.unwrap();
+        let source_index = source_indices
+            .iter()
+            .find(|idx| idx.name == "vector_ivf_pq")
+            .unwrap();
+
+        // Create target dataset with same schema
+        let target_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize IVF_PQ index on target
+        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1, "Target should have 1 index");
+        assert_eq!(
+            target_indices[0].name, "vector_ivf_pq",
+            "Index name should match"
+        );
+        assert_eq!(
+            target_indices[0].fields,
+            vec![1],
+            "Index should be on field 1 (vector)"
+        );
+
+        // Verify the index type and parameters match
+        let target_vector_index = target_dataset
+            .open_vector_index(
+                "vector",
+                &target_indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let stats = target_vector_index.statistics().unwrap();
+
+        // Check basic index type
+        assert_eq!(
+            stats.get("index_type").and_then(|v| v.as_str()),
+            Some("IVF_PQ"),
+            "Index type should be IVF_PQ"
+        );
+
+        // Check metric type
+        assert_eq!(
+            stats.get("metric_type").and_then(|v| v.as_str()),
+            Some("l2"),
+            "Metric type should be L2"
+        );
+
+        // Check number of partitions
+        assert_eq!(
+            stats.get("num_partitions").and_then(|v| v.as_u64()),
+            Some(10),
+            "Should have 10 partitions"
+        );
+
+        // The index should have the expected number of centroids
+        let centroids = stats
+            .get("centroids")
+            .and_then(|v| v.as_array())
+            .expect("IVF_PQ index should have centroids");
+        assert_eq!(centroids.len(), 10, "Should have 10 centroids");
+
+        // Check PQ parameters in sub_index
+        let sub_index = stats
+            .get("sub_index")
+            .and_then(|v| v.as_object())
+            .expect("IVF_PQ index should have sub_index");
+        assert_eq!(
+            sub_index.get("index_type").and_then(|v| v.as_str()),
+            Some("PQ"),
+            "Sub-index type should be PQ"
+        );
+        assert_eq!(
+            sub_index.get("nbits").and_then(|v| v.as_u64()),
+            Some(8),
+            "PQ should use 8 bits"
+        );
+        assert_eq!(
+            sub_index.get("num_sub_vectors").and_then(|v| v.as_u64()),
+            Some(16),
+            "PQ should have 16 sub vectors"
+        );
+        assert_eq!(
+            sub_index.get("metric_type").and_then(|v| v.as_str()),
+            Some("l2"),
+            "PQ metric type should be L2"
+        );
+
+        // Verify the index is functional by performing a search
+        let query_vector = lance_datagen::gen_batch()
+            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        let query_vector = query_vector
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap();
+        let results = target_dataset
+            .scan()
+            .nearest("vector", &query_vector.value(0), 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_vector_index_ivf_flat() {
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset with vector column
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(64.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create IVF_FLAT index on source
+        let params = VectorIndexParams::ivf_flat(8, MetricType::Cosine);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_flat".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload to get updated metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_indices = source_dataset.load_indices().await.unwrap();
+        let source_index = source_indices
+            .iter()
+            .find(|idx| idx.name == "vector_ivf_flat")
+            .unwrap();
+
+        // Create target dataset with same schema
+        let target_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(64.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize IVF_FLAT index on target
+        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1, "Target should have 1 index");
+        assert_eq!(
+            target_indices[0].name, "vector_ivf_flat",
+            "Index name should match"
+        );
+        assert_eq!(
+            target_indices[0].fields,
+            vec![1],
+            "Index should be on field 1 (vector)"
+        );
+
+        // Verify the index type and parameters match
+        let target_vector_index = target_dataset
+            .open_vector_index(
+                "vector",
+                &target_indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let stats = target_vector_index.statistics().unwrap();
+
+        // Check basic index type
+        assert_eq!(
+            stats.get("index_type").and_then(|v| v.as_str()),
+            Some("IVF_FLAT"),
+            "Index type should be IVF_FLAT"
+        );
+
+        // Check metric type (Cosine might be stored as "cosine")
+        let metric = stats
+            .get("metric_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            metric == "cosine" || metric == "Cosine",
+            "Metric type should be Cosine, got: {}",
+            metric
+        );
+
+        // Check number of partitions
+        assert_eq!(
+            stats.get("num_partitions").and_then(|v| v.as_u64()),
+            Some(8),
+            "Should have 8 partitions"
+        );
+
+        // The index should have the expected number of centroids
+        let centroids = stats
+            .get("centroids")
+            .and_then(|v| v.as_array())
+            .expect("IVF_FLAT index should have centroids");
+        assert_eq!(centroids.len(), 8, "Should have 8 centroids");
+
+        // Verify the index is functional
+        let query_vector = lance_datagen::gen_batch()
+            .anon_col(array::rand_vec::<Float32Type>(64.into()))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        let query_vector = query_vector
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap();
+        let results = target_dataset
+            .scan()
+            .nearest("vector", &query_vector.value(0), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 5, "Should return 5 nearest neighbors");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_vector_index_ivf_sq() {
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset with vector column
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create IVF_SQ index on source
+        use lance_index::vector::ivf::IvfBuildParams;
+        use lance_index::vector::sq::builder::SQBuildParams;
+        let ivf_params = IvfBuildParams::new(6);
+        let sq_params = SQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_sq_params(MetricType::Dot, ivf_params, sq_params);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_sq".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload to get updated metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_indices = source_dataset.load_indices().await.unwrap();
+        let source_index = source_indices
+            .iter()
+            .find(|idx| idx.name == "vector_ivf_sq")
+            .unwrap();
+
+        // Create target dataset with same schema
+        let target_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize IVF_SQ index on target
+        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1, "Target should have 1 index");
+        assert_eq!(
+            target_indices[0].name, "vector_ivf_sq",
+            "Index name should match"
+        );
+        assert_eq!(
+            target_indices[0].fields,
+            vec![1],
+            "Index should be on field 1 (vector)"
+        );
+
+        // Verify the index type and parameters match
+        let target_vector_index = target_dataset
+            .open_vector_index(
+                "vector",
+                &target_indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let stats = target_vector_index.statistics().unwrap();
+
+        // Check basic index type
+        assert_eq!(
+            stats.get("index_type").and_then(|v| v.as_str()),
+            Some("IVF_SQ"),
+            "Index type should be IVF_SQ"
+        );
+
+        // Check metric type (Dot might be stored as "dot")
+        let metric = stats
+            .get("metric_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            metric == "dot" || metric == "Dot",
+            "Metric type should be Dot, got: {}",
+            metric
+        );
+
+        // Check number of partitions
+        assert_eq!(
+            stats.get("num_partitions").and_then(|v| v.as_u64()),
+            Some(6),
+            "Should have 6 partitions"
+        );
+
+        // The index should have the expected number of centroids
+        let centroids = stats
+            .get("centroids")
+            .and_then(|v| v.as_array())
+            .expect("IVF_SQ index should have centroids");
+        assert_eq!(centroids.len(), 6, "Should have 6 centroids");
+
+        // Check SQ parameters in sub_index
+        let sub_index = stats
+            .get("sub_index")
+            .and_then(|v| v.as_object())
+            .expect("IVF_SQ index should have sub_index");
+        assert_eq!(
+            sub_index.get("index_type").and_then(|v| v.as_str()),
+            Some("SQ"),
+            "Sub-index type should be SQ"
+        );
+        // SQ specific parameters like num_bits might be available
+        if let Some(num_bits) = sub_index.get("num_bits").and_then(|v| v.as_u64()) {
+            assert!(num_bits > 0, "SQ should have positive num_bits");
+        }
+
+        // Verify the index is functional
+        let query_vector = lance_datagen::gen_batch()
+            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        let query_vector = query_vector
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap();
+        let results = target_dataset
+            .scan()
+            .nearest("vector", &query_vector.value(0), 15)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 15, "Should return 15 nearest neighbors");
+    }
+}

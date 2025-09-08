@@ -153,7 +153,28 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
-                let params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
+                let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
+
+                // If custom params were provided, extract the params JSON and apply it
+                let params = if let Some(provided_params) =
+                    self.params.as_any().downcast_ref::<ScalarIndexParams>()
+                {
+                    if let Some(params_json) = &provided_params.params {
+                        // Parse and apply the custom parameters
+                        if let Ok(json_value) =
+                            serde_json::from_str::<serde_json::Value>(params_json)
+                        {
+                            base_params.with_params(json_value)
+                        } else {
+                            base_params
+                        }
+                    } else {
+                        base_params
+                    }
+                } else {
+                    base_params
+                };
+
                 build_scalar_index(
                     self.dataset,
                     column,

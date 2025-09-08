@@ -72,8 +72,8 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
-    AnyQuery, CreatedIndex, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult,
-    TokenQuery, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
+    ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
 use crate::{pb, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -507,6 +507,20 @@ impl ScalarIndex for InvertedIndex {
         } else {
             UpdateCriteria::only_new_data(criteria)
         }
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let mut params = self.params.clone();
+        if params.base_tokenizer.is_empty() {
+            params.base_tokenizer = "simple".to_string();
+        }
+
+        let params_json = serde_json::to_string(&params)?;
+
+        Ok(ScalarIndexParams {
+            index_type: BuiltinIndexType::Inverted.as_str().to_string(),
+            params: Some(params_json),
+        })
     }
 }
 

@@ -719,4 +719,10 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
 
     /// Returns the criteria that will be used to update the index
     fn update_criteria(&self) -> UpdateCriteria;
+
+    /// Derive the index parameters from the current index
+    ///
+    /// This returns a ScalarIndexParams that can be used to recreate an index
+    /// with the same configuration on another dataset.
+    fn derive_index_params(&self) -> Result<ScalarIndexParams>;
 }

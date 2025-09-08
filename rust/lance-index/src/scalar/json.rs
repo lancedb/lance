@@ -156,6 +156,10 @@ impl ScalarIndex for JsonIndex {
     fn update_criteria(&self) -> UpdateCriteria {
         self.target_index.update_criteria()
     }
+
+    fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
+        self.target_index.derive_index_params()
+    }
 }
 
 /// Parameters for a [`JsonIndex`]
