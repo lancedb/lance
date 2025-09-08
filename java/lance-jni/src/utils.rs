@@ -38,6 +38,7 @@ pub fn extract_write_params(
     max_rows_per_group: &JObject,
     max_bytes_per_file: &JObject,
     mode: &JObject,
+    enable_move_stable_rowid: &JObject,
     storage_options_obj: &JObject,
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
@@ -53,6 +54,9 @@ pub fn extract_write_params(
     }
     if let Some(mode_val) = env.get_string_opt(mode)? {
         write_params.mode = WriteMode::try_from(mode_val.as_str())?;
+    }
+    if let Some(enable_move_stable_rowid_val) = env.get_boolean_opt(enable_move_stable_rowid)? {
+        write_params.enable_stable_row_ids = enable_move_stable_rowid_val;
     }
     // Java code always sets the data storage version to stable for now
     write_params.data_storage_version = Some(LanceFileVersion::Stable);
