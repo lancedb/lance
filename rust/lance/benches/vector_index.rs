@@ -164,7 +164,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         .await
         .unwrap();
     let ivf_params = IvfBuildParams {
-        num_partitions: 32,
+        num_partitions: Some(32),
         ..Default::default()
     };
     let pq_params = PQBuildParams {

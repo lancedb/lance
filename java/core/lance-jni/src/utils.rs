@@ -171,7 +171,7 @@ pub fn get_index_params(
             env.get_int_as_usize_from_method(&ivf_params_obj, "getShufflePartitionConcurrency")?;
 
         let ivf_params = IvfBuildParams {
-            num_partitions,
+            num_partitions: Some(num_partitions),
             max_iters,
             sample_rate,
             shuffle_partition_batches,
