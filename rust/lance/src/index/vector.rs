@@ -545,12 +545,15 @@ pub(crate) async fn build_vector_index_incremental(
     let quantizer = existing_index.quantizer();
 
     // Ensure the number of partitions matches
-    if ivf_model.num_partitions() != ivf_params.num_partitions {
+    let expected_partitions = ivf_params
+        .num_partitions
+        .unwrap_or(ivf_model.num_partitions());
+    if ivf_model.num_partitions() != expected_partitions {
         return Err(Error::Index {
             message: format!(
                 "Number of partitions mismatch: existing index has {} partitions, but params specify {}",
                 ivf_model.num_partitions(),
-                ivf_params.num_partitions
+                expected_partitions
             ),
             location: location!(),
         });
@@ -558,7 +561,7 @@ pub(crate) async fn build_vector_index_incremental(
 
     let temp_dir = tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
-    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, ivf_params.num_partitions));
+    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, ivf_model.num_partitions()));
 
     let index_dir = dataset.indices_dir().child(uuid);
 
