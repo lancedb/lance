@@ -214,16 +214,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 mod tests {
     use super::*;
 
-    use arrow::datatypes::Float32Type;
+    use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt32Type;
     use arrow_array::{
-        FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+        FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_datafusion::utils::reader_to_stream;
+    use lance_datagen::{array, Dimension, RowCount};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::storage::VectorStore;
@@ -237,9 +237,10 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
-    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
     use crate::index::vector::ivf::v2;
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[tokio::test]
     async fn test_append_index() {
@@ -475,38 +476,22 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        // Create initial dataset with vectors and ids
-        let vectors = generate_random_array(INITIAL_ROWS * DIM);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    DIM as i32,
-                ),
-                true,
-            ),
-            Field::new("id", DataType::UInt32, false),
-            Field::new("value", DataType::Utf8, false),
-        ]));
-
-        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                array.clone(),
-                Arc::new(UInt32Array::from_iter_values(0..INITIAL_ROWS as u32)),
-                Arc::new(StringArray::from(
-                    (0..INITIAL_ROWS)
-                        .map(|i| format!("value_{}", i))
-                        .collect::<Vec<_>>(),
-                )),
-            ],
-        )
-        .unwrap();
-
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        // Create initial dataset using lance_datagen
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::cycle_utf8_literals(&["a", "b", "c"]))
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)))
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount(1),
+                FragmentRowCount(INITIAL_ROWS as u32),
+                Some(WriteParams {
+                    max_rows_per_file: INITIAL_ROWS,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         // Create initial index
         let ivf_params = IvfBuildParams::new(IVF_PARTITIONS);
@@ -526,21 +511,13 @@ mod tests {
         assert_eq!(initial_indices.len(), 1);
         let index_name = initial_indices[0].name.clone();
 
-        // Prepare new data for merge insert (updates and inserts)
-        let new_vectors = generate_random_array(500 * DIM);
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(FixedSizeListArray::try_new_from_values(new_vectors, DIM as i32).unwrap()),
-                Arc::new(UInt32Array::from_iter_values(500..1000)), // Mix of updates and new inserts
-                Arc::new(StringArray::from(
-                    (500..1000)
-                        .map(|i| format!("new_value_{}", i))
-                        .collect::<Vec<_>>(),
-                )),
-            ],
-        )
-        .unwrap();
+        // Prepare new data for merge insert (updates to existing rows)
+        let new_batch = lance_datagen::gen_batch()
+            .col("id", array::step_custom::<UInt32Type>(500, 1))  // IDs 500-999
+            .col("value", array::cycle_utf8_literals(&["d", "e", "f"]))  // Different values
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)))
+            .into_batch_rows(RowCount::from(500))
+            .unwrap();
 
         // Record the maximum fragment ID before merge insert
         let max_fragment_id_before = dataset
@@ -559,6 +536,7 @@ mod tests {
                 .try_build()
                 .unwrap();
 
+        let schema = new_batch.schema();
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
         let (updated_dataset, merge_stats) = merge_job.execute(new_stream).await.unwrap();
@@ -615,11 +593,16 @@ mod tests {
         // There should still be indices (old one might be kept plus new one)
         assert!(!indices.is_empty());
 
-        // Test that search works
-        let q = array.value(5);
+        // Test that search works by querying for nearest neighbors
+        let query_batch = lance_datagen::gen_batch()
+            .col("query", array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap();
+        
+        let q = query_batch.column(0).as_fixed_size_list();
         let mut scanner = dataset.scan();
         scanner
-            .nearest("vector", q.as_primitive::<Float32Type>(), 10)
+            .nearest("vector", q.value(0).as_primitive::<Float32Type>(), 10)
             .unwrap();
         let results = scanner
             .try_into_stream()
