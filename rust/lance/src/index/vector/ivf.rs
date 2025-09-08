@@ -48,6 +48,7 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::utils::is_finite;
@@ -1760,14 +1761,13 @@ where
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     const REDOS: usize = 1;
+    let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
+        .with_balance_factor(1.0);
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
-        centroids,
         data,
+        kmeans_params,
         dimension,
         params.num_partitions,
-        params.max_iters as u32,
-        REDOS,
-        metric_type,
         params.sample_rate,
     )?;
     Ok(IvfModel::new(

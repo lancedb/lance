@@ -59,6 +59,8 @@ fn bench_train(c: &mut Criterion) {
                         data.values().as_primitive::<Float32Type>().values(),
                         dimension as usize,
                         DistanceType::L2,
+                        0.0,
+                        None,
                         Some(&index),
                     )
                 })

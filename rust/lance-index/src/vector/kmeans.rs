@@ -70,6 +70,13 @@ pub struct KMeansParams {
 
     /// The metric to calculate distance.
     pub distance_type: DistanceType,
+
+    /// Balance factor for the kmeans clustering.
+    /// Higher value means more balanced clustering.
+    ///
+    /// Setting this value to 0 means no balance factor,
+    /// which is the same as normal kmeans clustering.
+    pub balance_factor: f32,
 }
 
 impl Default for KMeansParams {
@@ -80,6 +87,7 @@ impl Default for KMeansParams {
             redos: 1,
             init: KMeanInit::Random,
             distance_type: DistanceType::L2,
+            balance_factor: 0.0,
         }
     }
 }
@@ -102,6 +110,11 @@ impl KMeansParams {
             init,
             ..Default::default()
         }
+    }
+
+    pub fn with_balance_factor(mut self, balance_factor: f32) -> Self {
+        self.balance_factor = balance_factor;
+        self
     }
 }
 
@@ -135,7 +148,7 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
 /// cluster has approximately half of the vectors.
 fn split_clusters<T: Float + MulAssign>(
     n: usize,
-    cnts: &mut [u64],
+    cnts: &mut [usize],
     centroids: &mut [T],
     dim: usize,
 ) {
@@ -168,27 +181,19 @@ fn split_clusters<T: Float + MulAssign>(
     }
 }
 
-fn histogram(k: usize, membership: &[Option<u32>]) -> Vec<usize> {
-    let mut hist: Vec<usize> = vec![0; k];
+fn compute_cluster_sizes(membership: &[Option<u32>], cluster_sizes: &mut [usize]) {
+    cluster_sizes.fill(0);
     membership.iter().for_each(|cd| {
         if let Some(cd) = cd {
-            hist[*cd as usize] += 1;
+            cluster_sizes[*cd as usize] += 1;
         }
     });
-
-    hist
 }
 
 /// Std deviation of the histogram / cluster distribution.
-fn hist_stddev(k: usize, membership: &[Option<u32>]) -> f32 {
-    let mean: f32 = membership.len() as f32 * 1.0 / k as f32;
-    let len = membership.len();
-    (histogram(k, membership)
-        .par_iter()
-        .map(|c| (*c as f32 - mean).powi(2))
-        .sum::<f32>()
-        / len as f32)
-        .sqrt()
+fn balance_loss(n: usize, k: usize, cluster_sizes: &[usize]) -> f32 {
+    let square_sum = cluster_sizes.iter().map(|s| s.pow(2)).sum::<usize>() as f32;
+    square_sum - (n as f32).powi(2) / k as f32
 }
 
 pub trait KMeansAlgo<T: Num> {
@@ -203,10 +208,19 @@ pub trait KMeansAlgo<T: Num> {
         data: &[T],
         dimension: usize,
         distance_type: DistanceType,
+        balance_factor: f32,
+        cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, f64) {
-        let (membership, dists) =
-            Self::compute_membership_and_dist(centroids, data, dimension, distance_type, index);
+        let (membership, dists) = Self::compute_membership_and_dist(
+            centroids,
+            data,
+            dimension,
+            distance_type,
+            balance_factor,
+            cluster_sizes,
+            index,
+        );
         (
             membership,
             dists
@@ -221,6 +235,8 @@ pub trait KMeansAlgo<T: Num> {
         data: &[T],
         dimension: usize,
         distance_type: DistanceType,
+        balance_factor: f32,
+        cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>);
 
@@ -230,6 +246,7 @@ pub trait KMeansAlgo<T: Num> {
         dimension: usize,
         k: usize,
         membership: &[Option<u32>],
+        cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans;
@@ -252,6 +269,8 @@ where
         data: &[T::Native],
         dimension: usize,
         distance_type: DistanceType,
+        balance_factor: f32,
+        cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
         let cluster_and_dists = match index {
@@ -259,6 +278,7 @@ where
                 .par_chunks(dimension)
                 .map(|vec| {
                     let query = PrimitiveArray::<T>::from_iter_values(vec.iter().copied());
+                    // unable to use balance_factor here because index.search returns the closest centroid
                     index
                         .search(Arc::new(query))
                         .map(|(id, dist)| Some((id, dist)))
@@ -268,11 +288,33 @@ where
             None => match distance_type {
                 DistanceType::L2 => data
                     .par_chunks(dimension)
-                    .map(|vec| argmin_value_float(l2_distance_batch(vec, centroids, dimension)))
+                    .map(|vec| {
+                        argmin_value_float(
+                            l2_distance_batch(vec, centroids, dimension)
+                                .enumerate()
+                                .map(|(id, dist)| {
+                                    dist + balance_factor
+                                        * cluster_sizes
+                                            .map(|sizes| sizes[id as usize] as f32)
+                                            .unwrap_or(0.0)
+                                }),
+                        )
+                    })
                     .collect::<Vec<_>>(),
                 DistanceType::Dot => data
                     .par_chunks(dimension)
-                    .map(|vec| argmin_value_float(dot_distance_batch(vec, centroids, dimension)))
+                    .map(|vec| {
+                        argmin_value_float(
+                            dot_distance_batch(vec, centroids, dimension)
+                                .enumerate()
+                                .map(|(id, dist)| {
+                                    dist + balance_factor
+                                        * cluster_sizes
+                                            .map(|sizes| sizes[id as usize] as f32)
+                                            .unwrap_or(0.0)
+                                }),
+                        )
+                    })
                     .collect::<Vec<_>>(),
                 _ => {
                     panic!(
@@ -291,10 +333,10 @@ where
         dimension: usize,
         k: usize,
         membership: &[Option<u32>],
+        cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut cluster_cnts = vec![0_u64; k];
         let mut centroids = vec![T::Native::zero(); k * dimension];
 
         let mut num_cpus = get_num_compute_intensive_cpus();
@@ -305,10 +347,9 @@ where
 
         centroids
             .par_chunks_mut(dimension * chunk_size)
-            .zip(cluster_cnts.par_chunks_mut(chunk_size))
             .enumerate()
             .with_max_len(1)
-            .for_each(|(i, (centroids, cnts))| {
+            .for_each(|(i, centroids)| {
                 let start = i * chunk_size;
                 let end = ((i + 1) * chunk_size).min(k);
                 data.chunks(dimension)
@@ -319,7 +360,6 @@ where
                     .for_each(|(vector, cluster_id)| {
                         if start <= cluster_id && cluster_id < end {
                             let local_id = cluster_id - start;
-                            cnts[local_id] += 1;
                             let centroid =
                                 &mut centroids[local_id * dimension..(local_id + 1) * dimension];
                             centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
@@ -329,15 +369,15 @@ where
 
         centroids
             .par_chunks_mut(dimension)
-            .zip(cluster_cnts.par_iter())
+            .zip(cluster_sizes.par_iter())
             .for_each(|(centroid, &cnt)| {
                 if cnt > 0 {
-                    let norm = T::Native::one() / T::Native::from_u64(cnt).unwrap();
+                    let norm = T::Native::one() / T::Native::from_usize(cnt).unwrap();
                     centroid.iter_mut().for_each(|v| *v *= norm);
                 }
             });
 
-        let empty_clusters = cluster_cnts.iter().filter(|&cnt| *cnt == 0).count();
+        let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             warn!(
                 "KMeans: more than 10% of clusters are empty: {} of {}.\nHelp: this could mean your dataset \
@@ -348,7 +388,7 @@ where
 
         split_clusters(
             data.len() / dimension,
-            &mut cluster_cnts,
+            cluster_sizes,
             &mut centroids,
             dimension,
         );
@@ -370,6 +410,8 @@ impl KMeansAlgo<u8> for KModeAlgo {
         data: &[u8],
         dimension: usize,
         distance_type: DistanceType,
+        balance_factor: f32,
+        cluster_sizes: Option<&[usize]>,
         _: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
         assert_eq!(distance_type, DistanceType::Hamming);
@@ -378,10 +420,15 @@ impl KMeansAlgo<u8> for KModeAlgo {
             .map(|vec| {
                 argmin_value(
                     centroids
-                        .par_chunks(dimension)
-                        .map(|c| hamming(vec, c))
-                        .collect::<Vec<f32>>()
-                        .into_iter(),
+                        .chunks_exact(dimension)
+                        .enumerate()
+                        .map(|(id, c)| {
+                            hamming(vec, c)
+                                + balance_factor
+                                    * cluster_sizes
+                                        .map(|sizes| sizes[id as usize] as f32)
+                                        .unwrap_or(0.0)
+                        }),
                 )
             })
             .collect::<Vec<_>>();
@@ -393,6 +440,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         dimension: usize,
         k: usize,
         membership: &[Option<u32>],
+        cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
@@ -537,7 +585,7 @@ impl KMeans {
                 )))?;
 
         let mut best_kmeans = Self::empty(dimension, params.distance_type);
-        let mut best_stddev = f32::MAX;
+        let mut cluster_sizes = vec![0; k];
 
         // TODO: use seed for Rng.
         let rng = SmallRng::from_os_rng();
@@ -559,7 +607,6 @@ impl KMeans {
             };
 
             let mut loss = f64::MAX;
-            let mut last_membership: Option<Vec<Option<u32>>> = None;
             for i in 1..=params.max_iters {
                 if i % 10 == 0 {
                     info!(
@@ -578,18 +625,23 @@ impl KMeans {
                     data.values(),
                     dimension,
                     params.distance_type,
+                    params.balance_factor,
+                    Some(&cluster_sizes),
                     index.as_ref(),
                 );
+
+                compute_cluster_sizes(&membership, &mut cluster_sizes);
+
                 kmeans = Algo::to_kmeans(
                     data.values(),
                     dimension,
                     k,
                     &membership,
+                    &mut cluster_sizes,
                     params.distance_type,
                     last_loss,
                 );
-                last_membership = Some(membership);
-                if (loss - last_loss).abs() / last_loss < params.tolerance {
+                if (loss - last_loss).abs() < params.tolerance * last_loss {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
                         i, params.max_iters, redo, loss, last_loss, (loss - last_loss).abs() / last_loss
@@ -598,14 +650,7 @@ impl KMeans {
                 }
                 loss = last_loss;
             }
-            let stddev = hist_stddev(
-                k,
-                last_membership
-                    .as_ref()
-                    .expect("Last membership should already set"),
-            );
-            if stddev < best_stddev {
-                best_stddev = stddev;
+            if kmeans.loss < best_kmeans.loss {
                 best_kmeans = kmeans;
             }
         }
@@ -836,6 +881,8 @@ where
         vectors.values(),
         dimension,
         distance_type,
+        0.0,
+        None,
         None,
     )
 }
@@ -855,6 +902,8 @@ where
         vectors.values(),
         dimension,
         distance_type,
+        0.0,
+        None,
         None,
     )
 }
@@ -873,13 +922,10 @@ where
 /// - *sample_rate*: sample rate to select the data for training
 #[allow(clippy::too_many_arguments)]
 pub fn train_kmeans<T: ArrowPrimitiveType>(
-    centroids: Option<Arc<FixedSizeListArray>>,
     array: &PrimitiveArray<T>,
+    params: KMeansParams,
     dimension: usize,
     k: usize,
-    max_iterations: u32,
-    redos: usize,
-    distance_type: DistanceType,
     sample_rate: usize,
 ) -> Result<KMeans>
 where
@@ -908,7 +954,6 @@ where
         array.clone()
     };
 
-    let params = KMeansParams::new(centroids, max_iterations, redos, distance_type);
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
     let model = KMeans::new_with_params(&data, k, &params)?;
     Ok(model)
@@ -997,6 +1042,8 @@ mod tests {
             data.values(),
             DIM,
             DistanceType::L2,
+            0.0,
+            None,
             None,
         );
         assert!(loss > 0.0, "loss is not zero: {}", loss);
@@ -1039,6 +1086,8 @@ mod tests {
             &values,
             DIM,
             DistanceType::L2,
+            0.0,
+            None,
             None,
         );
 
