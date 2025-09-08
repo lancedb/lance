@@ -963,8 +963,8 @@ pub(crate) async fn open_vector_index_v2(
 
 /// Initialize a vector index from a source dataset
 /// This will reuse the centroids from the source dataset,
-/// making the new indices act as delta indices. For scalar and FTS indices,
-/// this will recreate them with the same parameters.
+/// making the new indices basically a "delta index" of the source dataset,
+/// until the new dataset fully retains the index.
 pub async fn initialize_vector_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,

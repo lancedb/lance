@@ -1048,10 +1048,7 @@ mod tests {
             !params["lower_case"].as_bool().unwrap(),
             "lower_case should be false"
         );
-        assert!(
-            !params["stem"].as_bool().unwrap(),
-            "stem should be false"
-        );
+        assert!(!params["stem"].as_bool().unwrap(), "stem should be false");
         assert!(
             !params["remove_stop_words"].as_bool().unwrap(),
             "remove_stop_words should be false"
