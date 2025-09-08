@@ -10,7 +10,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
 use lance_index::VECTOR_INDEX_VERSION;
-use lance_table::format::Index as IndexMetadata;
+use lance_table::format::{Fragment, Index as IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
@@ -52,6 +52,36 @@ pub async fn merge_indices<'a>(
         });
     };
 
+    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
+    merge_indices_with_unindexed_frags(dataset, old_indices, unindexed, options).await
+}
+
+/// Merge in-inflight unindexed data with a known list of unindexed fragments,
+/// with a specific number of previous indices into a new index.
+///
+/// This is a helper function that allows callers to provide the unindexed fragments
+/// directly when they're already known (e.g., right after a commit).
+///
+/// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
+///
+/// Returns
+/// -------
+/// - the UUID of the new index
+/// - merged indices,
+/// - Bitmap of the fragments that covered in the newly created index.
+pub async fn merge_indices_with_unindexed_frags<'a>(
+    dataset: Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    unindexed: Vec<Fragment>,
+    options: &OptimizeOptions,
+) -> Result<Option<IndexMergeResults<'a>>> {
+    if old_indices.is_empty() {
+        return Err(Error::Index {
+            message: "Append index: no previous index found".to_string(),
+            location: location!(),
+        });
+    };
+
     let column = dataset
         .schema()
         .field_by_id(old_indices[0].fields[0])
@@ -80,7 +110,6 @@ pub async fn merge_indices<'a>(
             location: location!(),
         });
     }
-    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
 
     let mut frag_bitmap = RoaringBitmap::new();
     unindexed.iter().for_each(|frag| {
@@ -199,10 +228,11 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt32Type;
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_datafusion::utils::reader_to_stream;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::storage::VectorStore;
@@ -216,6 +246,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
     use crate::index::vector::ivf::v2;
     use crate::index::vector::VectorIndexParams;
 
@@ -442,5 +473,166 @@ mod tests {
         let mut id_arr = results["id"].as_primitive::<UInt32Type>().values().to_vec();
         id_arr.sort();
         assert_eq!(id_arr, vec![0, 1000]);
+    }
+
+    #[tokio::test]
+    async fn test_merge_indices_after_merge_insert() {
+        const DIM: usize = 64;
+        const IVF_PARTITIONS: usize = 2;
+        const INITIAL_ROWS: usize = 1000;
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create initial dataset with vectors and ids
+        let vectors = generate_random_array(INITIAL_ROWS * DIM);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                array.clone(),
+                Arc::new(UInt32Array::from_iter_values(0..INITIAL_ROWS as u32)),
+                Arc::new(StringArray::from(
+                    (0..INITIAL_ROWS)
+                        .map(|i| format!("value_{}", i))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        // Create initial index
+        let ivf_params = IvfBuildParams::new(IVF_PARTITIONS);
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 2,
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        // Load initial index metadata
+        let initial_indices = dataset.load_indices().await.unwrap();
+        assert_eq!(initial_indices.len(), 1);
+        let index_name = initial_indices[0].name.clone();
+
+        // Prepare new data for merge insert (updates and inserts)
+        let new_vectors = generate_random_array(500 * DIM);
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(FixedSizeListArray::try_new_from_values(new_vectors, DIM as i32).unwrap()),
+                Arc::new(UInt32Array::from_iter_values(500..1000)), // Mix of updates and new inserts
+                Arc::new(StringArray::from(
+                    (500..1000)
+                        .map(|i| format!("new_value_{}", i))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        // Execute merge insert operation
+        let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+        let (updated_dataset, merge_stats) = merge_job.execute(new_stream).await.unwrap();
+
+        // Check merge stats
+        assert_eq!(merge_stats.num_updated_rows, 500); // Updates for rows 500-999
+        assert_eq!(merge_stats.num_inserted_rows, 0);  // No new inserts in this case
+
+        // Get the newly added fragments from the transaction
+        // In a real scenario, you'd get this from the transaction itself
+        // For this test, we'll identify unindexed fragments
+        let all_fragments = updated_dataset.get_fragments();
+        let indexed_fragment_ids: Vec<u32> = initial_indices[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect();
+        
+        let unindexed_fragments: Vec<Fragment> = all_fragments
+            .into_iter()
+            .filter(|f| !indexed_fragment_ids.contains(&(f.id() as u32)))
+            .map(|f| f.metadata().clone())
+            .collect();
+
+        // Now use the new helper function with known unindexed fragments
+        let old_indices = updated_dataset.load_indices_by_name(&index_name).await.unwrap();
+        let old_indices_refs: Vec<&IndexMetadata> = old_indices.iter().collect();
+
+        let merge_result = merge_indices_with_unindexed_frags(
+            updated_dataset.clone(),
+            &old_indices_refs,
+            unindexed_fragments.clone(),
+            &OptimizeOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(merge_result.is_some());
+        let merge_result = merge_result.unwrap();
+
+        // Verify that the new index covers all fragments
+        let new_fragment_bitmap = &merge_result.new_fragment_bitmap;
+        
+        // Check that unindexed fragments are now included
+        for fragment in &unindexed_fragments {
+            assert!(new_fragment_bitmap.contains(fragment.id as u32));
+        }
+
+        // Check that old indexed fragments are still included
+        for frag_id in indexed_fragment_ids {
+            assert!(new_fragment_bitmap.contains(frag_id));
+        }
+
+        // Verify the index can be used for search
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        
+        // There should still be indices (old one might be kept plus new one)
+        assert!(!indices.is_empty());
+
+        // Test that search works
+        let q = array.value(5);
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", q.as_primitive::<Float32Type>(), 10)
+            .unwrap();
+        let results = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results[0].num_rows(), 10);
     }
 }
