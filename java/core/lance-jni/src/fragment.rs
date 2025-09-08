@@ -80,6 +80,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
     max_rows_per_group: JObject,  // Optional<Integer>
     max_bytes_per_file: JObject,  // Optional<Long>
     mode: JObject,                // Optional<String>
+    data_storage_version: JObject, // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
@@ -93,6 +94,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
             max_rows_per_group,
             max_bytes_per_file,
             mode,
+            data_storage_version,
             storage_options_obj
         ),
         JObject::default()
@@ -109,6 +111,7 @@ fn inner_create_with_ffi_array<'local>(
     max_rows_per_group: JObject,  // Optional<Integer>
     max_bytes_per_file: JObject,  // Optional<Long>
     mode: JObject,                // Optional<String>
+    data_storage_version: JObject, // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
@@ -131,6 +134,7 @@ fn inner_create_with_ffi_array<'local>(
         max_rows_per_group,
         max_bytes_per_file,
         mode,
+        data_storage_version,
         storage_options_obj,
         reader,
     )
@@ -146,6 +150,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
     max_rows_per_group: JObject,  // Optional<Integer>
     max_bytes_per_file: JObject,  // Optional<Long>
     mode: JObject,                // Optional<String>
+    data_storage_version: JObject, // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
@@ -158,6 +163,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
             max_rows_per_group,
             max_bytes_per_file,
             mode,
+            data_storage_version,
             storage_options_obj
         ),
         JObject::null()
@@ -173,6 +179,7 @@ fn inner_create_with_ffi_stream<'local>(
     max_rows_per_group: JObject,  // Optional<Integer>
     max_bytes_per_file: JObject,  // Optional<Long>
     mode: JObject,                // Optional<String>
+    data_storage_version: JObject, // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -185,6 +192,7 @@ fn inner_create_with_ffi_stream<'local>(
         max_rows_per_group,
         max_bytes_per_file,
         mode,
+        data_storage_version,
         storage_options_obj,
         reader,
     )
@@ -198,6 +206,7 @@ fn create_fragment<'a>(
     max_rows_per_group: JObject,  // Optional<Integer>
     max_bytes_per_file: JObject,  // Optional<Long>
     mode: JObject,                // Optional<String>
+    data_storage_version: JObject, // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
@@ -209,6 +218,7 @@ fn create_fragment<'a>(
         &max_rows_per_group,
         &max_bytes_per_file,
         &mode,
+        &data_storage_version,
         &storage_options_obj,
     )?;
     let fragments = RT.block_on(FileFragment::create_fragments(
