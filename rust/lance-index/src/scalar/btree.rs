@@ -1682,6 +1682,23 @@ pub struct PrefetchConfig {
     pub prefetch_batches: usize,
 }
 
+impl Default for PrefetchConfig {
+    fn default() -> Self {
+        Self {
+            prefetch_batches: 1,
+        }
+    }
+}
+
+impl PrefetchConfig {
+    /// Set the prefetch batch count
+    pub fn with_prefetch_batch(&self, batch_count: usize) -> Self {
+        Self {
+            prefetch_batches: batch_count,
+        }
+    }
+}
+
 /// Buffer entry for prefetch queue
 #[derive(Debug)]
 struct BufferEntry {
@@ -1971,23 +1988,6 @@ impl PrefetchManager {
                 message: format!("Partition {} not found in prefetch manager", partition_id),
                 location: location!(),
             })
-        }
-    }
-}
-
-impl Default for PrefetchConfig {
-    fn default() -> Self {
-        Self {
-            prefetch_batches: 1,
-        }
-    }
-}
-
-impl PrefetchConfig {
-    /// Set the prefetch batch count
-    pub fn with_prefetch_batch(&self, batch_count: usize) -> Self {
-        Self {
-            prefetch_batches: batch_count,
         }
     }
 }
