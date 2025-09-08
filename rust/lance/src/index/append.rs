@@ -56,8 +56,8 @@ pub async fn merge_indices<'a>(
     merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
 }
 
-/// Merge in-inflight unindexed data with a known list of unindexed fragments,
-/// with a specific number of previous indices into a new index.
+/// Merge a list of provided unindexed data, with a specific number of previous indices
+/// into a new index, to improve the query performance.
 pub async fn merge_indices_with_unindexed_frags<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
