@@ -1024,6 +1024,43 @@ def test_fts_deleted_rows(tmp_path):
     assert results.num_rows == 2
 
 
+def test_fts_multiple_columns(tmp_path):
+    data = pa.table(
+        {
+            "title": ["title hello", "title lance", "title common"],
+            "content": ["content world", "content database", "content common"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index(["title", "content"], "INVERTED")
+    results = ds.to_table(full_text_query=MatchQuery("title", "title"))
+    assert results.num_rows == 3
+    results = ds.to_table(full_text_query=MatchQuery("content", "content"))
+    assert results.num_rows == 3
+
+    results = ds.to_table(
+        full_text_query=BooleanQuery(
+            [
+                (Occur.SHOULD, MatchQuery("common", "title")),
+                (Occur.SHOULD, MatchQuery("common world database", "content")),
+            ]
+        )
+    )
+    assert results.num_rows == 3
+    # the common doc must be with the highest score
+    assert results["title"].to_pylist()[0] == "title common"
+    assert results["content"].to_pylist()[0] == "content common"
+
+    results = ds.to_table(
+        full_text_query=MatchQuery("common", "title")
+        | MatchQuery("common world database", "content")
+    )
+    assert results.num_rows == 3
+    # the common doc must be with the highest score
+    assert results["title"].to_pylist()[0] == "title common"
+    assert results["content"].to_pylist()[0] == "content common"
+
+
 def test_index_after_merge_insert(tmp_path):
     # This regresses a defect where a horizontal merge insert was not taking modified
     # fragments out of the index if the column is modified.
