@@ -466,7 +466,12 @@ impl WeakLanceCache {
         let cache = self.inner.upgrade()?;
         let key = self.get_key(key);
         if let Some(metadata) = cache.get(&(key, TypeId::of::<Arc<T>>())).await {
-            metadata.record.clone().downcast::<Arc<T>>().ok().map(|arc| arc.as_ref().clone())
+            metadata
+                .record
+                .clone()
+                .downcast::<Arc<T>>()
+                .ok()
+                .map(|arc| arc.as_ref().clone())
         } else {
             None
         }

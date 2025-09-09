@@ -345,7 +345,9 @@ pub mod tests {
                 .now_or_never()
                 .unwrap()
                 .unwrap();
-        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024));
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 

@@ -2553,7 +2553,9 @@ pub async fn decode_batch(
     let cache = if let Some(cache) = cache {
         cache
     } else {
-        Arc::new(lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024))
+        Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ))
     };
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),

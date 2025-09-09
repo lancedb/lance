@@ -1757,9 +1757,7 @@ mod tests {
             .unwrap();
 
         let cache = lance_core::cache::LanceCache::with_capacity(100 * 1024 * 1024);
-        let index = BTreeIndex::load(test_store, None, cache)
-            .await
-            .unwrap();
+        let index = BTreeIndex::load(test_store, None, cache).await.unwrap();
 
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
         let metrics = LocalMetricsCollector::default();
