@@ -315,7 +315,7 @@ const SEED: u64 = 0;
 
 #[inline]
 fn hash_as_bytes<A: AsBytes + ?Sized>(value: &A) -> u64 {
-    XxHash64::oneshot(SEED, value.as_bytes())
+    XxHash64::oneshot(SEED, &value.as_bytes())
 }
 
 /// Builder for creating SBBF instances with a fluent API

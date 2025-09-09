@@ -44,48 +44,38 @@ use snafu::location;
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
-const BLOOMFILTER_BITS_META_KEY: &str = "bloomfilter_bits";
+const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
 #[derive(Debug, PartialEq, Clone, DeepSizeOf)]
 struct BloomFilterStatistics {
     fragment_id: u64,
-    // block_start is the start row of the block in the fragment, also known
+    // zone_start is the start row of the zone in the fragment, also known
     // as local row offset
-    block_start: u64,
-    block_size: usize,
-    // Whether this block contains any null values
+    zone_start: u64,
+    zone_size: usize,
+    // Whether this zone contains any null values
     has_null: bool,
     // Serialized bloom filter data (SBBF bytes)
     bloom_filter_data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
 pub struct BloomFilterIndex {
-    blocks: Vec<BloomFilterStatistics>,
+    zones: Vec<BloomFilterStatistics>,
+    // Number of items in the filter
     number_of_items: u64,
-    number_of_bytes: usize,
+    // Probability of false positives, fraction between 0 and 1
+    probability: f64,
 
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
     index_cache: LanceCache,
 }
 
-impl std::fmt::Debug for BloomFilterIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BloomFilterIndex")
-            .field("blocks", &self.blocks)
-            .field("number_of_items", &self.number_of_items)
-            .field("number_of_bytes", &self.number_of_bytes)
-            .field("store", &self.store)
-            .field("fri", &self.fri)
-            .field("index_cache", &self.index_cache)
-            .finish()
-    }
-}
-
 impl DeepSizeOf for BloomFilterIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.blocks.deep_size_of_children(context)
+        self.zones.deep_size_of_children(context)
     }
 }
 
@@ -107,11 +97,11 @@ impl BloomFilterIndex {
             .and_then(|bs| bs.parse().ok())
             .unwrap_or(*DEFAULT_NUMBER_OF_ITEMS);
 
-        let number_of_bytes: usize = file_schema
+        let probability: f64 = file_schema
             .metadata
-            .get(BLOOMFILTER_BITS_META_KEY)
+            .get(BLOOMFILTER_PROBABILITY_META_KEY)
             .and_then(|bs| bs.parse().ok())
-            .unwrap_or(*DEFAULT_NUMBER_OF_BYTES);
+            .unwrap_or(*DEFAULT_PROBABILITY);
 
         Ok(Arc::new(Self::try_from_serialized(
             bloom_data,
@@ -119,7 +109,7 @@ impl BloomFilterIndex {
             fri,
             index_cache,
             number_of_items,
-            number_of_bytes,
+            probability,
         )?))
     }
 
@@ -129,14 +119,14 @@ impl BloomFilterIndex {
         fri: Option<Arc<FragReuseIndex>>,
         index_cache: LanceCache,
         number_of_items: u64,
-        number_of_bytes: usize,
+        probability: f64,
     ) -> Result<Self> {
         if data.num_rows() == 0 {
             // Return empty index for empty data
             return Ok(Self {
-                blocks: Vec::new(),
+                zones: Vec::new(),
                 number_of_items,
-                number_of_bytes,
+                probability,
                 store,
                 fri,
                 index_cache,
@@ -160,33 +150,30 @@ impl BloomFilterIndex {
                 )
             })?;
 
-        let block_start_col = data
-            .column_by_name("block_start")
+        let zone_start_col = data
+            .column_by_name("zone_start")
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "BloomFilterIndex: missing 'block_start' column",
-                    location!(),
-                )
+                Error::invalid_input("BloomFilterIndex: missing 'zone_start' column", location!())
             })?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "BloomFilterIndex: 'block_start' column is not UInt64",
+                    "BloomFilterIndex: 'zone_start' column is not UInt64",
                     location!(),
                 )
             })?;
 
-        let block_size_col = data
-            .column_by_name("block_size")
+        let zone_size_col = data
+            .column_by_name("zone_size")
             .ok_or_else(|| {
-                Error::invalid_input("BloomFilterIndex: missing 'block_size' column", location!())
+                Error::invalid_input("BloomFilterIndex: missing 'zone_size' column", location!())
             })?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "BloomFilterIndex: 'block_size' column is not UInt64",
+                    "BloomFilterIndex: 'zone_size' column is not UInt64",
                     location!(),
                 )
             })?;
@@ -234,17 +221,17 @@ impl BloomFilterIndex {
 
             blocks.push(BloomFilterStatistics {
                 fragment_id: fragment_id_col.value(i),
-                block_start: block_start_col.value(i),
-                block_size: block_size_col.value(i) as usize,
+                zone_start: zone_start_col.value(i),
+                zone_size: zone_size_col.value(i) as usize,
                 has_null: has_null_col.value(i),
                 bloom_filter_data,
             });
         }
 
         Ok(Self {
-            blocks,
+            zones: blocks,
             number_of_items,
-            number_of_bytes,
+            probability,
             store,
             fri,
             index_cache,
@@ -369,9 +356,9 @@ impl Index for BloomFilterIndex {
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
             "type": "BloomFilter",
-            "num_blocks": self.blocks.len(),
+            "num_blocks": self.zones.len(),
             "number_of_items": self.number_of_items,
-            "number_of_bytes": self.number_of_bytes,
+            "probability": self.probability,
         }))
     }
 
@@ -382,8 +369,8 @@ impl Index for BloomFilterIndex {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frag_ids = RoaringBitmap::new();
 
-        // Loop through blocks and add unique fragment IDs to the bitmap
-        for block in &self.blocks {
+        // Loop through zones and add unique fragment IDs to the bitmap
+        for block in &self.zones {
             frag_ids.insert(block.fragment_id as u32);
         }
 
@@ -398,21 +385,21 @@ impl ScalarIndex for BloomFilterIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        metrics.record_comparisons(self.blocks.len());
+        metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
         let mut row_id_tree_map = RowIdTreeMap::new();
 
-        // For each block, check if it might contain the queried value
-        for block in self.blocks.iter() {
+        // For each zone, check if it might contain the queried value
+        for block in self.zones.iter() {
             if self.evaluate_block_against_query(block, query)? {
-                // Calculate the range of row addresses for this block
-                // Row addresses are: (fragment_id << 32) + block_start
-                let block_start_addr = (block.fragment_id << 32) + block.block_start;
-                let block_end_addr = block_start_addr + (block.block_size as u64);
+                // Calculate the range of row addresses for this zone
+                // Row addresses are: (fragment_id << 32) + zone_start
+                let zone_start_addr = (block.fragment_id << 32) + block.zone_start;
+                let zone_end_addr = zone_start_addr + (block.zone_size as u64);
 
-                // Add all row addresses in this block to the result
-                row_id_tree_map.insert_range(block_start_addr..block_end_addr);
+                // Add all row addresses in this zone to the result
+                row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
             }
         }
 
@@ -444,7 +431,7 @@ impl ScalarIndex for BloomFilterIndex {
 
         let mut builder = BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
             number_of_items: self.number_of_items,
-            number_of_bytes: self.number_of_bytes,
+            probability: self.probability,
         })?;
 
         builder.train(batches_source).await?;
@@ -452,15 +439,15 @@ impl ScalarIndex for BloomFilterIndex {
         // Get the new blocks from the builder
         let new_blocks = builder.blocks;
 
-        // Combine existing blocks with new blocks
-        let mut all_blocks = self.blocks.clone();
+        // Combine existing zones with new zones
+        let mut all_blocks = self.zones.clone();
         all_blocks.extend(new_blocks);
 
         // Create a new builder with all blocks to write them out
         let mut combined_builder =
             BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
                 number_of_items: self.number_of_items,
-                number_of_bytes: self.number_of_bytes,
+                probability: self.probability,
             })?;
         combined_builder.blocks = all_blocks;
 
@@ -485,11 +472,11 @@ fn default_number_of_items() -> u64 {
     *DEFAULT_NUMBER_OF_ITEMS
 }
 
-fn default_number_of_bytes() -> usize {
-    *DEFAULT_NUMBER_OF_BYTES
+fn default_probability() -> f64 {
+    *DEFAULT_PROBABILITY
 }
 
-// NumberOfItems: 8192 + NumberOfBytes: 16384(16KiB) + 8 SALT values -> Probability of false positive: 0.00057(1 in 1754)
+// NumberOfItems: 8192 + Probability: 0.00057(1 in 1754) -> NumberOfBytes: 16384(16KiB) + 8 SALT values
 // reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
 static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_ITEMS")
@@ -498,37 +485,37 @@ static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
         .expect("failed to parse Lance_BLOOMFILTER_DEFAULT_NUMBER_OF_ITEMS")
 });
 
-static DEFAULT_NUMBER_OF_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("LANCE_BLOOMFILTER_DEFAULT_NUMBER_OF_BYTES")
-        // 16384 = 16KiB
-        .unwrap_or_else(|_| "16384".to_string())
+static DEFAULT_PROBABILITY: LazyLock<f64> = LazyLock::new(|| {
+    std::env::var("LANCE_BLOOMFILTER_DEFAULT_PROBABILITY")
+        // 0.00057 ≈ 1 in 1754 false positive rate
+        .unwrap_or_else(|_| "0.00057".to_string())
         .parse()
-        .expect("failed to parse Lance_BLOOMFILTER_DEFAULT_NUMBER_OF_BYTES")
+        .expect("failed to parse LANCE_BLOOMFILTER_DEFAULT_PROBABILITY")
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BloomFilterIndexBuilderParams {
     #[serde(default = "default_number_of_items")]
     number_of_items: u64,
-    #[serde(default = "default_number_of_bytes")]
-    number_of_bytes: usize,
+    #[serde(default = "default_probability")]
+    probability: f64,
 }
 
 impl Default for BloomFilterIndexBuilderParams {
     fn default() -> Self {
         Self {
             number_of_items: *DEFAULT_NUMBER_OF_ITEMS,
-            number_of_bytes: *DEFAULT_NUMBER_OF_BYTES,
+            probability: *DEFAULT_PROBABILITY,
         }
     }
 }
 
 impl BloomFilterIndexBuilderParams {
     #[cfg(test)]
-    fn new(number_of_items: u64, number_of_bytes: usize) -> Self {
+    fn new(number_of_items: u64, probability: f64) -> Self {
         Self {
             number_of_items,
-            number_of_bytes,
+            probability,
         }
     }
 }
@@ -536,10 +523,10 @@ impl BloomFilterIndexBuilderParams {
 pub struct BloomFilterIndexBuilder {
     params: BloomFilterIndexBuilderParams,
     blocks: Vec<BloomFilterStatistics>,
-    // The local offset within the current blocks
-    cur_block_offset: usize,
+    // The local offset within the current zones
+    cur_zone_offset: usize,
     cur_fragment_id: u64,
-    cur_block_has_null: bool,
+    cur_zone_has_null: bool,
     sbbf: Option<Sbbf>,
 }
 
@@ -547,7 +534,7 @@ impl BloomFilterIndexBuilder {
     pub fn try_new(params: BloomFilterIndexBuilderParams) -> Result<Self> {
         let sbbf = SbbfBuilder::new()
             .expected_items(params.number_of_items)
-            .num_bytes(params.number_of_bytes)
+            .false_positive_probability(params.probability)
             .build()
             .map_err(|e| Error::InvalidInput {
                 source: format!("Failed to build SBBF: {:?}", e).into(),
@@ -557,9 +544,9 @@ impl BloomFilterIndexBuilder {
         Ok(Self {
             params,
             blocks: Vec::new(),
-            cur_block_offset: 0,
+            cur_zone_offset: 0,
             cur_fragment_id: 0,
-            cur_block_has_null: false,
+            cur_zone_has_null: false,
             sbbf: Some(sbbf),
         })
     }
@@ -699,20 +686,20 @@ impl BloomFilterIndexBuilder {
                 }
             };
 
-            // Update the current block's null tracking
-            self.cur_block_has_null = self.cur_block_has_null || has_null;
+            // Update the current zone's null tracking
+            self.cur_zone_has_null = self.cur_zone_has_null || has_null;
         }
 
         Ok(())
     }
 
     fn new_block(&mut self, fragment_id: u64) -> Result<()> {
-        // Calculate block_start based on existing blocks in the same fragment
-        let block_start = self
+        // Calculate zone_start based on existing zones in the same fragment
+        let zone_start = self
             .blocks
             .iter()
             .filter(|block| block.fragment_id == fragment_id)
-            .map(|block| block.block_size as u64)
+            .map(|block| block.zone_size as u64)
             .sum::<u64>();
 
         // Store the current bloom filter data
@@ -724,21 +711,21 @@ impl BloomFilterIndexBuilder {
 
         let new_block = BloomFilterStatistics {
             fragment_id,
-            block_start,
-            block_size: self.cur_block_offset,
-            has_null: self.cur_block_has_null,
+            zone_start,
+            zone_size: self.cur_zone_offset,
+            has_null: self.cur_zone_has_null,
             bloom_filter_data,
         };
 
         self.blocks.push(new_block);
-        self.cur_block_offset = 0;
-        self.cur_block_has_null = false;
+        self.cur_zone_offset = 0;
+        self.cur_zone_has_null = false;
 
         // Reset sbbf for the next block
         self.sbbf = Some(
             SbbfBuilder::new()
                 .expected_items(self.params.number_of_items)
-                .num_bytes(self.params.number_of_bytes)
+                .false_positive_probability(self.params.probability)
                 .build()
                 .map_err(|e| Error::InvalidInput {
                     source: format!("Failed to build SBBF: {:?}", e).into(),
@@ -772,7 +759,7 @@ impl BloomFilterIndexBuilder {
             let mut array_offset: usize = 0;
 
             // Initialize cur_fragment_id from the first row address if this is the first batch
-            if self.blocks.is_empty() && self.cur_block_offset == 0 {
+            if self.blocks.is_empty() && self.cur_zone_offset == 0 {
                 let first_row_addr = row_addrs_array.value(0);
                 self.cur_fragment_id = first_row_addr >> 32;
             }
@@ -785,7 +772,7 @@ impl BloomFilterIndexBuilder {
                     fragment_id == self.cur_fragment_id + 1
                 });
                 let empty_rows_left_in_cur_zone: usize =
-                    (self.params.number_of_items - self.cur_block_offset as u64) as usize;
+                    (self.params.number_of_items - self.cur_zone_offset as u64) as usize;
 
                 // Check if there is enough data from the current fragment to fill the current zone
                 let desired = if let Some(idx) = next_fragment_index {
@@ -800,16 +787,16 @@ impl BloomFilterIndexBuilder {
                 if desired > remaining {
                     // Not enough data to fill a map, just increment counts
                     self.update_stats(&data_array.slice(array_offset, remaining))?;
-                    self.cur_block_offset += remaining;
+                    self.cur_zone_offset += remaining;
                     break;
                 } else if desired > 0 {
-                    // There is enough data, create a new block
+                    // There is enough data, create a new zone
                     self.update_stats(&data_array.slice(array_offset, desired))?;
-                    self.cur_block_offset += desired;
+                    self.cur_zone_offset += desired;
                     self.new_block(row_addrs_array.value(array_offset) >> 32)?;
                 } else if desired == 0 {
                     // The new batch starts with a new fragment. Flush the current zone if it's not empty
-                    if self.cur_block_offset > 0 {
+                    if self.cur_zone_offset > 0 {
                         self.new_block(self.cur_fragment_id - 1)?;
                     }
                     // Let the loop run again
@@ -820,8 +807,8 @@ impl BloomFilterIndexBuilder {
                 remaining = remaining.saturating_sub(desired);
             }
         }
-        // Create the final block
-        if self.cur_block_offset > 0 {
+        // Create the final zone
+        if self.cur_zone_offset > 0 {
             self.new_block(self.cur_fragment_id)?;
         }
 
@@ -832,11 +819,11 @@ impl BloomFilterIndexBuilder {
         let fragment_ids =
             UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.fragment_id));
 
-        let block_starts =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.block_start));
+        let zone_starts =
+            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.zone_start));
 
-        let block_sizes =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.block_size as u64));
+        let zone_sizes =
+            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.zone_size as u64));
 
         let has_nulls = arrow_array::BooleanArray::from(
             self.blocks
@@ -859,16 +846,16 @@ impl BloomFilterIndexBuilder {
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("block_start", DataType::UInt64, false),
-            Field::new("block_size", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_size", DataType::UInt64, false),
             Field::new("has_null", DataType::Boolean, false),
             Field::new("bloom_filter_data", DataType::Binary, false),
         ]));
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(fragment_ids) as ArrayRef,
-            Arc::new(block_starts) as ArrayRef,
-            Arc::new(block_sizes) as ArrayRef,
+            Arc::new(zone_starts) as ArrayRef,
+            Arc::new(zone_sizes) as ArrayRef,
             Arc::new(has_nulls) as ArrayRef,
             bloom_filter_data,
         ];
@@ -886,8 +873,8 @@ impl BloomFilterIndexBuilder {
         );
 
         file_schema.metadata.insert(
-            BLOOMFILTER_BITS_META_KEY.to_string(),
-            self.params.number_of_bytes.to_string(),
+            BLOOMFILTER_PROBABILITY_META_KEY.to_string(),
+            self.params.probability.to_string(),
         );
 
         let mut index_file = index_store
@@ -1035,8 +1022,8 @@ mod tests {
 
     use crate::scalar::{
         bloomfilter::{
-            BloomFilterIndex, BloomFilterIndexBuilderParams, BLOOMFILTER_BITS_META_KEY,
-            BLOOMFILTER_FILENAME, BLOOMFILTER_ITEM_META_KEY,
+            BloomFilterIndex, BloomFilterIndexBuilderParams, BLOOMFILTER_FILENAME,
+            BLOOMFILTER_ITEM_META_KEY, BLOOMFILTER_PROBABILITY_META_KEY,
         },
         lance_format::LanceIndexStore,
         SargableQuery, ScalarIndex, SearchResult,
@@ -1101,9 +1088,9 @@ mod tests {
         let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
-        assert_eq!(index.blocks.len(), 0);
+        assert_eq!(index.zones.len(), 0);
         assert_eq!(index.number_of_items, 8192);
-        assert_eq!(index.number_of_bytes, 16384); // 16kib
+        assert_eq!(index.probability, 0.00057); // Default probability
 
         // Equals query: null (should match nothing, as there are no nulls in empty index)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
@@ -1136,7 +1123,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(100, 1024)),
+            Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
         )
         .await
         .unwrap();
@@ -1148,14 +1135,14 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        assert_eq!(index.blocks.len(), 1);
+        assert_eq!(index.zones.len(), 1);
         assert_eq!(index.number_of_items, 100);
-        assert_eq!(index.number_of_bytes, 1024);
+        assert_eq!(index.probability, 0.01);
 
-        // Check that we have one block (since 100 items fit exactly in one block of size 100)
-        assert_eq!(index.blocks[0].fragment_id, 0);
-        assert_eq!(index.blocks[0].block_start, 0);
-        assert_eq!(index.blocks[0].block_size, 100);
+        // Check that we have one zone (since 100 items fit exactly in one zone of size 100)
+        assert_eq!(index.zones[0].fragment_id, 0);
+        assert_eq!(index.zones[0].zone_start, 0);
+        assert_eq!(index.zones[0].zone_size, 100);
 
         // Test search functionality
         // The bloom filter should work correctly and find the value
@@ -1220,7 +1207,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(50, 1024)),
+            Some(BloomFilterIndexBuilderParams::new(50, 0.05)), // ~5% false positive rate
         )
         .await
         .unwrap();
@@ -1230,26 +1217,26 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        // Should have 4 blocks total (2 blocks per fragment)
-        assert_eq!(index.blocks.len(), 4);
+        // Should have 4 zones total (2 zones per fragment)
+        assert_eq!(index.zones.len(), 4);
 
-        // Check fragment 0 blocks
-        assert_eq!(index.blocks[0].fragment_id, 0);
-        assert_eq!(index.blocks[0].block_start, 0);
-        assert_eq!(index.blocks[0].block_size, 50);
+        // Check fragment 0 zones
+        assert_eq!(index.zones[0].fragment_id, 0);
+        assert_eq!(index.zones[0].zone_start, 0);
+        assert_eq!(index.zones[0].zone_size, 50);
 
-        assert_eq!(index.blocks[1].fragment_id, 0);
-        assert_eq!(index.blocks[1].block_start, 50);
-        assert_eq!(index.blocks[1].block_size, 50);
+        assert_eq!(index.zones[1].fragment_id, 0);
+        assert_eq!(index.zones[1].zone_start, 50);
+        assert_eq!(index.zones[1].zone_size, 50);
 
-        // Check fragment 1 blocks
-        assert_eq!(index.blocks[2].fragment_id, 1);
-        assert_eq!(index.blocks[2].block_start, 0);
-        assert_eq!(index.blocks[2].block_size, 50);
+        // Check fragment 1 zones
+        assert_eq!(index.zones[2].fragment_id, 1);
+        assert_eq!(index.zones[2].zone_start, 0);
+        assert_eq!(index.zones[2].zone_size, 50);
 
-        assert_eq!(index.blocks[3].fragment_id, 1);
-        assert_eq!(index.blocks[3].block_start, 50);
-        assert_eq!(index.blocks[3].block_size, 50);
+        assert_eq!(index.zones[3].fragment_id, 1);
+        assert_eq!(index.zones[3].zone_start, 50);
+        assert_eq!(index.zones[3].zone_size, 50);
 
         // Test search functionality
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(150)));
@@ -1305,7 +1292,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(100, 1024)),
+            Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
         )
         .await
         .unwrap();
@@ -1315,8 +1302,8 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        // Should have 5 blocks since we have 500 rows and block size is 100
-        assert_eq!(index.blocks.len(), 5);
+        // Should have 5 zones since we have 500 rows and zone size is 100
+        assert_eq!(index.zones.len(), 5);
 
         // Test search for NaN values using Equals with NaN
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));
@@ -1393,7 +1380,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(1000, 2048)), // 10 blocks total
+            Some(BloomFilterIndexBuilderParams::new(1000, 0.001)), // 10 blocks total
         )
         .await
         .unwrap();
@@ -1403,24 +1390,24 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        // Should have 10 blocks since we have 10000 rows and block size is 1000
-        assert_eq!(index.blocks.len(), 10);
+        // Should have 10 zones since we have 10000 rows and zone size is 1000
+        assert_eq!(index.zones.len(), 10);
         assert_eq!(index.number_of_items, 1000);
-        assert_eq!(index.number_of_bytes, 2048);
+        assert_eq!(index.probability, 0.001);
 
-        // Verify block structure
-        for (i, block) in index.blocks.iter().enumerate() {
+        // Verify zone structure
+        for (i, block) in index.zones.iter().enumerate() {
             assert_eq!(block.fragment_id, 0);
-            assert_eq!(block.block_start, (i * 1000) as u64);
-            assert_eq!(block.block_size, 1000);
+            assert_eq!(block.zone_start, (i * 1000) as u64);
+            assert_eq!(block.zone_size, 1000);
             assert!(!block.bloom_filter_data.is_empty());
         }
 
-        // Test search for a value in a specific block
-        let query = SargableQuery::Equals(ScalarValue::Int64(Some(2500))); // In block 2 (2000-2999)
+        // Test search for a value in a specific zone
+        let query = SargableQuery::Equals(ScalarValue::Int64(Some(2500))); // In zone 2 (2000-2999)
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match block 2
+        // Should match zone 2
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(2000..3000);
         assert_eq!(result, SearchResult::AtMost(expected));
@@ -1432,20 +1419,20 @@ mod tests {
         // Should return empty since bloom filter correctly filters out this value
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
 
-        // Test IsIn query with values from different blocks
+        // Test IsIn query with values from different zones
         let query = SargableQuery::IsIn(vec![
-            ScalarValue::Int64(Some(500)),   // Block 0 (0-999)
-            ScalarValue::Int64(Some(2500)),  // Block 2 (2000-2999)
-            ScalarValue::Int64(Some(7500)),  // Block 7 (7000-7999)
-            ScalarValue::Int64(Some(50000)), // Not in any block
+            ScalarValue::Int64(Some(500)),   // Zone 0 (0-999)
+            ScalarValue::Int64(Some(2500)),  // Zone 2 (2000-2999)
+            ScalarValue::Int64(Some(7500)),  // Zone 7 (7000-7999)
+            ScalarValue::Int64(Some(50000)), // Not in any zone
         ]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match blocks 0, 2, and 7
+        // Should match zones 0, 2, and 7
         let mut expected = RowIdTreeMap::new();
-        expected.insert_range(0..1000); // Block 0
-        expected.insert_range(2000..3000); // Block 2
-        expected.insert_range(7000..8000); // Block 7
+        expected.insert_range(0..1000); // Zone 0
+        expected.insert_range(2000..3000); // Zone 2
+        expected.insert_range(7000..8000); // Zone 7
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test calculate_included_frags
@@ -1482,7 +1469,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(100, 1024)),
+            Some(BloomFilterIndexBuilderParams::new(100, 0.01)), // ~1% false positive rate
         )
         .await
         .unwrap();
@@ -1492,23 +1479,23 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        // Should have 2 blocks since we have 200 rows and block size is 100
-        assert_eq!(index.blocks.len(), 2);
+        // Should have 2 zones since we have 200 rows and zone size is 100
+        assert_eq!(index.zones.len(), 2);
 
-        // Test search for a value in the first block
+        // Test search for a value in the first zone
         let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_050".to_string())));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the first block
+        // Should match the first zone
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(0..100);
         assert_eq!(result, SearchResult::AtMost(expected));
 
-        // Test search for a value in the second block
+        // Test search for a value in the second zone
         let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_150".to_string())));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the second block
+        // Should match the second zone
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(100..200);
         assert_eq!(result, SearchResult::AtMost(expected));
@@ -1522,13 +1509,13 @@ mod tests {
 
         // Test IsIn query with string values
         let query = SargableQuery::IsIn(vec![
-            ScalarValue::Utf8(Some("value_025".to_string())), // First block
-            ScalarValue::Utf8(Some("value_175".to_string())), // Second block
+            ScalarValue::Utf8(Some("value_025".to_string())), // First zone
+            ScalarValue::Utf8(Some("value_175".to_string())), // Second zone
             ScalarValue::Utf8(Some("nonexistent".to_string())), // Not present
         ]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match both blocks
+        // Should match both zones
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(0..200);
         assert_eq!(result, SearchResult::AtMost(expected));
@@ -1563,7 +1550,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(50, 1024)),
+            Some(BloomFilterIndexBuilderParams::new(50, 0.05)),
         )
         .await
         .unwrap();
@@ -1573,23 +1560,23 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        // Should have 2 blocks since we have 100 rows and block size is 50
-        assert_eq!(index.blocks.len(), 2);
+        // Should have 2 zones since we have 100 rows and zone size is 50
+        assert_eq!(index.zones.len(), 2);
 
-        // Test search for a value in the first block
+        // Test search for a value in the first zone
         let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![25, 26, 27])));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the first block
+        // Should match the first zone
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(0..50);
         assert_eq!(result, SearchResult::AtMost(expected));
 
-        // Test search for a value in the second block
+        // Test search for a value in the second zone
         let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![75, 76, 77])));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the second block
+        // Should match the second zone
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(50..100);
         assert_eq!(result, SearchResult::AtMost(expected));
@@ -1631,7 +1618,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(50, 1024)),
+            Some(BloomFilterIndexBuilderParams::new(50, 0.05)),
         )
         .await
         .unwrap();
@@ -1641,7 +1628,7 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        assert_eq!(index.blocks.len(), 2);
+        assert_eq!(index.zones.len(), 2);
 
         // Test search functionality
         let query = SargableQuery::Equals(ScalarValue::LargeUtf8(Some(
@@ -1649,7 +1636,7 @@ mod tests {
         )));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
-        // Should match the first block
+        // Should match the first zone
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(0..50);
         assert_eq!(result, SearchResult::AtMost(expected));
@@ -1689,7 +1676,7 @@ mod tests {
         BloomFilterIndexPlugin::train_bloomfilter_index(
             data_stream,
             test_store.as_ref(),
-            Some(BloomFilterIndexBuilderParams::new(250, 1024)), // 4 blocks total
+            Some(BloomFilterIndexBuilderParams::new(250, 0.01)), // 4 zones total
         )
         .await
         .unwrap();
@@ -1699,7 +1686,7 @@ mod tests {
             .await
             .expect("Failed to load BloomFilterIndex");
 
-        assert_eq!(index.blocks.len(), 4);
+        assert_eq!(index.zones.len(), 4);
 
         // Test range query - bloom filters should return NotSupported error for range queries
         let query = SargableQuery::Range(

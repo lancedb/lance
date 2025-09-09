@@ -1954,10 +1954,9 @@ class LanceDataset(pa.dataset.Dataset):
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
-        * ``BLOOMFILTER``. This inexact index is a probabilistic data structure
-          that answers "Is this item definitely NOT in the set?" with 100% accuracy,
-          and "Is this item MAYBE in the set?" with some false positives with minimal
-          memory usage.
+        * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
+             but can only handle filters with equals and not equals and may require
+             more I/O than a btree or bitmap index```
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion

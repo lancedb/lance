@@ -61,7 +61,6 @@ pub enum BuiltinIndexType {
     NGram,
     ZoneMap,
     Inverted,
-    BloomFilter,
 }
 
 impl BuiltinIndexType {
@@ -73,7 +72,6 @@ impl BuiltinIndexType {
             Self::NGram => "ngram",
             Self::ZoneMap => "zonemap",
             Self::Inverted => "inverted",
-            Self::BloomFilter => "bloomfilter",
         }
     }
 }
@@ -89,7 +87,6 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::NGram => Ok(Self::NGram),
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
-            IndexType::BloomFilter => Ok(Self::BloomFilter),
             _ => Err(Error::Index {
                 message: "Invalid index type".to_string(),
                 location: location!(),
@@ -101,8 +98,6 @@ impl TryFrom<IndexType> for BuiltinIndexType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScalarIndexParams {
     /// The type of index to create
-    ///
-    /// Builtin indexes are listed in BuiltinIndexType
     ///
     /// Plugins may add additional index types.  Index type lookup is case-insensitive.
     pub index_type: String,
