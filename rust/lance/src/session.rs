@@ -95,28 +95,9 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        use lance_core::cache::SizedRecord;
-        use moka::future::Cache;
-
-        let index_cache_arc = Arc::new(
-            Cache::builder()
-                .max_capacity(index_cache_size as u64)
-                .weigher(|_, v: &SizedRecord| v.deep_size_of().try_into().unwrap_or(u32::MAX))
-                .support_invalidation_closures()
-                .build(),
-        );
-
-        let metadata_cache_arc = Arc::new(
-            Cache::builder()
-                .max_capacity(metadata_cache_size as u64)
-                .weigher(|_, v: &SizedRecord| v.deep_size_of().try_into().unwrap_or(u32::MAX))
-                .support_invalidation_closures()
-                .build(),
-        );
-
         Self {
-            index_cache: GlobalIndexCache(LanceCache::from_arc(index_cache_arc)),
-            metadata_cache: GlobalMetadataCache(LanceCache::from_arc(metadata_cache_arc)),
+            index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
+            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
         }

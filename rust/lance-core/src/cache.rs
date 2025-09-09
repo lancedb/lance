@@ -78,16 +78,6 @@ impl DeepSizeOf for LanceCache {
 }
 
 impl LanceCache {
-    /// Create from an existing Arc<Cache>
-    pub fn from_arc(cache: Arc<Cache<(String, TypeId), SizedRecord>>) -> Self {
-        Self {
-            cache,
-            prefix: String::new(),
-            hits: Arc::new(AtomicU64::new(0)),
-            misses: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
     pub fn with_capacity(capacity: usize) -> Self {
         let cache = Cache::builder()
             .max_capacity(capacity as u64)
