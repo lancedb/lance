@@ -129,7 +129,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        INVERTED_INDEX_VERSION
     }
 
     fn new_query_parser(

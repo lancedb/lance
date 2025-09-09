@@ -1191,7 +1191,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        BLOOMFILTER_INDEX_VERSION
     }
 
     fn new_query_parser(
