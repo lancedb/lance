@@ -357,21 +357,20 @@ message DataFile {
 //
 // The path of the deletion file is constructed as:
 //   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
-// where {extension} is `.arrow` or `.bin` depending on the type of deletion.
+// where {extension} depends on DeletionFileType.
 message DeletionFile {
-  // Type of deletion file, which varies depending on what is the most efficient
-  // way to store the deleted row offsets. If none, then will be unspecified. If there are
-  // sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there are
-  // densely deleted rows, then BIT_MAP is the most efficient.
+  // Type of deletion file, intended as a way to increase efficiency of the storage of deleted row
+  // offsets. If there are sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there
+  // are densely deleted rows, then BITMAP is the most efficient.
   enum DeletionFileType {
-    // Deletion file is a single Int32Array of deleted row offsets. This is stored as
-    // an Arrow IPC file with one batch and one column. Has a .arrow extension.
+    // A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
+    // one column. Has a .arrow extension.
     ARROW_ARRAY = 0;
-    // Deletion file is a Roaring Bitmap of deleted row offsets. Has a .bin extension.
+    // A Roaring Bitmap of deleted row offsets. Has a .bin extension.
     BITMAP = 1;
   }
 
-  // Type of deletion file. If it is unspecified, then the remaining fields will be missing.
+  // Type of deletion file.
   DeletionFileType file_type = 1;
   // The version of the dataset this deletion file was built from.
   uint64 read_version = 2;
@@ -380,8 +379,9 @@ message DeletionFile {
   uint64 id = 3;
   // The number of rows that are marked as deleted.
   uint64 num_deleted_rows = 4;
-  // The base path index of the data file. Used when the file is imported or referred from another dataset.
-  // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+  // The base path index of the deletion file. Used when the file is imported or referred from another
+  // dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base
+  // path of the deletion file.
   optional uint32 base_id = 7;
 } // DeletionFile
 
