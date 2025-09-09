@@ -54,7 +54,9 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
+use lance_io::object_store::ObjectStore;
 use log::{debug, warn};
+use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
@@ -1458,6 +1460,47 @@ fn extract_partition_id(filename: &str) -> Result<u64> {
         message: format!("Failed to parse partition ID from filename: {}", filename),
         location: location!(),
     })
+}
+
+/// List and filter files from the index directory
+/// Returns (page_files, lookup_files)
+pub async fn list_page_lookup_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut part_page_files = Vec::new();
+    let mut part_lookup_files = Vec::new();
+
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                let file_name = meta.location.filename().unwrap_or_default();
+                // Filter files matching the pattern part_*_page_data.lance
+                if file_name.starts_with("part_") && file_name.ends_with("_page_data.lance") {
+                    part_page_files.push(file_name.to_string());
+                }
+                // Filter files matching the pattern part_*_page_lookup.lance
+                if file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance") {
+                    part_lookup_files.push(file_name.to_string());
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if part_page_files.is_empty() || part_lookup_files.is_empty() {
+        return Err(Error::Internal {
+            message: format!(
+                "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
+                index_dir, part_page_files.len(), part_lookup_files.len()
+            ),
+            location: location!(),
+        });
+    }
+
+    Ok((part_page_files, part_lookup_files))
 }
 
 /// Merge multiple partition page / lookup files into a complete metadata file

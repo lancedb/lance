@@ -92,6 +92,99 @@ def data_table(indexed_dataset: lance.LanceDataset):
     return indexed_dataset.scanner().to_table()
 
 
+@pytest.fixture
+def btree_comparison_datasets(tmp_path):
+    """Setup datasets for B-tree comparison tests"""
+    # Test configuration
+    num_fragments = 3
+    rows_per_fragment = 10000
+    total_rows = num_fragments * rows_per_fragment
+
+    # Create dataset for fragment-level indexing
+    fragment_ds = generate_multi_fragment_dataset(
+        tmp_path / "fragment",
+        num_fragments=num_fragments,
+        rows_per_fragment=rows_per_fragment,
+    )
+
+    # Create dataset for complete indexing (same data structure)
+    complete_ds = generate_multi_fragment_dataset(
+        tmp_path / "complete",
+        num_fragments=num_fragments,
+        rows_per_fragment=rows_per_fragment,
+    )
+
+    import uuid
+
+    # Build fragment-level B-tree index
+    fragment_index_id = str(uuid.uuid4())
+    fragment_index_name = "fragment_btree_precise_test"
+
+    fragments = fragment_ds.get_fragments()
+    fragment_ids = [fragment.fragment_id for fragment in fragments]
+    print(f"Fragment IDs: {fragment_ids}")
+
+    # Create fragment-level indices
+    for fragment in fragments:
+        fragment_id = fragment.fragment_id
+        print(f"Creating B-tree index for fragment {fragment_id}")
+
+        fragment_ds.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            name=fragment_index_name,
+            replace=False,
+            fragment_uuid=fragment_index_id,
+            fragment_ids=[fragment_id],
+        )
+
+    # Merge fragment indices
+    fragment_ds.merge_index_metadata(fragment_index_id, index_type="BTREE")
+
+    # Create Index object for fragment-based index
+    from lance.dataset import Index
+
+    field_id = fragment_ds.schema.get_field_index("id")
+
+    fragment_index = Index(
+        uuid=fragment_index_id,
+        name=fragment_index_name,
+        fields=[field_id],
+        dataset_version=fragment_ds.version,
+        fragment_ids=set(fragment_ids),
+        index_version=0,
+    )
+
+    # Commit fragment-based index
+    create_fragment_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[fragment_index],
+        removed_indices=[],
+    )
+
+    fragment_ds_committed = lance.LanceDataset.commit(
+        fragment_ds.uri,
+        create_fragment_index_op,
+        read_version=fragment_ds.version,
+    )
+
+    # Build complete B-tree index
+    complete_index_name = f"complete_btree_{uuid.uuid4().hex[:8]}"
+    complete_ds.create_scalar_index(
+        column="id",
+        index_type="BTREE",
+        name=complete_index_name,
+    )
+    # Reload the dataset to get the indexed version
+    complete_ds = lance.dataset(complete_ds.uri)
+
+    return {
+        "fragment_ds": fragment_ds_committed,
+        "complete_ds": complete_ds,
+        "rows_per_fragment": rows_per_fragment,
+        "total_rows": total_rows,
+    }
+
+
 def test_load_indices(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.list_indices()
     vec_idx = next(idx for idx in indices if idx["type"] == "IVF_PQ")
@@ -2999,16 +3092,13 @@ def test_distribute_btree_index_build(tmp_path):
     import uuid
 
     index_id = str(uuid.uuid4())
-    print(f"Using index ID: {index_id}")
     index_name = "btree_multiple_fragment_idx"
 
     fragments = ds.get_fragments()
     fragment_ids = [fragment.fragment_id for fragment in fragments]
-    print(f"Fragment IDs: {fragment_ids}")
 
     for fragment in ds.get_fragments():
         fragment_id = fragment.fragment_id
-        print(f"Creating B-tree index for fragment {fragment_id}")
 
         # Create B-tree scalar index for each fragment
         # Use the same index_name for all fragments (like in FTS test)
@@ -3021,13 +3111,8 @@ def test_distribute_btree_index_build(tmp_path):
             fragment_ids=[fragment_id],
         )
 
-        # For fragment-level indexing, we expect the method to return successfully
-        # but not commit the index yet
-        print(f"Fragment {fragment_id} B-tree index created successfully")
-
     # Merge the B-tree index metadata
     ds.merge_index_metadata(index_id, index_type="BTREE")
-    print(ds.uri)
 
     # Create an Index object using the new dataclass format
     from lance.dataset import Index
@@ -3057,8 +3142,6 @@ def test_distribute_btree_index_build(tmp_path):
         read_version=ds.version,
     )
 
-    print("Successfully committed multiple fragment B-tree index")
-
     # Verify the index was created and is functional
     indices = ds_committed.list_indices()
     assert len(indices) > 0, "No indices found after commit"
@@ -3083,7 +3166,6 @@ def test_distribute_btree_index_build(tmp_path):
         columns=["id", "text"],
     ).to_table()
 
-    print(f"Search for id = {test_id} returned {results.num_rows} results")
     assert results.num_rows > 0, f"No results found for id = {test_id}"
 
     # Test range queries across fragments
@@ -3092,7 +3174,6 @@ def test_distribute_btree_index_build(tmp_path):
         columns=["id", "text"],
     ).to_table()
 
-    print(f"Range query returned {results_range.num_rows} results")
     assert results_range.num_rows > 0, "No results found for range query"
 
     # Compare with complete index results to ensure consistency
@@ -3129,210 +3210,6 @@ def test_distribute_btree_index_build(tmp_path):
         f"Distributed index range query returned {results_range.num_rows} results, "
         f"but complete index returned {reference_range_results.num_rows} results"
     )
-
-
-def test_btree_precise_query_comparison(tmp_path):
-    """
-    Precise comparison test between fragment-level B-tree index and complete
-    B-tree index.
-    This test creates identical datasets and compares query results in detail.
-    """
-    # Test configuration
-    num_fragments = 3
-    rows_per_fragment = 10000
-    total_rows = num_fragments * rows_per_fragment
-
-    print(
-        f"Creating datasets with {num_fragments} fragments,"
-        f" {rows_per_fragment} rows each"
-    )
-
-    # Create dataset for fragment-level indexing
-    fragment_ds = generate_multi_fragment_dataset(
-        tmp_path / "fragment",
-        num_fragments=num_fragments,
-        rows_per_fragment=rows_per_fragment,
-    )
-
-    # Create dataset for complete indexing (same data structure)
-    complete_ds = generate_multi_fragment_dataset(
-        tmp_path / "complete",
-        num_fragments=num_fragments,
-        rows_per_fragment=rows_per_fragment,
-    )
-
-    import uuid
-
-    # Build fragment-level B-tree index
-    fragment_index_id = str(uuid.uuid4())
-    fragment_index_name = "fragment_btree_precise_test"
-
-    fragments = fragment_ds.get_fragments()
-    fragment_ids = [fragment.fragment_id for fragment in fragments]
-    print(f"Fragment IDs: {fragment_ids}")
-
-    # Create fragment-level indices
-    for fragment in fragments:
-        fragment_id = fragment.fragment_id
-        print(f"Creating B-tree index for fragment {fragment_id}")
-
-        fragment_ds.create_scalar_index(
-            column="id",
-            index_type="BTREE",
-            name=fragment_index_name,
-            replace=False,
-            fragment_uuid=fragment_index_id,
-            fragment_ids=[fragment_id],
-        )
-
-    # Merge fragment indices
-    fragment_ds.merge_index_metadata(fragment_index_id, index_type="BTREE")
-
-    # Create Index object for fragment-based index
-    from lance.dataset import Index
-
-    field_id = fragment_ds.schema.get_field_index("id")
-
-    fragment_index = Index(
-        uuid=fragment_index_id,
-        name=fragment_index_name,
-        fields=[field_id],
-        dataset_version=fragment_ds.version,
-        fragment_ids=set(fragment_ids),
-        index_version=0,
-    )
-
-    # Commit fragment-based index
-    create_fragment_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[fragment_index],
-        removed_indices=[],
-    )
-
-    fragment_ds_committed = lance.LanceDataset.commit(
-        fragment_ds.uri,
-        create_fragment_index_op,
-        read_version=fragment_ds.version,
-    )
-
-    # Build complete B-tree index
-    complete_index_name = "complete_btree_precise_test"
-    complete_ds.create_scalar_index(
-        column="id",
-        index_type="BTREE",
-        name=complete_index_name,
-    )
-
-    print("Both indices created successfully")
-
-    # Detailed query comparison tests
-    test_cases = [
-        # Test 1: Boundary values at fragment edges
-        {"name": "First value", "filter": "id = 0"},
-        {"name": "Fragment 0 last value", "filter": f"id = {rows_per_fragment - 1}"},
-        {"name": "Fragment 1 first value", "filter": f"id = {rows_per_fragment}"},
-        {
-            "name": "Fragment 1 last value",
-            "filter": f"id = {2 * rows_per_fragment - 1}",
-        },
-        {"name": "Fragment 2 first value", "filter": f"id = {2 * rows_per_fragment}"},
-        {"name": "Last value", "filter": f"id = {total_rows - 1}"},
-        # Test 2: Values in the middle of fragments
-        {"name": "Fragment 0 middle", "filter": f"id = {rows_per_fragment // 2}"},
-        {
-            "name": "Fragment 1 middle",
-            "filter": f"id = {rows_per_fragment + rows_per_fragment // 2}",
-        },
-        {
-            "name": "Fragment 2 middle",
-            "filter": f"id = {2 * rows_per_fragment + rows_per_fragment // 2}",
-        },
-        # Test 3: Range queries within single fragments
-        {"name": "Range within fragment 0", "filter": "id >= 10 AND id < 20"},
-        {
-            "name": "Range within fragment 1",
-            "filter": f"id >= {rows_per_fragment + 10}"
-            f" AND id < {rows_per_fragment + 20}",
-        },
-        {
-            "name": "Range within fragment 2",
-            "filter": f"id >= {2 * rows_per_fragment + 10}"
-            f" AND id < {2 * rows_per_fragment + 20}",
-        },
-        # Test 4: Range queries spanning multiple fragments
-        {
-            "name": "Cross fragment 0-1",
-            "filter": f"id >= {rows_per_fragment - 5} AND id < {rows_per_fragment + 5}",
-        },
-        {
-            "name": "Cross fragment 1-2",
-            "filter": f"id >= {2 * rows_per_fragment - 5}"
-            f" AND id < {2 * rows_per_fragment + 5}",
-        },
-        {
-            "name": "Cross all fragments",
-            "filter": f"id >= {rows_per_fragment // 2} AND"
-            f" id < {2 * rows_per_fragment + rows_per_fragment // 2}",
-        },
-        # Test 5: Edge cases
-        {"name": "Non-existent small value", "filter": "id = -1"},
-        {"name": "Non-existent large value", "filter": f"id = {total_rows + 100}"},
-        {"name": "Large range", "filter": f"id >= 0 AND id < {total_rows}"},
-        # Test 6: Comparison operators
-        {"name": "Less than boundary", "filter": f"id < {rows_per_fragment}"},
-        {
-            "name": "Greater than boundary",
-            "filter": f"id > {2 * rows_per_fragment - 1}",
-        },
-        {"name": "Less than or equal", "filter": f"id <= {rows_per_fragment + 50}"},
-        {"name": "Greater than or equal", "filter": f"id >= {rows_per_fragment + 50}"},
-    ]
-
-    print(f"\nRunning {len(test_cases)} detailed comparison tests:")
-
-    for i, test_case in enumerate(test_cases, 1):
-        test_name = test_case["name"]
-        filter_expr = test_case["filter"]
-
-        print(f"  {i:2d}. Testing {test_name}: {filter_expr}")
-
-        # Query fragment-based index
-        fragment_results = fragment_ds_committed.scanner(
-            filter=filter_expr,
-            columns=["id", "text"],
-        ).to_table()
-
-        # Query complete index
-        complete_results = complete_ds.scanner(
-            filter=filter_expr,
-            columns=["id", "text"],
-        ).to_table()
-
-        # Compare row counts
-        assert fragment_results.num_rows == complete_results.num_rows, (
-            f"Test '{test_name}' failed: Fragment index "
-            f"returned {fragment_results.num_rows} rows, "
-            f"but complete index returned {complete_results.num_rows}"
-            f" rows for filter: {filter_expr}"
-        )
-
-        # Compare actual results if there are any
-        if fragment_results.num_rows > 0:
-            # Sort both results by id for comparison
-            fragment_ids = sorted(fragment_results.column("id").to_pylist())
-            complete_ids = sorted(complete_results.column("id").to_pylist())
-
-            assert fragment_ids == complete_ids, (
-                f"Test '{test_name}' failed: Fragment index"
-                f" returned different IDs than complete index. "
-                f"Fragment IDs:"
-                f" {fragment_ids[:10]}{'...' if len(fragment_ids) > 10 else ''}, "
-                f"Complete IDs:"
-                f" {complete_ids[:10]}{'...' if len(complete_ids) > 10 else ''}"
-            )
-
-        print(f"Passed ({fragment_results.num_rows} rows)")
-
-    print(f"All {len(test_cases)} precision tests passed.")
 
 
 def test_btree_fragment_ids_parameter_validation(tmp_path):
@@ -3391,3 +3268,80 @@ def test_btree_backward_compatibility_no_fragment_ids(tmp_path):
     # Test that the index works
     results = ds.scanner(filter="id = 50").to_table()
     assert results.num_rows > 0
+
+
+@pytest.mark.parametrize(
+    "test_name,filter_expr",
+    [
+        # Test 1: Boundary values at fragment edges
+        ("First value", "id = 0"),
+        ("Fragment 0 last value", "id = 9999"),
+        ("Fragment 1 first value", "id = 10000"),
+        ("Fragment 1 last value", "id = 19999"),
+        ("Fragment 2 first value", "id = 20000"),
+        ("Last value", "id = 29999"),
+        # Test 2: Values in the middle of fragments
+        ("Fragment 0 middle", "id = 5000"),
+        ("Fragment 1 middle", "id = 15000"),
+        ("Fragment 2 middle", "id = 25000"),
+        # Test 3: Range queries within single fragments
+        ("Range within fragment 0", "id >= 10 AND id < 20"),
+        ("Range within fragment 1", "id >= 10010 AND id < 10020"),
+        ("Range within fragment 2", "id >= 20010 AND id < 20020"),
+        # Test 4: Range queries spanning multiple fragments
+        ("Cross fragment 0-1", "id >= 9995 AND id < 10005"),
+        ("Cross fragment 1-2", "id >= 19995 AND id < 20005"),
+        ("Cross all fragments", "id >= 5000 AND id < 25000"),
+        # Test 5: Edge cases
+        ("Non-existent small value", "id = -1"),
+        ("Non-existent large value", "id = 30100"),
+        ("Large range", "id >= 0 AND id < 30000"),
+        # Test 6: Comparison operators
+        ("Less than boundary", "id < 10000"),
+        ("Greater than boundary", "id > 19999"),
+        ("Less than or equal", "id <= 10050"),
+        ("Greater than or equal", "id >= 10050"),
+    ],
+)
+def test_btree_query_comparison_parametrized(
+    btree_comparison_datasets, test_name, filter_expr
+):
+    """
+    Parametrized B-tree index query comparison test
+
+    Convert the original loop test to parametrized test,
+    each test case runs independently
+    """
+    fragment_ds = btree_comparison_datasets["fragment_ds"]
+    complete_ds = btree_comparison_datasets["complete_ds"]
+
+    # Query fragment-based index
+    fragment_results = fragment_ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+    ).to_table()
+
+    # Query complete index
+    complete_results = complete_ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+    ).to_table()
+
+    # Compare row counts
+    assert fragment_results.num_rows == complete_results.num_rows, (
+        f"Test '{test_name}' failed: Fragment index "
+        f"returned {fragment_results.num_rows} rows, "
+        f"but complete index returned {complete_results.num_rows}"
+        f" rows for filter: {filter_expr}"
+    )
+
+    # Compare actual results if there are any
+    if fragment_results.num_rows > 0:
+        # Sort both results by id for comparison
+        fragment_ids = sorted(fragment_results.column("id").to_pylist())
+        complete_ids = sorted(complete_results.column("id").to_pylist())
+
+        assert fragment_ids == complete_ids, (
+            f"Test '{test_name}' failed: Fragment index "
+            f"and complete index returned different results for filter: {filter_expr}"
+        )

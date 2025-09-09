@@ -2734,21 +2734,19 @@ class LanceDataset(pa.dataset.Dataset):
     def merge_index_metadata(
         self,
         index_uuid: str,
-        index_type: Union[
-            Literal["BTREE"],
-            Literal["INVERTED"],
-        ],
+        index_type: str,
         prefetch_batch: Optional[int] = None,
     ):
         """
-        Merge an index which not commit at present.
+        Merge an index which is not commit at present.
 
         Parameters
         ----------
         index_uuid: str
             The uuid of the index which want to merge.
-        index_type: Literal["BTREE", "INVERTED"]
+        index_type: str
             The type of the index.
+            Only "BTREE" and "INVERTED" are supported now.
         prefetch_batch: int, optional
             The number of prefetch batches of sub-page files for merging.
             Default 1.
