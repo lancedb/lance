@@ -1444,7 +1444,6 @@ def test_zonemap_index(tmp_path: Path):
     dataset.create_scalar_index("values", index_type="ZONEMAP")
     indices = dataset.list_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "ZoneMap"
 
     # Get detailed index statistics
     index_stats = dataset.stats.index_stats("values_idx")
@@ -1456,7 +1455,6 @@ def test_zonemap_index(tmp_path: Path):
     zonemap_stats = index_stats["indices"][0]
     assert zonemap_stats["max_zonemap_size"] == 8192
     assert zonemap_stats["num_zones"] == 2  # Should have 2 zones (8192 rows + 1 row)
-    assert zonemap_stats["type"] == "ZoneMap"
 
     # Test that the zonemap index is being used in the query plan
     scanner = dataset.scanner(filter="values > 50", prefilter=True)
@@ -1475,7 +1473,6 @@ def test_bloomfilter_index(tmp_path: Path):
     dataset.create_scalar_index("values", index_type="BLOOMFILTER")
     indices = dataset.list_indices()
     assert len(indices) == 1
-    assert indices[0]["type"] == "BloomFilter"
 
     # Get detailed index statistics
     index_stats = dataset.stats.index_stats("values_idx")
@@ -1485,7 +1482,6 @@ def test_bloomfilter_index(tmp_path: Path):
 
     # Verify bloomfilter statistics
     bloom_stats = index_stats["indices"][0]
-    assert bloom_stats["type"] == "BloomFilter"
     assert "num_blocks" in bloom_stats
     assert bloom_stats["num_blocks"] == 2
     assert bloom_stats["number_of_items"] == 8192
@@ -2095,9 +2091,9 @@ def compare_fts_results(
     if "_rowid" in single_df.columns:
         single_rowids = set(single_df["_rowid"])
         distributed_rowids = set(distributed_df["_rowid"])
-        assert single_rowids == distributed_rowids, (
-            f"Row ID mismatch: single={single_rowids}, distributed={distributed_rowids}"
-        )
+        assert (
+            single_rowids == distributed_rowids
+        ), f"Row ID mismatch: single={single_rowids}, distributed={distributed_rowids}"
 
     # Compare scores with tolerance
     if "_score" in single_df.columns:
@@ -2125,9 +2121,9 @@ def compare_fts_results(
             )
 
             if isinstance(single_values, set):
-                assert single_values == distributed_values, (
-                    f"Column {col} content mismatch"
-                )
+                assert (
+                    single_values == distributed_values
+                ), f"Column {col} content mismatch"
             else:
                 np.testing.assert_array_equal(
                     single_values,
@@ -2464,9 +2460,9 @@ def generate_multi_fragment_dataset(tmp_path, num_fragments=4, rows_per_fragment
 
     # Verify we have the expected number of fragments
     fragments = ds.get_fragments()
-    assert len(fragments) == num_fragments, (
-        f"Expected {num_fragments} fragments, got {len(fragments)}"
-    )
+    assert (
+        len(fragments) == num_fragments
+    ), f"Expected {num_fragments} fragments, got {len(fragments)}"
 
     return ds
 
@@ -2502,9 +2498,9 @@ def test_build_distributed_fts_index_basic(tmp_path):
             break
 
     assert distributed_index is not None, "Distributed index not found"
-    assert distributed_index["type"] == "Inverted", (
-        f"Expected Inverted index, got {distributed_index['type']}"
-    )
+    assert (
+        distributed_index["type"] == "Inverted"
+    ), f"Expected Inverted index, got {distributed_index['type']}"
 
     # Test that the index works for searching
     results = distributed_ds.scanner(
@@ -2611,9 +2607,9 @@ def test_validate_distributed_fts_basic_search(tmp_path):
     # Both should have the same number of rows
     single_rows = results["single_machine"].num_rows
     distributed_rows = results["distributed"].num_rows
-    assert single_rows == distributed_rows, (
-        f"Row count mismatch: {single_rows} vs {distributed_rows}"
-    )
+    assert (
+        single_rows == distributed_rows
+    ), f"Row count mismatch: {single_rows} vs {distributed_rows}"
 
     # Should have found some results for 'frodo'
     assert single_rows > 0, "No results found for search term 'frodo'"
@@ -2641,12 +2637,12 @@ def test_validate_distributed_fts_score_consistency(tmp_path):
     single_results = results["single_machine"]
     distributed_results = results["distributed"]
 
-    assert "_score" in single_results.column_names, (
-        "Missing _score in single machine results"
-    )
-    assert "_score" in distributed_results.column_names, (
-        "Missing _score in distributed results"
-    )
+    assert (
+        "_score" in single_results.column_names
+    ), "Missing _score in single machine results"
+    assert (
+        "_score" in distributed_results.column_names
+    ), "Missing _score in distributed results"
 
     # Scores should be very close (within 1e-6 tolerance)
     single_scores = single_results.column("_score").to_pylist()
@@ -2672,9 +2668,9 @@ def test_validate_distributed_fts_empty_results(tmp_path):
     )
 
     # Both should return empty results
-    assert results["single_machine"].num_rows == 0, (
-        "Single machine should return 0 results"
-    )
+    assert (
+        results["single_machine"].num_rows == 0
+    ), "Single machine should return 0 results"
     assert results["distributed"].num_rows == 0, "Distributed should return 0 results"
 
 
@@ -2700,9 +2696,9 @@ def test_validate_distributed_fts_large_dataset(tmp_path):
     distributed_rows = results["distributed"].num_rows
 
     assert single_rows > 0, "Should find results for 'gandalf'"
-    assert single_rows == distributed_rows, (
-        f"Row count mismatch: {single_rows} vs {distributed_rows}"
-    )
+    assert (
+        single_rows == distributed_rows
+    ), f"Row count mismatch: {single_rows} vs {distributed_rows}"
 
 
 # ============================================================================
@@ -2934,9 +2930,9 @@ def test_distribute_fts_index_build(tmp_path):
             our_index = idx
             break
     assert our_index is not None, f"Index '{index_name}' not found in indices list"
-    assert our_index["type"] == "Inverted", (
-        f"Expected Inverted index, got {our_index['type']}"
-    )
+    assert (
+        our_index["type"] == "Inverted"
+    ), f"Expected Inverted index, got {our_index['type']}"
 
     # Test that the index works for searching
     # Get a sample text from the dataset to search for

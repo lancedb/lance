@@ -503,7 +503,6 @@ impl Index for ZoneMapIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "type": "ZoneMap",
             "num_zones": self.zones.len(),
             "max_zonemap_size": self.max_zonemap_size,
         }))
