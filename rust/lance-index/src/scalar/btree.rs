@@ -1083,7 +1083,8 @@ impl Index for BTreeIndex {
             .buffer_unordered(get_num_compute_intensive_cpus());
 
         while let Some((page_idx, page)) = pages.try_next().await? {
-            self.index_cache
+            let inserted = self
+                .index_cache
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
@@ -1091,6 +1092,13 @@ impl Index for BTreeIndex {
                     Arc::new(CachedScalarIndex::new(page)),
                 )
                 .await;
+
+            if !inserted {
+                return Err(Error::Internal {
+                    message: "Failed to prewarm index: cache is no longer available".to_string(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())

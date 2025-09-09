@@ -260,10 +260,11 @@ impl InvertedIndex {
         });
         let invert_list_fut = tokio::spawn({
             let store = store.clone();
+            let index_cache_clone = index_cache.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
                 let invert_list =
-                    PostingListReader::try_new(invert_list_reader, index_cache.clone()).await?;
+                    PostingListReader::try_new(invert_list_reader, index_cache_clone).await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -334,11 +335,17 @@ impl InvertedIndex {
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
                     let frag_reuse_index_clone = frag_reuse_index.clone();
-                    let index_cache = index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                    let index_cache_for_part =
+                        index_cache.with_key_prefix(format!("part-{}", id).as_str());
                     async move {
                         Result::Ok(Arc::new(
-                            InvertedPartition::load(store, id, frag_reuse_index_clone, index_cache)
-                                .await?,
+                            InvertedPartition::load(
+                                store,
+                                id,
+                                frag_reuse_index_clone,
+                                index_cache_for_part,
+                            )
+                            .await?,
                         ))
                     }
                 });
@@ -1083,9 +1090,10 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
+        let cache_key = PostingListKey { token_id };
         let mut posting = self
             .index_cache
-            .get_or_insert_with_key(PostingListKey { token_id }, || async move {
+            .get_or_insert_with_key(cache_key, || async move {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
@@ -1131,7 +1139,8 @@ impl PostingListReader {
             // This ensures each cached entry has its own memory, not shared references
             let batch = batch.shrink_to_fit()?;
             let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
-            self.index_cache
+            let inserted = self
+                .index_cache
                 .insert_with_key(
                     &PostingListKey {
                         token_id: token_id as u32,
@@ -1139,6 +1148,13 @@ impl PostingListReader {
                     Arc::new(posting_list),
                 )
                 .await;
+
+            if !inserted {
+                return Err(Error::Internal {
+                    message: "Failed to prewarm index: cache is no longer available".to_string(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())

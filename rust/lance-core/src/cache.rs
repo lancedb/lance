@@ -336,6 +336,8 @@ impl LanceCache {
 pub struct WeakLanceCache {
     inner: std::sync::Weak<Cache<(String, TypeId), SizedRecord>>,
     prefix: String,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
 }
 
 impl WeakLanceCache {
@@ -344,6 +346,8 @@ impl WeakLanceCache {
         Self {
             inner: Arc::downgrade(&cache.cache),
             prefix: cache.prefix.clone(),
+            hits: cache.hits.clone(),
+            misses: cache.misses.clone(),
         }
     }
 
@@ -352,6 +356,8 @@ impl WeakLanceCache {
         Self {
             inner: self.inner.clone(),
             prefix: format!("{}{}/", self.prefix, prefix),
+            hits: self.hits.clone(),
+            misses: self.misses.clone(),
         }
     }
 
@@ -368,18 +374,28 @@ impl WeakLanceCache {
         let cache = self.inner.upgrade()?;
         let key = self.get_key(key);
         if let Some(metadata) = cache.get(&(key, TypeId::of::<T>())).await {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             Some(metadata.record.clone().downcast::<T>().unwrap())
         } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
 
     /// Insert an item if the cache is still alive
-    pub async fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, value: Arc<T>) {
+    /// Returns true if the item was inserted, false if the cache is no longer available
+    pub async fn insert<T: DeepSizeOf + Send + Sync + 'static>(
+        &self,
+        key: &str,
+        value: Arc<T>,
+    ) -> bool {
         if let Some(cache) = self.inner.upgrade() {
             let key = self.get_key(key);
             let record = SizedRecord::new(value);
             cache.insert((key, TypeId::of::<T>()), record).await;
+            true
+        } else {
+            false
         }
     }
 
@@ -393,6 +409,15 @@ impl WeakLanceCache {
         if let Some(cache) = self.inner.upgrade() {
             let full_key = self.get_key(key);
             let cache_key = (full_key.clone(), TypeId::of::<T>());
+
+            // First check if the item exists in cache
+            if let Some(record) = cache.get(&cache_key).await {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(record.record.clone().downcast::<T>().unwrap());
+            }
+            self.misses.fetch_add(1, Ordering::Relaxed);
+
+            // Not in cache, compute and insert
             let value = f().await?;
             let value = Arc::new(value);
             let record = SizedRecord::new(value.clone());
@@ -420,7 +445,8 @@ impl WeakLanceCache {
     }
 
     /// Insert with a cache key type
-    pub async fn insert_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>)
+    /// Returns true if the item was inserted, false if the cache is no longer available
+    pub async fn insert_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>) -> bool
     where
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
