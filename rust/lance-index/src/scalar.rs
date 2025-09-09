@@ -60,6 +60,7 @@ pub enum BuiltinIndexType {
     LabelList,
     NGram,
     ZoneMap,
+    BloomFilter,
     Inverted,
 }
 
@@ -72,6 +73,7 @@ impl BuiltinIndexType {
             Self::NGram => "ngram",
             Self::ZoneMap => "zonemap",
             Self::Inverted => "inverted",
+            Self::BloomFilter => "bloomfilter",
         }
     }
 }
@@ -87,6 +89,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::NGram => Ok(Self::NGram),
             IndexType::ZoneMap => Ok(Self::ZoneMap),
             IndexType::Inverted => Ok(Self::Inverted),
+            IndexType::BloomFilter => Ok(Self::BloomFilter),
             _ => Err(Error::Index {
                 message: "Invalid index type".to_string(),
                 location: location!(),

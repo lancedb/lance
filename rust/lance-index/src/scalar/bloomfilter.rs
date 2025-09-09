@@ -76,10 +76,6 @@ pub struct BloomFilterIndex {
     number_of_items: u64,
     // Probability of false positives, fraction between 0 and 1
     probability: f64,
-
-    store: Arc<dyn IndexStore>,
-    fri: Option<Arc<FragReuseIndex>>,
-    index_cache: LanceCache,
 }
 
 impl DeepSizeOf for BloomFilterIndex {
@@ -91,8 +87,8 @@ impl DeepSizeOf for BloomFilterIndex {
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        _fri: Option<Arc<FragReuseIndex>>,
+        _index_cache: LanceCache,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
         let bloom_data = index_file
@@ -114,9 +110,6 @@ impl BloomFilterIndex {
 
         Ok(Arc::new(Self::try_from_serialized(
             bloom_data,
-            store,
-            fri,
-            index_cache,
             number_of_items,
             probability,
         )?))
@@ -124,9 +117,6 @@ impl BloomFilterIndex {
 
     fn try_from_serialized(
         data: RecordBatch,
-        store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
         number_of_items: u64,
         probability: f64,
     ) -> Result<Self> {
@@ -136,9 +126,6 @@ impl BloomFilterIndex {
                 zones: Vec::new(),
                 number_of_items,
                 probability,
-                store,
-                fri,
-                index_cache,
             });
         }
 
@@ -252,9 +239,6 @@ impl BloomFilterIndex {
             zones: blocks,
             number_of_items,
             probability,
-            store,
-            fri,
-            index_cache,
         })
     }
 
@@ -575,6 +559,7 @@ static DEFAULT_NUMBER_OF_ITEMS: LazyLock<u64> = LazyLock::new(|| {
         .expect("failed to parse Lance_BLOOMFILTER_DEFAULT_NUMBER_OF_ITEMS")
 });
 
+#[allow(clippy::manual_inspect)]
 static DEFAULT_PROBABILITY: LazyLock<f64> = LazyLock::new(|| {
     std::env::var("LANCE_BLOOMFILTER_DEFAULT_PROBABILITY")
         // 0.00057 ≈ 1 in 1754 false positive rate

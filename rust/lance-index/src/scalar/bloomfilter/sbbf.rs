@@ -44,17 +44,17 @@ pub enum SbbfError {
 impl fmt::Display for SbbfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SbbfError::InvalidFpp { fpp } => {
+            Self::InvalidFpp { fpp } => {
                 write!(
                     f,
                     "False positive probability must be between 0.0 and 1.0, got {}",
                     fpp
                 )
             }
-            SbbfError::WriteError { source } => {
+            Self::WriteError { source } => {
                 write!(f, "Failed to write bloom filter: {}", source)
             }
-            SbbfError::InvalidData { message } => {
+            Self::InvalidData { message } => {
                 write!(f, "Invalid bloom filter data: {}", message)
             }
         }
@@ -64,7 +64,7 @@ impl fmt::Display for SbbfError {
 impl Error for SbbfError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            SbbfError::WriteError { source } => Some(source),
+            Self::WriteError { source } => Some(source),
             _ => None,
         }
     }
@@ -90,7 +90,7 @@ const SALT: [u32; 8] = [
 struct Block([u32; 8]);
 
 impl Block {
-    const ZERO: Block = Block([0; 8]);
+    const ZERO: Self = Self([0; 8]);
 
     /// Takes as its argument a single unsigned 32-bit integer and returns a block in which each
     /// word has exactly one bit set.
@@ -270,6 +270,7 @@ impl Sbbf {
     }
 
     /// Write the bitset in serialized form to the writer
+    #[allow(dead_code)]
     pub fn write_bitset<W: Write>(&self, mut writer: W) -> Result<()> {
         for block in &self.blocks {
             writer
@@ -289,16 +290,19 @@ impl Sbbf {
     }
 
     /// Get the number of blocks in this filter
+    #[allow(dead_code)]
     pub fn num_blocks(&self) -> usize {
         self.blocks.len()
     }
 
     /// Get the size in bytes of this filter
+    #[allow(dead_code)]
     pub fn size_bytes(&self) -> usize {
         self.blocks.len() * 32
     }
 
     /// Return the total in memory size of this bloom filter in bytes
+    #[allow(dead_code)]
     pub fn estimated_memory_size(&self) -> usize {
         self.blocks.capacity() * std::mem::size_of::<Block>()
     }
@@ -342,6 +346,7 @@ impl SbbfBuilder {
     }
 
     /// Set the number of bytes directly
+    #[allow(dead_code)]
     pub fn num_bytes(mut self, num_bytes: usize) -> Self {
         self.num_bytes = Some(num_bytes);
         self

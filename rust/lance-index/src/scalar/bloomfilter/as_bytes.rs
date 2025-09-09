@@ -77,7 +77,7 @@ impl AsBytes for i16 {
 
 impl AsBytes for str {
     fn as_bytes(&self) -> Cow<'_, [u8]> {
-        Cow::Borrowed(str::as_bytes(self))
+        Cow::Borrowed(Self::as_bytes(self))
     }
 }
 

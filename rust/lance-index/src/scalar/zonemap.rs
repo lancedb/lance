@@ -95,7 +95,6 @@ impl DeepSizeOf for ZoneMapStatistics {
 /// 2           | 10  | 14  | 5
 /// 2           | 15  | 16  | 2
 /// 3           | 20  | 23  | 4
-
 pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
@@ -958,7 +957,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        ZONEMAP_INDEX_VERSION
     }
 
     fn new_query_parser(
