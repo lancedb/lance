@@ -246,7 +246,7 @@ dependencies = [
  "arrow-data",
  "arrow-schema",
  "chrono",
- "num",
+ "num 0.4.3",
 ]
 
 [[package]]
@@ -263,7 +263,7 @@ dependencies = [
  "chrono-tz",
  "half",
  "hashbrown 0.15.4",
- "num",
+ "num 0.4.3",
 ]
 
 [[package]]
@@ -274,7 +274,7 @@ checksum = "169b1d5d6cb390dd92ce582b06b23815c7953e9dfaaea75556e89d890d19993d"
 dependencies = [
  "bytes",
  "half",
- "num",
+ "num 0.4.3",
 ]
 
 [[package]]
@@ -294,7 +294,7 @@ dependencies = [
  "comfy-table",
  "half",
  "lexical-core",
- "num",
+ "num 0.4.3",
  "ryu",
 ]
 
@@ -322,7 +322,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-schema",
  "half",
- "num",
+ "num 0.4.3",
 ]
 
 [[package]]
@@ -356,7 +356,7 @@ dependencies = [
  "indexmap",
  "lexical-core",
  "memchr",
- "num",
+ "num 0.4.3",
  "serde",
  "serde_json",
  "simdutf8",
@@ -422,7 +422,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
- "num",
+ "num 0.4.3",
 ]
 
 [[package]]
@@ -437,7 +437,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "memchr",
- "num",
+ "num 0.4.3",
  "regex",
  "regex-syntax 0.8.5",
 ]
@@ -1086,7 +1086,7 @@ checksum = "1a22f228ab7a1b23027ccc6c350b72868017af7ea8356fbdf19f8d991c690013"
 dependencies = [
  "autocfg",
  "libm",
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
 ]
@@ -4070,6 +4070,7 @@ dependencies = [
  "lindera",
  "lindera-tantivy",
  "log",
+ "morton-encoding",
  "num-traits",
  "object_store",
  "prost 0.13.5",
@@ -4708,6 +4709,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "morton-encoding"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f66c953d92a578cd98a4598021e3b473520d214665917eb51dba49dc227936c8"
+dependencies = [
+ "num 0.2.1",
+ "num-traits",
+]
+
+[[package]]
 name = "multimap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4750,15 +4761,40 @@ dependencies = [
 
 [[package]]
 name = "num"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8536030f9fea7127f841b45bb6243b27255787fb4eb83958aa1ef9d2fdc0c36"
+dependencies = [
+ "num-bigint 0.2.6",
+ "num-complex 0.2.4",
+ "num-integer",
+ "num-iter",
+ "num-rational 0.2.4",
+ "num-traits",
+]
+
+[[package]]
+name = "num"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
 dependencies = [
- "num-bigint",
- "num-complex",
+ "num-bigint 0.4.6",
+ "num-complex 0.4.6",
  "num-integer",
  "num-iter",
- "num-rational",
+ "num-rational 0.4.2",
+ "num-traits",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "090c7f9998ee0ff65aa5b723e4009f7b217707f1fb5ea551329cc4d6231fb304"
+dependencies = [
+ "autocfg",
+ "num-integer",
  "num-traits",
 ]
 
@@ -4769,6 +4805,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-complex"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6b19411a9719e753aff12e5187b74d60d3dc449ec3f4dc21e3989c3f554bc95"
+dependencies = [
+ "autocfg",
  "num-traits",
 ]
 
@@ -4809,11 +4855,23 @@ dependencies = [
 
 [[package]]
 name = "num-rational"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c000134b5dbf44adc5cb772486d335293351644b801551abe8f75c84cfa4aef"
+dependencies = [
+ "autocfg",
+ "num-bigint 0.2.6",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-rational"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
 ]
@@ -5039,8 +5097,8 @@ dependencies = [
  "half",
  "hashbrown 0.15.4",
  "lz4_flex",
- "num",
- "num-bigint",
+ "num 0.4.3",
+ "num-bigint 0.4.6",
  "object_store",
  "paste",
  "seq-macro",
@@ -6915,7 +6973,7 @@ dependencies = [
  "integer-encoding 4.0.2",
  "itertools 0.11.0",
  "noisy_float",
- "num",
+ "num 0.4.3",
  "num-traits",
  "once_cell",
  "pin-project",

@@ -30,6 +30,8 @@ use lance_index::scalar::{
 use lance_index::rtree::{
     simple_builder::train_geo_index,
     simple_rtree::RTreeIndex,
+    tiled_builder::train_tiled_rtree_index,
+    tiled_rtree::TiledRTreeIndex,
     GeoIndex, GeoIndexParams,
 };
 use lance_index::ScalarIndexCriteria;
@@ -224,6 +226,7 @@ fn rtree_index_details() -> prost_types::Any {
     let details = lance_table::format::pb::RTreeIndexDetails {};
     prost_types::Any::from_msg(&details).unwrap()
 }
+
 
 /// Check if a field is suitable for geo indexing by examining field structure
 /// This function accepts both GeoArrow extensions and struct<x: double, y: double> format for point data
@@ -425,9 +428,8 @@ pub(super) async fn build_scalar_index(
                 });
             }
             let geo_params = GeoIndexParams::default();
-            // Convert TrainingSource to SendableRecordBatchStream for simple_builder
-            let data_stream = training_request.scan_unordered_chunks(4096).await?;
-            train_geo_index(data_stream, Arc::new(index_store), &geo_params).await?;
+            // Use tiled R-tree builder for better performance with Morton/Z-order sorting
+            train_tiled_rtree_index(training_request, Arc::new(index_store), &geo_params).await?;
             Ok(rtree_index_details())
         }
         _ => {
@@ -502,8 +504,8 @@ pub async fn open_scalar_index(
         }
         ScalarIndexType::RTree => {
             // Load simple R-tree (now the default geo index implementation)
-            println!("🌍 Loading simple R-tree geo index");
-            let geo_index = <RTreeIndex as GeoIndex>::load(index_store).await?;
+            println!("🌍 Loading tiled R-tree geo index");
+            let geo_index = <TiledRTreeIndex as GeoIndex>::load(index_store).await?;
             Ok(geo_index)
         }
     }

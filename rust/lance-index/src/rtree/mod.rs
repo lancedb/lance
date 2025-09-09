@@ -20,6 +20,8 @@ pub mod rtree;
 pub mod paged_leaf_rtree;
 pub mod simple_rtree;
 pub mod simple_builder;
+pub mod tiled_rtree;
+pub mod tiled_builder;
 
 pub const LANCE_RTREE_INDEX: &str = "__lance_rtree_index";
 
@@ -130,6 +132,35 @@ impl BoundingBox {
         point.x <= self.max_x &&
         point.y >= self.min_y &&
         point.y <= self.max_y
+    }
+
+    /// Calculate the minimum distance from this bounding box to a point
+    pub fn distance_to_point(&self, point: &Point) -> f64 {
+        let dx = if point.x < self.min_x {
+            self.min_x - point.x
+        } else if point.x > self.max_x {
+            point.x - self.max_x
+        } else {
+            0.0
+        };
+
+        let dy = if point.y < self.min_y {
+            self.min_y - point.y
+        } else if point.y > self.max_y {
+            point.y - self.max_y
+        } else {
+            0.0
+        };
+
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Check if this bounding box touches another bounding box (shares boundary)
+    pub fn touches(&self, other: &BoundingBox) -> bool {
+        // Two boxes touch if they share a boundary but don't overlap
+        (self.max_x == other.min_x || self.min_x == other.max_x || 
+         self.max_y == other.min_y || self.min_y == other.max_y) &&
+        self.intersects(other)
     }
 }
 
