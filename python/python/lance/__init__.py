@@ -131,6 +131,7 @@ def dataset(
         include these fields if the appropriate scan options are set.
     metadata_cache_size_bytes : optional, int
         Size of the metadata cache in bytes. This cache is used to store metadata
+        information about the dataset, such as schema and statistics. If not specified,
         a default size will be used.
     read_params : optional, dict
         Dictionary of read parameters. Currently supports:
@@ -142,6 +143,7 @@ def dataset(
         across multiple datasets.
     """
     ds = LanceDataset(
+        uri,
         version,
         block_size,
         commit_lock=commit_lock,
