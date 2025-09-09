@@ -1006,7 +1006,8 @@ impl BTreeIndex {
         // them back into a single partition.
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
         let ordered = Arc::new(SortPreservingMergeExec::new(
-            LexOrdering::new(vec![sort_expr]),
+            LexOrdering::new(vec![sort_expr])
+                .expect("LexOrdering::new should return Some when vec is not empty"),
             all_data,
         ));
 
@@ -1705,7 +1706,11 @@ mod tests {
             .into_df_exec(RowCount::from(10), BatchCount::from(100));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
-        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let plan = Arc::new(SortExec::new(
+            LexOrdering::new(vec![sort_expr])
+                .expect("LexOrdering::new should return Some when vec is not empty"),
+            data,
+        ));
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let stream = break_stream(stream, 64);
         let stream = stream.map_err(DataFusionError::from);
@@ -1747,7 +1752,11 @@ mod tests {
             .into_df_exec(RowCount::from(1000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
-        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let plan = Arc::new(SortExec::new(
+            LexOrdering::new(vec![sort_expr])
+                .expect("LexOrdering::new should return Some when vec is not empty"),
+            data,
+        ));
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let stream = break_stream(stream, 64);
         let stream = stream.map_err(DataFusionError::from);
