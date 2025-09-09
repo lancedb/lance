@@ -18,6 +18,8 @@ import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import com.lancedb.lance.merge.MergeInsert;
+import com.lancedb.lance.merge.MergeInsertResult;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceSchema;
 import com.lancedb.lance.schema.SqlExpressions;
@@ -960,6 +962,37 @@ public class Dataset implements Closeable {
   public SqlQuery sql(String sql) {
     return new SqlQuery(this, sql);
   }
+
+  /**
+   * Merge source data with the existing target data.
+   *
+   * <p>This will take in the source, merge it with the existing target data, and insert new rows,
+   * update existing rows, and delete existing rows.
+   *
+   * <p>It is important that after merge insert, the current dataset is changed and should be
+   * closed. The merged new dataset is contained in the MergeInsertResult.
+   *
+   * @param mergeInsert MergeInsert options
+   * @param source ArrowArrayStream source data
+   * @return MergeInsertResult containing the new merged Dataset.
+   */
+  public MergeInsertResult mergeInsert(MergeInsert mergeInsert, ArrowArrayStream source) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      MergeInsertResult result = nativeMergeInsert(mergeInsert, source.memoryAddress());
+
+      Dataset newDataset = result.dataset();
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+
+      return new MergeInsertResult(newDataset, result.stats());
+    }
+  }
+
+  private native MergeInsertResult nativeMergeInsert(
+      MergeInsert mergeInsert, long arrowStreamMemoryAddress);
 
   private native void nativeCreateTag(String tag, long version);
 

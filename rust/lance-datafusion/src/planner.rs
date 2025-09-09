@@ -152,7 +152,7 @@ impl ScalarUDFImpl for CastListF16Udf {
 }
 
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
-struct LanceContextProvider {
+pub struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
     state: SessionState,
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
