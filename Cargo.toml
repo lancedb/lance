@@ -13,14 +13,16 @@ members = [
     "rust/lance-table",
     "rust/lance-test-macros",
     "rust/lance-testing",
-    "rust/lance-encoding/src/compression_algo/fsst",
+    "rust/lance-tools",
+    "rust/compression/fsst",
+    "rust/compression/bitpacking",
 ]
-exclude = ["python", "java/core/lance-jni"]
+exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
 resolver = "2"
 
 [workspace.package]
-version = "0.32.0"
+version = "0.35.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 license = "Apache-2.0"
@@ -43,19 +45,19 @@ categories = [
 rust-version = "1.82.0"
 
 [workspace.dependencies]
-lance = { version = "=0.32.0", path = "./rust/lance" }
-lance-arrow = { version = "=0.32.0", path = "./rust/lance-arrow" }
-lance-core = { version = "=0.32.0", path = "./rust/lance-core" }
-lance-datafusion = { version = "=0.32.0", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=0.32.0", path = "./rust/lance-datagen" }
-lance-encoding = { version = "=0.32.0", path = "./rust/lance-encoding" }
-lance-file = { version = "=0.32.0", path = "./rust/lance-file" }
-lance-index = { version = "=0.32.0", path = "./rust/lance-index" }
-lance-io = { version = "=0.32.0", path = "./rust/lance-io" }
-lance-linalg = { version = "=0.32.0", path = "./rust/lance-linalg" }
-lance-table = { version = "=0.32.0", path = "./rust/lance-table" }
-lance-test-macros = { version = "=0.32.0", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=0.32.0", path = "./rust/lance-testing" }
+lance = { version = "=0.35.0", path = "./rust/lance" }
+lance-arrow = { version = "=0.35.0", path = "./rust/lance-arrow" }
+lance-core = { version = "=0.35.0", path = "./rust/lance-core" }
+lance-datafusion = { version = "=0.35.0", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=0.35.0", path = "./rust/lance-datagen" }
+lance-encoding = { version = "=0.35.0", path = "./rust/lance-encoding" }
+lance-file = { version = "=0.35.0", path = "./rust/lance-file" }
+lance-index = { version = "=0.35.0", path = "./rust/lance-index" }
+lance-io = { version = "=0.35.0", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=0.35.0", path = "./rust/lance-linalg" }
+lance-table = { version = "=0.35.0", path = "./rust/lance-table" }
+lance-test-macros = { version = "=0.35.0", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=0.35.0", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "55.1", optional = false, features = ["prettyprint"] }
@@ -79,6 +81,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
 ] }
+lance-bitpacking = { version = "=0.35.0", path = "./rust/compression/bitpacking" }
 bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
@@ -116,19 +119,20 @@ deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=0.32.0", path = "./rust/lance-encoding/src/compression_algo/fsst" }
+fsst = { version = "=0.35.0", path = "./rust/compression/fsst" }
 futures = "0.3"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
-jieba-rs = { version = "0.7", default-features = false }
+jieba-rs = { version = "0.8.1", default-features = false }
+jsonb = { version = "0.5.3", default-features = false, features = ["databend"]}
 log = "0.4"
 mockall = { version = "0.13.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
-object_store = { version = "0.12.2" }
+object_store = { version = "0.12.3" }
 opendal = { version = "0.54" }
 object_store_opendal = { version = "0.54" }
 pin-project = "1.0"
@@ -138,7 +142,9 @@ proptest = "1.3.1"
 prost = "0.13.2"
 prost-build = "0.13.2"
 prost-types = "0.13.2"
-rand = { version = "0.8.3", features = ["small_rng"] }
+rand = { version = "0.9.1", features = ["small_rng"] }
+rand_distr = { version = "0.5.1" }
+rand_xoshiro = "0.7.0"
 rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
@@ -165,7 +171,6 @@ tracing = "0.1"
 url = "2.3"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 pretty_assertions = "1.4.0"
-zstd = "0.13.1"
 
 [profile.bench]
 opt-level = 3

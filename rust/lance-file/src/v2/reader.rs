@@ -17,8 +17,8 @@ use deepsize::{Context, DeepSizeOf};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
-        schedule_and_decode, schedule_and_decode_blocking, ColumnInfo, DecoderPlugins,
-        FilterExpression, PageEncoding, PageInfo, ReadBatchTask, RequestedRows,
+        schedule_and_decode, schedule_and_decode_blocking, ColumnInfo, DecoderConfig,
+        DecoderPlugins, FilterExpression, PageEncoding, PageInfo, ReadBatchTask, RequestedRows,
         SchedulerDecoderConfig,
     },
     encoder::EncodedBatch,
@@ -36,6 +36,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_encoding::format::pb as pbenc;
+use lance_encoding::format::pb21 as pbenc21;
 use lance_io::{
     scheduler::FileScheduler,
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
@@ -49,6 +50,10 @@ use crate::{
 };
 
 use super::io::LanceEncodingsIo;
+
+/// Default chunk size for reading large pages (8MiB)
+/// Pages larger than this will be split into multiple chunks during read
+pub const DEFAULT_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 
 // For now, we don't use global buffers for anything other than schema.  If we
 // use these later we should make them lazily loaded and then cached once loaded.
@@ -119,6 +124,7 @@ impl CachedFileMetadata {
         match (self.major_version, self.minor_version) {
             (0, 3) => LanceFileVersion::V2_0,
             (2, 1) => LanceFileVersion::V2_1,
+            (2, 2) => LanceFileVersion::V2_2,
             _ => panic!(
                 "Unsupported version: {}.{}",
                 self.major_version, self.minor_version
@@ -311,12 +317,23 @@ impl ReaderProjection {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// File Reader Options that can control reading behaviors, such as whether to enable caching on repetition indices
+#[derive(Clone, Debug)]
 pub struct FileReaderOptions {
-    validate_on_decode: bool,
-    /// Whether to cache repetition indices for better performance
-    /// Default is false for backward compatibility
-    pub cache_repetition_index: bool,
+    pub decoder_config: DecoderConfig,
+    /// Size of chunks when reading large pages. Pages larger than this
+    /// will be read in multiple chunks to control memory usage.
+    /// Default: 8MB (DEFAULT_READ_CHUNK_SIZE)
+    pub read_chunk_size: u64,
+}
+
+impl Default for FileReaderOptions {
+    fn default() -> Self {
+        Self {
+            decoder_config: DecoderConfig::default(),
+            read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -671,11 +688,11 @@ impl FileReader {
                                     page.encoding.as_ref().unwrap(),
                                 ))
                             }
-                            _ => {
-                                PageEncoding::Structural(Self::fetch_encoding::<pbenc::PageLayout>(
-                                    page.encoding.as_ref().unwrap(),
-                                ))
-                            }
+                            _ => PageEncoding::Structural(Self::fetch_encoding::<
+                                pbenc21::PageLayout,
+                            >(
+                                page.encoding.as_ref().unwrap()
+                            )),
                         };
                         let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets
@@ -761,8 +778,13 @@ impl FileReader {
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         let path = scheduler.reader().path().clone();
+
+        // Create LanceEncodingsIo with read chunk size from options
+        let encodings_io =
+            LanceEncodingsIo::new(scheduler).with_read_chunk_size(options.read_chunk_size);
+
         Self::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(scheduler)),
+            Arc::new(encodings_io),
             path,
             base_projection,
             decoder_plugins,
@@ -838,8 +860,7 @@ impl FileReader {
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
-        should_validate: bool,
-        cache_repetition_index: bool,
+        decoder_config: DecoderConfig,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -855,8 +876,7 @@ impl FileReader {
             cache,
             decoder_plugins,
             io,
-            should_validate,
-            cache_repetition_index,
+            decoder_config,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -889,8 +909,7 @@ impl FileReader {
             batch_size,
             projection,
             filter,
-            self.options.validate_on_decode,
-            self.options.cache_repetition_index,
+            self.options.decoder_config.clone(),
         )
     }
 
@@ -904,8 +923,7 @@ impl FileReader {
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
-        should_validate: bool,
-        cache_repetition_index: bool,
+        decoder_config: DecoderConfig,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -921,8 +939,7 @@ impl FileReader {
             cache,
             decoder_plugins,
             io,
-            should_validate,
-            cache_repetition_index,
+            decoder_config,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -953,8 +970,7 @@ impl FileReader {
             batch_size,
             projection,
             FilterExpression::no_filter(),
-            self.options.validate_on_decode,
-            self.options.cache_repetition_index,
+            self.options.decoder_config.clone(),
         )
     }
 
@@ -968,8 +984,7 @@ impl FileReader {
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
-        should_validate: bool,
-        cache_repetition_index: bool,
+        decoder_config: DecoderConfig,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -987,8 +1002,7 @@ impl FileReader {
             cache,
             decoder_plugins,
             io,
-            should_validate,
-            cache_repetition_index,
+            decoder_config,
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1019,8 +1033,7 @@ impl FileReader {
             batch_size,
             projection,
             filter,
-            self.options.validate_on_decode,
-            self.options.cache_repetition_index,
+            self.options.decoder_config.clone(),
         )
     }
 
@@ -1173,8 +1186,7 @@ impl FileReader {
             cache: self.cache.clone(),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
-            should_validate: self.options.validate_on_decode,
-            cache_repetition_index: self.options.cache_repetition_index,
+            decoder_config: self.options.decoder_config.clone(),
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -1213,8 +1225,7 @@ impl FileReader {
             cache: self.cache.clone(),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
-            should_validate: self.options.validate_on_decode,
-            cache_repetition_index: self.options.cache_repetition_index,
+            decoder_config: self.options.decoder_config.clone(),
         };
 
         let requested_rows = RequestedRows::Ranges(ranges);
@@ -1253,8 +1264,7 @@ impl FileReader {
             cache: self.cache.clone(),
             decoder_plugins: self.decoder_plugins.clone(),
             io: self.scheduler.clone(),
-            should_validate: self.options.validate_on_decode,
-            cache_repetition_index: self.options.cache_repetition_index,
+            decoder_config: self.options.decoder_config.clone(),
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -1407,8 +1417,8 @@ pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
                                 format!("Unsupported(decode_err={})", err)
                             }
                         }
-                    } else if encoding_any.type_url == "/lance.encodings.PageLayout" {
-                        let encoding = encoding_any.to_msg::<pbenc::PageLayout>();
+                    } else if encoding_any.type_url == "/lance.encodings21.PageLayout" {
+                        let encoding = encoding_any.to_msg::<pbenc21::PageLayout>();
                         match encoding {
                             Ok(encoding) => {
                                 format!("{:#?}", encoding)
@@ -1547,7 +1557,7 @@ pub mod tests {
     use futures::{prelude::stream::TryStreamExt, StreamExt};
     use lance_arrow::RecordBatchExt;
     use lance_core::{datatypes::Schema, ArrowResult};
-    use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
         decoder::{decode_batch, DecodeBatchScheduler, DecoderPlugins, FilterExpression},
         encoder::{default_encoding_strategy, encode_batch, EncodedBatch, EncodingOptions},
@@ -1563,6 +1573,7 @@ pub mod tests {
         testing::{test_cache, write_lance_file, FsFixture, WrittenFile},
         writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
     };
+    use lance_encoding::decoder::DecoderConfig;
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
@@ -1571,7 +1582,7 @@ pub mod tests {
         ]));
         let categories_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
 
-        let mut reader = gen()
+        let mut reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
             .col("location", array::rand_type(&location_type))
             .col("categories", array::rand_type(&categories_type))
@@ -1688,7 +1699,7 @@ pub mod tests {
         // TODO: Add V2_1 (currently fails)
         #[values(LanceFileVersion::V2_0)] version: LanceFileVersion,
     ) {
-        let data = gen()
+        let data = gen_batch()
             .col("x", array::rand::<Int32Type>())
             .col("y", array::rand_utf8(ByteCount::from(16), false))
             .into_batch_rows(RowCount::from(10000))
@@ -2135,7 +2146,7 @@ pub mod tests {
             file_reader.scheduler.clone(),
             test_cache(),
             &FilterExpression::no_filter(),
-            false,
+            &DecoderConfig::default(),
         )
         .await
         .unwrap();
@@ -2154,6 +2165,56 @@ pub mod tests {
             tx,
             file_reader.scheduler.clone(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_read_empty_range() {
+        let fs = FsFixture::default();
+        create_some_file(&fs, LanceFileVersion::V2_0).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // All ranges empty, no data
+        let batches = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Range(0..0),
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 0);
+
+        // Some ranges empty
+        let batches = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Ranges(Arc::new([0..1, 2..2])),
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
     }
 
     #[tokio::test]

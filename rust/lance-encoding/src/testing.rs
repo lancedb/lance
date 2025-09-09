@@ -3,8 +3,14 @@
 
 use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
-use arrow::array::make_comparator;
+use crate::{
+    decoder::DecoderConfig,
+    encodings::physical::block::CompressionScheme,
+    format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
+};
+
 use arrow_array::{Array, StructArray, UInt64Array};
+use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
@@ -13,7 +19,7 @@ use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::{cache::LanceCache, utils::bit::pad_bytes, Result};
-use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
+use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
 
 use crate::{
     buffer::LanceBuffer,
@@ -93,7 +99,7 @@ fn column_indices_from_schema_helper(
                     *column_counter += 1;
                 }
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
@@ -105,7 +111,7 @@ fn column_indices_from_schema_helper(
                     *column_counter += 1;
                 }
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
@@ -114,7 +120,7 @@ fn column_indices_from_schema_helper(
             DataType::FixedSizeList(inner, _) => {
                 // FSL(primitive) does not get its own column in either approach
                 column_indices_from_schema_helper(
-                    &[inner.clone()],
+                    std::slice::from_ref(inner),
                     column_indices,
                     column_counter,
                     is_structural_encoding,
@@ -174,7 +180,7 @@ async fn test_decode(
         io,
         cache,
         &FilterExpression::no_filter(),
-        false, // cache_repetition_index - default to false for tests
+        &DecoderConfig::default(),
     )
     .await
     .unwrap();
@@ -348,6 +354,7 @@ pub struct TestCases {
     page_sizes: Vec<u64>,
     file_version: LanceFileVersion,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
+    expected_encoding: Option<Vec<String>>,
 }
 
 impl Default for TestCases {
@@ -361,6 +368,7 @@ impl Default for TestCases {
             page_sizes: vec![4096, 1024 * 1024],
             file_version: LanceFileVersion::default(),
             verify_encoding: None,
+            expected_encoding: None,
         }
     }
 }
@@ -415,6 +423,175 @@ impl TestCases {
             verify_encoding(encoding);
         }
     }
+
+    pub fn with_expected_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.expected_encoding = Some(vec![encoding.into()]);
+        self
+    }
+
+    pub fn with_expected_encoding_chain<I: IntoIterator<Item = T>, T: Into<String>>(
+        mut self,
+        encodings: I,
+    ) -> Self {
+        self.expected_encoding = Some(encodings.into_iter().map(Into::into).collect());
+        self
+    }
+}
+
+/// Maps encoding enum variant to its string tag
+/// Uses exhaustive match to ensure compile-time checking when variants are added/removed
+fn tag(e: &Compression) -> &'static str {
+    use Compression::*;
+
+    match e {
+        Flat(_) => "flat",
+        Variable(_) => "variable",
+        Constant(_) => "constant",
+        OutOfLineBitpacking(_) => "out_of_line_bitpacking",
+        InlineBitpacking(_) => "inline_bitpacking",
+        Fsst(_) => "fsst",
+        Dictionary(_) => "dictionary",
+        Rle(_) => "rle",
+        ByteStreamSplit(_) => "byte_stream_split",
+        General(_) => "general",
+        FixedSizeList(_) => "fixed_size_list",
+        PackedStruct(_) => "packed_struct",
+    }
+}
+
+/// Returns any buffer outputs of this encoding
+fn buffer(c: &Compression) -> Option<Vec<&BufferCompression>> {
+    use Compression::*;
+
+    match c {
+        Flat(f) => f.data.as_ref().map(|b| vec![b]),
+        Variable(v) => v.values.as_ref().map(|b| vec![b]),
+        InlineBitpacking(i) => i.values.as_ref().map(|b| vec![b]),
+        General(g) => g.compression.as_ref().map(|c| vec![c]),
+        _ => None,
+    }
+}
+
+/// Returns the child encoding if this variant contains nested ArrayEncoding
+fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
+    use Compression::*;
+
+    match c {
+        Variable(v) => v.offsets.as_ref().map(|b| vec![b.as_ref()]),
+        OutOfLineBitpacking(o) => o.values.as_ref().map(|b| vec![b.as_ref()]),
+        Fsst(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        ByteStreamSplit(b) => b.values.as_ref().map(|b| vec![b.as_ref()]),
+        General(g) => g.values.as_ref().map(|b| vec![b.as_ref()]),
+        Dictionary(d) => {
+            let mut children = Vec::new();
+            if let Some(values) = d.items.as_ref() {
+                children.push(values.as_ref());
+            }
+            if let Some(indices) = d.indices.as_ref() {
+                children.push(indices.as_ref());
+            }
+            Some(children)
+        }
+        Rle(r) => {
+            let mut children = Vec::new();
+            if let Some(values) = r.values.as_ref() {
+                children.push(values.as_ref());
+            }
+            if let Some(run_lengths) = r.run_lengths.as_ref() {
+                children.push(run_lengths.as_ref());
+            }
+            Some(children)
+        }
+        FixedSizeList(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        _ => None,
+    }
+}
+
+/// Extract encoding types from array encoding (helper for nested encodings)
+/// Returns the encoding chain including compression schemes for Block variants
+pub fn extract_array_encoding_chain(enc: &CompressiveEncoding) -> Vec<String> {
+    let mut chain = Vec::with_capacity(8);
+    let mut stack = vec![enc];
+
+    while let Some(cur) = stack.pop() {
+        if let Some(inner) = &cur.compression {
+            // 1. Add current layer's tag
+            chain.push(tag(inner).to_string());
+
+            // 2. Extract any buffer output
+            if let Some(buffer) = buffer(inner) {
+                chain.extend(buffer.into_iter().map(|b| {
+                    let scheme = CompressionScheme::try_from(b.scheme()).unwrap();
+                    scheme.to_string()
+                }));
+            }
+
+            // 3. Process child encoding if exists
+            if let Some(children) = child(inner) {
+                stack.extend(children);
+            }
+        }
+    }
+    chain
+}
+
+/// Verify that a single page contains the expected encoding
+fn verify_page_encoding(
+    page: &EncodedPage,
+    expected_chain: &[String],
+    col_idx: usize,
+) -> Result<()> {
+    use crate::decoder::PageEncoding;
+    use lance_core::Error;
+    use snafu::location;
+
+    let mut actual_chain = Vec::new();
+
+    match &page.description {
+        PageEncoding::Structural(layout) => {
+            // Extract encodings from the page layout
+            use crate::format::pb21::page_layout::Layout;
+            if let Some(ref layout_type) = layout.layout {
+                match layout_type {
+                    Layout::MiniBlockLayout(mini_block) => {
+                        // Check value compression
+                        if let Some(ref value_comp) = mini_block.value_compression {
+                            let chain = extract_array_encoding_chain(value_comp);
+                            actual_chain.extend(chain);
+                        }
+                    }
+                    Layout::FullZipLayout(full_zip) => {
+                        // Check value compression in full zip layout
+                        if let Some(ref value_comp) = full_zip.value_compression {
+                            let chain = extract_array_encoding_chain(value_comp);
+                            actual_chain.extend(chain);
+                        }
+                    }
+                    Layout::AllNullLayout(_) => {
+                        // No value encoding for all null
+                    }
+                }
+            }
+        }
+        PageEncoding::Legacy(_) => {
+            // We don't need to care about legacy.
+        }
+    }
+
+    // Check that all expected encodings appear in the actual chain
+    for expected in expected_chain {
+        if !actual_chain.iter().any(|actual| actual.contains(expected)) {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Column {} expected encoding chain {:?} but got {:?}",
+                    col_idx, expected_chain, actual_chain
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Given specific data and test cases we check round trip encoding and decoding
@@ -540,6 +717,15 @@ async fn check_round_trip_encoding_inner(
         }
         for encode_task in encode_tasks {
             let encoded_page = encode_task.await.unwrap();
+
+            // For V2.1, verify encoding in the page if expected
+            if test_cases.file_version >= LanceFileVersion::V2_1 {
+                if let Some(ref expected) = test_cases.expected_encoding {
+                    verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                        .unwrap();
+                }
+            }
+
             writer.write_page(encoded_page);
         }
         row_number += arr.len() as u64;
@@ -551,7 +737,17 @@ async fn check_round_trip_encoding_inner(
         writer.write_lance_buffer(buffer);
     }
     for task in encode_tasks {
-        writer.write_page(task.await.unwrap());
+        let encoded_page = task.await.unwrap();
+
+        // For V2.1, verify encoding in the page if expected
+        if test_cases.file_version >= LanceFileVersion::V2_1 {
+            if let Some(ref expected) = test_cases.expected_encoding {
+                verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
+                    .unwrap();
+            }
+        }
+
+        writer.write_page(encoded_page);
     }
 
     let mut external_buffers = writer.new_external_buffers();
@@ -562,6 +758,7 @@ async fn check_round_trip_encoding_inner(
     }
     let mut column_infos = Vec::new();
     for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
+        // Keep track of pages for encoding verification
         for page in encoded_column.final_pages {
             writer.write_page(page);
         }
@@ -758,7 +955,7 @@ async fn check_round_trip_field_encoding_random(
                 // example, a list array sliced into smaller arrays will have arrays whose
                 // starting offset is not 0.
                 if use_slicing {
-                    let mut generator = gen().anon_col(array_generator_provider.provide());
+                    let mut generator = gen_batch().anon_col(array_generator_provider.provide());
                     if let Some(null_rate) = null_rate {
                         // The null generator is the only generator that already inserts nulls
                         // and attempting to do so again makes arrow-rs grumpy
@@ -778,7 +975,7 @@ async fn check_round_trip_field_encoding_random(
                     }
                 } else {
                     for i in 0..num_ingest_batches {
-                        let mut generator = gen()
+                        let mut generator = gen_batch()
                             .with_seed(Seed::from(i as u64))
                             .anon_col(array_generator_provider.provide());
                         if let Some(null_rate) = null_rate {

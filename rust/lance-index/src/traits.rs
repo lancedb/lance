@@ -8,7 +8,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 use snafu::location;
 
-use crate::{optimize::OptimizeOptions, scalar::ScalarIndexType, IndexParams, IndexType};
+use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
 use lance_table::format::Index;
 use uuid::Uuid;
 
@@ -20,10 +20,10 @@ pub struct ScalarIndexCriteria<'a> {
     pub for_column: Option<&'a str>,
     /// Only consider indices with this name
     pub has_name: Option<&'a str>,
-    /// Only consider indices with this type
-    pub has_type: Option<ScalarIndexType>,
-    /// Only consider indices that support exact equality
-    pub supports_exact_equality: bool,
+    /// If true, only consider indices that support FTS
+    pub must_support_fts: bool,
+    /// If true, only consider indices that support exact equality
+    pub must_support_exact_equality: bool,
 }
 
 impl<'a> ScalarIndexCriteria<'a> {
@@ -40,9 +40,9 @@ impl<'a> ScalarIndexCriteria<'a> {
         self
     }
 
-    /// Only consider indices with this type
-    pub fn with_type(mut self, ty: ScalarIndexType) -> Self {
-        self.has_type = Some(ty);
+    /// Only consider indices that support FTS
+    pub fn supports_fts(mut self) -> Self {
+        self.must_support_fts = true;
         self
     }
 
@@ -51,7 +51,7 @@ impl<'a> ScalarIndexCriteria<'a> {
     /// This will disqualify, for example, the ngram and inverted indices
     /// or an index like a bloom filter
     pub fn supports_exact_equality(mut self) -> Self {
-        self.supports_exact_equality = true;
+        self.must_support_exact_equality = true;
         self
     }
 }
@@ -59,6 +59,26 @@ impl<'a> ScalarIndexCriteria<'a> {
 // Extends Lance Dataset with secondary index.
 #[async_trait]
 pub trait DatasetIndexExt {
+    type IndexBuilder<'a>
+    where
+        Self: 'a;
+
+    /// Create a builder for creating an index on columns.
+    ///
+    /// This returns a builder that can be configured with additional options
+    /// like `name()`, `replace()`, and `train()` before awaiting to execute.
+    ///
+    /// # Parameters
+    /// - `columns`: the columns to build the indices on.
+    /// - `index_type`: specify [`IndexType`].
+    /// - `params`: index parameters.
+    fn create_index_builder<'a>(
+        &'a mut self,
+        columns: &'a [&'a str],
+        index_type: IndexType,
+        params: &'a dyn IndexParams,
+    ) -> Self::IndexBuilder<'a>;
+
     /// Create indices on columns.
     ///
     /// Upon finish, a new dataset version is generated.

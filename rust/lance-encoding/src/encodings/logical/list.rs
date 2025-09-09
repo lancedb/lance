@@ -227,17 +227,17 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
+    use crate::constants::{
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    };
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
+        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
         Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
         UInt64Array, UInt8Array,
     };
+
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
-    use lance_core::datatypes::{
-        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
-    };
     use rstest::rstest;
 
     use crate::{
@@ -552,6 +552,7 @@ mod tests {
     ) {
         // This is a simple pre-defined list that spans two pages.  This test is useful for
         // debugging the repetition index
+
         let items_builder = Int64Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         for i in 0..512 {
@@ -761,9 +762,12 @@ mod tests {
             .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
     #[ignore] // This test is quite slow in debug mode
-    async fn test_jumbo_list() {
+    async fn test_jumbo_list(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         // This is an overflow test.  We have a list of lists where each list
         // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
         // offsets range
@@ -778,7 +782,57 @@ mod tests {
         let arrs = vec![list_arr; 5000];
 
         // We can't validate because our validation relies on concatenating all input arrays
-        let test_cases = TestCases::default().without_validation();
+        let test_cases = TestCases::default()
+            .without_validation()
+            .with_file_version(version);
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
+    }
+
+    // Regression test for issue with ListArray encoding when crossing 1024 value boundary
+    // This test reproduces the bug where rows_avail assertion fails in schedule_instructions
+    // when encoding a ListArray with specific size patterns that cross the 1024 value boundary
+    #[tokio::test]
+    async fn test_fuzz_issue_4466() {
+        // This specific pattern of list sizes triggers the bug when total values cross 1024
+        // 94 lists total 1009 values (passes), 95 lists total 1025 values (fails)
+        let list_sizes = vec![
+            13, 18, 12, 7, 14, 12, 6, 13, 18, 8, // 0-9: 119 values
+            6, 11, 17, 12, 8, 19, 5, 6, 10, 13, // 10-19: 107 values
+            8, 6, 10, 4, 8, 16, 14, 12, 18, 9, // 20-29: 105 values
+            17, 8, 14, 18, 15, 3, 2, 4, 5, 1, // 30-39: 82 values
+            3, 13, 1, 2, 10, 4, 10, 18, 7, 14, // 40-49: 75 values
+            18, 13, 9, 17, 3, 13, 10, 14, 8, 19, // 50-59: 125 values
+            17, 10, 5, 11, 6, 15, 10, 18, 18, 20, // 60-69: 130 values
+            16, 11, 12, 15, 7, 9, 3, 10, 20, 5, // 70-79: 102 values
+            2, 3, 17, 4, 8, 12, 15, 6, 3, 20, // 80-89: 90 values
+            15, 20, 1, 19, 16, // 90-94: 71 values
+        ];
+
+        // Build the ListArray
+        let mut list_builder = ListBuilder::new(Int32Builder::new());
+        let mut total_values = 0;
+
+        for size in &list_sizes {
+            for i in 0..*size {
+                list_builder.values().append_value(i);
+            }
+            list_builder.append(true);
+            total_values += size;
+        }
+
+        let list_array = Arc::new(list_builder.finish());
+
+        // Verify we have the expected number of values
+        assert_eq!(list_array.len(), 95);
+        assert_eq!(total_values, 1025);
+
+        // This should trigger the assertion failure at primitive.rs:1362
+        // debug_assert!(rows_avail > 0)
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+
+        // The bug manifests when encoding this specific pattern
+        // Expected: successful round-trip encoding
+        // Actual: panic at primitive.rs:1362 - assertion failed: rows_avail > 0
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 }

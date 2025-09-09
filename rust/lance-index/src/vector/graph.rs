@@ -12,6 +12,8 @@ use arrow_schema::{DataType, Field};
 use bitvec::vec::BitVec;
 use deepsize::DeepSizeOf;
 
+use crate::vector::hnsw::builder::HnswQueryParams;
+
 pub mod builder;
 
 use crate::vector::DIST_COL;
@@ -92,37 +94,40 @@ impl From<OrderedFloat> for f32 {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
-pub struct OrderedNode {
-    pub id: u32,
+pub struct OrderedNode<T = u32>
+where
+    T: PartialEq + Eq,
+{
+    pub id: T,
     pub dist: OrderedFloat,
 }
 
-impl OrderedNode {
-    pub fn new(id: u32, dist: OrderedFloat) -> Self {
+impl<T: PartialEq + Eq> OrderedNode<T> {
+    pub fn new(id: T, dist: OrderedFloat) -> Self {
         Self { id, dist }
     }
 }
 
-impl PartialOrd for OrderedNode {
+impl<T: PartialEq + Eq> PartialOrd for OrderedNode<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.dist.cmp(&other.dist))
+        Some(self.cmp(other))
     }
 }
 
-impl Ord for OrderedNode {
+impl<T: PartialEq + Eq> Ord for OrderedNode<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.dist.cmp(&other.dist)
     }
 }
 
-impl From<(OrderedFloat, u32)> for OrderedNode {
-    fn from((dist, id): (OrderedFloat, u32)) -> Self {
+impl<T: PartialEq + Eq> From<(OrderedFloat, T)> for OrderedNode<T> {
+    fn from((dist, id): (OrderedFloat, T)) -> Self {
         Self { id, dist }
     }
 }
 
-impl From<OrderedNode> for (OrderedFloat, u32) {
-    fn from(node: OrderedNode) -> Self {
+impl<T: PartialEq + Eq> From<OrderedNode<T>> for (OrderedFloat, T) {
+    fn from(node: OrderedNode<T>) -> Self {
         (node.dist, node.id)
     }
 }
@@ -270,19 +275,27 @@ fn process_neighbors_with_look_ahead<F>(
 pub fn beam_search(
     graph: &dyn Graph,
     ep: &OrderedNode,
-    k: usize,
+    params: &HnswQueryParams,
     dist_calc: &impl DistCalculator,
     bitset: Option<&Visited>,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
 ) -> Vec<OrderedNode> {
-    //let mut visited: HashSet<_> = HashSet::with_capacity(k);
+    let k = params.ef;
     let mut candidates = BinaryHeap::with_capacity(k);
     visited.insert(ep.id);
     candidates.push(Reverse(ep.clone()));
 
+    // add range search support
+    let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+
     let mut results = BinaryHeap::with_capacity(k);
-    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true) {
+
+    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true)
+        && ep.dist >= lower_bound
+        && ep.dist < upper_bound
+    {
         results.push(ep.clone());
     }
 
@@ -312,11 +325,13 @@ pub fn beam_search(
 
         let process_neighbor = |neighbor: u32| {
             visited.insert(neighbor);
-            let dist = dist_calc.distance(neighbor).into();
+            let dist: OrderedFloat = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
                 if bitset
                     .map(|bitset| bitset.contains(neighbor))
                     .unwrap_or(true)
+                    && dist >= lower_bound
+                    && dist < upper_bound
                 {
                     if results.len() < k {
                         results.push((dist, neighbor).into());

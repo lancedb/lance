@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.32.0"
+version = "0.35.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.80"
@@ -48,7 +48,8 @@ lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
 log = "0.4"
-prost = "0.13.2"
+prost = "0.13"
+prost-types = "0.13"
 pyo3 = { version = "0.24.1", features = [
     "extension-module",
     "abi3-py39",
@@ -57,6 +58,7 @@ pyo3 = { version = "0.24.1", features = [
 ] }
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 uuid = "1.3.0"
+roaring = "0.10.1"
 serde_json = "1"
 serde = "1.0.197"
 serde_yaml = "0.9.34"

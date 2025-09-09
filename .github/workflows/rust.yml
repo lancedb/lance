@@ -9,6 +9,8 @@ on:
       - protos/**
       - .github/workflows/rust.yml
       - Cargo.toml
+      - Cargo.lock
+      - deny.toml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -44,10 +46,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt update
@@ -56,11 +58,9 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
-      - uses: auguwu/clippy-action@1.4.0
-        with:
-          check-args: --locked --features ${{ env.ALL_FEATURES }} --tests --benches --examples
-          token: ${{secrets.GITHUB_TOKEN}}
-          deny: warnings
+      - name: Clippy
+        run: cargo clippy --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
+
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
     runs-on: ubuntu-24.04
@@ -70,6 +70,7 @@ jobs:
         with:
           log-level: warn
           command: check
+
   linux-build:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 60
@@ -85,18 +86,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # pin the toolchain version to avoid surprises
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          # When using the nightly toolchain, do not surface warnings as check annotations
-          matcher: ${{ matrix.toolchain != 'nightly'}}
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-          rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
@@ -130,11 +132,15 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: "stable"
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
@@ -191,7 +197,6 @@ jobs:
         working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
       - name: Select new xcode
         # Default XCode right now is 15.0.1, which contains a bug that causes
         # backtraces to not show properly. See:
@@ -202,6 +207,10 @@ jobs:
       - name: Set up Rust
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Build tests
         run: |
           cargo test --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
@@ -219,6 +228,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Install Protoc v21.12
         working-directory: C:\
         run: |
@@ -234,6 +246,7 @@ jobs:
         run: cargo test
       - name: Check benchmarks
         run: cargo check --benches
+
   msrv:
     # Check the minimum supported Rust version
     name: MSRV Check - Rust v${{ matrix.msrv }}
@@ -250,14 +263,17 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Install ${{ matrix.msrv }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.msrv }}
+        run: |
+          rustup toolchain install ${{ matrix.msrv }}
+          rustup default ${{ matrix.msrv }}
       - name: cargo +${{ matrix.msrv }} check
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`

@@ -42,6 +42,11 @@ use crate::format::MAGIC;
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
+// In 2.1+, we split large pages on read instead of write to avoid empty pages
+// and small pages issues. However, we keep the write-time limit at 32MB to avoid
+// potential regressions in 2.0 format readers.
+//
+// This limit is not applied in the 2.1 writer
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
 
@@ -548,6 +553,7 @@ impl FileWriter {
         match version.resolve() {
             LanceFileVersion::V2_0 => (0, 3),
             LanceFileVersion::V2_1 => (2, 1),
+            LanceFileVersion::V2_2 => (2, 2),
             _ => panic!("Unsupported version: {}", version),
         }
     }
@@ -615,6 +621,10 @@ impl FileWriter {
         // 7. close the writer
         self.writer.shutdown().await?;
         Ok(self.rows_written)
+    }
+
+    pub async fn abort(&mut self) {
+        self.writer.abort().await;
     }
 
     pub async fn tell(&mut self) -> Result<u64> {
@@ -757,18 +767,22 @@ impl EncodedBatchWriteExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::v2::reader::{FileReader, FileReaderOptions};
+    use crate::v2::reader::{describe_encoding, FileReader, FileReaderOptions};
     use crate::v2::testing::FsFixture;
     use crate::v2::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
-    use arrow_array::{types::Float64Type, RecordBatchReader};
-    use arrow_array::{RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::builder::{Float32Builder, Int32Builder};
+    use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
+    use arrow_array::{Int32Array, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
+    use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::decoder::DecoderPlugins;
+    use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_io::utils::CachedFileSize;
     use object_store::path::Path;
@@ -782,7 +796,7 @@ mod tests {
         let tmp_path = tmp_path.child("some_file.lance");
         let obj_store = Arc::new(ObjectStore::local());
 
-        let reader = gen()
+        let reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
             .into_reader_rows(RowCount::from(1000), BatchCount::from(10));
 
@@ -810,7 +824,7 @@ mod tests {
         let tmp_path = tmp_path.child("some_file.lance");
         let obj_store = Arc::new(ObjectStore::local());
 
-        let reader = gen()
+        let reader = gen_batch()
             .col("score", array::rand::<Float64Type>())
             .into_reader_rows(RowCount::from(0), BatchCount::from(0));
 
@@ -973,5 +987,497 @@ mod tests {
         }
 
         std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
+    }
+
+    #[tokio::test]
+    async fn test_compression_overrides_end_to_end() {
+        // Create test schema with different column types
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("customer_id", DataType::Int32, false),
+            ArrowField::new("product_id", DataType::Int32, false),
+            ArrowField::new("quantity", DataType::Int32, false),
+            ArrowField::new("price", DataType::Float32, false),
+            ArrowField::new("description", DataType::Utf8, false),
+        ]));
+
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create test data with patterns suitable for different compression
+        let mut customer_ids = Int32Builder::new();
+        let mut product_ids = Int32Builder::new();
+        let mut quantities = Int32Builder::new();
+        let mut prices = Float32Builder::new();
+        let mut descriptions = Vec::new();
+
+        // Generate data with specific patterns:
+        // - customer_id: highly repetitive (good for RLE)
+        // - product_id: moderately repetitive (good for RLE)
+        // - quantity: random values (not good for RLE)
+        // - price: some repetition
+        // - description: long strings (good for Zstd)
+        for i in 0..10000 {
+            // Customer ID repeats every 100 rows (100 unique customers)
+            // This creates runs of 100 identical values
+            customer_ids.append_value(i / 100);
+
+            // Product ID has only 5 unique values with long runs
+            product_ids.append_value(i / 2000);
+
+            // Quantity is mostly 1 with occasional other values
+            quantities.append_value(if i % 10 == 0 { 5 } else { 1 });
+
+            // Price has only 3 unique values
+            prices.append_value(match i % 3 {
+                0 => 9.99,
+                1 => 19.99,
+                _ => 29.99,
+            });
+
+            // Descriptions are repetitive but we'll keep them simple
+            descriptions.push(format!("Product {}", i / 2000));
+        }
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(customer_ids.finish()),
+                Arc::new(product_ids.finish()),
+                Arc::new(quantities.finish()),
+                Arc::new(prices.finish()),
+                Arc::new(StringArray::from(descriptions)),
+            ],
+        )
+        .unwrap();
+
+        // Configure compression parameters
+        let mut params = CompressionParams::new();
+
+        // RLE for ID columns (ends with _id)
+        params.columns.insert(
+            "*_id".to_string(),
+            CompressionFieldParams {
+                rle_threshold: Some(0.5), // Lower threshold to trigger RLE more easily
+                compression: None,        // Will use default compression if any
+                compression_level: None,
+                bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+            },
+        );
+
+        // For now, we'll skip Zstd compression since it's not imported
+        // In a real implementation, you could add other compression types here
+
+        // Build encoding strategy with compression parameters
+        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
+            LanceFileVersion::V2_1,
+            params,
+        )
+        .unwrap();
+
+        // Configure file writer options
+        let options = FileWriterOptions {
+            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            format_version: Some(LanceFileVersion::V2_1),
+            max_page_bytes: Some(64 * 1024), // 64KB pages
+            ..Default::default()
+        };
+
+        // Write the file
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().join("test_compression_overrides.lance");
+        let object_store = ObjectStore::local();
+
+        let mut writer = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.add_schema_metadata("compression_test", "configured_compression");
+        writer.finish().await.unwrap();
+
+        // Now write the same data without compression overrides for comparison
+        let path_no_compression = tmp_dir.path().join("test_no_compression.lance");
+        let default_options = FileWriterOptions {
+            format_version: Some(LanceFileVersion::V2_1),
+            max_page_bytes: Some(64 * 1024),
+            ..Default::default()
+        };
+
+        let mut writer_no_compression = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path_no_compression.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema.clone(),
+            default_options,
+        )
+        .unwrap();
+
+        writer_no_compression.write_batch(&batch).await.unwrap();
+        writer_no_compression.finish().await.unwrap();
+
+        // Note: With our current data patterns and RLE compression, the compressed file
+        // might actually be slightly larger due to compression metadata overhead.
+        // This is expected and the test is mainly to verify the system works end-to-end.
+
+        // Read back the compressed file and verify data integrity
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(
+                &Path::from(path.to_str().unwrap()),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Verify metadata
+        let metadata = file_reader.metadata();
+        assert_eq!(metadata.major_version, 2);
+        assert_eq!(metadata.minor_version, 1);
+
+        let schema = file_reader.schema();
+        assert_eq!(
+            schema.metadata.get("compression_test"),
+            Some(&"configured_compression".to_string())
+        );
+
+        // Verify the actual encodings used
+        let column_metadatas = &metadata.column_metadatas;
+
+        // Check customer_id column (index 0) - should use RLE due to our configuration
+        assert!(!column_metadatas[0].pages.is_empty());
+        let customer_id_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        assert!(
+            customer_id_encoding.contains("RLE") || customer_id_encoding.contains("Rle"),
+            "customer_id column should use RLE encoding due to '*_id' pattern match, but got: {}",
+            customer_id_encoding
+        );
+
+        // Check product_id column (index 1) - should use RLE due to our configuration
+        assert!(!column_metadatas[1].pages.is_empty());
+        let product_id_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        assert!(
+            product_id_encoding.contains("RLE") || product_id_encoding.contains("Rle"),
+            "product_id column should use RLE encoding due to '*_id' pattern match, but got: {}",
+            product_id_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_compression() {
+        // Test that field metadata compression settings are respected
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
+            "zstd".to_string(),
+        );
+        metadata.insert(
+            lance_encoding::constants::COMPRESSION_LEVEL_META_KEY.to_string(),
+            "6".to_string(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("text", DataType::Utf8, false).with_metadata(metadata.clone()),
+            ArrowField::new("data", DataType::Int32, false).with_metadata(HashMap::from([(
+                lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
+                "none".to_string(),
+            )])),
+        ]));
+
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create test data
+        let id_array = Int32Array::from_iter_values(0..1000);
+        let text_array = StringArray::from_iter_values(
+            (0..1000).map(|i| format!("test string {} repeated text", i)),
+        );
+        let data_array = Int32Array::from_iter_values((0..1000).map(|i| i * 2));
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(id_array),
+                Arc::new(text_array),
+                Arc::new(data_array),
+            ],
+        )
+        .unwrap();
+
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().join("field_metadata_test.lance");
+        let object_store = ObjectStore::local();
+
+        // Create encoding strategy that will read from field metadata
+        let params = CompressionParams::new();
+        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
+            LanceFileVersion::V2_1,
+            params,
+        )
+        .unwrap();
+
+        let options = FileWriterOptions {
+            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let mut writer = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back metadata
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(
+                &Path::from(path.to_str().unwrap()),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+
+        // The text column (index 1) should use zstd compression based on metadata
+        let text_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        // For string columns, we expect Binary encoding with zstd compression
+        assert!(
+            text_encoding.contains("Zstd"),
+            "text column should use zstd compression from field metadata, but got: {}",
+            text_encoding
+        );
+
+        // The data column (index 2) should use no compression based on metadata
+        let data_encoding = describe_encoding(&column_metadatas[2].pages[0]);
+        // For Int32 columns with "none" compression, we expect Flat encoding without compression
+        assert!(
+            data_encoding.contains("Flat") && data_encoding.contains("compression: None"),
+            "data column should use no compression from field metadata, but got: {}",
+            data_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_rle_threshold() {
+        // Test that RLE threshold from field metadata is respected
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            lance_encoding::constants::RLE_THRESHOLD_META_KEY.to_string(),
+            "0.9".to_string(),
+        );
+        // Also set compression to ensure RLE is used
+        metadata.insert(
+            lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
+            "lz4".to_string(),
+        );
+        // Explicitly disable BSS to ensure RLE is tested
+        metadata.insert(
+            lance_encoding::constants::BSS_META_KEY.to_string(),
+            "off".to_string(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "status",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(metadata)]));
+
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create data with very high repetition (3 runs for 10000 values = 0.0003 ratio)
+        let status_array = Int32Array::from_iter_values(
+            std::iter::repeat_n(200, 8000)
+                .chain(std::iter::repeat_n(404, 1500))
+                .chain(std::iter::repeat_n(500, 500)),
+        );
+
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(status_array)]).unwrap();
+
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().join("rle_threshold_test.lance");
+        let object_store = ObjectStore::local();
+
+        // Create encoding strategy that will read from field metadata
+        let params = CompressionParams::new();
+        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
+            LanceFileVersion::V2_1,
+            params,
+        )
+        .unwrap();
+
+        let options = FileWriterOptions {
+            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let mut writer = FileWriter::try_new(
+            object_store
+                .create(&Path::from(path.to_str().unwrap()))
+                .await
+                .unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        // Read back and check encoding
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(
+                &Path::from(path.to_str().unwrap()),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        let status_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        assert!(
+            status_encoding.contains("RLE") || status_encoding.contains("Rle"),
+            "status column should use RLE encoding due to metadata threshold, but got: {}",
+            status_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_page_split_on_read() {
+        use arrow_array::Array;
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        // Test that large pages written with relaxed limits can be split during read
+
+        let arrow_field = ArrowField::new("data", DataType::Binary, false);
+        let arrow_schema = ArrowSchema::new(vec![arrow_field]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // Create a large binary value (40MB) to trigger large page creation
+        let large_value = vec![42u8; 40 * 1024 * 1024];
+        let array = arrow_array::BinaryArray::from(vec![
+            Some(large_value.as_slice()),
+            Some(b"small value"),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
+
+        // Write with relaxed page size limit (128MB)
+        let options = FileWriterOptions {
+            max_page_bytes: Some(128 * 1024 * 1024),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+
+        let fs = FsFixture::default();
+        let path = fs.tmp_path.child("large_page_test.lance");
+
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        let num_rows = writer.finish().await.unwrap();
+        assert_eq!(num_rows, 2);
+
+        // Read back with split configuration
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        // Configure reader to split pages larger than 10MB into chunks
+        let reader_options = FileReaderOptions {
+            read_chunk_size: 10 * 1024 * 1024, // 10MB chunks
+            ..Default::default()
+        };
+
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            reader_options,
+        )
+        .await
+        .unwrap();
+
+        // Read the data back
+        let stream = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                10, // batch_readahead
+                FilterExpression::no_filter(),
+            )
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+
+        // Verify the data is correctly read despite splitting
+        let read_array = batches[0].column(0);
+        let read_binary = read_array
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .unwrap();
+
+        assert_eq!(read_binary.len(), 2);
+        assert_eq!(read_binary.value(0).len(), 40 * 1024 * 1024);
+        assert_eq!(read_binary.value(1), b"small value");
+
+        // Verify first value matches what we wrote
+        assert!(read_binary.value(0).iter().all(|&b| b == 42u8));
     }
 }

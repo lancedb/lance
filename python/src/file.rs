@@ -271,7 +271,7 @@ impl LanceFileWriter {
         })
     }
 
-    fn inner_lock(&self) -> PyResult<MutexGuard<Box<FileWriter>>> {
+    fn inner_lock(&self) -> PyResult<MutexGuard<'_, Box<FileWriter>>> {
         self.inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -291,38 +291,49 @@ impl LanceFileWriter {
         keep_original_array: Option<bool>,
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(
-            path,
-            schema,
-            data_cache_bytes,
-            version,
-            storage_options,
-            keep_original_array,
-            max_page_bytes,
-        ))
+        RT.block_on(
+            None,
+            Self::open(
+                path,
+                schema,
+                data_cache_bytes,
+                version,
+                storage_options,
+                keep_original_array,
+                max_page_bytes,
+            ),
+        )?
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
-        RT.runtime
-            .block_on(self.inner_lock()?.write_batch(&batch.0))
+        RT.block_on(None, self.inner_lock()?.write_batch(&batch.0))?
             .infer_error()
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        RT.runtime
-            .block_on(self.inner_lock()?.finish())
+        RT.block_on(None, self.inner_lock()?.finish())?
             .infer_error()
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
-        RT.runtime
-            .block_on(self.inner_lock()?.add_global_buffer(Bytes::from(bytes)))
-            .infer_error()
+        RT.block_on(
+            None,
+            self.inner_lock()?.add_global_buffer(Bytes::from(bytes)),
+        )?
+        .infer_error()
     }
 
     pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
         self.inner_lock()?.add_schema_metadata(key, value);
         Ok(())
+    }
+}
+
+impl Drop for LanceFileWriter {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner_lock() {
+            RT.runtime.block_on(inner.abort());
+        }
     }
 }
 
@@ -388,6 +399,51 @@ pub async fn object_store_from_uri_or_path(
 }
 
 #[pyclass]
+pub struct LanceFileSession {
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
+}
+
+impl LanceFileSession {
+    pub async fn try_new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let (object_store, base_path) =
+            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        Ok(Self {
+            object_store,
+            base_path,
+        })
+    }
+}
+
+#[pymethods]
+impl LanceFileSession {
+    #[new]
+    #[pyo3(signature=(uri_or_path, storage_options=None))]
+    pub fn new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        RT.block_on(None, Self::try_new(uri_or_path, storage_options))?
+    }
+
+    #[pyo3(signature=(path, columns=None))]
+    pub fn open_reader(
+        &self,
+        path: String,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<LanceFileReader> {
+        let path = self.base_path.child(path);
+        RT.block_on(
+            None,
+            LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+        )?
+    }
+}
+
+#[pyclass]
 pub struct LanceFileReader {
     inner: Arc<FileReader>,
 }
@@ -400,6 +456,14 @@ impl LanceFileReader {
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        Self::open_with_store(object_store, path, columns).await
+    }
+
+    async fn open_with_store(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Self> {
         let scheduler = ScanScheduler::new(
             object_store,
             SchedulerConfig {
@@ -427,7 +491,7 @@ impl LanceFileReader {
         }
 
         let inner = FileReader::try_open_with_file_metadata(
-            Arc::new(LanceEncodingsIo(file.clone())),
+            Arc::new(LanceEncodingsIo::new(file.clone())),
             path,
             base_projection,
             Arc::<DecoderPlugins>::default(),
@@ -449,7 +513,7 @@ impl Iterator for LanceReaderAdapter {
     type Item = std::result::Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = RT.runtime.block_on(self.0.next());
+        let batch = RT.block_on(None, self.0.next()).ok()?;
         batch.map(|b| b.map_err(|e| e.into()))
     }
 }
@@ -470,15 +534,16 @@ impl LanceFileReader {
         // read_stream is a synchronous method but it launches tasks and needs to be
         // run in the context of a tokio runtime
         let inner = self.inner.clone();
-        let _guard = RT.runtime.enter();
-        let stream = inner
-            .read_stream(
-                params,
-                batch_size,
-                batch_readahead,
-                FilterExpression::no_filter(),
-            )
-            .infer_error()?;
+        let stream = RT.block_on(None, async move {
+            inner
+                .read_stream(
+                    params,
+                    batch_size,
+                    batch_readahead,
+                    FilterExpression::no_filter(),
+                )
+                .infer_error()
+        })??;
         Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
     }
 }
@@ -492,8 +557,7 @@ impl LanceFileReader {
         storage_options: Option<HashMap<String, String>>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
-        RT.runtime
-            .block_on(Self::open(path, storage_options, columns))
+        RT.block_on(None, Self::open(path, storage_options, columns))?
     }
 
     pub fn read_all(

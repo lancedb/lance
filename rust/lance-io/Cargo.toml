@@ -65,10 +65,10 @@ harness = false
 [features]
 default = ["aws", "azure", "gcp"]
 gcs-test = []
-gcp = ["object_store/gcp"]
-aws = ["object_store/aws", "aws-config", "aws-credential-types"]
-azure = ["object_store/azure"]
-oss = ["opendal/services-oss", "object_store_opendal"]
+gcp = ["object_store/gcp", "dep:opendal", "opendal/services-gcs", "dep:object_store_opendal"]
+aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
+azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "dep:object_store_opendal"]
+oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 
 [lints]
 workspace = true

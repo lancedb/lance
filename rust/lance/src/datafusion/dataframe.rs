@@ -85,21 +85,28 @@ impl TableProvider for LanceTableProvider {
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
-        if let Some(projection) = projection {
-            let mut columns = Vec::with_capacity(projection.len());
-            for field_idx in projection {
-                if Some(*field_idx) == self.row_id_idx {
-                    scan.with_row_id();
-                } else if Some(*field_idx) == self.row_addr_idx {
-                    scan.with_row_address();
-                } else {
-                    columns.push(self.full_schema.field(*field_idx).name());
+        match projection {
+            Some(projection) if projection.is_empty() => {
+                scan.empty_project()?;
+            }
+            Some(projection) => {
+                let mut columns = Vec::with_capacity(projection.len());
+                for field_idx in projection {
+                    if Some(*field_idx) == self.row_id_idx {
+                        scan.with_row_id();
+                    } else if Some(*field_idx) == self.row_addr_idx {
+                        scan.with_row_address();
+                    } else {
+                        columns.push(self.full_schema.field(*field_idx).name());
+                    }
+                }
+                if !columns.is_empty() {
+                    scan.project(&columns)?;
                 }
             }
-            if !columns.is_empty() {
-                scan.project(&columns)?;
-            }
+            _ => {}
         }
+
         let combined_filter = match filters.len() {
             0 => None,
             1 => Some(filters[0].clone()),
@@ -254,7 +261,7 @@ pub mod tests {
     pub async fn test_table_provider() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let data = lance_datagen::gen()
+        let data = lance_datagen::gen_batch()
             .col("x", array::step::<Int32Type>())
             .col("y", array::step_custom::<Int32Type>(0, 2))
             .into_dataset(

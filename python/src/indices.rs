@@ -13,6 +13,7 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use pyo3::types::PyModuleMethods;
 use pyo3::Bound;
 use pyo3::{
@@ -21,6 +22,8 @@ use pyo3::{
     wrap_pyfunction, PyObject, PyResult, Python,
 };
 
+use lance::index::DatasetIndexInternalExt;
+
 use crate::fragment::FileFragment;
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, RT,
@@ -28,6 +31,87 @@ use crate::{
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::DatasetIndexExt;
 use uuid::Uuid;
+
+#[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
+#[derive(Debug, Clone)]
+pub struct PyIndexConfig {
+    pub index_type: String,
+    pub config: String,
+}
+
+#[pymethods]
+impl PyIndexConfig {
+    #[new]
+    fn new(index_type: &str, config: &str) -> PyResult<Self> {
+        Ok(Self {
+            index_type: index_type.to_string(),
+            config: config.to_string(),
+        })
+    }
+}
+
+#[pyclass(name = "IvfModel", module = "lance.indices")]
+#[derive(Debug, Clone)]
+pub struct PyIvfModel {
+    pub(crate) inner: IvfModel,
+}
+
+#[pymethods]
+impl PyIvfModel {
+    #[getter]
+    fn centroids(&self, py: Python) -> PyResult<Option<PyObject>> {
+        if let Some(centroids) = &self.inner.centroids {
+            let data = centroids.clone().into_data();
+            Ok(Some(data.to_pyarrow(py)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Internal helper to fetch an IVF model for the given index name.
+async fn do_get_ivf_model(dataset: &Dataset, index_name: &str) -> PyResult<IvfModel> {
+    use lance_index::metrics::NoOpMetricsCollector;
+
+    // Load index metadata list
+    let idx_metas = dataset.ds.load_indices().await.infer_error()?; // Convert Lance error to PyErr
+
+    // Find the index by name
+    let idx_meta = idx_metas
+        .iter()
+        .find(|idx| idx.name == index_name)
+        .ok_or_else(|| PyValueError::new_err(format!("Index \"{}\" not found", index_name)))?;
+
+    if idx_meta.fields.is_empty() {
+        return Err(PyValueError::new_err("Index has no fields"));
+    }
+
+    let schema = dataset.ds.schema();
+    let field = schema
+        .field_by_id(idx_meta.fields[0])
+        .ok_or_else(|| PyValueError::new_err("Failed to resolve index field"))?;
+    let column_name = &field.name;
+
+    // Open the vector index
+    let vindex = dataset
+        .ds
+        .open_vector_index(
+            column_name,
+            &idx_meta.uuid.to_string(),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .infer_error()?;
+
+    // Clone the IVF model
+    Ok(vindex.ivf_model().clone())
+}
+
+#[pyfunction]
+fn get_ivf_model(py: Python<'_>, dataset: &Dataset, index_name: &str) -> PyResult<Py<PyIvfModel>> {
+    let ivf_model = RT.block_on(Some(py), do_get_ivf_model(dataset, index_name))??;
+    Py::new(py, PyIvfModel { inner: ivf_model })
+}
 
 async fn do_train_ivf_model(
     dataset: &Dataset,
@@ -43,7 +127,7 @@ async fn do_train_ivf_model(
     let params = IvfBuildParams {
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
-        num_partitions: num_partitions as usize,
+        num_partitions: Some(num_partitions as usize),
         ..Default::default()
     };
     let ivf_model = lance::index::vector::ivf::build_ivf_model(
@@ -386,6 +470,9 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
+    indices.add_class::<PyIvfModel>()?;
+    indices.add_class::<PyIndexConfig>()?;
+    indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
     m.add_submodule(&indices)?;
     Ok(())
 }

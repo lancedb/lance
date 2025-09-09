@@ -3,6 +3,7 @@
 
 //! Wraps a Fragment of the dataset.
 
+pub mod session;
 pub mod write;
 
 use std::borrow::Cow;
@@ -53,6 +54,7 @@ use super::statistics::FieldStatistics;
 use super::updater::Updater;
 use super::{schema_evolution, NewColumnTransform, WriteParams};
 use crate::arrow::*;
+use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 
@@ -416,7 +418,7 @@ mod v2_adapter {
                 let scheduler = self.file_scheduler.with_priority(op_priority);
                 Arc::new(
                     self.reader
-                        .with_scheduler(Arc::new(LanceEncodingsIo(scheduler))),
+                        .with_scheduler(Arc::new(LanceEncodingsIo::new(scheduler))),
                 )
             } else {
                 self.reader.clone()
@@ -613,6 +615,8 @@ pub struct FragReadConfig {
     ///
     /// operation_priority: u32 | reader_priority: u32 | file_position: u64
     pub reader_priority: Option<u32>,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 impl FragReadConfig {
@@ -633,6 +637,11 @@ impl FragReadConfig {
 
     pub fn with_reader_priority(mut self, value: u32) -> Self {
         self.reader_priority = Some(value);
+        self
+    }
+
+    pub fn with_file_reader_options(mut self, value: FileReaderOptions) -> Self {
+        self.file_reader_options = Some(value);
         self
     }
 }
@@ -724,7 +733,7 @@ impl FileFragment {
                 None,
                 Arc::<DecoderPlugins>::default(),
                 &dataset.metadata_cache.file_metadata_cache(&filepath),
-                FileReaderOptions::default(),
+                dataset.file_reader_options.clone().unwrap_or_default(),
             )
             .await?;
             // If the schemas are not compatible we can't calculate field id offsets
@@ -827,7 +836,7 @@ impl FileFragment {
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
-        let row_id_load = if self.dataset.manifest.uses_move_stable_row_ids() {
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )
@@ -894,7 +903,10 @@ impl FileFragment {
         if data_file.is_legacy_file() {
             let max_field_id = data_file.fields.iter().max().unwrap();
             if !schema_per_file.fields.is_empty() {
-                let path = self.dataset.data_dir().child(data_file.path.as_str());
+                let path = self
+                    .dataset
+                    .data_file_dir(data_file)?
+                    .child(data_file.path.as_str());
                 let field_id_offset = Self::get_field_id_offset(data_file);
                 let reader = FileReader::try_new_with_fragment_id(
                     &self.dataset.object_store,
@@ -919,7 +931,10 @@ impl FileFragment {
         } else if schema_per_file.fields.is_empty() {
             Ok(None)
         } else {
-            let path = self.dataset.data_dir().child(data_file.path.as_str());
+            let path = self
+                .dataset
+                .data_file_dir(data_file)?
+                .child(data_file.path.as_str());
             let (store_scheduler, reader_priority) =
                 if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
                     (
@@ -943,13 +958,17 @@ impl FileFragment {
             let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
-                    Arc::new(LanceEncodingsIo(file_scheduler.clone())),
+                    Arc::new(LanceEncodingsIo::new(file_scheduler.clone())),
                     path,
                     None,
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
                     &metadata_cache,
-                    FileReaderOptions::default(),
+                    read_config
+                        .file_reader_options
+                        .clone()
+                        .or_else(|| self.dataset.file_reader_options.clone())
+                        .unwrap_or_default(),
                 )
                 .await?,
             );
@@ -1113,8 +1132,8 @@ impl FileFragment {
                 if *field_id <= last {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_dir()
-                            .child(self.metadata.files[0].path.as_str()),
+                            .data_file_dir(data_file)?
+                            .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is not in increasing order in fragment {:#?}",
                             field_id, self
@@ -1126,8 +1145,8 @@ impl FileFragment {
                 if !seen_fields.insert(field_id) {
                     return Err(Error::corrupt_file(
                         self.dataset
-                            .data_dir()
-                            .child(self.metadata.files[0].path.as_str()),
+                            .data_file_dir(data_file)?
+                            .child(data_file.path.as_str()),
                         format!(
                             "Field id {} is duplicated in fragment {:#?}",
                             field_id, self
@@ -1143,7 +1162,7 @@ impl FileFragment {
         {
             return Err(Error::corrupt_file(
                 self.dataset
-                    .data_dir()
+                    .data_file_dir(&self.metadata.files[0])?
                     .child(self.metadata.files[0].path.as_str()),
                 "Fragment contains a mix of v1 and v2 data files".to_string(),
                 location!(),
@@ -1151,16 +1170,17 @@ impl FileFragment {
         }
 
         for data_file in &self.metadata.files {
-            data_file.validate(&self.dataset.data_dir())?;
+            data_file.validate(&self.dataset.data_file_dir(&self.metadata.files[0])?)?;
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
+            let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
                 .open_reader(data_file, None, &FragReadConfig::default())
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
-                        self.dataset.data_dir().child(data_file.path.clone()),
+                        data_file_dir.child(data_file.path.as_str()),
                         "did not have any fields in common with the dataset schema",
                         location!(),
                     )
@@ -1177,7 +1197,10 @@ impl FileFragment {
         let expected_length = get_lengths.first().unwrap_or(&0);
         for (length, data_file) in get_lengths.iter().zip(self.metadata.files.iter()) {
             if length != expected_length {
-                let path = self.dataset.data_dir().child(data_file.path.as_str());
+                let path = self
+                    .dataset
+                    .data_file_dir(data_file)?
+                    .child(data_file.path.as_str());
                 return Err(Error::corrupt_file(
                     path,
                     format!(
@@ -1192,7 +1215,7 @@ impl FileFragment {
             if physical_rows != *expected_length {
                 return Err(Error::corrupt_file(
                     self.dataset
-                        .data_dir()
+                        .data_file_dir(&self.metadata.files[0])?
                         .child(self.metadata.files[0].path.as_str()),
                     format!(
                         "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
@@ -1246,6 +1269,17 @@ impl FileFragment {
         Ok(())
     }
 
+    /// Open a [`FragmentSession`], which manages a short-lived session of [`FileFragment`].
+    ///
+    /// This API works well for users making repeated requests over the same projected schema.
+    pub async fn open_session(
+        &self,
+        projection: &Schema,
+        with_row_address: bool,
+    ) -> Result<FragmentSession> {
+        FragmentSession::open(Arc::new(self.clone()), projection, with_row_address).await
+    }
+
     /// Take rows from this fragment based on the offset in the file.
     ///
     /// This will always return the same number of rows as the input indices.
@@ -1264,39 +1298,7 @@ impl FileFragment {
                 .collect::<Vec<_>>();
             sorted_deleted_ids.sort();
 
-            let mut row_ids = indices.to_vec();
-            for row_id in row_ids.iter_mut() {
-                // We find the number of deleted rows that are less than each row
-                // index, and that becomes the initial offset. We increment the
-                // index by that amount, plus the number of deleted row ids we
-                // encounter along the way. So for example, if deleted rows are
-                // [2, 3, 5] and we want row 4, we need to advanced by 2 (since
-                // 2 and 3 are less than 4). That puts us at row 6, but since
-                // we passed row 5, we need to advance by 1 more, giving a final
-                // row id of 7.
-                let mut new_row_id = *row_id;
-                let offset = sorted_deleted_ids.partition_point(|v| *v <= new_row_id);
-
-                let mut deletion_i = offset;
-                let mut i = 0;
-                while i < offset {
-                    // Advance the row id
-                    new_row_id += 1;
-                    while deletion_i < sorted_deleted_ids.len()
-                        && sorted_deleted_ids[deletion_i] == new_row_id
-                    {
-                        // If we encounter a deleted row, we need to advance
-                        // again.
-                        deletion_i += 1;
-                        new_row_id += 1;
-                    }
-                    i += 1;
-                }
-
-                *row_id = new_row_id;
-            }
-
-            Cow::Owned(row_ids)
+            Cow::Owned(resolve_actual_row_ids(indices, &sorted_deleted_ids))
         } else {
             Cow::Borrowed(indices)
         };
@@ -1542,7 +1544,7 @@ impl FileFragment {
             self.dataset.as_ref(),
             transforms,
             read_columns,
-            &[self.clone()],
+            std::slice::from_ref(self),
             batch_size,
         )
         .await?;
@@ -1626,7 +1628,7 @@ impl FileFragment {
         self.write_deletions(deletion_vector).await
     }
 
-    pub(crate) async fn extend_deletions(
+    pub async fn extend_deletions(
         self,
         new_deletions: impl IntoIterator<Item = u32>,
     ) -> Result<Option<Self>> {
@@ -1679,6 +1681,43 @@ impl FileFragment {
     }
 }
 
+/// Using deleted ids to remap row ids into actual row ids.
+pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]) -> Vec<u32> {
+    let mut row_ids = row_ids.to_vec();
+    for row_id in row_ids.iter_mut() {
+        // We find the number of deleted rows that are less than each row
+        // index, and that becomes the initial offset. We increment the
+        // index by that amount, plus the number of deleted row ids we
+        // encounter along the way. So for example, if deleted rows are
+        // [2, 3, 5] and we want row 4, we need to advanced by 2 (since
+        // 2 and 3 are less than 4). That puts us at row 6, but since
+        // we passed row 5, we need to advance by 1 more, giving a final
+        // row id of 7.
+        let mut new_row_id = *row_id;
+        let offset = sorted_deleted_ids.partition_point(|v| *v <= new_row_id);
+
+        let mut deletion_i = offset;
+        let mut i = 0;
+        while i < offset {
+            // Advance the row id
+            new_row_id += 1;
+            while deletion_i < sorted_deleted_ids.len()
+                && sorted_deleted_ids[deletion_i] == new_row_id
+            {
+                // If we encounter a deleted row, we need to advance
+                // again.
+                deletion_i += 1;
+                new_row_id += 1;
+            }
+            i += 1;
+        }
+
+        *row_id = new_row_id;
+    }
+
+    row_ids
+}
+
 // Cache key for file metadata
 #[derive(Debug, Clone)]
 struct FileMetadataCacheKey;
@@ -1714,7 +1753,7 @@ pub struct FragmentReader {
 
     /// The row id sequence
     ///
-    /// Only populated if the move-stable row id feature is enabled.
+    /// Only populated if the stable row id feature is enabled.
     row_id_sequence: Option<Arc<RowIdSequence>>,
 
     /// ID of the fragment
@@ -2337,12 +2376,11 @@ impl FragmentReader {
 
 #[cfg(test)]
 mod tests {
-
     use arrow_arith::numeric::mul;
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen, RowCount};
+    use lance_datagen::{array, gen_batch, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams};
     use pretty_assertions::assert_eq;
@@ -3387,7 +3425,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let make_gen = || {
-            gen()
+            gen_batch()
                 .col("str", array::rand_type(&DataType::Utf8))
                 .col("int", array::rand_type(&DataType::Int32))
         };
@@ -3411,7 +3449,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            Fragment::try_infer_version(&[frag.clone()])
+            Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
             LanceFileVersion::Stable.resolve()

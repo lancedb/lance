@@ -25,22 +25,61 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout lance-spark
+        uses: actions/checkout@v4
+        with:
+          repository: lancedb/lance-spark
+          path: lance-spark
+      - name: Checkout lance-namespace
+        uses: actions/checkout@v4
+        with:
+          repository: lancedb/lance-namespace
+          path: lance-namespace
+      - name: Checkout lance-ray
+        uses: actions/checkout@v4
+        with:
+          repository: lancedb/lance-ray
+          path: lance-ray
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-      - uses: actions/setup-python@v5
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.11
-          cache: 'pip'
-          cache-dependency-path: "docs/requirements.txt"
-      - uses: actions/cache@v4
+          python-version-file: "docs/pyproject.toml"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          key: mkdocs-material-${{ env.cache_id }}
-          path: .cache
-          restore-keys: |
-            mkdocs-material-
-      - run: pip install -r docs/requirements.txt
+          enable-cache: true
+      - name: Copy lance-namespace docs
+        run: |
+          cp -r lance-namespace/docs/src docs/src/format/namespace
+          cat >> docs/src/format/.pages << 'EOF'
+            - Namespace Spec: namespace
+          EOF
+          cp docs/src/format/namespace/rest.yaml docs/src/rest.yaml
+          cp lance-namespace/CONTRIBUTING.md docs/src/community/contributing/namespace.md
+          # Update contributing .pages to include namespace.md in navbar
+          echo "  - Namespace: namespace.md" >> docs/src/community/contributing/.pages
+      - name: Copy lance-spark docs
+        run: |
+          cp -r lance-spark/docs/src docs/src/integrations/spark
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Apache Spark: spark
+          EOF
+          cp lance-spark/CONTRIBUTING.md docs/src/community/contributing/spark.md
+          # Update contributing .pages to include spark.md in navbar
+          echo "  - Apache Spark: spark.md" >> docs/src/community/contributing/.pages
+      - name: Copy lance-ray docs
+        run: |
+          cp -r lance-ray/docs/src docs/src/integrations/ray
+          cat >> docs/src/integrations/.pages << 'EOF'
+            - Ray: ray
+          EOF
+          cp lance-ray/CONTRIBUTING.md docs/src/community/contributing/ray.md
+          # Update contributing .pages to include ray.md in navbar
+          echo "  - Ray: ray.md" >> docs/src/community/contributing/.pages
       - name: Deploy
         working-directory: docs
-        run: mkdocs gh-deploy --force
+        run: uv run mkdocs gh-deploy --force

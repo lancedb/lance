@@ -32,6 +32,7 @@ futures.workspace = true
 half.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
+jsonb.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-datafusion.workspace = true
@@ -44,6 +45,7 @@ log.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 rand.workspace = true
 roaring.workspace = true
 rayon.workspace = true
@@ -61,6 +63,7 @@ bytes.workspace = true
 uuid.workspace = true
 async-channel = "2.3.1"
 bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
+lance-datagen.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
@@ -76,8 +79,8 @@ rstest.workspace = true
 
 [features]
 protoc = ["dep:protobuf-src"]
-tokenizer-lindera = ["lindera", "lindera-tantivy"]
-tokenizer-jieba = ["jieba-rs"]
+tokenizer-lindera = ["dep:lindera", "dep:lindera-tantivy"]
+tokenizer-jieba = ["dep:jieba-rs"]
 
 [build-dependencies]
 prost-build.workspace = true
@@ -116,6 +119,10 @@ harness = false
 
 [[bench]]
 name = "ngram"
+harness = false
+
+[[bench]]
+name = "zonemap"
 harness = false
 
 [[bench]]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -37,15 +38,20 @@ use crate::Dataset;
 use super::blob::BlobStreamExt;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
+use super::utils::wrap_json_stream_for_writing;
 use super::DATA_DIR;
+
+use lance_arrow::json::is_arrow_json_field;
 
 mod commit;
 pub mod delete;
 mod insert;
 pub mod merge_insert;
+mod retry;
 pub mod update;
 
 pub use commit::CommitBuilder;
+pub use delete::DeleteBuilder;
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.
@@ -62,6 +68,13 @@ impl WriteDestination<'_> {
         match self {
             WriteDestination::Dataset(dataset) => Some(dataset.as_ref()),
             WriteDestination::Uri(_) => None,
+        }
+    }
+
+    pub fn uri(&self) -> String {
+        match self {
+            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
+            WriteDestination::Uri(uri) => uri.to_string(),
         }
     }
 }
@@ -179,11 +192,11 @@ pub struct WriteParams {
     /// If not specified then the latest stable version will be used.
     pub data_storage_version: Option<LanceFileVersion>,
 
-    /// Experimental: if set to true, the writer will use move-stable row ids.
+    /// Experimental: if set to true, the writer will use stable row ids.
     /// These row ids are stable after compaction operations, but not after updates.
     /// This makes compaction more efficient, since with stable row ids no
     /// secondary indices need to be updated to point to new row ids.
-    pub enable_move_stable_row_ids: bool,
+    pub enable_stable_row_ids: bool,
 
     /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
     /// These allow constant-time lookups for the latest manifest on object storage.
@@ -201,6 +214,17 @@ pub struct WriteParams {
     /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
     /// Both parameters must be set to invoke autocleaning.
     pub auto_cleanup: Option<AutoCleanupParams>,
+
+    /// If true, skip auto cleanup during commits. This should be set to true
+    /// for high frequency writes to improve performance. This is also useful
+    /// if the writer does not have delete permissions and the clean up would
+    /// just try and log a failure anyway. Default is false.
+    pub skip_auto_cleanup: bool,
+
+    /// Configuration key-value pairs for this write operation.
+    /// This can include commit messages, engine information, etc.
+    /// this properties map will be persisted as part of Transaction object.
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl Default for WriteParams {
@@ -216,10 +240,12 @@ impl Default for WriteParams {
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
             data_storage_version: None,
-            enable_move_stable_row_ids: false,
+            enable_stable_row_ids: false,
             enable_v2_manifest_paths: false,
             session: None,
             auto_cleanup: Some(AutoCleanupParams::default()),
+            skip_auto_cleanup: false,
+            transaction_properties: None,
         }
     }
 }
@@ -243,6 +269,14 @@ impl WriteParams {
             .as_ref()
             .map(|s| s.store_registry())
             .unwrap_or_default()
+    }
+
+    /// Set the properties for this WriteParams.
+    pub fn with_transaction_properties(self, properties: HashMap<String, String>) -> Self {
+        Self {
+            transaction_properties: Some(Arc::new(properties)),
+            ..self
+        }
     }
 }
 
@@ -274,6 +308,11 @@ pub async fn do_write_fragments(
     params: WriteParams,
     storage_version: LanceFileVersion,
 ) -> Result<Vec<Fragment>> {
+    // Convert arrow.json to lance.json (JSONB) for storage if needed
+    //
+    // FIXME: this is bad, really bad, we need to find a way to remove this.
+    let data = wrap_json_stream_for_writing(data);
+
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
         // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
@@ -355,6 +394,26 @@ pub async fn write_fragments_internal(
     data: SendableRecordBatchStream,
     mut params: WriteParams,
 ) -> Result<WrittenFragments> {
+    // Convert Arrow JSON columns to Lance JSON (JSONB) format
+    //
+    // FIXME: this is bad, really bad, we need to find a way to remove this.
+    let needs_conversion = data
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| is_arrow_json_field(f));
+
+    let (data, converted_schema) = if needs_conversion {
+        let data = wrap_json_stream_for_writing(data);
+        // Update the schema to match the converted data
+        let arrow_schema = data.schema();
+        let converted_schema = Schema::try_from(arrow_schema.as_ref())?;
+        (data, converted_schema)
+    } else {
+        // No conversion needed, use original schema to preserve dictionary info
+        (data, schema)
+    };
+
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
@@ -362,7 +421,7 @@ pub async fn write_fragments_internal(
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
-                schema.check_compatible(
+                converted_schema.check_compatible(
                     dataset.schema(),
                     &SchemaCompareOptions {
                         // We don't care if the user claims their data is nullable / non-nullable.  We will
@@ -376,7 +435,7 @@ pub async fn write_fragments_internal(
                 )?;
                 // Project from the dataset schema, because it has the correct field ids.
                 let write_schema = dataset.schema().project_by_schema(
-                    &schema,
+                    &converted_schema,
                     OnMissing::Error,
                     OnTypeMismatch::Error,
                 )?;
@@ -397,13 +456,13 @@ pub async fn write_fragments_internal(
                         .data_storage_format
                         .lance_file_version()?,
                 );
-                (schema, data_storage_version)
+                (converted_schema, data_storage_version)
             }
         }
     } else {
         // Brand new dataset, use the schema from the data and the storage version
         // from the user or the default.
-        (schema, params.storage_version_or_default())
+        (converted_schema, params.storage_version_or_default())
     };
 
     let data_schema = schema.project_by_schema(
@@ -419,7 +478,7 @@ pub async fn write_fragments_internal(
         store_params: params.store_params.clone(),
         commit_handler: params.commit_handler.clone(),
         data_storage_version: params.data_storage_version,
-        enable_move_stable_row_ids: true,
+        enable_stable_row_ids: true,
         // This shouldn't really matter since all commits are detached
         enable_v2_manifest_paths: true,
         max_bytes_per_file: params.max_bytes_per_file,
@@ -427,9 +486,9 @@ pub async fn write_fragments_internal(
         ..Default::default()
     };
 
-    if blob_data.is_some() && !params.enable_move_stable_row_ids {
+    if blob_data.is_some() && !params.enable_stable_row_ids {
         return Err(Error::invalid_input(
-            "The blob storage class requires move stable row ids",
+            "The blob storage class requires stable row ids",
             location!(),
         ));
     }
@@ -769,7 +828,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_file::reader::FileReader;
     use lance_io::traits::Reader;
 
@@ -896,7 +955,7 @@ mod tests {
         // To avoid generating and writing millions of rows (which is a bit slow for a unit
         // test) we can use a large data type (1KiB binary)
         let data_reader = Box::new(
-            gen()
+            gen_batch()
                 .anon_col(array::rand_fsb(1024))
                 .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
         );

@@ -14,6 +14,7 @@ use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::ROW_ADDR;
 use lance_core::ROW_ID;
+use lance_core::ROW_OFFSET;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -23,8 +24,7 @@ use object_store::path::Path;
 use snafu::location;
 
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::Operation;
-use crate::dataset::transaction::Transaction;
+use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::write_fragments_internal;
 use crate::dataset::ReadParams;
 use crate::Dataset;
@@ -123,11 +123,12 @@ impl<'a> InsertBuilder<'a> {
 
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
-            .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
+            .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
-            .with_object_store(context.object_store.clone());
+            .with_object_store(context.object_store.clone())
+            .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
 
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());
@@ -185,7 +186,12 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
 
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_WRITING_EVENT, path=context.base_path.to_string(), mode=?context.params.mode);
+        info!(
+            target: TRACE_DATASET_EVENTS,
+            event=DATASET_WRITING_EVENT,
+            uri=context.dest.uri(),
+            mode=?context.params.mode
+        );
 
         self.validate_write(&mut context, &schema)?;
 
@@ -267,16 +273,19 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
-        Ok(Transaction::new(
+        let transaction = TransactionBuilder::new(
             context
                 .dest
                 .dataset()
                 .map(|ds| ds.manifest.version)
                 .unwrap_or(0),
             operation,
-            blobs_op,
-            None,
-        ))
+        )
+        .blobs_op(blobs_op)
+        .transaction_properties(context.params.transaction_properties.clone())
+        .build();
+
+        Ok(transaction)
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
@@ -298,18 +307,15 @@ impl<'a> InsertBuilder<'a> {
         // Validate schema
         if matches!(context.params.mode, WriteMode::Append) {
             if let WriteDestination::Dataset(dataset) = &context.dest {
-                // If the dataset is already using (or not using) move stable row ids, we need to match
+                // If the dataset is already using (or not using) stable row ids, we need to match
                 // and ignore whatever the user provided as input
-                if context.params.enable_move_stable_row_ids
-                    != dataset.manifest.uses_move_stable_row_ids()
-                {
+                if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
                     log::info!(
-                        "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
-                        context.params.enable_move_stable_row_ids,
-                        dataset.manifest.uses_move_stable_row_ids()
+                        "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
+                        context.params.enable_stable_row_ids,
+                        dataset.manifest.uses_stable_row_ids()
                     );
-                    context.params.enable_move_stable_row_ids =
-                        dataset.manifest.uses_move_stable_row_ids();
+                    context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
                 }
                 let m = dataset.manifest.as_ref();
                 let mut schema_cmp_opts = SchemaCompareOptions {
@@ -336,7 +342,7 @@ impl<'a> InsertBuilder<'a> {
 
         // Make sure we aren't using any reserved column names
         for field in data_schema.fields.iter() {
-            if field.name == ROW_ID || field.name == ROW_ADDR {
+            if field.name == ROW_ID || field.name == ROW_ADDR || field.name == ROW_OFFSET {
                 return Err(Error::InvalidInput {
                     source: format!(
                         "The column {} is a reserved name and cannot be used in a Lance dataset",
@@ -348,13 +354,13 @@ impl<'a> InsertBuilder<'a> {
             }
         }
 
-        // If we are writing a dataset with non-default storage, we need to enable move stable row ids
+        // If we are writing a dataset with non-default storage, we need to enable stable row ids
         if context.dest.dataset().is_none()
-            && !context.params.enable_move_stable_row_ids
+            && !context.params.enable_stable_row_ids
             && data_schema.fields.iter().any(|f| !f.is_default_storage())
         {
-            log::info!("Enabling move stable row ids because non-default storage is used");
-            context.params.enable_move_stable_row_ids = true;
+            log::info!("Enabling stable row ids because non-default storage is used");
+            context.params.enable_stable_row_ids = true;
         }
 
         // Feature flags
@@ -411,6 +417,7 @@ impl<'a> InsertBuilder<'a> {
                 let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: params.store_params.clone(),
                     commit_handler: params.commit_handler.clone(),
+                    session: params.session.clone(),
                     ..Default::default()
                 });
 
@@ -461,4 +468,31 @@ struct WriteContext<'a> {
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: LanceFileVersion,
+}
+
+#[cfg(test)]
+mod test {
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::session::Session;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_pass_session() {
+        let session = Arc::new(Session::new(0, 0, Default::default()));
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![],
+                Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)])),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(Arc::as_ptr(&dataset.session()), Arc::as_ptr(&session));
+    }
 }

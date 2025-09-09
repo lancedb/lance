@@ -10,6 +10,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use object_store::ObjectStore as OSObjectStore;
+use object_store_opendal::OpendalStore;
+use opendal::{services::S3, Operator};
+
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
@@ -33,6 +37,91 @@ use lance_core::error::{Error, Result};
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
 
+impl AwsStoreProvider {
+    async fn build_amazon_s3_store(
+        &self,
+        base_path: &mut Url,
+        params: &ObjectStoreParams,
+        storage_options: &StorageOptions,
+        is_s3_express: bool,
+    ) -> Result<Arc<dyn OSObjectStore>> {
+        let max_retries = storage_options.client_max_retries();
+        let retry_timeout = storage_options.client_retry_timeout();
+        let retry_config = RetryConfig {
+            backoff: Default::default(),
+            max_retries,
+            retry_timeout: Duration::from_secs(retry_timeout),
+        };
+
+        let mut s3_storage_options = storage_options.as_s3_options();
+        let region = resolve_s3_region(base_path, &s3_storage_options).await?;
+        let (aws_creds, region) = build_aws_credential(
+            params.s3_credentials_refresh_offset,
+            params.aws_credentials.clone(),
+            Some(&s3_storage_options),
+            region,
+        )
+        .await?;
+
+        // Set S3Express flag if detected
+        if is_s3_express {
+            s3_storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
+        }
+
+        // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
+        base_path.set_scheme("s3").unwrap();
+        base_path.set_query(None);
+
+        // we can't use parse_url_opts here because we need to manually set the credentials provider
+        let mut builder = AmazonS3Builder::new();
+        for (key, value) in s3_storage_options {
+            builder = builder.with_config(key, value);
+        }
+        builder = builder
+            .with_url(base_path.as_ref())
+            .with_credentials(aws_creds)
+            .with_retry(retry_config)
+            .with_region(region);
+
+        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+    }
+
+    async fn build_opendal_s3_store(
+        &self,
+        base_path: &Url,
+        storage_options: &StorageOptions,
+    ) -> Result<Arc<dyn OSObjectStore>> {
+        let bucket = base_path
+            .host_str()
+            .ok_or_else(|| Error::invalid_input("S3 URL must contain bucket name", location!()))?
+            .to_string();
+
+        let prefix = base_path.path().trim_start_matches('/').to_string();
+
+        // Start with all storage options as the config map
+        // OpenDAL will handle environment variables through its default credentials chain
+        let mut config_map: HashMap<String, String> = storage_options.0.clone();
+
+        // Set required OpenDAL configuration
+        config_map.insert("bucket".to_string(), bucket);
+
+        if !prefix.is_empty() {
+            config_map.insert("root".to_string(), format!("/{}", prefix));
+        }
+
+        let operator = Operator::from_iter::<S3>(config_map)
+            .map_err(|e| {
+                Error::invalid_input(
+                    format!("Failed to create S3 operator: {:?}", e),
+                    location!(),
+                )
+            })?
+            .finish();
+
+        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectStoreProvider for AwsStoreProvider {
     async fn new_store(
@@ -43,58 +132,33 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
         let mut storage_options =
             StorageOptions(params.storage_options.clone().unwrap_or_default());
+        storage_options.with_env_s3();
         let download_retry_count = storage_options.download_retry_count();
 
-        let max_retries = storage_options.client_max_retries();
-        let retry_timeout = storage_options.client_retry_timeout();
-        let retry_config = RetryConfig {
-            backoff: Default::default(),
-            max_retries,
-            retry_timeout: Duration::from_secs(retry_timeout),
-        };
+        let use_opendal = storage_options
+            .0
+            .get("use_opendal")
+            .map(|v| v == "true")
+            .unwrap_or(false);
 
-        storage_options.with_env_s3();
+        // Determine S3 Express and constant size upload parts before building the store
+        let is_s3_express = check_s3_express(&base_path, &storage_options);
 
-        let mut storage_options = storage_options.as_s3_options();
-        let region = resolve_s3_region(&base_path, &storage_options).await?;
-        let (aws_creds, region) = build_aws_credential(
-            params.s3_credentials_refresh_offset,
-            params.aws_credentials.clone(),
-            Some(&storage_options),
-            region,
-        )
-        .await?;
-
-        // This will be default in next version of object store.
-        // https://github.com/apache/arrow-rs/pull/7181
-        // We can do this when we upgrade to 0.12.
-        storage_options
-            .entry(AmazonS3ConfigKey::ConditionalPut)
-            .or_insert_with(|| "etag".to_string());
-
-        // Cloudflare does not support varying part sizes.
         let use_constant_size_upload_parts = storage_options
-            .get(&AmazonS3ConfigKey::Endpoint)
+            .0
+            .get("aws_endpoint")
             .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
             .unwrap_or(false);
 
-        let is_s3_express = check_s3_express(&base_path, &mut storage_options);
-
-        // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
-        base_path.set_scheme("s3").unwrap();
-        base_path.set_query(None);
-
-        // we can't use parse_url_opts here because we need to manually set the credentials provider
-        let mut builder = AmazonS3Builder::new();
-        for (key, value) in storage_options {
-            builder = builder.with_config(key, value);
-        }
-        builder = builder
-            .with_url(base_path.as_ref())
-            .with_credentials(aws_creds)
-            .with_retry(retry_config)
-            .with_region(region);
-        let inner = Arc::new(builder.build()?);
+        let inner = if use_opendal {
+            // Use OpenDAL implementation
+            self.build_opendal_s3_store(&base_path, &storage_options)
+                .await?
+        } else {
+            // Use default Amazon S3 implementation
+            self.build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
+                .await?
+        };
 
         Ok(ObjectStore {
             inner,
@@ -109,18 +173,14 @@ impl ObjectStoreProvider for AwsStoreProvider {
     }
 }
 
-/// Check if the storage is S3 Express, update object storage options along the way
-fn check_s3_express(url: &Url, storage_options: &mut HashMap<AmazonS3ConfigKey, String>) -> bool {
-    if matches!(storage_options.get(&AmazonS3ConfigKey::S3Express), Some(val) if val == "true") {
-        return true;
-    }
-
-    if url.authority().ends_with("--x-s3") {
-        storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
-        return true;
-    }
-
-    false
+/// Check if the storage is S3 Express
+fn check_s3_express(url: &Url, storage_options: &StorageOptions) -> bool {
+    storage_options
+        .0
+        .get("s3_express")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+        || url.authority().ends_with("--x-s3")
 }
 
 /// Figure out the S3 region of the bucket.
@@ -211,15 +271,9 @@ pub async fn build_aws_credential(
 fn extract_static_s3_credentials(
     options: &HashMap<AmazonS3ConfigKey, String>,
 ) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
-    let key_id = options
-        .get(&AmazonS3ConfigKey::AccessKeyId)
-        .map(|s| s.to_string());
-    let secret_key = options
-        .get(&AmazonS3ConfigKey::SecretAccessKey)
-        .map(|s| s.to_string());
-    let token = options
-        .get(&AmazonS3ConfigKey::Token)
-        .map(|s| s.to_string());
+    let key_id = options.get(&AmazonS3ConfigKey::AccessKeyId).cloned();
+    let secret_key = options.get(&AmazonS3ConfigKey::SecretAccessKey).cloned();
+    let token = options.get(&AmazonS3ConfigKey::Token).cloned();
     match (key_id, secret_key, token) {
         (Some(key_id), Some(secret_key), token) => {
             Some(StaticCredentialProvider::new(ObjectStoreAwsCredential {
@@ -295,7 +349,7 @@ impl CredentialProvider for AwsCredentialAdapter {
         } else {
             let refreshed_creds = Arc::new(self.inner.provide_credentials().await.map_err(
                 |e| Error::Internal {
-                    message: format!("Failed to get AWS credentials: {}", e),
+                    message: format!("Failed to get AWS credentials: {:?}", e),
                     location: location!(),
                 },
             )?);
@@ -420,6 +474,10 @@ mod tests {
 
         let cases = [
             ("s3://bucket/path/to/file", "path/to/file"),
+            // for non ASCII string tests
+            ("s3://bucket/测试path/to/file", "测试path/to/file"),
+            ("s3://bucket/path/&to/file", "path/&to/file"),
+            ("s3://bucket/path/=to/file", "path/=to/file"),
             (
                 "s3+ddb://bucket/path/to/file?ddbTableName=test",
                 "path/to/file",
@@ -428,9 +486,9 @@ mod tests {
 
         for (uri, expected_path) in cases {
             let url = Url::parse(uri).unwrap();
-            let path = provider.extract_path(&url);
+            let path = provider.extract_path(&url).unwrap();
             let expected_path = Path::from(expected_path);
-            assert_eq!(path, expected_path);
+            assert_eq!(path, expected_path)
         }
     }
 
@@ -439,37 +497,52 @@ mod tests {
         let cases = [
             (
                 "s3://bucket/path/to/file",
-                HashMap::from([(AmazonS3ConfigKey::S3Express, "true".into())]),
+                HashMap::from([("s3_express".to_string(), "true".to_string())]),
                 true,
             ),
             (
                 "s3://bucket/path/to/file",
-                HashMap::from([(AmazonS3ConfigKey::S3Express, "false".into())]),
+                HashMap::from([("s3_express".to_string(), "false".to_string())]),
                 false,
             ),
             ("s3://bucket/path/to/file", HashMap::from([]), false),
             (
                 "s3://bucket--x-s3/path/to/file",
-                HashMap::from([(AmazonS3ConfigKey::S3Express, "true".into())]),
+                HashMap::from([("s3_express".to_string(), "true".to_string())]),
                 true,
             ),
             (
                 "s3://bucket--x-s3/path/to/file",
-                HashMap::from([(AmazonS3ConfigKey::S3Express, "false".into())]),
-                true,
+                HashMap::from([("s3_express".to_string(), "false".to_string())]),
+                true, // URL takes precedence
             ),
             ("s3://bucket--x-s3/path/to/file", HashMap::from([]), true),
         ];
 
-        for (uri, mut configs, expected) in cases {
+        for (uri, storage_map, expected) in cases {
             let url = Url::parse(uri).unwrap();
-            let is_s3_express = check_s3_express(&url, &mut configs);
+            let storage_options = StorageOptions(storage_map);
+            let is_s3_express = check_s3_express(&url, &storage_options);
             assert_eq!(is_s3_express, expected);
-            if is_s3_express {
-                assert!(configs
-                    .get(&AmazonS3ConfigKey::S3Express)
-                    .is_some_and(|opt| opt == "true"));
-            }
         }
+    }
+
+    #[tokio::test]
+    async fn test_use_opendal_flag() {
+        let provider = AwsStoreProvider;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let params_with_flag = ObjectStoreParams {
+            storage_options: Some(HashMap::from([
+                ("use_opendal".to_string(), "true".to_string()),
+                ("region".to_string(), "us-west-2".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let store = provider
+            .new_store(url.clone(), &params_with_flag)
+            .await
+            .unwrap();
+        assert_eq!(store.scheme, "s3");
     }
 }

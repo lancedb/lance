@@ -15,10 +15,8 @@ use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField};
 use half::bf16;
 
-use crate::FloatArray;
+use crate::{FloatArray, ARROW_EXT_NAME_KEY};
 
-pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";
-pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 pub const BFLOAT16_EXT_NAME: &str = "lance.bfloat16";
 
 /// Check whether the given field is a bfloat16 field.
@@ -62,7 +60,7 @@ impl BFloat16Array {
         values.into()
     }
 
-    pub fn iter(&self) -> BFloat16Iter {
+    pub fn iter(&self) -> BFloat16Iter<'_> {
         BFloat16Iter::new(self)
     }
 

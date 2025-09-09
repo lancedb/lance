@@ -56,6 +56,7 @@ use crate::Dataset;
 
 use super::utils::IoMetrics;
 
+#[derive(Debug)]
 pub struct EvaluatedIndex {
     index_result: IndexExprResult,
     applicable_fragments: RoaringBitmap,
@@ -174,7 +175,13 @@ impl<I: Iterator<Item = u64> + Send> Iterator for DvToValidRanges<I> {
         }
         let position = self.position;
         self.position = self.num_rows;
-        Some(position..self.num_rows)
+        if position == self.num_rows {
+            // Last deleted row was end of the fragment, return None
+            None
+        } else {
+            // Still some rows after the last deleted row, return them
+            Some(position..self.num_rows)
+        }
     }
 }
 
@@ -435,7 +442,7 @@ impl FilteredReadStream {
         };
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
-        let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_move_stable_row_ids() {
+        let (row_id_sequence, num_logical_rows) = if dataset.manifest.uses_stable_row_ids() {
             let row_id_sequence = load_row_id_sequence(dataset.as_ref(), &frag).await?;
             let num_logical_rows = row_id_sequence.len();
             (row_id_sequence, num_logical_rows)
@@ -691,7 +698,8 @@ impl FilteredReadStream {
                 to_skip -= range_len;
                 continue;
             }
-            let to_take_here = range_len.min(to_take);
+            let avail_here = range_len - to_skip;
+            let to_take_here = avail_here.min(to_take);
             to_take -= to_take_here;
             if to_take_here > 0 {
                 trimmed.push(range.start + to_skip..range.start + to_skip + to_take_here);
@@ -947,6 +955,10 @@ impl FilteredReadOptions {
     /// This is the default behavior and you can use the various builder
     /// methods on this type to modify the behavior.
     pub fn basic_full_read(dataset: &Arc<Dataset>) -> Self {
+        Self::new(dataset.full_projection())
+    }
+
+    pub fn new(projection: Projection) -> Self {
         Self {
             scan_range_before_filter: None,
             scan_range_after_filter: None,
@@ -954,7 +966,7 @@ impl FilteredReadOptions {
             batch_size: None,
             fragment_readahead: None,
             fragments: None,
-            projection: dataset.full_projection(),
+            projection,
             refine_filter: None,
             full_filter: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
@@ -1478,6 +1490,8 @@ impl ExecutionPlan for FilteredReadExec {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use arrow::{
         compute::concat_batches,
         datatypes::{Float32Type, UInt32Type, UInt64Type},
@@ -1485,7 +1499,7 @@ mod tests {
     use arrow_array::{cast::AsArray, Array, UInt32Array};
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
-    use lance_datagen::{array, r#gen, BatchCount, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_index::{
         optimize::OptimizeOptions,
         scalar::{expression::PlannerIndexExt, ScalarIndexParams},
@@ -1520,7 +1534,7 @@ mod tests {
         async fn new() -> Self {
             let tmp_path = tempfile::tempdir().unwrap();
 
-            let mut dataset = gen()
+            let mut dataset = gen_batch()
                 .col("fully_indexed", array::step::<UInt32Type>())
                 .col("partly_indexed", array::step::<UInt64Type>())
                 .col("not_indexed", array::step::<UInt32Type>())
@@ -1568,7 +1582,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let new_data = gen()
+            let new_data = gen_batch()
                 .col("fully_indexed", array::step_custom::<UInt32Type>(200, 1))
                 .col("partly_indexed", array::step_custom::<UInt64Type>(200, 1))
                 .col("not_indexed", array::step_custom::<UInt32Type>(200, 1))
@@ -2106,7 +2120,7 @@ mod tests {
         // This test reproduces the issue from the Python test_limit_offset[stable] failure
         // Create a simple dataset with 10 rows (0-9)
         let tmp_path = tempfile::tempdir().unwrap();
-        let mut dataset = gen()
+        let mut dataset = gen_batch()
             .col("a", array::step::<UInt32Type>())
             .into_dataset(
                 tmp_path.path().to_str().unwrap(),
@@ -2143,5 +2157,40 @@ mod tests {
             let col = batch.column(0).as_primitive::<UInt32Type>();
             assert_eq!(col.value(0), 7, "Expected a=7 but got a={}", col.value(0));
         }
+    }
+
+    #[test]
+    fn test_trim_ranges() {
+        let ranges = vec![0..10, 15..25, 30..40];
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(0..10)),
+            vec![0..10]
+        );
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(10..15)),
+            vec![15..20]
+        );
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges.clone(), 0..25, &(15..20)),
+            vec![20..25]
+        );
+
+        assert_eq!(
+            FilteredReadStream::trim_ranges(ranges, 0..25, &(15..25)),
+            vec![20..25, 30..35]
+        );
+    }
+
+    #[test]
+    fn test_full_frag_range() {
+        let dv = Arc::new(DeletionVector::Set(HashSet::from_iter([
+            13, 52, 51, 51, 17,
+        ])));
+        let ranges = FilteredReadStream::full_frag_range(53, &Some(dv));
+        let expected = vec![0..13, 14..17, 18..51];
+        assert_eq!(ranges, expected);
     }
 }

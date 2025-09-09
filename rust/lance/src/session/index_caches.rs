@@ -12,12 +12,9 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
+use deepsize::{Context, DeepSizeOf};
 use lance_core::cache::{CacheKey, LanceCache};
-use lance_index::{
-    frag_reuse::FragReuseIndex,
-    scalar::{ScalarIndex, ScalarIndexType},
-    vector::{VectorIndex, VectorIndexCacheEntry},
-};
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_table::format::Index;
 use uuid::Uuid;
 
@@ -75,46 +72,6 @@ impl DSIndexCache {
 // Cache key types for type-safe cache access
 
 #[derive(Debug)]
-pub struct ScalarIndexKey<'a> {
-    pub uuid: &'a str,
-}
-
-impl CacheKey for ScalarIndexKey<'_> {
-    type ValueType = Arc<dyn ScalarIndex>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("scalar/{}", self.uuid))
-    }
-}
-
-#[derive(Debug)]
-pub struct VectorIndexKey<'a> {
-    pub uuid: &'a str,
-}
-
-impl CacheKey for VectorIndexKey<'_> {
-    type ValueType = Arc<dyn VectorIndex>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("vector/{}", self.uuid))
-    }
-}
-
-#[derive(Debug)]
-pub struct VectorPartitionKey<'a> {
-    pub uuid: &'a str,
-    pub partition: u32,
-}
-
-impl CacheKey for VectorPartitionKey<'_> {
-    type ValueType = Arc<dyn VectorIndexCacheEntry>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("vector_partition/{}/{}", self.uuid, self.partition))
-    }
-}
-
-#[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
     pub uuid: &'a str,
 }
@@ -140,13 +97,27 @@ impl CacheKey for IndexMetadataKey {
     }
 }
 
+pub struct ProstAny(pub Arc<prost_types::Any>);
+
+impl DeepSizeOf for ProstAny {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.0.type_url.deep_size_of_children(context) + self.0.value.deep_size_of_children(context)
+    }
+}
+
+/// Cache key for scalar index details
+///
+/// Typically we don't use the cache for scalar index details because they are stored
+/// in the manifest and readily available.  However, old versions of Lance didn't store
+/// details in the manifest, and we have to perform an expensive inference process to determine
+/// what they are.  These we cache.
 #[derive(Debug)]
-pub struct ScalarIndexTypeKey<'a> {
+pub struct ScalarIndexDetailsKey<'a> {
     pub uuid: &'a str,
 }
 
-impl CacheKey for ScalarIndexTypeKey<'_> {
-    type ValueType = ScalarIndexType;
+impl CacheKey for ScalarIndexDetailsKey<'_> {
+    type ValueType = ProstAny;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("type/{}", self.uuid))

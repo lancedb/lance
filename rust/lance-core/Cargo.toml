@@ -52,7 +52,7 @@ lance-testing.workspace = true
 proptest.workspace = true
 
 [features]
-datafusion = ["datafusion-common", "datafusion-sql"]
+datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
 
 [lints]
 workspace = true

@@ -34,23 +34,19 @@ jobs:
         with:
           workspaces: |
             lance
-            java/core/lance-jni -> ../target/rust-maven-plugin/lance-jni
+            java/lance-jni -> ../target/rust-maven-plugin/lance-jni
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      # pin the toolchain version to avoid surprises
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
       - uses: rui314/setup-mold@v1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run cargo fmt
-        working-directory: java/core/lance-jni
+        working-directory: java/lance-jni
         run: cargo fmt --check
       - name: Rust Clippy
-        working-directory: java/core/lance-jni
+        working-directory: java/lance-jni
         run: cargo clippy --all-targets -- -D warnings
 
   build-and-test-java:
@@ -76,7 +72,9 @@ jobs:
         uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: java/core/lance-jni -> ../target/rust-maven-plugin/lance-jni
+          workspaces: java/lance-jni -> ../target/rust-maven-plugin/lance-jni
+          cache-targets: false
+          cache-workspace-crates: true
       - name: Set up Java ${{ matrix.java-version }}
         uses: actions/setup-java@v4
         with:

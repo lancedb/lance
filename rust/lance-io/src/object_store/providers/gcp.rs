@@ -3,6 +3,11 @@
 
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
+use object_store::ObjectStore as OSObjectStore;
+use object_store_opendal::OpendalStore;
+use opendal::{services::Gcs, Operator};
+use snafu::location;
+
 use object_store::{
     gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
     RetryConfig, StaticCredentialProvider,
@@ -13,19 +18,52 @@ use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
 };
-use lance_core::error::Result;
+use lance_core::error::{Error, Result};
 
 #[derive(Default, Debug)]
 pub struct GcsStoreProvider;
 
-#[async_trait::async_trait]
-impl ObjectStoreProvider for GcsStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let mut storage_options =
-            StorageOptions(params.storage_options.clone().unwrap_or_default());
-        let download_retry_count = storage_options.download_retry_count();
+impl GcsStoreProvider {
+    async fn build_opendal_gcs_store(
+        &self,
+        base_path: &Url,
+        storage_options: &StorageOptions,
+    ) -> Result<Arc<dyn OSObjectStore>> {
+        let bucket = base_path
+            .host_str()
+            .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name", location!()))?
+            .to_string();
 
+        let prefix = base_path.path().trim_start_matches('/').to_string();
+
+        // Start with all storage options as the config map
+        // OpenDAL will handle environment variables through its default credentials chain
+        let mut config_map: HashMap<String, String> = storage_options.0.clone();
+
+        // Set required OpenDAL configuration
+        config_map.insert("bucket".to_string(), bucket);
+
+        if !prefix.is_empty() {
+            config_map.insert("root".to_string(), format!("/{}", prefix));
+        }
+
+        let operator = Operator::from_iter::<Gcs>(config_map)
+            .map_err(|e| {
+                Error::invalid_input(
+                    format!("Failed to create GCS operator: {:?}", e),
+                    location!(),
+                )
+            })?
+            .finish();
+
+        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+    }
+
+    async fn build_google_cloud_store(
+        &self,
+        base_path: &Url,
+        storage_options: &StorageOptions,
+    ) -> Result<Arc<dyn OSObjectStore>> {
         let max_retries = storage_options.client_max_retries();
         let retry_timeout = storage_options.client_retry_timeout();
         let retry_config = RetryConfig {
@@ -34,7 +72,6 @@ impl ObjectStoreProvider for GcsStoreProvider {
             retry_timeout: Duration::from_secs(retry_timeout),
         };
 
-        storage_options.with_env_gcs();
         let mut builder = GoogleCloudStorageBuilder::new()
             .with_url(base_path.as_ref())
             .with_retry(retry_config);
@@ -44,12 +81,38 @@ impl ObjectStoreProvider for GcsStoreProvider {
         let token_key = "google_storage_token";
         if let Some(storage_token) = storage_options.get(token_key) {
             let credential = GcpCredential {
-                bearer: storage_token.to_string(),
+                bearer: storage_token.clone(),
             };
             let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
             builder = builder.with_credentials(credential_provider);
         }
-        let inner = Arc::new(builder.build()?);
+
+        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for GcsStoreProvider {
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
+        let mut storage_options =
+            StorageOptions(params.storage_options.clone().unwrap_or_default());
+        storage_options.with_env_gcs();
+        let download_retry_count = storage_options.download_retry_count();
+
+        let use_opendal = storage_options
+            .0
+            .get("use_opendal")
+            .map(|v| v.as_str() == "true")
+            .unwrap_or(false);
+
+        let inner = if use_opendal {
+            self.build_opendal_gcs_store(&base_path, &storage_options)
+                .await?
+        } else {
+            self.build_google_cloud_store(&base_path, &storage_options)
+                .await?
+        };
 
         Ok(ObjectStore {
             inner,
@@ -101,14 +164,38 @@ impl StorageOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_store::ObjectStoreParams;
+    use std::collections::HashMap;
 
     #[test]
     fn test_gcs_store_path() {
         let provider = GcsStoreProvider;
 
         let url = Url::parse("gs://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url).unwrap();
         let expected_path = object_store::path::Path::from("path/to/file");
         assert_eq!(path, expected_path);
+    }
+
+    #[tokio::test]
+    async fn test_use_opendal_flag() {
+        let provider = GcsStoreProvider;
+        let url = Url::parse("gs://test-bucket/path").unwrap();
+        let params_with_flag = ObjectStoreParams {
+            storage_options: Some(HashMap::from([
+                ("use_opendal".to_string(), "true".to_string()),
+                (
+                    "service_account".to_string(),
+                    "test@example.iam.gserviceaccount.com".to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+
+        let store = provider
+            .new_store(url.clone(), &params_with_flag)
+            .await
+            .unwrap();
+        assert_eq!(store.scheme, "gs");
     }
 }

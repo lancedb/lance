@@ -62,7 +62,7 @@ impl Backoff {
             .base
             .saturating_pow(self.attempt)
             .saturating_mul(self.unit);
-        let jitter = rand::thread_rng().gen_range(-self.jitter..=self.jitter);
+        let jitter = rand::rng().random_range(-self.jitter..=self.jitter);
         let backoff = (backoff.saturating_add_signed(jitter)).clamp(self.min, self.max);
         self.attempt += 1;
         Duration::from_millis(backoff as u64)
@@ -123,7 +123,7 @@ impl Default for SlotBackoff {
             unit: 50,
             starting_i: 2, // start with 4 slots
             attempt: 0,
-            rng: rand::rngs::SmallRng::from_entropy(),
+            rng: rand::rngs::SmallRng::from_os_rng(),
         }
     }
 }
@@ -139,7 +139,7 @@ impl SlotBackoff {
 
     pub fn next_backoff(&mut self) -> Duration {
         let num_slots = self.base.saturating_pow(self.attempt + self.starting_i);
-        let slot_i = self.rng.gen_range(0..num_slots);
+        let slot_i = self.rng.random_range(0..num_slots);
         self.attempt += 1;
         Duration::from_millis((slot_i * self.unit) as u64)
     }
@@ -166,7 +166,7 @@ mod tests {
     fn test_slot_backoff() {
         fn assert_in(value: u128, expected: &[u128]) {
             assert!(
-                expected.iter().any(|&x| x == value),
+                expected.contains(&value),
                 "value {} not in {:?}",
                 value,
                 expected

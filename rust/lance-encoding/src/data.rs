@@ -19,11 +19,13 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
-use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, OffsetSizeTrait, UInt64Array};
+use arrow_array::{
+    cast::AsArray, new_empty_array, new_null_array, Array, ArrayRef, OffsetSizeTrait, UInt64Array,
+};
 use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer,
 };
+use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
 use snafu::location;
@@ -40,7 +42,7 @@ use crate::{
 /// Note: this data block should not be used for future work.  It will be deprecated
 /// in the 2.1 version of the format where nullability will be handled by the structural
 /// encoders.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AllNullDataBlock {
     /// The number of values represented by this block
     pub num_values: u64,
@@ -53,18 +55,6 @@ impl AllNullDataBlock {
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
         vec![]
-    }
-
-    fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            num_values: self.num_values,
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            num_values: self.num_values,
-        })
     }
 }
 
@@ -100,7 +90,7 @@ impl PartialEq for BlockInfo {
 /// Note: this data block should not be used for future work.  It will be deprecated
 /// in the 2.1 version of the format where nullability will be handled by the structural
 /// encoders.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NullableDataBlock {
     /// The underlying data
     pub data: Box<DataBlock>,
@@ -128,29 +118,13 @@ impl NullableDataBlock {
         buffers
     }
 
-    fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            data: Box::new(self.data.borrow_and_clone()),
-            nulls: self.nulls.borrow_and_clone(),
-            block_info: self.block_info.clone(),
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            data: Box::new(self.data.try_clone()?),
-            nulls: self.nulls.try_clone()?,
-            block_info: self.block_info.clone(),
-        })
-    }
-
     pub fn data_size(&self) -> u64 {
         self.data.data_size() + self.nulls.len() as u64
     }
 }
 
 /// A block representing the same constant value repeated many times
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct ConstantDataBlock {
     /// Data buffer containing the value
     pub data: LanceBuffer,
@@ -169,16 +143,9 @@ impl ConstantDataBlock {
         todo!()
     }
 
-    pub fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            data: self.data.borrow_and_clone(),
-            num_values: self.num_values,
-        }
-    }
-
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
-            data: self.data.try_clone()?,
+            data: self.data.clone(),
             num_values: self.num_values,
         })
     }
@@ -189,7 +156,7 @@ impl ConstantDataBlock {
 }
 
 /// A data block for a single buffer of data where each element has a fixed number of bits
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct FixedWidthDataBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -229,18 +196,9 @@ impl FixedWidthDataBlock {
         vec![self.data]
     }
 
-    pub fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            data: self.data.borrow_and_clone(),
-            bits_per_value: self.bits_per_value,
-            num_values: self.num_values,
-            block_info: self.block_info.clone(),
-        }
-    }
-
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
-            data: self.data.try_clone()?,
+            data: self.data.clone(),
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
@@ -272,7 +230,7 @@ impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<
         let block = data_block.as_variable_width_ref().unwrap();
         assert!(block.bits_per_offset == T::get_byte_width() as u8 * 8);
 
-        let offsets: ScalarBuffer<T> = block.offsets.try_clone().unwrap().borrow_to_typed_slice();
+        let offsets: ScalarBuffer<T> = block.offsets.clone().borrow_to_typed_slice();
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];
@@ -296,7 +254,7 @@ impl<T: OffsetSizeTrait> DataBlockBuilderImpl for VariableWidthDataBlockBuilder<
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.offsets.len() - 1) as u64;
         DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::Owned(self.bytes),
+            data: LanceBuffer::from(self.bytes),
             offsets: LanceBuffer::reinterpret_vec(self.offsets),
             bits_per_offset: T::get_byte_width() as u8 * 8,
             num_values,
@@ -370,7 +328,7 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.values.len() / self.bytes_per_value as usize) as u64;
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::Owned(self.values),
+            data: LanceBuffer::from(self.values),
             bits_per_value: self.bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
@@ -422,11 +380,12 @@ impl DataBlockBuilderImpl for StructDataBlockBuilder {
         DataBlock::Struct(StructDataBlock {
             children: children_data_block,
             block_info: BlockInfo::new(),
+            validity: None,
         })
     }
 }
 /// A data block to represent a fixed size list
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FixedSizeListBlock {
     /// The child data block
     pub child: Box<DataBlock>,
@@ -435,20 +394,6 @@ pub struct FixedSizeListBlock {
 }
 
 impl FixedSizeListBlock {
-    fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            child: Box::new(self.child.borrow_and_clone()),
-            dimension: self.dimension,
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            child: Box::new(self.child.try_clone()?),
-            dimension: self.dimension,
-        })
-    }
-
     pub fn num_values(&self) -> u64 {
         self.child.num_values() / self.dimension
     }
@@ -481,7 +426,7 @@ impl FixedSizeListBlock {
     pub fn flatten_as_fixed(&mut self) -> FixedWidthDataBlock {
         match self.child.as_mut() {
             DataBlock::FixedSizeList(fsl) => fsl.flatten_as_fixed(),
-            DataBlock::FixedWidth(fw) => fw.borrow_and_clone(),
+            DataBlock::FixedWidth(fw) => fw.clone(),
             _ => panic!("Expected FixedSizeList or FixedWidth data block"),
         }
     }
@@ -581,7 +526,7 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
     fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         let nullable = data_block.as_nullable_ref().unwrap();
         let bool_buf = BooleanBuffer::new(
-            nullable.nulls.try_clone().unwrap().into_buffer(),
+            nullable.nulls.clone().into_buffer(),
             selection.start as usize,
             (selection.end - selection.start) as usize,
         );
@@ -593,7 +538,7 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
         let inner_block = self.inner.finish();
         DataBlock::Nullable(NullableDataBlock {
             data: Box::new(inner_block),
-            nulls: LanceBuffer::Borrowed(self.validity.finish().into_inner()),
+            nulls: LanceBuffer::from(self.validity.finish().into_inner()),
             block_info: BlockInfo::new(),
         })
     }
@@ -602,7 +547,7 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
 /// A data block with no regular structure.  There is no available spot to attach
 /// validity / repdef information and it cannot be converted to Arrow without being
 /// decoded
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpaqueBlock {
     pub buffers: Vec<LanceBuffer>,
     pub num_values: u64,
@@ -610,37 +555,13 @@ pub struct OpaqueBlock {
 }
 
 impl OpaqueBlock {
-    fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            buffers: self
-                .buffers
-                .iter_mut()
-                .map(|b| b.borrow_and_clone())
-                .collect(),
-            num_values: self.num_values,
-            block_info: self.block_info.clone(),
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            buffers: self
-                .buffers
-                .iter()
-                .map(|b| b.try_clone())
-                .collect::<Result<_>>()?,
-            num_values: self.num_values,
-            block_info: self.block_info.clone(),
-        })
-    }
-
     pub fn data_size(&self) -> u64 {
         self.buffers.iter().map(|b| b.len() as u64).sum()
     }
 }
 
 /// A data block for variable-width data (e.g. strings, packed rows, etc.)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariableWidthBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -676,28 +597,8 @@ impl VariableWidthBlock {
         vec![self.offsets, self.data]
     }
 
-    fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            data: self.data.borrow_and_clone(),
-            offsets: self.offsets.borrow_and_clone(),
-            bits_per_offset: self.bits_per_offset,
-            num_values: self.num_values,
-            block_info: self.block_info.clone(),
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            data: self.data.try_clone()?,
-            offsets: self.offsets.try_clone()?,
-            bits_per_offset: self.bits_per_offset,
-            num_values: self.num_values,
-            block_info: self.block_info.clone(),
-        })
-    }
-
     pub fn offsets_as_block(&mut self) -> DataBlock {
-        let offsets = self.offsets.borrow_and_clone();
+        let offsets = self.offsets.clone();
         DataBlock::FixedWidth(FixedWidthDataBlock {
             data: offsets,
             bits_per_value: self.bits_per_offset as u64,
@@ -712,11 +613,13 @@ impl VariableWidthBlock {
 }
 
 /// A data block representing a struct
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StructDataBlock {
     /// The child arrays
     pub children: Vec<DataBlock>,
     pub block_info: BlockInfo,
+    /// The validity bitmap for the struct (None means all valid)
+    pub validity: Option<NullBuffer>,
 }
 
 impl StructDataBlock {
@@ -729,7 +632,18 @@ impl StructDataBlock {
                 num_rows = child_data.len();
                 builder = builder.add_child_data(child_data);
             }
-            let builder = builder.null_count(0).len(num_rows);
+
+            // Apply validity if present
+            let builder = if let Some(validity) = self.validity {
+                let null_count = validity.null_count();
+                builder
+                    .null_bit_buffer(Some(validity.into_inner().into_inner()))
+                    .null_count(null_count)
+            } else {
+                builder.null_count(0)
+            };
+
+            let builder = builder.len(num_rows);
             if validate {
                 Ok(builder.build()?)
             } else {
@@ -751,6 +665,7 @@ impl StructDataBlock {
                 .map(|c| c.remove_outer_validity())
                 .collect(),
             block_info: self.block_info,
+            validity: None, // Remove the validity
         }
     }
 
@@ -759,28 +674,6 @@ impl StructDataBlock {
             .into_iter()
             .flat_map(|c| c.into_buffers())
             .collect()
-    }
-
-    fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            children: self
-                .children
-                .iter_mut()
-                .map(|c| c.borrow_and_clone())
-                .collect(),
-            block_info: self.block_info.clone(),
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            children: self
-                .children
-                .iter()
-                .map(|c| c.try_clone())
-                .collect::<Result<_>>()?,
-            block_info: self.block_info.clone(),
-        })
     }
 
     pub fn data_size(&self) -> u64 {
@@ -792,7 +685,7 @@ impl StructDataBlock {
 }
 
 /// A data block for dictionary encoded data
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DictionaryDataBlock {
     /// The indices buffer
     pub indices: FixedWidthDataBlock,
@@ -832,20 +725,6 @@ impl DictionaryDataBlock {
         buffers.extend(self.dictionary.into_buffers());
         buffers
     }
-
-    fn borrow_and_clone(&mut self) -> Self {
-        Self {
-            indices: self.indices.borrow_and_clone(),
-            dictionary: Box::new(self.dictionary.borrow_and_clone()),
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            indices: self.indices.try_clone()?,
-            dictionary: Box::new(self.dictionary.try_clone()?),
-        })
-    }
 }
 
 /// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
@@ -862,7 +741,7 @@ impl DictionaryDataBlock {
 ///
 /// In addition, a DataBlock can be created from an Arrow array or arrays.  This is not a zero-copy
 /// operation as some normalization may be required.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DataBlock {
     Empty(),
     Constant(ConstantDataBlock),
@@ -918,21 +797,6 @@ impl DataBlock {
     ///
     /// This is a zero-copy operation but requires a mutable reference to self and, afterwards,
     /// all buffers will be in Borrowed mode.
-    pub fn borrow_and_clone(&mut self) -> Self {
-        match self {
-            Self::Empty() => Self::Empty(),
-            Self::Constant(inner) => Self::Constant(inner.borrow_and_clone()),
-            Self::AllNull(inner) => Self::AllNull(inner.borrow_and_clone()),
-            Self::Nullable(inner) => Self::Nullable(inner.borrow_and_clone()),
-            Self::FixedWidth(inner) => Self::FixedWidth(inner.borrow_and_clone()),
-            Self::FixedSizeList(inner) => Self::FixedSizeList(inner.borrow_and_clone()),
-            Self::VariableWidth(inner) => Self::VariableWidth(inner.borrow_and_clone()),
-            Self::Struct(inner) => Self::Struct(inner.borrow_and_clone()),
-            Self::Dictionary(inner) => Self::Dictionary(inner.borrow_and_clone()),
-            Self::Opaque(inner) => Self::Opaque(inner.borrow_and_clone()),
-        }
-    }
-
     /// Try and clone the block
     ///
     /// This will fail if any buffers are in owned mode.  You can call borrow_and_clone() to
@@ -940,15 +804,15 @@ impl DataBlock {
     pub fn try_clone(&self) -> Result<Self> {
         match self {
             Self::Empty() => Ok(Self::Empty()),
-            Self::Constant(inner) => Ok(Self::Constant(inner.try_clone()?)),
-            Self::AllNull(inner) => Ok(Self::AllNull(inner.try_clone()?)),
-            Self::Nullable(inner) => Ok(Self::Nullable(inner.try_clone()?)),
-            Self::FixedWidth(inner) => Ok(Self::FixedWidth(inner.try_clone()?)),
-            Self::FixedSizeList(inner) => Ok(Self::FixedSizeList(inner.try_clone()?)),
-            Self::VariableWidth(inner) => Ok(Self::VariableWidth(inner.try_clone()?)),
-            Self::Struct(inner) => Ok(Self::Struct(inner.try_clone()?)),
-            Self::Dictionary(inner) => Ok(Self::Dictionary(inner.try_clone()?)),
-            Self::Opaque(inner) => Ok(Self::Opaque(inner.try_clone()?)),
+            Self::Constant(inner) => Ok(Self::Constant(inner.clone())),
+            Self::AllNull(inner) => Ok(Self::AllNull(inner.clone())),
+            Self::Nullable(inner) => Ok(Self::Nullable(inner.clone())),
+            Self::FixedWidth(inner) => Ok(Self::FixedWidth(inner.clone())),
+            Self::FixedSizeList(inner) => Ok(Self::FixedSizeList(inner.clone())),
+            Self::VariableWidth(inner) => Ok(Self::VariableWidth(inner.clone())),
+            Self::Struct(inner) => Ok(Self::Struct(inner.clone())),
+            Self::Dictionary(inner) => Ok(Self::Dictionary(inner.clone())),
+            Self::Opaque(inner) => Ok(Self::Opaque(inner.clone())),
         }
     }
 
@@ -1261,7 +1125,7 @@ fn arrow_binary_to_data_block(
     let offsets = data_vec
         .iter()
         .map(|d| {
-            LanceBuffer::Borrowed(
+            LanceBuffer::from(
                 d.buffers()[0].slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset),
             )
         })
@@ -1275,7 +1139,7 @@ fn arrow_binary_to_data_block(
         .iter()
         .zip(data_ranges)
         .map(|(d, byte_range)| {
-            LanceBuffer::Borrowed(
+            LanceBuffer::from(
                 d.buffers()[1]
                     .slice_with_length(byte_range.start, byte_range.end - byte_range.start),
             )
@@ -1298,7 +1162,7 @@ fn encode_flat_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
         let data = arr.to_data();
         buffer.extend_from_slice(data.buffers()[0].as_slice());
     }
-    LanceBuffer::Owned(buffer)
+    LanceBuffer::from(buffer)
 }
 
 fn do_encode_bitmap_data(bitmaps: &[BooleanBuffer], num_values: u64) -> LanceBuffer {
@@ -1309,7 +1173,7 @@ fn do_encode_bitmap_data(bitmaps: &[BooleanBuffer], num_values: u64) -> LanceBuf
     }
 
     let buffer = builder.finish().into_inner();
-    LanceBuffer::Borrowed(buffer)
+    LanceBuffer::from(buffer)
 }
 
 fn encode_bitmap_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
@@ -1449,14 +1313,14 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
                 .copy_from_slice(null_index_bytes.as_slice());
         }
         FixedWidthDataBlock {
-            data: LanceBuffer::Owned(indices_bytes),
+            data: LanceBuffer::from(indices_bytes),
             bits_per_value: bits_per_index,
             num_values,
             block_info: BlockInfo::new(),
         }
     } else {
         FixedWidthDataBlock {
-            data: LanceBuffer::Borrowed(indices.to_data().buffers()[0].clone()),
+            data: LanceBuffer::from(indices.to_data().buffers()[0].clone()),
             bits_per_value: indices.data_type().byte_width() as u64 * 8,
             num_values,
             block_info: BlockInfo::new(),
@@ -1586,9 +1450,18 @@ impl DataBlock {
                         .collect::<Vec<_>>();
                     children.push(Self::from_arrays(&child_vec, num_values));
                 }
+
+                // Extract validity for the struct array
+                let validity = match &nulls {
+                    Nullability::None => None,
+                    Nullability::Some(null_buffer) => Some(null_buffer.clone()),
+                    Nullability::All => unreachable!("Should have returned AllNull earlier"),
+                };
+
                 Self::Struct(StructDataBlock {
                     children,
                     block_info: BlockInfo::default(),
+                    validity,
                 })
             }
             DataType::FixedSizeList(_, dim) => {
@@ -1624,7 +1497,7 @@ impl DataBlock {
                 Nullability::None => encoded,
                 Nullability::Some(nulls) => Self::Nullable(NullableDataBlock {
                     data: Box::new(encoded),
-                    nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
+                    nulls: LanceBuffer::from(nulls.into_inner().into_inner()),
                     block_info: BlockInfo::new(),
                 }),
                 _ => unreachable!(),
@@ -1688,10 +1561,11 @@ impl DataBlockBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
-        make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
-        StringArray, UInt16Array, UInt8Array,
+        make_array, new_null_array,
+        types::{Int32Type, Int8Type},
+        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt16Array,
+        UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
@@ -1703,7 +1577,6 @@ mod tests {
 
     use super::{AllNullDataBlock, DataBlock};
 
-    use arrow::compute::concat;
     use arrow_array::Array;
 
     #[test]
@@ -1722,7 +1595,7 @@ mod tests {
         let data = DataBlock::from_array(nullable_ints);
 
         let nullable = data.as_nullable().unwrap();
-        assert_eq!(nullable.nulls, LanceBuffer::Owned(vec![0b00000010]));
+        assert_eq!(nullable.nulls, LanceBuffer::from(vec![0b00000010]));
     }
 
     #[test]
@@ -1742,7 +1615,7 @@ mod tests {
         assert_eq!(block.num_values(), 7);
         let block = block.as_nullable().unwrap();
 
-        assert_eq!(block.nulls, LanceBuffer::Owned(vec![0b00011101]));
+        assert_eq!(block.nulls, LanceBuffer::from(vec![0b00011101]));
 
         let data = block.data.as_variable_width().unwrap();
         assert_eq!(
@@ -1865,7 +1738,7 @@ mod tests {
             let dict = data.as_dictionary().unwrap();
 
             let nullable_items = dict.dictionary.as_nullable().unwrap();
-            assert_eq!(nullable_items.nulls, LanceBuffer::Owned(vec![0b00000111]));
+            assert_eq!(nullable_items.nulls, LanceBuffer::from(vec![0b00000111]));
             assert_eq!(nullable_items.data.num_values(), 4);
 
             let items = nullable_items.data.as_variable_width().unwrap();
@@ -1997,19 +1870,19 @@ mod tests {
     fn test_data_size() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
         // test data_size() when input has no nulls
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
 
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
 
-        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(400), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
         assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
 
         // test data_size() when input has nulls
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2018,7 +1891,7 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(400), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2026,8 +1899,8 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
+        let arr = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2035,7 +1908,7 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let arr = genn.generate(RowCount::from(400), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
 
         let array_data = arr.to_data();
@@ -2043,13 +1916,13 @@ mod tests {
         let array_nulls_size_in_bytes = arr.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
-        let arr1 = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let arr2 = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let arr3 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut genn = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr1 = genn.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr2 = genn.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr3 = genn.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9);
 
-        let concatenated_array = concat(&[
+        let concatenated_array = arrow_select::concat::concat(&[
             &*Arc::new(arr1.clone()) as &dyn Array,
             &*Arc::new(arr2.clone()) as &dyn Array,
             &*Arc::new(arr3.clone()) as &dyn Array,

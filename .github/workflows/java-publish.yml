@@ -41,6 +41,10 @@ jobs:
           docker run --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
             
             set -ex
+            # Update sources.list to use archive repositories for Debian 10 (EOL)
+            echo 'deb http://archive.debian.org/debian/ buster main' > /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian/ buster-updates main' >> /etc/apt/sources.list
             apt-get update
           
             DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
@@ -82,7 +86,7 @@ jobs:
             source \$HOME/.cargo/env
             cargo --version
             
-            cd java/core/lance-jni
+            cd java/lance-jni
             
             # https://github.com/rustls/rustls/issues/1967
             export CC=clang
@@ -94,7 +98,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_linux_arm_64.zip
-          path: java/core/lance-jni/target/release/liblance_jni.so
+          path: java/lance-jni/target/release/liblance_jni.so
           retention-days: 1
           if-no-files-found: error
   linux-x86:
@@ -115,6 +119,10 @@ jobs:
           docker run --platform linux/amd64 -v ${{ github.workspace }}:/workspace -w /workspace debian:10 bash -c "
           
             set -ex
+            # Update sources.list to use archive repositories for Debian 10 (EOL)
+            echo 'deb http://archive.debian.org/debian/ buster main' > /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian/ buster-updates main' >> /etc/apt/sources.list
             apt-get update
           
             DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
@@ -156,7 +164,7 @@ jobs:
             source \$HOME/.cargo/env
             cargo --version
           
-            cd java/core/lance-jni
+            cd java/lance-jni
           
             # https://github.com/rustls/rustls/issues/1967
             export CC=clang
@@ -168,7 +176,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: liblance_jni_linux_x86_64.zip
-          path: java/core/lance-jni/target/release/liblance_jni.so
+          path: java/lance-jni/target/release/liblance_jni.so
           retention-days: 1
           if-no-files-found: error
   macos-arm64:
@@ -204,9 +212,9 @@ jobs:
         uses: actions/download-artifact@v4
       - name: Copy native libs
         run: |
-          mkdir -p ./java/core/target/classes/nativelib/linux-x86-64 ./java/core/target/classes/nativelib/linux-aarch64
-          cp ./liblance_jni_linux_x86_64.zip/liblance_jni.so ./java/core/target/classes/nativelib/linux-x86-64/liblance_jni.so
-          cp ./liblance_jni_linux_arm_64.zip/liblance_jni.so ./java/core/target/classes/nativelib/linux-aarch64/liblance_jni.so
+          mkdir -p ./java/target/classes/nativelib/linux-x86-64 ./java/target/classes/nativelib/linux-aarch64
+          cp ./liblance_jni_linux_x86_64.zip/liblance_jni.so ./java/target/classes/nativelib/linux-x86-64/liblance_jni.so
+          cp ./liblance_jni_linux_arm_64.zip/liblance_jni.so ./java/target/classes/nativelib/linux-aarch64/liblance_jni.so
       - name: Set github
         run: |
           git config --global user.email "Lance Github Runner"

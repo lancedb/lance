@@ -22,3 +22,7 @@ jobs:
         run: ./bin/license-header-checker -a -v ./python/license_header.txt python py && [[ -z `git status -s` ]]
       - name: Check license headers (protos)
         run: ./bin/license-header-checker -a -v ./protos/license_header.txt protos proto && [[ -z `git status -s` ]]
+      - name: Check license headers (java jni)
+        run: ./bin/license-header-checker -a -v ./java/jni_license_header.txt java/lance-jni rs && [[ -z `git status -s` ]]
+      - name: Check license headers (java core src)
+        run: ./bin/license-header-checker -a -v ./java/license_header.txt java/src java && [[ -z `git status -s` ]]

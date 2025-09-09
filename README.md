@@ -47,7 +47,7 @@ The key features of Lance include:
 * **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Ray, Spark and more on the way.
 
 > [!TIP]
-> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lancedb.github.io/lance/community/contributing/) for more information.
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lancedb.github.io/lance/community/contributing) for more information.
 
 ## Quick Start
 
@@ -173,7 +173,7 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 ## What makes Lance different
 
-Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format.html).
+Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format).
 
 **Vector index**: Vector index for similarity search over embedding space.
 Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Apple Silicon (mps)``).
@@ -207,7 +207,7 @@ We used the SIFT dataset to benchmark our results with 1M vectors of 128D
 
 We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/XMLs. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
 
-![](docs/lance_perf.png)
+![](docs/src/images/lance_perf.png)
 
 ## Why are you building yet another data format?!
 

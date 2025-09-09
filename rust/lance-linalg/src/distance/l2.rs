@@ -8,6 +8,7 @@ use std::iter::Sum;
 use std::ops::AddAssign;
 use std::sync::Arc;
 
+use crate::{Error, Result};
 use arrow_array::{
     cast::AsArray,
     types::{Float16Type, Float32Type, Float64Type, Int8Type},
@@ -16,16 +17,11 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::assume_eq;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, Num};
-
-use crate::simd::{
-    f32::{f32x16, f32x8},
-    SIMD,
-};
-use crate::{Error, Result};
 
 /// Calculate the L2 distance between two vectors.
 ///
@@ -33,12 +29,8 @@ pub trait L2: Num {
     /// Calculate the L2 distance between two vectors.
     fn l2(x: &[Self], y: &[Self]) -> f32;
 
-    fn l2_batch<'a>(
-        x: &'a [Self],
-        y: &'a [Self],
-        dimension: usize,
-    ) -> Box<dyn Iterator<Item = f32> + 'a> {
-        Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v)))
+    fn l2_batch(x: &[Self], y: &[Self], dimension: usize) -> impl Iterator<Item = f32> {
+        y.chunks_exact(dimension).map(|v| Self::l2(x, v))
     }
 }
 
@@ -173,26 +165,6 @@ impl L2 for f32 {
         // See https://github.com/lancedb/lance/pull/2450.
         l2_scalar::<Self, Self, 16>(x, y)
     }
-
-    fn l2_batch<'a>(
-        x: &'a [Self],
-        y: &'a [Self],
-        dimension: usize,
-    ) -> Box<dyn Iterator<Item = f32> + 'a> {
-        use self::f32::l2_once;
-        // Dispatch based on the dimension.
-        match dimension {
-            8 => Box::new(
-                y.chunks_exact(dimension)
-                    .map(move |v| l2_once::<f32x8, 8>(x, v)),
-            ),
-            16 => Box::new(
-                y.chunks_exact(dimension)
-                    .map(move |v| l2_once::<f32x16, 16>(x, v)),
-            ),
-            _ => Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v))),
-        }
-    }
 }
 
 impl L2 for f64 {
@@ -206,21 +178,6 @@ impl L2 for f64 {
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     l2(from, to)
-}
-
-// f32 kernels for L2
-mod f32 {
-    use super::*;
-
-    #[inline]
-    pub fn l2_once<S: SIMD<f32, N>, const N: usize>(x: &[f32], y: &[f32]) -> f32 {
-        debug_assert_eq!(x.len(), N);
-        debug_assert_eq!(y.len(), N);
-        let x = unsafe { S::load_unaligned(x.as_ptr()) };
-        let y = unsafe { S::load_unaligned(y.as_ptr()) };
-        let s = x - y;
-        (s * s).reduce_sum()
-    }
 }
 
 /// Compute L2 distance between a vector and a batch of vectors.
@@ -238,9 +195,9 @@ pub fn l2_distance_batch<'a, T: L2>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a> {
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+) -> impl Iterator<Item = f32> + 'a {
+    assume_eq!(from.len(), dimension);
+    assume_eq!(to.len() % dimension, 0);
 
     T::l2_batch(from, to, dimension)
 }

@@ -2,11 +2,15 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use super::super::utils::make_rowaddr_capture_stream;
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::utils::make_rowid_capture_stream;
+use crate::{io::exec::Planner, Dataset};
+use crate::{Error, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
@@ -16,21 +20,17 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use futures::{future::Either, FutureExt, StreamExt, TryFutureExt};
+use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
-use lance_core::utils::backoff::SlotBackoff;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
-use std::future::Future;
 
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::{io::exec::Planner, Dataset};
-use crate::{Error, Result};
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 
 /// Build an update operation.
 ///
@@ -39,13 +39,19 @@ use crate::{Error, Result};
 ///
 /// Use the [UpdateBuilder] to construct an update job. For example:
 ///
-/// ```ignore
-/// let dataset = UpdateBuilder::new(dataset.clone())
-///     .update_where("region_id = 10")
-///     .set("region_name", "New York")
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::UpdateBuilder;
+/// # use std::sync::Arc;
+/// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+/// let result = UpdateBuilder::new(dataset)
+///     .update_where("region_id = 10")?
+///     .set("region_name", "New York")?
 ///     .build()?
 ///     .execute()
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 #[derive(Debug, Clone)]
@@ -244,7 +250,7 @@ pub struct UpdateResult {
 }
 
 #[derive(Debug)]
-struct UpdateData {
+pub struct UpdateData {
     removed_fragment_ids: Vec<u64>,
     old_fragments: Vec<Fragment>,
     new_fragments: Vec<Fragment>,
@@ -263,90 +269,18 @@ pub struct UpdateJob {
 
 impl UpdateJob {
     pub async fn execute(self) -> Result<UpdateResult> {
-        let start = Instant::now();
-        let mut dataset_ref = self.dataset.clone();
-        let max_retries = self.conflict_retries;
-        let mut backoff = SlotBackoff::default();
+        let dataset = self.dataset.clone();
+        let config = RetryConfig {
+            max_retries: self.conflict_retries,
+            retry_timeout: self.retry_timeout,
+        };
 
-        fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
-            Error::TooMuchWriteContention {
-                message: format!(
-                    "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
-                    attempts,
-                    retry_timeout.as_secs_f32()
-                ),
-                location: location!(),
-            }
-        }
-
-        fn maybe_timeout<T>(
-            backoff: &SlotBackoff,
-            start: Instant,
-            retry_timeout: Duration,
-            future: impl Future<Output = T>,
-        ) -> impl Future<Output = Result<T>> {
-            let attempt = backoff.attempt();
-            if attempt == 0 {
-                // No timeout on first attempt
-                Either::Left(future.map(|res| Ok(res)))
-            } else {
-                let remaining = retry_timeout.saturating_sub(start.elapsed());
-                Either::Right(
-                    tokio::time::timeout(remaining, future)
-                        .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
-                )
-            }
-        }
-
-        while backoff.attempt() <= max_retries {
-            let mut job_with_updated_dataset = self.clone();
-            job_with_updated_dataset.dataset = dataset_ref.clone();
-            let execute_fut = job_with_updated_dataset.execute_impl();
-            let execute_fut = maybe_timeout(&backoff, start, self.retry_timeout, execute_fut);
-            let update_data = execute_fut.await??;
-
-            let commit_future = self.commit_impl(dataset_ref.clone(), update_data);
-            let commit_future = maybe_timeout(&backoff, start, self.retry_timeout, commit_future);
-            match commit_future.await? {
-                Ok(result) => return Ok(result),
-                Err(Error::RetryableCommitConflict { .. }) => {
-                    // Check whether we have exhausted our retries *before*
-                    // we sleep.
-                    if backoff.attempt() >= max_retries {
-                        break;
-                    }
-                    if start.elapsed() > self.retry_timeout {
-                        return Err(timeout_error(self.retry_timeout, backoff.attempt() + 1));
-                    }
-                    if backoff.attempt() == 0 {
-                        // We add 10% buffer here, to allow concurrent writes to complete.
-                        // We pass the first attempt's time to the backoff so it's used
-                        // as the unit for backoff time slots.
-                        // See SlotBackoff implementation for more details on how this works.
-                        backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
-                    }
-
-                    let sleep_fut = tokio::time::sleep(backoff.next_backoff());
-                    let sleep_fut = maybe_timeout(&backoff, start, self.retry_timeout, sleep_fut);
-                    sleep_fut.await?;
-
-                    let mut ds = dataset_ref.as_ref().clone();
-                    ds.checkout_latest().await?;
-                    dataset_ref = Arc::new(ds);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-        }
-        Err(Error::TooMuchWriteContention {
-            message: format!("Attempted {} retries.", max_retries),
-            location: location!(),
-        })
+        execute_with_retry(self, dataset, config).await
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
         let mut scanner = self.dataset.scan();
-        scanner.with_row_address();
+        scanner.with_row_id();
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -354,10 +288,10 @@ impl UpdateJob {
 
         let stream = scanner.try_into_stream().await?.into();
 
-        // We keep track of seen row addresses so we can delete them from the existing
-        // fragments.
-        let removed_row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-        let stream = make_rowaddr_capture_stream(removed_row_ids.clone(), stream)?;
+        // We keep track of seen row ids so we can delete them from the existing
+        // fragments and then set the row id segments in the new fragments.
+        let (stream, row_id_rx) =
+            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
 
         let schema = stream.schema();
 
@@ -404,15 +338,40 @@ impl UpdateJob {
                 location: location!(),
             });
         }
-        let new_fragments = written.default.0;
+        let mut new_fragments = written.default.0;
+
+        let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
+            message: format!("Failed to receive row ids: {}", err),
+            location: location!(),
+        })?;
+
+        if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
+            let fragment_sizes = new_fragments
+                .iter()
+                .map(|f| f.physical_rows.unwrap() as u64);
+            let sequences = lance_table::rowids::rechunk_sequences(
+                [row_id_sequence.clone()],
+                fragment_sizes,
+                false,
+            )
+            .map_err(|e| Error::Internal {
+                message: format!(
+                    "Captured row ids not equal to number of rows written: {}",
+                    e
+                ),
+                location: location!(),
+            })?;
+            for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                let serialized = lance_table::rowids::write_row_ids(&sequence);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+            }
+        }
 
         // Apply deletions
-        let removed_row_ids = Arc::into_inner(removed_row_ids)
-            .unwrap()
-            .into_inner()
-            .unwrap();
-        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
-        let affected_rows = RowIdTreeMap::from(removed_row_ids);
+        let row_id_index = get_row_id_index(&self.dataset).await?;
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
+        let affected_rows = RowIdTreeMap::from(row_addrs.as_ref().clone());
 
         let num_updated_rows = new_fragments
             .iter()
@@ -476,9 +435,9 @@ impl UpdateJob {
     /// Returns the set of modified fragments and removed fragments, if any.
     async fn apply_deletions(
         &self,
-        removed_row_ids: &RoaringTreemap,
+        removed_row_addrs: &RoaringTreemap,
     ) -> Result<(Vec<Fragment>, Vec<u64>)> {
-        let bitmaps = Arc::new(removed_row_ids.bitmaps().collect::<BTreeMap<_, _>>());
+        let bitmaps = Arc::new(removed_row_addrs.bitmaps().collect::<BTreeMap<_, _>>());
 
         enum FragmentChange {
             Unchanged,
@@ -521,6 +480,23 @@ impl UpdateJob {
     }
 }
 
+impl RetryExecutor for UpdateJob {
+    type Data = UpdateData;
+    type Result = UpdateResult;
+
+    async fn execute_impl(&self) -> Result<Self::Data> {
+        self.clone().execute_impl().await
+    }
+
+    async fn commit(&self, dataset: Arc<Dataset>, data: Self::Data) -> Result<Self::Result> {
+        self.commit_impl(dataset, data).await
+    }
+
+    fn update_dataset(&mut self, dataset: Arc<Dataset>) {
+        self.dataset = dataset;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -534,10 +510,11 @@ mod tests {
     use super::*;
 
     use arrow::{array::AsArray, datatypes::UInt32Type};
-    use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array};
+    use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::{future::try_join_all, TryStreamExt};
+    use lance_core::ROW_ID;
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreParams;
     use object_store::throttle::ThrottleConfig;
@@ -550,7 +527,10 @@ mod tests {
     /// Also returns the TempDir, which should be kept alive as long as the
     /// dataset is being accessed. Once that is dropped, the temp directory is
     /// deleted.
-    async fn make_test_dataset(version: LanceFileVersion) -> (Arc<Dataset>, TempDir) {
+    async fn make_test_dataset(
+        version: LanceFileVersion,
+        enable_stable_row_ids: bool,
+    ) -> (Arc<Dataset>, TempDir) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -569,6 +549,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 10,
             data_storage_version: Some(version),
+            enable_stable_row_ids,
             ..Default::default()
         };
 
@@ -585,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_validation() {
-        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy).await;
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy, false).await;
 
         let builder = UpdateBuilder::new(dataset);
 
@@ -623,8 +604,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_all(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
-        let (dataset, _test_dir) = make_test_dataset(version).await;
+        let (dataset, _test_dir) = make_test_dataset(version, enable_stable_row_ids).await;
 
         let update_result = UpdateBuilder::new(dataset)
             .set("name", "'bar' || cast(id as string)")
@@ -666,8 +648,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_conditional(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
-        let (dataset, _test_dir) = make_test_dataset(version).await;
+        let (dataset, _test_dir) = make_test_dataset(version, enable_stable_row_ids).await;
 
         let original_fragments = dataset.get_fragments();
 
@@ -730,8 +713,9 @@ mod tests {
         assert_eq!(fragments[2].metadata.physical_rows, Some(15));
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_update_concurrency() {
+    async fn test_update_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -766,6 +750,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
+                enable_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])
@@ -824,8 +809,9 @@ mod tests {
         assert!(values.iter().all(|&value| value == 1));
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_update_same_row_concurrency() {
+    async fn test_update_same_row_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -858,6 +844,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
+                enable_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])
@@ -913,5 +900,152 @@ mod tests {
 
         let values = data["value"].as_primitive::<UInt32Type>().values();
         assert_eq!(values, &[99]);
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_stable_after_update() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let orig_row_ids = orig_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let orig_ids = orig_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let updated_batch = UpdateBuilder::new(dataset)
+            .update_where("id >= 15")
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let updated_row_ids = updated_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let updated_ids = updated_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(orig_row_ids, updated_row_ids);
+        assert_eq!(orig_ids, updated_ids);
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_stable_after_update_odd_id() {
+        use std::collections::HashSet;
+
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let orig_row_ids = orig_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let orig_ids = orig_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let orig_names = orig_batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let updated_batch = UpdateBuilder::new(dataset)
+            .update_where("id % 2 = 1")
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let updated_row_ids = updated_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let updated_ids = updated_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let updated_names = updated_batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(
+            orig_row_ids
+                .values()
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            updated_row_ids
+                .values()
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            orig_ids.values().iter().cloned().collect::<HashSet<_>>(),
+            updated_ids.values().iter().cloned().collect::<HashSet<_>>()
+        );
+
+        for i in 0..orig_row_ids.len() {
+            let row_id = orig_row_ids.value(i);
+            let updated_idx = updated_row_ids
+                .iter()
+                .position(|rid| rid == Some(row_id))
+                .unwrap();
+            let id = orig_ids.value(i);
+            let updated_name = updated_names.value(updated_idx);
+            if id % 2 == 1 {
+                assert_eq!(updated_name, "updated");
+            } else {
+                assert_eq!(updated_name, orig_names.value(i));
+            }
+        }
     }
 }

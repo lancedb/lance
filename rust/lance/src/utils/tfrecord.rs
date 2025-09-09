@@ -16,7 +16,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use half::{bf16, f16};
-use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+use lance_arrow::bfloat16::BFLOAT16_EXT_NAME;
+use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use prost_old::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,7 +73,7 @@ pub async fn infer_tfrecord_schema(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let mut records = RecordStream::<Example, _>::from_reader(data, Default::default());
     let mut i = 0;
@@ -134,7 +135,7 @@ pub async fn read_tfrecord(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let schema_ref = schema.clone();
     let batch_stream = RecordStream::<Example, _>::from_reader(data, Default::default())

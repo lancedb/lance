@@ -13,6 +13,7 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::assume_eq;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
@@ -218,8 +219,8 @@ pub fn dot_distance_batch<'a, T: Dot>(
     to: &'a [T],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+    assume_eq!(from.len(), dimension);
+    assume_eq!(to.len() % dimension, 0);
     Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
 }
 
@@ -295,7 +296,6 @@ pub fn dot_distance_arrow_batch(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
@@ -329,15 +329,24 @@ mod tests {
         x.iter().zip(y.iter()).map(|(&x, &y)| x * y).sum::<f64>() as f32
     }
 
-    // Accuracy of dot product depends on the size of the components
-    // of the vector.
-    // Imagine that each `x_i` can vary by `є * |x_i|`. Similarly for `y_i`.
-    // (Basically, it's accurate to ±(1 + є) * |x_i|).
-    // Error for `sum(x, y)` is `є_x + є_y`. Error for multiple is `є_x * x + є_y * y`.
-    // See: https://www.geol.lsu.edu/jlorenzo/geophysics/uncertainties/Uncertaintiespart2.html
-    // The multiplication of `x_i` and `y_i` can vary by `(є * |x_i|) * |y_i| + (є * |y_i|) * |x_i|`.
-    // This simplifies to `2 * є * (|x_i| + |y_i|)`.
-    // So the error for the sum of all the multiplications is `є * sum(|x_i| + |y_i|)`.
+    /// Error bound for vector dot product
+    /// http://ftp.demec.ufpr.br/CFD/bibliografia/Higham_2002_Accuracy%20and%20Stability%20of%20Numerical%20Algorithms.pdf
+    /// Chapter 3 (page 61) equation 3.5
+    /// A float point calculation error is bounded by:
+    /// (kє/(1-kє)) Sum_i(|x_i||y_i|) if kє < 1
+    /// We are currently using a SIMD version of naive product and summation.
+    /// Therefore, k = 2n-1 (n multiplications, n-1 additions).
+    /// For f16 and bf16, kє can be >=1.
+    /// When that happens, we will use a simpler estimation method:
+    /// Imagine that each `x_i` can vary by `є * |x_i|`, similarly for `y_i`.
+    /// (Basically, it's accurate to ±(1 + є) * |x_i|).
+    /// Error for `sum(x, y)` is `є_x + є_y`.
+    /// Error for multiple is `є_x * x + є_y * y + є_x * є_y`,
+    /// which simplifies to `є_x * x + є_y * y`
+    /// See: https://www.geol.lsu.edu/jlorenzo/geophysics/uncertainties/Uncertaintiespart2.html
+    /// The multiplication of `x_i` and `y_i` can vary by `є|x_i||y_i| + є|y_i||x_i|`.
+    /// This simplifies to `2є|x_i||y_i|`.
+    /// So the error for the sum of all the multiplications is `2є Sum_i(|x_i||y_i|)`.
     fn max_error<T: Float + AsPrimitive<f64>>(x: &[f64], y: &[f64]) -> f32 {
         let dot = x
             .iter()
@@ -345,7 +354,14 @@ mod tests {
             .zip(y.iter().cloned())
             .map(|(x, y)| x.abs() * y.abs())
             .sum::<f64>();
-        (2.0 * T::epsilon().as_() * dot) as f32
+        let k = ((2 * x.len()) - 1) as f64;
+        let k_epsilon = k * T::epsilon().as_();
+
+        if k_epsilon < 1.0 {
+            (k_epsilon * dot) as f32
+        } else {
+            (2.0 * T::epsilon().as_() * dot) as f32
+        }
     }
 
     fn do_dot_test<T: Dot + AsPrimitive<f64> + Float>(

@@ -1,0 +1,30 @@
+[project]
+name = "lance-docs"
+version = "0.1.0"
+description = "Documentation for Lance - Modern columnar data format for ML and LLMs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.4.0",
+    "mkdocs-protobuf>=0.1.0",
+    "mkdocs-linkcheck>=1.0.0",
+    "mkdocs-awesome-pages-plugin>=2.10.1"
+]
+
+[tool.uv]
+dev-dependencies = [
+    "mike>=2.0.0",  # For versioned documentation
+    "mkdocs-minify-plugin>=0.7.0",  # Minify HTML output
+    "mkdocs-git-revision-date-localized-plugin>=1.2.0",  # Add git revision date
+    "ruff>=0.4.0",  # For linting markdown code blocks
+]
+
+[tool.ruff]
+# Only lint Python code blocks in markdown files
+include = ["*.py", "*.md"]
+extend-include = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I"]
+ignore = ["E501"]  # Ignore line length in documentation

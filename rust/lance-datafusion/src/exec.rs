@@ -5,7 +5,9 @@
 
 use std::{
     collections::HashMap,
+    fmt::{self, Formatter},
     sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 
 use arrow_array::RecordBatch;
@@ -45,6 +47,7 @@ use log::{debug, info, warn};
 use snafu::location;
 use tracing::Span;
 
+use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
@@ -116,7 +119,8 @@ impl DisplayAs for OneShotExec {
             .schema
             .field_names()
             .iter()
-            .map(|s| s.to_string())
+            .cloned()
+            .cloned()
             .collect::<Vec<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -158,9 +162,15 @@ impl ExecutionPlan for OneShotExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        // OneShotExec has no children, so this should only be called with an empty vector
+        if !children.is_empty() {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "OneShotExec does not support children".to_string(),
+            ));
+        }
+        Ok(self)
     }
 
     fn execute(
@@ -340,7 +350,11 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
-    SessionContext::new_with_config_rt(session_config, runtime_env)
+
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
+    register_functions(&ctx);
+
+    ctx
 }
 
 static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
@@ -496,8 +510,94 @@ pub async fn analyze_plan(
     // fully execute the plan
     while (stream.next().await).is_some() {}
 
-    let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
-    Ok(format!("{}", display.indent(true)))
+    let result = format_plan(analyze);
+    Ok(result)
+}
+
+pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
+    /// A visitor which calculates additional metrics for all the plans.
+    struct CalculateVisitor {
+        highest_index: usize,
+        index_to_cumulative_cpu: HashMap<usize, usize>,
+    }
+    impl CalculateVisitor {
+        fn calculate_cumulative_cpu(&mut self, plan: &Arc<dyn ExecutionPlan>) -> usize {
+            self.highest_index += 1;
+            let plan_index = self.highest_index;
+            let elapsed_cpu: usize = match plan.metrics() {
+                Some(metrics) => metrics.elapsed_compute().unwrap_or_default(),
+                None => 0,
+            };
+            let mut cumulative_cpu = elapsed_cpu;
+            for child in plan.children() {
+                cumulative_cpu += self.calculate_cumulative_cpu(child);
+            }
+            self.index_to_cumulative_cpu
+                .insert(plan_index, cumulative_cpu);
+            cumulative_cpu
+        }
+    }
+
+    /// A visitor which prints out all the plans.
+    struct PrintVisitor {
+        highest_index: usize,
+        indent: usize,
+    }
+    impl PrintVisitor {
+        fn write_output(
+            &mut self,
+            plan: &Arc<dyn ExecutionPlan>,
+            f: &mut Formatter,
+            calcs: &CalculateVisitor,
+        ) -> std::fmt::Result {
+            self.highest_index += 1;
+            write!(f, "{:indent$}", "", indent = self.indent * 2)?;
+            plan.fmt_as(datafusion::physical_plan::DisplayFormatType::Verbose, f)?;
+            if let Some(metrics) = plan.metrics() {
+                let metrics = metrics
+                    .aggregate_by_name()
+                    .sorted_for_display()
+                    .timestamps_removed();
+
+                write!(f, ", metrics=[{metrics}]")?;
+            } else {
+                write!(f, ", metrics=[]")?;
+            }
+            let cumulative_cpu = calcs
+                .index_to_cumulative_cpu
+                .get(&self.highest_index)
+                .unwrap();
+            let cumulative_cpu_duration = Duration::from_nanos((*cumulative_cpu) as u64);
+            write!(f, ", cumulative_cpu={cumulative_cpu_duration:?}")?;
+            writeln!(f)?;
+            self.indent += 1;
+            for child in plan.children() {
+                self.write_output(child, f, calcs)?;
+            }
+            self.indent -= 1;
+            std::fmt::Result::Ok(())
+        }
+    }
+    // A wrapper which prints out a plan.
+    struct PrintWrapper {
+        plan: Arc<dyn ExecutionPlan>,
+    }
+    impl fmt::Display for PrintWrapper {
+        fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+            let mut calcs = CalculateVisitor {
+                highest_index: 0,
+                index_to_cumulative_cpu: HashMap::new(),
+            };
+            calcs.calculate_cumulative_cpu(&self.plan);
+            let mut prints = PrintVisitor {
+                highest_index: 0,
+                indent: 0,
+            };
+            prints.write_output(&self.plan, f, &calcs)
+        }
+    }
+    let wrapper = PrintWrapper { plan };
+    format!("{}", wrapper)
 }
 
 pub trait SessionContextExt {

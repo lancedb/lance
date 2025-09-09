@@ -2,14 +2,15 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import math
 import warnings
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 
-from lance import LanceFragment
 from lance.file import LanceFileReader, LanceFileWriter
+from lance.fragment import LanceFragment
 
 from .lance import indices
 
@@ -632,3 +633,9 @@ class IndicesBuilder:
                 )
 
         return column
+
+
+@dataclass
+class IndexConfig:
+    index_type: str  # The type of index to create (e.g. btree, zonemap, json)
+    parameters: dict  # Parameters to configure the index

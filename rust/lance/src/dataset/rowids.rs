@@ -5,13 +5,13 @@ use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
-use snafu::location;
-use std::sync::Arc;
-
+use lance_core::utils::deletion::DeletionVector;
 use lance_table::{
     format::{Fragment, RowIdMeta},
-    rowids::{read_row_ids, RowIdIndex, RowIdSequence},
+    rowids::{read_row_ids, FragmentRowIdIndex, RowIdIndex, RowIdSequence},
 };
+use snafu::location;
+use std::sync::Arc;
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -77,7 +77,7 @@ pub fn load_row_id_sequences<'a>(
 pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
-    if dataset.manifest.uses_move_stable_row_ids() {
+    if dataset.manifest.uses_stable_row_ids() {
         let key = RowIdIndexKey {
             version: dataset.manifest.version,
         };
@@ -96,7 +96,31 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
         .try_collect::<Vec<_>>()
         .await?;
 
-    let index = RowIdIndex::new(&sequences)?;
+    let fragment_indices: Vec<_> =
+        futures::future::try_join_all(sequences.into_iter().map(|(fragment_id, sequence)| {
+            let dataset = dataset.clone();
+            async move {
+                let fragments = dataset.get_fragments();
+                let fragment = fragments
+                    .iter()
+                    .find(|f| f.id() as u32 == fragment_id)
+                    .expect("Fragment should exist");
+
+                let deletion_vector = match fragment.get_deletion_vector().await {
+                    Ok(Some(dv)) => dv,
+                    Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
+                };
+
+                Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
+                    fragment_id,
+                    row_id_sequence: sequence,
+                    deletion_vector,
+                })
+            }
+        }))
+        .await?;
+
+    let index = RowIdIndex::new(&fragment_indices)?;
 
     Ok(index)
 }
@@ -109,11 +133,19 @@ mod test {
 
     use super::*;
 
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, UInt64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
+    use lance_core::datatypes::Schema;
     use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
+    use lance_datagen::Dimension;
     use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
+    use std::collections::HashMap;
+    use std::collections::HashSet;
 
     fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -129,14 +161,14 @@ mod test {
         let schema = sequence_batch(0..0).schema();
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
             .await
             .unwrap();
 
-        assert!(dataset.manifest.uses_move_stable_row_ids());
+        assert!(dataset.manifest.uses_stable_row_ids());
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
@@ -153,18 +185,18 @@ mod test {
         let reader =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: false,
+            enable_stable_row_ids: false,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
             .await
             .unwrap();
-        assert!(!dataset.manifest().uses_move_stable_row_ids());
+        assert!(!dataset.manifest().uses_stable_row_ids());
 
         // Trying to append without stable row ids should pass (a warning is emitted) but should not
-        // affect the move_stable_row_ids setting.
+        // affect the stable_row_ids setting.
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -173,7 +205,7 @@ mod test {
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
             .await
             .unwrap();
-        assert!(!dataset.manifest().uses_move_stable_row_ids());
+        assert!(!dataset.manifest().uses_stable_row_ids());
     }
 
     #[tokio::test]
@@ -182,7 +214,7 @@ mod test {
         let batch = sequence_batch(0..num_rows as i32);
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 10,
             ..Default::default()
         };
@@ -214,7 +246,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let temp_dir = tempfile::tempdir().unwrap();
@@ -250,7 +282,7 @@ mod test {
             *start += 10;
             let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
             let write_params = WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 mode: WriteMode::Append,
                 ..Default::default()
             };
@@ -288,7 +320,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -350,7 +382,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -401,7 +433,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
@@ -424,11 +456,213 @@ mod test {
         let dataset = update_result.new_dataset;
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
-        // Old address is still there.
-        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(0, 3)));
-        // New location is there.
-        assert_eq!(index.get(5), Some(RowAddress::new_from_parts(1, 0)));
+        // the updated row ids mapping to new address
+        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(1, 0)));
+        // there is no new row id
+        assert_eq!(index.get(5), None);
     }
 
-    // TODO: query / scan / take after deletion, compaction, then deletion
+    fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {
+        row_ids
+            .values()
+            .iter()
+            .zip(i_array.values().iter())
+            .map(|(&row_id, &i)| (row_id, i))
+            .collect()
+    }
+
+    async fn scan_rowid_map(dataset: &Dataset) -> HashMap<u64, i32> {
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        scan.scan_in_order(true);
+        let result = scan.try_into_batch().await.unwrap();
+        let i = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let row_ids = result[ROW_ID]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        build_rowid_to_i_map(row_ids, i)
+    }
+
+    async fn compact(dataset: &mut Dataset, target_rows: usize) {
+        let options = CompactionOptions {
+            target_rows_per_fragment: target_rows,
+            ..Default::default()
+        };
+        let _ = compact_files(dataset, options, None).await.unwrap();
+    }
+
+    async fn delete(dataset: &mut Dataset, expr: &str) {
+        dataset.delete(expr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_after_multiple_deletion_and_compaction() {
+        async fn delete(dataset: &mut Dataset, expr: &str) {
+            dataset.delete(expr).await.unwrap();
+        }
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .col(
+                "category",
+                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    enable_v2_manifest_paths: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // first delete and compact
+        delete(&mut dataset, "i = 2 or i = 3 or i = 5").await;
+        let map_before = scan_rowid_map(&dataset).await;
+        compact(&mut dataset, 20).await;
+        let map_after = scan_rowid_map(&dataset).await;
+
+        // verify row id
+        assert_eq!(
+            map_before.keys().collect::<HashSet<_>>(),
+            map_after.keys().collect::<HashSet<_>>()
+        );
+        for row_id in map_before.keys() {
+            assert_eq!(map_before[row_id], map_after[row_id]);
+        }
+
+        // second delete
+        delete(&mut dataset, "i = 9").await;
+        let mut scan = dataset.scan();
+        let result = scan
+            .filter("i >= 0")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let id_set = ids.values().iter().cloned().collect::<HashSet<_>>();
+        let expected: Vec<i32> = (0..60)
+            .filter(|&i| i != 2 && i != 3 && i != 5 && i != 9)
+            .collect();
+        assert_eq!(id_set, expected.iter().cloned().collect());
+
+        // get the row_id where i == 15
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        scan.scan_in_order(true);
+        let result = scan
+            .filter("i == 15")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_id_vec = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+
+        // third delete and compact
+        delete(&mut dataset, "i = 15 or i = 25").await;
+        let map_before = scan_rowid_map(&dataset).await;
+        compact(&mut dataset, 30).await;
+        let map_after = scan_rowid_map(&dataset).await;
+
+        assert_eq!(
+            map_before.keys().collect::<HashSet<_>>(),
+            map_after.keys().collect::<HashSet<_>>()
+        );
+        for row_id in map_before.keys() {
+            assert_eq!(map_before[row_id], map_after[row_id]);
+        }
+
+        // verify the rowid represent i == 15 has been deleted
+        let result = dataset
+            .take_rows(&row_id_vec, Schema::try_from(dataset.schema()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stable_row_id_after_deletion_update_and_compaction() {
+        // gen dataset
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "i",
+                lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+            )
+            .col(
+                "category",
+                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    enable_v2_manifest_paths: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // delete some rows
+        delete(&mut dataset, "i = 2 or i = 3 or i = 5").await;
+        let map_before = scan_rowid_map(&dataset).await;
+
+        // update some rows
+        let updated_dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i >= 15")
+            .unwrap()
+            .set("category", "999")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // compact the dataset
+        let mut dataset = Arc::try_unwrap(updated_dataset).expect("no other Arc references");
+        compact(&mut dataset, 20).await;
+        let map_after = scan_rowid_map(&dataset).await;
+
+        // verify row id
+        assert_eq!(
+            map_before.keys().collect::<HashSet<_>>(),
+            map_after.keys().collect::<HashSet<_>>()
+        );
+        for row_id in map_before.keys() {
+            assert_eq!(map_before[row_id], map_after[row_id]);
+        }
+
+        // verify category filed
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        scan.scan_in_order(true);
+        let result = scan.try_into_batch().await.unwrap();
+        let i = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let category = result["category"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for idx in 0..i.len() {
+            if i.value(idx) >= 15 {
+                assert_eq!(category.value(idx), 999);
+            }
+        }
+    }
 }

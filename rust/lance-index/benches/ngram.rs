@@ -13,9 +13,10 @@ use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_datagen::{array, RowCount};
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::pb;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions};
-use lance_index::scalar::{ScalarIndex, TextQuery};
+use lance_index::scalar::ngram::{NGramIndexBuilder, NGramIndexBuilderOptions, NGramIndexPlugin};
+use lance_index::scalar::{registry::ScalarIndexPlugin, TextQuery};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
@@ -88,12 +89,13 @@ fn bench_ngram(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
+    let details = prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(NGramIndex::load(store, None, LanceCache::no_cache()))
+        .block_on(NGramIndexPlugin.load_index(store, &details, None, LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
-            let sample_idx = rand::random::<usize>() % batch.num_rows();
+            let sample_idx = rand::random_range(0..batch.num_rows());
             let sample = batch
                 .column(0)
                 .as_string::<i32>()
