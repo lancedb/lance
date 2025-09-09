@@ -35,7 +35,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
-    cache::{LanceCache, UnsizedCacheKey},
+    cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
     Error, Result, ROW_ID_FIELD,
@@ -129,7 +129,7 @@ pub struct IVFIndex {
 
     pub metric_type: MetricType,
 
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl DeepSizeOf for IVFIndex {
@@ -165,7 +165,7 @@ impl IVFIndex {
             sub_index,
             metric_type,
             partition_locks: PartitionLoadLock::new(num_partitions),
-            index_cache,
+            index_cache: WeakLanceCache::from(&index_cache),
         })
     }
 

@@ -41,7 +41,7 @@ use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
         mask::RowIdTreeMap,
@@ -753,7 +753,7 @@ impl CacheKey for BTreePageKey {
 #[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
@@ -773,7 +773,7 @@ impl BTreeIndex {
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
-        index_cache: LanceCache,
+        index_cache: WeakLanceCache,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
@@ -862,7 +862,7 @@ impl BTreeIndex {
                 map,
                 null_pages,
                 store,
-                index_cache,
+                WeakLanceCache::from(&index_cache),
                 sub_index,
                 batch_size,
                 frag_reuse_index,
@@ -912,7 +912,7 @@ impl BTreeIndex {
             map,
             null_pages,
             store,
-            index_cache,
+            WeakLanceCache::from(&index_cache),
             sub_index,
             batch_size,
             frag_reuse_index,
@@ -1756,13 +1756,10 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(
-            test_store,
-            None,
-            LanceCache::with_capacity(100 * 1024 * 1024),
-        )
-        .await
-        .unwrap();
+        let cache = lance_core::cache::LanceCache::with_capacity(100 * 1024 * 1024);
+        let index = BTreeIndex::load(test_store, None, cache)
+            .await
+            .unwrap();
 
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
         let metrics = LocalMetricsCollector::default();

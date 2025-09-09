@@ -2550,7 +2550,11 @@ pub async fn decode_batch(
     // polled twice.
 
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
-    let cache = cache.unwrap_or_else(|| Arc::new(LanceCache::with_capacity(128 * 1024 * 1024)));
+    let cache = if let Some(cache) = cache {
+        cache
+    } else {
+        Arc::new(lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024))
+    };
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
         &batch.top_level_columns,

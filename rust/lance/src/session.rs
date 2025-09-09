@@ -9,7 +9,9 @@ use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
+use moka::future::Cache;
 use snafu::location;
+use std::any::TypeId;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -24,6 +26,10 @@ pub mod index_extension;
 /// A user session tracks the runtime state.
 #[derive(Clone)]
 pub struct Session {
+    /// Strong references to the actual caches - Session owns these
+    index_cache_arc: Arc<Cache<(String, TypeId), lance_core::cache::SizedRecord>>,
+    metadata_cache_arc: Arc<Cache<(String, TypeId), lance_core::cache::SizedRecord>>,
+
     /// Global cache for opened indices.
     ///
     /// Sub-caches are created from this cache for each dataset by adding the
@@ -47,8 +53,17 @@ pub struct Session {
 impl DeepSizeOf for Session {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         let mut size = 0;
-        size += self.index_cache.0.deep_size_of_children(context);
-        size += self.metadata_cache.0.deep_size_of_children(context);
+        // Measure the actual cache contents
+        size += self
+            .index_cache_arc
+            .iter()
+            .map(|(_, v)| v.deep_size_of())
+            .sum::<usize>();
+        size += self
+            .metadata_cache_arc
+            .iter()
+            .map(|(_, v)| v.deep_size_of())
+            .sum::<usize>();
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -94,9 +109,30 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
+        use lance_core::cache::SizedRecord;
+        use moka::future::Cache;
+
+        let index_cache_arc = Arc::new(
+            Cache::builder()
+                .max_capacity(index_cache_size as u64)
+                .weigher(|_, v: &SizedRecord| v.deep_size_of().try_into().unwrap_or(u32::MAX))
+                .support_invalidation_closures()
+                .build(),
+        );
+
+        let metadata_cache_arc = Arc::new(
+            Cache::builder()
+                .max_capacity(metadata_cache_size as u64)
+                .weigher(|_, v: &SizedRecord| v.deep_size_of().try_into().unwrap_or(u32::MAX))
+                .support_invalidation_closures()
+                .build(),
+        );
+
         Self {
-            index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            index_cache: GlobalIndexCache(LanceCache::from_arc(index_cache_arc.clone())),
+            metadata_cache: GlobalMetadataCache(LanceCache::from_arc(metadata_cache_arc.clone())),
+            index_cache_arc,
+            metadata_cache_arc,
             index_extensions: HashMap::new(),
             store_registry,
         }
@@ -180,14 +216,11 @@ impl Session {
 
 impl Default for Session {
     fn default() -> Self {
-        Self {
-            index_cache: GlobalIndexCache(LanceCache::with_capacity(DEFAULT_INDEX_CACHE_SIZE)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(
-                DEFAULT_METADATA_CACHE_SIZE,
-            )),
-            index_extensions: HashMap::new(),
-            store_registry: Arc::new(ObjectStoreRegistry::default()),
-        }
+        Self::new(
+            DEFAULT_INDEX_CACHE_SIZE,
+            DEFAULT_METADATA_CACHE_SIZE,
+            Arc::new(ObjectStoreRegistry::default()),
+        )
     }
 }
 

@@ -31,7 +31,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -207,7 +207,7 @@ impl NGramPostingList {
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl DeepSizeOf for NGramPostingListReader {
@@ -313,7 +313,7 @@ impl NGramIndex {
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
             frag_reuse_index,
-            index_cache,
+            index_cache: WeakLanceCache::from(&index_cache),
         });
 
         Ok(Self {

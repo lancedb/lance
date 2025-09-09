@@ -19,7 +19,7 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{cache::LanceCache, utils::bit::pad_bytes, Result};
+use lance_core::{utils::bit::pad_bytes, Result};
 use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
 
 use crate::{
@@ -169,7 +169,7 @@ async fn test_decode(
     ) -> BoxFuture<'static, ()>,
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
-    let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
+    let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,

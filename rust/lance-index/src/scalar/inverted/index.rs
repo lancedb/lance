@@ -38,7 +38,7 @@ use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::{
     mask::RowIdMask,
@@ -263,7 +263,7 @@ impl InvertedIndex {
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
                 let invert_list =
-                    PostingListReader::try_new(invert_list_reader, index_cache).await?;
+                    PostingListReader::try_new(invert_list_reader, index_cache.clone()).await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -557,7 +557,7 @@ impl InvertedPartition {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache.clone()).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
         let fragments = docs.fragment_ids();
@@ -923,7 +923,7 @@ pub struct PostingListReader {
 
     has_position: bool,
 
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl std::fmt::Debug for PostingListReader {
@@ -973,7 +973,7 @@ impl PostingListReader {
             max_scores,
             lengths,
             has_position,
-            index_cache,
+            index_cache: WeakLanceCache::from(&index_cache),
         })
     }
 
@@ -2370,7 +2370,8 @@ mod tests {
         writer.finish_with_metadata(metadata).await.unwrap();
 
         // Load the inverted index
-        let index = InvertedIndex::load(store.clone(), None, LanceCache::with_capacity(4096))
+        let cache = lance_core::cache::LanceCache::with_capacity(4096);
+        let index = InvertedIndex::load(store.clone(), None, cache)
             .await
             .unwrap();
 

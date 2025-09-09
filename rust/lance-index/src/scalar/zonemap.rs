@@ -21,7 +21,7 @@ use crate::{pb, Any};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
 use futures::TryStreamExt;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,7 @@ pub struct ZoneMapIndex {
     max_zonemap_size: u64,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl std::fmt::Debug for ZoneMapIndex {
@@ -431,7 +431,7 @@ impl ZoneMapIndex {
                 max_zonemap_size,
                 store,
                 fri,
-                index_cache,
+                index_cache: WeakLanceCache::from(&index_cache),
             });
         }
 
@@ -460,7 +460,7 @@ impl ZoneMapIndex {
             max_zonemap_size,
             store,
             fri,
-            index_cache,
+            index_cache: WeakLanceCache::from(&index_cache),
         })
     }
 }
