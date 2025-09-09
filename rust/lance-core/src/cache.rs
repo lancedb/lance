@@ -123,11 +123,7 @@ impl LanceCache {
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
             cache: self.cache.clone(),
-            prefix: if self.prefix.is_empty() {
-                prefix.to_string()
-            } else {
-                format!("{}/{}", self.prefix, prefix)
-            },
+            prefix: format!("{}{}/", self.prefix, prefix),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
         }
@@ -365,11 +361,7 @@ impl WeakLanceCache {
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
             inner: self.inner.clone(),
-            prefix: if self.prefix.is_empty() {
-                prefix.to_string()
-            } else {
-                format!("{}/{}", self.prefix, prefix)
-            },
+            prefix: format!("{}{}/", self.prefix, prefix),
         }
     }
 
