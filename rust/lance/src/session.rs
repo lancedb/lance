@@ -9,9 +9,7 @@ use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
-use moka::future::Cache;
 use snafu::location;
-use std::any::TypeId;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -26,10 +24,6 @@ pub mod index_extension;
 /// A user session tracks the runtime state.
 #[derive(Clone)]
 pub struct Session {
-    /// Strong references to the actual caches - Session owns these
-    index_cache_arc: Arc<Cache<(String, TypeId), lance_core::cache::SizedRecord>>,
-    metadata_cache_arc: Arc<Cache<(String, TypeId), lance_core::cache::SizedRecord>>,
-
     /// Global cache for opened indices.
     ///
     /// Sub-caches are created from this cache for each dataset by adding the
@@ -53,17 +47,9 @@ pub struct Session {
 impl DeepSizeOf for Session {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         let mut size = 0;
-        // Measure the actual cache contents
-        size += self
-            .index_cache_arc
-            .iter()
-            .map(|(_, v)| v.deep_size_of())
-            .sum::<usize>();
-        size += self
-            .metadata_cache_arc
-            .iter()
-            .map(|(_, v)| v.deep_size_of())
-            .sum::<usize>();
+        // Measure the actual cache contents through the wrapper types
+        size += self.index_cache.deep_size_of_children(context);
+        size += self.metadata_cache.deep_size_of_children(context);
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -129,10 +115,8 @@ impl Session {
         );
 
         Self {
-            index_cache: GlobalIndexCache(LanceCache::from_arc(index_cache_arc.clone())),
-            metadata_cache: GlobalMetadataCache(LanceCache::from_arc(metadata_cache_arc.clone())),
-            index_cache_arc,
-            metadata_cache_arc,
+            index_cache: GlobalIndexCache(LanceCache::from_arc(index_cache_arc)),
+            metadata_cache: GlobalMetadataCache(LanceCache::from_arc(metadata_cache_arc)),
             index_extensions: HashMap::new(),
             store_registry,
         }
