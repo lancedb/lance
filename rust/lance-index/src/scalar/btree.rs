@@ -2562,7 +2562,7 @@ mod tests {
 
         // Method 1: Build complete index directly using the same data
         // Create deterministic data for comparison - use 2 * DEFAULT_BTREE_BATCH_SIZE for testing
-        let total_count = (2 * DEFAULT_BTREE_BATCH_SIZE) as u64;
+        let total_count = 2 * DEFAULT_BTREE_BATCH_SIZE;
         let full_data_gen = gen_batch()
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
@@ -2745,7 +2745,7 @@ mod tests {
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Int32);
 
         // Use 3 * DEFAULT_BTREE_BATCH_SIZE for more comprehensive boundary testing
-        let total_count = (3 * DEFAULT_BTREE_BATCH_SIZE) as u64;
+        let total_count = 3 * DEFAULT_BTREE_BATCH_SIZE;
 
         // Method 1: Build complete index directly
         let full_data_gen = gen_batch()
@@ -3202,9 +3202,6 @@ mod tests {
         // The cleanup function should handle both valid and invalid file patterns gracefully
         // This test mainly verifies that the function doesn't panic and handles edge cases
         super::cleanup_partition_files(&test_store, &lookup_files, &page_files).await;
-
-        // If we get here without panicking, the cleanup function handled all cases correctly
-        assert!(true);
     }
 
     #[test]

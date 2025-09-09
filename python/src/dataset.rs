@@ -1715,12 +1715,10 @@ impl Dataset {
                     )
                     .await
                 }
-                _ => {
-                    return Err(Error::InvalidInput {
-                        source: format!("Index type {} is not supported.", index_type).into(),
-                        location: location!(),
-                    });
-                }
+                _ => Err(Error::InvalidInput {
+                    source: format!("Index type {} is not supported.", index_type).into(),
+                    location: location!(),
+                }),
             }
         })?
         .map_err(|err| PyValueError::new_err(err.to_string()))
