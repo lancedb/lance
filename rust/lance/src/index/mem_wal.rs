@@ -1134,7 +1134,7 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Flushed, but expected Sealed"), 
                 "Error message should indicate the MemWAL is already flushed, got: {}", error);
-        
+
         // Test success case: mark flushed generation 0 as merged
         let version_before_merge = dataset.manifest.version;
         mark_mem_wal_as_merged(&mut dataset, "GLOBAL", 0, "owner_0")
@@ -2072,7 +2072,7 @@ mod tests {
         mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "new_owner_id")
             .await
             .unwrap();
-        
+
         // Try to create merge insert job that merges using the old owner_id
         let mut merge_insert_job_builder = crate::dataset::MergeInsertBuilder::try_new(
             Arc::new(dataset.clone()),
@@ -2385,11 +2385,11 @@ mod tests {
             .find(|m| m.id.generation == 1)
             .expect("Generation 1 should exist");
 
-        // Verify generation 0 is sealed and flushed
+        // Verify generation 0 is merged (after merge_insert)
         assert_eq!(
             gen_0.state,
-            lance_index::mem_wal::State::Flushed,
-            "Generation 0 should be flushed"
+            lance_index::mem_wal::State::Merged,
+            "Generation 0 should be merged"
         );
 
         // Verify generation 1 is unsealed and unflushed
@@ -2550,11 +2550,11 @@ mod tests {
             .find(|m| m.id.generation == 2)
             .expect("Generation 2 should exist");
 
-        // Verify generation 0 is sealed and flushed
+        // Verify generation 0 is merged (after merge_insert)
         assert_eq!(
             gen_0.state,
-            lance_index::mem_wal::State::Flushed,
-            "Generation 0 should be flushed"
+            lance_index::mem_wal::State::Merged,
+            "Generation 0 should be merged"
         );
 
         // Verify generation 1 is sealed (due to advance) but unflushed
