@@ -632,8 +632,8 @@ mod tests {
     use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
-        Int64Array, ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
+        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -661,8 +661,7 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::{
-        ivf::storage::IvfModel, pq::storage::ProductQuantizationMetadata,
-        storage::STORAGE_METADATA_KEY,
+        pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
     use lance_index::{metrics::NoOpMetricsCollector, INDEX_AUXILIARY_FILE_NAME};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
