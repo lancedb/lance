@@ -66,7 +66,6 @@ const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
-
 const BTREE_INDEX_VERSION: u32 = 0;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
@@ -1438,30 +1437,6 @@ pub async fn train_btree_index(
     Ok(())
 }
 
-/// Extract partition ID from partition file name
-/// Expected format: "part_{partition_id}_{suffix}.lance"
-fn extract_partition_id(filename: &str) -> Result<u64> {
-    if !filename.starts_with("part_") {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
-    }
-
-    let parts: Vec<&str> = filename.split('_').collect();
-    if parts.len() < 3 {
-        return Err(Error::Internal {
-            message: format!("Invalid partition file name format: {}", filename),
-            location: location!(),
-        });
-    }
-
-    parts[1].parse::<u64>().map_err(|_| Error::Internal {
-        message: format!("Failed to parse partition ID from filename: {}", filename),
-        location: location!(),
-    })
-}
-
 /// List and filter files from the index directory
 /// Returns (page_files, lookup_files)
 pub async fn list_page_lookup_files(
@@ -1570,6 +1545,7 @@ pub async fn merge_metadata_files(
         prefetch_config = prefetch_config.with_prefetch_batch(batch);
     }
 
+    // Step 4: Merge pages and create lookup entries
     let lookup_entries = merge_page(
         part_lookup_files,
         &page_files_map,
@@ -1583,7 +1559,7 @@ pub async fn merge_metadata_files(
 
     page_file.finish().await?;
 
-    // Step 4: Generate new lookup file based on reorganized pages
+    // Step 5: Generate new lookup file based on reorganized pages
     // Add batch_size to schema metadata
     let mut metadata = HashMap::new();
     metadata.insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
@@ -1625,6 +1601,225 @@ pub async fn merge_metadata_files(
     cleanup_partition_files(&store, part_lookup_files, part_page_files).await;
 
     Ok(())
+}
+
+async fn merge_page(
+    part_lookup_files: &[String],
+    page_files_map: &HashMap<u64, &String>,
+    store: &Arc<dyn IndexStore>,
+    batch_size: u64,
+    page_file: &mut Box<dyn IndexWriter>,
+    arrow_schema: Arc<Schema>,
+    prefetch_config: PrefetchConfig,
+) -> Result<Vec<(ScalarValue, ScalarValue, u32, u32)>> {
+    let mut lookup_entries = Vec::new();
+    let mut page_idx = 0u32;
+
+    let start_time = std::time::Instant::now();
+    debug!(
+        "Starting multi-way merge with {} partitions using prefetch manager",
+        part_lookup_files.len()
+    );
+
+    // Directly create iterators and read first element
+    let mut partition_map = HashMap::new();
+    let mut heap = BinaryHeap::new();
+
+    debug!("Initializing {} partitions", part_lookup_files.len());
+
+    // Initialize all partitions
+    for lookup_file in part_lookup_files {
+        let partition_id = extract_partition_id(lookup_file)?;
+        let page_file_name =
+            (*page_files_map
+                .get(&partition_id)
+                .ok_or_else(|| Error::Internal {
+                    message: format!("Page file not found for partition ID: {}", partition_id),
+                    location: location!(),
+                })?)
+            .clone();
+
+        let mut iterator = PartitionIterator::new(
+            store.clone(),
+            page_file_name,
+            batch_size,
+            prefetch_config.clone(),
+        )
+        .await?;
+
+        let first_element = iterator.next().await?;
+
+        if let Some((value, row_id)) = first_element {
+            // Put the first element into the heap with cached orderable value
+            let orderable_value = OrderableScalarValue(value.clone());
+            heap.push(HeapElement {
+                value,
+                row_id,
+                partition_id,
+                orderable_value,
+            });
+        }
+
+        partition_map.insert(partition_id, iterator);
+    }
+
+    debug!(
+        "Initialized {} partitions, heap size: {}",
+        partition_map.len(),
+        heap.len()
+    );
+
+    let mut current_batch_rows = Vec::with_capacity(batch_size as usize);
+    let mut total_merged = 0usize;
+
+    // Multi-way merge main loop
+    while let Some(min_element) = heap.pop() {
+        // Add current minimum element to batch
+        current_batch_rows.push((min_element.value, min_element.row_id));
+        total_merged += 1;
+
+        // Read next element from corresponding partition
+        if let Some(iterator) = partition_map.get_mut(&min_element.partition_id) {
+            if let Some((next_value, next_row_id)) = iterator.next().await? {
+                let orderable_value = OrderableScalarValue(next_value.clone());
+                heap.push(HeapElement {
+                    value: next_value,
+                    row_id: next_row_id,
+                    partition_id: min_element.partition_id,
+                    orderable_value,
+                });
+            }
+        }
+
+        if current_batch_rows.len() >= batch_size as usize {
+            write_batch_and_lookup_entry(
+                &mut current_batch_rows,
+                page_file,
+                &arrow_schema,
+                &mut lookup_entries,
+                &mut page_idx,
+            )
+            .await?;
+        }
+    }
+
+    if !current_batch_rows.is_empty() {
+        write_batch_and_lookup_entry(
+            &mut current_batch_rows,
+            page_file,
+            &arrow_schema,
+            &mut lookup_entries,
+            &mut page_idx,
+        )
+        .await?;
+    }
+
+    let elapsed = start_time.elapsed();
+    let rows_per_second = if elapsed.as_secs_f64() > 0.0 {
+        total_merged as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    debug!(
+        "Completed multi-way merge: merged {} rows into {} lookup entries in {:.2}s ({:.0} rows/s)",
+        total_merged,
+        lookup_entries.len(),
+        elapsed.as_secs_f64(),
+        rows_per_second
+    );
+    Ok(lookup_entries)
+}
+
+/// Helper function to prepare batch data with optimized memory usage
+async fn prepare_batch_data(
+    batch_rows: Vec<(ScalarValue, ScalarValue)>,
+    arrow_schema: Arc<Schema>,
+    page_idx: u32,
+) -> Result<(RecordBatch, (ScalarValue, ScalarValue, u32, u32))> {
+    if batch_rows.is_empty() {
+        return Err(Error::Internal {
+            message: "Cannot prepare empty batch".to_string(),
+            location: location!(),
+        });
+    }
+
+    let capacity = batch_rows.len();
+    let mut values = Vec::with_capacity(capacity);
+    let mut row_ids = Vec::with_capacity(capacity);
+
+    for (value, row_id) in batch_rows.into_iter() {
+        values.push(value);
+        row_ids.push(row_id);
+    }
+
+    let (values_array, row_ids_array) = rayon::join(
+        || ScalarValue::iter_to_array(values.into_iter()),
+        || ScalarValue::iter_to_array(row_ids.into_iter()),
+    );
+
+    let values_array = values_array?;
+    let row_ids_array = row_ids_array?;
+
+    let batch = RecordBatch::try_new(arrow_schema, vec![values_array, row_ids_array])?;
+
+    // Calculate min/max/null_count for lookup entry
+    let min_val = ScalarValue::try_from_array(batch.column(0), 0)?;
+    let max_val = ScalarValue::try_from_array(batch.column(0), batch.num_rows() - 1)?;
+    let null_count = batch.column(0).null_count() as u32;
+
+    let lookup_entry = (min_val, max_val, null_count, page_idx);
+
+    Ok((batch, lookup_entry))
+}
+
+/// Helper function to write a batch and create lookup entry
+async fn write_batch_and_lookup_entry(
+    batch_rows: &mut Vec<(ScalarValue, ScalarValue)>,
+    page_file: &mut Box<dyn IndexWriter>,
+    arrow_schema: &Arc<Schema>,
+    lookup_entries: &mut Vec<(ScalarValue, ScalarValue, u32, u32)>,
+    page_idx: &mut u32,
+) -> Result<()> {
+    if batch_rows.is_empty() {
+        return Ok(());
+    }
+
+    let batch_data = std::mem::take(batch_rows);
+    let current_page_idx = *page_idx;
+
+    let (batch, lookup_entry) =
+        prepare_batch_data(batch_data, arrow_schema.clone(), current_page_idx).await?;
+
+    lookup_entries.push(lookup_entry);
+    page_file.write_record_batch(batch).await?;
+    *page_idx += 1;
+
+    Ok(())
+}
+
+/// Extract partition ID from partition file name
+/// Expected format: "part_{partition_id}_{suffix}.lance"
+fn extract_partition_id(filename: &str) -> Result<u64> {
+    if !filename.starts_with("part_") {
+        return Err(Error::Internal {
+            message: format!("Invalid partition file name format: {}", filename),
+            location: location!(),
+        });
+    }
+
+    let parts: Vec<&str> = filename.split('_').collect();
+    if parts.len() < 3 {
+        return Err(Error::Internal {
+            message: format!("Invalid partition file name format: {}", filename),
+            location: location!(),
+        });
+    }
+
+    parts[1].parse::<u64>().map_err(|_| Error::Internal {
+        message: format!("Failed to parse partition ID from filename: {}", filename),
+        location: location!(),
+    })
 }
 
 /// Clean up partition files after successful merge
@@ -1671,15 +1866,12 @@ async fn cleanup_single_file(
     expected_suffix: &str,
     file_type: &str,
 ) {
-    // Ensure we only delete files that match the expected pattern (safety check)
     if file_name.starts_with(expected_prefix) && file_name.ends_with(expected_suffix) {
         match store.delete_index_file(file_name).await {
             Ok(()) => {
                 debug!("Successfully deleted {} file: {}", file_type, file_name);
             }
             Err(e) => {
-                // File deletion failures should not affect the overall success of the function
-                // Log the error but continue processing other files
                 warn!(
                     "Failed to delete {} file '{}': {}. \
                     This does not affect the merge operation, but may leave \
@@ -1696,6 +1888,14 @@ async fn cleanup_single_file(
             file_name, file_type, expected_prefix, expected_suffix
         );
     }
+}
+
+pub(crate) fn part_page_data_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, BTREE_PAGES_NAME)
+}
+
+pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, BTREE_LOOKUP_NAME)
 }
 
 /// Prefetch configuration for partition iterators
@@ -1932,8 +2132,6 @@ impl Eq for HeapElement {}
 
 impl PartialOrd for HeapElement {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Note: BinaryHeap is a maximum heap, we need a minimum heap,
-        // so reverse the comparison result
         Some(self.cmp(other))
     }
 }
@@ -1944,214 +2142,6 @@ impl Ord for HeapElement {
         // so reverse the comparison result
         other.orderable_value.cmp(&self.orderable_value)
     }
-}
-
-async fn merge_page(
-    part_lookup_files: &[String],
-    page_files_map: &HashMap<u64, &String>,
-    store: &Arc<dyn IndexStore>,
-    batch_size: u64,
-    page_file: &mut Box<dyn IndexWriter>,
-    arrow_schema: Arc<Schema>,
-    prefetch_config: PrefetchConfig,
-) -> Result<Vec<(ScalarValue, ScalarValue, u32, u32)>> {
-    let mut lookup_entries = Vec::new();
-    let mut page_idx = 0u32;
-
-    let start_time = std::time::Instant::now();
-    debug!(
-        "Starting multi-way merge with {} partitions using prefetch manager",
-        part_lookup_files.len()
-    );
-
-    // Directly create iterators and read first element
-    let mut partition_map = HashMap::new();
-    let mut heap = BinaryHeap::new();
-
-    debug!("Initializing {} partitions", part_lookup_files.len());
-
-    // Initialize all partitions
-    for lookup_file in part_lookup_files {
-        let partition_id = extract_partition_id(lookup_file)?;
-        let page_file_name =
-            (*page_files_map
-                .get(&partition_id)
-                .ok_or_else(|| Error::Internal {
-                    message: format!("Page file not found for partition ID: {}", partition_id),
-                    location: location!(),
-                })?)
-            .clone();
-
-        let mut iterator = PartitionIterator::new(
-            store.clone(),
-            page_file_name,
-            batch_size,
-            prefetch_config.clone(),
-        )
-        .await?;
-
-        let first_element = iterator.next().await?;
-
-        if let Some((value, row_id)) = first_element {
-            // Put the first element into the heap with cached orderable value
-            let orderable_value = OrderableScalarValue(value.clone());
-            heap.push(HeapElement {
-                value,
-                row_id,
-                partition_id,
-                orderable_value,
-            });
-        }
-
-        partition_map.insert(partition_id, iterator);
-    }
-
-    debug!(
-        "Initialized {} partitions, heap size: {}",
-        partition_map.len(),
-        heap.len()
-    );
-
-    let mut current_batch_rows = Vec::with_capacity(batch_size as usize);
-    let mut total_merged = 0usize;
-
-    // Multi-way merge main loop
-    while let Some(min_element) = heap.pop() {
-        // Add current minimum element to batch
-        current_batch_rows.push((min_element.value, min_element.row_id));
-        total_merged += 1;
-
-        // Read next element from corresponding partition
-        if let Some(iterator) = partition_map.get_mut(&min_element.partition_id) {
-            if let Some((next_value, next_row_id)) = iterator.next().await? {
-                let orderable_value = OrderableScalarValue(next_value.clone());
-                heap.push(HeapElement {
-                    value: next_value,
-                    row_id: next_row_id,
-                    partition_id: min_element.partition_id,
-                    orderable_value,
-                });
-            }
-        }
-
-        // Write when batch reaches specified size
-        if current_batch_rows.len() >= batch_size as usize {
-            write_batch_and_lookup_entry(
-                &mut current_batch_rows,
-                page_file,
-                &arrow_schema,
-                &mut lookup_entries,
-                &mut page_idx,
-            )
-            .await?;
-        }
-    }
-
-    // Write the remaining data
-    if !current_batch_rows.is_empty() {
-        write_batch_and_lookup_entry(
-            &mut current_batch_rows,
-            page_file,
-            &arrow_schema,
-            &mut lookup_entries,
-            &mut page_idx,
-        )
-        .await?;
-    }
-
-    let elapsed = start_time.elapsed();
-    let rows_per_second = if elapsed.as_secs_f64() > 0.0 {
-        total_merged as f64 / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
-
-    debug!(
-        "Completed multi-way merge: merged {} rows into {} lookup entries in {:.2}s ({:.0} rows/s)",
-        total_merged,
-        lookup_entries.len(),
-        elapsed.as_secs_f64(),
-        rows_per_second
-    );
-    Ok(lookup_entries)
-}
-
-/// Helper function to prepare batch data with optimized memory usage
-async fn prepare_batch_data(
-    batch_rows: Vec<(ScalarValue, ScalarValue)>,
-    arrow_schema: Arc<Schema>,
-    page_idx: u32,
-) -> Result<(RecordBatch, (ScalarValue, ScalarValue, u32, u32))> {
-    if batch_rows.is_empty() {
-        return Err(Error::Internal {
-            message: "Cannot prepare empty batch".to_string(),
-            location: location!(),
-        });
-    }
-
-    // Pre-allocate vectors with exact capacity to avoid reallocations
-    let capacity = batch_rows.len();
-    let mut values = Vec::with_capacity(capacity);
-    let mut row_ids = Vec::with_capacity(capacity);
-
-    // Unzip with pre-allocated vectors
-    for (value, row_id) in batch_rows.into_iter() {
-        values.push(value);
-        row_ids.push(row_id);
-    }
-
-    // Convert to arrays in parallel
-    let (values_array, row_ids_array) = rayon::join(
-        || ScalarValue::iter_to_array(values.into_iter()),
-        || ScalarValue::iter_to_array(row_ids.into_iter()),
-    );
-
-    let values_array = values_array?;
-    let row_ids_array = row_ids_array?;
-
-    let batch = RecordBatch::try_new(arrow_schema, vec![values_array, row_ids_array])?;
-
-    // Calculate min/max/null_count for lookup entry
-    let min_val = ScalarValue::try_from_array(batch.column(0), 0)?;
-    let max_val = ScalarValue::try_from_array(batch.column(0), batch.num_rows() - 1)?;
-    let null_count = batch.column(0).null_count() as u32;
-
-    let lookup_entry = (min_val, max_val, null_count, page_idx);
-
-    Ok((batch, lookup_entry))
-}
-
-/// Helper function to write a batch and create lookup entry
-async fn write_batch_and_lookup_entry(
-    batch_rows: &mut Vec<(ScalarValue, ScalarValue)>,
-    page_file: &mut Box<dyn IndexWriter>,
-    arrow_schema: &Arc<Schema>,
-    lookup_entries: &mut Vec<(ScalarValue, ScalarValue, u32, u32)>,
-    page_idx: &mut u32,
-) -> Result<()> {
-    if batch_rows.is_empty() {
-        return Ok(());
-    }
-
-    let batch_data = std::mem::take(batch_rows);
-    let current_page_idx = *page_idx;
-
-    let (batch, lookup_entry) =
-        prepare_batch_data(batch_data, arrow_schema.clone(), current_page_idx).await?;
-
-    lookup_entries.push(lookup_entry);
-    page_file.write_record_batch(batch).await?;
-    *page_idx += 1;
-
-    Ok(())
-}
-
-pub(crate) fn part_page_data_file_path(partition_id: u64) -> String {
-    format!("part_{}_{}", partition_id, BTREE_PAGES_NAME)
-}
-
-pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
-    format!("part_{}_{}", partition_id, BTREE_LOOKUP_NAME)
 }
 
 /// A stream that reads the original training data back out of the index
@@ -2354,7 +2344,6 @@ mod tests {
         OrderableScalarValue, DEFAULT_BTREE_BATCH_SIZE,
     };
 
-    // Additional imports for new tests
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -2540,7 +2529,6 @@ mod tests {
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
     }
 
-    /// Test that fragment-based btree index construction produces exactly the same results as building a complete index
     #[tokio::test]
     async fn test_fragment_btree_index_consistency() {
         // Setup stores for both indexes
@@ -3281,6 +3269,7 @@ mod tests {
         let second_with_null = heap_with_null.pop().unwrap();
         assert_eq!(second_with_null.value, ScalarValue::Int32(Some(1)));
     }
+
     #[tokio::test]
     async fn test_partition_iterator() {
         // Create test environment
