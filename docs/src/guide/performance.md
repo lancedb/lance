@@ -2,6 +2,19 @@
 
 This guide provides tips and tricks for optimizing the performance of your Lance applications.
 
+## Logging
+
+Lance uses the `log` crate to log messages. Displaying these log messages will depend on the client
+library you are using. For rust, you will need to configure a logging subscriber. For more details
+ses the [log](https://docs.rs/log/latest/log/) docs. The Python and Java clients configure a default
+logging subscriber that logs to stderr.
+
+The Python/Java logger can be configured with several environment variables:
+
+- `LANCE_LOG`: Controls log filtering based on log level and target. See the [env_logger](https://docs.rs/env_logger/latest/env_logger/) docs for more details. The `LANCE_LOG` environment variable replaces the `RUST_LOG` environment variable.
+- `LANCE_LOG_STYLE`: Controls whether colors are used in the log messages. Valid values are `auto`, `always`, `never`.
+- `LANCE_LOG_TS_PRECISION`: The precision of the timestamp in the log messages. Valid values are `ns`, `us`, `ms`, `s`.
+
 ## Trace Events
 
 Lance uses tracing to log events. If you are running `pylance` then these events will be emitted to
@@ -12,7 +25,7 @@ as log messages. For Rust connections you can use the `tracing` crate to capture
 File audit events are emitted when significant files are created or deleted.
 
 | Event               | Parameter | Description                                                                |
-|---------------------|-----------|----------------------------------------------------------------------------|
+| ------------------- | --------- | -------------------------------------------------------------------------- |
 | `lance::file_audit` | `mode`    | The mode of I/O operation (create, delete, delete_unverified)              |
 | `lance::file_audit` | `type`    | The type of file affected (manifest, data file, index file, deletion file) |
 
@@ -24,7 +37,7 @@ the in-memory cache. Correct cache utilization is important for performance and 
 events are intended to help you debug cache usage.
 
 | Event              | Parameter | Description                                                                                          |
-|--------------------|-----------|------------------------------------------------------------------------------------------------------|
+| ------------------ | --------- | ---------------------------------------------------------------------------------------------------- |
 | `lance::io_events` | `type`    | The type of I/O operation (open_scalar_index, open_vector_index, load_vector_part, load_scalar_part) |
 
 ### Execution Events
@@ -33,7 +46,7 @@ Execution events are emitted when an execution plan is run. These events are use
 debugging query performance.
 
 | Event              | Parameter           | Description                                                    |
-|--------------------|---------------------|----------------------------------------------------------------|
+| ------------------ | ------------------- | -------------------------------------------------------------- |
 | `lance::execution` | `type`              | The type of execution event (plan_run is the only type today)  |
 | `lance::execution` | `output_rows`       | The number of rows in the output of the plan                   |
 | `lance::execution` | `iops`              | The number of I/O operations performed by the plan             |
@@ -121,4 +134,4 @@ The above limits refer to limits per-scan. There is an additional limit on the n
 across the entire process. This limit is specified by the `LANCE_PROCESS_IO_THREADS_LIMIT` environment variable.
 The default is 128 which is more than enough for most workloads. You can increase this limit if you are working
 with a high-throughput workload. You can even disable this limit entirely by setting it to zero. Note that this
-can often lead to issues with excessive retries and timeouts from the object store. 
+can often lead to issues with excessive retries and timeouts from the object store.
