@@ -61,7 +61,7 @@ struct ZoneMapStatistics {
     // zone_start is the start row of the zone in the fragment, also known
     // as local row offset
     zone_start: u64,
-    zone_size: usize,
+    zone_length: usize,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -89,7 +89,7 @@ impl DeepSizeOf for ZoneMapStatistics {
 /// * Zone size AKA “rows_per_zone” (from user) - 5
 ///
 /// Output:
-/// fragment id | min | max | zone_size
+/// fragment id | min | max | zone_length
 /// 1           | 0   |  4  | 5
 /// 1           | 5   |  9  | 5
 /// 2           | 10  | 14  | 5
@@ -394,16 +394,16 @@ impl ZoneMapIndex {
                     location!(),
                 )
             })?;
-        let zone_size = data
-            .column_by_name("zone_size")
+        let zone_length = data
+            .column_by_name("zone_length")
             .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_size' column", location!())
+                Error::invalid_input("ZoneMapIndex: missing 'zone_length' column", location!())
             })?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "ZoneMapIndex: 'zone_size' column is not Uint64",
+                    "ZoneMapIndex: 'zone_length' column is not Uint64",
                     location!(),
                 )
             })?;
@@ -464,7 +464,7 @@ impl ZoneMapIndex {
                 nan_count,
                 fragment_id: fragment_id_col.value(i),
                 zone_start: zone_start_col.value(i),
-                zone_size: zone_size.value(i) as usize,
+                zone_length: zone_length.value(i) as usize,
             });
         }
 
@@ -543,7 +543,7 @@ impl ScalarIndex for ZoneMapIndex {
                 // Calculate the range of row addresses for this zone
                 // Row addresses are: (fragment_id << 32) + zone_start
                 let zone_start_addr = (zone.fragment_id << 32) + zone.zone_start;
-                let zone_end_addr = zone_start_addr + (zone.zone_size as u64);
+                let zone_end_addr = zone_start_addr + (zone.zone_length as u64);
 
                 // Add all row addresses in this zone to the result
                 row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
@@ -722,7 +722,7 @@ impl ZoneMapIndexBuilder {
             .maps
             .iter()
             .filter(|zone| zone.fragment_id == fragment_id)
-            .map(|zone| zone.zone_size as u64)
+            .map(|zone| zone.zone_length as u64)
             .sum::<u64>();
         let new_map = ZoneMapStatistics {
             min: self.min.evaluate()?,
@@ -731,7 +731,7 @@ impl ZoneMapIndexBuilder {
             nan_count: self.nan_count,
             fragment_id,
             zone_start,
-            zone_size: self.cur_zone_offset,
+            zone_length: self.cur_zone_offset,
         };
 
         self.maps.push(new_map);
@@ -843,8 +843,8 @@ impl ZoneMapIndexBuilder {
         let fragment_ids =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.fragment_id));
 
-        let zone_sizes =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_size as u64));
+        let zone_lengths =
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_length as u64));
 
         let zone_starts =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_start));
@@ -857,7 +857,7 @@ impl ZoneMapIndexBuilder {
             Field::new("nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_size", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
         ]));
 
         let columns: Vec<ArrayRef> = vec![
@@ -867,7 +867,7 @@ impl ZoneMapIndexBuilder {
             Arc::new(nan_counts) as ArrayRef,
             Arc::new(fragment_ids) as ArrayRef,
             Arc::new(zone_starts) as ArrayRef,
-            Arc::new(zone_sizes) as ArrayRef,
+            Arc::new(zone_lengths) as ArrayRef,
         ];
         Ok(RecordBatch::try_new(schema, columns)?)
     }
@@ -1137,7 +1137,7 @@ mod tests {
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.null_count, 1000);
             assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
-            assert_eq!(zone.zone_size, 5000);
+            assert_eq!(zone.zone_length, 5000);
             assert_eq!(zone.fragment_id, i as u64);
         }
 
@@ -1192,7 +1192,7 @@ mod tests {
         // Verify the new zone was added
         let new_zone = &updated_index.zones[10]; // Last zone should be the new one
         assert_eq!(new_zone.fragment_id, 10); // New fragment ID
-        assert_eq!(new_zone.zone_size, 5000);
+        assert_eq!(new_zone.zone_length, 5000);
         assert_eq!(new_zone.null_count, 0); // New data has no nulls
         assert_eq!(new_zone.nan_count, 0); // New data has no NaN values
 
@@ -1285,7 +1285,11 @@ mod tests {
         // So each zone should have 20 NaN values (100/5 = 20)
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.nan_count, 20, "Zone {} should have 20 NaN values", i);
-            assert_eq!(zone.zone_size, 100, "Zone {} should have zone_size 100", i);
+            assert_eq!(
+                zone.zone_length, 100,
+                "Zone {} should have zone_length 100",
+                i
+            );
             assert_eq!(zone.fragment_id, 0, "Zone {} should have fragment_id 0", i);
         }
 
@@ -1503,7 +1507,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 0,
-                    zone_size: 100,
+                    zone_length: 100,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int32(Some(100)),
@@ -1512,7 +1516,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 100,
-                    zone_size: 1,
+                    zone_length: 1,
                 }
             ]
         );
@@ -1681,7 +1685,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 0,
-                    zone_size: 8192,
+                    zone_length: 8192,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(8192)),
@@ -1690,7 +1694,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 8192,
-                    zone_size: 8192,
+                    zone_length: 8192,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(16384)),
@@ -1699,7 +1703,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 16384,
-                    zone_size: 42,
+                    zone_length: 42,
                 }
             ]
         );
@@ -1835,7 +1839,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 0,
-                        zone_size: 5000,
+                        zone_length: 5000,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(5000)),
@@ -1844,7 +1848,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 5000,
-                        zone_size: 3192,
+                        zone_length: 3192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
@@ -1853,7 +1857,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 0,
-                        zone_size: 5000,
+                        zone_length: 5000,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(13192)),
@@ -1862,7 +1866,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 5000,
-                        zone_size: 3192,
+                        zone_length: 3192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
@@ -1871,7 +1875,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 2,
                         zone_start: 0,
-                        zone_size: 42,
+                        zone_length: 42,
                     }
                 ]
             );
@@ -2033,7 +2037,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
@@ -2042,7 +2046,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
@@ -2051,7 +2055,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 2,
                         zone_start: 0,
-                        zone_size: 42,
+                        zone_length: 42,
                     }
                 ]
             );
@@ -2102,7 +2106,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
@@ -2111,7 +2115,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
@@ -2120,7 +2124,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 2,
                         zone_start: 0,
-                        zone_size: 42,
+                        zone_length: 42,
                     }
                 ]
             );
