@@ -379,9 +379,9 @@ message DeletionFile {
   uint64 id = 3;
   // The number of rows that are marked as deleted.
   uint64 num_deleted_rows = 4;
-  // The base path index of the data file. Used when the file is imported or referred from another
+  // The base path index of the deletion file. Used when the file is imported or referred from another
   // dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base
-  // path of the data file.
+  // path of the deletion file.
   optional uint32 base_id = 7;
 } // DeletionFile
 
