@@ -27,9 +27,9 @@ use lance_index::scalar::{
     inverted::METADATA_FILE,
     ngram::{train_ngram_index, NGramIndex},
 };
-use lance_index::geo::{
-    builder::train_geo_index,
-    rtree::RTreeIndex,
+use lance_index::rtree::{
+    simple_builder::train_geo_index,
+    simple_rtree::RTreeIndex,
     GeoIndex, GeoIndexParams,
 };
 use lance_index::ScalarIndexCriteria;
@@ -220,8 +220,8 @@ pub(super) fn inverted_index_details() -> prost_types::Any {
     prost_types::Any::from_msg(&details).unwrap()
 }
 
-fn geo_index_details() -> prost_types::Any {
-    let details = lance_table::format::pb::GeoIndexDetails {};
+fn rtree_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::RTreeIndexDetails {};
     prost_types::Any::from_msg(&details).unwrap()
 }
 
@@ -286,9 +286,9 @@ impl ScalarIndexDetails for lance_table::format::pb::NGramIndexDetails {
     }
 }
 
-impl ScalarIndexDetails for lance_table::format::pb::GeoIndexDetails {
+impl ScalarIndexDetails for lance_table::format::pb::RTreeIndexDetails {
     fn get_type(&self) -> ScalarIndexType {
-        ScalarIndexType::Geo
+        ScalarIndexType::RTree
     }
 }
 
@@ -315,9 +315,9 @@ fn get_scalar_index_details(
         Ok(Some(Box::new(
             details.to_msg::<lance_table::format::pb::NGramIndexDetails>()?,
         )))
-    } else if details.type_url.ends_with("GeoIndexDetails") {
+    } else if details.type_url.ends_with("RTreeIndexDetails") {
         Ok(Some(Box::new(
-            details.to_msg::<lance_table::format::pb::GeoIndexDetails>()?,
+            details.to_msg::<lance_table::format::pb::RTreeIndexDetails>()?,
         )))
     } else {
         Ok(None)
@@ -376,7 +376,7 @@ pub(super) async fn build_scalar_index(
     // In theory it should be possible to create a btree/bitmap index on a nested field but
     // performance would be poor and I'm not sure we want to allow that unless there is a need.
     // Exception: LabelList and Geo indexes are allowed on nested fields.
-    if !matches!(params.force_index_type, Some(ScalarIndexType::LabelList | ScalarIndexType::Geo))
+    if !matches!(params.force_index_type, Some(ScalarIndexType::LabelList | ScalarIndexType::RTree))
         && field.data_type().is_nested()
     {
         return Err(Error::InvalidInput {
@@ -413,7 +413,7 @@ pub(super) async fn build_scalar_index(
             train_ngram_index(training_request, &index_store).await?;
             Ok(ngram_index_details())
         }
-        Some(ScalarIndexType::Geo) => {
+        Some(ScalarIndexType::RTree) => {
             // Validate that this is a suitable column for geo indexing
             if !is_suitable_for_geo_index(&field) {
                 return Err(Error::InvalidInput {
@@ -425,9 +425,10 @@ pub(super) async fn build_scalar_index(
                 });
             }
             let geo_params = GeoIndexParams::default();
-            let batches_source = training_request.scan_unordered_chunks(4096).await?;
-            train_geo_index(batches_source, Arc::new(index_store), &geo_params).await?;
-            Ok(geo_index_details())
+            // Convert TrainingSource to SendableRecordBatchStream for simple_builder
+            let data_stream = training_request.scan_unordered_chunks(4096).await?;
+            train_geo_index(data_stream, Arc::new(index_store), &geo_params).await?;
+            Ok(rtree_index_details())
         }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
@@ -499,9 +500,9 @@ pub async fn open_scalar_index(
             let btree_index = BTreeIndex::load(index_store, frag_reuse_index, index_cache).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
-        ScalarIndexType::Geo => {
-            // Load paged leaf R-tree (now the default geo index implementation)
-            println!("🌲 Loading paged leaf R-tree geo index");
+        ScalarIndexType::RTree => {
+            // Load simple R-tree (now the default geo index implementation)
+            println!("🌍 Loading simple R-tree geo index");
             let geo_index = <RTreeIndex as GeoIndex>::load(index_store).await?;
             Ok(geo_index)
         }
@@ -540,7 +541,7 @@ async fn infer_scalar_index_type(
         ScalarIndexType::Inverted
     } else if matches!(col.data_type(), DataType::Struct(_)) && is_suitable_for_geo_index(&col) {
         println!("🌍 INFERRED: Detected geo index for column {}", column);
-        ScalarIndexType::Geo
+        ScalarIndexType::RTree
     } else {
         println!("🌍 INFERRED: Falling back to BTree for column {}", column);
         ScalarIndexType::BTree

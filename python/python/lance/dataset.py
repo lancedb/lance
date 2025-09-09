@@ -2017,11 +2017,11 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED", "GEO"]:
+        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED", "RTREE"]:
             raise NotImplementedError(
                 (
                     'Only "BTREE", "LABEL_LIST", "INVERTED", "NGRAM", '
-                    '"BITMAP", or "GEO" are supported for '
+                    '"BITMAP", or "RTREE" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
             )

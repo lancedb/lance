@@ -1476,7 +1476,7 @@ impl Dataset {
             "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "GEO" => IndexType::Scalar,
+            "RTREE" => IndexType::Scalar,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
                 IndexType::Vector
             }
@@ -1546,8 +1546,8 @@ impl Dataset {
                 }
                 Box::new(params)
             }
-            "GEO" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::Geo),
+            "RTREE" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::RTree),
             }),
             _ => {
                 let column_type = match self.ds.schema().field(columns[0]) {

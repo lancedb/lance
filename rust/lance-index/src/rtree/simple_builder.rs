@@ -6,53 +6,10 @@ use arrow_array::Array;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 
-use crate::geo::{BoundingBox, GeoIndexParams};
-use crate::geo::paged_leaf_rtree::{PagedLeafRTreeIndex, PagedLeafConfig, SpatialDataEntry};
+use crate::rtree::{BoundingBox, GeoIndexParams};
+use crate::rtree::simple_rtree::RTreeEntry;
 use crate::scalar::IndexStore;
 use lance_core::{Error, Result};
-
-/// Train a paged leaf geo index from a stream of record batches
-pub async fn train_paged_leaf_geo_index(
-    mut data_source: SendableRecordBatchStream,
-    store: Arc<dyn IndexStore>,
-    config: PagedLeafConfig,
-) -> Result<PagedLeafRTreeIndex> {
-    println!("🌲 Starting PAGED LEAF GEO INDEX TRAINING");
-    
-    let mut spatial_entries: Vec<SpatialDataEntry> = Vec::new();
-    let mut row_id = 0u64;
-    
-    while let Some(batch) = data_source.try_next().await? {
-        println!("🌲 Processing batch with {} rows", batch.num_rows());
-        
-        // Get the geometry column (should be the first column)
-        if batch.num_columns() == 0 {
-            continue;
-        }
-        
-        let geometry_column = batch.column(0);
-        let schema = batch.schema();
-        let geometry_field = schema.field(0);
-        
-        // Extract bounding boxes from the geometry column
-        let bboxes = extract_bounding_boxes(geometry_field, geometry_column.as_ref())?;
-        println!("🌲 Extracted {} bounding boxes", bboxes.len());
-        
-        // Create spatial data entries
-        for bbox in bboxes {
-            spatial_entries.push(SpatialDataEntry::new(bbox, row_id));
-            row_id += 1;
-        }
-    }
-    
-    println!("🌲 Building paged leaf R-tree with {} entries", spatial_entries.len());
-    
-    // Build using the new paged leaf R-tree
-    let index = PagedLeafRTreeIndex::build_from_entries(spatial_entries, store, config).await?;
-    
-    println!("🌲 PAGED LEAF GEO INDEX TRAINING COMPLETE - Built and stored successfully");
-    Ok(index)
-}
 
 /// Train a geo index from a stream of record batches
 pub async fn train_geo_index(
@@ -60,13 +17,13 @@ pub async fn train_geo_index(
     store: Arc<dyn IndexStore>,
     _params: &GeoIndexParams,
 ) -> Result<()> {
-    println!("🌲 Starting GEO INDEX TRAINING (Paged Leaf R-tree)");
+    println!("🌍 Starting GEO INDEX TRAINING");
     
-    let mut spatial_entries: Vec<SpatialDataEntry> = Vec::new();
+    let mut entries: Vec<RTreeEntry> = Vec::new();
     let mut row_id = 0u64;
     
     while let Some(batch) = data_source.try_next().await? {
-        println!("🌲 Processing batch with {} rows", batch.num_rows());
+        println!("🌍 Processing batch with {} rows", batch.num_rows());
         
         // Get the geometry column (should be the first column)
         if batch.num_columns() == 0 {
@@ -79,25 +36,84 @@ pub async fn train_geo_index(
         
         // Extract bounding boxes from the geometry column
         let bboxes = extract_bounding_boxes(geometry_field, geometry_column.as_ref())?;
-        println!("🌲 Extracted {} bounding boxes", bboxes.len());
+        println!("🌍 Extracted {} bounding boxes", bboxes.len());
         
-        // Create spatial data entries
+        // Create R-tree entries
         for bbox in bboxes {
-            spatial_entries.push(SpatialDataEntry::new(bbox, row_id));
+            entries.push(RTreeEntry { bbox, row_id });
             row_id += 1;
         }
     }
     
-    println!("🌲 Building paged leaf R-tree with {} entries", spatial_entries.len());
+    println!("🌍 Building R-tree with {} entries", entries.len());
     
-    // Build using the paged leaf R-tree
-    let config = PagedLeafConfig::default();
-    let _index = PagedLeafRTreeIndex::build_from_entries(spatial_entries, store, config).await?;
+    // Save R-tree data using Lance's IndexStore infrastructure
+    save_rtree_to_index_store(&entries, store.as_ref()).await?;
     
-    println!("🌲 GEO INDEX TRAINING COMPLETE - Paged leaf R-tree built and stored successfully");
+    println!("🌍 GEO INDEX TRAINING COMPLETE - Index saved successfully");
     Ok(())
 }
 
+/// Save R-tree entries using binary serialization
+async fn save_rtree_to_index_store(entries: &[RTreeEntry], index_store: &dyn IndexStore) -> Result<()> {
+    use arrow_array::{BinaryArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    
+    println!("🌍 Saving R-tree entries using binary serialization");
+    
+    // Serialize entries using serde_json (could also use bincode for better performance)
+    let serialized = serde_json::to_vec(entries).map_err(|e| Error::Arrow {
+        message: format!("Failed to serialize R-tree entries: {}", e),
+        location: snafu::location!(),
+    })?;
+
+    // Create a binary schema for the serialized data
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rtree_data", DataType::Binary, false),
+    ]));
+
+    // Create record batch with the serialized data
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BinaryArray::from_iter_values([serialized]))],
+    ).map_err(|e| Error::Arrow {
+        message: format!("Failed to create record batch: {}", e),
+        location: snafu::location!(),
+    })?;
+
+    // Save using IndexStore with standard Lance file names
+    let mut geo_data_file = index_store
+        .new_index_file("page_data.lance", schema.clone())
+        .await?;
+    geo_data_file.write_record_batch(batch).await?;
+    geo_data_file.finish().await?;
+
+    println!("🌍 R-tree data saved to IndexStore successfully using binary serialization");
+    
+    
+    // Create a lookup file (required by Lance index system)
+    let lookup_schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("num_entries", arrow_schema::DataType::UInt64, false),
+    ]));
+    
+    let lookup_batch = arrow_array::RecordBatch::try_new(
+        lookup_schema.clone(),
+        vec![Arc::new(arrow_array::UInt64Array::from(vec![entries.len() as u64]))],
+    ).map_err(|e| Error::Arrow { 
+        message: format!("Failed to create lookup batch: {}", e),
+        location: snafu::location!(),
+    })?;
+    
+    let mut geo_lookup_file = index_store
+        .new_index_file("page_lookup.lance", lookup_schema)
+        .await?;
+    geo_lookup_file.write_record_batch(lookup_batch).await?;
+    geo_lookup_file.finish().await?;
+    
+    println!("🌍 R-tree data saved to IndexStore successfully using binary serialization");
+    Ok(())
+}
 
 /// Extract bounding boxes from geometry columns
 /// 
@@ -152,119 +168,6 @@ fn extract_bboxes_from_point_struct(array: &dyn Array) -> Result<Vec<BoundingBox
 
     extract_point_bboxes(x_column.as_ref(), y_column.as_ref())
 }
-
-fn extract_bboxes_from_geoarrow_point(array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    use arrow_array::StructArray;
-    
-    let struct_array = array.as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| Error::Index {
-            message: "Expected StructArray for geoarrow.point".to_string(),
-            location: snafu::location!(),
-        })?;
-    
-    // GeoArrow point should have x, y fields
-    let x_column = struct_array.column_by_name("x")
-        .ok_or_else(|| Error::Index {
-            message: "geoarrow.point must have 'x' field".to_string(),
-            location: snafu::location!(),
-        })?;
-        
-    let y_column = struct_array.column_by_name("y")
-        .ok_or_else(|| Error::Index {
-            message: "geoarrow.point must have 'y' field".to_string(),
-            location: snafu::location!(),
-        })?;
-
-    extract_point_bboxes(x_column.as_ref(), y_column.as_ref())
-}
-
-fn extract_bboxes_from_geoarrow_wkb(array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    // TODO: Parse actual WKB data here
-    // For now, return dummy bounding boxes
-    let mut bboxes = Vec::with_capacity(array.len());
-    
-    for i in 0..array.len() {
-        if array.is_null(i) {
-            continue;
-        }
-        
-        // TODO: Parse WKB and extract actual geometry bounds
-        let bbox = BoundingBox::new(
-            -1.0 + (i as f64 * 0.1), 
-            -1.0 + (i as f64 * 0.1),
-            1.0 + (i as f64 * 0.1),
-            1.0 + (i as f64 * 0.1),
-        );
-        bboxes.push(bbox);
-    }
-    
-    Ok(bboxes)
-}
-
-fn extract_bboxes_from_geoarrow_wkt(array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    // TODO: Parse WKT data and extract geometry bounds
-    let mut bboxes = Vec::with_capacity(array.len());
-    
-    for i in 0..array.len() {
-        if array.is_null(i) {
-            continue;
-        }
-        
-        // TODO: Parse WKT strings and extract actual geometry bounds
-        let bbox = BoundingBox::new(
-            -1.0 + (i as f64 * 0.1), 
-            -1.0 + (i as f64 * 0.1),
-            1.0 + (i as f64 * 0.1),
-            1.0 + (i as f64 * 0.1),
-        );
-        bboxes.push(bbox);
-    }
-    
-    Ok(bboxes)
-}
-
-fn extract_bboxes_from_geoarrow_linestring(_array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    // TODO: Implement LineString bbox extraction
-    Err(Error::Index {
-        message: "geoarrow.linestring not yet implemented".to_string(),
-        location: snafu::location!(),
-    })
-}
-
-fn extract_bboxes_from_geoarrow_polygon(_array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    // TODO: Implement Polygon bbox extraction
-    Err(Error::Index {
-        message: "geoarrow.polygon not yet implemented".to_string(),
-        location: snafu::location!(),
-    })
-}
-
-fn extract_bboxes_from_geoarrow_multipoint(_array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    // TODO: Implement MultiPoint bbox extraction
-    Err(Error::Index {
-        message: "geoarrow.multipoint not yet implemented".to_string(),
-        location: snafu::location!(),
-    })
-}
-
-fn extract_bboxes_from_geoarrow_multilinestring(_array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    // TODO: Implement MultiLineString bbox extraction
-    Err(Error::Index {
-        message: "geoarrow.multilinestring not yet implemented".to_string(),
-        location: snafu::location!(),
-    })
-}
-
-fn extract_bboxes_from_geoarrow_multipolygon(_array: &dyn Array) -> Result<Vec<BoundingBox>> {
-    // TODO: Implement MultiPolygon bbox extraction
-    Err(Error::Index {
-        message: "geoarrow.multipolygon not yet implemented".to_string(),
-        location: snafu::location!(),
-    })
-}
-
-
 
 fn extract_point_bboxes(x_array: &dyn Array, y_array: &dyn Array) -> Result<Vec<BoundingBox>> {
     use arrow_array::{Float64Array, Float32Array};

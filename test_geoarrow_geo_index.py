@@ -66,7 +66,7 @@ def main():
     # Step 3: Create geo index
     print("\n🔵 Step 3: Creating geo index on GeoArrow Point column")
     try:
-        geo_ds.create_scalar_index(column="start_location", index_type="GEO")
+        geo_ds.create_scalar_index(column="start_location", index_type="RTREE")
         print("✅ Successfully created geo index")
         
         # Check what indexes exist

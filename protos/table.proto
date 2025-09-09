@@ -374,7 +374,7 @@ message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message InvertedIndexDetails {}
 message NGramIndexDetails {}
-message GeoIndexDetails {}
+message RTreeIndexDetails {}
 message VectorIndexDetails {}
 
 message FragmentReuseIndexDetails {

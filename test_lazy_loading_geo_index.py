@@ -108,7 +108,7 @@ def main():
     print("=" * 60)
     
     # Clean slate
-    dataset_path = "test_lazy_loading_geo"
+    dataset_path = "../../test_lazy_loading_geo"
     if os.path.exists(dataset_path):
         shutil.rmtree(dataset_path)
         print(f"✅ Cleaned up existing dataset: {dataset_path}")
@@ -141,7 +141,7 @@ def main():
     # Step 3: Create geo index (should create multiple leaf pages)
     print("\n🔵 Step 3: Creating geo index (expecting multiple leaf pages)")
     try:
-        geo_ds.create_scalar_index(column="start_location", index_type="GEO")
+        geo_ds.create_scalar_index(column="start_location", index_type="RTREE")
         print("✅ Successfully created geo index")
         
         # Check what indexes exist

@@ -13,13 +13,15 @@ use serde::{Deserialize, Serialize};
 use crate::metrics::MetricsCollector;
 use crate::scalar::{AnyQuery, IndexStore, SearchResult};
 use crate::{Index, IndexParams, IndexType};
-use lance_core::{Result};
+use lance_core::Result;
 
 pub mod builder;
 pub mod rtree;
 pub mod paged_leaf_rtree;
+pub mod simple_rtree;
+pub mod simple_builder;
 
-pub const LANCE_GEO_INDEX: &str = "__lance_geo_index";
+pub const LANCE_RTREE_INDEX: &str = "__lance_rtree_index";
 
 /// Spatial query types that can be performed against a GeoIndex
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +154,49 @@ impl Point {
     }
 }
 
+/// Spatial geometry types supported by the index
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DeepSizeOf)]
+pub enum SpatialGeometry {
+    /// A single point geometry
+    Point(Point),
+}
+
+impl SpatialGeometry {
+    /// Compute the minimum bounding box that encloses this geometry
+    pub fn envelope(&self) -> BoundingBox {
+        match self {
+            Self::Point(p) => BoundingBox::new(p.x, p.y, p.x, p.y),
+        }
+    }
+
+    /// Check if this geometry matches a spatial query (geometry-specific optimization)
+    pub fn matches_query(&self, query: &SpatialQuery) -> bool {
+        match (self, query) {
+            (Self::Point(p), SpatialQuery::Intersects(bbox)) => bbox.contains_point(p),
+            (Self::Point(p), SpatialQuery::Within(bbox)) => bbox.contains_point(p),
+            (Self::Point(p), SpatialQuery::Contains(point)) => p == point,
+            (Self::Point(p), SpatialQuery::DWithin(point, distance)) => {
+                let dx = p.x - point.x;
+                let dy = p.y - point.y;
+                (dx * dx + dy * dy).sqrt() <= *distance
+            },
+            (Self::Point(p), SpatialQuery::Touches(bbox)) => {
+                // For points, touching means on the boundary
+                (p.x == bbox.min_x || p.x == bbox.max_x) && (p.y >= bbox.min_y && p.y <= bbox.max_y) ||
+                (p.y == bbox.min_y || p.y == bbox.max_y) && (p.x >= bbox.min_x && p.x <= bbox.max_x)
+            },
+            (Self::Point(p), SpatialQuery::Disjoint(bbox)) => !bbox.contains_point(p),
+        }
+    }
+
+    /// Format geometry for display/debugging
+    pub fn format(&self) -> String {
+        match self {
+            Self::Point(p) => p.format(),
+        }
+    }
+}
+
 /// Parameters for creating a spatial index
 #[derive(Default, Debug, Clone)]
 pub struct GeoIndexParams {
@@ -176,11 +221,11 @@ impl IndexParams for GeoIndexParams {
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Geo
+        IndexType::RTree
     }
 
     fn index_name(&self) -> &str {
-        LANCE_GEO_INDEX
+        LANCE_RTREE_INDEX
     }
 }
 

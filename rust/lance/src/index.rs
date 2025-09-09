@@ -1360,7 +1360,7 @@ impl DatasetIndexInternalExt for Dataset {
                 DataType::Struct(_) => {
                     // Check if this is a geo index
                     let index_type = detect_scalar_index_type(self, index, &field.name).await?;
-                    if matches!(index_type, ScalarIndexType::Geo) {
+                    if matches!(index_type, ScalarIndexType::RTree) {
                         Box::new(GeoQueryParser::new(index.name.clone()))
                             as Box<dyn ScalarQueryParser>
                     } else {
