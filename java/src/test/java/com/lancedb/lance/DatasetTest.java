@@ -14,6 +14,7 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.operation.Append;
 import com.lancedb.lance.operation.Overwrite;
 import com.lancedb.lance.schema.ColumnAlteration;
@@ -26,6 +27,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -43,6 +45,7 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -960,6 +963,60 @@ public class DatasetTest {
           assertEquals(1, readTransaction.readVersion());
           assertNotNull(readTransaction.uuid());
           assertInstanceOf(Append.class, readTransaction.operation());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testEnableStableRowIds(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("enable_stable_row_ids").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build())) {
+        // Step1: write two fragments
+        FragmentMetadata frag1 = testDataset.createNewFragment(10);
+        FragmentMetadata frag2 = testDataset.createNewFragment(10);
+
+        Transaction.Builder builder = new Transaction.Builder(dataset);
+        Append append = Append.builder().fragments(Arrays.asList(frag1, frag2)).build();
+        Transaction transaction = builder.operation(append).readVersion(dataset.version()).build();
+
+        // Step2: if move-stable-rowid is enabled, the rowids of new fragments should be
+        // consecutive.
+        try (Dataset newDataset = transaction.commit()) {
+          assertEquals(2, newDataset.version());
+
+          LanceScanner scanner =
+              newDataset.newScan(
+                  new ScanOptions.Builder()
+                      .withRowId(true)
+                      // load data in one batch
+                      .batchSize(20)
+                      .fragmentIds(Arrays.asList(0, 1))
+                      .build());
+
+          try (ArrowReader reader = scanner.scanBatches()) {
+            List<Long> rowIds = new ArrayList<>();
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              UInt8Vector rowidVec = (UInt8Vector) (root.getVector("_rowid"));
+              for (int i = 0; i < rowidVec.getValueCount(); i++) {
+                rowIds.add(rowidVec.get(i));
+              }
+            }
+
+            assertEquals(20, rowIds.size());
+
+            // rowids should be consecutive even across fragments
+            Collections.sort(rowIds);
+            for (int i = 0; i < rowIds.size() - 1; i++) {
+              assertEquals(rowIds.get(i) + 1, (long) rowIds.get(i + 1));
+            }
+          }
         }
       }
     }

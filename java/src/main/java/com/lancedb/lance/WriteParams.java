@@ -33,6 +33,7 @@ public class WriteParams {
   private final Optional<Integer> maxRowsPerGroup;
   private final Optional<Long> maxBytesPerFile;
   private final Optional<WriteMode> mode;
+  private final Optional<Boolean> enableStableRowIds;
   private Map<String, String> storageOptions = new HashMap<>();
 
   private WriteParams(
@@ -40,11 +41,13 @@ public class WriteParams {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<WriteMode> mode,
+      Optional<Boolean> enableStableRowIds,
       Map<String, String> storageOptions) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
     this.mode = mode;
+    this.enableStableRowIds = enableStableRowIds;
     this.storageOptions = storageOptions;
   }
 
@@ -69,6 +72,10 @@ public class WriteParams {
     return mode.map(Enum::name);
   }
 
+  public Optional<Boolean> getEnableStableRowIds() {
+    return enableStableRowIds;
+  }
+
   public Map<String, String> getStorageOptions() {
     return storageOptions;
   }
@@ -89,6 +96,7 @@ public class WriteParams {
     private Optional<Integer> maxRowsPerGroup = Optional.empty();
     private Optional<Long> maxBytesPerFile = Optional.empty();
     private Optional<WriteMode> mode = Optional.empty();
+    private Optional<Boolean> enableStableRowIds = Optional.empty();
     private Map<String, String> storageOptions = new HashMap<>();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
@@ -116,9 +124,19 @@ public class WriteParams {
       return this;
     }
 
+    public Builder withEnableStableRowIds(boolean enableStableRowIds) {
+      this.enableStableRowIds = Optional.of(enableStableRowIds);
+      return this;
+    }
+
     public WriteParams build() {
       return new WriteParams(
-          maxRowsPerFile, maxRowsPerGroup, maxBytesPerFile, mode, storageOptions);
+          maxRowsPerFile,
+          maxRowsPerGroup,
+          maxBytesPerFile,
+          mode,
+          enableStableRowIds,
+          storageOptions);
     }
   }
 }
