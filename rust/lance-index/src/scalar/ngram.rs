@@ -1708,7 +1708,7 @@ mod tests {
 
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            data.map_err(|arrow_err| DataFusionError::ArrowError(arrow_err, None)),
+            data.map_err(|arrow_err| DataFusionError::ArrowError(Box::new(arrow_err), None)),
         ));
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {

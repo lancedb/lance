@@ -21,11 +21,29 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 
 use assign_action::merge_insert_action;
 
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
+use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::utils::CapturedRowIds;
+use crate::{
+    datafusion::dataframe::SessionContextExt,
+    dataset::{
+        fragment::{FileFragment, FragReadConfig},
+        transaction::{Operation, Transaction},
+        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+    },
+    index::DatasetIndexInternalExt,
+    io::exec::{
+        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
+    },
+    Dataset,
+};
 use arrow_array::{
     cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchIterator, StructArray,
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::common::NullEquality;
 use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
@@ -45,49 +63,23 @@ use datafusion::{
     prelude::DataFrame,
     scalar::ScalarValue,
 };
-use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{
-    chunker::chunk_stream,
-    dataframe::DataFrameExt,
-    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
-    utils::reader_to_stream,
-};
-use std::{
-    collections::{BTreeMap, HashSet},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
-};
-
-use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
-use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::utils::CapturedRowIds;
-use crate::{
-    datafusion::dataframe::SessionContextExt,
-    dataset::{
-        fragment::{FileFragment, FragReadConfig},
-        transaction::{Operation, Transaction},
-        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
-    },
-    index::DatasetIndexInternalExt,
-    io::exec::{
-        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
-    },
-    Dataset,
-};
 use datafusion_physical_expr::expressions::Column;
 use futures::{
     stream::{self},
     Stream, StreamExt, TryStreamExt,
 };
+use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
     utils::{futures::Capacity, mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
+};
+use lance_datafusion::{
+    chunker::chunk_stream,
+    dataframe::DataFrameExt,
+    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
+    utils::reader_to_stream,
 };
 use lance_datafusion::{
     exec::{execute_plan, OneShotExec},
@@ -101,6 +93,14 @@ use lance_table::format::{Fragment, Index, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 use tokio::task::JoinSet;
 
 mod assign_action;
@@ -631,7 +631,7 @@ impl MergeInsertJob {
                 &JoinType::Full,
                 None,
                 PartitionMode::CollectLeft,
-                true,
+                NullEquality::NullEqualsNull,
             )
             .unwrap(),
         );
@@ -3814,8 +3814,9 @@ mod tests {
       ProjectionExec: expr=[key@3 IS NOT NULL as __common_expr_1, _rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key]
         CoalesceBatchesExec...
           HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-            row_id=true, row_addr=true, full_filter=--, refine_filter=--
+            CooperativeExec
+              LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+              row_id=true, row_addr=true, full_filter=--, refine_filter=--
             RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
               StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
@@ -3861,7 +3862,8 @@ mod tests {
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+          CooperativeExec
+            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
@@ -3907,7 +3909,8 @@ mod tests {
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+          CooperativeExec
+            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
