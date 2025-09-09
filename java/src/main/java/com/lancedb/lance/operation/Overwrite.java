@@ -15,6 +15,7 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
@@ -57,14 +58,11 @@ public class Overwrite extends SchemaOperation {
 
   @Override
   public String toString() {
-    return "Overwrite{"
-        + "fragments="
-        + fragments
-        + ", schema="
-        + schema()
-        + ", configUpsertValues="
-        + configUpsertValues
-        + '}';
+    return MoreObjects.toStringHelper(this)
+        .add("fragments", fragments)
+        .add("schema", schema())
+        .add("configUpsertValues", configUpsertValues)
+        .toString();
   }
 
   @Override

@@ -45,9 +45,6 @@ public class Utils {
    * @return Optional list
    */
   public static Optional<List<String>> convert(Optional<String[]> optionalArray) {
-    if (optionalArray.isPresent()) {
-      return Optional.of(Arrays.asList(optionalArray.get()));
-    }
-    return Optional.empty();
+    return optionalArray.map(Arrays::asList);
   }
 }

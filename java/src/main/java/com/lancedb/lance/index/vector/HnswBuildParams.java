@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.index.vector;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.util.Optional;
 
@@ -105,11 +105,11 @@ public class HnswBuildParams {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("maxLevel", maxLevel)
-        .append("m", m)
-        .append("efConstruction", efConstruction)
-        .append("prefetchDistance", prefetchDistance.orElse(null))
+    return MoreObjects.toStringHelper(this)
+        .add("maxLevel", maxLevel)
+        .add("m", m)
+        .add("efConstruction", efConstruction)
+        .add("prefetchDistance", prefetchDistance.orElse(null))
         .toString();
   }
 }

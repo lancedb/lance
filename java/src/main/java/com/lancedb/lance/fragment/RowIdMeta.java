@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.fragment;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
 import java.util.Objects;
@@ -45,6 +45,6 @@ public class RowIdMeta implements Serializable {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this).append("metadata", metadata).toString();
+    return MoreObjects.toStringHelper(this).add("metadata", metadata).toString();
   }
 }

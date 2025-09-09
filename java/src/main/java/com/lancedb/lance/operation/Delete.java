@@ -15,6 +15,8 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
+import com.google.common.base.MoreObjects;
+
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -54,9 +56,11 @@ public class Delete implements Operation {
   }
 
   public String toString() {
-    return String.format(
-        "Delete{updatedFragments=%s, deletedFragmentIds=%s, predicate=%s}",
-        updatedFragments, deletedFragmentIds, predicate);
+    return MoreObjects.toStringHelper(this)
+        .add("updatedFragments", updatedFragments)
+        .add("deletedFragmentIds", deletedFragmentIds)
+        .add("predicate", predicate)
+        .toString();
   }
 
   @Override

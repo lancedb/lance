@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.operation;
 
+import com.google.common.base.MoreObjects;
+
 import java.util.List;
 import java.util.Map;
 
@@ -61,16 +63,12 @@ public class UpdateConfig implements Operation {
 
   @Override
   public String toString() {
-    return "UpdateConfig{"
-        + "upsertValues="
-        + upsertValues
-        + ", deleteKeys="
-        + deleteKeys
-        + ", schemaMetadata="
-        + schemaMetadata
-        + ", fieldMetadata="
-        + fieldMetadata
-        + '}';
+    return MoreObjects.toStringHelper(this)
+        .add("upsertValues", upsertValues)
+        .add("deleteKeys", deleteKeys)
+        .add("schemaMetadata", schemaMetadata)
+        .add("fieldMetadata", fieldMetadata)
+        .toString();
   }
 
   public static Builder builder() {

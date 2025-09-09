@@ -13,8 +13,8 @@
  */
 package com.lancedb.lance.ipc;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
-import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -187,21 +187,21 @@ public class ScanOptions {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("fragmentIds", fragmentIds.orElse(null))
-        .append("batchSize", batchSize.orElse(null))
-        .append("columns", columns.orElse(null))
-        .append("filter", filter.orElse(null))
-        .append(
+    return MoreObjects.toStringHelper(this)
+        .add("fragmentIds", fragmentIds.orElse(null))
+        .add("batchSize", batchSize.orElse(null))
+        .add("columns", columns.orElse(null))
+        .add("filter", filter.orElse(null))
+        .add(
             "substraitFilter",
             substraitFilter.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
-        .append("limit", limit.orElse(null))
-        .append("offset", offset.orElse(null))
-        .append("nearest", nearest.orElse(null))
-        .append("withRowId", withRowId)
-        .append("WithRowAddress", withRowAddress)
-        .append("batchReadahead", batchReadahead)
-        .append("columnOrdering", columnOrderings)
+        .add("limit", limit.orElse(null))
+        .add("offset", offset.orElse(null))
+        .add("nearest", nearest.orElse(null))
+        .add("withRowId", withRowId)
+        .add("WithRowAddress", withRowAddress)
+        .add("batchReadahead", batchReadahead)
+        .add("columnOrdering", columnOrderings)
         .toString();
   }
 

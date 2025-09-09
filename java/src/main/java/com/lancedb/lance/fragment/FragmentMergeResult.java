@@ -16,6 +16,7 @@ package com.lancedb.lance.fragment;
 import com.lancedb.lance.FragmentMetadata;
 import com.lancedb.lance.schema.LanceSchema;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.c.ArrowArrayStream;
 
 /**
@@ -37,5 +38,13 @@ public class FragmentMergeResult {
 
   public FragmentMetadata getFragmentMetadata() {
     return fragmentMetadata;
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("fragmentMetadata", fragmentMetadata)
+        .add("schema", schema)
+        .toString();
   }
 }

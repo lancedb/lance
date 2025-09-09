@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.operation.Operation;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
 import java.util.HashMap;
@@ -95,9 +96,14 @@ public class Transaction {
 
   @Override
   public String toString() {
-    return String.format(
-        "Transaction{readVersion=%d, uuid='%s', operation=%s, blobOp=%s}",
-        readVersion, uuid, operation, blobOp);
+    return MoreObjects.toStringHelper(this)
+        .add("readVersion", readVersion)
+        .add("uuid", uuid)
+        .add("operation", operation)
+        .add("writeParams", writeParams)
+        .add("blobOp", blobOp)
+        .add("transactionProperties", transactionProperties)
+        .toString();
   }
 
   @Override

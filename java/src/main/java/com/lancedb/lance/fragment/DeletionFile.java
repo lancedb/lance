@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.fragment;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
 import java.util.Objects;
@@ -70,12 +70,12 @@ public class DeletionFile implements Serializable {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("id", id)
-        .append("readVersion", readVersion)
-        .append("numDeletedRows", numDeletedRows)
-        .append("fileType", fileType)
-        .append("baseId", baseId)
+    return MoreObjects.toStringHelper(this)
+        .add("id", id)
+        .add("readVersion", readVersion)
+        .add("numDeletedRows", numDeletedRows)
+        .add("fileType", fileType)
+        .add("baseId", baseId)
         .toString();
   }
 }

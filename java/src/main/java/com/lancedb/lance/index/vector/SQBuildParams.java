@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.index.vector;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 /** Parameters for using SQ quantizer. */
 public class SQBuildParams {
@@ -65,9 +65,9 @@ public class SQBuildParams {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("numBits", numBits)
-        .append("sampleRate", sampleRate)
+    return MoreObjects.toStringHelper(this)
+        .add("numBits", numBits)
+        .add("sampleRate", sampleRate)
         .toString();
   }
 }

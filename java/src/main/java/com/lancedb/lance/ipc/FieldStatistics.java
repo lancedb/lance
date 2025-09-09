@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.ipc;
 
+import com.google.common.base.MoreObjects;
+
 import java.io.Serializable;
 
 public class FieldStatistics implements Serializable {
@@ -35,6 +37,6 @@ public class FieldStatistics implements Serializable {
 
   @Override
   public String toString() {
-    return "FieldStatistics{" + "id=" + id + ", dataSize=" + dataSize + '}';
+    return MoreObjects.toStringHelper(this).add("id", id).add("dataSize", dataSize).toString();
   }
 }
