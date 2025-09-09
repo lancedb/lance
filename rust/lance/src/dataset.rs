@@ -1374,6 +1374,25 @@ impl Dataset {
         &self.manifest.local_schema
     }
 
+    /// Get the full field path for a field ID, handling nested fields
+    ///
+    /// Returns the dot-separated path from root to the field (e.g., "struct_field.nested_field")
+    pub fn field_path(&self, field_id: i32) -> Result<String> {
+        self.schema()
+            .field_ancestry_by_id(field_id)
+            .ok_or_else(|| Error::Index {
+                message: format!("Could not find field ancestry for id {}", field_id),
+                location: location!(),
+            })
+            .map(|ancestry| {
+                ancestry
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+    }
+
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
         Projection::empty(self.clone())
@@ -3792,6 +3811,65 @@ mod tests {
     ) {
         // don't allow `.` in the field name
         assert!(create_bad_file(data_storage_version).await.is_err());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_nested_field_with_dot(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+
+        // Create a struct field with a nested field containing a dot
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "parent",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("child.with.dot", DataType::Int32, false),
+                ArrowField::new("normal_child", DataType::Int32, false),
+            ])),
+            false,
+        )]));
+
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("child.with.dot", DataType::Int32, false)),
+                Arc::new(Int32Array::from_iter_values(0..20)) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("normal_child", DataType::Int32, false)),
+                Arc::new(Int32Array::from_iter_values(20..40)) as ArrayRef,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array)]).unwrap();
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+
+        // Nested fields should also not allow dots in their names
+        let result = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Should not allow nested field names with dots"
+        );
+        if let Err(e) = result {
+            let err_msg = e.to_string();
+            assert!(
+                err_msg.contains("cannot contain `.`") || err_msg.contains("Dots are reserved"),
+                "Error should mention dots are not allowed, got: {}",
+                err_msg
+            );
+        }
     }
 
     #[tokio::test]

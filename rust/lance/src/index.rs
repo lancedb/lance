@@ -240,17 +240,16 @@ pub(crate) async fn remap_index(
         }
     }
 
-    let field = matched
+    let field_id = matched
         .fields
         .first()
         .expect("An index existed with no fields");
-
-    let field = dataset.schema().field_by_id(*field).unwrap();
+    let field_path = dataset.field_path(*field_id)?;
 
     let new_id = Uuid::new_v4();
 
     let generic = dataset
-        .open_generic_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
+        .open_generic_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
         .await?;
 
     let created_index = match generic.index_type() {
@@ -258,7 +257,7 @@ pub(crate) async fn remap_index(
             let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id.to_string())?;
 
             let scalar_index = dataset
-                .open_scalar_index(&field.name, &index_id.to_string(), &NoOpMetricsCollector)
+                .open_scalar_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
                 .await?;
             if !scalar_index.can_remap() {
                 return Ok(RemapResult::Drop);
@@ -277,11 +276,11 @@ pub(crate) async fn remap_index(
                         log::warn!("reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
                             scalar_index.index_type(),
                             index_id,
-                            field.name
+                            field_path
                         );
                         let training_data = load_training_data(
                             dataset,
-                            &field.name,
+                            &field_path,
                             &TrainingCriteria::new(TrainingOrdering::None),
                             None,
                             true, // Legacy reindexing should always train
@@ -305,7 +304,7 @@ pub(crate) async fn remap_index(
         it if it.is_vector() => {
             remap_vector_index(
                 Arc::new(dataset.clone()),
-                &field.name,
+                &field_path,
                 index_id,
                 &new_id,
                 matched,
@@ -727,20 +726,17 @@ impl DatasetIndexExt for Dataset {
             });
         }
 
-        let column = self
-            .schema()
-            .field_by_id(metadatas[0].fields[0])
-            .map(|f| f.name.as_str())
-            .ok_or(Error::IndexNotFound {
-                identity: index_name.to_string(),
-                location: location!(),
-            })?;
+        let field_id = metadatas[0].fields[0];
+        let field_path = self.field_path(field_id)?;
 
         // Open all delta indices
         let indices = stream::iter(metadatas.iter())
-            .then(|m| async move {
-                self.open_generic_index(column, &m.uuid.to_string(), &NoOpMetricsCollector)
-                    .await
+            .then(|m| {
+                let field_path = field_path.clone();
+                async move {
+                    self.open_generic_index(&field_path, &m.uuid.to_string(), &NoOpMetricsCollector)
+                        .await
+                }
             })
             .try_collect::<Vec<_>>()
             .await?;
@@ -3982,5 +3978,212 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not found in source dataset"));
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_on_nested_field() {
+        let dimensions = 16;
+        let num_rows = 512;
+        let struct_field = Field::new(
+            "embedding_data",
+            DataType::Struct(
+                vec![
+                    Field::new(
+                        "vector",
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, true)),
+                            dimensions,
+                        ),
+                        false,
+                    ),
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("label", DataType::Utf8, false),
+                ]
+                    .into(),
+            ),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Int32, false),
+            struct_field,
+            Field::new("category", DataType::Utf8, false),
+        ]));
+
+        // Generate test data
+        let float_arr = generate_random_array(num_rows * dimensions as usize);
+        let vectors = FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let labels = StringArray::from_iter_values((0..num_rows).map(|i| format!("label_{}", i)));
+
+        let struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dimensions,
+                    ),
+                    false,
+                )),
+                Arc::new(vectors) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("id", DataType::Int32, false)),
+                Arc::new(ids.clone()) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("label", DataType::Utf8, false)),
+                Arc::new(labels) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+
+        let categories =
+            StringArray::from_iter_values((0..num_rows).map(|i| format!("category_{}", i % 3)));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(struct_array), Arc::new(categories)],
+        )
+            .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test creating vector index on nested field using dot notation
+        let nested_column_path = "embedding_data.vector";
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 10);
+
+        dataset
+            .create_index(
+                &[nested_column_path],
+                IndexType::Vector,
+                Some("nested_vec_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "nested_vec_idx");
+
+        // Test querying using the nested vector field
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let search_results = dataset
+            .scan()
+            .nearest(nested_column_path, &query_vector, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(search_results.num_rows(), 5);
+        assert!(search_results.column_by_name("doc_id").is_some());
+        assert!(search_results.column_by_name("embedding_data").is_some());
+        assert!(search_results.column_by_name("category").is_some());
+
+        // Verify index statistics before optimization
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("nested_vec_idx").await.unwrap())
+                .unwrap();
+
+        assert_eq!(stats["num_indexed_rows"], num_rows);
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["index_type"], "IVF_PQ");
+
+        // Append new data
+        let new_rows = 256;
+        let new_float_arr = generate_random_array(new_rows * dimensions as usize);
+        let new_vectors =
+            FixedSizeListArray::try_new_from_values(new_float_arr, dimensions).unwrap();
+        let new_ids = Int32Array::from_iter_values(num_rows as i32..(num_rows + new_rows) as i32);
+        let new_labels = StringArray::from_iter_values(
+            (num_rows..num_rows + new_rows).map(|i| format!("label_{}", i)),
+        );
+
+        let new_struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dimensions,
+                    ),
+                    false,
+                )),
+                Arc::new(new_vectors) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("id", DataType::Int32, false)),
+                Arc::new(new_ids.clone()) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("label", DataType::Utf8, false)),
+                Arc::new(new_labels) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+
+        let new_categories = StringArray::from_iter_values(
+            (num_rows..num_rows + new_rows).map(|i| format!("category_{}", i % 3)),
+        );
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(new_ids),
+                Arc::new(new_struct_array),
+                Arc::new(new_categories),
+            ],
+        )
+            .unwrap();
+
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![new_batch].into_iter().map(Ok), schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stats_after_append: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("nested_vec_idx").await.unwrap())
+                .unwrap();
+
+        assert_eq!(stats_after_append["num_indexed_rows"], num_rows);
+        assert_eq!(stats_after_append["num_unindexed_rows"], new_rows);
+
+        // Test index optimization on nested field
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let stats_after_optimize: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("nested_vec_idx").await.unwrap())
+                .unwrap();
+
+        assert_eq!(
+            stats_after_optimize["num_indexed_rows"],
+            num_rows + new_rows
+        );
+        assert_eq!(stats_after_optimize["num_unindexed_rows"], 0);
+
+        // Verify queries work after optimization
+        let post_optimize_results = dataset
+            .scan()
+            .nearest(nested_column_path, &query_vector, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(post_optimize_results.num_rows(), 10);
     }
 }

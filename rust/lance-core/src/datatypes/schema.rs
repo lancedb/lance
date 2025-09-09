@@ -221,20 +221,36 @@ impl Schema {
         self.do_project(columns, false)
     }
 
-    /// Check that the top level fields don't contain `.` in their names
-    /// to distinguish from nested fields.
+    /// Check that field names don't contain `.` to avoid ambiguity in field paths,
+    /// and validate other schema constraints.
     // TODO: pub(crate)
     pub fn validate(&self) -> Result<()> {
         let mut seen_names = HashSet::new();
 
-        for field in self.fields.iter() {
+        // Check for dots in all field names and duplicate field paths
+        for field in self.fields_pre_order() {
+            // Check that no field names contain dots
             if field.name.contains('.') {
+                let field_path = self
+                    .field_ancestry_by_id(field.id)
+                    .map(|ancestry| {
+                        ancestry
+                            .iter()
+                            .map(|f| f.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    })
+                    .unwrap_or_else(|| field.name.clone());
+
                 return Err(Error::Schema{message:format!(
-                    "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
-                    field.name.clone()
+                    "Field '{}' cannot contain `.` in its name. Dots are reserved for separating nested field paths.",
+                    field_path
                 ), location: location!(),});
             }
+        }
 
+        // Check for duplicate field paths
+        for field in self.fields.iter() {
             let column_path = self
                 .field_ancestry_by_id(field.id)
                 .unwrap()
