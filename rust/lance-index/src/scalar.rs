@@ -589,6 +589,70 @@ pub enum TokenQuery {
     TokensContains(String),
 }
 
+/// A query that a BloomFilter index can satisfy
+///
+/// This is a subset of SargableQuery that only includes operations that bloom filters
+/// can efficiently handle: equals, is_null, and is_in queries.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BloomFilterQuery {
+    /// Retrieve all row ids where the value is exactly the given value
+    Equals(ScalarValue),
+    /// Retrieve all row ids where the value is null
+    IsNull(),
+    /// Retrieve all row ids where the value is in the given set of values
+    IsIn(Vec<ScalarValue>),
+}
+
+impl AnyQuery for BloomFilterQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            Self::Equals(val) => {
+                format!("{} = {}", col, val)
+            }
+            Self::IsNull() => {
+                format!("{} IS NULL", col)
+            }
+            Self::IsIn(values) => {
+                format!(
+                    "{} IN [{}]",
+                    col,
+                    values
+                        .iter()
+                        .map(|val| val.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+        }
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        let col_expr = Expr::Column(Column::new_unqualified(col));
+        match self {
+            Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
+            Self::IsNull() => col_expr.is_null(),
+            Self::IsIn(values) => col_expr.in_list(
+                values
+                    .iter()
+                    .map(|val| Expr::Literal(val.clone(), None))
+                    .collect::<Vec<_>>(),
+                false,
+            ),
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
 impl AnyQuery for TokenQuery {
     fn as_any(&self) -> &dyn Any {
         self

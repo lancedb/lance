@@ -8,11 +8,11 @@
 //! It's an inexact filter - they may include false positives that require rechecking.
 
 use crate::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
-use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
+use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
+use crate::scalar::{BloomFilterQuery, CreatedIndex, UpdateCriteria};
 use crate::{pb, Any};
 use arrow_array::{Array, UInt64Array};
 use lance_core::utils::mask::RowIdTreeMap;
@@ -261,16 +261,16 @@ impl BloomFilterIndex {
     fn evaluate_block_against_query(
         &self,
         block: &BloomFilterStatistics,
-        query: &SargableQuery,
+        query: &BloomFilterQuery,
     ) -> Result<bool> {
         let sbbf = &block.bloom_filter;
 
         match query {
-            SargableQuery::IsNull() => {
+            BloomFilterQuery::IsNull() => {
                 // Use the has_null information to determine if this block contains nulls
                 Ok(block.has_null)
             }
-            SargableQuery::Equals(target) => {
+            BloomFilterQuery::Equals(target) => {
                 if target.is_null() {
                     // Handle null values using has_null information
                     return Ok(block.has_null);
@@ -338,11 +338,7 @@ impl BloomFilterIndex {
                     }),
                 }
             }
-            SargableQuery::Range(_, _) => Err(Error::NotSupported {
-                source: "range queries are not supported for bloom filter indexes".into(),
-                location: location!(),
-            }),
-            SargableQuery::IsIn(values) => {
+            BloomFilterQuery::IsIn(values) => {
                 // Check if any value in the set is in the bloom filter
                 for value in values {
                     if value.is_null() {
@@ -422,10 +418,6 @@ impl BloomFilterIndex {
                 }
                 Ok(false) // None of the values were found
             }
-            SargableQuery::FullTextSearch(_) => Err(Error::NotSupported {
-                source: "full text search is not supported for bloom filter indexes".into(),
-                location: location!(),
-            }),
         }
     }
 }
@@ -484,7 +476,7 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         metrics.record_comparisons(self.zones.len());
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
 
         let mut row_id_tree_map = RowIdTreeMap::new();
 
@@ -1249,8 +1241,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        // TODO: Should it be sargable query?
-        Some(Box::new(SargableQueryParser::new(index_name, true)))
+        Some(Box::new(BloomFilterQueryParser::new(index_name, true)))
     }
 
     async fn load_index(
@@ -1297,35 +1288,27 @@ mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use std::sync::Arc;
 
-    use crate::scalar::bloomfilter::{BloomFilterIndexPlugin, BloomFilterStatistics};
-    use arrow::datatypes::Float32Type;
-    use arrow_array::{Array, RecordBatch, UInt64Array};
+    use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
+    use arrow_array::{RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
-    use futures::{stream, StreamExt, TryStreamExt};
+    use futures::{stream, StreamExt};
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR};
-    use lance_datafusion::datagen::DatafusionDatagenExt;
-    use lance_datagen::ArrayGeneratorExt;
-    use lance_datagen::{array, BatchCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use tempfile::tempdir;
 
     use crate::scalar::{
-        bloomfilter::{
-            BloomFilterIndex, BloomFilterIndexBuilderParams, BLOOMFILTER_FILENAME,
-            BLOOMFILTER_ITEM_META_KEY, BLOOMFILTER_PROBABILITY_META_KEY,
-        },
+        bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams},
         lance_format::LanceIndexStore,
-        SargableQuery, ScalarIndex, SearchResult,
+        BloomFilterQuery, ScalarIndex, SearchResult,
     };
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
-    use std::collections::Bound;
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -1386,7 +1369,7 @@ mod tests {
         assert_eq!(index.probability, 0.00057); // Default probability
 
         // Equals query: null (should match nothing, as there are no nulls in empty index)
-        let query = SargableQuery::Equals(ScalarValue::Int32(None));
+        let query = BloomFilterQuery::Equals(ScalarValue::Int32(None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
     }
@@ -1439,7 +1422,7 @@ mod tests {
 
         // Test search functionality
         // The bloom filter should work correctly and find the value
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(50)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Int32(Some(50)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the block since value 50 is in the range [0, 100)
@@ -1448,7 +1431,7 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value that shouldn't exist
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(500))); // Value not in [0, 100)
+        let query = BloomFilterQuery::Equals(ScalarValue::Int32(Some(500))); // Value not in [0, 100)
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty result since bloom filter correctly filters out this value
@@ -1532,7 +1515,7 @@ mod tests {
         assert_eq!(index.zones[3].zone_length, 50);
 
         // Test search functionality
-        let query = SargableQuery::Equals(ScalarValue::Int64(Some(150)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(150)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should only match fragment 1 blocks since bloom filter correctly filters
@@ -1599,7 +1582,7 @@ mod tests {
         assert_eq!(index.zones.len(), 5);
 
         // Test search for NaN values using Equals with NaN
-        let query = SargableQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match all blocks since they all contain NaN values
@@ -1608,7 +1591,7 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a specific finite value that exists in the data
-        let query = SargableQuery::Equals(ScalarValue::Float32(Some(5.0)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(5.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match only the first block since 5.0 only exists in rows 0-99
@@ -1617,7 +1600,7 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value that doesn't exist but is within expected range
-        let query = SargableQuery::Equals(ScalarValue::Float32(Some(250.0)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(250.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the third block since 250.0 would be in that range if it existed
@@ -1626,14 +1609,14 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value way outside the range
-        let query = SargableQuery::Equals(ScalarValue::Float32(Some(10000.0)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Float32(Some(10000.0)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
 
         // Test IsIn query with NaN and finite values
-        let query = SargableQuery::IsIn(vec![
+        let query = BloomFilterQuery::IsIn(vec![
             ScalarValue::Float32(Some(f32::NAN)),
             ScalarValue::Float32(Some(5.0)),
             ScalarValue::Float32(Some(150.0)), // This value exists in the second block
@@ -1698,7 +1681,7 @@ mod tests {
         }
 
         // Test search for a value in a specific zone
-        let query = SargableQuery::Equals(ScalarValue::Int64(Some(2500))); // In zone 2 (2000-2999)
+        let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(2500))); // In zone 2 (2000-2999)
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match zone 2
@@ -1707,14 +1690,14 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value way outside the range
-        let query = SargableQuery::Equals(ScalarValue::Int64(Some(50000)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Int64(Some(50000)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
 
         // Test IsIn query with values from different zones
-        let query = SargableQuery::IsIn(vec![
+        let query = BloomFilterQuery::IsIn(vec![
             ScalarValue::Int64(Some(500)),   // Zone 0 (0-999)
             ScalarValue::Int64(Some(2500)),  // Zone 2 (2000-2999)
             ScalarValue::Int64(Some(7500)),  // Zone 7 (7000-7999)
@@ -1777,7 +1760,7 @@ mod tests {
         assert_eq!(index.zones.len(), 2);
 
         // Test search for a value in the first zone
-        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_050".to_string())));
+        let query = BloomFilterQuery::Equals(ScalarValue::Utf8(Some("value_050".to_string())));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the first zone
@@ -1786,7 +1769,7 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value in the second zone
-        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("value_150".to_string())));
+        let query = BloomFilterQuery::Equals(ScalarValue::Utf8(Some("value_150".to_string())));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the second zone
@@ -1795,14 +1778,15 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value that doesn't exist
-        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("nonexistent_value".to_string())));
+        let query =
+            BloomFilterQuery::Equals(ScalarValue::Utf8(Some("nonexistent_value".to_string())));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
 
         // Test IsIn query with string values
-        let query = SargableQuery::IsIn(vec![
+        let query = BloomFilterQuery::IsIn(vec![
             ScalarValue::Utf8(Some("value_025".to_string())), // First zone
             ScalarValue::Utf8(Some("value_175".to_string())), // Second zone
             ScalarValue::Utf8(Some("nonexistent".to_string())), // Not present
@@ -1858,7 +1842,7 @@ mod tests {
         assert_eq!(index.zones.len(), 2);
 
         // Test search for a value in the first zone
-        let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![25, 26, 27])));
+        let query = BloomFilterQuery::Equals(ScalarValue::Binary(Some(vec![25, 26, 27])));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the first zone
@@ -1867,7 +1851,7 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value in the second zone
-        let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![75, 76, 77])));
+        let query = BloomFilterQuery::Equals(ScalarValue::Binary(Some(vec![75, 76, 77])));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should match the second zone
@@ -1876,7 +1860,7 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value that doesn't exist
-        let query = SargableQuery::Equals(ScalarValue::Binary(Some(vec![255, 254, 253])));
+        let query = BloomFilterQuery::Equals(ScalarValue::Binary(Some(vec![255, 254, 253])));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
@@ -1925,7 +1909,7 @@ mod tests {
         assert_eq!(index.zones.len(), 2);
 
         // Test search functionality
-        let query = SargableQuery::Equals(ScalarValue::LargeUtf8(Some(
+        let query = BloomFilterQuery::Equals(ScalarValue::LargeUtf8(Some(
             "large_value_00025".to_string(),
         )));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
@@ -1936,7 +1920,7 @@ mod tests {
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for a value that doesn't exist
-        let query = SargableQuery::Equals(ScalarValue::LargeUtf8(Some(
+        let query = BloomFilterQuery::Equals(ScalarValue::LargeUtf8(Some(
             "nonexistent_large_value".to_string(),
         )));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
@@ -1985,21 +1969,21 @@ mod tests {
         assert_eq!(index.zones.len(), 2); // 100 rows, zone size 50
 
         // Test search for Date32 value in first zone
-        let query = SargableQuery::Equals(ScalarValue::Date32(Some(25)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Date32(Some(25)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(0..50);
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for Date32 value in second zone
-        let query = SargableQuery::Equals(ScalarValue::Date32(Some(75)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Date32(Some(75)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(50..100);
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for Date32 value that doesn't exist
-        let query = SargableQuery::Equals(ScalarValue::Date32(Some(500)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Date32(Some(500)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
     }
@@ -2046,7 +2030,7 @@ mod tests {
 
         // Test search for Timestamp value in first zone
         let first_timestamp = timestamp_values[25];
-        let query = SargableQuery::Equals(ScalarValue::TimestampNanosecond(
+        let query = BloomFilterQuery::Equals(ScalarValue::TimestampNanosecond(
             Some(first_timestamp),
             None,
         ));
@@ -2057,7 +2041,7 @@ mod tests {
 
         // Test search for Timestamp value in second zone
         let second_timestamp = timestamp_values[75];
-        let query = SargableQuery::Equals(ScalarValue::TimestampNanosecond(
+        let query = BloomFilterQuery::Equals(ScalarValue::TimestampNanosecond(
             Some(second_timestamp),
             None,
         ));
@@ -2068,12 +2052,12 @@ mod tests {
 
         // Test search for Timestamp value that doesn't exist
         let query =
-            SargableQuery::Equals(ScalarValue::TimestampNanosecond(Some(999_999_999i64), None));
+            BloomFilterQuery::Equals(ScalarValue::TimestampNanosecond(Some(999_999_999i64), None));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
 
         // Test IsIn query with multiple timestamp values
-        let query = SargableQuery::IsIn(vec![
+        let query = BloomFilterQuery::IsIn(vec![
             ScalarValue::TimestampNanosecond(Some(timestamp_values[10]), None), // First zone
             ScalarValue::TimestampNanosecond(Some(timestamp_values[85]), None), // Second zone
             ScalarValue::TimestampNanosecond(Some(999_999_999i64), None),       // Not present
@@ -2128,20 +2112,20 @@ mod tests {
 
         // Test search for Time64 value in first zone
         let first_time = time_values[10];
-        let query = SargableQuery::Equals(ScalarValue::Time64Microsecond(Some(first_time)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Time64Microsecond(Some(first_time)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         let mut expected = RowIdTreeMap::new();
         expected.insert_range(0..25);
         assert_eq!(result, SearchResult::AtMost(expected));
 
         // Test search for Time64 value that doesn't exist
-        let query = SargableQuery::Equals(ScalarValue::Time64Microsecond(Some(999_999_999i64)));
+        let query = BloomFilterQuery::Equals(ScalarValue::Time64Microsecond(Some(999_999_999i64)));
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
     }
 
     #[tokio::test]
-    async fn test_bloomfilter_range_queries() {
+    async fn test_bloomfilter_supported_operations() {
         let tmpdir = Arc::new(tempdir().unwrap());
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -2177,16 +2161,28 @@ mod tests {
 
         assert_eq!(index.zones.len(), 4);
 
-        // Test range query - bloom filters should return NotSupported error for range queries
-        let query = SargableQuery::Range(
-            Bound::Included(ScalarValue::Int32(Some(100))),
-            Bound::Included(ScalarValue::Int32(Some(300))),
-        );
-        let result = index.search(&query, &NoOpMetricsCollector).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            lance_core::Error::NotSupported { .. }
-        ));
+        // Test that bloom filters support the operations they are designed for
+        // Test a specific equality query
+        let query = BloomFilterQuery::Equals(ScalarValue::Int32(Some(500)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(500..750); // Should match the zone containing 500
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test IsNull query
+        let query = BloomFilterQuery::IsNull();
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new())); // No nulls in the data
+
+        // Test IsIn query
+        let query = BloomFilterQuery::IsIn(vec![
+            ScalarValue::Int32(Some(100)),
+            ScalarValue::Int32(Some(600)),
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..250); // Zone containing 100
+        expected.insert_range(500..750); // Zone containing 600
+        assert_eq!(result, SearchResult::AtMost(expected));
     }
 }
