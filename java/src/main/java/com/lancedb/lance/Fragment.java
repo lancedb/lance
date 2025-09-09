@@ -185,7 +185,7 @@ public class Fragment {
           params.getMaxRowsPerGroup(),
           params.getMaxBytesPerFile(),
           params.getMode(),
-          params.getEnableMoveStableRowId(),
+          params.getEnableStableRowIds(),
           params.getStorageOptions());
     }
   }
@@ -210,7 +210,7 @@ public class Fragment {
         params.getMaxRowsPerGroup(),
         params.getMaxBytesPerFile(),
         params.getMode(),
-        params.getEnableMoveStableRowId(),
+        params.getEnableStableRowIds(),
         params.getStorageOptions());
   }
 
@@ -227,7 +227,7 @@ public class Fragment {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
-      Optional<Boolean> enableMoveStableRowId,
+      Optional<Boolean> enableStableRowIds,
       Map<String, String> storageOptions);
 
   /**
@@ -242,6 +242,6 @@ public class Fragment {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
-      Optional<Boolean> enableMoveStableRowId,
+      Optional<Boolean> enableStableRowIds,
       Map<String, String> storageOptions);
 }

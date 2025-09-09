@@ -33,7 +33,7 @@ public class WriteParams {
   private final Optional<Integer> maxRowsPerGroup;
   private final Optional<Long> maxBytesPerFile;
   private final Optional<WriteMode> mode;
-  private final Optional<Boolean> enableMoveStableRowId;
+  private final Optional<Boolean> enableStableRowIds;
   private Map<String, String> storageOptions = new HashMap<>();
 
   private WriteParams(
@@ -41,13 +41,13 @@ public class WriteParams {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<WriteMode> mode,
-      Optional<Boolean> enableMoveStableRowId,
+      Optional<Boolean> enableStableRowIds,
       Map<String, String> storageOptions) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
     this.mode = mode;
-    this.enableMoveStableRowId = enableMoveStableRowId;
+    this.enableStableRowIds = enableStableRowIds;
     this.storageOptions = storageOptions;
   }
 
@@ -72,8 +72,8 @@ public class WriteParams {
     return mode.map(Enum::name);
   }
 
-  public Optional<Boolean> getEnableMoveStableRowId() {
-    return enableMoveStableRowId;
+  public Optional<Boolean> getEnableStableRowIds() {
+    return enableStableRowIds;
   }
 
   public Map<String, String> getStorageOptions() {
@@ -96,7 +96,7 @@ public class WriteParams {
     private Optional<Integer> maxRowsPerGroup = Optional.empty();
     private Optional<Long> maxBytesPerFile = Optional.empty();
     private Optional<WriteMode> mode = Optional.empty();
-    private Optional<Boolean> enableMoveStableRowId = Optional.empty();
+    private Optional<Boolean> enableStableRowIds = Optional.empty();
     private Map<String, String> storageOptions = new HashMap<>();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
@@ -124,8 +124,8 @@ public class WriteParams {
       return this;
     }
 
-    public Builder withEnableMoveStableRowId(boolean enableMoveStableRowId) {
-      this.enableMoveStableRowId = Optional.of(enableMoveStableRowId);
+    public Builder withEnableStableRowIds(boolean enableStableRowIds) {
+      this.enableStableRowIds = Optional.of(enableStableRowIds);
       return this;
     }
 
@@ -135,7 +135,7 @@ public class WriteParams {
           maxRowsPerGroup,
           maxBytesPerFile,
           mode,
-          enableMoveStableRowId,
+          enableStableRowIds,
           storageOptions);
     }
   }

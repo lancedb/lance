@@ -969,14 +969,14 @@ public class DatasetTest {
   }
 
   @Test
-  void testEnableMoveStableRowId(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("enable_move_stable_rowid").toString();
+  void testEnableStableRowIds(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("enable_stable_row_ids").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset =
           testDataset.createDatasetWithWriteParams(
-              new WriteParams.Builder().withEnableMoveStableRowId(true).build())) {
+              new WriteParams.Builder().withEnableStableRowIds(true).build())) {
         // Step1: write two fragments
         FragmentMetadata frag1 = testDataset.createNewFragment(10);
         FragmentMetadata frag2 = testDataset.createNewFragment(10);
