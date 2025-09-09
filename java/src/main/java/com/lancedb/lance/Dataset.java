@@ -91,6 +91,7 @@ public class Dataset implements Closeable {
               params.getMaxRowsPerGroup(),
               params.getMaxBytesPerFile(),
               params.getMode(),
+              params.getEnableStableRowIds(),
               params.getStorageOptions());
       dataset.allocator = allocator;
       return dataset;
@@ -120,6 +121,7 @@ public class Dataset implements Closeable {
             params.getMaxRowsPerGroup(),
             params.getMaxBytesPerFile(),
             params.getMode(),
+            params.getEnableStableRowIds(),
             params.getStorageOptions());
     dataset.allocator = allocator;
     return dataset;
@@ -132,6 +134,7 @@ public class Dataset implements Closeable {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
+      Optional<Boolean> enableStableRowIds,
       Map<String, String> storageOptions);
 
   private static native Dataset createWithFfiStream(
@@ -141,6 +144,7 @@ public class Dataset implements Closeable {
       Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
       Optional<String> mode,
+      Optional<Boolean> enableStableRowIds,
       Map<String, String> storageOptions);
 
   /**

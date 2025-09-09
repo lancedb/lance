@@ -81,6 +81,10 @@ public class TestUtils {
       return dataset;
     }
 
+    public Dataset createDatasetWithWriteParams(WriteParams writeParams) {
+      return Dataset.create(allocator, datasetPath, getSchema(), writeParams);
+    }
+
     public FragmentMetadata createNewFragment(int rowCount) {
       List<FragmentMetadata> fragmentMetas = createNewFragment(rowCount, Integer.MAX_VALUE);
       assertEquals(1, fragmentMetas.size());
