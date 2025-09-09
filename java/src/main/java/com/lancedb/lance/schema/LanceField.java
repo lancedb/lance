@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance.schema;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -108,28 +109,17 @@ public class LanceField {
 
   @Override
   public String toString() {
-    return "LanceField{"
-        + "id="
-        + id
-        + ", parentId="
-        + parentId
-        + ", name='"
-        + name
-        + '\''
-        + ", nullable="
-        + nullable
-        + ", type="
-        + type
-        + ", storageType="
-        + storageType
-        + ", dictionaryEncoding="
-        + dictionaryEncoding
-        + ", metadata="
-        + metadata
-        + ", children="
-        + children
-        + ", isUnenforcedPrimaryKey="
-        + isUnenforcedPrimaryKey
-        + '}';
+    return MoreObjects.toStringHelper(this)
+        .add("id", id)
+        .add("parentId", parentId)
+        .add("name", name)
+        .add("nullable", nullable)
+        .add("type", type)
+        .add("storageType", storageType)
+        .add("dictionaryEncoding", dictionaryEncoding)
+        .add("children", children)
+        .add("isUnenforcedPrimaryKey", isUnenforcedPrimaryKey)
+        .add("metadata", metadata)
+        .toString();
   }
 }

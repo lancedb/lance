@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.util.Objects;
 
@@ -42,10 +42,10 @@ public class Tag {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("name", name)
-        .append("version", version)
-        .append("manifestSize", manifestSize)
+    return MoreObjects.toStringHelper(this)
+        .add("name", name)
+        .add("version", version)
+        .add("manifestSize", manifestSize)
         .toString();
   }
 

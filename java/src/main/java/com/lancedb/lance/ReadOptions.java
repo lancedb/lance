@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -58,12 +58,12 @@ public class ReadOptions {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("version", version.orElse(null))
-        .append("blockSize", blockSize.orElse(null))
-        .append("indexCacheSizeBytes", indexCacheSizeBytes)
-        .append("metadataCacheSizeBytes", metadataCacheSizeBytes)
-        .append("storageOptions", storageOptions)
+    return MoreObjects.toStringHelper(this)
+        .add("version", version.orElse(null))
+        .add("blockSize", blockSize.orElse(null))
+        .add("indexCacheSizeBytes", indexCacheSizeBytes)
+        .add("metadataCacheSizeBytes", metadataCacheSizeBytes)
+        .add("storageOptions", storageOptions)
         .toString();
   }
 

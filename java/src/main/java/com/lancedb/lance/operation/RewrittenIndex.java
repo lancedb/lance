@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.operation;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.util.Arrays;
 import java.util.Objects;
@@ -99,12 +99,12 @@ public class RewrittenIndex {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("oldId", oldId)
-        .append("newId", newId)
-        .append("newIndexDetailsTypeUrl", newIndexDetailsTypeUrl)
-        .append("newIndexDetailsValue", newIndexDetailsValue)
-        .append("newIndexVersion", newIndexVersion)
+    return MoreObjects.toStringHelper(this)
+        .add("oldId", oldId)
+        .add("newId", newId)
+        .add("newIndexDetailsTypeUrl", newIndexDetailsTypeUrl)
+        .add("newIndexDetailsValue", newIndexDetailsValue)
+        .add("newIndexVersion", newIndexVersion)
         .toString();
   }
 

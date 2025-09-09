@@ -15,7 +15,7 @@ package com.lancedb.lance.index.vector;
 
 import com.lancedb.lance.index.DistanceType;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.util.Optional;
 
@@ -221,12 +221,12 @@ public class VectorIndexParams {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("distanceType", distanceType)
-        .append("ivfParams", ivfParams)
-        .append("pqParams", pqParams.orElse(null))
-        .append("hnswParams", hnswParams.orElse(null))
-        .append("sqParams", sqParams.orElse(null))
+    return MoreObjects.toStringHelper(this)
+        .add("distanceType", distanceType)
+        .add("ivfParams", ivfParams)
+        .add("pqParams", pqParams.orElse(null))
+        .add("hnswParams", hnswParams.orElse(null))
+        .add("sqParams", sqParams.orElse(null))
         .toString();
   }
 }

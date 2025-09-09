@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.fragment;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
 import java.util.Arrays;
@@ -90,14 +90,14 @@ public class DataFile implements Serializable {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("path", path)
-        .append("fields", fields)
-        .append("columnIndices", columnIndices)
-        .append("fileMajorVersion", fileMajorVersion)
-        .append("fileMinorVersion", fileMinorVersion)
-        .append("fileSizeBytes", fileSizeBytes)
-        .append("baseId", baseId)
+    return MoreObjects.toStringHelper(this)
+        .add("path", path)
+        .add("fields", fields)
+        .add("columnIndices", columnIndices)
+        .add("fileMajorVersion", fileMajorVersion)
+        .add("fileMinorVersion", fileMinorVersion)
+        .add("fileSizeBytes", fileSizeBytes)
+        .add("baseId", baseId)
         .toString();
   }
 }

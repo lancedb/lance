@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -75,11 +75,11 @@ public class WriteParams {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("maxRowsPerFile", maxRowsPerFile.orElse(null))
-        .append("maxRowsPerGroup", maxRowsPerGroup.orElse(null))
-        .append("maxBytesPerFile", maxBytesPerFile.orElse(null))
-        .append("mode", mode.orElse(null))
+    return MoreObjects.toStringHelper(this)
+        .add("maxRowsPerFile", maxRowsPerFile.orElse(null))
+        .add("maxRowsPerGroup", maxRowsPerGroup.orElse(null))
+        .add("maxBytesPerFile", maxBytesPerFile.orElse(null))
+        .add("mode", mode.orElse(null))
         .toString();
   }
 

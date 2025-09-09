@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.index.vector;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 /**
  * Train a PQ model for a given column.
@@ -123,12 +123,12 @@ public class PQBuildParams {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("numSubVectors", numSubVectors)
-        .append("numBits", numBits)
-        .append("maxIters", maxIters)
-        .append("kmeansRedos", kmeansRedos)
-        .append("sampleRate", sampleRate)
+    return MoreObjects.toStringHelper(this)
+        .add("numSubVectors", numSubVectors)
+        .add("numBits", numBits)
+        .add("maxIters", maxIters)
+        .add("kmeansRedos", kmeansRedos)
+        .add("sampleRate", sampleRate)
         .toString();
   }
 }

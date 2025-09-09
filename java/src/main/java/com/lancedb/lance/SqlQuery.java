@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -65,4 +66,14 @@ public class SqlQuery {
       boolean withRowAddr,
       long streamAddress)
       throws IOException;
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("sql", sql)
+        .add("table", table)
+        .add("withRowId", withRowId)
+        .add("withRowAddr", withRowAddr)
+        .toString();
+  }
 }

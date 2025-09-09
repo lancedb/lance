@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance.schema;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 
 import java.util.Optional;
@@ -46,6 +47,16 @@ public class ColumnAlteration {
 
   public Optional<ArrowType> getDataType() {
     return dataType;
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("path", path)
+        .add("rename", rename.orElse(null))
+        .add("nullable", nullable.orElse(null))
+        .add("dataType", dataType.orElse(null))
+        .toString();
   }
 
   public static class Builder {

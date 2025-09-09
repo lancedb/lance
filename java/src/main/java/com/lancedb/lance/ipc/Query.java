@@ -15,8 +15,8 @@ package com.lancedb.lance.ipc;
 
 import com.lancedb.lance.index.DistanceType;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
-import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.util.Optional;
 
@@ -90,16 +90,16 @@ public class Query {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("column", column)
-        .append("key", key)
-        .append("k", k)
-        .append("minimumNprobes", minimumNprobes)
-        .append("maximumNprobes", maximumNprobes.orElse(null))
-        .append("ef", ef.orElse(null))
-        .append("refineFactor", refineFactor.orElse(null))
-        .append("distanceType", distanceType)
-        .append("useIndex", useIndex)
+    return MoreObjects.toStringHelper(this)
+        .add("column", column)
+        .add("key", key)
+        .add("k", k)
+        .add("minimumNprobes", minimumNprobes)
+        .add("maximumNprobes", maximumNprobes.orElse(null))
+        .add("ef", ef.orElse(null))
+        .add("refineFactor", refineFactor.orElse(null))
+        .add("distanceType", distanceType)
+        .add("useIndex", useIndex)
         .toString();
   }
 
