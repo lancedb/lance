@@ -805,14 +805,28 @@ impl BloomFilterIndexBuilder {
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
                 }
-                DataType::Time32(_) => {
-                    // Time32 types are stored as i32, so we can treat them as Int32Arrays
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Int32Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
+                DataType::Time32(time_unit) => match time_unit {
+                    arrow_schema::TimeUnit::Second => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::Time32SecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::Time32MillisecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                    _ => {
+                        return Err(Error::InvalidInput {
+                            source: format!("Unsupported Time32 unit: {:?}", time_unit).into(),
+                            location: location!(),
+                        });
+                    }
+                },
                 // Date and time types (stored as i64 internally)
                 DataType::Date64 => {
                     let typed_array = array
@@ -821,22 +835,58 @@ impl BloomFilterIndexBuilder {
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
                 }
-                DataType::Time64(_) => {
-                    // Time64 types are stored as i64, so we can treat them as Int64Arrays
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Int64Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
-                DataType::Timestamp(_, _) => {
-                    // All timestamp types are stored as i64 internally, so we can treat them as Int64Arrays
-                    let typed_array = array
-                        .as_any()
-                        .downcast_ref::<arrow_array::Int64Array>()
-                        .unwrap();
-                    Self::process_primitive_array(sbbf, typed_array)
-                }
+                DataType::Time64(time_unit) => match time_unit {
+                    arrow_schema::TimeUnit::Microsecond => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::Time64MicrosecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::Time64NanosecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                    _ => {
+                        return Err(Error::InvalidInput {
+                            source: format!("Unsupported Time64 unit: {:?}", time_unit).into(),
+                            location: location!(),
+                        });
+                    }
+                },
+                DataType::Timestamp(time_unit, _) => match time_unit {
+                    arrow_schema::TimeUnit::Second => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampSecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                    arrow_schema::TimeUnit::Microsecond => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        let typed_array = array
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                            .unwrap();
+                        Self::process_primitive_array(sbbf, typed_array)
+                    }
+                },
                 DataType::Utf8 => {
                     let typed_array = array
                         .as_any()
@@ -1892,6 +1942,201 @@ mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         // Should return empty since bloom filter correctly filters out this value
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test Date32 (days since Unix epoch)
+        let date32_values: Vec<i32> = (0..100).collect(); // Days since Unix epoch
+        let date32_data = arrow_array::Date32Array::from(date32_values.clone());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Date32,
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(date32_data)]).unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        let data_stream = add_row_addr(data_stream);
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(50, 0.01)),
+        )
+        .await
+        .unwrap();
+
+        // Load the Date32 index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load Date32 BloomFilterIndex");
+
+        assert_eq!(index.zones.len(), 2); // 100 rows, zone size 50
+
+        // Test search for Date32 value in first zone
+        let query = SargableQuery::Equals(ScalarValue::Date32(Some(25)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..50);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for Date32 value in second zone
+        let query = SargableQuery::Equals(ScalarValue::Date32(Some(75)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(50..100);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for Date32 value that doesn't exist
+        let query = SargableQuery::Equals(ScalarValue::Date32(Some(500)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_types_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test Timestamp with nanosecond precision - use simple incrementing values
+        let timestamp_values: Vec<i64> = (0..100).map(|i| 1_000_000_000i64 + (i as i64)).collect();
+
+        let timestamp_data = arrow_array::TimestampNanosecondArray::from(timestamp_values.clone());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(timestamp_data)]).unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        let data_stream = add_row_addr(data_stream);
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(50, 0.01)),
+        )
+        .await
+        .unwrap();
+
+        // Load the Timestamp index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load Timestamp BloomFilterIndex");
+
+        assert_eq!(index.zones.len(), 2); // 100 rows, zone size 50
+
+        // Test search for Timestamp value in first zone
+        let first_timestamp = timestamp_values[25];
+        let query = SargableQuery::Equals(ScalarValue::TimestampNanosecond(
+            Some(first_timestamp),
+            None,
+        ));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..50);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for Timestamp value in second zone
+        let second_timestamp = timestamp_values[75];
+        let query = SargableQuery::Equals(ScalarValue::TimestampNanosecond(
+            Some(second_timestamp),
+            None,
+        ));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(50..100);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for Timestamp value that doesn't exist
+        let query =
+            SargableQuery::Equals(ScalarValue::TimestampNanosecond(Some(999_999_999i64), None));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
+
+        // Test IsIn query with multiple timestamp values
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::TimestampNanosecond(Some(timestamp_values[10]), None), // First zone
+            ScalarValue::TimestampNanosecond(Some(timestamp_values[85]), None), // Second zone
+            ScalarValue::TimestampNanosecond(Some(999_999_999i64), None),       // Not present
+        ]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..100); // Should match both zones
+        assert_eq!(result, SearchResult::AtMost(expected));
+    }
+
+    #[tokio::test]
+    async fn test_time_types_bloomfilter_index() {
+        let tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test Time64 with microsecond precision (stored as i64)
+        let time_values: Vec<i64> = (0..100)
+            .map(|i| (i as i64) * 3600_000_000) // Hours in microseconds
+            .collect();
+
+        let time_data = arrow_array::Time64MicrosecondArray::from(time_values.clone());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(time_data)]).unwrap();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        let data_stream = add_row_addr(data_stream);
+
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            data_stream,
+            test_store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(25, 0.05)),
+        )
+        .await
+        .unwrap();
+
+        // Load the Time64 index
+        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            .await
+            .expect("Failed to load Time64 BloomFilterIndex");
+
+        assert_eq!(index.zones.len(), 4); // 100 rows, zone size 25
+
+        // Test search for Time64 value in first zone
+        let first_time = time_values[10];
+        let query = SargableQuery::Equals(ScalarValue::Time64Microsecond(Some(first_time)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_range(0..25);
+        assert_eq!(result, SearchResult::AtMost(expected));
+
+        // Test search for Time64 value that doesn't exist
+        let query = SargableQuery::Equals(ScalarValue::Time64Microsecond(Some(999_999_999i64)));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         assert_eq!(result, SearchResult::AtMost(RowIdTreeMap::new()));
     }
 
