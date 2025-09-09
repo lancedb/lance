@@ -57,6 +57,7 @@ pub use error::Result;
 pub use ffi::JNIEnvExt;
 
 use env_logger::{Builder, Env};
+use std::env;
 use std::sync::Arc;
 
 use std::sync::LazyLock;
