@@ -722,6 +722,7 @@ pub struct ComplexAllNullScheduler {
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
+    max_visible_level: u16,
 }
 
 impl ComplexAllNullScheduler {
@@ -729,10 +730,16 @@ impl ComplexAllNullScheduler {
         buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
         def_meaning: Arc<[DefinitionInterpretation]>,
     ) -> Self {
+        let max_visible_level = def_meaning
+            .iter()
+            .take_while(|l| !l.is_list())
+            .map(|l| l.num_def_levels())
+            .sum::<u16>();
         Self {
             buffer_offsets_and_sizes,
             def_meaning,
             repdef: None,
+            max_visible_level,
         }
     }
 }
@@ -811,6 +818,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             def: self.repdef.as_ref().unwrap().def.clone(),
             num_rows,
             def_meaning: self.def_meaning.clone(),
+            max_visible_level: self.max_visible_level,
         }) as Box<dyn StructuralPageDecoder>))
         .boxed())
     }
@@ -823,6 +831,7 @@ pub struct ComplexAllNullPageDecoder {
     def: Option<ScalarBuffer<u16>>,
     num_rows: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_level: u16,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -853,6 +862,7 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
             rep: self.rep.clone(),
             def: self.def.clone(),
             def_meaning: self.def_meaning.clone(),
+            max_visible_level: self.max_visible_level,
         }))
     }
 
@@ -869,6 +879,7 @@ pub struct DecodeComplexAllNullTask {
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_level: u16,
 }
 
 impl DecodeComplexAllNullTask {
@@ -894,9 +905,19 @@ impl DecodeComplexAllNullTask {
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let data = DataBlock::AllNull(AllNullDataBlock { num_values });
         let rep = self.decode_level(&self.rep, num_values);
         let def = self.decode_level(&self.def, num_values);
+
+        // If there are definition levels there may be empty / null lists which are not visible
+        // in the items array.  We need to account for that here to figure out how many values
+        // should be in the items array.
+        let num_values = if let Some(def) = &def {
+            def.iter().filter(|&d| *d < self.max_visible_level).count() as u64
+        } else {
+            num_values
+        };
+
+        let data = DataBlock::AllNull(AllNullDataBlock { num_values });
         let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning);
         Ok(DecodedPage {
             data,
