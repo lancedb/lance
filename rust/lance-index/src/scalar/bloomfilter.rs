@@ -278,24 +278,64 @@ impl BloomFilterIndex {
 
                 // Check the bloom filter for the target value
                 match target {
+                    // Signed integers
+                    datafusion_common::ScalarValue::Int8(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Int16(Some(val)) => Ok(sbbf.check(val)),
                     datafusion_common::ScalarValue::Int32(Some(val)) => Ok(sbbf.check(val)),
                     datafusion_common::ScalarValue::Int64(Some(val)) => Ok(sbbf.check(val)),
+                    // Unsigned integers
+                    datafusion_common::ScalarValue::UInt8(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::UInt16(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::UInt32(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::UInt64(Some(val)) => Ok(sbbf.check(val)),
+                    // Floating point
                     datafusion_common::ScalarValue::Float32(Some(val)) => Ok(sbbf.check(val)),
                     datafusion_common::ScalarValue::Float64(Some(val)) => Ok(sbbf.check(val)),
+                    // String types
                     datafusion_common::ScalarValue::Utf8(Some(val)) => Ok(sbbf.check(val.as_str())),
                     datafusion_common::ScalarValue::LargeUtf8(Some(val)) => {
                         Ok(sbbf.check(val.as_str()))
                     }
+                    // Binary types
                     datafusion_common::ScalarValue::Binary(Some(val)) => {
                         Ok(sbbf.check(val.as_slice()))
                     }
                     datafusion_common::ScalarValue::LargeBinary(Some(val)) => {
                         Ok(sbbf.check(val.as_slice()))
                     }
-                    _ => {
-                        // For unsupported types, be conservative
-                        Ok(true)
+                    // Date and time types
+                    datafusion_common::ScalarValue::Date32(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Date64(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Time32Second(Some(val)) => Ok(sbbf.check(val)),
+                    datafusion_common::ScalarValue::Time32Millisecond(Some(val)) => {
+                        Ok(sbbf.check(val))
                     }
+                    datafusion_common::ScalarValue::Time64Microsecond(Some(val)) => {
+                        Ok(sbbf.check(val))
+                    }
+                    datafusion_common::ScalarValue::Time64Nanosecond(Some(val)) => {
+                        Ok(sbbf.check(val))
+                    }
+                    datafusion_common::ScalarValue::TimestampSecond(Some(val), _) => {
+                        Ok(sbbf.check(val))
+                    }
+                    datafusion_common::ScalarValue::TimestampMillisecond(Some(val), _) => {
+                        Ok(sbbf.check(val))
+                    }
+                    datafusion_common::ScalarValue::TimestampMicrosecond(Some(val), _) => {
+                        Ok(sbbf.check(val))
+                    }
+                    datafusion_common::ScalarValue::TimestampNanosecond(Some(val), _) => {
+                        Ok(sbbf.check(val))
+                    }
+                    _ => Err(Error::InvalidInput {
+                        source: format!(
+                            "Unsupported data type in bloom filter query: {:?}",
+                            target
+                        )
+                        .into(),
+                        location: location!(),
+                    }),
                 }
             }
             SargableQuery::Range(_, _) => Err(Error::NotSupported {
@@ -314,21 +354,66 @@ impl BloomFilterIndex {
                     }
 
                     let found = match value {
+                        // Signed integers
+                        datafusion_common::ScalarValue::Int8(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Int16(Some(val)) => sbbf.check(val),
                         datafusion_common::ScalarValue::Int32(Some(val)) => sbbf.check(val),
                         datafusion_common::ScalarValue::Int64(Some(val)) => sbbf.check(val),
+                        // Unsigned integers
+                        datafusion_common::ScalarValue::UInt8(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::UInt16(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::UInt32(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::UInt64(Some(val)) => sbbf.check(val),
+                        // Floating point
                         datafusion_common::ScalarValue::Float32(Some(val)) => sbbf.check(val),
                         datafusion_common::ScalarValue::Float64(Some(val)) => sbbf.check(val),
+                        // String types
                         datafusion_common::ScalarValue::Utf8(Some(val)) => sbbf.check(val.as_str()),
                         datafusion_common::ScalarValue::LargeUtf8(Some(val)) => {
                             sbbf.check(val.as_str())
                         }
+                        // Binary types
                         datafusion_common::ScalarValue::Binary(Some(val)) => {
                             sbbf.check(val.as_slice())
                         }
                         datafusion_common::ScalarValue::LargeBinary(Some(val)) => {
                             sbbf.check(val.as_slice())
                         }
-                        _ => true, // Conservative for unsupported types
+                        // Date and time types
+                        datafusion_common::ScalarValue::Date32(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Date64(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Time32Second(Some(val)) => sbbf.check(val),
+                        datafusion_common::ScalarValue::Time32Millisecond(Some(val)) => {
+                            sbbf.check(val)
+                        }
+                        datafusion_common::ScalarValue::Time64Microsecond(Some(val)) => {
+                            sbbf.check(val)
+                        }
+                        datafusion_common::ScalarValue::Time64Nanosecond(Some(val)) => {
+                            sbbf.check(val)
+                        }
+                        datafusion_common::ScalarValue::TimestampSecond(Some(val), _) => {
+                            sbbf.check(val)
+                        }
+                        datafusion_common::ScalarValue::TimestampMillisecond(Some(val), _) => {
+                            sbbf.check(val)
+                        }
+                        datafusion_common::ScalarValue::TimestampMicrosecond(Some(val), _) => {
+                            sbbf.check(val)
+                        }
+                        datafusion_common::ScalarValue::TimestampNanosecond(Some(val), _) => {
+                            sbbf.check(val)
+                        }
+                        _ => {
+                            return Err(Error::InvalidInput {
+                                source: format!(
+                                    "Unsupported data type in bloom filter query: {:?}",
+                                    value
+                                )
+                                .into(),
+                                location: location!(),
+                            });
+                        }
                     };
 
                     if found {
@@ -639,6 +724,21 @@ impl BloomFilterIndexBuilder {
     fn update_stats(&mut self, array: &ArrayRef) -> Result<()> {
         if let Some(ref mut sbbf) = self.sbbf {
             let has_null = match array.data_type() {
+                // Signed integers
+                DataType::Int8 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int8Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                DataType::Int16 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int16Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
                 DataType::Int32 => {
                     let typed_array = array
                         .as_any()
@@ -653,6 +753,36 @@ impl BloomFilterIndexBuilder {
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
                 }
+                // Unsigned integers
+                DataType::UInt8 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::UInt8Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                DataType::UInt16 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::UInt16Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                DataType::UInt32 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::UInt32Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                DataType::UInt64 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::UInt64Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                // Floating point numbers
                 DataType::Float32 => {
                     let typed_array = array
                         .as_any()
@@ -664,6 +794,46 @@ impl BloomFilterIndexBuilder {
                     let typed_array = array
                         .as_any()
                         .downcast_ref::<arrow_array::Float64Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                // Date and time types (stored as i32 internally)
+                DataType::Date32 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Date32Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                DataType::Time32(_) => {
+                    // Time32 types are stored as i32, so we can treat them as Int32Arrays
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int32Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                // Date and time types (stored as i64 internally)
+                DataType::Date64 => {
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Date64Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                DataType::Time64(_) => {
+                    // Time64 types are stored as i64, so we can treat them as Int64Arrays
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
+                        .unwrap();
+                    Self::process_primitive_array(sbbf, typed_array)
+                }
+                DataType::Timestamp(_, _) => {
+                    // All timestamp types are stored as i64 internally, so we can treat them as Int64Arrays
+                    let typed_array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int64Array>()
                         .unwrap();
                     Self::process_primitive_array(sbbf, typed_array)
                 }
@@ -949,6 +1119,46 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
                 source: "A bloom filter index can only be created on a non-nested field.".into(),
                 location: location!(),
             });
+        }
+
+        // Check if the data type is supported by bloom filter
+        match field.data_type() {
+            // Signed integers
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            // Unsigned integers
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            // Floating point
+            | DataType::Float32
+            | DataType::Float64
+            // String types
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            // Binary types
+            | DataType::Binary
+            | DataType::LargeBinary
+            // Date and time types
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _) => {
+                // Type is supported, continue
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "Bloom filter index does not support data type: {:?}. Supported types: Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, Utf8, LargeUtf8, Binary, LargeBinary, Date32, Date64, Time32, Time64, Timestamp",
+                        field.data_type()
+                    ).into(),
+                    location: location!(),
+                });
+            }
         }
 
         let params = serde_json::from_str::<BloomFilterIndexBuilderParams>(params)?;

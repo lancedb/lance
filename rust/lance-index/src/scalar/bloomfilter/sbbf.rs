@@ -72,12 +72,6 @@ impl Error for SbbfError {
 
 pub type Result<T> = std::result::Result<T, SbbfError>;
 
-// We reuse the AsBytes trait from parquet crate instead of reimplementing it
-// This trait already has implementations for all common types including:
-// - All primitive types (i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, f32, f64)
-// - bool, String, &str, str, [u8], Vec<u8>
-// - Parquet-specific types like ByteArray, FixedLenByteArray, Int96, Decimal
-
 /// Salt as defined in the Parquet spec
 const SALT: [u32; 8] = [
     0x47b6137b_u32,
