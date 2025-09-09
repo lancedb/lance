@@ -192,8 +192,8 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// The MemWAL (pre-image) that should be marked as flushed after this transaction
-    MemWalIndexDetails.MemWal mem_wal_to_flush = 5;
+    /// The MemWAL (pre-image) that should be marked as merged after this transaction
+    MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
   }
   
   // An operation that updates the table config.

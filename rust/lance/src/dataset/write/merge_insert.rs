@@ -231,9 +231,9 @@ struct MergeInsertParams {
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
     retry_timeout: Duration,
-    // If set, this MemWAL should be marked as flushed, and will be committed to replace the
+    // If set, this MemWAL should be marked as merged, and will be committed to replace the
     // MemWAL that is currently in the index with the same ID.
-    mem_wal_to_flush: Option<MemWal>,
+    mem_wal_to_merge: Option<MemWal>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -320,7 +320,7 @@ impl MergeInsertBuilder {
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
                 skip_auto_cleanup: false,
             },
         })
@@ -382,9 +382,9 @@ impl MergeInsertBuilder {
         self
     }
 
-    /// Indicate that this merge-insert uses data in a sealed MemTable.
-    /// Once write is completed, the corresponding MemTable should also be marked as flushed.
-    pub async fn mark_mem_wal_as_flushed(
+    /// Indicate that this merge-insert uses data in a flushed MemTable.
+    /// Once write is completed, the corresponding MemTable should also be marked as merged.
+    pub async fn mark_mem_wal_as_merged(
         &mut self,
         mem_wal_id: MemWalId,
         expected_owner_id: &str,
@@ -396,9 +396,9 @@ impl MergeInsertBuilder {
         {
             if let Some(generations) = mem_wal_index.mem_wal_map.get(mem_wal_id.region.as_str()) {
                 if let Some(mem_wal) = generations.get(&mem_wal_id.generation) {
-                    mem_wal.check_state(lance_index::mem_wal::State::Sealed)?;
+                    mem_wal.check_state(lance_index::mem_wal::State::Flushed)?;
                     mem_wal.check_expected_owner_id(expected_owner_id)?;
-                    self.params.mem_wal_to_flush = Some(mem_wal.clone());
+                    self.params.mem_wal_to_merge = Some(mem_wal.clone());
                     Ok(self)
                 } else {
                     Err(Error::invalid_input(
@@ -1358,7 +1358,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush: self.params.mem_wal_to_flush,
+                mem_wal_to_merge: self.params.mem_wal_to_merge,
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1428,7 +1428,7 @@ impl MergeInsertJob {
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
                 fields_modified: vec![],
-                mem_wal_to_flush: self.params.mem_wal_to_flush,
+                mem_wal_to_merge: self.params.mem_wal_to_merge,
             };
 
             let affected_rows = Some(RowIdTreeMap::from(removed_row_addrs));

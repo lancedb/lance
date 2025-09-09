@@ -338,7 +338,7 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::Update {
-            mem_wal_to_flush, ..
+            mem_wal_to_merge, ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
@@ -445,13 +445,13 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateMemWalState { added, updated, .. } => {
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         added,
-                        mem_wal_to_flush.as_slice(),
+                        mem_wal_to_merge.as_slice(),
                         other_transaction,
                         other_version,
                     )?;
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         updated,
-                        mem_wal_to_flush.as_slice(),
+                        mem_wal_to_merge.as_slice(),
                         other_transaction,
                         other_version,
                     )?;
@@ -1077,9 +1077,9 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::Update {
-                    mem_wal_to_flush, ..
+                    mem_wal_to_merge, ..
                 } => {
-                    if mem_wal_to_flush.is_some() {
+                    if mem_wal_to_merge.is_some() {
                         // TODO: This check could be more detailed, there is an assumption that
                         //  once a MemWAL is sealed, there is no other operation that could change
                         //  the state back to open, and at that point it can always be flushed.
@@ -1588,7 +1588,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
-            mem_wal_to_flush: None,
+            mem_wal_to_merge: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1597,7 +1597,7 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1609,7 +1609,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1708,7 +1708,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1720,7 +1720,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
         ];
         let transactions =
@@ -1839,7 +1839,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 },
             ),
             (
@@ -1849,7 +1849,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 },
             ),
             (
@@ -2004,7 +2004,7 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
             Operation::UpdateConfig {
                 upsert_values: Some(HashMap::from_iter(vec![(
@@ -2196,7 +2196,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 },
                 [
                     Compatible,    // append
