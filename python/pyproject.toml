@@ -54,6 +54,7 @@ tests = [
     "pillow",
     "pandas",
     "polars[pyarrow,pandas]",
+    "psutil",
     "pytest",
     # Workardound for https://github.com/lancedb/lance/issues/4472
     #
