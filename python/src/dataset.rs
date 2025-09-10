@@ -213,6 +213,11 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.use_index(use_index);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
