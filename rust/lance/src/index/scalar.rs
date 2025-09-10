@@ -355,7 +355,7 @@ pub async fn open_scalar_index(
         .for_index(&uuid_str, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
     plugin
-        .load_index(index_store, &index_details, frag_reuse_index, index_cache)
+        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
         .await
 }
 

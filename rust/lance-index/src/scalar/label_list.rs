@@ -70,7 +70,7 @@ impl LabelListIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         BitmapIndex::load(store, frag_reuse_index, index_cache)
             .await
@@ -442,7 +442,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             LabelListIndex::load(index_store, frag_reuse_index, cache).await?

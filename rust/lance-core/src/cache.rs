@@ -395,6 +395,7 @@ impl WeakLanceCache {
             cache.insert((key, TypeId::of::<T>()), record).await;
             true
         } else {
+            log::warn!("WeakLanceCache: cache no longer available, unable to insert item");
             false
         }
     }
@@ -410,20 +411,53 @@ impl WeakLanceCache {
             let full_key = self.get_key(key);
             let cache_key = (full_key.clone(), TypeId::of::<T>());
 
-            // First check if the item exists in cache
-            if let Some(record) = cache.get(&cache_key).await {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(record.record.clone().downcast::<T>().unwrap());
-            }
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            // Use optionally_get_with to handle concurrent requests properly
+            let hits = self.hits.clone();
+            let misses = self.misses.clone();
 
-            // Not in cache, compute and insert
-            let value = f().await?;
-            let value = Arc::new(value);
-            let record = SizedRecord::new(value.clone());
-            cache.insert(cache_key, record).await;
-            Ok(value)
+            // Track whether init was run (for metrics)
+            let (init_run_tx, mut init_run_rx) = tokio::sync::oneshot::channel();
+            let (error_tx, error_rx) = tokio::sync::oneshot::channel();
+
+            let init = Box::pin(async move {
+                let _ = init_run_tx.send(());
+                misses.fetch_add(1, Ordering::Relaxed);
+                match f().await {
+                    Ok(value) => Some(SizedRecord::new(Arc::new(value))),
+                    Err(e) => {
+                        let _ = error_tx.send(e);
+                        None
+                    }
+                }
+            });
+
+            match cache.optionally_get_with(cache_key, init).await {
+                Some(record) => {
+                    // Check if init was run or if this was a cache hit
+                    match init_run_rx.try_recv() {
+                        Ok(()) => {
+                            // Init was run, miss was already recorded
+                        }
+                        Err(_) => {
+                            // Init was not run, this was a cache hit
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(record.record.clone().downcast::<T>().unwrap())
+                }
+                None => {
+                    // Init returned None, which means there was an error
+                    match error_rx.await {
+                        Ok(e) => Err(e),
+                        Err(_) => Err(crate::Error::Internal {
+                            message: "Failed to receive error from cache init function".to_string(),
+                            location: location!(),
+                        }),
+                    }
+                }
+            }
         } else {
+            log::warn!("WeakLanceCache: cache no longer available, computing without caching");
             f().await.map(Arc::new)
         }
     }
@@ -495,6 +529,8 @@ impl WeakLanceCache {
             let key = self.get_key(key);
             let record = SizedRecord::new(Arc::new(value));
             cache.insert((key, TypeId::of::<Arc<T>>()), record).await;
+        } else {
+            log::warn!("WeakLanceCache: cache no longer available, unable to insert unsized item");
         }
     }
 

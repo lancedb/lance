@@ -394,7 +394,7 @@ pub mod tests {
                 index_store,
                 &default_details::<crate::pb::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -459,7 +459,7 @@ pub mod tests {
                 index_store,
                 &default_details::<crate::pb::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -486,7 +486,7 @@ pub mod tests {
                 updated_index_store,
                 &default_details::<crate::pb::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -574,7 +574,7 @@ pub mod tests {
                 index_store,
                 &default_details::<crate::pb::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -818,7 +818,7 @@ pub mod tests {
                     index_store,
                     &default_details::<crate::pb::BTreeIndexDetails>(),
                     None,
-                    LanceCache::no_cache(),
+                    &LanceCache::no_cache(),
                 )
                 .await
                 .unwrap();
@@ -877,7 +877,7 @@ pub mod tests {
                 index_store,
                 &default_details::<crate::pb::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -954,7 +954,7 @@ pub mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -996,7 +996,7 @@ pub mod tests {
             .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1093,7 +1093,7 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1281,7 +1281,7 @@ pub mod tests {
             .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1299,7 +1299,7 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store, None, LanceCache::no_cache())
+        let updated_index = BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1326,7 +1326,7 @@ pub mod tests {
             .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1349,7 +1349,7 @@ pub mod tests {
             .remap(&mapping, remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store, None, LanceCache::no_cache())
+        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1441,7 +1441,7 @@ pub mod tests {
                         index_store,
                         &default_details::<crate::pb::LabelListIndexDetails>(),
                         None,
-                        LanceCache::no_cache(),
+                        &LanceCache::no_cache(),
                     )
                     .await
                     .unwrap();

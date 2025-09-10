@@ -848,7 +848,7 @@ impl BTreeIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
@@ -862,7 +862,7 @@ impl BTreeIndex {
                 map,
                 null_pages,
                 store,
-                WeakLanceCache::from(&index_cache),
+                WeakLanceCache::from(index_cache),
                 sub_index,
                 batch_size,
                 frag_reuse_index,
@@ -922,7 +922,7 @@ impl BTreeIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
         let num_rows_in_lookup = page_lookup_file.num_rows();
@@ -1559,7 +1559,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
@@ -1640,7 +1640,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1659,7 +1659,7 @@ mod tests {
             .await
             .unwrap();
 
-        let remap_index = BTreeIndex::load(remap_store.clone(), None, LanceCache::no_cache())
+        let remap_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1723,7 +1723,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store, None, LanceCache::no_cache())
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1764,8 +1764,10 @@ mod tests {
             .await
             .unwrap();
 
-        let cache = lance_core::cache::LanceCache::with_capacity(100 * 1024 * 1024);
-        let index = BTreeIndex::load(test_store, None, cache).await.unwrap();
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
 
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
         let metrics = LocalMetricsCollector::default();

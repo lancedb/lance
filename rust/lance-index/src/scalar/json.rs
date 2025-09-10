@@ -815,7 +815,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let registry = self.registry().unwrap();
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
