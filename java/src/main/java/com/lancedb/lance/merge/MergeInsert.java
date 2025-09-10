@@ -136,9 +136,9 @@ public class MergeInsert {
   /**
    * Set number of times to retry the operation if there is contention.
    *
-   * <p>If this is set > 0, then the operation will keep a copy of the input data either in memory
-   * or on disk (depending on the size of the data) and will retry the operation if there is
-   * contention.
+   * <p>If this is set greater than 0, then the operation will keep a copy of the input data either
+   * in memory or on disk (depending on the size of the data) and will retry the operation if there
+   * is contention.
    *
    * <p>Default is 10.
    *
