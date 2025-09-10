@@ -20,8 +20,7 @@ import java.util.Optional;
 
 /** Column alteration used to alter dataset columns. */
 public class ColumnAlteration {
-
-  private String path;
+  private final String path;
   private Optional<String> rename;
   private Optional<Boolean> nullable;
   private Optional<ArrowType> dataType;

@@ -25,6 +25,7 @@ import java.util.Objects;
  * lance/rust/lance/src/dataset/transaction.rs.
  */
 public class RewriteGroup {
+
   private final List<FragmentMetadata> oldFragments;
   private final List<FragmentMetadata> newFragments;
 
@@ -33,11 +34,11 @@ public class RewriteGroup {
     this.newFragments = newFragments;
   }
 
-  public List<FragmentMetadata> getOldFragments() {
+  public List<FragmentMetadata> oldFragments() {
     return oldFragments;
   }
 
-  public List<FragmentMetadata> getNewFragments() {
+  public List<FragmentMetadata> newFragments() {
     return newFragments;
   }
 

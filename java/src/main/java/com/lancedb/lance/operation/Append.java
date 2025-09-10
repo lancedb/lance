@@ -22,7 +22,6 @@ import java.util.List;
 import java.util.Objects;
 
 public class Append implements Operation {
-
   private final List<FragmentMetadata> fragments;
 
   private Append(List<FragmentMetadata> fragments) {

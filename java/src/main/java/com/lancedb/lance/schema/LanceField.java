@@ -25,7 +25,6 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class LanceField {
-
   private final int id;
   private final int parentId;
   private final String name;

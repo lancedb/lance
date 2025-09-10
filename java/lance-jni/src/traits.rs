@@ -149,6 +149,27 @@ pub fn import_vec<'local>(env: &mut JNIEnv<'local>, obj: &JObject) -> Result<Vec
     Ok(ret)
 }
 
+pub fn import_vec_from_method<T, F>(
+    env: &mut JNIEnv<'_>,
+    java_obj: &JObject<'_>,
+    method_name: &str,
+    mut extractor: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&mut JNIEnv<'_>, JObject<'_>) -> Result<T>,
+{
+    let list_obj = env
+        .call_method(java_obj, method_name, "()Ljava/util/List;", &[])?
+        .l()?;
+
+    let java_items = import_vec(env, &list_obj)?;
+    let mut result = Vec::with_capacity(java_items.len());
+    for item in java_items {
+        result.push(extractor(env, item)?);
+    }
+    Ok(result)
+}
+
 pub struct JLance<T>(pub T);
 
 impl IntoJava for JLance<Vec<i32>> {
@@ -174,6 +195,12 @@ impl IntoJava for JLance<i64> {
 impl IntoJava for &JLance<i64> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         Ok(env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(self.0)])?)
+    }
+}
+
+impl IntoJava for &String {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        Ok(env.new_string(self)?.into())
     }
 }
 
@@ -204,6 +231,13 @@ impl FromJObjectWithEnv<Vec<i32>> for JIntArray<'_> {
         let len = env.get_array_length(self)?;
         let mut ret: Vec<i32> = vec![0; len as usize];
         env.get_int_array_region(self, 0, ret.as_mut_slice())?;
+        Ok(ret)
+    }
+}
+
+impl FromJObjectWithEnv<i32> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<i32> {
+        let ret = env.call_method(self, "intValue", "()I", &[])?.i()?;
         Ok(ret)
     }
 }

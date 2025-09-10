@@ -24,6 +24,7 @@ import java.util.UUID;
  * Rust RewrittenIndex struct in lance/rust/lance/src/dataset/transaction.rs.
  */
 public class RewrittenIndex {
+
   private final UUID oldId;
   private final UUID newId;
   private final String newIndexDetailsTypeUrl;

@@ -20,6 +20,7 @@ import com.google.common.base.MoreObjects;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Rewrite operation for reorganizing data without changing content. This operation rewrites the
@@ -27,16 +28,15 @@ import java.util.Objects;
  * addresses of existing rows, so indices that cover rewritten fragments need to be remapped.
  */
 public class Rewrite implements Operation {
-
   private final List<RewriteGroup> groups;
   private final List<RewrittenIndex> rewrittenIndices;
-  private final Index fragReuseIndex;
+  private final Optional<Index> fragReuseIndex;
 
   private Rewrite(
       List<RewriteGroup> groups, List<RewrittenIndex> rewrittenIndices, Index fragReuseIndex) {
     this.groups = groups != null ? groups : new ArrayList<>();
     this.rewrittenIndices = rewrittenIndices != null ? rewrittenIndices : new ArrayList<>();
-    this.fragReuseIndex = fragReuseIndex;
+    this.fragReuseIndex = Optional.ofNullable(fragReuseIndex);
   }
 
   @Override
@@ -67,7 +67,7 @@ public class Rewrite implements Operation {
    *
    * @return the fragment reuse index
    */
-  public Index fragReuseIndex() {
+  public Optional<Index> fragReuseIndex() {
     return fragReuseIndex;
   }
 

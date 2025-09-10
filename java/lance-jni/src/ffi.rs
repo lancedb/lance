@@ -65,6 +65,8 @@ pub trait JNIEnvExt {
     fn get_vec_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<f32>>;
     // Get int as usize from Java Object with given method name.
     fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize>;
+    // Get u64 int from Java Object with given method name.
+    fn get_u64_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u64>;
     // Get boolean from Java Object with given method name.
     fn get_boolean_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<bool>;
     // Get Option<uszie> from Java Object Optional<Integer> with given method name.
@@ -94,6 +96,12 @@ pub trait JNIEnvExt {
     where
         T: TryFrom<i32>,
         <T as TryFrom<i32>>::Error: std::fmt::Debug;
+
+    fn get_optional_string_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<String>>;
 
     fn get_optional_from_method<T, F>(
         &mut self,
@@ -256,8 +264,20 @@ impl JNIEnvExt for JNIEnv<'_> {
         Ok(self.call_method(obj, method_name, "()I", &[])?.i()? as usize)
     }
 
+    fn get_u64_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u64> {
+        Ok(self.call_method(obj, method_name, "()J", &[])?.j()? as u64)
+    }
+
     fn get_boolean_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<bool> {
         Ok(self.call_method(obj, method_name, "()Z", &[])?.z()?)
+    }
+
+    fn get_optional_usize_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<usize>> {
+        self.get_optional_integer_from_method(obj, method_name)
     }
 
     fn get_optional_i32_from_method(
@@ -273,14 +293,6 @@ impl JNIEnvExt for JNIEnv<'_> {
         obj: &JObject,
         method_name: &str,
     ) -> Result<Option<u32>> {
-        self.get_optional_integer_from_method(obj, method_name)
-    }
-
-    fn get_optional_usize_from_method(
-        &mut self,
-        obj: &JObject,
-        method_name: &str,
-    ) -> Result<Option<usize>> {
         self.get_optional_integer_from_method(obj, method_name)
     }
 
@@ -311,6 +323,18 @@ impl JNIEnvExt for JNIEnv<'_> {
             None
         };
         Ok(rust_obj)
+    }
+
+    fn get_optional_string_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<String>> {
+        self.get_optional_from_method(obj, method_name, |env, str_object| {
+            let jstring = JString::from(str_object);
+            let rust_string = env.get_string(&jstring)?.into();
+            Ok(rust_string)
+        })
     }
 
     fn get_optional_from_method<T, F>(
