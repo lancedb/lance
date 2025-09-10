@@ -91,7 +91,7 @@ fn bench_ngram(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
     let details = prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(NGramIndexPlugin.load_index(store, &details, None, LanceCache::no_cache()))
+        .block_on(NGramIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
