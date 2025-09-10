@@ -44,6 +44,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::NullEquality;
+use datafusion::error::DataFusionError;
 use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
@@ -140,6 +141,50 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
         vec![Arc::new(source), Arc::new(target)],
     )
     .unwrap()
+}
+
+/// Create duplicate rows error via extracting "on" column values from the given RecordBatch.
+fn create_duplicate_row_error(
+    batch: &RecordBatch,
+    row_idx: usize,
+    on_columns: &[String],
+) -> DataFusionError {
+    let mut on_values = Vec::new();
+
+    for col_name in on_columns {
+        if let Some(col_idx) = batch.schema().column_with_name(col_name) {
+            let column = batch.column(col_idx.0);
+            let value_str = if column.is_null(row_idx) {
+                "NULL".to_string()
+            } else {
+                // Convert the value to string representation
+                match ScalarValue::try_from_array(column, row_idx) {
+                    Ok(scalar_value) => match &scalar_value {
+                        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+                            format!("\"{}\"", s)
+                        }
+                        _ => scalar_value.to_string(),
+                    },
+                    Err(_) => format!("<{:?}>", column.data_type()),
+                }
+            };
+            on_values.push(format!("{} = {}", col_name, value_str));
+        }
+    }
+
+    let on_values_str = if on_values.is_empty() {
+        "<unable to extract on column values>".to_string()
+    } else {
+        on_values.join(", ")
+    };
+
+    DataFusionError::Execution(
+        format!(
+            "Ambiguous merge insert: multiple source rows match the same target row on ({}). \
+                                This could lead to data corruption. Please ensure each target row is matched by at most one source row.",
+            on_values_str
+        )
+    )
 }
 
 /// Describes how rows should be handled when there is no matching row in the source table
@@ -1690,6 +1735,8 @@ struct Merger {
     output_schema: Arc<Schema>,
     /// Whether to enable stable row ids
     enable_stable_row_ids: bool,
+    /// Set to track processed row IDs to detect duplicates
+    processed_row_ids: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl Merger {
@@ -1745,6 +1792,7 @@ impl Merger {
             with_row_addr,
             output_schema,
             enable_stable_row_ids,
+            processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -1866,6 +1914,19 @@ impl Merger {
             // the batch at all.  Writing an empty batch currently panics
             if matched.num_rows() > 0 {
                 let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
+
+                let mut processed_row_ids = self.processed_row_ids.lock().unwrap();
+                for (row_idx, &row_id) in row_ids.values().iter().enumerate() {
+                    if !processed_row_ids.insert(row_id) {
+                        return Err(create_duplicate_row_error(
+                            &matched,
+                            row_idx,
+                            &self.params.on,
+                        ));
+                    }
+                }
+                drop(processed_row_ids);
+
                 deleted_row_ids.extend(row_ids.values());
                 if self.enable_stable_row_ids {
                     self.updating_row_ids
@@ -4289,5 +4350,73 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 _ => panic!("Unexpected id: {}", id_col.value(i)),
             }
         }
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_duplicate_rowid_detection(
+        #[values(false, true)] is_full_schema: bool,
+        #[values(true, false)] enable_stable_row_ids: bool,
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_uri = "memory://test_duplicate_rowid_multi_fragment.lance";
+
+        // Create initial dataset with multiple fragments to test cross-fragment duplicate detection
+        let dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(1, 1))
+            .col("value", array::step_custom::<UInt32Type>(10, 10))
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount(3),
+                FragmentRowCount(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    enable_stable_row_ids,
+                    data_storage_version: Some(data_storage_version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 3, "Should have 3 fragments");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, is_full_schema),
+            Field::new("value", DataType::UInt32, is_full_schema),
+        ]));
+
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![2, 2, 6, 6, 10, 10, 15])),
+                Arc::new(UInt32Array::from(vec![100, 200, 300, 400, 500, 600, 700])),
+            ],
+        )
+        .unwrap();
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+
+        let reader = Box::new(RecordBatchIterator::new([Ok(source_batch)], schema.clone()));
+        let stream = reader_to_stream(reader);
+
+        let result = job.execute(stream).await;
+
+        assert!(
+            result.is_err(),
+            "Expected merge insert to fail due to duplicate rows on key column."
+        );
+
+        let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Ambiguous merge insert") && error_msg.contains("multiple source rows"),
+            "Expected error message to mention ambiguous merge insert and multiple source rows, got: {}",
+            error_msg
+        );
     }
 }
