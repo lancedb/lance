@@ -1470,7 +1470,6 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     async fn initialize_index(&mut self, source_dataset: &Dataset, index_name: &str) -> Result<()> {
-        // Load indices with the specified name from the source dataset
         let source_indices = source_dataset.load_indices_by_name(index_name).await?;
 
         if source_indices.is_empty() {
@@ -1480,7 +1479,6 @@ impl DatasetIndexInternalExt for Dataset {
             });
         }
 
-        // Find the oldest (original) index by created_at timestamp, not delta indices
         let source_index = source_indices
             .iter()
             .min_by_key(|idx| idx.created_at)
@@ -1489,7 +1487,6 @@ impl DatasetIndexInternalExt for Dataset {
                 location: location!(),
             })?;
 
-        // Check that ALL fields from the source index exist in the target dataset
         let mut field_names = Vec::new();
         for field_id in source_index.fields.iter() {
             let source_field = source_dataset
@@ -1500,7 +1497,6 @@ impl DatasetIndexInternalExt for Dataset {
                     location: location!(),
                 })?;
 
-            // Check if the field exists in the current dataset
             let target_field =
                 self.schema()
                     .field(&source_field.name)
@@ -1512,7 +1508,6 @@ impl DatasetIndexInternalExt for Dataset {
                         location: location!(),
                     })?;
 
-            // Verify field types match
             if source_field.data_type() != target_field.data_type() {
                 return Err(Error::Index {
                     message: format!(
@@ -1536,8 +1531,6 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let column_name = field_names[0].as_str();
-
-        // Determine index type from index details
         if let Some(index_details) = &source_index.index_details {
             let index_details_wrapper = IndexDetails(index_details.clone());
 
