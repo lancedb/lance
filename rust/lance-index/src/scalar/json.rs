@@ -94,7 +94,7 @@ impl Index for JsonIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        todo!()
+        self.target_index.statistics()
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
@@ -971,5 +971,44 @@ mod tests {
                 .unwrap();
 
         assert_eq!(inferred_type, DataType::Utf8);
+    }
+
+    #[tokio::test]
+    async fn test_json_index_statistics() {
+        use crate::scalar::{btree::BTreeIndex, flat::FlatIndex};
+        use arrow_array::{Int32Array, UInt64Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Create a simple flat index as the target
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+
+        let values = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let row_ids = UInt64Array::from(vec![0, 1, 2, 3, 4]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(values) as ArrayRef, Arc::new(row_ids) as ArrayRef],
+        )
+        .unwrap();
+
+        let flat_index = FlatIndex::try_from(Box::new(batch)).unwrap();
+        let target_index: Arc<dyn Index> = Arc::new(flat_index);
+
+        // Create JSON index wrapping the flat index
+        let json_index = JsonIndex::new(target_index.clone(), "$.test_path".to_string());
+
+        // Get statistics from both indexes
+        let target_stats = target_index.statistics().unwrap();
+        let json_stats = json_index.statistics().unwrap();
+
+        // Statistics should be identical since JsonIndex delegates to target
+        assert_eq!(json_stats, target_stats);
+        
+        // Check that we actually get valid statistics
+        assert!(json_stats.get("num_values").is_some());
     }
 }
