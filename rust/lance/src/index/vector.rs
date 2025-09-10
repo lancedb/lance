@@ -1117,7 +1117,7 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
 }
 
 /// Create PQ build parameters from a ProductQuantizer
-/// TODO: support deriving all the original parameters
+/// TODO: support consistently deriving all the original parameters
 fn derive_pq_params(pq_quantizer: &ProductQuantizer) -> PQBuildParams {
     PQBuildParams {
         num_sub_vectors: pq_quantizer.num_sub_vectors,
@@ -1130,7 +1130,7 @@ fn derive_pq_params(pq_quantizer: &ProductQuantizer) -> PQBuildParams {
 }
 
 /// Create SQ build parameters from a ScalarQuantizer
-/// TODO: support deriving all the original parameters
+/// TODO: support consistently deriving all the original parameters
 fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
     SQBuildParams {
         num_bits: sq_quantizer.num_bits(),
@@ -1140,6 +1140,7 @@ fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
 
 /// Extract HNSW build parameters from the source vector index statistics.
 /// Returns default parameters if extraction fails.
+/// TODO: support consistently deriving all the original parameters
 fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
     let default_params = HnswBuildParams {
         max_level: 4,
@@ -1158,18 +1159,19 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
         None => return default_params,
     };
 
-    if let Some(hnsw_params) = sub_index.get("hnsw_params") {
-        let max_level = hnsw_params
+    // Extract HNSW parameters from sub_index.params
+    if let Some(params) = sub_index.get("params") {
+        let max_level = params
             .get("max_level")
             .and_then(|v| v.as_u64())
             .map(|v| v as u16)
             .unwrap_or(4);
-        let m = hnsw_params
+        let m = params
             .get("m")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(20);
-        let ef_construction = hnsw_params
+        let ef_construction = params
             .get("ef_construction")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
@@ -1181,34 +1183,6 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
             ef_construction,
             prefetch_distance: None,
         };
-    } else if let Some(metadata_array) = sub_index.as_array() {
-        // For some indices, the metadata might be an array of partition metadata
-        if let Some(first_partition) = metadata_array.first() {
-            if let Some(params) = first_partition.get("params") {
-                let max_level = params
-                    .get("max_level")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u16)
-                    .unwrap_or(4);
-                let m = params
-                    .get("m")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(20);
-                let ef_construction = params
-                    .get("ef_construction")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(100);
-
-                return HnswBuildParams {
-                    max_level,
-                    m,
-                    ef_construction,
-                    prefetch_distance: None,
-                };
-            }
-        }
     }
 
     default_params
@@ -1379,37 +1353,41 @@ mod tests {
             panic!("Both source and target should have centroids");
         }
 
+        // Verify IVF parameters are correctly derived
+        let source_ivf_params = derive_ivf_params(source_ivf_model);
+        let target_ivf_params = derive_ivf_params(target_ivf_model);
         assert_eq!(
-            source_ivf_model.num_partitions(),
-            10,
+            source_ivf_params.num_partitions, target_ivf_params.num_partitions,
+            "IVF num_partitions should match"
+        );
+        assert_eq!(
+            target_ivf_params.num_partitions,
+            Some(10),
             "Should have 10 partitions as configured"
         );
 
-        // Check PQ parameters in sub_index
-        let sub_index = stats
-            .get("sub_index")
-            .and_then(|v| v.as_object())
-            .expect("IVF_PQ index should have sub_index");
+        // Verify PQ parameters are correctly derived
+        let source_quantizer = source_vector_index.quantizer();
+        let target_quantizer = target_vector_index.quantizer();
+        let source_pq: ProductQuantizer = source_quantizer.try_into().unwrap();
+        let target_pq: ProductQuantizer = target_quantizer.try_into().unwrap();
+
+        let source_pq_params = derive_pq_params(&source_pq);
+        let target_pq_params = derive_pq_params(&target_pq);
+
         assert_eq!(
-            sub_index.get("index_type").and_then(|v| v.as_str()),
-            Some("PQ"),
-            "Sub-index type should be PQ"
+            source_pq_params.num_sub_vectors, target_pq_params.num_sub_vectors,
+            "PQ num_sub_vectors should match"
         );
         assert_eq!(
-            sub_index.get("nbits").and_then(|v| v.as_u64()),
-            Some(8),
-            "PQ should use 8 bits"
+            source_pq_params.num_bits, target_pq_params.num_bits,
+            "PQ num_bits should match"
         );
         assert_eq!(
-            sub_index.get("num_sub_vectors").and_then(|v| v.as_u64()),
-            Some(16),
+            target_pq_params.num_sub_vectors, 16,
             "PQ should have 16 sub vectors"
         );
-        assert_eq!(
-            sub_index.get("metric_type").and_then(|v| v.as_str()),
-            Some("l2"),
-            "PQ metric type should be L2"
-        );
+        assert_eq!(target_pq_params.num_bits, 8, "PQ should use 8 bits");
 
         // Verify the index is functional by performing a search
         let query_vector = lance_datagen::gen_batch()
@@ -1589,9 +1567,16 @@ mod tests {
             panic!("Both source and target should have centroids");
         }
 
+        // Verify IVF parameters are correctly derived
+        let source_ivf_params = derive_ivf_params(source_ivf_model);
+        let target_ivf_params = derive_ivf_params(target_ivf_model);
         assert_eq!(
-            source_ivf_model.num_partitions(),
-            8,
+            source_ivf_params.num_partitions, target_ivf_params.num_partitions,
+            "IVF num_partitions should match"
+        );
+        assert_eq!(
+            target_ivf_params.num_partitions,
+            Some(8),
             "Should have 8 partitions as configured"
         );
 
@@ -2005,26 +1990,32 @@ mod tests {
             panic!("Both source and target should have centroids");
         }
 
+        // Verify IVF parameters are correctly derived
+        let source_ivf_params = derive_ivf_params(source_ivf_model);
+        let target_ivf_params = derive_ivf_params(target_ivf_model);
         assert_eq!(
-            source_ivf_model.num_partitions(),
-            6,
+            source_ivf_params.num_partitions, target_ivf_params.num_partitions,
+            "IVF num_partitions should match"
+        );
+        assert_eq!(
+            target_ivf_params.num_partitions,
+            Some(6),
             "Should have 6 partitions as configured"
         );
 
-        // Check SQ parameters in sub_index
-        let sub_index = stats
-            .get("sub_index")
-            .and_then(|v| v.as_object())
-            .expect("IVF_SQ index should have sub_index");
+        // Verify SQ parameters are correctly derived
+        let source_quantizer = source_vector_index.quantizer();
+        let target_quantizer = target_vector_index.quantizer();
+        let source_sq: ScalarQuantizer = source_quantizer.try_into().unwrap();
+        let target_sq: ScalarQuantizer = target_quantizer.try_into().unwrap();
+
+        let source_sq_params = derive_sq_params(&source_sq);
+        let target_sq_params = derive_sq_params(&target_sq);
+
         assert_eq!(
-            sub_index.get("index_type").and_then(|v| v.as_str()),
-            Some("SQ"),
-            "Sub-index type should be SQ"
+            source_sq_params.num_bits, target_sq_params.num_bits,
+            "SQ num_bits should match"
         );
-        // SQ specific parameters like num_bits might be available
-        if let Some(num_bits) = sub_index.get("num_bits").and_then(|v| v.as_u64()) {
-            assert!(num_bits > 0, "SQ should have positive num_bits");
-        }
 
         // Verify the index is functional
         let query_vector = lance_datagen::gen_batch()
@@ -2229,6 +2220,57 @@ mod tests {
             "PQ should have 8 sub vectors"
         );
 
+        // Verify IVF parameters are correctly derived
+        let source_ivf_params = derive_ivf_params(source_ivf_model);
+        let target_ivf_params = derive_ivf_params(target_ivf_model);
+        assert_eq!(
+            source_ivf_params.num_partitions, target_ivf_params.num_partitions,
+            "IVF num_partitions should match"
+        );
+        assert_eq!(
+            target_ivf_params.num_partitions,
+            Some(8),
+            "Should have 8 partitions as configured"
+        );
+
+        // Verify PQ parameters are correctly derived
+        let source_quantizer = source_vector_index.quantizer();
+        let target_quantizer = target_vector_index.quantizer();
+        let source_pq: ProductQuantizer = source_quantizer.try_into().unwrap();
+        let target_pq: ProductQuantizer = target_quantizer.try_into().unwrap();
+
+        let source_pq_params = derive_pq_params(&source_pq);
+        let target_pq_params = derive_pq_params(&target_pq);
+
+        assert_eq!(
+            source_pq_params.num_sub_vectors, target_pq_params.num_sub_vectors,
+            "PQ num_sub_vectors should match"
+        );
+        assert_eq!(
+            source_pq_params.num_bits, target_pq_params.num_bits,
+            "PQ num_bits should match"
+        );
+        assert_eq!(
+            target_pq_params.num_sub_vectors, 8,
+            "PQ should have 8 sub vectors"
+        );
+        assert_eq!(target_pq_params.num_bits, 8, "PQ should use 8 bits");
+
+        // Verify HNSW parameters are extracted and used correctly
+        let derived_hnsw_params = derive_hnsw_params(target_vector_index.as_ref());
+        assert_eq!(
+            derived_hnsw_params.max_level, 6,
+            "HNSW max_level should be extracted as 6 from source index"
+        );
+        assert_eq!(
+            derived_hnsw_params.m, 24,
+            "HNSW m should be extracted as 24 from source index"
+        );
+        assert_eq!(
+            derived_hnsw_params.ef_construction, 120,
+            "HNSW ef_construction should be extracted as 120 from source index"
+        );
+
         // Verify the index is functional by performing a search
         let query_vector = lance_datagen::gen_batch()
             .anon_col(array::rand_vec::<Float32Type>(32.into()))
@@ -2392,6 +2434,49 @@ mod tests {
             sub_index.get("num_bits").and_then(|v| v.as_u64()),
             Some(8),
             "SQ should use 8 bits"
+        );
+
+        // Verify IVF parameters are correctly derived
+        let source_ivf_params = derive_ivf_params(source_ivf_model);
+        let target_ivf_params = derive_ivf_params(target_ivf_model);
+        assert_eq!(
+            source_ivf_params.num_partitions, target_ivf_params.num_partitions,
+            "IVF num_partitions should match"
+        );
+        assert_eq!(
+            target_ivf_params.num_partitions,
+            Some(6),
+            "Should have 6 partitions as configured"
+        );
+
+        // Verify SQ parameters are correctly derived
+        let source_quantizer = source_vector_index.quantizer();
+        let target_quantizer = target_vector_index.quantizer();
+        let source_sq: ScalarQuantizer = source_quantizer.try_into().unwrap();
+        let target_sq: ScalarQuantizer = target_quantizer.try_into().unwrap();
+
+        let source_sq_params = derive_sq_params(&source_sq);
+        let target_sq_params = derive_sq_params(&target_sq);
+
+        assert_eq!(
+            source_sq_params.num_bits, target_sq_params.num_bits,
+            "SQ num_bits should match"
+        );
+        assert_eq!(target_sq_params.num_bits, 8, "SQ should use 8 bits");
+
+        // Verify HNSW parameters are extracted and used correctly
+        let derived_hnsw_params = derive_hnsw_params(target_vector_index.as_ref());
+        assert_eq!(
+            derived_hnsw_params.max_level, 5,
+            "HNSW max_level should be extracted as 5 from source index"
+        );
+        assert_eq!(
+            derived_hnsw_params.m, 16,
+            "HNSW m should be extracted as 16 from source index"
+        );
+        assert_eq!(
+            derived_hnsw_params.ef_construction, 80,
+            "HNSW ef_construction should be extracted as 80 from source index"
         );
 
         // Verify the index is functional by performing a search
