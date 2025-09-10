@@ -75,13 +75,13 @@ pub struct BitmapIndex {
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
 
-/// Cache key for bitmap values
+/// Cache key for bitmap entries
 #[derive(Debug, Clone)]
-pub struct BitmapValueKey {
+pub struct BitmapKey {
     value: OrderableScalarValue,
 }
 
-impl CacheKey for BitmapValueKey {
+impl CacheKey for BitmapKey {
     type ValueType = RowIdTreeMap;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
@@ -136,7 +136,6 @@ impl BitmapIndex {
         let mut value_type: Option<DataType> = None;
         let mut global_row_idx = 0;
 
-        // Single pass: Read both metadata and null bitmap data
         for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
             let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
             let chunk = page_lookup_file
@@ -204,7 +203,7 @@ impl BitmapIndex {
         }
 
         // Check cache first for non-null values
-        let cache_key = BitmapValueKey { value: key.clone() };
+        let cache_key = BitmapKey { value: key.clone() };
 
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
             return Ok(cached);
@@ -285,7 +284,7 @@ impl BitmapIndex {
                 }
 
                 let key = OrderableScalarValue(scalar_value);
-                let cache_key = BitmapValueKey { value: key.clone() };
+                let cache_key = BitmapKey { value: key.clone() };
 
                 // Check if already cached to avoid redundant work
                 if self.index_cache.get_with_key(&cache_key).await.is_some() {
@@ -394,7 +393,7 @@ impl Index for BitmapIndex {
                 }
 
                 // Force insert into cache (will overwrite if exists)
-                let cache_key = BitmapValueKey { value: key };
+                let cache_key = BitmapKey { value: key };
                 self.index_cache
                     .insert_with_key(&cache_key, Arc::new(bitmap))
                     .await;
@@ -1064,19 +1063,19 @@ pub mod tests {
             .unwrap();
 
         // Verify no bitmaps are cached yet
-        let cache_key_red = BitmapValueKey {
+        let cache_key_red = BitmapKey {
             value: OrderableScalarValue(ScalarValue::Utf8(Some("red".to_string()))),
         };
-        let cache_key_blue = BitmapValueKey {
+        let cache_key_blue = BitmapKey {
             value: OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string()))),
         };
 
         assert!(cache
-            .get_with_key::<BitmapValueKey>(&cache_key_red)
+            .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .is_none());
         assert!(cache
-            .get_with_key::<BitmapValueKey>(&cache_key_blue)
+            .get_with_key::<BitmapKey>(&cache_key_blue)
             .await
             .is_none());
 
@@ -1085,17 +1084,17 @@ pub mod tests {
 
         // Verify all bitmaps are now cached
         assert!(cache
-            .get_with_key::<BitmapValueKey>(&cache_key_red)
+            .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .is_some());
         assert!(cache
-            .get_with_key::<BitmapValueKey>(&cache_key_blue)
+            .get_with_key::<BitmapKey>(&cache_key_blue)
             .await
             .is_some());
 
         // Verify cached bitmaps have correct content
         let cached_red = cache
-            .get_with_key::<BitmapValueKey>(&cache_key_red)
+            .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .unwrap();
         let red_rows: Vec<u64> = cached_red.row_ids().unwrap().map(u64::from).collect();
@@ -1106,7 +1105,7 @@ pub mod tests {
 
         // Verify cache still contains the same items
         let cached_red_2 = cache
-            .get_with_key::<BitmapValueKey>(&cache_key_red)
+            .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .unwrap();
         let red_rows_2: Vec<u64> = cached_red_2.row_ids().unwrap().map(u64::from).collect();
