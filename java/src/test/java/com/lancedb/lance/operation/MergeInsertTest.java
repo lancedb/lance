@@ -54,17 +54,16 @@ public class MergeInsertTest extends OperationTestBase {
       int rowCount = 5;
       try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
 
-        VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
-        ArrowArrayStream sourceStream = convertToStream(source, allocator);
-        MergeInsertResult result =
-            initialDataset.mergeInsert(new MergeInsert(Arrays.asList("id")), sourceStream);
+        try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+          try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+            MergeInsertResult result =
+                initialDataset.mergeInsert(new MergeInsert(Arrays.asList("id")), sourceStream);
 
-        Assertions.assertEquals(
-            "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4, 7=Source 7, 8=Source 8, 9=Source 9}",
-            readAll(result.dataset()).toString());
-
-        sourceStream.close();
-        source.close();
+            Assertions.assertEquals(
+                "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4, 7=Source 7, 8=Source 8, 9=Source 9}",
+                readAll(result.dataset()).toString());
+          }
+        }
       }
     }
   }
@@ -81,21 +80,20 @@ public class MergeInsertTest extends OperationTestBase {
       int rowCount = 5;
       try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
 
-        VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
-        ArrowArrayStream sourceStream = convertToStream(source, allocator);
-        MergeInsertResult result =
-            initialDataset.mergeInsert(
-                new MergeInsert(Arrays.asList("id"))
-                    .withMatchedUpdateAll()
-                    .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
-                sourceStream);
+        try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+          try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+            MergeInsertResult result =
+                initialDataset.mergeInsert(
+                    new MergeInsert(Arrays.asList("id"))
+                        .withMatchedUpdateAll()
+                        .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
+                    sourceStream);
 
-        Assertions.assertEquals(
-            "{0=Source 0, 1=Source 1, 2=Source 2, 3=Person 3, 4=Person 4}",
-            readAll(result.dataset()).toString());
-
-        sourceStream.close();
-        source.close();
+            Assertions.assertEquals(
+                "{0=Source 0, 1=Source 1, 2=Source 2, 3=Person 3, 4=Person 4}",
+                readAll(result.dataset()).toString());
+          }
+        }
       }
     }
   }
@@ -112,21 +110,20 @@ public class MergeInsertTest extends OperationTestBase {
       int rowCount = 5;
       try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
 
-        VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
-        ArrowArrayStream sourceStream = convertToStream(source, allocator);
-        MergeInsertResult result =
-            initialDataset.mergeInsert(
-                new MergeInsert(Arrays.asList("id"))
-                    .withMatchedUpdateIf("target.name = 'Person 0' or target.name = 'Person 1'")
-                    .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
-                sourceStream);
+        try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+          try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+            MergeInsertResult result =
+                initialDataset.mergeInsert(
+                    new MergeInsert(Arrays.asList("id"))
+                        .withMatchedUpdateIf("target.name = 'Person 0' or target.name = 'Person 1'")
+                        .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
+                    sourceStream);
 
-        Assertions.assertEquals(
-            "{0=Source 0, 1=Source 1, 2=Person 2, 3=Person 3, 4=Person 4}",
-            readAll(result.dataset()).toString());
-
-        sourceStream.close();
-        source.close();
+            Assertions.assertEquals(
+                "{0=Source 0, 1=Source 1, 2=Person 2, 3=Person 3, 4=Person 4}",
+                readAll(result.dataset()).toString());
+          }
+        }
       }
     }
   }
@@ -143,20 +140,19 @@ public class MergeInsertTest extends OperationTestBase {
       int rowCount = 5;
       try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
 
-        VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
-        ArrowArrayStream sourceStream = convertToStream(source, allocator);
-        MergeInsertResult result =
-            initialDataset.mergeInsert(
-                new MergeInsert(Arrays.asList("id"))
-                    .withNotMatchedBySourceDelete()
-                    .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
-                sourceStream);
+        try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+          try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+            MergeInsertResult result =
+                initialDataset.mergeInsert(
+                    new MergeInsert(Arrays.asList("id"))
+                        .withNotMatchedBySourceDelete()
+                        .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
+                    sourceStream);
 
-        Assertions.assertEquals(
-            "{0=Person 0, 1=Person 1, 2=Person 2}", readAll(result.dataset()).toString());
-
-        sourceStream.close();
-        source.close();
+            Assertions.assertEquals(
+                "{0=Person 0, 1=Person 1, 2=Person 2}", readAll(result.dataset()).toString());
+          }
+        }
       }
     }
   }
@@ -173,21 +169,20 @@ public class MergeInsertTest extends OperationTestBase {
       int rowCount = 5;
       try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
 
-        VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator);
-        ArrowArrayStream sourceStream = convertToStream(source, allocator);
-        MergeInsertResult result =
-            initialDataset.mergeInsert(
-                new MergeInsert(Arrays.asList("id"))
-                    .withNotMatchedBySourceDeleteIf("name = 'Person 3'")
-                    .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
-                sourceStream);
+        try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+          try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+            MergeInsertResult result =
+                initialDataset.mergeInsert(
+                    new MergeInsert(Arrays.asList("id"))
+                        .withNotMatchedBySourceDeleteIf("name = 'Person 3'")
+                        .withNotMatched(MergeInsert.WhenNotMatched.DoNothing),
+                    sourceStream);
 
-        Assertions.assertEquals(
-            "{0=Person 0, 1=Person 1, 2=Person 2, 4=Person 4}",
-            readAll(result.dataset()).toString());
-
-        sourceStream.close();
-        source.close();
+            Assertions.assertEquals(
+                "{0=Person 0, 1=Person 1, 2=Person 2, 4=Person 4}",
+                readAll(result.dataset()).toString());
+          }
+        }
       }
     }
   }
