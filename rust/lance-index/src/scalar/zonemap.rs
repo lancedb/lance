@@ -21,7 +21,7 @@ use crate::{pb, Any};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
 use futures::TryStreamExt;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,7 @@ pub struct ZoneMapIndex {
     max_zonemap_size: u64,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl std::fmt::Debug for ZoneMapIndex {
@@ -315,7 +315,7 @@ impl ZoneMapIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -344,7 +344,7 @@ impl ZoneMapIndex {
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
         max_zonemap_size: u64,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
@@ -431,7 +431,7 @@ impl ZoneMapIndex {
                 max_zonemap_size,
                 store,
                 fri,
-                index_cache,
+                index_cache: WeakLanceCache::from(index_cache),
             });
         }
 
@@ -460,7 +460,7 @@ impl ZoneMapIndex {
             max_zonemap_size,
             store,
             fri,
-            index_cache,
+            index_cache: WeakLanceCache::from(index_cache),
         })
     }
 }
@@ -980,7 +980,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
@@ -1073,7 +1073,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 0);
@@ -1117,7 +1117,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 10);
@@ -1169,7 +1169,7 @@ mod tests {
             .unwrap();
 
         // Verify the updated index has more zones
-        let updated_index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let updated_index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load updated ZoneMapIndex");
 
@@ -1260,7 +1260,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
 
@@ -1476,7 +1476,7 @@ mod tests {
         assert_eq!(metadata.get(ZONEMAP_SIZE_META_KEY).unwrap(), "100");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 2);
@@ -1654,7 +1654,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 3);
@@ -1808,7 +1808,7 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 5);
@@ -2006,7 +2006,7 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);
@@ -2075,7 +2075,7 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);

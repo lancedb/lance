@@ -5040,7 +5040,6 @@ mod tests {
     #[tokio::test]
     async fn test_fullzip_repetition_index_caching() {
         use crate::testing::SimulatedScheduler;
-        use lance_core::cache::LanceCache;
 
         // Simplified FixedPerValueDecompressor for testing
         #[derive(Debug)]
@@ -5079,7 +5078,7 @@ mod tests {
 
         let data = bytes::Bytes::from(full_data);
         let io = Arc::new(SimulatedScheduler::new(data));
-        let _cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let _cache = Arc::new(lance_core::cache::LanceCache::with_capacity(1024 * 1024));
 
         // Create FullZipScheduler with repetition index
         let mut scheduler = FullZipScheduler {
