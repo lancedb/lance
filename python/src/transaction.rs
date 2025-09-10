@@ -187,7 +187,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 };
                 Ok(Self(op))
             }

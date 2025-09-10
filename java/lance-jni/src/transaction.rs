@@ -475,7 +475,7 @@ fn convert_to_java_operation_inner<'local>(
             updated_fragments,
             new_fragments,
             fields_modified: _,
-            mem_wal_to_flush: _,
+            mem_wal_to_merge: _,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
                 .iter()
@@ -1020,7 +1020,7 @@ fn convert_to_rust_operation(
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             }
         }
         "DataReplacement" => {
