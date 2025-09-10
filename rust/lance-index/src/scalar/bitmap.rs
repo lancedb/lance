@@ -64,8 +64,6 @@ pub struct BitmapIndex {
     /// for quickly locating the row and reading it out
     index_map: BTreeMap<OrderableScalarValue, usize>,
 
-    /// The null bitmap, loaded eagerly and kept in memory
-    /// Empty RowIdTreeMap if no nulls exist
     null_map: RowIdTreeMap,
 
     value_type: DataType,
