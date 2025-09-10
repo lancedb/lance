@@ -1149,15 +1149,9 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
         prefetch_distance: None,
     };
 
-    let stats = match source_index.statistics() {
-        Ok(stats) => stats,
-        Err(_) => return default_params,
-    };
+    let Ok(stats) = source_index.statistics() else { return default_params };
 
-    let sub_index = match stats.get("sub_index") {
-        Some(sub_index) => sub_index,
-        None => return default_params,
-    };
+    let Some(sub_index) = stats.get("sub_index") else { return default_params };
 
     // Extract HNSW parameters from sub_index.params
     if let Some(params) = sub_index.get("params") {
