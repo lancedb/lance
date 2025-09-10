@@ -134,11 +134,11 @@ impl BitmapIndex {
         }
 
         let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
-        let mut null_location: Option<usize> = None;
+        let mut null_map = RowIdTreeMap::default();
         let mut value_type: Option<DataType> = None;
         let mut global_row_idx = 0;
 
-        // First pass: Read only metadata (keys) to build location map
+        // Single pass: Read both metadata and null bitmap data
         for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
             let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
             let chunk = page_lookup_file
@@ -155,52 +155,36 @@ impl BitmapIndex {
             }
 
             let dict_keys = chunk.column(0);
-
-            for idx in 0..chunk.num_rows() {
-                let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
-
-                if key.0.is_null() {
-                    null_location = Some(global_row_idx);
-                } else {
-                    index_map.insert(key, global_row_idx);
-                }
-
-                global_row_idx += 1;
-            }
-        }
-
-        // Second pass: Load null bitmap if it exists
-        let null_map = if let Some(null_loc) = null_location {
-            // Calculate which chunk contains the null bitmap
-            let chunk_idx = null_loc / MAX_ROWS_PER_CHUNK;
-            let row_in_chunk = null_loc % MAX_ROWS_PER_CHUNK;
-
-            let chunk_start = chunk_idx * MAX_ROWS_PER_CHUNK;
-            let chunk_end = ((chunk_idx + 1) * MAX_ROWS_PER_CHUNK).min(total_rows);
-            let chunk = page_lookup_file
-                .read_range(chunk_start..chunk_end, None)
-                .await?;
-
-            let binary_bitmaps = chunk
-                .column(1)
+            let binary_bitmaps = chunk.column(1)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| Error::Internal {
                     message: "Invalid bitmap column type".to_string(),
                     location: location!(),
                 })?;
-            let bitmap_bytes = binary_bitmaps.value(row_in_chunk);
-            let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
-            // Apply fragment remapping if needed
-            if let Some(fri) = &frag_reuse_index {
-                bitmap = fri.remap_row_ids_tree_map(&bitmap);
+            for idx in 0..chunk.num_rows() {
+                let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
+
+                if key.0.is_null() {
+                    // Load null bitmap directly in the same pass
+                    let bitmap_bytes = binary_bitmaps.value(idx);
+                    let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+                    
+                    // Apply fragment remapping if needed
+                    if let Some(fri) = &frag_reuse_index {
+                        bitmap = fri.remap_row_ids_tree_map(&bitmap);
+                    }
+                    
+                    null_map = bitmap;
+                } else {
+                    // For non-null values, just store location for lazy loading
+                    index_map.insert(key, global_row_idx);
+                }
+
+                global_row_idx += 1;
             }
-
-            bitmap
-        } else {
-            RowIdTreeMap::default()
-        };
+        }
 
         let final_value_type = value_type.expect_ok()?;
 
