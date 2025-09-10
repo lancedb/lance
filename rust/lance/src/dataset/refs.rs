@@ -20,6 +20,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
+use std::io::ErrorKind;
 
 /// Lance Ref
 #[derive(Debug, Clone)]
@@ -439,7 +440,9 @@ impl RefOperations<BranchContents> for Branches {
             });
         }
 
-        self.object_store().delete(&branch_file).await
+        self.object_store().delete(&branch_file).await?;
+        // Clean up empty branch directories
+        self.cleanup_empty_directories(branch).await
     }
 
     async fn list_ordered(&self, order: Option<Ordering>) -> Result<Vec<(String, BranchContents)>> {
@@ -454,6 +457,68 @@ impl RefOperations<BranchContents> for Branches {
             version_result.then_with(|| a.0.cmp(&b.0))
         });
         Ok(branches)
+    }
+}
+
+impl Branches {
+    /// Clean up empty parent directories using 4-step algorithm
+    async fn cleanup_empty_directories(&self, branch: &str) -> Result<()> {
+        // Step 1: Get all branch_name as a vector
+        let branches = self.list().await?;
+        let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
+        let remaining_used_dir = Self::find_longest_prefix_str(branch, &remaining_branches);
+
+        let unused_dir = branch.strip_prefix(remaining_used_dir);
+        if let Some(unused_dir_inner) = unused_dir {
+            if let Some(dir) = unused_dir_inner.split('/').next() {
+                let dir_location = self
+                    .refs
+                    .dataset_location
+                    .switch_branch(Some(dir.to_string()))?;
+                if let Err(e) = self
+                    .refs
+                    .object_store
+                    .remove_dir_all(dir_location.base_path().clone())
+                    .await
+                {
+                    match &e {
+                        Error::IO { source, .. } => {
+                            if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                                if io_err.kind() == ErrorKind::NotFound {
+                                    log::debug!("Branch directory already deleted: {}", io_err);
+                                } else {
+                                    return Err(e);
+                                }
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn find_longest_prefix_str<'a>(reference: &'a str, candidates: &[&str]) -> &'a str {
+        if reference.is_empty() || candidates.is_empty() {
+            return "";
+        }
+
+        let mut longest_length = 0;
+        for &candidate in candidates {
+            let common_len = reference
+                .chars()
+                .zip(candidate.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            if common_len > longest_length {
+                longest_length = common_len;
+            }
+        }
+        &reference[..longest_length]
     }
 }
 

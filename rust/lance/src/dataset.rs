@@ -51,7 +51,6 @@ use snafu::location;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
-use std::io::ErrorKind;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -458,30 +457,6 @@ impl Dataset {
 
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches.delete(branch).await?;
-        let branch_location = self
-            .dataset_location
-            .switch_branch(Some(branch.to_string()))?;
-
-        if let Err(e) = self
-            .object_store
-            .remove_dir_all(branch_location.base_path().clone())
-            .await
-        {
-            match &e {
-                Error::IO { source, .. } => {
-                    if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                        if io_err.kind() == ErrorKind::NotFound {
-                            log::debug!("Branch directory already deleted: {}", io_err);
-                        } else {
-                            return Err(e);
-                        }
-                    } else {
-                        return Err(e);
-                    }
-                }
-                _ => return Err(e),
-            }
-        }
         Ok(())
     }
 
@@ -4606,7 +4581,7 @@ mod tests {
         let bad_tag_creation = dataset.tags.create("tag1", 3, None).await;
         assert_eq!(
             bad_tag_creation.err().unwrap().to_string(),
-            "Version not found error: version 3 does not exist"
+            "Version not found error: version Main::3 does not exist"
         );
 
         let bad_tag_deletion = dataset.tags.delete("tag1").await;
@@ -8152,7 +8127,10 @@ mod tests {
         // Verify branch3 content
         let branch3_content = branches.get("feature/nathan/branch3").unwrap();
         // Created based on tag pointed to branch2
-        assert_eq!(branch3_content.parent_branch.as_deref().unwrap(), "dev/branch2");
+        assert_eq!(
+            branch3_content.parent_branch.as_deref().unwrap(),
+            "dev/branch2"
+        );
         assert_eq!(branch3_content.parent_version, 3);
         assert!(branch3_content.create_at > 0);
         assert!(branch3_content.manifest_size > 0);
@@ -8172,11 +8150,11 @@ mod tests {
         assert!(branches_after_delete.is_empty());
 
         // Verify branch directories are all deleted cleanly
-        let branches = dataset.object_store.read_dir(
-            Path::parse(
-                test_dir.path().join("tree").to_str().unwrap()
-            ).unwrap()
-        ).await.unwrap();
+        let branches = dataset
+            .object_store
+            .read_dir(Path::parse(test_dir.path().join("tree").to_str().unwrap()).unwrap())
+            .await
+            .unwrap();
         assert!(branches.is_empty());
     }
 }

@@ -178,7 +178,7 @@ impl BlockingDataset {
     }
 
     pub fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.create(tag, version))?;
+        RT.block_on(self.inner.tags.create(tag, version, None))?;
         Ok(())
     }
 
@@ -188,7 +188,7 @@ impl BlockingDataset {
     }
 
     pub fn update_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.update(tag, version))?;
+        RT.block_on(self.inner.tags.update(tag, version, None))?;
         Ok(())
     }
 
