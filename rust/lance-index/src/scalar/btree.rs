@@ -912,7 +912,7 @@ impl BTreeIndex {
             map,
             null_pages,
             store,
-            WeakLanceCache::from(&index_cache),
+            WeakLanceCache::from(index_cache),
             sub_index,
             batch_size,
             frag_reuse_index,

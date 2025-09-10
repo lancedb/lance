@@ -313,7 +313,7 @@ impl NGramIndex {
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
             frag_reuse_index,
-            index_cache: WeakLanceCache::from(&index_cache),
+            index_cache: WeakLanceCache::from(index_cache),
         });
 
         Ok(Self {
