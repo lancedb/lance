@@ -3,6 +3,8 @@
 
 //! Testing utilities
 
+#![allow(deprecated)] // For PutMultipartOpts which is deprecated but PutMultipartOpts doesn't exist yet
+
 use crate::Result;
 use async_trait::async_trait;
 use bytes::Bytes;

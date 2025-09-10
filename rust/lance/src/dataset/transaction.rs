@@ -171,8 +171,6 @@ pub enum Operation {
         replacements: Vec<DataReplacementGroup>,
     },
     /// Merge a new column in
-    /// 'fragments' is the final fragments include all data files, the new fragments must align with old ones at rows.
-    /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
     Merge {
         fragments: Vec<Fragment>,
         schema: Schema,
@@ -2674,15 +2672,16 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         (
             None,
             Operation::Overwrite {
-                fragments, schema, ..
+                fragments,
+                schema,
+                config_upsert_values: None,
             },
         ) => {
             // Validate here because we are going to return early.
-            schema_fragments_valid(None, schema, fragments)?;
+            schema_fragments_valid(schema, fragments)?;
 
             return Ok(());
         }
-        (None, Operation::Clone { .. }) => return Ok(()),
         (Some(manifest), _) => manifest,
         (None, _) => {
             return Err(Error::invalid_input(
@@ -2698,60 +2697,33 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
     match operation {
         Operation::Append { fragments } => {
             // Fragments must contain all fields in the schema
-            schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
+            schema_fragments_valid(&manifest.schema, fragments)
         }
         Operation::Project { schema } => {
-            schema_fragments_valid(Some(manifest), schema, manifest.fragments.as_ref())
+            schema_fragments_valid(schema, manifest.fragments.as_ref())
         }
-        Operation::Merge { fragments, schema } => {
-            merge_fragments_valid(manifest, fragments)?;
-            schema_fragments_valid(Some(manifest), schema, fragments)
-        }
-        Operation::Overwrite {
+        Operation::Merge { fragments, schema }
+        | Operation::Overwrite {
             fragments,
             schema,
             config_upsert_values: None,
-        } => schema_fragments_valid(Some(manifest), schema, fragments),
+        } => schema_fragments_valid(schema, fragments),
         Operation::Update {
             updated_fragments,
             new_fragments,
             ..
         } => {
-            schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
-            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
+            schema_fragments_valid(&manifest.schema, updated_fragments)?;
+            schema_fragments_valid(&manifest.schema, new_fragments)
         }
         _ => Ok(()),
     }
 }
 
-fn schema_fragments_valid(
-    manifest: Option<&Manifest>,
-    schema: &Schema,
-    fragments: &[Fragment],
-) -> Result<()> {
-    if let Some(manifest) = manifest {
-        if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
-            return schema_fragments_legacy_valid(schema, fragments);
-        }
-    }
-    // validate that each data file at least contains one field.
-    for fragment in fragments {
-        for data_file in &fragment.files {
-            if data_file.fields.iter().len() == 0 {
-                return Err(Error::invalid_input(
-                    format!("Datafile {} does not contain any fields", data_file.path),
-                    location!(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Check that each fragment contains all fields in the schema.
 /// It is not required that the schema contains all fields in the fragment.
 /// There may be masked fields.
-fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // TODO: add additional validation. Consider consolidating with various
     // validate() methods in the codebase.
     for fragment in fragments {
@@ -2772,70 +2744,6 @@ fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Res
             }
         }
     }
-    Ok(())
-}
-
-/// Validate that Merge operations preserve all original fragments.
-/// Merge operations should only add columns or rows, not reduce fragments.
-/// This ensures fragments correspond at one-to-one with the original fragment list.
-fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Result<()> {
-    let original_fragments = manifest.fragments.as_ref();
-
-    // Additional validation: ensure we're not accidentally reducing the fragment count
-    if new_fragments.len() < original_fragments.len() {
-        return Err(Error::invalid_input(
-            format!(
-                "Merge operation reduced fragment count from {} to {}. \
-                 Merge operations should only add columns, not reduce fragments.",
-                original_fragments.len(),
-                new_fragments.len()
-            ),
-            location!(),
-        ));
-    }
-
-    // Collect new fragment IDs
-    let new_fragment_map: HashMap<u64, &Fragment> =
-        new_fragments.iter().map(|f| (f.id, f)).collect();
-
-    // Check that all original fragments are preserved in the new fragments list
-    // Validate that each original fragment's metadata is preserved
-    let mut missing_fragments: Vec<u64> = Vec::new();
-    for original_fragment in original_fragments {
-        if let Some(new_fragment) = new_fragment_map.get(&original_fragment.id) {
-            // Validate physical_rows (row count) hasn't changed
-            if original_fragment.physical_rows != new_fragment.physical_rows {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Merge operation changed row count for fragment {}. \
-                         Original: {:?}, New: {:?}. \
-                         Merge operations should preserve fragment row counts and only add new columns.",
-                        original_fragment.id,
-                        original_fragment.physical_rows,
-                        new_fragment.physical_rows
-                    ),
-                    location!(),
-                ));
-            }
-        } else {
-            missing_fragments.push(original_fragment.id);
-        }
-    }
-
-    if !missing_fragments.is_empty() {
-        return Err(Error::invalid_input(
-            format!(
-                "Merge operation is missing original fragments: {:?}. \
-                 Merge operations should preserve all original fragments and only add new columns. \
-                 Expected fragments: {:?}, but got: {:?}",
-                missing_fragments,
-                original_fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
-                new_fragment_map.keys().copied().collect::<Vec<_>>()
-            ),
-            location!(),
-        ));
-    }
-
     Ok(())
 }
 
@@ -2892,84 +2800,6 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
-    }
-
-    #[test]
-    fn test_merge_fragments_valid() {
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema as LanceSchema;
-        use lance_table::format::Manifest;
-        use std::sync::Arc;
-
-        // Create a simple schema for testing
-        let schema = ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("name", DataType::Utf8, false),
-        ]);
-
-        // Create original fragments
-        let original_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
-
-        // Create a manifest with original fragments
-        let manifest = Manifest::new(
-            LanceSchema::try_from(&schema).unwrap(),
-            Arc::new(original_fragments),
-            DataStorageFormat::new(LanceFileVersion::V2_0),
-            None,
-            HashMap::new(),
-        );
-
-        // Test 1: Empty fragments should fail
-        let empty_fragments = vec![];
-        let result = merge_fragments_valid(&manifest, &empty_fragments);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
-
-        // Test 2: Missing original fragments should fail
-        let missing_fragments = vec![
-            Fragment::new(1),
-            Fragment::new(2),
-            // Fragment 3 is missing
-            Fragment::new(4), // New fragment
-        ];
-        let result = merge_fragments_valid(&manifest, &missing_fragments);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing original fragments"));
-
-        // Test 3: Reduced fragment count should fail
-        let reduced_fragments = vec![
-            Fragment::new(1),
-            Fragment::new(2),
-            // Fragment 3 is missing, no new fragments added
-        ];
-        let result = merge_fragments_valid(&manifest, &reduced_fragments);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reduced fragment count"));
-
-        // Test 4: Valid merge with all original fragments plus new ones should succeed
-        let valid_fragments = vec![
-            Fragment::new(1),
-            Fragment::new(2),
-            Fragment::new(3),
-            Fragment::new(4), // New fragment
-            Fragment::new(5), // Another new fragment
-        ];
-        let result = merge_fragments_valid(&manifest, &valid_fragments);
-        assert!(result.is_ok());
-
-        // Test 5: Same fragments (no new ones) should succeed
-        let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
-        let result = merge_fragments_valid(&manifest, &same_fragments);
-        assert!(result.is_ok());
     }
 
     #[test]
