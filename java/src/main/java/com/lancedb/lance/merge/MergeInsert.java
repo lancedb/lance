@@ -13,14 +13,6 @@
  */
 package com.lancedb.lance.merge;
 
-import com.lancedb.lance.Dataset;
-
-import org.apache.arrow.c.ArrowArray;
-import org.apache.arrow.c.ArrowSchema;
-import org.apache.arrow.c.Data;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.VectorSchemaRoot;
-
 import java.util.List;
 
 public class MergeInsert {
@@ -228,41 +220,6 @@ public class MergeInsert {
   public boolean skipAutoCleanup() {
     return skipAutoCleanup;
   }
-
-  public MergeInsertStats execute(Dataset dataset, VectorSchemaRoot source) {
-    BufferAllocator allocator = dataset.allocator();
-    try (ArrowArray ffiArrowArray = ArrowArray.allocateNew(allocator);
-        ArrowSchema ffiArrowSchema = ArrowSchema.allocateNew(allocator)) {
-      Data.exportVectorSchemaRoot(allocator, source, null, ffiArrowArray, ffiArrowSchema);
-      return nativeExecute(
-          dataset,
-          on,
-          whenMatched.name(),
-          whenMatchedUpdateExpr,
-          whenNotMatched.name(),
-          whenNotMatchedBySource.name(),
-          whenNotMatchedBySourceDeleteExpr,
-          conflictRetries,
-          retryTimeoutMs,
-          skipAutoCleanup,
-          ffiArrowArray.memoryAddress(),
-          ffiArrowSchema.memoryAddress());
-    }
-  }
-
-  private static native MergeInsertStats nativeExecute(
-      Dataset dataset,
-      List<String> on,
-      String whenMatched,
-      String whenMatchedUpdateExpr,
-      String whenNotMatched,
-      String whenNotMatchedBySource,
-      String whenNotMatchedDeleteExpr,
-      int conflictRetries,
-      long retryTimeoutMs,
-      boolean skipAutoCleanup,
-      long batchMemoryAddress,
-      long schemaMemoryAddress);
 
   public enum WhenMatched {
     /**
