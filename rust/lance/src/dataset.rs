@@ -84,7 +84,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
-use crate::dataset::cleanup::{CleanupBuilder, CleanupPolicy};
+use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -859,7 +859,7 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        let mut builder = CleanupBuilder::default();
+        let mut builder = CleanupPolicyBuilder::default();
         builder = builder.before_timestamp(utc_now() - older_than);
         if let Some(v) = delete_unverified {
             builder = builder.delete_unverified(v);

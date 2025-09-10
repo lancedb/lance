@@ -480,11 +480,11 @@ impl Default for CleanupPolicy {
 }
 
 #[derive(Default)]
-pub struct CleanupBuilder {
+pub struct CleanupPolicyBuilder {
     policy: CleanupPolicy,
 }
 
-impl CleanupBuilder {
+impl CleanupPolicyBuilder {
     /// Cleanup all versions before the specified timestamp.
     pub fn before_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
         self.policy.before_timestamp = Some(timestamp);
@@ -575,7 +575,7 @@ pub async fn auto_cleanup_hook(
         return Ok(None);
     }
 
-    let mut builder = CleanupBuilder::default();
+    let mut builder = CleanupPolicyBuilder::default();
     if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
         let std_older_than = match parse_duration(older_than) {
             Ok(t) => t,
@@ -863,7 +863,9 @@ mod tests {
             let db = self.open().await?;
             cleanup_old_versions(
                 &db,
-                CleanupBuilder::default().before_timestamp(before).build(),
+                CleanupPolicyBuilder::default()
+                    .before_timestamp(before)
+                    .build(),
             )
             .await
         }
@@ -882,7 +884,7 @@ mod tests {
             let db = self.open().await?;
             cleanup_old_versions(
                 &db,
-                CleanupBuilder::default()
+                CleanupPolicyBuilder::default()
                     .before_timestamp(before)
                     .delete_unverified(delete_unverified.unwrap_or(false))
                     .error_if_tagged_old_versions(error_if_tagged_old_versions.unwrap_or(true))
@@ -1535,7 +1537,7 @@ mod tests {
         assert_eq!(before_count.num_manifest_files, 5);
 
         // Retain 3 recent versions
-        let policy = CleanupBuilder::default()
+        let policy = CleanupPolicyBuilder::default()
             .retain_n_versions(&fixture.open().await.unwrap(), 3)
             .await
             .unwrap()
@@ -1571,7 +1573,7 @@ mod tests {
         assert_eq!(before_count.num_manifest_files, 5);
 
         // Retain 3 recent versions before timestamp now - 6days
-        let policy = CleanupBuilder::default()
+        let policy = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now() - TimeDelta::try_days(6).unwrap())
             .retain_n_versions(&fixture.open().await.unwrap(), 3)
             .await
@@ -1581,7 +1583,7 @@ mod tests {
         assert_eq!(removed.old_versions, 0);
 
         // Retain 10 recent versions before timestamp now
-        let policy = CleanupBuilder::default()
+        let policy = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now())
             .retain_n_versions(&fixture.open().await.unwrap(), 10)
             .await
@@ -1591,7 +1593,7 @@ mod tests {
         assert_eq!(removed.old_versions, 0);
 
         // Retain 3 recent versions before timestamp now - 1days
-        let policy = CleanupBuilder::default()
+        let policy = CleanupPolicyBuilder::default()
             .before_timestamp(utc_now() - TimeDelta::try_days(2).unwrap())
             .retain_n_versions(&fixture.open().await.unwrap(), 3)
             .await
