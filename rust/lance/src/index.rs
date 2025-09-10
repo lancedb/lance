@@ -1559,43 +1559,25 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()> {
-        // Load all non-system indices from the source dataset
         let source_indices = source_dataset.load_indices().await?;
-
-        // Filter out system indices (FragmentReuse, MemWal)
         let non_system_indices: Vec<_> = source_indices
             .iter()
             .filter(|idx| !lance_index::is_system_index(idx))
             .collect();
 
         if non_system_indices.is_empty() {
-            log::info!("No non-system indices found in source dataset");
             return Ok(());
         }
 
-        // Group indices by name to avoid duplicate initialization
         let mut unique_index_names = HashSet::new();
         for index in non_system_indices.iter() {
             unique_index_names.insert(index.name.clone());
         }
 
-        log::info!(
-            "Initializing {} unique indices from source dataset",
-            unique_index_names.len()
-        );
-
-        // Initialize each unique index
         for index_name in unique_index_names {
-            log::info!("Initializing index '{}'", index_name);
-
-            // Initialize all delta indices with this name
-            if let Err(e) = self.initialize_index(source_dataset, &index_name).await {
-                log::error!("Failed to initialize index '{}': {}", index_name, e);
-                return Err(e);
-            }
+            self.initialize_index(source_dataset, &index_name).await?;
         }
 
-        log::info!("Successfully initialized all indices from source dataset");
         Ok(())
     }
 }

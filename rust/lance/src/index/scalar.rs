@@ -20,7 +20,7 @@ use itertools::Itertools;
 use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::inverted::{InvertedIndexPlugin, METADATA_FILE};
 use lance_index::scalar::registry::{
@@ -32,7 +32,7 @@ use lance_index::scalar::{
     bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams,
 };
-use lance_index::{ScalarIndexCriteria, VECTOR_INDEX_VERSION};
+use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, Index};
 use log::info;
 use snafu::location;
@@ -469,20 +469,9 @@ pub fn index_matches_criteria(
 pub async fn initialize_scalar_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
-    source_index: &lance_table::format::Index,
+    source_index: &Index,
     column_name: &str,
 ) -> Result<()> {
-    use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-    use lance_index::{DatasetIndexExt, IndexType};
-
-    log::info!(
-        "Initializing scalar index '{}' on column '{}'",
-        source_index.name,
-        column_name
-    );
-
-    // Open the source scalar index to extract parameters
     let source_scalar_index = source_dataset
         .open_scalar_index(
             column_name,
@@ -491,10 +480,7 @@ pub async fn initialize_scalar_index(
         )
         .await?;
 
-    // Derive the index parameters from the source index
     let params = source_scalar_index.derive_index_params()?;
-
-    // Get the index type from the source scalar index
     let index_type = source_scalar_index.index_type();
 
     // For Inverted index, we need to parse the params JSON and create InvertedIndexParams

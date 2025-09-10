@@ -41,6 +41,7 @@ use lance_index::vector::{
 };
 use lance_index::{
     DatasetIndexExt, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+    VECTOR_INDEX_VERSION,
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -53,7 +54,8 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{pb, DatasetIndexInternalExt, IndexParams};
+use super::{pb, vector_index_details, DatasetIndexInternalExt, IndexParams};
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
@@ -974,16 +976,6 @@ pub async fn initialize_vector_index(
     source_index: &lance_table::format::Index,
     column_name: &str,
 ) -> Result<()> {
-    use lance_index::vector::ivf::IvfBuildParams;
-    use lance_index::vector::sq::builder::SQBuildParams;
-
-    log::info!(
-        "Initializing vector index '{}' on column '{}'",
-        source_index.name,
-        column_name
-    );
-
-    // Open the source vector index to extract IvfModel and quantizer
     let source_vector_index = source_dataset
         .open_vector_index(
             column_name,
@@ -992,160 +984,234 @@ pub async fn initialize_vector_index(
         )
         .await?;
 
-    // Extract index statistics to get parameters
-    let stats = source_vector_index.statistics()?;
+    let metric_type = source_vector_index.metric_type();
+    let ivf_model = source_vector_index.ivf_model();
+    let quantizer = source_vector_index.quantizer();
+    let (sub_index_type, quantization_type) = source_vector_index.sub_index_type();
+    let ivf_params = derive_ivf_params(ivf_model);
 
-    // Try to extract IVF model and create delta index
-    // The stats have the IVF parameters directly, not under "ivf" key
-    if let Some(num_partitions_val) = stats.get("num_partitions") {
-        // Extract number of partitions
-        let num_partitions = num_partitions_val.as_u64().ok_or_else(|| Error::Index {
-            message: "Failed to extract num_partitions from source index".to_string(),
-            location: location!(),
-        })? as usize;
-
-        // Extract metric type
-        let metric_type_str = stats
-            .get("metric_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("L2");
-        let metric_type = match metric_type_str {
-            "L2" => lance_linalg::distance::MetricType::L2,
-            "Cosine" | "cosine" => lance_linalg::distance::MetricType::Cosine,
-            "Dot" | "dot" => lance_linalg::distance::MetricType::Dot,
-            _ => lance_linalg::distance::MetricType::L2,
-        };
-
-        // Determine index type and build params
-        let index_type_str = stats
-            .get("index_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("IVF_PQ");
-
-        let params = match index_type_str {
-            "IVF_FLAT" => VectorIndexParams::ivf_flat(num_partitions, metric_type),
-            "IVF_PQ" => {
-                // Extract PQ parameters from sub_index
-                let sub_index = stats.get("sub_index").ok_or_else(|| Error::Index {
-                    message: "No sub_index found in source vector index stats".to_string(),
-                    location: location!(),
-                })?;
-
-                let num_bits = sub_index
-                    .get("num_bits")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(8) as u8;
-                let num_sub_vectors = sub_index
-                    .get("num_sub_vectors")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(16) as usize;
-
-                VectorIndexParams::ivf_pq(
-                    num_partitions,
-                    num_bits,
-                    num_sub_vectors,
-                    metric_type,
-                    50,
-                )
+    let params = match (sub_index_type, quantization_type) {
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params)
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            let pq_quantizer: ProductQuantizer = quantizer.try_into()?;
+            let pq_params = derive_pq_params(&pq_quantizer);
+            VectorIndexParams::with_ivf_pq_params(metric_type, ivf_params, pq_params)
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            let sq_quantizer: ScalarQuantizer = quantizer.try_into()?;
+            let sq_params = derive_sq_params(&sq_quantizer);
+            VectorIndexParams::with_ivf_sq_params(metric_type, ivf_params, sq_params)
+        }
+        (SubIndexType::Hnsw, quantization_type) => {
+            let hnsw_params = derive_hnsw_params(source_vector_index.as_ref());
+            match quantization_type {
+                QuantizationType::Flat => {
+                    VectorIndexParams::ivf_hnsw(metric_type, ivf_params, hnsw_params)
+                }
+                QuantizationType::Product => {
+                    let pq_quantizer: ProductQuantizer = quantizer.try_into()?;
+                    let pq_params = derive_pq_params(&pq_quantizer);
+                    VectorIndexParams::with_ivf_hnsw_pq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        pq_params,
+                    )
+                }
+                QuantizationType::Scalar => {
+                    let sq_quantizer: ScalarQuantizer = quantizer.try_into()?;
+                    let sq_params = derive_sq_params(&sq_quantizer);
+                    VectorIndexParams::with_ivf_hnsw_sq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        sq_params,
+                    )
+                }
             }
-            "IVF_SQ" => {
-                // Create IVF_SQ params
-                let ivf_params = IvfBuildParams::new(num_partitions);
-                let sq_params = SQBuildParams::default();
-                VectorIndexParams::with_ivf_sq_params(metric_type, ivf_params, sq_params)
-            }
-            _ => {
-                // Default to IVF_PQ
-                VectorIndexParams::ivf_pq(num_partitions, 8, 16, metric_type, 50)
-            }
-        };
+        }
+    };
 
-        // Always use incremental builder to reuse centroids from source index
-        // This ensures both empty and non-empty datasets share the same centroids
-        log::info!(
-            "Creating vector index '{}' with shared centroids from source index",
-            source_index.name
-        );
-
-        let new_uuid = Uuid::new_v4();
-        let frag_reuse_index = target_dataset
-            .open_frag_reuse_index(&NoOpMetricsCollector)
-            .await?;
-
-        // Build the index incrementally using the source index's IVF model
-        // This works for both empty and non-empty datasets
-        build_vector_index_incremental(
-            target_dataset,
-            column_name,
-            &new_uuid.to_string(),
-            &params,
-            source_vector_index,
-            frag_reuse_index,
-        )
+    let new_uuid = Uuid::new_v4();
+    let frag_reuse_index = target_dataset
+        .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?;
 
-        // Register the new index in the dataset manifest
-        use crate::index::vector_index_details;
-        use lance_index::VECTOR_INDEX_VERSION;
-        use lance_table::format::Index as IndexMetadata;
+    build_vector_index_incremental(
+        target_dataset,
+        column_name,
+        &new_uuid.to_string(),
+        &params,
+        source_vector_index,
+        frag_reuse_index,
+    )
+    .await?;
 
-        let field = target_dataset
-            .schema()
-            .field(column_name)
-            .ok_or_else(|| Error::Index {
-                message: format!("Column '{}' not found in target dataset", column_name),
-                location: location!(),
-            })?;
+    let field = target_dataset
+        .schema()
+        .field(column_name)
+        .ok_or_else(|| Error::Index {
+            message: format!("Column '{}' not found in target dataset", column_name),
+            location: location!(),
+        })?;
 
-        // Get fragment bitmap - will be empty for empty dataset
-        let fragment_bitmap = if target_dataset.get_fragments().is_empty() {
-            // Empty bitmap for empty dataset
-            Some(roaring::RoaringBitmap::new())
-        } else {
-            // Include all fragments for non-empty dataset
-            Some(
-                target_dataset
-                    .get_fragments()
-                    .iter()
-                    .map(|f| f.id() as u32)
-                    .collect(),
-            )
-        };
-
-        let new_idx = IndexMetadata {
-            uuid: new_uuid,
-            name: source_index.name.clone(),
-            fields: vec![field.id],
-            dataset_version: target_dataset.manifest.version,
-            fragment_bitmap,
-            index_details: Some(Arc::new(vector_index_details())),
-            index_version: VECTOR_INDEX_VERSION as i32,
-            created_at: Some(chrono::Utc::now()),
-            base_id: None,
-        };
-
-        use crate::dataset::transaction::{Operation, Transaction};
-        let transaction = Transaction::new(
-            target_dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices: vec![],
-            },
-            None,
-            None,
-        );
-
-        target_dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
+    let fragment_bitmap = if target_dataset.get_fragments().is_empty() {
+        Some(roaring::RoaringBitmap::new())
     } else {
-        log::warn!(
-            "Could not extract num_partitions from source vector index '{}', skipping",
-            source_index.name
-        );
-    }
+        Some(
+            target_dataset
+                .get_fragments()
+                .iter()
+                .map(|f| f.id() as u32)
+                .collect(),
+        )
+    };
+
+    let new_idx = IndexMetadata {
+        uuid: new_uuid,
+        name: source_index.name.clone(),
+        fields: vec![field.id],
+        dataset_version: target_dataset.manifest.version,
+        fragment_bitmap,
+        index_details: Some(Arc::new(vector_index_details())),
+        index_version: VECTOR_INDEX_VERSION as i32,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+    };
+
+    let transaction = Transaction::new(
+        target_dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![new_idx],
+            removed_indices: vec![],
+        },
+        None,
+        None,
+    );
+
+    target_dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
 
     Ok(())
+}
+
+/// Create IVF build parameters for delta index creation from an existing IVF model
+/// TODO: support deriving all the original parameters
+fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
+    IvfBuildParams {
+        num_partitions: Some(ivf_model.num_partitions()),
+        target_partition_size: None,
+        max_iters: 50, // Default
+        centroids: ivf_model.centroids.clone().map(Arc::new),
+        retrain: false,   // Don't retrain since we have centroids
+        sample_rate: 256, // Default
+        precomputed_partitions_file: None,
+        precomputed_shuffle_buffers: None,
+        shuffle_partition_batches: 1024 * 10, // Default
+        shuffle_partition_concurrency: 2,     // Default
+        storage_options: None,
+    }
+}
+
+/// Create PQ build parameters from a ProductQuantizer
+/// TODO: support deriving all the original parameters
+fn derive_pq_params(pq_quantizer: &ProductQuantizer) -> PQBuildParams {
+    PQBuildParams {
+        num_sub_vectors: pq_quantizer.num_sub_vectors,
+        num_bits: pq_quantizer.num_bits as usize,
+        max_iters: 50,   // Default
+        kmeans_redos: 1, // Default
+        codebook: Some(Arc::new(pq_quantizer.codebook.clone())),
+        sample_rate: 256, // Default
+    }
+}
+
+/// Create SQ build parameters from a ScalarQuantizer
+/// TODO: support deriving all the original parameters
+fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
+    SQBuildParams {
+        num_bits: sq_quantizer.num_bits(),
+        sample_rate: 256, // Default
+    }
+}
+
+/// Extract HNSW build parameters from the source vector index statistics.
+/// Returns default parameters if extraction fails.
+fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
+    let default_params = HnswBuildParams {
+        max_level: 4,
+        m: 20,
+        ef_construction: 100,
+        prefetch_distance: None,
+    };
+
+    let stats = match source_index.statistics() {
+        Ok(stats) => stats,
+        Err(_) => return default_params,
+    };
+
+    let sub_index = match stats.get("sub_index") {
+        Some(sub_index) => sub_index,
+        None => return default_params,
+    };
+
+    if let Some(hnsw_params) = sub_index.get("hnsw_params") {
+        let max_level = hnsw_params
+            .get("max_level")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16)
+            .unwrap_or(4);
+        let m = hnsw_params
+            .get("m")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(20);
+        let ef_construction = hnsw_params
+            .get("ef_construction")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(100);
+
+        return HnswBuildParams {
+            max_level,
+            m,
+            ef_construction,
+            prefetch_distance: None,
+        };
+    } else if let Some(metadata_array) = sub_index.as_array() {
+        // For some indices, the metadata might be an array of partition metadata
+        if let Some(first_partition) = metadata_array.first() {
+            if let Some(params) = first_partition.get("params") {
+                let max_level = params
+                    .get("max_level")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u16)
+                    .unwrap_or(4);
+                let m = params
+                    .get("m")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(20);
+                let ef_construction = params
+                    .get("ef_construction")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(100);
+
+                return HnswBuildParams {
+                    max_level,
+                    m,
+                    ef_construction,
+                    prefetch_distance: None,
+                };
+            }
+        }
+    }
+
+    default_params
 }
 
 #[cfg(test)]
@@ -1979,5 +2045,373 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 15, "Should return 15 nearest neighbors");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_vector_index_ivf_hnsw_pq() {
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create IVF_HNSW_PQ index on source with custom HNSW parameters
+        let ivf_params = IvfBuildParams {
+            num_partitions: Some(8),
+            ..Default::default()
+        };
+        let hnsw_params = HnswBuildParams {
+            max_level: 6,
+            m: 24,
+            ef_construction: 120,
+            prefetch_distance: None,
+        };
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 8,
+            num_bits: 8,
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            MetricType::L2,
+            ivf_params,
+            hnsw_params,
+            pq_params,
+        );
+
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_hnsw_pq".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload to get updated metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_indices = source_dataset.load_indices().await.unwrap();
+        let source_index = source_indices
+            .iter()
+            .find(|idx| idx.name == "vector_ivf_hnsw_pq")
+            .unwrap();
+
+        // Create target dataset with same schema
+        let target_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize IVF_HNSW_PQ index on target
+        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1, "Target should have 1 index");
+        assert_eq!(
+            target_indices[0].name, "vector_ivf_hnsw_pq",
+            "Index name should match"
+        );
+
+        // Verify the index type and parameters match
+        let target_vector_index = target_dataset
+            .open_vector_index(
+                "vector",
+                &target_indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let stats = target_vector_index.statistics().unwrap();
+
+        // Check basic index type
+        assert_eq!(
+            stats.get("index_type").and_then(|v| v.as_str()),
+            Some("IVF_HNSW_PQ"),
+            "Index type should be IVF_HNSW_PQ"
+        );
+
+        // Check metric type
+        assert_eq!(
+            stats.get("metric_type").and_then(|v| v.as_str()),
+            Some("l2"),
+            "Metric type should be L2"
+        );
+
+        // Check number of partitions
+        assert_eq!(
+            stats.get("num_partitions").and_then(|v| v.as_u64()),
+            Some(8),
+            "Should have 8 partitions"
+        );
+
+        // Verify centroids are shared between source and target indices
+        let source_vector_index = source_dataset
+            .open_vector_index(
+                "vector",
+                &source_index.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Get IVF models from both indices to compare centroids
+        let source_ivf_model = source_vector_index.ivf_model();
+        let target_ivf_model = target_vector_index.ivf_model();
+
+        // Verify they have the same number of partitions
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            target_ivf_model.num_partitions(),
+            "Source and target should have same number of partitions"
+        );
+
+        // Verify the centroids are exactly the same (key verification for delta indices)
+        if let (Some(source_centroids), Some(target_centroids)) =
+            (&source_ivf_model.centroids, &target_ivf_model.centroids)
+        {
+            assert_eq!(
+                source_centroids.len(),
+                target_centroids.len(),
+                "Centroids arrays should have same length"
+            );
+
+            // Compare first centroid to verify they're identical
+            let source_centroid = source_centroids.value(0);
+            let target_centroid = target_centroids.value(0);
+
+            let source_data = source_centroid
+                .as_any()
+                .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                .expect("Centroid should be Float32Array");
+            let target_data = target_centroid
+                .as_any()
+                .downcast_ref::<arrow_array::PrimitiveArray<arrow_array::types::Float32Type>>()
+                .expect("Centroid should be Float32Array");
+
+            assert_eq!(
+                source_data.values(),
+                target_data.values(),
+                "Centroid values should be identical between source and target"
+            );
+        } else {
+            panic!("Both source and target should have centroids");
+        }
+
+        // Check sub_index contains HNSW and PQ information
+        let sub_index = stats
+            .get("sub_index")
+            .and_then(|v| v.as_object())
+            .expect("IVF_HNSW_PQ index should have sub_index");
+
+        // Verify PQ parameters
+        assert_eq!(
+            sub_index.get("nbits").and_then(|v| v.as_u64()),
+            Some(8),
+            "PQ should use 8 bits"
+        );
+        assert_eq!(
+            sub_index.get("num_sub_vectors").and_then(|v| v.as_u64()),
+            Some(8),
+            "PQ should have 8 sub vectors"
+        );
+
+        // Verify the index is functional by performing a search
+        let query_vector = lance_datagen::gen_batch()
+            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        let query_vector = query_vector
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap();
+        let results = target_dataset
+            .scan()
+            .nearest("vector", &query_vector.value(0), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 5, "Should return 5 nearest neighbors");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_vector_index_ivf_hnsw_sq() {
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset with vector column
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create IVF_HNSW_SQ index on source with custom HNSW parameters
+        let ivf_params = IvfBuildParams {
+            num_partitions: Some(6),
+            ..Default::default()
+        };
+        let hnsw_params = HnswBuildParams {
+            max_level: 5,
+            m: 16,
+            ef_construction: 80,
+            prefetch_distance: None,
+        };
+        let sq_params = SQBuildParams {
+            num_bits: 8,
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::Cosine,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_hnsw_sq".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload to get updated metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_indices = source_dataset.load_indices().await.unwrap();
+        let source_index = source_indices
+            .iter()
+            .find(|idx| idx.name == "vector_ivf_hnsw_sq")
+            .unwrap();
+
+        // Create target dataset with same schema
+        let target_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize IVF_HNSW_SQ index on target
+        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1, "Target should have 1 index");
+        assert_eq!(
+            target_indices[0].name, "vector_ivf_hnsw_sq",
+            "Index name should match"
+        );
+
+        // Verify the index type and parameters match
+        let target_vector_index = target_dataset
+            .open_vector_index(
+                "vector",
+                &target_indices[0].uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let stats = target_vector_index.statistics().unwrap();
+
+        // Check basic index type
+        assert_eq!(
+            stats.get("index_type").and_then(|v| v.as_str()),
+            Some("IVF_HNSW_SQ"),
+            "Index type should be IVF_HNSW_SQ"
+        );
+
+        // Check metric type
+        assert_eq!(
+            stats.get("metric_type").and_then(|v| v.as_str()),
+            Some("cosine"),
+            "Metric type should be cosine"
+        );
+
+        // Check number of partitions
+        assert_eq!(
+            stats.get("num_partitions").and_then(|v| v.as_u64()),
+            Some(6),
+            "Should have 6 partitions"
+        );
+
+        // Verify centroids are shared between source and target indices
+        let source_vector_index = source_dataset
+            .open_vector_index(
+                "vector",
+                &source_index.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Get IVF models from both indices to compare centroids
+        let source_ivf_model = source_vector_index.ivf_model();
+        let target_ivf_model = target_vector_index.ivf_model();
+
+        // Verify they have the same number of partitions
+        assert_eq!(
+            source_ivf_model.num_partitions(),
+            target_ivf_model.num_partitions(),
+            "Source and target should have same number of partitions"
+        );
+
+        // Check sub_index contains SQ information
+        let sub_index = stats
+            .get("sub_index")
+            .and_then(|v| v.as_object())
+            .expect("IVF_HNSW_SQ index should have sub_index");
+
+        // Verify SQ parameters
+        assert_eq!(
+            sub_index.get("num_bits").and_then(|v| v.as_u64()),
+            Some(8),
+            "SQ should use 8 bits"
+        );
+
+        // Verify the index is functional by performing a search
+        let query_vector = lance_datagen::gen_batch()
+            .anon_col(array::rand_vec::<Float32Type>(32.into()))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        let query_vector = query_vector
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap();
+        let results = target_dataset
+            .scan()
+            .nearest("vector", &query_vector.value(0), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 5, "Should return 5 nearest neighbors");
     }
 }
