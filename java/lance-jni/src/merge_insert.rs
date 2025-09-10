@@ -76,13 +76,13 @@ fn inner_merge_insert<'local>(
         RT.block_on(async move { merge_insert_job.execute_reader(source_stream).await })?
     };
 
-    Ok(MergeResult(
+    MergeResult(
         BlockingDataset {
             inner: Arc::try_unwrap(new_ds).unwrap(),
         },
         merge_stats,
     )
-    .into_java(env)?)
+    .into_java(env)
 }
 
 fn extract_on<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<Vec<String>> {
@@ -166,7 +166,7 @@ fn extract_when_not_matched_by_source_delete_expr<'local>(
     when_not_matched_by_source_delete_expr.extract(env)
 }
 
-fn extract_when_not_matched_by_source<'local>(
+fn extract_when_not_matched_by_source(
     schema: Schema,
     when_not_matched_by_source: &str,
     when_not_matched_by_source_delete_expr: &str,
