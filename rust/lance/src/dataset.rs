@@ -84,6 +84,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -858,15 +859,40 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
+        let mut builder = CleanupPolicyBuilder::default();
+        builder = builder.before_timestamp(utc_now() - older_than);
+        if let Some(v) = delete_unverified {
+            builder = builder.delete_unverified(v);
+        }
+        if let Some(v) = error_if_tagged_old_versions {
+            builder = builder.error_if_tagged_old_versions(v);
+        }
+
+        self.cleanup_with_policy(builder.build())
+    }
+
+    /// Removes old versions of the dataset from storage
+    ///
+    /// This function will remove all versions of the dataset that satisfies the given policy.
+    /// This function will not remove the current version of the dataset.
+    ///
+    /// Once a version is removed it can no longer be checked out or restored.  Any data unique
+    /// to that version will be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
+    ///
+    /// # Returns
+    ///
+    /// * `RemovalStats` - Statistics about the removal operation
+    #[instrument(level = "debug", skip(self))]
+    pub fn cleanup_with_policy(
+        &self,
+        policy: CleanupPolicy,
+    ) -> BoxFuture<'_, Result<RemovalStats>> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        let before = utc_now() - older_than;
-        cleanup::cleanup_old_versions(
-            self,
-            before,
-            delete_unverified,
-            error_if_tagged_old_versions,
-        )
-        .boxed()
+        cleanup::cleanup_old_versions(self, policy).boxed()
     }
 
     #[allow(clippy::too_many_arguments)]

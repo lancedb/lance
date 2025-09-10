@@ -87,7 +87,7 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
         let output = self.list(Some(dir_path.into())).map_err(|e| e.into());
         if let Some(unmodified_since_val) = unmodified_since {
             output
-                .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
+                .try_filter(move |file| future::ready(file.last_modified <= unmodified_since_val))
                 .boxed()
         } else {
             output.boxed()

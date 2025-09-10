@@ -463,11 +463,13 @@ message MemWalIndexDetails {
       // When a MemTable is considered full, the writer should update this MemWAL as sealed
       // and create a new MemWAL to write to atomically.
       SEALED = 1;
-      // When a MemTable is sealed, it can be flushed asynchronously to the table.
-      // When the flush completes, the process should commit the new dataset version
-      // and mark this MemWAL as flushed atomically.
-      // After a MemWAL is flushed, the cleanup process can delete the WAL.
+      // When a MemTable is sealed, it can be flushed asynchronously to disk.
+      // This state indicates the data has been persisted to disk but not yet merged
+      // into the source table.
       FLUSHED = 2;
+      // When the flushed data has been merged into the source table.
+      // After a MemWAL is merged, the cleanup process can delete the WAL.
+      MERGED = 3;
     }
 
     MemWalId id = 1;

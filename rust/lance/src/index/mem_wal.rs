@@ -287,7 +287,7 @@ pub async fn mark_mem_wal_as_sealed(
     mutate_mem_wal(dataset, mem_wal_region, mem_wal_generation, mutate).await
 }
 
-/// Mark the specific MemWAL as flushed
+/// Mark the specific MemWAL as flushed (data on disk but not merged)
 pub async fn mark_mem_wal_as_flushed(
     dataset: &mut Dataset,
     mem_wal_region: &str,
@@ -301,6 +301,26 @@ pub async fn mark_mem_wal_as_flushed(
 
         let mut updated_mem_wal = mem_wal.clone();
         updated_mem_wal.state = lance_index::mem_wal::State::Flushed;
+        Ok(updated_mem_wal)
+    };
+
+    mutate_mem_wal(dataset, mem_wal_region, mem_wal_generation, mutate).await
+}
+
+/// Mark the specific MemWAL as merged (data merged into source table)
+pub async fn mark_mem_wal_as_merged(
+    dataset: &mut Dataset,
+    mem_wal_region: &str,
+    mem_wal_generation: u64,
+    expected_owner_id: &str,
+) -> Result<MemWal> {
+    let mutate = |mem_wal: &MemWal| -> Result<MemWal> {
+        // Can only merge flushed MemWALs
+        mem_wal.check_state(lance_index::mem_wal::State::Flushed)?;
+        mem_wal.check_expected_owner_id(expected_owner_id)?;
+
+        let mut updated_mem_wal = mem_wal.clone();
+        updated_mem_wal.state = lance_index::mem_wal::State::Merged;
         Ok(updated_mem_wal)
     };
 
@@ -421,7 +441,7 @@ pub async fn update_mem_wal_owner(
     mutate_mem_wal(dataset, region, generation, mutate).await
 }
 
-/// Trim all the MemWALs that are already flushed.
+/// Trim all the MemWALs that are already merged.
 pub async fn trim_mem_wal_index(dataset: &mut Dataset) -> Result<()> {
     if let Some(mem_wal_index) = dataset.open_mem_wal_index(&NoOpMetricsCollector).await? {
         let indices = dataset.load_indices().await?;
@@ -441,7 +461,7 @@ pub async fn trim_mem_wal_index(dataset: &mut Dataset) -> Result<()> {
         let mut removed = Vec::new();
         for (_, generations) in mem_wal_index.mem_wal_map.iter() {
             for (_, mem_wal) in generations.iter() {
-                if mem_wal.state == lance_index::mem_wal::State::Flushed {
+                if mem_wal.state == lance_index::mem_wal::State::Merged {
                     // all indices are caught up, can trim it
                     if mem_wal.last_updated_dataset_version <= min_index_dataset_version {
                         removed.push(mem_wal.clone());
@@ -1009,7 +1029,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flush_mem_wal() {
+    async fn test_flush_and_merge_mem_wal() {
         // Create a dataset with some data
         let mut dataset = lance_datagen::gen_batch()
             .col(
@@ -1114,6 +1134,44 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Flushed, but expected Sealed"), 
                 "Error message should indicate the MemWAL is already flushed, got: {}", error);
+
+        // Test success case: mark flushed generation 0 as merged
+        let version_before_merge = dataset.manifest.version;
+        mark_mem_wal_as_merged(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
+
+        // Verify generation 0 is now merged
+        let indices = dataset.load_indices().await.unwrap();
+        let mem_wal_index_meta = indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .expect("MemWAL index should exist");
+
+        let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
+        let mem_wal = &mem_wal_details.mem_wal_list[0];
+        assert_eq!(
+            mem_wal.state,
+            lance_index::mem_wal::State::Merged,
+            "Generation 0 should now be merged"
+        );
+        // Verify the MemWAL version was updated after merging
+        assert_eq!(
+            mem_wal.last_updated_dataset_version,
+            version_before_merge + 1
+        );
+
+        // Test failure case: cannot merge already merged MemWAL
+        let result = mark_mem_wal_as_merged(&mut dataset, "GLOBAL", 0, "owner_0").await;
+        assert!(
+            result.is_err(),
+            "Should fail when trying to merge already merged MemWAL"
+        );
+
+        // Check the specific error message
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Merged, but expected Flushed"), 
+                "Error message should indicate the MemWAL is already merged, got: {}", error);
     }
 
     #[tokio::test]
@@ -1342,13 +1400,16 @@ mod tests {
             "Should have 3 generations initially"
         );
 
-        // flush generation 0
+        // flush and merge generation 0
         mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
+        mark_mem_wal_as_merged(&mut dataset, "GLOBAL", 0, "owner_0")
             .await
             .unwrap();
 
         // Test case 1: No indices exist (besides MemWAL index itself)
-        // Should trim flushed MemWAL since no other indices exist
+        // Should trim merged MemWAL since no other indices exist
         trim_mem_wal_index(&mut dataset).await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
@@ -1383,12 +1444,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Seal and flush generation 1
+        // Seal, flush and merge generation 1
         mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 1, "owner_1")
             .await
             .unwrap();
+        mark_mem_wal_as_merged(&mut dataset, "GLOBAL", 1, "owner_1")
+            .await
+            .unwrap();
 
-        // Create an index after the MemWAL was flushed
+        // Create an index after the MemWAL was merged
         dataset
             .create_index(
                 &["i"],
@@ -1400,7 +1464,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Should trim the flushed MemWAL since the index was created after it
+        // Should trim the merged MemWAL since the index was created after it
         trim_mem_wal_index(&mut dataset).await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
@@ -1436,8 +1500,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Now flush generation 2 (created before the vector index)
+        // Now flush and merge generation 2 (created before the vector index)
         mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 2, "owner_2")
+            .await
+            .unwrap();
+        mark_mem_wal_as_merged(&mut dataset, "GLOBAL", 2, "owner_2")
             .await
             .unwrap();
 
@@ -1532,12 +1599,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Flush the MemWAL separately
+        // Flush and merge the MemWAL separately
         mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "owner_0")
             .await
             .unwrap();
+        mark_mem_wal_as_merged(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
 
-        // Verify the MemWAL is now flushed
+        // Verify the MemWAL is now merged
         let indices = dataset.load_indices().await.unwrap();
         let mem_wal_index_meta = indices
             .iter()
@@ -1546,7 +1616,7 @@ mod tests {
         let mem_wal_details = load_mem_wal_index_details(mem_wal_index_meta.clone()).unwrap();
         assert_eq!(mem_wal_details.mem_wal_list.len(), 1);
         let mem_wal = &mem_wal_details.mem_wal_list[0];
-        assert_eq!(mem_wal.state, lance_index::mem_wal::State::Flushed);
+        assert_eq!(mem_wal.state, lance_index::mem_wal::State::Merged);
 
         // Now use optimize_indices to create delta index (this is how delta indices are actually created)
         let optimize_options = OptimizeOptions {
@@ -1574,7 +1644,7 @@ mod tests {
             "Latest delta index should have higher dataset version than original"
         );
 
-        // Now the MemWAL should be trimmed because the delta index was created after the flush
+        // Now the MemWAL should be trimmed because the delta index was created after the merge
         // Our logic should take the maximum dataset version for each index name
         trim_mem_wal_index(&mut dataset).await.unwrap();
 
@@ -1624,12 +1694,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Seal the MemWAL (required before flushing)
+        // Seal and flush the MemWAL (required before merging)
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 0, "owner_0")
             .await
             .unwrap();
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
 
-        // Verify the MemWAL is sealed but not flushed
+        // Verify the MemWAL is flushed but not merged
         let indices = dataset.load_indices().await.unwrap();
         let mem_wal_index_meta = indices
             .iter()
@@ -1640,8 +1713,8 @@ mod tests {
         let mem_wal = &mem_wal_details.mem_wal_list[0];
         assert_eq!(
             mem_wal.state,
-            lance_index::mem_wal::State::Sealed,
-            "MemWAL should be sealed but not flushed yet"
+            lance_index::mem_wal::State::Flushed,
+            "MemWAL should be flushed but not merged yet"
         );
 
         // Create new data for merge insert
@@ -1653,7 +1726,7 @@ mod tests {
             .col("i", lance_datagen::array::step_custom::<Int32Type>(1000, 1))
             .into_df_stream(RowCount::from(100), BatchCount::from(10));
 
-        // Create merge insert job that will flush the MemWAL
+        // Create merge insert job that will merge the MemWAL
         let merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
             Arc::new(dataset.clone()),
             vec!["i".to_string()],
@@ -1661,7 +1734,7 @@ mod tests {
         .unwrap()
         .when_matched(crate::dataset::WhenMatched::UpdateAll)
         .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
-        .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 0), "owner_0")
+        .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 0), "owner_0")
         .await
         .unwrap()
         .try_build()
@@ -1670,7 +1743,7 @@ mod tests {
         // Execute the merge insert
         let (updated_dataset, _stats) = merge_insert_job.execute_reader(new_data).await.unwrap();
 
-        // Verify that the MemWAL is now marked as flushed
+        // Verify that the MemWAL is now marked as merged
         let indices = updated_dataset.load_indices().await.unwrap();
         let mem_wal_index_meta = indices
             .iter()
@@ -1681,11 +1754,11 @@ mod tests {
         let mem_wal = &mem_wal_details.mem_wal_list[0];
         assert_eq!(
             mem_wal.state,
-            lance_index::mem_wal::State::Flushed,
-            "MemWAL should now be flushed"
+            lance_index::mem_wal::State::Merged,
+            "MemWAL should now be merged"
         );
 
-        // Test that trying to mark a non-existent MemWAL as flushed fails
+        // Test that trying to mark a non-existent MemWAL as merged fails
         let mut merge_insert_job = crate::dataset::MergeInsertBuilder::try_new(
             updated_dataset.clone(),
             vec!["i".to_string()],
@@ -1696,23 +1769,23 @@ mod tests {
             .when_not_matched(crate::dataset::WhenNotMatched::InsertAll);
 
         let result = merge_insert_job
-            .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 999), "owner_0")
+            .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 999), "owner_0")
             .await;
         assert!(
             result.is_err(),
-            "Should fail when trying to mark non-existent MemWAL as flushed"
+            "Should fail when trying to mark non-existent MemWAL as merged"
         );
 
         // Test that trying to mark a MemWAL from non-existent region fails
         let result = merge_insert_job
-            .mark_mem_wal_as_flushed(MemWalId::new("NONEXISTENT", 0), "owner_0")
+            .mark_mem_wal_as_merged(MemWalId::new("NONEXISTENT", 0), "owner_0")
             .await;
         assert!(
             result.is_err(),
-            "Should fail when trying to mark MemWAL from non-existent region as flushed"
+            "Should fail when trying to mark MemWAL from non-existent region as merged"
         );
 
-        // Test that trying to mark an unsealed MemWAL as flushed fails
+        // Test that trying to mark an unflushed MemWAL as merged fails
         // First, create a new generation that is unsealed
         let mut dataset_for_advance = updated_dataset.as_ref().clone();
         advance_mem_wal_generation(
@@ -1758,50 +1831,53 @@ mod tests {
             .when_not_matched(crate::dataset::WhenNotMatched::InsertAll);
 
         let result = merge_insert_job_unsealed
-            .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 1), "owner_1")
+            .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 1), "owner_1")
             .await;
         assert!(
             result.is_err(),
-            "Should fail when trying to mark unsealed MemWAL as flushed"
+            "Should fail when trying to mark unsealed MemWAL as merged"
         );
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 1 } is in state Open, but expected Sealed"),
-                "Error message should indicate the MemWAL is not sealed, got: {}", error);
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 1 } is in state Open, but expected Flushed"),
+                "Error message should indicate the MemWAL is not flushed, got: {}", error);
 
-        // Test that trying to mark an already flushed MemWAL as flushed fails
-        let mut merge_insert_job_flushed = crate::dataset::MergeInsertBuilder::try_new(
+        // Test that trying to mark an already merged MemWAL as merged fails
+        let mut merge_insert_job_merged = crate::dataset::MergeInsertBuilder::try_new(
             updated_dataset.clone(),
             vec!["i".to_string()],
         )
         .unwrap();
-        merge_insert_job_flushed
+        merge_insert_job_merged
             .when_matched(crate::dataset::WhenMatched::UpdateAll)
             .when_not_matched(crate::dataset::WhenNotMatched::InsertAll);
 
-        let result = merge_insert_job_flushed
-            .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 0), "owner_1")
+        let result = merge_insert_job_merged
+            .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 0), "owner_1")
             .await;
         assert!(
             result.is_err(),
-            "Should fail when trying to mark already flushed MemWAL as flushed"
+            "Should fail when trying to mark already merged MemWAL as merged"
         );
 
         // Check the specific error message
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Flushed, but expected Sealed"),
-                "Error message should indicate the MemWAL is already flushed, got: {}", error);
+        assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } is in state Merged, but expected Flushed"),
+                "Error message should indicate the MemWAL is already merged, got: {}", error);
 
-        // Test that merge insert with mark_mem_wal_as_flushed works correctly when MemWAL is in proper state
-        // Seal generation 1 and then test the merge insert
+        // Test that merge insert with mark_mem_wal_as_merged works correctly when MemWAL is in proper state
+        // Seal and flush generation 1 and then test the merge insert
         let mut dataset_for_seal = updated_dataset.as_ref().clone();
         mark_mem_wal_as_sealed(&mut dataset_for_seal, "GLOBAL", 1, "owner_1")
             .await
             .unwrap();
+        mark_mem_wal_as_flushed(&mut dataset_for_seal, "GLOBAL", 1, "owner_1")
+            .await
+            .unwrap();
         let updated_dataset = Arc::new(dataset_for_seal);
 
-        // Verify generation 1 is now sealed but not flushed
+        // Verify generation 1 is now flushed but not merged
         let indices = updated_dataset.load_indices().await.unwrap();
         let mem_wal_index_meta = indices
             .iter()
@@ -1816,11 +1892,11 @@ mod tests {
             .expect("Generation 1 should exist");
         assert_eq!(
             gen_1.state,
-            lance_index::mem_wal::State::Sealed,
-            "Generation 1 should be sealed"
+            lance_index::mem_wal::State::Flushed,
+            "Generation 1 should be flushed"
         );
 
-        // Create merge insert that flushes generation 1
+        // Create merge insert that merges generation 1
         let new_data_valid = lance_datagen::gen_batch()
             .col(
                 "vec",
@@ -1836,7 +1912,7 @@ mod tests {
         .unwrap()
         .when_matched(crate::dataset::WhenMatched::UpdateAll)
         .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
-        .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 1), "owner_1")
+        .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 1), "owner_1")
         .await
         .unwrap()
         .try_build()
@@ -1848,7 +1924,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify that the MemWAL is now marked as flushed
+        // Verify that the MemWAL is now marked as merged
         let indices = final_dataset.load_indices().await.unwrap();
         let mem_wal_index_meta = indices
             .iter()
@@ -1863,8 +1939,8 @@ mod tests {
             .expect("Generation 1 should still exist");
         assert_eq!(
             gen_1.state,
-            lance_index::mem_wal::State::Flushed,
-            "Generation 1 should now be flushed"
+            lance_index::mem_wal::State::Merged,
+            "Generation 1 should now be merged"
         );
     }
 
@@ -1991,8 +2067,13 @@ mod tests {
         assert!(error.to_string().contains("MemWAL MemWalId { region: \"GLOBAL\", generation: 0 } has owner_id: new_owner_id, but expected owner_0"), 
                 "Error message should indicate owner_id mismatch, got: {}", error);
 
-        // Test 5: merge_insert with mark_mem_wal_as_flushed using old owner_id should fail
-        // Try to create merge insert job that flushes using the old owner_id
+        // Test 5: merge_insert with mark_mem_wal_as_merged using old owner_id should fail
+        // First flush the MemWAL using the correct owner_id so it's ready for merging
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "new_owner_id")
+            .await
+            .unwrap();
+
+        // Try to create merge insert job that merges using the old owner_id
         let mut merge_insert_job_builder = crate::dataset::MergeInsertBuilder::try_new(
             Arc::new(dataset.clone()),
             vec!["i".to_string()],
@@ -2002,12 +2083,12 @@ mod tests {
         let build_result = merge_insert_job_builder
             .when_matched(crate::dataset::WhenMatched::UpdateAll)
             .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
-            .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 0), "owner_0") // Using old owner_id
+            .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 0), "owner_0") // Using old owner_id
             .await;
 
         assert!(
             build_result.is_err(),
-            "Should fail when using old owner_id for merge insert flush"
+            "Should fail when using old owner_id for merge insert merge"
         );
 
         // Check the specific error message
@@ -2082,7 +2163,7 @@ mod tests {
         )
         .await;
 
-        // Test merge_insert flush operation separately (requires sealed MemWAL)
+        // Test merge_insert merge operation separately (requires flushed MemWAL)
         // Advance to a new generation and seal it for merge insert test
         advance_mem_wal_generation(
             &mut dataset,
@@ -2095,8 +2176,11 @@ mod tests {
         .await
         .unwrap();
 
-        // Seal the new generation
+        // Seal and flush the new generation
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 1, "owner_1")
+            .await
+            .unwrap();
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 1, "owner_1")
             .await
             .unwrap();
 
@@ -2112,7 +2196,7 @@ mod tests {
         )
         .await;
 
-        // Test merge_insert flush operation
+        // Test merge_insert merge operation
         let mut merge_insert_job_builder = crate::dataset::MergeInsertBuilder::try_new(
             Arc::new(dataset_clone_merge_insert),
             vec!["i".to_string()],
@@ -2122,7 +2206,7 @@ mod tests {
         let merge_insert_job = merge_insert_job_builder
             .when_matched(crate::dataset::WhenMatched::UpdateAll)
             .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
-            .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 1), "owner_1")
+            .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 1), "owner_1")
             .await
             .unwrap()
             .try_build()
@@ -2203,8 +2287,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Seal generation 0 (required for merge insert flush)
+        // Seal and flush generation 0 (required for merge insert merge)
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "owner_0")
             .await
             .unwrap();
 
@@ -2232,11 +2319,11 @@ mod tests {
         let mut dataset_clone_append = dataset.clone();
         let dataset_clone_merge_insert = dataset.clone();
 
-        // Test concurrent operations: append to generation 1 and merge_insert flush generation 0
+        // Test concurrent operations: append to generation 1 and merge_insert merge generation 0
         let append_result =
             append_mem_wal_entry(&mut dataset_clone_append, "GLOBAL", 1, 791, "owner_1").await;
 
-        // Create merge insert job that flushes generation 0
+        // Create merge insert job that merges generation 0
         let mut merge_insert_job_builder = crate::dataset::MergeInsertBuilder::try_new(
             Arc::new(dataset_clone_merge_insert),
             vec!["i".to_string()],
@@ -2246,7 +2333,7 @@ mod tests {
         let merge_insert_job = merge_insert_job_builder
             .when_matched(crate::dataset::WhenMatched::UpdateAll)
             .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
-            .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 0), "owner_0")
+            .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 0), "owner_0")
             .await
             .unwrap()
             .try_build()
@@ -2298,11 +2385,11 @@ mod tests {
             .find(|m| m.id.generation == 1)
             .expect("Generation 1 should exist");
 
-        // Verify generation 0 is sealed and flushed
+        // Verify generation 0 is merged (after merge_insert)
         assert_eq!(
             gen_0.state,
-            lance_index::mem_wal::State::Flushed,
-            "Generation 0 should be flushed"
+            lance_index::mem_wal::State::Merged,
+            "Generation 0 should be merged"
         );
 
         // Verify generation 1 is unsealed and unflushed
@@ -2353,8 +2440,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Seal generation 0 (required for merge insert flush)
+        // Seal and flush generation 0 (required for merge insert merge)
         mark_mem_wal_as_sealed(&mut dataset, "GLOBAL", 0, "owner_0")
+            .await
+            .unwrap();
+        mark_mem_wal_as_flushed(&mut dataset, "GLOBAL", 0, "owner_0")
             .await
             .unwrap();
 
@@ -2393,7 +2483,7 @@ mod tests {
         )
         .await;
 
-        // Create merge insert job that flushes generation 0
+        // Create merge insert job that merges generation 0
         let mut merge_insert_job_builder = crate::dataset::MergeInsertBuilder::try_new(
             Arc::new(dataset_clone_merge_insert),
             vec!["i".to_string()],
@@ -2403,7 +2493,7 @@ mod tests {
         let merge_insert_job = merge_insert_job_builder
             .when_matched(crate::dataset::WhenMatched::UpdateAll)
             .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
-            .mark_mem_wal_as_flushed(MemWalId::new("GLOBAL", 0), "owner_0")
+            .mark_mem_wal_as_merged(MemWalId::new("GLOBAL", 0), "owner_0")
             .await
             .unwrap()
             .try_build()
@@ -2460,11 +2550,11 @@ mod tests {
             .find(|m| m.id.generation == 2)
             .expect("Generation 2 should exist");
 
-        // Verify generation 0 is sealed and flushed
+        // Verify generation 0 is merged (after merge_insert)
         assert_eq!(
             gen_0.state,
-            lance_index::mem_wal::State::Flushed,
-            "Generation 0 should be flushed"
+            lance_index::mem_wal::State::Merged,
+            "Generation 0 should be merged"
         );
 
         // Verify generation 1 is sealed (due to advance) but unflushed
