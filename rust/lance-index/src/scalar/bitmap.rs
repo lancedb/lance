@@ -278,7 +278,7 @@ impl BitmapIndex {
     pub async fn prewarm(&self) -> Result<()> {
         let page_lookup_file = self.store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
-        
+
         if total_rows == 0 {
             return Ok(());
         }
@@ -376,9 +376,55 @@ impl Index for BitmapIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        // TODO: Bitmap index essentially pre-warms on load right now.  This is a problem for some
-        // of the larger bitmap indices (e.g. label_list).  We should probably change it to behave
-        // like other indices and then we will need to implement this.
+        let page_lookup_file = self.store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+        let total_rows = page_lookup_file.num_rows();
+
+        if total_rows == 0 {
+            return Ok(());
+        }
+
+        // Read and process in chunks to avoid offset overflow
+        for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
+            let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
+            let chunk = page_lookup_file
+                .read_range(start_row..end_row, None)
+                .await?;
+
+            if chunk.num_rows() == 0 {
+                continue;
+            }
+
+            let dict_keys = chunk.column(0);
+            let binary_bitmaps = chunk.column(1);
+            let bitmap_binary_array = binary_bitmaps
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+
+            for idx in 0..chunk.num_rows() {
+                let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
+
+                // Skip null bitmap as it's already in memory
+                if key.0.is_null() {
+                    continue;
+                }
+
+                let bitmap_bytes = bitmap_binary_array.value(idx);
+                let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
+
+                // Apply fragment remapping if needed
+                if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                    bitmap = frag_reuse_index_ref.remap_row_ids_tree_map(&bitmap);
+                }
+
+                // Force insert into cache (will overwrite if exists)
+                let cache_key = BitmapEntryKey { value: key };
+                self.index_cache
+                    .insert_with_key(&cache_key, Arc::new(bitmap))
+                    .await;
+            }
+        }
+
         Ok(())
     }
 
@@ -492,7 +538,7 @@ impl ScalarIndex for BitmapIndex {
         let mut state = HashMap::new();
 
         // Load and remap each bitmap
-        for (key, _) in &self.value_locations {
+        for key in self.value_locations.keys() {
             let bitmap = self.load_bitmap(key).await?;
             let remapped_bitmap =
                 RowIdTreeMap::from_iter(bitmap.row_ids().unwrap().filter_map(|addr| {
@@ -535,7 +581,7 @@ impl ScalarIndex for BitmapIndex {
         let mut state = HashMap::new();
 
         // Load all existing bitmaps
-        for (key, _) in &self.value_locations {
+        for key in self.value_locations.keys() {
             let bitmap = self.load_bitmap(key).await?;
             state.insert(key.0.clone(), (*bitmap).clone());
         }
@@ -731,10 +777,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            BitmapIndex::load(index_store, frag_reuse_index, cache).await?
-                as Arc<dyn ScalarIndex>,
-        )
+        Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
 }
 
@@ -796,7 +839,7 @@ pub mod tests {
         let cache = LanceCache::with_capacity(1024 * 1024); // 1MB cache
 
         // Load the index (should only load metadata, not bitmaps)
-        let index = BitmapIndex::load(store.clone(), None, cache.clone())
+        let index = BitmapIndex::load(store.clone(), None, &cache)
             .await
             .unwrap();
 
@@ -1008,116 +1051,159 @@ pub mod tests {
 
         // Create test data with low cardinality
         let colors = vec![
-            "red", "blue", "green", "red", "yellow",
-            "blue", "red", "green", "blue", "yellow",
+            "red", "blue", "green", "red", "yellow", "blue", "red", "green", "blue", "yellow",
             "red", "red", "blue", "green", "yellow",
         ];
-        
+
         let row_ids = (0u64..15u64).collect::<Vec<_>>();
-        
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
             Field::new("_rowid", DataType::UInt64, false),
         ]));
-        
+
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(colors.clone())),
                 Arc::new(UInt64Array::from(row_ids.clone())),
             ],
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         let stream = stream::once(async move { Ok(batch) });
         let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
-        
+
         // Train and write the bitmap index
         BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
             .await
             .unwrap();
-        
+
         // Create a cache with metrics tracking
         let cache = LanceCache::with_capacity(1024 * 1024); // 1MB cache
-        
+
         // Load the index (should only load metadata, not bitmaps)
         let index = BitmapIndex::load(store.clone(), None, &cache)
             .await
             .unwrap();
-        
+
         // Verify no bitmaps are cached yet
-        let cache_key_red = BitmapEntryKey { 
-            value: OrderableScalarValue(ScalarValue::Utf8(Some("red".to_string())))
+        let cache_key_red = BitmapEntryKey {
+            value: OrderableScalarValue(ScalarValue::Utf8(Some("red".to_string()))),
         };
-        let cache_key_blue = BitmapEntryKey { 
-            value: OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string())))
+        let cache_key_blue = BitmapEntryKey {
+            value: OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string()))),
         };
-        
-        assert!(cache.get_with_key::<BitmapEntryKey>(&cache_key_red).await.is_none());
-        assert!(cache.get_with_key::<BitmapEntryKey>(&cache_key_blue).await.is_none());
-        
+
+        assert!(cache
+            .get_with_key::<BitmapEntryKey>(&cache_key_red)
+            .await
+            .is_none());
+        assert!(cache
+            .get_with_key::<BitmapEntryKey>(&cache_key_blue)
+            .await
+            .is_none());
+
         // Call prewarm
         index.prewarm().await.unwrap();
-        
+
         // Verify all bitmaps are now cached
-        assert!(cache.get_with_key::<BitmapEntryKey>(&cache_key_red).await.is_some());
-        assert!(cache.get_with_key::<BitmapEntryKey>(&cache_key_blue).await.is_some());
-        
+        assert!(cache
+            .get_with_key::<BitmapEntryKey>(&cache_key_red)
+            .await
+            .is_some());
+        assert!(cache
+            .get_with_key::<BitmapEntryKey>(&cache_key_blue)
+            .await
+            .is_some());
+
         // Verify cached bitmaps have correct content
-        let cached_red = cache.get_with_key::<BitmapEntryKey>(&cache_key_red).await.unwrap();
+        let cached_red = cache
+            .get_with_key::<BitmapEntryKey>(&cache_key_red)
+            .await
+            .unwrap();
         let red_rows: Vec<u64> = cached_red.row_ids().unwrap().map(u64::from).collect();
         assert_eq!(red_rows, vec![0, 3, 6, 10, 11]);
-        
+
         // Call prewarm again - should be idempotent
         index.prewarm().await.unwrap();
-        
+
         // Verify cache still contains the same items
-        let cached_red_2 = cache.get_with_key::<BitmapEntryKey>(&cache_key_red).await.unwrap();
+        let cached_red_2 = cache
+            .get_with_key::<BitmapEntryKey>(&cache_key_red)
+            .await
+            .unwrap();
         let red_rows_2: Vec<u64> = cached_red_2.row_ids().unwrap().map(u64::from).collect();
         assert_eq!(red_rows_2, vec![0, 3, 6, 10, 11]);
     }
 
     #[tokio::test]
-    #[ignore] // This test uses old internal structure - needs rewrite for lazy loading
     async fn test_remap_bitmap_with_null() {
+        use arrow_array::UInt32Array;
+
         // Create a temporary store.
         let tmpdir = Arc::new(tempdir().unwrap());
-        let _test_store = Arc::new(LanceIndexStore::new(
+        let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             Path::from_filesystem_path(tmpdir.path()).unwrap(),
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Simulate a bitmap where:
+        // Create test data that simulates:
         // frag 1 - { 0: null, 1: null, 2: 1 }
         // frag 2 - { 0: 1, 1: 2, 2: 2 }
-        let mut null_map = RowIdTreeMap::new();
-        null_map.insert(RowAddress::new_from_parts(1, 0).into());
-        null_map.insert(RowAddress::new_from_parts(1, 1).into());
+        // We'll create this data with specific row addresses
+        let values = vec![
+            None,       // row 0: null (will be at address (1,0))
+            None,       // row 1: null (will be at address (1,1))
+            Some(1u32), // row 2: 1    (will be at address (1,2))
+            Some(1u32), // row 3: 1    (will be at address (2,0))
+            Some(2u32), // row 4: 2    (will be at address (2,1))
+            Some(2u32), // row 5: 2    (will be at address (2,2))
+        ];
 
-        let mut scalar_value1 = RowIdTreeMap::new();
-        scalar_value1.insert(RowAddress::new_from_parts(1, 2).into());
-        scalar_value1.insert(RowAddress::new_from_parts(2, 0).into());
+        // Create row IDs with specific fragment addresses
+        let row_ids: Vec<u64> = vec![
+            RowAddress::new_from_parts(1, 0).into(),
+            RowAddress::new_from_parts(1, 1).into(),
+            RowAddress::new_from_parts(1, 2).into(),
+            RowAddress::new_from_parts(2, 0).into(),
+            RowAddress::new_from_parts(2, 1).into(),
+            RowAddress::new_from_parts(2, 2).into(),
+        ];
 
-        let mut scalar_value2 = RowIdTreeMap::new();
-        scalar_value2.insert(RowAddress::new_from_parts(2, 1).into());
-        scalar_value2.insert(RowAddress::new_from_parts(2, 2).into());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::UInt32, true),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
 
-        let mut index_map = BTreeMap::new();
-        index_map.insert(
-            OrderableScalarValue(ScalarValue::UInt32(Some(1))),
-            scalar_value1,
-        );
-        index_map.insert(
-            OrderableScalarValue(ScalarValue::UInt32(Some(2))),
-            scalar_value2,
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(values)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
 
-        // This test needs to be rewritten for lazy loading
-        // The old constructor no longer exists
-        return;
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
-        /* Commented out old test code that uses direct constructor
-        // Simulating a compaction that compacts all frags to frag 3
+        // Create the bitmap index
+        BitmapIndexPlugin::train_bitmap_index(stream, test_store.as_ref())
+            .await
+            .unwrap();
+
+        // Load the index
+        let index = BitmapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .expect("Failed to load bitmap index");
+
+        // Verify initial state
+        assert_eq!(index.value_locations.len(), 2); // 2 non-null values (1 and 2)
+        assert!(!index.null_bitmap.is_empty()); // Should have null values
+
+        // Create a remap that simulates compaction of frags 1 and 2 into frag 3
         let mut row_addr_map = HashMap::<u64, Option<u64>>::new();
         row_addr_map.insert(
             RowAddress::new_from_parts(1, 0).into(),
@@ -1145,7 +1231,7 @@ pub mod tests {
         );
 
         // Perform remap
-        bitmap_index
+        index
             .remap(&row_addr_map, test_store.as_ref())
             .await
             .unwrap();
@@ -1153,32 +1239,69 @@ pub mod tests {
         // Reload and check
         let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())
             .await
-            .expect("Failed to load bitmap index");
+            .expect("Failed to load remapped bitmap index");
 
-        let mut expected_null_map = RowIdTreeMap::new();
-        expected_null_map.insert(RowAddress::new_from_parts(3, 0).into());
-        expected_null_map.insert(RowAddress::new_from_parts(3, 1).into());
-        // assert_eq!(reloaded_idx.null_map, expected_null_map);
-
-        let mut expected_scalar_value1 = RowIdTreeMap::new();
-        expected_scalar_value1.insert(RowAddress::new_from_parts(3, 2).into());
-        expected_scalar_value1.insert(RowAddress::new_from_parts(3, 3).into());
-
-        let mut expected_scalar_value2 = RowIdTreeMap::new();
-        expected_scalar_value2.insert(RowAddress::new_from_parts(3, 4).into());
-        expected_scalar_value2.insert(RowAddress::new_from_parts(3, 5).into());
-
-        let mut expected_index_map = BTreeMap::new();
-        expected_index_map.insert(
-            OrderableScalarValue(ScalarValue::UInt32(Some(1))),
-            expected_scalar_value1,
-        );
-        expected_index_map.insert(
-            OrderableScalarValue(ScalarValue::UInt32(Some(2))),
-            expected_scalar_value2,
+        // Verify the null bitmap was remapped correctly
+        let expected_null_addrs: Vec<u64> = vec![
+            RowAddress::new_from_parts(3, 0).into(),
+            RowAddress::new_from_parts(3, 1).into(),
+        ];
+        let actual_null_addrs: Vec<u64> = reloaded_idx
+            .null_bitmap
+            .row_ids()
+            .unwrap()
+            .map(u64::from)
+            .collect();
+        assert_eq!(
+            actual_null_addrs, expected_null_addrs,
+            "Null bitmap not remapped correctly"
         );
 
-        // assert_eq!(reloaded_idx.index_map, expected_index_map);
-        */
+        // Search for value 1 and verify remapped addresses
+        let query = SargableQuery::Equals(ScalarValue::UInt32(Some(1)));
+        let result = reloaded_idx
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        if let crate::scalar::SearchResult::Exact(row_ids) = result {
+            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+            actual.sort();
+            let expected: Vec<u64> = vec![
+                RowAddress::new_from_parts(3, 2).into(),
+                RowAddress::new_from_parts(3, 3).into(),
+            ];
+            assert_eq!(actual, expected, "Value 1 bitmap not remapped correctly");
+        }
+
+        // Search for value 2 and verify remapped addresses
+        let query = SargableQuery::Equals(ScalarValue::UInt32(Some(2)));
+        let result = reloaded_idx
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        if let crate::scalar::SearchResult::Exact(row_ids) = result {
+            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+            actual.sort();
+            let expected: Vec<u64> = vec![
+                RowAddress::new_from_parts(3, 4).into(),
+                RowAddress::new_from_parts(3, 5).into(),
+            ];
+            assert_eq!(actual, expected, "Value 2 bitmap not remapped correctly");
+        }
+
+        // Search for null values
+        let query = SargableQuery::IsNull();
+        let result = reloaded_idx
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        if let crate::scalar::SearchResult::Exact(row_ids) = result {
+            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+            actual.sort();
+            assert_eq!(
+                actual, expected_null_addrs,
+                "Null search results not correct"
+            );
+        }
     }
 }
