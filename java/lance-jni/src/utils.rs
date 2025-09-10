@@ -272,6 +272,43 @@ pub fn get_index_params(
     }
 }
 
+pub fn get_scalar_index_params(
+    env: &mut JNIEnv,
+    index_params_obj: JObject,
+    index_type: lance_index::IndexType,
+) -> Result<String> {
+    // For scalar indices, we return a simple JSON string with parameters
+    match index_type {
+        lance_index::IndexType::BTree => {
+            let scalar_params = env.get_optional_from_method(
+                &index_params_obj,
+                "getScalarIndexParams",
+                |env, scalar_obj| {
+                    env.get_optional_from_method(&scalar_obj, "getBTreeParams", |env, btree_obj| {
+                        let batch_size = env
+                            .call_method(&btree_obj, "getBatchSize", "()J", &[])?
+                            .j()?;
+                        Ok(format!(r#"{{"zone_size": {}}}"#, batch_size))
+                    })
+                },
+            )?;
+
+            match scalar_params {
+                Some(Some(params_str)) => Ok(params_str),
+                _ => Ok(r#"{"zone_size": 4096}"#.to_string()), // Default batch size
+            }
+        }
+        lance_index::IndexType::ZoneMap => {
+            // ZoneMap uses default parameters for now
+            Ok(r#"{}"#.to_string())
+        }
+        _ => Err(Error::input_error(format!(
+            "Unsupported scalar index type: {:?}",
+            index_type
+        ))),
+    }
+}
+
 pub fn to_rust_map(env: &mut JNIEnv, jmap: &JMap) -> Result<HashMap<String, String>> {
     env.with_local_frame(16, |env| {
         let mut map = HashMap::new();

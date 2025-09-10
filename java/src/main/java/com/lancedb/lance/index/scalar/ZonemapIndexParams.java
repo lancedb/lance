@@ -11,29 +11,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.lancedb.lance.index;
+package com.lancedb.lance.index.scalar;
 
-public enum IndexType {
-  SCALAR(0),
-  BTREE(1),
-  BITMAP(2),
-  LABEL_LIST(3),
-  INVERTED(4),
-  ZONEMAP(8),
-  VECTOR(100),
-  IVF_FLAT(101),
-  IVF_SQ(102),
-  IVF_PQ(103),
-  IVF_HNSW_SQ(104),
-  IVF_HNSW_PQ(105);
+import com.google.common.base.MoreObjects;
 
-  private final int value;
+/** Parameters for creating Zonemap scalar indices. */
+public class ZonemapIndexParams {
 
-  IndexType(int value) {
-    this.value = value;
+  private ZonemapIndexParams(Builder builder) {
+    // Currently no specific parameters for zonemap index
   }
 
-  public int getValue() {
-    return value;
+  public static class Builder {
+    public Builder() {}
+
+    public ZonemapIndexParams build() {
+      return new ZonemapIndexParams(this);
+    }
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this).toString();
   }
 }

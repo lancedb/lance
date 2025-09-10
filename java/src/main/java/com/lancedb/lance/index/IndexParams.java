@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance.index;
 
+import com.lancedb.lance.index.scalar.ScalarIndexParams;
 import com.lancedb.lance.index.vector.VectorIndexParams;
 
 import com.google.common.base.MoreObjects;
@@ -23,15 +24,18 @@ import java.util.Optional;
 public class IndexParams {
   private final DistanceType distanceType;
   private final Optional<VectorIndexParams> vectorIndexParams;
+  private final Optional<ScalarIndexParams> scalarIndexParams;
 
   private IndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
     this.vectorIndexParams = builder.vectorIndexParams;
+    this.scalarIndexParams = builder.scalarIndexParams;
   }
 
   public static class Builder {
     private DistanceType distanceType = DistanceType.L2;
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
+    private Optional<ScalarIndexParams> scalarIndexParams = Optional.empty();
 
     public Builder() {}
 
@@ -57,6 +61,17 @@ public class IndexParams {
       return this;
     }
 
+    /**
+     * Scalar index parameters for creating a scalar index.
+     *
+     * @param scalarIndexParams scalar index parameters
+     * @return this builder
+     */
+    public Builder setScalarIndexParams(ScalarIndexParams scalarIndexParams) {
+      this.scalarIndexParams = Optional.of(scalarIndexParams);
+      return this;
+    }
+
     public IndexParams build() {
       return new IndexParams(this);
     }
@@ -70,11 +85,16 @@ public class IndexParams {
     return vectorIndexParams;
   }
 
+  public Optional<ScalarIndexParams> getScalarIndexParams() {
+    return scalarIndexParams;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("distanceType", distanceType)
         .add("vectorIndexParams", vectorIndexParams.orElse(null))
+        .add("scalarIndexParams", scalarIndexParams.orElse(null))
         .toString();
   }
 }
