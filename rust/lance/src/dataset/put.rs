@@ -136,7 +136,7 @@ impl FragmentPutBuilder {
             updated_fragments: vec![],
             new_fragments: vec![updated_fragment],
             fields_modified: vec![], // Track modified fields
-            ../* expr */
+            ..                       /* expr */
         };
 
         // Create transaction with current dataset version
@@ -401,7 +401,7 @@ impl DatasetPutBuilder {
             updated_fragments: vec![], // Old fragments are replaced
             new_fragments: updated_fragments,
             fields_modified: vec![], // Track modified fields
-            ../* expr */
+            ..                       /* expr */
         };
 
         // Create Transaction object (no commit - following merge_insert pattern)
