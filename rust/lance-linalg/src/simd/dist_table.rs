@@ -11,6 +11,16 @@ pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7
 pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
 
+// This function is used to sum the distance table for 4-bit codes.
+// The codes are organized in the order of PERM0:
+// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+// | address  |  0 |  1 |  2 |  3 |  4 |  5 |  6 |  7 |  8 |  9 | 10 | 11 | 12 | 13 | 14 | 15 |
+// | (bytes)  |    |    |    |    |    |    |    |    |    |    |    |    |    |    |    |    |
+// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+// | bits 0..3|  0 |  8 |  1 |  9 |  2 | 10 |  3 | 11 |  4 | 12 |  5 | 13 |  6 | 14 |  7 | 15 |
+// | bits 4..7| 16 | 24 | 17 | 25 | 18 | 26 | 19 | 27 | 20 | 28 | 21 | 29 | 22 | 30 | 23 | 31 |
+// +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
+// so that we can use SIMD instruction (especially _mm256_shuffle_epi8) to do the summation.
 #[inline]
 pub fn sum_4bit_dist_table(
     n: usize,
@@ -154,4 +164,49 @@ extern "C" {
         dist_table: *const u8,
         dists: *mut u16,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sum_4bit_dist_table_basic() {
+        // we have 32 vectors
+        let n = 32;
+
+        // each code is 2 bytes (16 dim), so code_len = 2
+        let code_len = 2;
+
+        let codes = vec![
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, // codes[0..8]
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // codes[8..16]
+            0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, // codes[16..24]
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, // codes[24..32]
+        ];
+        let codes = codes.repeat(n * code_len / codes.len());
+
+        let mut dist_table = vec![0u8; 16 * 4];
+        for i in 0..dist_table.len() {
+            dist_table[i] = (i % 16 + 1) as u8;
+        }
+
+        // Test the function
+        let mut dists = vec![0u16; n];
+        sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut dists);
+
+        // Compare with reference implementation
+        let mut expected_dists = vec![0u16; n];
+        sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected_dists);
+
+        assert_eq!(dists, expected_dists);
+        // the vector 1's code is the low 4bits of codes[PERM0_INVERSE[1]] = codes[2],
+        // the first 4 bits are the low 4 bits of codes[2], so it's 0x6,
+        // the second 4 bits are the low 4 bits of codes[2 + 16], so it's 0xb,
+        // the third 4 bits are the same as the first 4 bits, so it's 0x6,
+        // the fourth 4 bits are the same as the second 4 bits, so it's 0xb,
+
+        // so the distance is 2 * (dist_table[0x6] + dist_table[0xb + 16]) = 2*(7 + 12) = 38
+        assert_eq!(dists[1], 38);
+    }
 }
