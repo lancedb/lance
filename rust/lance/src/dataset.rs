@@ -2771,7 +2771,7 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_location(&dataset.base(), dataset.object_store())
+                .resolve_latest_location(dataset.base(), dataset.object_store())
                 .await
                 .unwrap()
                 .path,
@@ -2795,7 +2795,7 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_location(&dataset.base(), dataset.object_store())
+                .resolve_latest_location(dataset.base(), dataset.object_store())
                 .await
                 .unwrap()
                 .path,
@@ -2819,7 +2819,7 @@ mod tests {
         write_manifest_file(
             dataset.object_store(),
             dataset.commit_handler.as_ref(),
-            &dataset.base(),
+            dataset.base(),
             &mut manifest,
             None,
             &ManifestWriteConfig {
