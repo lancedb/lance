@@ -49,8 +49,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
-            | Operation::Restore { .. }
-            | Operation::UpdateMemWalState { .. } => Ok(Self {
+            | Operation::UpdateMemWalState { .. }
+            | Operation::Clone { .. }
+            | Operation::Restore { .. } => Ok(Self {
                 transaction,
                 affected_rows,
                 initial_fragments: HashMap::new(),
@@ -210,6 +211,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateMemWalState { .. } => {
                 self.check_update_mem_wal_state_txn(other_transaction, other_version)
             }
+            Operation::Clone { .. } => Ok(()),
         }
     }
 
@@ -222,6 +224,7 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
+                | Operation::Clone { .. }
                 | Operation::Project { .. }
                 | Operation::Append { .. }
                 | Operation::UpdateConfig { .. } => Ok(()),
@@ -335,7 +338,7 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::Update {
-            mem_wal_to_flush, ..
+            mem_wal_to_merge, ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
@@ -343,6 +346,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::Append { .. }
+                | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
@@ -441,13 +445,13 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateMemWalState { added, updated, .. } => {
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         added,
-                        mem_wal_to_flush.as_slice(),
+                        mem_wal_to_merge.as_slice(),
                         other_transaction,
                         other_version,
                     )?;
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         updated,
-                        mem_wal_to_flush.as_slice(),
+                        mem_wal_to_merge.as_slice(),
                         other_transaction,
                         other_version,
                     )?;
@@ -471,7 +475,7 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
-                Operation::Append { .. } => Ok(()),
+                Operation::Append { .. } | Operation::Clone { .. } => Ok(()),
                 // Indices are identified by UUIDs, so they shouldn't conflict.
                 // unless it is the same frag reuse index
                 Operation::CreateIndex {
@@ -599,6 +603,7 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Append { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
+                | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateMemWalState { .. } => Ok(()),
                 Operation::Delete {
@@ -771,6 +776,7 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
             }
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Delete { .. }
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
@@ -805,6 +811,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
+            | Operation::Clone { .. }
             | Operation::DataReplacement { .. } => Ok(()),
         }
     }
@@ -816,6 +823,7 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         match &other_transaction.operation {
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Delete { .. }
             | Operation::Update { .. }
             | Operation::Merge { .. }
@@ -850,6 +858,7 @@ impl<'a> TransactionRebase<'a> {
         match &other_transaction.operation {
             Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::Clone { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
 
             Operation::Update { .. }
@@ -886,6 +895,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
+            | Operation::Clone { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
             Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version, location!()))
@@ -911,6 +921,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
+            | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. } => Ok(()),
         }
@@ -930,6 +941,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::DataReplacement { .. }
             | Operation::Rewrite { .. }
+            | Operation::Clone { .. }
             | Operation::ReserveFragments { .. } => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
@@ -994,6 +1006,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::Append { .. }
+                | Operation::Clone { .. }
                 | Operation::Delete { .. }
                 | Operation::CreateIndex { .. }
                 | Operation::Rewrite { .. }
@@ -1064,9 +1077,9 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::Update {
-                    mem_wal_to_flush, ..
+                    mem_wal_to_merge, ..
                 } => {
-                    if mem_wal_to_flush.is_some() {
+                    if mem_wal_to_merge.is_some() {
                         // TODO: This check could be more detailed, there is an assumption that
                         //  once a MemWAL is sealed, there is no other operation that could change
                         //  the state back to open, and at that point it can always be flushed.
@@ -1089,6 +1102,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::DataReplacement { .. }
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
+                | Operation::Clone { .. }
                 | Operation::Project { .. } => Err(self.incompatible_conflict_err(
                     other_transaction,
                     other_version,
@@ -1162,6 +1176,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
+            | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. } => Ok(self.transaction),
         }
@@ -1573,7 +1588,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
-            mem_wal_to_flush: None,
+            mem_wal_to_merge: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1582,7 +1597,7 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1594,7 +1609,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1635,6 +1650,7 @@ mod tests {
             read_deletion_file(
                 fragment.id,
                 deletion_file,
+                // Reference deletion file should never enter this apply_deletion. So base path is fine.
                 &dataset.base,
                 dataset.object_store(),
             )
@@ -1692,7 +1708,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1704,7 +1720,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
         ];
         let transactions =
@@ -1823,7 +1839,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 },
             ),
             (
@@ -1833,7 +1849,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 },
             ),
             (
@@ -1943,6 +1959,7 @@ mod tests {
             index_details: None,
             index_version: 0,
             created_at: None, // Test index, not setting timestamp
+            base_id: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -1987,7 +2004,7 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
             Operation::UpdateConfig {
                 upsert_values: Some(HashMap::from_iter(vec![(
@@ -2179,7 +2196,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 },
                 [
                     Compatible,    // append
@@ -2418,6 +2435,7 @@ mod tests {
         match operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
+            | Operation::Clone { .. }
             | Operation::Overwrite { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }

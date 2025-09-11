@@ -14,18 +14,26 @@ use super::{
     flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     SargableQuery, ScalarIndex, SearchResult,
 };
-use crate::frag_reuse::FragReuseIndex;
-use crate::metrics::NoOpMetricsCollector;
+use crate::{
+    frag_reuse::FragReuseIndex,
+    pb,
+    scalar::{
+        expression::{SargableQueryParser, ScalarQueryParser},
+        registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
+        CreatedIndex, UpdateCriteria,
+    },
+};
+use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
+use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
 use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
@@ -33,13 +41,14 @@ use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, LanceCache, WeakLanceCache},
+    error::LanceOptionExt,
     utils::{
         mask::RowIdTreeMap,
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
-    Error, Result,
+    Error, Result, ROW_ID,
 };
 use lance_datafusion::{
     chunker::chunk_concat_stream,
@@ -47,7 +56,7 @@ use lance_datafusion::{
 };
 use log::debug;
 use roaring::RoaringBitmap;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use snafu::location;
 use tracing::info;
 
@@ -55,6 +64,9 @@ const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
+const BTREE_INDEX_VERSION: u32 = 0;
+pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
+pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -741,7 +753,7 @@ impl CacheKey for BTreePageKey {
 #[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
@@ -761,7 +773,7 @@ impl BTreeIndex {
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
-        index_cache: LanceCache,
+        index_cache: WeakLanceCache,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
@@ -822,7 +834,7 @@ impl BTreeIndex {
         let subindex = self.lookup_page(page_number, index_reader, metrics).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
+        // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
         // to search for X IN [5, 3]
         match subindex.search(query, metrics).await? {
             SearchResult::Exact(map) => Ok(map),
@@ -836,7 +848,7 @@ impl BTreeIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
@@ -850,7 +862,7 @@ impl BTreeIndex {
                 map,
                 null_pages,
                 store,
-                index_cache,
+                WeakLanceCache::from(index_cache),
                 sub_index,
                 batch_size,
                 frag_reuse_index,
@@ -900,23 +912,109 @@ impl BTreeIndex {
             map,
             null_pages,
             store,
-            index_cache,
+            WeakLanceCache::from(index_cache),
             sub_index,
             batch_size,
             frag_reuse_index,
         ))
     }
 
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
+        let num_rows_in_lookup = page_lookup_file.num_rows();
+        let serialized_lookup = page_lookup_file
+            .read_range(0..num_rows_in_lookup, None)
+            .await?;
+        let file_schema = page_lookup_file.schema();
+        let batch_size = file_schema
+            .metadata
+            .get(BATCH_SIZE_META_KEY)
+            .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
+            .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+        Ok(Arc::new(Self::try_from_serialized(
+            serialized_lookup,
+            store,
+            index_cache,
+            batch_size,
+            frag_reuse_index,
+        )?))
+    }
+
     /// Create a stream of all the data in the index, in the same format used to train the index
-    async fn into_data_stream(self) -> Result<impl RecordBatchStream> {
+    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let schema = self.sub_index.schema().clone();
+        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
+        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema_clone = new_schema.clone();
         let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
         let batches = reader_stream
             .map(|fut| fut.map_err(DataFusionError::from))
             .buffered(self.store.io_parallelism())
+            .map_ok(move |batch| {
+                RecordBatch::try_new(
+                    new_schema.clone(),
+                    vec![batch.column(0).clone(), batch.column(1).clone()],
+                )
+                .unwrap()
+            })
             .boxed();
-        Ok(RecordBatchStreamAdapter::new(schema, batches))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            new_schema_clone,
+            batches,
+        )))
+    }
+
+    async fn into_old_data(self) -> Result<Arc<dyn ExecutionPlan>> {
+        let stream = self.into_data_stream().await?;
+        Ok(Arc::new(OneShotExec::new(stream)))
+    }
+
+    async fn combine_old_new(
+        self,
+        new_data: SendableRecordBatchStream,
+        chunk_size: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        let data_type = new_data.schema().field(0).data_type().clone();
+        // Datafusion currently has bugs with spilling on string columns
+        // See https://github.com/apache/datafusion/issues/10073
+        //
+        // One we upgrade we can remove this
+        let use_spilling = !matches!(data_type, DataType::Utf8 | DataType::LargeUtf8);
+        let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
+
+        let new_input = Arc::new(OneShotExec::new(new_data));
+        let old_input = self.into_old_data().await?;
+        debug_assert_eq!(
+            old_input.schema().flattened_fields().len(),
+            new_input.schema().flattened_fields().len()
+        );
+
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
+        // them back into a single partition.
+        let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
+        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
+
+        let unchunked = execute_plan(
+            ordered,
+            LanceExecutionOptions {
+                use_spilling,
+                ..Default::default()
+            },
+        )?;
+        Ok(chunk_concat_stream(unchunked, chunk_size as usize))
     }
 }
 
@@ -985,7 +1083,8 @@ impl Index for BTreeIndex {
             .buffer_unordered(get_num_compute_intensive_cpus());
 
         while let Some((page_idx, page)) = pages.try_next().await? {
-            self.index_cache
+            let inserted = self
+                .index_cache
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
@@ -993,6 +1092,13 @@ impl Index for BTreeIndex {
                     Arc::new(CachedScalarIndex::new(page)),
                 )
                 .await;
+
+            if !inserted {
+                return Err(Error::Internal {
+                    message: "Failed to prewarm index: cache is no longer available".to_string(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())
@@ -1079,40 +1185,15 @@ impl ScalarIndex for BTreeIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+    fn can_remap(&self) -> bool {
         true
-    }
-
-    async fn load(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
-    ) -> Result<Arc<Self>> {
-        let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
-        let num_rows_in_lookup = page_lookup_file.num_rows();
-        let serialized_lookup = page_lookup_file
-            .read_range(0..num_rows_in_lookup, None)
-            .await?;
-        let file_schema = page_lookup_file.schema();
-        let batch_size = file_schema
-            .metadata
-            .get(BATCH_SIZE_META_KEY)
-            .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
-            .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
-        Ok(Arc::new(Self::try_from_serialized(
-            serialized_lookup,
-            store,
-            index_cache,
-            batch_size,
-            frag_reuse_index,
-        )?))
     }
 
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         // Remap and write the pages
         let mut sub_index_file = dest_store
             .new_index_file(BTREE_PAGES_NAME, self.sub_index.schema().clone())
@@ -1132,23 +1213,40 @@ impl ScalarIndex for BTreeIndex {
         // Copy the lookup file as-is
         self.store
             .copy_index_file(BTREE_LOOKUP_NAME, dest_store)
-            .await
+            .await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_version: BTREE_INDEX_VERSION,
+        })
     }
 
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
-        let merged_data_source = Box::new(BTreeUpdater::new(self.clone(), new_data));
+        let merged_data_source = self
+            .clone()
+            .combine_old_new(new_data, DEFAULT_BTREE_BATCH_SIZE)
+            .await?;
         train_btree_index(
             merged_data_source,
             self.sub_index.as_ref(),
             dest_store,
-            DEFAULT_BTREE_BATCH_SIZE as u32,
+            DEFAULT_BTREE_BATCH_SIZE,
         )
-        .await
+        .await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_version: BTREE_INDEX_VERSION,
+        })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
     }
 }
 
@@ -1159,7 +1257,7 @@ struct BatchStats {
 }
 
 fn analyze_batch(batch: &RecordBatch) -> Result<BatchStats> {
-    let values = batch.column(0);
+    let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
     if values.is_empty() {
         return Err(Error::Internal {
             message: "received an empty batch in btree training".to_string(),
@@ -1263,54 +1361,32 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>, value_type: &DataType) -> Resu
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-#[async_trait]
-pub trait TrainingSource: Send {
-    /// Returns a stream of batches, ordered by the value column (in ascending order)
-    ///
-    /// Each batch should have chunk_size rows
-    ///
-    /// The schema for the batch is slightly flexible.
-    /// The first column may have any name or type, these are the values to index
-    /// The second column must be the row ids which must be UInt64Type
-    async fn scan_ordered_chunks(
-        self: Box<Self>,
-        chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream>;
-
-    /// Returns a stream of batches
-    ///
-    /// Each batch should have chunk_size rows
-    ///
-    /// The schema for the batch is slightly flexible.
-    /// The first column may have any name or type, these are the values to index
-    /// The second column must be the row ids which must be UInt64Type
-    async fn scan_unordered_chunks(
-        self: Box<Self>,
-        chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream>;
-}
-
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
 ///
 /// Note: This is likely to change.  It is unreasonable to expect the caller to do the sorting
 /// and re-chunking into page-size batches.  This is left for simplicity as this feature is still
 /// a work in progress
 pub async fn train_btree_index(
-    data_source: Box<dyn TrainingSource + Send>,
+    batches_source: SendableRecordBatchStream,
     sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
-    batch_size: u32,
+    batch_size: u64,
 ) -> Result<()> {
     let mut sub_index_file = index_store
         .new_index_file(BTREE_PAGES_NAME, sub_index_trainer.schema().clone())
         .await?;
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
-    let mut batches_source = data_source.scan_ordered_chunks(batch_size).await?;
-    let value_type = batches_source.schema().field(0).data_type().clone();
+
+    let value_type = batches_source
+        .schema()
+        .field_with_name(VALUE_COLUMN_NAME)?
+        .data_type()
+        .clone();
+
+    let mut batches_source = chunk_concat_stream(batches_source, batch_size as usize);
+
     while let Some(batch) = batches_source.try_next().await? {
-        debug_assert_eq!(batch.num_columns(), 2);
-        debug_assert_eq!(*batch.column(1).data_type(), DataType::UInt64);
         encoded_batches.push(
             train_btree_page(batch, batch_idx, sub_index_trainer, sub_index_file.as_mut()).await?,
         );
@@ -1328,80 +1404,6 @@ pub async fn train_btree_index(
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
     Ok(())
-}
-
-/// A source of training data created by merging existing data with new data
-struct BTreeUpdater {
-    index: BTreeIndex,
-    new_data: SendableRecordBatchStream,
-}
-
-impl BTreeUpdater {
-    fn new(index: BTreeIndex, new_data: SendableRecordBatchStream) -> Self {
-        Self { index, new_data }
-    }
-}
-
-impl BTreeUpdater {
-    fn into_old_input(index: BTreeIndex) -> Arc<dyn ExecutionPlan> {
-        let schema = index.sub_index.schema().clone();
-        let batches = index.into_data_stream().into_stream().try_flatten().boxed();
-        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, batches));
-        Arc::new(OneShotExec::new(stream))
-    }
-}
-
-#[async_trait]
-impl TrainingSource for BTreeUpdater {
-    async fn scan_ordered_chunks(
-        self: Box<Self>,
-        chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        let data_type = self.new_data.schema().field(0).data_type().clone();
-        // Datafusion currently has bugs with spilling on string columns
-        // See https://github.com/apache/datafusion/issues/10073
-        //
-        // One we upgrade we can remove this
-        let use_spilling = !matches!(data_type, DataType::Utf8 | DataType::LargeUtf8);
-
-        let new_input = Arc::new(OneShotExec::new(self.new_data));
-        let old_input = Self::into_old_input(self.index);
-        debug_assert_eq!(
-            old_input.schema().flattened_fields().len(),
-            new_input.schema().flattened_fields().len()
-        );
-        let sort_expr = PhysicalSortExpr {
-            expr: Arc::new(Column::new("values", 0)),
-            options: SortOptions {
-                descending: false,
-                nulls_first: true,
-            },
-        };
-        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
-        // them back into a single partition.
-        let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
-        let ordered = Arc::new(SortPreservingMergeExec::new(
-            LexOrdering::new(vec![sort_expr]),
-            all_data,
-        ));
-
-        let unchunked = execute_plan(
-            ordered,
-            LanceExecutionOptions {
-                use_spilling,
-                ..Default::default()
-            },
-        )?;
-        Ok(chunk_concat_stream(unchunked, chunk_size as usize))
-    }
-
-    async fn scan_unordered_chunks(
-        self: Box<Self>,
-        _chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        // BTree indices will never use unordered scans
-        unimplemented!()
-    }
 }
 
 /// A stream that reads the original training data back out of the index
@@ -1451,6 +1453,118 @@ impl Stream for IndexReaderStream {
     }
 }
 
+/// Parameters for a btree index
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BTreeParameters {
+    /// The number of rows to include in each zone
+    pub zone_size: Option<u64>,
+}
+
+struct BTreeTrainingRequest {
+    parameters: BTreeParameters,
+    criteria: TrainingCriteria,
+}
+
+impl BTreeTrainingRequest {
+    pub fn new(parameters: BTreeParameters) -> Self {
+        Self {
+            parameters,
+            // BTree indexes need data sorted by the value column
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        }
+    }
+}
+
+impl TrainingRequest for BTreeTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BTreeIndexPlugin;
+
+#[async_trait]
+impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        if field.data_type().is_nested() {
+            return Err(Error::InvalidInput {
+                source: "A btree index can only be created on a non-nested field.".into(),
+                location: location!(),
+            });
+        }
+
+        let params = serde_json::from_str::<BTreeParameters>(params)?;
+        Ok(Box::new(BTreeTrainingRequest::new(params)))
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        BTREE_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(index_name, false)))
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+    ) -> Result<CreatedIndex> {
+        let request = request
+            .as_any()
+            .downcast_ref::<BTreeTrainingRequest>()
+            .unwrap();
+        let value_type = data
+            .schema()
+            .field_with_name(VALUE_COLUMN_NAME)?
+            .data_type()
+            .clone();
+        let flat_index_trainer = FlatIndexMetadata::new(value_type);
+        train_btree_index(
+            data,
+            &flat_index_trainer,
+            index_store,
+            request
+                .parameters
+                .zone_size
+                .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
+        )
+        .await?;
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_version: BTREE_INDEX_VERSION,
+        })
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -1464,7 +1578,7 @@ mod tests {
         physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
     };
     use datafusion_common::{DataFusionError, ScalarValue};
-    use datafusion_physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
@@ -1478,9 +1592,9 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            btree::{BTreeIndex, BTREE_PAGES_NAME, DEFAULT_BTREE_BATCH_SIZE},
+            btree::{BTreeIndex, BTREE_PAGES_NAME},
             flat::FlatIndexMetadata,
-            lance_format::{tests::MockTrainingSource, LanceIndexStore},
+            lance_format::LanceIndexStore,
             IndexStore, SargableQuery, ScalarIndex, SearchResult,
         },
     };
@@ -1520,19 +1634,13 @@ mod tests {
             )
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(5000), BatchCount::from(10));
-        let data_source = Box::new(MockTrainingSource::from(stream));
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        train_btree_index(
-            data_source,
-            &sub_index_trainer,
-            test_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE as u32,
-        )
-        .await
-        .unwrap();
+        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 5000)
+            .await
+            .unwrap();
 
-        let index = BTreeIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1551,7 +1659,7 @@ mod tests {
             .await
             .unwrap();
 
-        let remap_index = BTreeIndex::load(remap_store.clone(), None, LanceCache::no_cache())
+        let remap_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1602,21 +1710,20 @@ mod tests {
             .into_df_exec(RowCount::from(10), BatchCount::from(100));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
-        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let stream = break_stream(stream, 64);
         let stream = stream.map_err(DataFusionError::from);
         let stream =
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
-        let data_source = Box::new(MockTrainingSource::from(stream));
 
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float64);
 
-        train_btree_index(data_source, &sub_index_trainer, test_store.as_ref(), 64)
+        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64)
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store, None, LanceCache::no_cache())
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1645,26 +1752,22 @@ mod tests {
             .into_df_exec(RowCount::from(1000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
-        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let stream = break_stream(stream, 64);
         let stream = stream.map_err(DataFusionError::from);
         let stream =
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
-        let data_source = Box::new(MockTrainingSource::from(stream));
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
 
-        train_btree_index(data_source, &sub_index_trainer, test_store.as_ref(), 64)
+        train_btree_index(stream, &sub_index_trainer, test_store.as_ref(), 64)
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(
-            test_store,
-            None,
-            LanceCache::with_capacity(100 * 1024 * 1024),
-        )
-        .await
-        .unwrap();
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
 
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
         let metrics = LocalMetricsCollector::default();

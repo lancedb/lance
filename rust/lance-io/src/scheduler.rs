@@ -131,7 +131,7 @@ impl IopsQuota {
     }
 
     // Acquire a reservation on the global IOPS quota
-    async fn acquire(&self) -> IopsReservation {
+    async fn acquire(&self) -> IopsReservation<'_> {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
             IopsReservation {
                 value: Some(iops_avail.acquire().await.unwrap()),
@@ -1118,6 +1118,7 @@ mod tests {
             false,
             1,
             DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
         ));
 
         let config = SchedulerConfig {
@@ -1207,6 +1208,7 @@ mod tests {
             false,
             1,
             DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
         ));
 
         let config = SchedulerConfig {

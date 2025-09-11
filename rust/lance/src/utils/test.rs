@@ -22,7 +22,7 @@ use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -325,7 +325,11 @@ impl StatsHolder {
 }
 
 impl WrappingObjectStore for StatsHolder {
-    fn wrap(&self, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+    fn wrap(
+        &self,
+        target: Arc<dyn ObjectStore>,
+        _storage_options: Option<&std::collections::HashMap<String, String>>,
+    ) -> Arc<dyn ObjectStore> {
         Arc::new(IoTrackingStore {
             target,
             stats: self.0.clone(),
@@ -401,7 +405,7 @@ impl ObjectStore for IoTrackingStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> OSResult<Box<dyn MultipartUpload>> {
         let _guard = self.hop_guard();
         let target = self.target.put_multipart_opts(location, opts).await?;

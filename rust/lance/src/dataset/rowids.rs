@@ -5,13 +5,13 @@ use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
-use snafu::location;
-use std::sync::Arc;
-
+use lance_core::utils::deletion::DeletionVector;
 use lance_table::{
     format::{Fragment, RowIdMeta},
-    rowids::{read_row_ids, RowIdIndex, RowIdSequence},
+    rowids::{read_row_ids, FragmentRowIdIndex, RowIdIndex, RowIdSequence},
 };
+use snafu::location;
+use std::sync::Arc;
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -77,7 +77,7 @@ pub fn load_row_id_sequences<'a>(
 pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
-    if dataset.manifest.uses_move_stable_row_ids() {
+    if dataset.manifest.uses_stable_row_ids() {
         let key = RowIdIndexKey {
             version: dataset.manifest.version,
         };
@@ -96,7 +96,31 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
         .try_collect::<Vec<_>>()
         .await?;
 
-    let index = RowIdIndex::new(&sequences, dataset.manifest.uses_move_stable_row_ids())?;
+    let fragment_indices: Vec<_> =
+        futures::future::try_join_all(sequences.into_iter().map(|(fragment_id, sequence)| {
+            let dataset = dataset.clone();
+            async move {
+                let fragments = dataset.get_fragments();
+                let fragment = fragments
+                    .iter()
+                    .find(|f| f.id() as u32 == fragment_id)
+                    .expect("Fragment should exist");
+
+                let deletion_vector = match fragment.get_deletion_vector().await {
+                    Ok(Some(dv)) => dv,
+                    Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
+                };
+
+                Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
+                    fragment_id,
+                    row_id_sequence: sequence,
+                    deletion_vector,
+                })
+            }
+        }))
+        .await?;
+
+    let index = RowIdIndex::new(&fragment_indices)?;
 
     Ok(index)
 }
@@ -137,14 +161,14 @@ mod test {
         let schema = sequence_batch(0..0).schema();
         let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
             .await
             .unwrap();
 
-        assert!(dataset.manifest.uses_move_stable_row_ids());
+        assert!(dataset.manifest.uses_stable_row_ids());
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
@@ -161,18 +185,18 @@ mod test {
         let reader =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: false,
+            enable_stable_row_ids: false,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
             .await
             .unwrap();
-        assert!(!dataset.manifest().uses_move_stable_row_ids());
+        assert!(!dataset.manifest().uses_stable_row_ids());
 
         // Trying to append without stable row ids should pass (a warning is emitted) but should not
-        // affect the move_stable_row_ids setting.
+        // affect the stable_row_ids setting.
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             mode: WriteMode::Append,
             ..Default::default()
         };
@@ -181,7 +205,7 @@ mod test {
         let dataset = Dataset::write(reader, tmp_path, Some(write_params))
             .await
             .unwrap();
-        assert!(!dataset.manifest().uses_move_stable_row_ids());
+        assert!(!dataset.manifest().uses_stable_row_ids());
     }
 
     #[tokio::test]
@@ -190,7 +214,7 @@ mod test {
         let batch = sequence_batch(0..num_rows as i32);
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 10,
             ..Default::default()
         };
@@ -222,7 +246,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let temp_dir = tempfile::tempdir().unwrap();
@@ -258,7 +282,7 @@ mod test {
             *start += 10;
             let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
             let write_params = WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 mode: WriteMode::Append,
                 ..Default::default()
             };
@@ -296,7 +320,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -358,7 +382,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             max_rows_per_file: 2,
             ..Default::default()
         };
@@ -409,7 +433,7 @@ mod test {
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let write_params = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             ..Default::default()
         };
         let dataset = Dataset::write(reader, "memory://", Some(write_params))
@@ -493,7 +517,7 @@ mod test {
                 FragmentRowCount::from(10),
                 Some(WriteParams {
                     max_rows_per_file: 10,
-                    enable_move_stable_row_ids: true,
+                    enable_stable_row_ids: true,
                     enable_v2_manifest_paths: true,
                     ..Default::default()
                 }),
@@ -586,7 +610,7 @@ mod test {
                 FragmentRowCount::from(10),
                 Some(WriteParams {
                     max_rows_per_file: 10,
-                    enable_move_stable_row_ids: true,
+                    enable_stable_row_ids: true,
                     enable_v2_manifest_paths: true,
                     ..Default::default()
                 }),

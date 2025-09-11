@@ -82,7 +82,10 @@ ignore = [
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
     { id = "RUSTSEC-2021-0153", reason = "`encoding` is used by lindera" },
     { id = "RUSTSEC-2024-0384", reason = "`instant` is used by tantivy" },
+    { id = "RUSTSEC-2024-0370", reason = "`proc-macro-error` is used by jieba-rs via include-flate" },
     { id = "RUSTSEC-2024-0436", reason = "`paste` is used by datafusion" },
+    { id = "RUSTSEC-2025-0052", reason = "`async-std` is used by tfrecord" },
+    { id = "RUSTSEC-2023-0071", reason = "`rsa` is used by opendal via reqsign" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

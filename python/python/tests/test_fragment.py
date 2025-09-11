@@ -106,6 +106,20 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
     assert actual == expected
 
 
+def test_fragment_session(tmp_path: Path):
+    tab = pa.table({"a": range(100), "b": range(100, 200)})
+    ds = write_dataset(tab, tmp_path)
+    frag = ds.get_fragments()[0]
+
+    session = frag.open_session(columns=["a", "b"], with_row_address=False)
+    expected = frag.take(indices=range(1, 50), columns=["a", "b"])
+    actual = session.take(range(1, 50))
+    assert actual == expected
+
+    session = frag.open_session(columns=["a", "b"], with_row_address=True)
+    assert session.take(range(1, 5)).schema.names == ["a", "b", "_rowaddr"]
+
+
 def test_write_fragments(tmp_path: Path):
     # Should result in two files since each batch is 8MB and max_bytes_per_file is small
     batches = pa.RecordBatchReader.from_batches(
@@ -438,12 +452,12 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
-@pytest.mark.parametrize("enable_move_stable_row_ids", [False, True])
-def test_fragment_metadata_pickle(tmp_path: Path, enable_move_stable_row_ids: bool):
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_fragment_metadata_pickle(tmp_path: Path, enable_stable_row_ids: bool):
     ds = write_dataset(
         pa.table({"a": range(100)}),
         tmp_path,
-        enable_move_stable_row_ids=enable_move_stable_row_ids,
+        enable_stable_row_ids=enable_stable_row_ids,
     )
     # Create a deletion file
     ds.delete("a < 50")
@@ -452,10 +466,50 @@ def test_fragment_metadata_pickle(tmp_path: Path, enable_move_stable_row_ids: bo
     frag_meta = fragment.metadata
 
     assert frag_meta.deletion_file is not None
-    if enable_move_stable_row_ids:
+    if enable_stable_row_ids:
         assert frag_meta.row_id_meta is not None
 
     # Pickle and unpickle the fragment metadata
     round_trip = pickle.loads(pickle.dumps(frag_meta))
 
     assert frag_meta == round_trip
+
+
+def test_deletion_file_with_base_id_serialization():
+    """Test that DeletionFile with base_id serializes correctly."""
+    from lance.fragment import DeletionFile, FragmentMetadata
+
+    # Create a DeletionFile with base_id
+    deletion_file = DeletionFile(
+        read_version=1, id=123, file_type="array", num_deleted_rows=10, base_id=456
+    )
+
+    # Verify the base_id is set
+    assert deletion_file.base_id == 456
+
+    # Test asdict includes base_id
+    deletion_dict = deletion_file.asdict()
+    assert "base_id" in deletion_dict
+    assert deletion_dict["base_id"] == 456
+
+    # Create a FragmentMetadata with the deletion file
+    metadata = FragmentMetadata(
+        id=1, files=[], physical_rows=1000, deletion_file=deletion_file
+    )
+
+    # Test pickle serialization/deserialization
+    pickled = pickle.dumps(metadata)
+    unpickled = pickle.loads(pickled)
+
+    # Verify the deletion file was correctly deserialized
+    assert unpickled.deletion_file is not None
+    assert unpickled.deletion_file.base_id == 456
+    assert unpickled == metadata
+
+    # Test JSON serialization/deserialization
+    json_data = metadata.to_json()
+    assert json_data["deletion_file"]["base_id"] == 456
+
+    deserialized = FragmentMetadata.from_json(json.dumps(json_data))
+    assert deserialized.deletion_file is not None
+    assert deserialized.deletion_file.base_id == 456

@@ -10,12 +10,12 @@ use datafusion::{
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
-use lance_core::ROW_ADDR;
+use lance_core::{ROW_ADDR, ROW_ID};
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::{dataset::write::merge_insert::exec::FullSchemaMergeInsertExec, Dataset};
 
-use super::MergeInsertParams;
+use super::{MergeInsertParams, MERGE_ACTION_COLUMN};
 
 /// Logical plan node for merge insert write.
 ///
@@ -23,7 +23,7 @@ use super::MergeInsertParams;
 /// * `source.{col1, col2, ...}` - columns from the source relation
 /// * `target.{col1, col2, ...}` - columns from the target relation
 /// * `target._rowaddr` - special column to locate existing rows in the target
-/// * `action` - unqualified column that describes the action to perform.
+/// * `__action` - unqualified column that describes the action to perform.
 ///   See [`super::assign_action::merge_insert_action`]
 ///
 /// Output is empty.
@@ -145,7 +145,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         // Going to need:
         // * all columns from the `source` relation
-        // * `action` column (unqualified)
+        // * `__action` column (unqualified)
         // * `target._rowaddr` column specifically
 
         let input_schema = self.input.schema();
@@ -161,8 +161,11 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
                     true
                 }
 
-                // Include unqualified columns like "action" - tells us what operation to perform
-                None if field.name() == "action" => true,
+                // Include target._rowid specifically - needed to locate existing rows for updates
+                Some(qualifier) if qualifier.table() == "target" && field.name() == ROW_ID => true,
+
+                // Include unqualified columns like "__action" - tells us what operation to perform
+                None if field.name() == MERGE_ACTION_COLUMN => true,
 
                 // Skip other target columns (target.value, target.key, target._rowid) - not needed for write
                 _ => false,

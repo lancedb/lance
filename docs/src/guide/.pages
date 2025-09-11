@@ -2,6 +2,7 @@ nav:
   - Read and Write: read_and_write.md
   - Data Evolution: data_evolution.md
   - Blob API: blob.md
+  - JSON Support: json.md
   - Tags: tags.md
   - Object Store Configuration: object_store.md
   - Distributed Write: distributed_write.md

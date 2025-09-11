@@ -9,6 +9,7 @@ terrestial = "terrestial"
 abd = "abd"
 afe = "afe"
 typ = "typ"
+flate = "flate"
 
 [files]
 extend-exclude = ["notebooks/*.ipynb"]

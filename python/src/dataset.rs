@@ -32,6 +32,7 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
+use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
@@ -56,18 +57,20 @@ use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
+use lance_core::Error;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
 use lance_index::{
     optimize::OptimizeOptions,
-    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams, ScalarIndexType},
+    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
         sq::builder::SQBuildParams,
@@ -82,6 +85,7 @@ use lance_table::io::commit::CommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::indices::PyIndexConfig;
 use crate::scanner::ScanStatistics;
 use crate::schema::LanceSchema;
 use crate::session::Session;
@@ -441,7 +445,10 @@ impl Dataset {
                 cache_repetition_index,
                 validate_on_decode,
             };
-            let file_reader_options = FileReaderOptions { decoder_config };
+            let file_reader_options = FileReaderOptions {
+                decoder_config,
+                ..Default::default()
+            };
             params.file_reader_options = Some(file_reader_options);
         }
 
@@ -618,13 +625,15 @@ impl Dataset {
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
+                dict.set_item("base_id", idx.base_id.map(|id| id as i64))
+                    .unwrap();
                 dict.into_py_any(py)
             })
             .collect::<PyResult<Vec<_>>>()
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -652,6 +661,7 @@ impl Dataset {
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
         strict_batch_size: Option<bool>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
+        disable_scoring_autoprojection: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
 
@@ -661,6 +671,10 @@ impl Dataset {
 
         if with_row_address.unwrap_or(false) {
             scanner.with_row_address();
+        }
+
+        if let Some(true) = disable_scoring_autoprojection {
+            scanner.disable_scoring_autoprojection();
         }
 
         match (columns, columns_with_transform) {
@@ -1474,11 +1488,14 @@ impl Dataset {
             "BTREE" => IndexType::Scalar,
             "BITMAP" => IndexType::Bitmap,
             "NGRAM" => IndexType::NGram,
+            "ZONEMAP" => IndexType::ZoneMap,
+            "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
                 IndexType::Vector
             }
+            "SCALAR" => IndexType::Scalar,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -1488,17 +1505,47 @@ impl Dataset {
 
         log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
-            "BTREE" => Box::<ScalarIndexParams>::default(),
+            "BTREE" => Box::new(ScalarIndexParams {
+                index_type: "btree".to_string(),
+                params: None,
+            }),
             "BITMAP" => Box::new(ScalarIndexParams {
-                // Temporary workaround until we add support for auto-detection of scalar index type
-                force_index_type: Some(ScalarIndexType::Bitmap),
+                index_type: "bitmap".to_string(),
+                params: None,
             }),
             "NGRAM" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::NGram),
+                index_type: "ngram".to_string(),
+                params: None,
+            }),
+            "ZONEMAP" => Box::new(ScalarIndexParams {
+                index_type: "zonemap".to_string(),
+                params: None,
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::LabelList),
+                index_type: "label_list".to_string(),
+                params: None,
             }),
+            "BLOOMFILTER" => Box::new(ScalarIndexParams {
+                index_type: "bloomfilter".to_string(),
+                params: None,
+            }),
+            "SCALAR" => {
+                let Some(kwargs) = kwargs else {
+                    return Err(PyValueError::new_err(
+                        "SCALAR index type specified by no kwargs provided",
+                    ));
+                };
+                let Some(config) = kwargs.get_item("config")? else {
+                    return Err(PyValueError::new_err(
+                        "SCALAR index type specified by no `config` in kwargs",
+                    ));
+                };
+                let config: PyIndexConfig = config.extract()?;
+                Box::new(ScalarIndexParams {
+                    index_type: config.index_type.clone(),
+                    params: Some(config.config.clone()),
+                })
+            }
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
@@ -1567,9 +1614,49 @@ impl Dataset {
         if let Some(name) = name {
             builder = builder.name(name);
         }
+
+        // Extract fragment_ids and fragment_uuid from kwargs
+        let fragment_ids: Option<Vec<u32>> = if let Some(kwargs) = kwargs {
+            kwargs
+                .get_item("fragment_ids")?
+                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .transpose()?
+        } else {
+            None
+        };
+
+        let fragment_uuid: Option<String> = if let Some(kwargs) = kwargs {
+            kwargs
+                .get_item("fragment_uuid")?
+                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .transpose()?
+        } else {
+            None
+        };
+
+        // Add fragment_ids and fragment_uuid support
+        let has_fragment_ids = fragment_ids.is_some();
+        if let Some(fragment_ids) = fragment_ids {
+            builder = builder.fragments(fragment_ids);
+        }
+        if let Some(fragment_uuid) = fragment_uuid {
+            builder = builder.fragment_uuid(fragment_uuid);
+        }
+
         use std::future::IntoFuture;
-        RT.block_on(None, builder.into_future())?.infer_error()?;
-        self.ds = Arc::new(new_self);
+
+        // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
+        if has_fragment_ids {
+            // For fragment-level indexing, use execute_uncommitted
+            let _index_metadata = RT
+                .block_on(None, builder.execute_uncommitted())?
+                .infer_error()?;
+            // Note: We don't update self.ds here as the index is not committed
+        } else {
+            // For regular indexing, use the standard execute path
+            RT.block_on(None, builder.into_future())?.infer_error()?;
+            self.ds = Arc::new(new_self);
+        }
 
         Ok(())
     }
@@ -1586,6 +1673,51 @@ impl Dataset {
     fn prewarm_index(&self, name: &str) -> PyResult<()> {
         RT.block_on(None, self.ds.prewarm_index(name))?
             .infer_error()
+    }
+
+    #[pyo3(signature = (index_uuid))]
+    fn merge_index_metadata(&self, index_uuid: &str) -> PyResult<()> {
+        RT.block_on(None, async {
+            let store = LanceIndexStore::from_dataset_for_new(self.ds.as_ref(), index_uuid)?;
+            let index_dir = self.ds.indices_dir().child(index_uuid);
+
+            // List all partition metadata files in the index directory
+            let mut part_metadata_files = Vec::new();
+            let mut list_stream = self.ds.object_store().list(Some(index_dir.clone()));
+
+            while let Some(item) = list_stream.next().await {
+                match item {
+                    Ok(meta) => {
+                        let file_name = meta.location.filename().unwrap_or_default();
+                        // Filter files matching the pattern part_*_metadata.lance
+                        if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance")
+                        {
+                            part_metadata_files.push(file_name.to_string());
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            if part_metadata_files.is_empty() {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "No partition metadata files found in index directory: {}",
+                        index_dir
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+
+            // Call merge_metadata_files function for inverted index
+            lance_index::scalar::inverted::builder::merge_metadata_files(
+                Arc::new(store),
+                &part_metadata_files,
+            )
+            .await
+        })?
+        .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
     fn count_fragments(&self) -> usize {
@@ -2043,6 +2175,22 @@ impl Dataset {
         let builder = ds.sql(&sql);
         Ok(SqlQueryBuilder { builder })
     }
+
+    #[pyo3(signature=(compared_version))]
+    fn diff_meta(&self, compared_version: u64) -> PyResult<Vec<PyLance<Transaction>>> {
+        let new_self = self.ds.as_ref().clone();
+        let transactions = RT
+            .block_on(None, new_self.diff_meta(compared_version))?
+            .map_err(|err: Error| match err {
+                Error::InvalidInput { source, .. } => PyValueError::new_err(source.to_string()),
+                Error::VersionNotFound { .. } => {
+                    PyValueError::new_err(format!("Version not found: {}", err))
+                }
+                _ => PyIOError::new_err(format!("Storage error: {}", err)),
+            })?;
+
+        Ok(transactions.into_iter().map(PyLance).collect())
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass)]
@@ -2331,10 +2479,9 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             });
         }
 
-        if let Some(enable_move_stable_row_ids) =
-            get_dict_opt::<bool>(options, "enable_move_stable_row_ids")?
+        if let Some(enable_stable_row_ids) = get_dict_opt::<bool>(options, "enable_stable_row_ids")?
         {
-            p.enable_move_stable_row_ids = enable_move_stable_row_ids;
+            p.enable_stable_row_ids = enable_stable_row_ids;
         }
         if let Some(enable_v2_manifest_paths) =
             get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
@@ -2415,7 +2562,11 @@ fn prepare_vector_index_params(
 
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
-            ivf_params.num_partitions = n.extract()?
+            ivf_params.num_partitions = Some(n.extract()?)
+        };
+
+        if let Some(n) = kwargs.get_item("target_partition_size")? {
+            ivf_params.target_partition_size = Some(n.extract()?)
         };
 
         if let Some(n) = kwargs.get_item("shuffle_partition_concurrency")? {
@@ -2522,9 +2673,8 @@ fn prepare_vector_index_params(
     }
 
     let mut params = match index_type {
-        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::ivf_flat(
-            ivf_params.num_partitions,
-            m_type,
+        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::with_ivf_flat_params(
+            m_type, ivf_params,
         ))),
 
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(

@@ -687,15 +687,15 @@ fn binary_search_to_end(to_search: &[u64], target: u64) -> u64 {
 }
 
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<'_, Result<()>> {
         async move {
             // wait for the indirect I/O to finish, run the scheduler for the indirect
             // I/O and then wait for enough items to arrive
             if self.unloaded.is_some() {
                 trace!("List scheduler needs to wait for indirect I/O to complete");
                 let indirectly_loaded = self.unloaded.take().unwrap().await;
-                if indirectly_loaded.is_err() {
-                    match indirectly_loaded.unwrap_err().try_into_panic() {
+                if let Err(err) = indirectly_loaded {
+                    match err.try_into_panic() {
                         Ok(err) => std::panic::resume_unwind(err),
                         Err(err) => panic!("{:?}", err),
                     };

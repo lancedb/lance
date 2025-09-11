@@ -23,6 +23,7 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::v3::shuffler::IvfShuffler;
@@ -36,7 +37,9 @@ use lance_index::vector::{
     sq::{builder::SQBuildParams, ScalarQuantizer},
     VectorIndex,
 };
-use lance_index::{IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{
+    DatasetIndexExt, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
+};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
@@ -105,6 +108,15 @@ impl VectorIndexParams {
     pub fn ivf_flat(num_partitions: usize, metric_type: MetricType) -> Self {
         let ivf_params = IvfBuildParams::new(num_partitions);
         let stages = vec![StageParams::Ivf(ivf_params)];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
+    pub fn with_ivf_flat_params(metric_type: MetricType, ivf: IvfBuildParams) -> Self {
+        let stages = vec![StageParams::Ivf(ivf)];
         Self {
             stages,
             metric_type,
@@ -224,6 +236,20 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
         }
     }
+
+    pub fn index_type(&self) -> IndexType {
+        let len = self.stages.len();
+        match (len, self.stages.get(1), self.stages.last()) {
+            (0, _, _) => IndexType::Vector,
+            (1, _, Some(StageParams::Ivf(_))) => IndexType::IvfFlat,
+            (2, _, Some(StageParams::PQ(_))) => IndexType::IvfPq,
+            (2, _, Some(StageParams::SQ(_))) => IndexType::IvfSq,
+            (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
+            _ => IndexType::Vector,
+        }
+    }
 }
 
 impl IndexParams for VectorIndexParams {
@@ -231,47 +257,9 @@ impl IndexParams for VectorIndexParams {
         self
     }
 
-    fn index_type(&self) -> IndexType {
-        IndexType::Vector
-    }
-
     fn index_name(&self) -> &str {
         LANCE_VECTOR_INDEX
     }
-}
-
-fn is_ivf_flat(stages: &[StageParams]) -> bool {
-    if stages.len() != 1 {
-        return false;
-    }
-
-    matches!(&stages[0], StageParams::Ivf(_))
-}
-
-fn is_ivf_pq(stages: &[StageParams]) -> bool {
-    if stages.len() < 2 {
-        return false;
-    }
-    let len = stages.len();
-
-    matches!(&stages[len - 1], StageParams::PQ(_))
-        && matches!(&stages[len - 2], StageParams::Ivf(_))
-}
-
-fn is_ivf_sq(stages: &[StageParams]) -> bool {
-    if stages.len() < 2 {
-        return false;
-    }
-
-    matches!(&stages[0], StageParams::Ivf(_)) && matches!(&stages[1], StageParams::SQ(_))
-}
-
-fn is_ivf_hnsw(stages: &[StageParams]) -> bool {
-    if stages.len() < 2 {
-        return false;
-    }
-
-    matches!(&stages[0], StageParams::Ivf(_)) && matches!(&stages[1], StageParams::Hnsw(_))
 }
 
 /// Build a Vector Index
@@ -311,11 +299,24 @@ pub(crate) async fn build_vector_index(
         }
     }
 
+    let num_rows = dataset.count_rows(None).await?;
+    let index_type = params.index_type();
+    let num_partitions = ivf_params.num_partitions.unwrap_or_else(|| {
+        recommended_num_partitions(
+            num_rows,
+            ivf_params
+                .target_partition_size
+                .unwrap_or(index_type.target_partition_size()),
+        )
+    });
+    let mut ivf_params = ivf_params.clone();
+    ivf_params.num_partitions = Some(num_partitions);
+
     let temp_dir = tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
-    let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
-    if is_ivf_flat(stages) {
-        match element_type {
+    let shuffler = IvfShuffler::new(temp_dir_path, num_partitions);
+    match index_type {
+        IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     dataset.clone(),
@@ -323,7 +324,7 @@ pub(crate) async fn build_vector_index(
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
                     Box::new(shuffler),
-                    Some(ivf_params.clone()),
+                    Some(ivf_params),
                     Some(()),
                     (),
                     frag_reuse_index,
@@ -338,7 +339,7 @@ pub(crate) async fn build_vector_index(
                     dataset.indices_dir().child(uuid),
                     params.metric_type,
                     Box::new(shuffler),
-                    Some(ivf_params.clone()),
+                    Some(ivf_params),
                     Some(()),
                     (),
                     frag_reuse_index,
@@ -352,124 +353,82 @@ pub(crate) async fn build_vector_index(
                     location: location!(),
                 });
             }
-        }
-    } else if is_ivf_pq(stages) {
-        let len = stages.len();
-        let StageParams::PQ(pq_params) = &stages[len - 1] else {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                location: location!(),
-            });
-        };
+        },
+        IndexType::IvfPq => {
+            let len = stages.len();
+            let StageParams::PQ(pq_params) = &stages[len - 1] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
 
-        match params.version {
-            IndexFileVersion::Legacy => {
-                build_ivf_pq_index(
-                    dataset,
-                    column,
-                    name,
-                    uuid,
-                    params.metric_type,
-                    ivf_params,
-                    pq_params,
-                )
-                .await?;
-            }
-            IndexFileVersion::V3 => {
-                IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
-                    dataset.clone(),
-                    column.to_owned(),
-                    dataset.indices_dir().child(uuid),
-                    params.metric_type,
-                    Box::new(shuffler),
-                    Some(ivf_params.clone()),
-                    Some(pq_params.clone()),
-                    (),
-                    frag_reuse_index,
-                )?
-                .build()
-                .await?;
-            }
-        }
-    } else if is_ivf_sq(stages) {
-        let StageParams::SQ(sq_params) = &stages[1] else {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                location: location!(),
-            });
-        };
-
-        IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
-            dataset.clone(),
-            column.to_owned(),
-            dataset.indices_dir().child(uuid),
-            params.metric_type,
-            Box::new(shuffler),
-            Some(ivf_params.clone()),
-            Some(sq_params.clone()),
-            (),
-            frag_reuse_index,
-        )?
-        .build()
-        .await?;
-    } else if is_ivf_hnsw(stages) {
-        let len = stages.len();
-        let StageParams::Hnsw(hnsw_params) = &stages[1] else {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                location: location!(),
-            });
-        };
-
-        // with quantization
-        if len > 2 {
-            match stages.last().unwrap() {
-                StageParams::PQ(pq_params) => {
-                    IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            match params.version {
+                IndexFileVersion::Legacy => {
+                    build_ivf_pq_index(
+                        dataset,
+                        column,
+                        name,
+                        uuid,
+                        params.metric_type,
+                        &ivf_params,
+                        pq_params,
+                    )
+                    .await?;
+                }
+                IndexFileVersion::V3 => {
+                    IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().child(uuid),
                         params.metric_type,
                         Box::new(shuffler),
-                        Some(ivf_params.clone()),
+                        Some(ivf_params),
                         Some(pq_params.clone()),
-                        hnsw_params.clone(),
+                        (),
                         frag_reuse_index,
                     )?
                     .build()
                     .await?;
-                }
-                StageParams::SQ(sq_params) => {
-                    IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
-                        dataset.clone(),
-                        column.to_owned(),
-                        dataset.indices_dir().child(uuid),
-                        params.metric_type,
-                        Box::new(shuffler),
-                        Some(ivf_params.clone()),
-                        Some(sq_params.clone()),
-                        hnsw_params.clone(),
-                        frag_reuse_index,
-                    )?
-                    .build()
-                    .await?;
-                }
-                _ => {
-                    return Err(Error::Index {
-                        message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                        location: location!(),
-                    });
                 }
             }
-        } else {
-            // without quantization
+        }
+        IndexType::IvfSq => {
+            let StageParams::SQ(sq_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(sq_params.clone()),
+                (),
+                frag_reuse_index,
+            )?
+            .build()
+            .await?;
+        }
+        IndexType::IvfHnswFlat => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().child(uuid),
                 params.metric_type,
                 Box::new(shuffler),
-                Some(ivf_params.clone()),
+                Some(ivf_params),
                 Some(()),
                 hnsw_params.clone(),
                 frag_reuse_index,
@@ -477,13 +436,67 @@ pub(crate) async fn build_vector_index(
             .build()
             .await?;
         }
-    } else {
-        return Err(Error::Index {
-            message: format!("Build Vector Index: invalid stages: {:?}", stages),
-            location: location!(),
-        });
-    }
-
+        IndexType::IvfHnswPq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+            let StageParams::PQ(pq_params) = &stages[2] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(pq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .build()
+            .await?;
+        }
+        IndexType::IvfHnswSq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+            let StageParams::SQ(sq_params) = &stages[2] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(sq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .build()
+            .await?;
+        }
+        _ => {
+            return Err(Error::Index {
+                message: format!("Build Vector Index: invalid index type: {:?}", index_type),
+                location: location!(),
+            });
+        }
+    };
     Ok(())
 }
 
@@ -652,13 +665,19 @@ pub(crate) async fn open_vector_index_v2(
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
     let frag_reuse_uuid = dataset.frag_reuse_index_uuid();
+    // Load the index metadata to get the correct index directory
+    let index_meta = dataset
+        .load_index(uuid)
+        .await?
+        .ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+    let index_dir = dataset.indice_files_dir(&index_meta)?;
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
-            let aux_path = dataset
-                .indices_dir()
-                .child(uuid)
-                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
@@ -685,10 +704,7 @@ pub(crate) async fn open_vector_index_v2(
         }
 
         "IVF_HNSW_SQ" => {
-            let aux_path = dataset
-                .indices_dir()
-                .child(uuid)
-                .child(INDEX_AUXILIARY_FILE_NAME);
+            let aux_path = index_dir.child(uuid).child(INDEX_AUXILIARY_FILE_NAME);
             let aux_reader = dataset.object_store().open(&aux_path).await?;
 
             let ivf_data = IvfModel::load(&reader).await?;

@@ -3,6 +3,8 @@
 
 //! Metadata for index
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
@@ -11,6 +13,7 @@ use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
+
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
 pub struct Index {
@@ -37,7 +40,7 @@ pub struct Index {
     ///
     /// This is an Option because older versions of Lance may not have this defined.  However, it should always
     /// be present in newer versions.
-    pub index_details: Option<prost_types::Any>,
+    pub index_details: Option<Arc<prost_types::Any>>,
 
     /// The index version.
     pub index_version: i32,
@@ -47,6 +50,10 @@ pub struct Index {
     /// This field is optional for backward compatibility. For existing indices created before
     /// this field was added, this will be None.
     pub created_at: Option<DateTime<Utc>>,
+
+    /// The base path index of the index files. Used when the index is imported or referred from another dataset.
+    /// Lance uses it as key of the base_paths field in Manifest to determine the actual base path of the index files.
+    pub base_id: Option<u32>,
 }
 
 impl Index {
@@ -96,12 +103,13 @@ impl TryFrom<pb::IndexMetadata> for Index {
             fields: proto.fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
-            index_details: proto.index_details,
+            index_details: proto.index_details.map(Arc::new),
             index_version: proto.index_version.unwrap_or_default(),
             created_at: proto.created_at.map(|ts| {
                 DateTime::from_timestamp_millis(ts as i64)
                     .expect("Invalid timestamp in index metadata")
             }),
+            base_id: proto.base_id,
         })
     }
 }
@@ -124,9 +132,13 @@ impl From<&Index> for pb::IndexMetadata {
             fields: idx.fields.clone(),
             dataset_version: idx.dataset_version,
             fragment_bitmap,
-            index_details: idx.index_details.clone(),
+            index_details: idx
+                .index_details
+                .as_ref()
+                .map(|details| details.as_ref().clone()),
             index_version: Some(idx.index_version),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
+            base_id: idx.base_id,
         }
     }
 }

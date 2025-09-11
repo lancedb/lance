@@ -45,11 +45,6 @@
 //! the operation does not modify the region of the column being replaced.
 //!
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
 use super::ManifestWriteConfig;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
@@ -59,7 +54,8 @@ use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MemWal;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
+use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
+use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
@@ -74,6 +70,11 @@ use lance_table::{
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
+use std::cmp::Ordering;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 /// A change to a dataset that can be retried
@@ -170,6 +171,8 @@ pub enum Operation {
         replacements: Vec<DataReplacementGroup>,
     },
     /// Merge a new column in
+    /// 'fragments' is the final fragments include all data files, the new fragments must align with old ones at rows.
+    /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
     Merge {
         fragments: Vec<Fragment>,
         schema: Schema,
@@ -207,8 +210,8 @@ pub enum Operation {
         new_fragments: Vec<Fragment>,
         /// The fields that have been modified
         fields_modified: Vec<u32>,
-        /// The MemWAL (pre-image) that should be marked as flushed after this transaction
-        mem_wal_to_flush: Option<MemWal>,
+        /// The MemWAL (pre-image) that should be marked as merged after this transaction
+        mem_wal_to_merge: Option<MemWal>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -227,6 +230,14 @@ pub enum Operation {
         updated: Vec<MemWal>,
         removed: Vec<MemWal>,
     },
+
+    /// Clone a dataset.
+    Clone {
+        is_shallow: bool,
+        ref_name: Option<String>,
+        ref_version: u64,
+        ref_path: String,
+    },
 }
 
 impl std::fmt::Display for Operation {
@@ -244,6 +255,7 @@ impl std::fmt::Display for Operation {
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
+            Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
         }
     }
@@ -261,6 +273,25 @@ impl PartialEq for Operation {
         }
         match (self, other) {
             (Self::Append { fragments: a }, Self::Append { fragments: b }) => compare_vec(a, b),
+            (
+                Self::Clone {
+                    is_shallow: a_is_shallow,
+                    ref_name: a_ref_name,
+                    ref_version: a_ref_version,
+                    ref_path: a_source_path,
+                },
+                Self::Clone {
+                    is_shallow: b_is_shallow,
+                    ref_name: b_ref_name,
+                    ref_version: b_ref_version,
+                    ref_path: b_source_path,
+                },
+            ) => {
+                a_is_shallow == b_is_shallow
+                    && a_ref_name == b_ref_name
+                    && a_ref_version == b_ref_version
+                    && a_source_path == b_source_path
+            }
             (
                 Self::Delete {
                     updated_fragments: a_updated,
@@ -340,21 +371,21 @@ impl PartialEq for Operation {
                     updated_fragments: a_updated,
                     new_fragments: a_new,
                     fields_modified: a_fields,
-                    mem_wal_to_flush: a_mem_wal_to_flush,
+                    mem_wal_to_merge: a_mem_wal_to_merge,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
                     updated_fragments: b_updated,
                     new_fragments: b_new,
                     fields_modified: b_fields,
-                    mem_wal_to_flush: b_mem_wal_to_flush,
+                    mem_wal_to_merge: b_mem_wal_to_merge,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
-                    && a_mem_wal_to_flush == b_mem_wal_to_flush
+                    && a_mem_wal_to_merge == b_mem_wal_to_merge
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -427,6 +458,9 @@ impl PartialEq for Operation {
             (Self::Append { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Append { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Delete { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -462,6 +496,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Delete { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -501,6 +538,9 @@ impl PartialEq for Operation {
             (Self::Overwrite { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Overwrite { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::CreateIndex { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -536,6 +576,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::CreateIndex { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -575,6 +618,9 @@ impl PartialEq for Operation {
             (Self::Rewrite { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Rewrite { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Merge { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -610,6 +656,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Merge { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -649,6 +698,9 @@ impl PartialEq for Operation {
             (Self::Restore { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Restore { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::ReserveFragments { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -684,6 +736,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::ReserveFragments { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -723,6 +778,9 @@ impl PartialEq for Operation {
             (Self::Update { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::Update { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::Project { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -758,6 +816,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::Project { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -797,6 +858,9 @@ impl PartialEq for Operation {
             (Self::UpdateConfig { .. }, Self::UpdateMemWalState { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateConfig { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
 
             (Self::DataReplacement { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
@@ -832,6 +896,9 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::DataReplacement { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::Clone { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
 
@@ -871,6 +938,9 @@ impl PartialEq for Operation {
             (Self::UpdateMemWalState { .. }, Self::DataReplacement { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::UpdateMemWalState { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
             (
                 Self::UpdateMemWalState {
                     added: a_added,
@@ -887,6 +957,45 @@ impl PartialEq for Operation {
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_removed, b_removed)
             }
+            (Self::Clone { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
         }
     }
 }
@@ -895,11 +1004,16 @@ impl PartialEq for Operation {
 pub struct RewrittenIndex {
     pub old_id: Uuid,
     pub new_id: Uuid,
+    pub new_index_details: prost_types::Any,
+    pub new_index_version: u32,
 }
 
 impl DeepSizeOf for RewrittenIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        0
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.new_index_details
+            .type_url
+            .deep_size_of_children(context)
+            + self.new_index_details.value.deep_size_of_children(context)
     }
 }
 
@@ -1015,6 +1129,7 @@ impl Operation {
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
+            Self::Clone { .. } => "Clone",
         }
     }
 }
@@ -1169,9 +1284,9 @@ impl Transaction {
         config: &ManifestWriteConfig,
         new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
-        if config.use_move_stable_row_ids
+        if config.use_stable_row_ids
             && current_manifest
-                .map(|m| !m.uses_move_stable_row_ids())
+                .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
             return Err(Error::NotSupported {
@@ -1179,6 +1294,10 @@ impl Transaction {
                 location: location!(),
             });
         }
+        let reference_paths = match current_manifest {
+            Some(m) => m.base_paths.clone(),
+            None => HashMap::new(),
+        };
 
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -1210,10 +1329,8 @@ impl Transaction {
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
-            match (current_manifest, config.use_move_stable_row_ids) {
-                (Some(manifest), _)
-                    if manifest.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0 =>
-                {
+            match (current_manifest, config.use_stable_row_ids) {
+                (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
                 }
                 (None, true) => Some(0),
@@ -1239,6 +1356,12 @@ impl Transaction {
                 });
 
         match &self.operation {
+            Operation::Clone { .. } => {
+                return Err(Error::Internal {
+                    message: "Clone operation should not enter build_manifest.".to_string(),
+                    location: location!(),
+                })
+            }
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
@@ -1271,7 +1394,7 @@ impl Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush,
+                mem_wal_to_merge,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
                     if removed_fragment_ids.contains(&f.id) {
@@ -1300,17 +1423,17 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
-                if let Some(mem_wal_to_flush) = mem_wal_to_flush {
+                if let Some(mem_wal_to_merge) = mem_wal_to_merge {
                     update_mem_wal_index_in_indices_list(
                         self.read_version,
                         current_manifest.map_or(1, |m| m.version + 1),
                         &mut final_indices,
                         vec![],
                         vec![MemWal {
-                            state: lance_index::mem_wal::State::Flushed,
-                            ..mem_wal_to_flush.clone()
+                            state: lance_index::mem_wal::State::Merged,
+                            ..mem_wal_to_merge.clone()
                         }],
-                        vec![mem_wal_to_flush.clone()],
+                        vec![mem_wal_to_merge.clone()],
                     )?;
                 }
             }
@@ -1530,6 +1653,9 @@ impl Transaction {
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
+        // Clean up data files that only contain tombstoned fields
+        Self::remove_tombstoned_data_files(&mut final_fragments);
+
         let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
             (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
             (None, Some(true)) => Some(LanceFileVersion::Legacy),
@@ -1544,15 +1670,16 @@ impl Transaction {
                 Arc::new(final_fragments),
                 new_blob_version,
             );
-            if user_requested_version.is_some()
-                && matches!(self.operation, Operation::Overwrite { .. })
+
+            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
+                (user_requested_version, &self.operation)
             {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format =
-                    DataStorageFormat::new(user_requested_version.unwrap());
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
             }
+
             prev_manifest
         } else {
             let data_storage_format =
@@ -1562,13 +1689,14 @@ impl Transaction {
                 Arc::new(final_fragments),
                 data_storage_format,
                 new_blob_version,
+                reference_paths,
             )
         };
 
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest, config.use_move_stable_row_ids)?;
+            apply_feature_flags(&mut manifest, config.use_stable_row_ids)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -1658,6 +1786,17 @@ impl Transaction {
             details.type_url.ends_with("VectorIndexDetails")
         } else {
             false
+        }
+    }
+
+    /// Remove data files that only contain tombstoned fields (-2)
+    /// These files no longer contain any live data and can be safely dropped
+    fn remove_tombstoned_data_files(fragments: &mut [Fragment]) {
+        for fragment in fragments {
+            fragment.files.retain(|file| {
+                // Keep file if it has at least one non-tombstoned field
+                file.fields.iter().any(|&field_id| field_id != -2)
+            });
         }
     }
 
@@ -1868,20 +2007,78 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
-            if fragment.row_id_meta.is_some() {
-                // Operation must have already assigned ids.
-                continue;
-            }
             let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
                 message: "Fragment does not have physical rows".into(),
                 location: location!(),
             })? as u64;
-            let row_ids = *next_row_id..(*next_row_id + physical_rows);
-            let sequence = RowIdSequence::from(row_ids);
-            // TODO: write to a separate file if large. Possibly share a file with other fragments.
-            let serialized = write_row_ids(&sequence);
-            fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
-            *next_row_id += physical_rows;
+
+            if fragment.row_id_meta.is_some() {
+                // we may meet merge insert case, it only has partial row ids.
+                // so here, we need to check if the row ids match the physical rows
+                // if yes, continue
+                // if not, fill the remaining row ids to the physical rows, then update row_id_meta
+
+                // Check if existing row IDs match the physical rows count
+                let existing_row_count = match &fragment.row_id_meta {
+                    Some(RowIdMeta::Inline(data)) => {
+                        // Parse the serialized row ID sequence to get the count
+                        let sequence = read_row_ids(data)?;
+                        sequence.len() as u64
+                    }
+                    _ => 0,
+                };
+
+                match existing_row_count.cmp(&physical_rows) {
+                    Ordering::Equal => {
+                        // Row IDs already match physical rows, continue to next fragment
+                        continue;
+                    }
+                    Ordering::Less => {
+                        // Partial row IDs - need to fill the remaining ones
+                        let remaining_rows = physical_rows - existing_row_count;
+                        let new_row_ids = *next_row_id..(*next_row_id + remaining_rows);
+
+                        // Merge existing and new row IDs
+                        let combined_sequence = match &fragment.row_id_meta {
+                            Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
+                            _ => {
+                                return Err(Error::Internal {
+                                    message: "Failed to deserialize existing row ID sequence"
+                                        .into(),
+                                    location: location!(),
+                                })
+                            }
+                        };
+
+                        let mut row_ids: Vec<u64> = combined_sequence.iter().collect();
+                        for row_id in new_row_ids {
+                            row_ids.push(row_id);
+                        }
+                        let combined_sequence = RowIdSequence::from(row_ids.as_slice());
+
+                        let serialized = write_row_ids(&combined_sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                        *next_row_id += remaining_rows;
+                    }
+                    Ordering::Greater => {
+                        // More row IDs than physical rows - this shouldn't happen
+                        return Err(Error::Internal {
+                            message: format!(
+                                "Fragment has more row IDs ({}) than physical rows ({})",
+                                existing_row_count, physical_rows
+                            ),
+                            location: location!(),
+                        });
+                    }
+                }
+            } else {
+                let row_ids = *next_row_id..(*next_row_id + physical_rows);
+                let sequence = RowIdSequence::from(row_ids);
+                // TODO: write to a separate file if large. Possibly share a file with other fragments.
+                let serialized = write_row_ids(&sequence);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                *next_row_id += physical_rows;
+            }
         }
         Ok(())
     }
@@ -1928,6 +2125,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .collect::<Result<Vec<_>>>()?,
                 }
             }
+            Some(pb::transaction::Operation::Clone(pb::transaction::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            })) => Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            },
             Some(pb::transaction::Operation::Delete(pb::transaction::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -2030,7 +2238,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush,
+                mem_wal_to_merge,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2042,7 +2250,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
-                mem_wal_to_flush: mem_wal_to_flush.map(|m| MemWal::try_from(m).unwrap()),
+                mem_wal_to_merge: mem_wal_to_merge.map(|m| MemWal::try_from(m).unwrap()),
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -2198,6 +2406,17 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                         location!(),
                     )
                 })??,
+            new_index_details: message
+                .new_index_details
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "new_index_details is a required field".to_string(),
+                        location!(),
+                    )
+                })?
+                .clone(),
+            new_index_version: message.new_index_version,
         })
     }
 }
@@ -2229,6 +2448,17 @@ impl From<&Transaction> for pb::Transaction {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                 })
             }
+            Operation::Clone {
+                is_shallow,
+                ref_name,
+                ref_version,
+                ref_path,
+            } => pb::transaction::Operation::Clone(pb::transaction::Clone {
+                is_shallow: *is_shallow,
+                ref_name: ref_name.clone(),
+                ref_version: *ref_version,
+                ref_path: ref_path.clone(),
+            }),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -2297,7 +2527,7 @@ impl From<&Transaction> for pb::Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush,
+                mem_wal_to_merge,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -2306,7 +2536,7 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 fields_modified: fields_modified.clone(),
-                mem_wal_to_flush: mem_wal_to_flush
+                mem_wal_to_merge: mem_wal_to_merge
                     .as_ref()
                     .map(pb::mem_wal_index_details::MemWal::from),
             }),
@@ -2415,6 +2645,8 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
         Self {
             old_id: Some((&value.old_id).into()),
             new_id: Some((&value.new_id).into()),
+            new_index_details: Some(value.new_index_details.clone()),
+            new_index_version: value.new_index_version,
         }
     }
 }
@@ -2442,16 +2674,15 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         (
             None,
             Operation::Overwrite {
-                fragments,
-                schema,
-                config_upsert_values: None,
+                fragments, schema, ..
             },
         ) => {
             // Validate here because we are going to return early.
-            schema_fragments_valid(schema, fragments)?;
+            schema_fragments_valid(None, schema, fragments)?;
 
             return Ok(());
         }
+        (None, Operation::Clone { .. }) => return Ok(()),
         (Some(manifest), _) => manifest,
         (None, _) => {
             return Err(Error::invalid_input(
@@ -2467,33 +2698,60 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
     match operation {
         Operation::Append { fragments } => {
             // Fragments must contain all fields in the schema
-            schema_fragments_valid(&manifest.schema, fragments)
+            schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
         Operation::Project { schema } => {
-            schema_fragments_valid(schema, manifest.fragments.as_ref())
+            schema_fragments_valid(Some(manifest), schema, manifest.fragments.as_ref())
         }
-        Operation::Merge { fragments, schema }
-        | Operation::Overwrite {
+        Operation::Merge { fragments, schema } => {
+            merge_fragments_valid(manifest, fragments)?;
+            schema_fragments_valid(Some(manifest), schema, fragments)
+        }
+        Operation::Overwrite {
             fragments,
             schema,
             config_upsert_values: None,
-        } => schema_fragments_valid(schema, fragments),
+        } => schema_fragments_valid(Some(manifest), schema, fragments),
         Operation::Update {
             updated_fragments,
             new_fragments,
             ..
         } => {
-            schema_fragments_valid(&manifest.schema, updated_fragments)?;
-            schema_fragments_valid(&manifest.schema, new_fragments)
+            schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
+            schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
         }
         _ => Ok(()),
     }
 }
 
+fn schema_fragments_valid(
+    manifest: Option<&Manifest>,
+    schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
+    if let Some(manifest) = manifest {
+        if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
+            return schema_fragments_legacy_valid(schema, fragments);
+        }
+    }
+    // validate that each data file at least contains one field.
+    for fragment in fragments {
+        for data_file in &fragment.files {
+            if data_file.fields.iter().len() == 0 {
+                return Err(Error::invalid_input(
+                    format!("Datafile {} does not contain any fields", data_file.path),
+                    location!(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check that each fragment contains all fields in the schema.
 /// It is not required that the schema contains all fields in the fragment.
 /// There may be masked fields.
-fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
+fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
     // TODO: add additional validation. Consider consolidating with various
     // validate() methods in the codebase.
     for fragment in fragments {
@@ -2517,9 +2775,74 @@ fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()>
     Ok(())
 }
 
+/// Validate that Merge operations preserve all original fragments.
+/// Merge operations should only add columns or rows, not reduce fragments.
+/// This ensures fragments correspond at one-to-one with the original fragment list.
+fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Result<()> {
+    let original_fragments = manifest.fragments.as_ref();
+
+    // Additional validation: ensure we're not accidentally reducing the fragment count
+    if new_fragments.len() < original_fragments.len() {
+        return Err(Error::invalid_input(
+            format!(
+                "Merge operation reduced fragment count from {} to {}. \
+                 Merge operations should only add columns, not reduce fragments.",
+                original_fragments.len(),
+                new_fragments.len()
+            ),
+            location!(),
+        ));
+    }
+
+    // Collect new fragment IDs
+    let new_fragment_map: HashMap<u64, &Fragment> =
+        new_fragments.iter().map(|f| (f.id, f)).collect();
+
+    // Check that all original fragments are preserved in the new fragments list
+    // Validate that each original fragment's metadata is preserved
+    let mut missing_fragments: Vec<u64> = Vec::new();
+    for original_fragment in original_fragments {
+        if let Some(new_fragment) = new_fragment_map.get(&original_fragment.id) {
+            // Validate physical_rows (row count) hasn't changed
+            if original_fragment.physical_rows != new_fragment.physical_rows {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Merge operation changed row count for fragment {}. \
+                         Original: {:?}, New: {:?}. \
+                         Merge operations should preserve fragment row counts and only add new columns.",
+                        original_fragment.id,
+                        original_fragment.physical_rows,
+                        new_fragment.physical_rows
+                    ),
+                    location!(),
+                ));
+            }
+        } else {
+            missing_fragments.push(original_fragment.id);
+        }
+    }
+
+    if !missing_fragments.is_empty() {
+        return Err(Error::invalid_input(
+            format!(
+                "Merge operation is missing original fragments: {:?}. \
+                 Merge operations should preserve all original fragments and only add new columns. \
+                 Expected fragments: {:?}, but got: {:?}",
+                missing_fragments,
+                original_fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
+                new_fragment_map.keys().copied().collect::<Vec<_>>()
+            ),
+            location!(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_io::utils::CachedFileSize;
 
     #[test]
     fn test_rewrite_fragments() {
@@ -2569,5 +2892,333 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[test]
+    fn test_merge_fragments_valid() {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema as LanceSchema;
+        use lance_table::format::Manifest;
+        use std::sync::Arc;
+
+        // Create a simple schema for testing
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+        ]);
+
+        // Create original fragments
+        let original_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
+
+        // Create a manifest with original fragments
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(original_fragments),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            None,
+            HashMap::new(),
+        );
+
+        // Test 1: Empty fragments should fail
+        let empty_fragments = vec![];
+        let result = merge_fragments_valid(&manifest, &empty_fragments);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reduced fragment count"));
+
+        // Test 2: Missing original fragments should fail
+        let missing_fragments = vec![
+            Fragment::new(1),
+            Fragment::new(2),
+            // Fragment 3 is missing
+            Fragment::new(4), // New fragment
+        ];
+        let result = merge_fragments_valid(&manifest, &missing_fragments);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing original fragments"));
+
+        // Test 3: Reduced fragment count should fail
+        let reduced_fragments = vec![
+            Fragment::new(1),
+            Fragment::new(2),
+            // Fragment 3 is missing, no new fragments added
+        ];
+        let result = merge_fragments_valid(&manifest, &reduced_fragments);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reduced fragment count"));
+
+        // Test 4: Valid merge with all original fragments plus new ones should succeed
+        let valid_fragments = vec![
+            Fragment::new(1),
+            Fragment::new(2),
+            Fragment::new(3),
+            Fragment::new(4), // New fragment
+            Fragment::new(5), // Another new fragment
+        ];
+        let result = merge_fragments_valid(&manifest, &valid_fragments);
+        assert!(result.is_ok());
+
+        // Test 5: Same fragments (no new ones) should succeed
+        let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
+        let result = merge_fragments_valid(&manifest, &same_fragments);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_remove_tombstoned_data_files() {
+        // Create a fragment with mixed data files: some normal, some fully tombstoned
+        let mut fragment = Fragment::new(1);
+
+        // Add a normal data file with valid field IDs
+        fragment.files.push(DataFile {
+            path: "normal.lance".to_string(),
+            fields: vec![1, 2, 3],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(1000),
+            base_id: None,
+        });
+
+        // Add a data file with all fields tombstoned
+        fragment.files.push(DataFile {
+            path: "all_tombstoned.lance".to_string(),
+            fields: vec![-2, -2, -2],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(500),
+            base_id: None,
+        });
+
+        // Add a data file with mixed tombstoned and valid fields
+        fragment.files.push(DataFile {
+            path: "mixed.lance".to_string(),
+            fields: vec![4, -2, 5],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(750),
+            base_id: None,
+        });
+
+        // Add another fully tombstoned file
+        fragment.files.push(DataFile {
+            path: "another_tombstoned.lance".to_string(),
+            fields: vec![-2],
+            column_indices: vec![],
+            file_major_version: 2,
+            file_minor_version: 0,
+            file_size_bytes: CachedFileSize::new(250),
+            base_id: None,
+        });
+
+        let mut fragments = vec![fragment];
+
+        // Apply the cleanup
+        Transaction::remove_tombstoned_data_files(&mut fragments);
+
+        // Should have removed the two fully tombstoned files
+        assert_eq!(fragments[0].files.len(), 2);
+        assert_eq!(fragments[0].files[0].path, "normal.lance");
+        assert_eq!(fragments[0].files[1].path, "mixed.lance");
+    }
+
+    #[test]
+    fn test_assign_row_ids_new_fragment() {
+        // Test assigning row IDs to a fragment without existing row IDs
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(100),
+            row_id_meta: None,
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 0;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        assert_eq!(next_row_id, 100);
+        assert!(fragments[0].row_id_meta.is_some());
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 100);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (0..100).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_existing_complete() {
+        // Test with fragment that already has complete row IDs
+        let existing_sequence = RowIdSequence::from(0..50);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50),
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // next_row_id should not change
+        assert_eq!(next_row_id, 100);
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 50);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (0..50).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_partial_existing() {
+        // Test with fragment that has partial row IDs (merge insert case)
+        let existing_sequence = RowIdSequence::from(0..30);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50), // More physical rows than existing row IDs
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // next_row_id should advance by 20 (50 - 30)
+        assert_eq!(next_row_id, 120);
+
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 50);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            // Should contain original 0-29 plus new 100-119
+            let mut expected = (0..30).collect::<Vec<u64>>();
+            expected.extend(100..120);
+            assert_eq!(row_ids, expected);
+        } else {
+            panic!("Expected inline row ID metadata");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_excess_row_ids() {
+        // Test error case where fragment has more row IDs than physical rows
+        let existing_sequence = RowIdSequence::from(0..60);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: Some(50), // Less physical rows than existing row IDs
+            row_id_meta: Some(RowIdMeta::Inline(serialized)),
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 100;
+
+        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+
+        assert!(result.is_err());
+        if let Err(Error::Internal { message, .. }) = result {
+            assert!(message.contains("more row IDs (60) than physical rows (50)"));
+        } else {
+            panic!("Expected Internal error about excess row IDs");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_multiple_fragments() {
+        // Test with multiple fragments, some with existing row IDs, some without
+        let existing_sequence = RowIdSequence::from(500..520);
+        let serialized = write_row_ids(&existing_sequence);
+
+        let mut fragments = vec![
+            Fragment {
+                id: 1,
+                physical_rows: Some(30), // No existing row IDs
+                row_id_meta: None,
+                files: vec![],
+                deletion_file: None,
+            },
+            Fragment {
+                id: 2,
+                physical_rows: Some(25), // Partial existing row IDs
+                row_id_meta: Some(RowIdMeta::Inline(serialized)),
+                files: vec![],
+                deletion_file: None,
+            },
+        ];
+        let mut next_row_id = 1000;
+
+        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+
+        // Should advance by 30 (first fragment) + 5 (second fragment partial)
+        assert_eq!(next_row_id, 1035);
+
+        // Check first fragment
+        if let Some(RowIdMeta::Inline(data)) = &fragments[0].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 30);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            assert_eq!(row_ids, (1000..1030).collect::<Vec<u64>>());
+        } else {
+            panic!("Expected inline row ID metadata for first fragment");
+        }
+
+        // Check second fragment
+        if let Some(RowIdMeta::Inline(data)) = &fragments[1].row_id_meta {
+            let sequence = read_row_ids(data).unwrap();
+            assert_eq!(sequence.len(), 25);
+            let row_ids: Vec<u64> = sequence.iter().collect();
+            // Should contain original 500-519 plus new 1030-1034
+            let mut expected = (500..520).collect::<Vec<u64>>();
+            expected.extend(1030..1035);
+            assert_eq!(row_ids, expected);
+        } else {
+            panic!("Expected inline row ID metadata for second fragment");
+        }
+    }
+
+    #[test]
+    fn test_assign_row_ids_missing_physical_rows() {
+        // Test error case where fragment doesn't have physical_rows set
+        let mut fragments = vec![Fragment {
+            id: 1,
+            physical_rows: None,
+            row_id_meta: None,
+            files: vec![],
+            deletion_file: None,
+        }];
+        let mut next_row_id = 0;
+
+        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+
+        assert!(result.is_err());
+        if let Err(Error::Internal { message, .. }) = result {
+            assert!(message.contains("Fragment does not have physical rows"));
+        } else {
+            panic!("Expected Internal error about missing physical rows");
+        }
     }
 }

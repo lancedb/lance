@@ -35,7 +35,7 @@ impl TableProvider for Dataset {
         None
     }
 
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         None
     }
 
@@ -83,6 +83,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
     use datafusion::prelude::*;
+    use datafusion_physical_plan::coop::CooperativeExec;
     use tempfile::tempdir;
 
     fn create_batches() -> (SchemaRef, Vec<RecordBatch>) {
@@ -157,6 +158,13 @@ mod tests {
         ctx.register_table("my_table", Arc::new(dataset)).unwrap();
         let df = ctx.sql("SELECT vector, utf8 FROM my_table").await.unwrap();
         let physical_plan = df.clone().create_physical_plan().await.unwrap();
+
+        // DataFusion will create a cooperative execution plan, so we need to get its inner plan
+        let physical_plan = physical_plan
+            .as_any()
+            .downcast_ref::<CooperativeExec>()
+            .unwrap()
+            .children()[0];
 
         assert!(physical_plan
             .as_any()

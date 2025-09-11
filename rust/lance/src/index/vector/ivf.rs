@@ -35,7 +35,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
-    cache::{LanceCache, UnsizedCacheKey},
+    cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
     Error, Result, ROW_ID_FIELD,
@@ -129,7 +129,7 @@ pub struct IVFIndex {
 
     pub metric_type: MetricType,
 
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl DeepSizeOf for IVFIndex {
@@ -165,7 +165,7 @@ impl IVFIndex {
             sub_index,
             metric_type,
             partition_locks: PartitionLoadLock::new(num_partitions),
-            index_cache,
+            index_cache: WeakLanceCache::from(&index_cache),
         })
     }
 
@@ -1207,23 +1207,24 @@ pub async fn build_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<IvfModel> {
+    let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
     if centroids.is_some() && !params.retrain {
         let centroids = centroids.unwrap();
         info!("Pre-computed IVF centroids is provided, skip IVF training");
-        if centroids.values().len() != params.num_partitions * dim {
+        if centroids.values().len() != num_partitions * dim {
             return Err(Error::Index {
                 message: format!(
                     "IVF centroids length mismatch: {} != {}",
                     centroids.len(),
-                    params.num_partitions * dim,
+                    num_partitions * dim,
                 ),
                 location: location!(),
             });
         }
         return Ok(IvfModel::new(centroids.as_ref().clone(), None));
     }
-    let sample_size_hint = params.num_partitions * params.sample_rate;
+    let sample_size_hint = num_partitions * params.sample_rate;
 
     let start = std::time::Instant::now();
     info!(
@@ -1268,9 +1269,13 @@ async fn build_ivf_model_and_pq(
 ) -> Result<(IvfModel, ProductQuantizer)> {
     sanity_check_params(ivf_params, pq_params)?;
 
+    // `num_partitions` should be set before building the IVF model,
+    // we use 32 as the default to avoid panicking, 32 is the default value
+    // before we make `num_partitions` optional.
+    let num_partitions = ivf_params.num_partitions.unwrap_or(32);
     info!(
         "Building vector index: IVF{},PQ{}, metric={}",
-        ivf_params.num_partitions, pq_params.num_sub_vectors, metric_type,
+        num_partitions, pq_params.num_sub_vectors, metric_type,
     );
 
     // sanity check
@@ -1764,7 +1769,7 @@ where
         centroids,
         data,
         dimension,
-        params.num_partitions,
+        params.num_partitions.unwrap(),
         params.max_iters as u32,
         REDOS,
         metric_type,
@@ -1876,6 +1881,7 @@ mod tests {
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::VECTOR_INDEX_VERSION;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
@@ -2267,10 +2273,52 @@ mod tests {
         .await
         .unwrap();
 
-        let index = dataset
+        // After building the index file, we need to register the index metadata
+        // so that the dataset can find it when we try to open it
+        let field = dataset.schema().field(WellKnownIvfPqData::COLUMN).unwrap();
+        let index_meta = lance_table::format::Index {
+            uuid,
+            dataset_version: dataset.version().version,
+            fields: vec![field.id],
+            name: INDEX_NAME.to_string(),
+            fragment_bitmap: Some(
+                dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        };
+
+        // We need to commit this index to the dataset so that it can be found
+        use crate::dataset::transaction::{Operation, Transaction};
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![index_meta.clone()],
+                removed_indices: vec![],
+            },
+            None,
+            None,
+        );
+
+        // Apply the transaction to register the index
+        // Since dataset is Arc<Dataset>, we need to create a mutable reference
+        let mut dataset_mut = (*dataset).clone();
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let index = dataset_mut
             .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid_str, &NoOpMetricsCollector)
             .await
             .unwrap();
+
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
         let index_meta = lance_table::format::Index {
@@ -2279,9 +2327,10 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
-            index_details: Some(vector_index_details()),
-            index_version: index.index_type().version(),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
+            base_id: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2312,10 +2361,10 @@ mod tests {
         let new_uuid_str = new_uuid.to_string();
 
         remap_index_file(
-            &dataset,
+            &dataset_mut,
             &uuid_str,
             &new_uuid_str,
-            dataset.version().version,
+            dataset_mut.version().version,
             ivf_index,
             &mapping,
             INDEX_NAME.to_string(),
@@ -2325,7 +2374,48 @@ mod tests {
         .await
         .unwrap();
 
-        let remapped = dataset
+        // After remapping the index file, we need to register the new index metadata
+        // so that the dataset can find it when we try to open it
+        let field = dataset_mut
+            .schema()
+            .field(WellKnownIvfPqData::COLUMN)
+            .unwrap();
+        let new_index_meta = lance_table::format::Index {
+            uuid: new_uuid,
+            dataset_version: dataset_mut.version().version,
+            fields: vec![field.id],
+            name: format!("{}_remapped", INDEX_NAME),
+            fragment_bitmap: Some(
+                dataset_mut
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        };
+
+        // We need to commit this new index to the dataset so it can be found
+        let transaction = Transaction::new(
+            dataset_mut.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![new_index_meta],
+                removed_indices: vec![],
+            },
+            None,
+            None,
+        );
+
+        // Apply the transaction to register the new index
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let remapped = dataset_mut
             .open_vector_index(
                 WellKnownIvfPqData::COLUMN,
                 &new_uuid.to_string(),

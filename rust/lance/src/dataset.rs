@@ -33,7 +33,8 @@ use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION,
+    MINOR_VERSION,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
@@ -83,6 +84,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -133,10 +135,10 @@ pub struct Dataset {
     /// Uri of the dataset.
     ///
     /// On cloud storage, we can not use [Dataset::base] to build the full uri because the
-    /// `bucket` is swlloed in the inner [ObjectStore].
+    /// `bucket` is swallowed in the inner [ObjectStore].
     uri: String,
     pub(crate) base: Path,
-    pub(crate) manifest: Arc<Manifest>,
+    pub manifest: Arc<Manifest>,
     // Path for the manifest that is loaded. Used to get additional information,
     // such as the index metadata.
     pub(crate) manifest_location: ManifestLocation,
@@ -336,7 +338,6 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
-        let mut projection_plan = ProjectionPlan::new(dataset.clone());
         match self {
             Self::Schema(schema) => {
                 let projection = dataset.schema().project_by_schema(
@@ -344,13 +345,9 @@ impl ProjectionRequest {
                     OnMissing::Error,
                     OnTypeMismatch::Error,
                 )?;
-                projection_plan.project_from_schema(&projection);
-                Ok(projection_plan)
+                ProjectionPlan::from_schema(dataset, &projection)
             }
-            Self::Sql(columns) => {
-                projection_plan.project_from_expressions(&columns)?;
-                Ok(projection_plan)
-            }
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
         }
     }
 }
@@ -448,7 +445,7 @@ impl Dataset {
         self.checkout_by_version_number(version).await
     }
 
-    async fn load_manifest(
+    pub(crate) async fn load_manifest(
         object_store: &ObjectStore,
         manifest_location: &ManifestLocation,
         uri: &str,
@@ -861,16 +858,41 @@ impl Dataset {
         older_than: Duration,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
-    ) -> BoxFuture<Result<RemovalStats>> {
+    ) -> BoxFuture<'_, Result<RemovalStats>> {
+        let mut builder = CleanupPolicyBuilder::default();
+        builder = builder.before_timestamp(utc_now() - older_than);
+        if let Some(v) = delete_unverified {
+            builder = builder.delete_unverified(v);
+        }
+        if let Some(v) = error_if_tagged_old_versions {
+            builder = builder.error_if_tagged_old_versions(v);
+        }
+
+        self.cleanup_with_policy(builder.build())
+    }
+
+    /// Removes old versions of the dataset from storage
+    ///
+    /// This function will remove all versions of the dataset that satisfies the given policy.
+    /// This function will not remove the current version of the dataset.
+    ///
+    /// Once a version is removed it can no longer be checked out or restored.  Any data unique
+    /// to that version will be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
+    ///
+    /// # Returns
+    ///
+    /// * `RemovalStats` - Statistics about the removal operation
+    #[instrument(level = "debug", skip(self))]
+    pub fn cleanup_with_policy(
+        &self,
+        policy: CleanupPolicy,
+    ) -> BoxFuture<'_, Result<RemovalStats>> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        let before = utc_now() - older_than;
-        cleanup::cleanup_old_versions(
-            self,
-            before,
-            delete_unverified,
-            error_if_tagged_old_versions,
-        )
-        .boxed()
+        cleanup::cleanup_old_versions(self, policy).boxed()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1192,7 +1214,7 @@ impl Dataset {
             .await
     }
 
-    pub(crate) fn object_store(&self) -> &ObjectStore {
+    pub fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
 
@@ -1200,8 +1222,88 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub(crate) fn indices_dir(&self) -> Path {
+    pub fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
+    }
+
+    pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
+        match data_file.base_id.as_ref() {
+            Some(base_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(base_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "base_path id {} not found for data_file {}",
+                            base_id, data_file.path
+                        ),
+                        location!(),
+                    )
+                })?;
+
+                let path = Path::parse(base_path.path.as_str())?;
+                if base_path.is_dataset_root {
+                    Ok(path.child(DATA_DIR))
+                } else {
+                    Ok(path)
+                }
+            }
+            None => Ok(self.base.child(DATA_DIR)),
+        }
+    }
+
+    pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
+        match deletion_file.base_id.as_ref() {
+            Some(base_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(base_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "base_path id {} not found for deletion_file {:?}",
+                            base_id, deletion_file
+                        ),
+                        location!(),
+                    )
+                })?;
+
+                if !base_path.is_dataset_root {
+                    return Err(Error::Internal {
+                        message: format!(
+                            "base_path id {} is not a dataset root for deletion_file {:?}",
+                            base_id, deletion_file
+                        ),
+                        location: location!(),
+                    });
+                }
+                Ok(Path::parse(base_path.path.as_str())?)
+            }
+            None => Ok(self.base.clone()),
+        }
+    }
+
+    /// Get the indices directory for a specific index, considering its base_id
+    pub(crate) fn indice_files_dir(&self, index: &Index) -> Result<Path> {
+        match index.base_id.as_ref() {
+            Some(base_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(base_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "base_path id {} not found for index {}",
+                            base_id, index.uuid
+                        ),
+                        location!(),
+                    )
+                })?;
+                let path = Path::parse(base_path.path.as_str())?;
+                if base_path.is_dataset_root {
+                    Ok(path.child(INDICES_DIR))
+                } else {
+                    // For non-dataset-root base paths, we assume the path already points to the indices directory
+                    Ok(path)
+                }
+            }
+            None => Ok(self.base.child(INDICES_DIR)),
+        }
     }
 
     pub fn session(&self) -> Arc<Session> {
@@ -1310,7 +1412,7 @@ impl Dataset {
 
     // Gets a filtered list of fragments from ids in O(N) time instead of using
     // `get_fragment` which would require O(N^2) time.
-    fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
         let mut fragments = Vec::with_capacity(ordered_ids.len());
         let mut id_iter = ordered_ids.iter();
         let mut id = id_iter.next();
@@ -1608,6 +1710,37 @@ impl Dataset {
         let latest_version = self.latest_version_id().await?;
         *self = self.checkout_version(latest_version).await?;
         Ok(())
+    }
+
+    /// Shallow clone the target version into a new dataset at target_path.
+    /// 'target_path': the uri string to clone the dataset into.
+    /// 'version': the version cloned from, could be a version number or tag.
+    /// 'store_params': the object store params to use for the new dataset.
+    pub async fn shallow_clone(
+        &mut self,
+        target_path: &str,
+        version: impl Into<refs::Ref>,
+        store_params: ObjectStoreParams,
+    ) -> Result<Self> {
+        let ref_: refs::Ref = version.into();
+        let (version_number, ref_name) = match ref_ {
+            refs::Ref::Version(version) => (version, None),
+            refs::Ref::Tag(tag) => (self.tags.get_version(tag.as_str()).await?, Some(tag)),
+        };
+        let clone_op = Operation::Clone {
+            is_shallow: true,
+            ref_name,
+            ref_version: version_number,
+            ref_path: String::from(self.base.clone()),
+        };
+        let transaction = Transaction::new(version_number, clone_op, None, None);
+
+        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+            .with_store_params(store_params)
+            .with_object_store(Arc::new(self.object_store().clone()))
+            .with_commit_handler(self.commit_handler.clone())
+            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+        builder.execute(transaction).await
     }
 
     /// Run a SQL query against the dataset.
@@ -1986,7 +2119,7 @@ impl DatasetTakeRows for Dataset {
 pub(crate) struct ManifestWriteConfig {
     auto_set_feature_flags: bool,              // default true
     timestamp: Option<SystemTime>,             // default None
-    use_move_stable_row_ids: bool,             // default false
+    use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
 }
@@ -1996,7 +2129,7 @@ impl Default for ManifestWriteConfig {
         Self {
             auto_set_feature_flags: true,
             timestamp: None,
-            use_move_stable_row_ids: false,
+            use_stable_row_ids: false,
             use_legacy_format: None,
             storage_format: None,
         }
@@ -2014,7 +2147,7 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest, config.use_move_stable_row_ids)?;
+        apply_feature_flags(manifest, config.use_stable_row_ids)?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -2085,9 +2218,10 @@ mod tests {
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
-        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+        DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
     };
-    use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
@@ -2103,8 +2237,12 @@ mod tests {
     use lance_table::feature_flags;
     use lance_table::format::{DataFile, WriterVersion};
 
+    use crate::datafusion::LanceTableProvider;
     use all_asserts::assert_true;
+    use datafusion::common::{assert_contains, assert_not_contains};
+    use datafusion::prelude::SessionContext;
     use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion::udf::register_functions;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -2554,7 +2692,7 @@ mod tests {
             &ManifestWriteConfig {
                 auto_set_feature_flags: false,
                 timestamp: None,
-                use_move_stable_row_ids: false,
+                use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
             },
@@ -2668,6 +2806,246 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..2).collect::<Vec<_>>()
         )
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_shallow_clone_with_hybrid_paths(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let clone_dir = test_dir.path().join("clone");
+        let cloned_uri = clone_dir.to_str().unwrap();
+
+        // Generate consistent test data batches
+        let generate_data = |prefix: &str, start_id: i32, row_count: u64| {
+            gen_batch()
+                .col("id", array::step_custom::<Int32Type>(start_id, 1))
+                .col("value", array::fill_utf8(format!("{prefix}_data")))
+                .into_reader_rows(RowCount::from(row_count), BatchCount::from(1))
+        };
+
+        // Reusable dataset writer with configurable mode
+        async fn write_dataset(
+            uri: &str,
+            data_reader: impl RecordBatchReader + Send + 'static,
+            mode: WriteMode,
+            version: LanceFileVersion,
+        ) -> Dataset {
+            let params = WriteParams {
+                max_rows_per_file: 100,
+                max_rows_per_group: 20,
+                data_storage_version: Some(version),
+                mode,
+                ..Default::default()
+            };
+            Dataset::write(data_reader, uri, Some(params))
+                .await
+                .unwrap()
+        }
+
+        // Unified dataset scanning and row counting
+        async fn collect_rows(dataset: &Dataset) -> (usize, Vec<RecordBatch>) {
+            let batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            (batches.iter().map(|b| b.num_rows()).sum(), batches)
+        }
+
+        // Create initial dataset
+        let mut dataset = write_dataset(
+            test_uri,
+            generate_data("initial", 0, 50),
+            WriteMode::Create,
+            data_storage_version,
+        )
+        .await;
+
+        // Store original state for comparison
+        let original_version = dataset.version().version;
+        let original_fragment_count = dataset.fragments().len();
+
+        // Create tag and shallow clone
+        dataset
+            .tags
+            .create("test_tag", original_version)
+            .await
+            .unwrap();
+        let cloned_dataset = dataset
+            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .await
+            .unwrap();
+
+        // Verify cloned dataset state
+        let (cloned_rows, _) = collect_rows(&cloned_dataset).await;
+        assert_eq!(cloned_rows, 50);
+        assert_eq!(cloned_dataset.version().version, original_version);
+
+        // Append data to cloned dataset
+        let updated_cloned = write_dataset(
+            cloned_uri,
+            generate_data("cloned_new", 50, 30),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Verify updated cloned dataset
+        let (updated_cloned_rows, updated_batches) = collect_rows(&updated_cloned).await;
+        assert_eq!(updated_cloned_rows, 80);
+        assert_eq!(updated_cloned.version().version, original_version + 1);
+
+        // Append data to original dataset
+        let updated_original = write_dataset(
+            test_uri,
+            generate_data("original_new", 50, 25),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Verify updated original dataset
+        let (original_rows, _) = collect_rows(&updated_original).await;
+        assert_eq!(original_rows, 75);
+        assert_eq!(updated_original.version().version, original_version + 1);
+
+        // Final validations
+        // Verify cloned dataset isolation
+        let final_cloned = Dataset::open(cloned_uri).await.unwrap();
+        let (final_cloned_rows, _) = collect_rows(&final_cloned).await;
+
+        // Data integrity check
+        let combined_batch =
+            concat_batches(&updated_batches[0].schema(), &updated_batches).unwrap();
+        assert_eq!(combined_batch.column_by_name("id").unwrap().len(), 80);
+        assert_eq!(combined_batch.column_by_name("value").unwrap().len(), 80);
+
+        // Fragment count validation
+        assert_eq!(
+            updated_original.fragments().len(),
+            original_fragment_count + 1
+        );
+        assert_eq!(final_cloned.fragments().len(), original_fragment_count + 1);
+
+        // Final assertions
+        assert_eq!(final_cloned_rows, 80);
+        assert_eq!(final_cloned.version().version, original_version + 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_shallow_clone_multiple_times(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let append_row_count = 36;
+
+        // Async dataset writer function
+        async fn write_dataset(
+            dest: impl Into<WriteDestination<'_>>,
+            row_count: u64,
+            mode: WriteMode,
+            version: LanceFileVersion,
+        ) -> Dataset {
+            let data = gen_batch()
+                .col("index", array::step::<Int32Type>())
+                .col("category", array::fill_utf8("base".to_string()))
+                .col("score", array::step_custom::<Float32Type>(1.0, 0.5));
+            Dataset::write(
+                data.into_reader_rows(RowCount::from(row_count), BatchCount::from(1)),
+                dest,
+                Some(WriteParams {
+                    max_rows_per_file: 60,
+                    max_rows_per_group: 12,
+                    mode,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        }
+
+        let mut current_dataset = write_dataset(
+            test_uri,
+            append_row_count,
+            WriteMode::Create,
+            data_storage_version,
+        )
+        .await;
+
+        let test_round = 3;
+        // Generate clone paths
+        let clone_paths = (1..=test_round)
+            .map(|i| test_dir.path().join(format!("clone{}", i)))
+            .collect::<Vec<_>>();
+        let mut cloned_datasets = Vec::with_capacity(test_round);
+
+        // Unified cloning procedure, write a fragment to each cloned dataset.
+        for path in clone_paths.iter() {
+            let clone_path = path.to_str().unwrap();
+            current_dataset
+                .tags
+                .create("v1", current_dataset.latest_version_id().await.unwrap())
+                .await
+                .unwrap();
+
+            current_dataset = current_dataset
+                .shallow_clone(clone_path, "v1", ObjectStoreParams::default())
+                .await
+                .unwrap();
+            current_dataset = write_dataset(
+                Arc::new(current_dataset),
+                append_row_count,
+                WriteMode::Append,
+                data_storage_version,
+            )
+            .await;
+            cloned_datasets.push(current_dataset.clone());
+        }
+
+        // Validation function
+        async fn validate_dataset(
+            dataset: &Dataset,
+            expected_rows: usize,
+            expected_fragments_count: usize,
+            expected_base_paths_count: usize,
+        ) {
+            let batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, expected_rows);
+            assert_eq!(dataset.fragments().len(), expected_fragments_count);
+            assert_eq!(
+                dataset.manifest().base_paths.len(),
+                expected_base_paths_count
+            );
+        }
+
+        // Verify cloned datasets row count, fragment count, base_path count
+        for (i, ds) in cloned_datasets.iter().enumerate() {
+            validate_dataset(ds, 36 * (i + 2), i + 2, i + 1).await;
+        }
+
+        // Verify original dataset row count, fragment count, base_path count
+        let original = Dataset::open(test_uri).await.unwrap();
+        validate_dataset(&original, 36, 1, 0).await;
     }
 
     #[rstest]
@@ -3157,7 +3535,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )
@@ -3590,7 +3968,7 @@ mod tests {
         let write_params = WriteParams {
             mode: WriteMode::Append,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
 
@@ -3703,7 +4081,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         Dataset::write(data, test_uri, Some(write_params.clone()))
@@ -3741,7 +4119,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(data, "memory://", Some(write_params.clone()))
@@ -3803,7 +4181,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 1024,
             max_rows_per_group: 150,
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(data, "memory://", Some(write_params.clone()))
@@ -4256,7 +4634,7 @@ mod tests {
             test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )
@@ -5473,7 +5851,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(result.num_rows(), 5);
+        assert_eq!(result.num_rows(), 5, "{:?}", result);
         let ids = result["id"].as_primitive::<UInt64Type>().values();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
@@ -6247,7 +6625,7 @@ mod tests {
         ]));
         let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
         let options = WriteParams {
-            enable_move_stable_row_ids: true,
+            enable_stable_row_ids: true,
             enable_v2_manifest_paths: true,
             ..Default::default()
         };
@@ -6485,6 +6863,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
+            base_id: None,
         };
 
         let dataset = Dataset::commit(
@@ -6539,6 +6918,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
+            base_id: None,
         };
 
         let dataset = Dataset::commit(
@@ -6637,6 +7017,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
+            base_id: None,
         };
 
         let new_data_file = DataFile {
@@ -7273,5 +7654,174 @@ mod tests {
 
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sql_contains_tokens() {
+        let text_col = Arc::new(StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat catchup fish",
+            "cat fish catch",
+        ]));
+
+        // Prepare dataset
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        // Test without fts index
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
+        );
+
+        // Verify plan, should not contain ScalarIndexQuery.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+
+        // Test with unsuitable fts index
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().base_tokenizer("raw".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
+        );
+
+        // Verify plan, should not contain ScalarIndexQuery because fts index is not unsuitable.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+
+        // Test with suitable fts index
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .max_token_length(None)
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let results = execute_sql(
+            "select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_results(
+            results,
+            &StringArray::from(vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat fish catch",
+            ]),
+        );
+
+        // Verify plan, should contain ScalarIndexQuery.
+        let results = execute_sql(
+            "explain select * from foo where contains_tokens(text, 'cat catch fish')",
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    async fn execute_sql(
+        sql: &str,
+        table: String,
+        dataset: Arc<Dataset>,
+    ) -> Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            table,
+            Arc::new(LanceTableProvider::new(dataset, false, false)),
+        )?;
+        register_functions(&ctx);
+
+        let df = ctx.sql(sql).await?;
+        Ok(df
+            .execute_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await?)
+    }
+
+    fn assert_results<T: Array + PartialEq + 'static>(results: Vec<RecordBatch>, values: &T) {
+        assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        assert_eq!(results.num_columns(), 1);
+
+        assert_eq!(
+            results.column(0).as_any().downcast_ref::<T>().unwrap(),
+            values
+        )
     }
 }

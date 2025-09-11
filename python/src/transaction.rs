@@ -38,6 +38,10 @@ impl FromPyObject<'_> for PyLance<Index> {
                 .map(|id| id.extract::<u32>())
                 .collect::<PyResult<RoaringBitmap>>()?,
         );
+        let base_id: Option<u32> = ob
+            .getattr("base_id")?
+            .extract::<Option<i64>>()?
+            .map(|id| id as u32);
 
         Ok(Self(Index {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
@@ -48,6 +52,7 @@ impl FromPyObject<'_> for PyLance<Index> {
             index_details: None,
             index_version,
             created_at,
+            base_id,
         }))
     }
 }
@@ -78,6 +83,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
             },
         );
         let created_at = self.0.created_at;
+        let base_id = self.0.base_id.map(|id| id as i64);
 
         let cls = namespace
             .getattr("Index")
@@ -90,7 +96,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
             fragment_ids,
             index_version,
             created_at,
+            base_id,
         ))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<Index> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
     }
 }
 
@@ -170,7 +187,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 };
                 Ok(Self(op))
             }
@@ -488,7 +505,18 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
         let new_id = Uuid::parse_str(&new_id)
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
-        Ok(Self(RewrittenIndex { old_id, new_id }))
+        let new_details_type_url: String = ob.getattr("new_details_type_url")?.extract()?;
+        let new_details_value: Vec<u8> = ob.getattr("new_details_value")?.extract()?;
+        let new_index_version: u32 = ob.getattr("new_index_version")?.extract()?;
+        Ok(Self(RewrittenIndex {
+            old_id,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: new_details_type_url,
+                value: new_details_value,
+            },
+            new_index_version,
+        }))
     }
 }
 

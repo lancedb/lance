@@ -22,6 +22,7 @@ pub enum State {
     Open,
     Sealed,
     Flushed,
+    Merged,
 }
 
 impl From<State> for pb::mem_wal_index_details::mem_wal::State {
@@ -30,6 +31,7 @@ impl From<State> for pb::mem_wal_index_details::mem_wal::State {
             State::Open => Self::Open,
             State::Sealed => Self::Sealed,
             State::Flushed => Self::Flushed,
+            State::Merged => Self::Merged,
         }
     }
 }
@@ -42,6 +44,7 @@ impl TryFrom<pb::mem_wal_index_details::mem_wal::State> for State {
             pb::mem_wal_index_details::mem_wal::State::Open => Ok(Self::Open),
             pb::mem_wal_index_details::mem_wal::State::Sealed => Ok(Self::Sealed),
             pb::mem_wal_index_details::mem_wal::State::Flushed => Ok(Self::Flushed),
+            pb::mem_wal_index_details::mem_wal::State::Merged => Ok(Self::Merged),
         }
     }
 }
@@ -54,6 +57,7 @@ impl TryFrom<i32> for State {
             0 => Ok(Self::Open),
             1 => Ok(Self::Sealed),
             2 => Ok(Self::Flushed),
+            3 => Ok(Self::Merged),
             _ => Err(Error::invalid_input(
                 format!("Unknown MemWAL state value: {}", value),
                 location!(),

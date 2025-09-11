@@ -54,7 +54,7 @@ impl MiniBlockCompressor for GeneralMiniBlockCompressor {
         let mut offset = 0usize;
         let mut total_original_size = 0usize;
 
-        let compressor = GeneralBufferCompressor::get_compressor(self.compression);
+        let compressor = GeneralBufferCompressor::get_compressor(self.compression)?;
 
         for chunk in &inner_compressed.chunks {
             let chunk_first_buffer_size = chunk.buffer_sizes[0] as usize;
@@ -126,7 +126,7 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
     fn decompress(&self, mut data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let mut decompressed_buffer = Vec::new();
 
-        let decompressor = GeneralBufferCompressor::get_compressor(self.compression);
+        let decompressor = GeneralBufferCompressor::get_compressor(self.compression)?;
         decompressor.decompress(&data[0], &mut decompressed_buffer)?;
         data[0] = LanceBuffer::from(decompressed_buffer);
 

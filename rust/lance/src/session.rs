@@ -47,8 +47,9 @@ pub struct Session {
 impl DeepSizeOf for Session {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         let mut size = 0;
-        size += self.index_cache.0.deep_size_of_children(context);
-        size += self.metadata_cache.0.deep_size_of_children(context);
+        // Measure the actual cache contents through the wrapper types
+        size += self.index_cache.deep_size_of_children(context);
+        size += self.metadata_cache.deep_size_of_children(context);
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -180,14 +181,11 @@ impl Session {
 
 impl Default for Session {
     fn default() -> Self {
-        Self {
-            index_cache: GlobalIndexCache(LanceCache::with_capacity(DEFAULT_INDEX_CACHE_SIZE)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(
-                DEFAULT_METADATA_CACHE_SIZE,
-            )),
-            index_extensions: HashMap::new(),
-            store_registry: Arc::new(ObjectStoreRegistry::default()),
-        }
+        Self::new(
+            DEFAULT_INDEX_CACHE_SIZE,
+            DEFAULT_METADATA_CACHE_SIZE,
+            Arc::new(ObjectStoreRegistry::default()),
+        )
     }
 }
 

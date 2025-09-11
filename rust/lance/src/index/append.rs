@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lance_core::{Error, Result};
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::IndexType;
-use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::InvertedIndex};
-use lance_table::format::Index as IndexMetadata;
+use lance_index::scalar::CreatedIndex;
+use lance_index::VECTOR_INDEX_VERSION;
+use lance_table::format::{Fragment, Index as IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
@@ -17,14 +18,16 @@ use uuid::Uuid;
 use super::vector::ivf::optimize_vector_indices;
 use super::DatasetIndexInternalExt;
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::Dataset;
+use crate::index::scalar::load_training_data;
+use crate::index::vector_index_details;
 
 pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
     pub new_fragment_bitmap: RoaringBitmap,
     pub new_index_version: i32,
+    pub new_index_details: prost_types::Any,
 }
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
@@ -40,6 +43,25 @@ pub struct IndexMergeResults<'a> {
 pub async fn merge_indices<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
+    options: &OptimizeOptions,
+) -> Result<Option<IndexMergeResults<'a>>> {
+    if old_indices.is_empty() {
+        return Err(Error::Index {
+            message: "Append index: no previous index found".to_string(),
+            location: location!(),
+        });
+    };
+
+    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
+    merge_indices_with_unindexed_frags(dataset, old_indices, &unindexed, options).await
+}
+
+/// Merge a list of provided unindexed data, with a specific number of previous indices
+/// into a new index, to improve the query performance.
+pub async fn merge_indices_with_unindexed_frags<'a>(
+    dataset: Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    unindexed: &[Fragment],
     options: &OptimizeOptions,
 ) -> Result<Option<IndexMergeResults<'a>>> {
     if old_indices.is_empty() {
@@ -77,7 +99,6 @@ pub async fn merge_indices<'a>(
             location: location!(),
         });
     }
-    let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
 
     let mut frag_bitmap = RoaringBitmap::new();
     unindexed.iter().for_each(|frag| {
@@ -85,7 +106,7 @@ pub async fn merge_indices<'a>(
     });
 
     let index_type = indices[0].index_type();
-    let (new_uuid, indices_merged) = match index_type {
+    let (new_uuid, indices_merged, created_index) = match index_type {
         it if it.is_scalar() => {
             // There are no delta indices for scalar, so adding all indexed
             // fragments to the new index.
@@ -101,43 +122,30 @@ pub async fn merge_indices<'a>(
                 )
                 .await?;
 
-            let need_full_data = match index.index_type() {
-                IndexType::Inverted => {
-                    // we can't directly update the legacy inverted index to the new format,
-                    // so we need to read the full data and rebuild it.
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or(Error::Index {
-                                message: "Append index: invalid index type".to_string(),
-                                location: location!(),
-                            })?;
-                    index.is_legacy()
-                }
-                _ => false,
-            };
+            let update_criteria = index.update_criteria();
 
-            let mut scanner = dataset.scan();
-            let orodering = match index.index_type() {
-                IndexType::Inverted => None,
-                _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
+            let fragments = if update_criteria.requires_old_data {
+                None
+            } else {
+                Some(unindexed.to_vec())
             };
-            scanner
-                .with_row_id()
-                .order_by(orodering)?
-                .project(&[&column.name])?;
-            if !need_full_data {
-                scanner.with_fragments(unindexed);
-            }
-            let new_data_stream = scanner.try_into_stream().await?;
+            let new_data_stream = load_training_data(
+                dataset.as_ref(),
+                &column.name,
+                &update_criteria.data_criteria,
+                fragments,
+                true,
+                None,
+            )
+            .await?;
 
             let new_uuid = Uuid::new_v4();
 
-            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
-            index.update(new_data_stream.into(), &new_store).await?;
+            let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+            let created_index = index.update(new_data_stream, &new_store).await?;
 
-            Ok((new_uuid, 1))
+            // TODO: don't hard-code index version
+            Ok((new_uuid, 1, created_index))
         }
         it if it.is_vector() => {
             let start_pos = old_indices
@@ -153,7 +161,7 @@ pub async fn merge_indices<'a>(
             } else {
                 let mut scanner = dataset.scan();
                 scanner
-                    .with_fragments(unindexed)
+                    .with_fragments(unindexed.to_vec())
                     .with_row_id()
                     .project(&[&column.name])?;
                 if column.nullable {
@@ -162,7 +170,7 @@ pub async fn merge_indices<'a>(
                 Some(scanner.try_into_stream().await?)
             };
 
-            optimize_vector_indices(
+            let (new_uuid, indices_merged) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
                 &column.name,
@@ -170,7 +178,15 @@ pub async fn merge_indices<'a>(
                 options,
             )
             .boxed()
-            .await
+            .await?;
+            Ok((
+                new_uuid,
+                indices_merged,
+                CreatedIndex {
+                    index_details: vector_index_details(),
+                    index_version: VECTOR_INDEX_VERSION,
+                },
+            ))
         }
         _ => Err(Error::Index {
             message: format!(
@@ -190,7 +206,8 @@ pub async fn merge_indices<'a>(
         new_uuid,
         removed_indices,
         new_fragment_bitmap: frag_bitmap,
-        new_index_version: index_type.version(),
+        new_index_version: created_index.index_version as i32,
+        new_index_details: created_index.index_details,
     }))
 }
 
@@ -198,13 +215,14 @@ pub async fn merge_indices<'a>(
 mod tests {
     use super::*;
 
-    use arrow::datatypes::Float32Type;
+    use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt32Type;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_datafusion::utils::reader_to_stream;
+    use lance_datagen::{array, Dimension, RowCount};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::storage::VectorStore;
@@ -218,8 +236,10 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
     use crate::index::vector::ivf::v2;
     use crate::index::vector::VectorIndexParams;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[tokio::test]
     async fn test_append_index() {
@@ -444,5 +464,149 @@ mod tests {
         let mut id_arr = results["id"].as_primitive::<UInt32Type>().values().to_vec();
         id_arr.sort();
         assert_eq!(id_arr, vec![0, 1000]);
+    }
+
+    #[tokio::test]
+    async fn test_merge_indices_after_merge_insert() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Create initial dataset using lance_datagen
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::cycle_utf8_literals(&["a", "b", "c"]))
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(64)),
+            )
+            .into_dataset_with_params(
+                test_uri,
+                FragmentCount(1),
+                FragmentRowCount(1000),
+                Some(WriteParams {
+                    max_rows_per_file: 1000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Create initial index
+        let ivf_params = IvfBuildParams::new(2);
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 2,
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        // Load initial index metadata
+        let initial_indices = dataset.load_indices().await.unwrap();
+        assert_eq!(initial_indices.len(), 1);
+        let index_name = initial_indices[0].name.clone();
+
+        // Prepare new data for merge insert (updates to existing rows)
+        let new_batch = lance_datagen::gen_batch()
+            .col("id", array::step_custom::<UInt32Type>(500, 1)) // IDs 500-999
+            .col("value", array::cycle_utf8_literals(&["d", "e", "f"])) // Different values
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(64)),
+            )
+            .into_batch_rows(RowCount::from(500))
+            .unwrap();
+
+        // Record the maximum fragment ID before merge insert
+        let max_fragment_id_before = dataset.manifest.max_fragment_id().unwrap_or(0);
+
+        // Execute merge insert operation
+        let merge_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+
+        let schema = new_batch.schema();
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+        let (updated_dataset, merge_stats) = merge_job.execute(new_stream).await.unwrap();
+
+        // Check merge stats
+        assert_eq!(merge_stats.num_updated_rows, 500); // Updates for rows 500-999
+        assert_eq!(merge_stats.num_inserted_rows, 0); // No new inserts in this case
+
+        // Get the newly added fragments by comparing fragment IDs
+        let unindexed_fragments: Vec<Fragment> = updated_dataset
+            .get_fragments()
+            .into_iter()
+            .filter(|f| f.id() as u64 > max_fragment_id_before)
+            .map(|f| f.metadata().clone())
+            .collect();
+
+        // Now run merge with known unindexed fragments
+        let old_indices = updated_dataset
+            .load_indices_by_name(&index_name)
+            .await
+            .unwrap();
+        let old_indices_refs: Vec<&IndexMetadata> = old_indices.iter().collect();
+
+        let merge_result = merge_indices_with_unindexed_frags(
+            updated_dataset.clone(),
+            &old_indices_refs,
+            &unindexed_fragments,
+            &OptimizeOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(merge_result.is_some());
+        let merge_result = merge_result.unwrap();
+
+        // Verify that the new index covers all fragments
+        let new_fragment_bitmap = &merge_result.new_fragment_bitmap;
+
+        // Check that unindexed fragments are now included
+        for fragment in &unindexed_fragments {
+            assert!(new_fragment_bitmap.contains(fragment.id as u32));
+        }
+
+        // Check that old indexed fragments are still included
+        // All fragments with ID <= max_fragment_id_before should be included
+        for frag_id in 0..=max_fragment_id_before as u32 {
+            assert!(new_fragment_bitmap.contains(frag_id));
+        }
+
+        // Verify the index can be used for search
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+
+        // There should still be indices (old one might be kept plus new one)
+        assert!(!indices.is_empty());
+
+        // Test that search works by querying for nearest neighbors
+        let query_batch = lance_datagen::gen_batch()
+            .col("query", array::rand_vec::<Float32Type>(Dimension::from(64)))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap();
+
+        let q = query_batch.column(0).as_fixed_size_list();
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", q.value(0).as_primitive::<Float32Type>(), 10)
+            .unwrap();
+        let results = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results[0].num_rows(), 10);
     }
 }

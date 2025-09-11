@@ -1,4 +1,4 @@
-## Contributing to Python
+# Contributing to Python
 
 The python integration is done via pyo3 + custom python code:
 

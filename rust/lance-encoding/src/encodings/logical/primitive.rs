@@ -22,8 +22,7 @@ use crate::{
         ProtobufUtils21,
     },
 };
-use arrow::array::AsArray;
-use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
+use arrow_array::{cast::AsArray, make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, TryStreamExt};
@@ -723,6 +722,7 @@ pub struct ComplexAllNullScheduler {
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
+    max_visible_level: u16,
 }
 
 impl ComplexAllNullScheduler {
@@ -730,10 +730,16 @@ impl ComplexAllNullScheduler {
         buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
         def_meaning: Arc<[DefinitionInterpretation]>,
     ) -> Self {
+        let max_visible_level = def_meaning
+            .iter()
+            .take_while(|l| !l.is_list())
+            .map(|l| l.num_def_levels())
+            .sum::<u16>();
         Self {
             buffer_offsets_and_sizes,
             def_meaning,
             repdef: None,
+            max_visible_level,
         }
     }
 }
@@ -812,6 +818,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             def: self.repdef.as_ref().unwrap().def.clone(),
             num_rows,
             def_meaning: self.def_meaning.clone(),
+            max_visible_level: self.max_visible_level,
         }) as Box<dyn StructuralPageDecoder>))
         .boxed())
     }
@@ -824,6 +831,7 @@ pub struct ComplexAllNullPageDecoder {
     def: Option<ScalarBuffer<u16>>,
     num_rows: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_level: u16,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -854,6 +862,7 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
             rep: self.rep.clone(),
             def: self.def.clone(),
             def_meaning: self.def_meaning.clone(),
+            max_visible_level: self.max_visible_level,
         }))
     }
 
@@ -870,6 +879,7 @@ pub struct DecodeComplexAllNullTask {
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_level: u16,
 }
 
 impl DecodeComplexAllNullTask {
@@ -895,9 +905,19 @@ impl DecodeComplexAllNullTask {
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let data = DataBlock::AllNull(AllNullDataBlock { num_values });
         let rep = self.decode_level(&self.rep, num_values);
         let def = self.decode_level(&self.def, num_values);
+
+        // If there are definition levels there may be empty / null lists which are not visible
+        // in the items array.  We need to account for that here to figure out how many values
+        // should be in the items array.
+        let num_values = if let Some(def) = &def {
+            def.iter().filter(|&d| *d < self.max_visible_level).count() as u64
+        } else {
+            num_values
+        };
+
+        let data = DataBlock::AllNull(AllNullDataBlock { num_values });
         let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning);
         Ok(DecodedPage {
             data,
@@ -3496,7 +3516,7 @@ impl PrimitiveStructuralEncoder {
                     0
                 };
 
-                if chunk_idx != 0 && rep_values[0] == max_rep {
+                if chunk_idx != 0 && rep_values.first() == Some(&max_rep) {
                     // This chunk starts with a new row and so, if we thought we had leftovers
                     // in the previous chunk, we were mistaken
                     // TODO: Can use unchecked here
@@ -4394,12 +4414,16 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc};
-
+    use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
+    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+    use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_schema::DataType;
+    use std::collections::HashMap;
+    use std::{collections::VecDeque, sync::Arc};
 
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
@@ -5023,7 +5047,6 @@ mod tests {
     #[tokio::test]
     async fn test_fullzip_repetition_index_caching() {
         use crate::testing::SimulatedScheduler;
-        use lance_core::cache::LanceCache;
 
         // Simplified FixedPerValueDecompressor for testing
         #[derive(Debug)]
@@ -5062,7 +5085,7 @@ mod tests {
 
         let data = bytes::Bytes::from(full_data);
         let io = Arc::new(SimulatedScheduler::new(data));
-        let _cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let _cache = Arc::new(lance_core::cache::LanceCache::with_capacity(1024 * 1024));
 
         // Create FullZipScheduler with repetition index
         let mut scheduler = FullZipScheduler {
@@ -5259,5 +5282,41 @@ mod tests {
                 .is_some(),
             "With enable_cache=true, should return FullZipCacheableState"
         );
+    }
+
+    /// This test is used to reproduce fuzz test https://github.com/lancedb/lance/issues/4492
+    #[tokio::test]
+    async fn test_fuzz_issue_4492_empty_rep_values() {
+        use lance_datagen::{array, gen_batch, RowCount, Seed};
+
+        let seed = 1823859942947654717u64;
+        let num_rows = 2741usize;
+
+        // Generate the exact same data that caused the failure
+        let batch_gen = gen_batch().with_seed(Seed::from(seed));
+        let base_generator = array::rand_type(&DataType::FixedSizeBinary(32));
+        let list_generator = array::rand_list_any(base_generator, false);
+
+        let batch = batch_gen
+            .anon_col(list_generator)
+            .into_batch_rows(RowCount::from(num_rows as u64))
+            .unwrap();
+
+        let list_array = batch.column(0).clone();
+
+        // Force miniblock encoding
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_file_version(LanceFileVersion::V2_1)
+            .with_batch_size(100)
+            .with_range(0..num_rows.min(500) as u64)
+            .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
+
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
     }
 }

@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
+use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
 
@@ -35,7 +36,7 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
-    use_move_stable_row_ids: Option<bool>,
+    use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -52,7 +53,7 @@ impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
-            use_move_stable_row_ids: None,
+            use_stable_row_ids: None,
             enable_v2_manifest_paths: false,
             storage_format: None,
             commit_handler: None,
@@ -66,15 +67,15 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    /// Whether to use move-stable row ids. This makes the `_rowid` column stable
+    /// Whether to use stable row ids. This makes the `_rowid` column stable
     /// after compaction, but not updates.
     ///
     /// This is only used for new datasets. Existing datasets will use their
     /// existing setting.
     ///
     /// **Default is false.**
-    pub fn use_move_stable_row_ids(mut self, use_move_stable_row_ids: bool) -> Self {
-        self.use_move_stable_row_ids = Some(use_move_stable_row_ids);
+    pub fn use_stable_row_ids(mut self, use_stable_row_ids: bool) -> Self {
+        self.use_stable_row_ids = Some(use_stable_row_ids);
         self
     }
 
@@ -242,13 +243,25 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        if dest.dataset().is_none() && !matches!(transaction.operation, Operation::Overwrite { .. })
+        if dest.dataset().is_none()
+            && !matches!(
+                transaction.operation,
+                Operation::Overwrite { .. } | Operation::Clone { .. }
+            )
         {
             return Err(Error::DatasetNotFound {
                 path: base_path.to_string(),
                 source: "The dataset must already exist unless the operation is Overwrite".into(),
                 location: location!(),
             });
+        }
+
+        // Validate the operation before proceeding with the commit
+        // This ensures that operations like Merge have proper validation for data integrity
+        if let Some(dataset) = dest.dataset() {
+            validate_operation(Some(&dataset.manifest), &transaction.operation)?;
+        } else {
+            validate_operation(None, &transaction.operation)?;
         }
 
         let (metadata_cache, index_cache) = match &dest {
@@ -267,10 +280,10 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_move_stable_row_ids = if let Some(ds) = dest.dataset() {
-            ds.manifest.uses_move_stable_row_ids()
+        let use_stable_row_ids = if let Some(ds) = dest.dataset() {
+            ds.manifest.uses_stable_row_ids()
         } else {
-            self.use_move_stable_row_ids.unwrap_or(false)
+            self.use_stable_row_ids.unwrap_or(false)
         };
 
         // Validate storage format matches existing dataset
@@ -293,7 +306,7 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let manifest_config = ManifestWriteConfig {
-            use_move_stable_row_ids,
+            use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             ..Default::default()
         };
@@ -490,6 +503,7 @@ mod tests {
                 file_major_version: 2,
                 file_minor_version: 0,
                 file_size_bytes: CachedFileSize::new(100),
+                base_id: None,
             }],
             deletion_file: None,
             row_id_meta: None,
@@ -774,7 +788,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
             },
             read_version: 1,
             blobs_op: None,

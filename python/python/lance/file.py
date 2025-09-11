@@ -17,6 +17,9 @@ from .lance import (
     LanceFileReader as _LanceFileReader,
 )
 from .lance import (
+    LanceFileSession as _LanceFileSession,
+)
+from .lance import (
     LanceFileWriter as _LanceFileWriter,
 )
 
@@ -56,12 +59,13 @@ class LanceFileReader:
     Lance datasets then you should use the LanceDataset class instead.
     """
 
-    # TODO: make schema optional
     def __init__(
         self,
         path: str,
         storage_options: Optional[Dict[str, str]] = None,
         columns: Optional[List[str]] = None,
+        *,
+        _inner_reader: Optional[_LanceFileReader] = None,
     ):
         """
         Creates a new file reader to read the given file
@@ -79,11 +83,14 @@ class LanceFileReader:
             List of column names to be fetched.
             All columns are fetched if None or unspecified.
         """
-        if isinstance(path, Path):
-            path = str(path)
-        self._reader = _LanceFileReader(
-            path, storage_options=storage_options, columns=columns
-        )
+        if _inner_reader is not None:
+            self._reader = _inner_reader
+        else:
+            if isinstance(path, Path):
+                path = str(path)
+            self._reader = _LanceFileReader(
+                path, storage_options=storage_options, columns=columns
+            )
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
@@ -182,6 +189,49 @@ class LanceFileReader:
     def num_rows(self) -> int:
         """Return the number of rows belonging to the data file."""
         return self._reader.num_rows()
+
+
+class LanceFileSession:
+    """
+    A file session for reading Lance files.
+
+    If you plan on opening many readers then creating a session first can be more
+    efficient as it will share the underlying object_store configuration with all
+    of the readers.
+    """
+
+    def __init__(
+        self, base_path: str, storage_options: Optional[Dict[str, str]] = None
+    ):
+        """
+        Creates a new file session
+
+        Parameters
+        ----------
+        base_path: str
+            The base path to read from.  Can be a pathname for local storage
+            or a URI to read from cloud storage.  All readers will be opened relative
+            to this base path.
+        storage_options : optional, dict
+            Extra options to be used for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
+        """
+        if isinstance(base_path, Path):
+            base_path = str(base_path)
+        self._session = _LanceFileSession(base_path, storage_options=storage_options)
+
+    def open_reader(
+        self, path: str, columns: Optional[List[str]] = None
+    ) -> LanceFileReader:
+        """
+        Opens a new reader for the given path
+
+        The path will be appended to the base path of the session.
+        """
+        return LanceFileReader(
+            None,  # pyright: ignore[reportArgumentType]
+            _inner_reader=self._session.open_reader(path, columns),
+        )
 
 
 class LanceFileWriter:

@@ -291,7 +291,7 @@ impl UpdateJob {
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
         let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_move_stable_row_ids())?;
+            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
 
         let schema = stream.schema();
 
@@ -349,15 +349,18 @@ impl UpdateJob {
             let fragment_sizes = new_fragments
                 .iter()
                 .map(|f| f.physical_rows.unwrap() as u64);
-            let sequences =
-                lance_table::rowids::rechunk_sequences([row_id_sequence.clone()], fragment_sizes)
-                    .map_err(|e| Error::Internal {
-                    message: format!(
-                        "Captured row ids not equal to number of rows written: {}",
-                        e
-                    ),
-                    location: location!(),
-                })?;
+            let sequences = lance_table::rowids::rechunk_sequences(
+                [row_id_sequence.clone()],
+                fragment_sizes,
+                false,
+            )
+            .map_err(|e| Error::Internal {
+                message: format!(
+                    "Captured row ids not equal to number of rows written: {}",
+                    e
+                ),
+                location: location!(),
+            })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                 let serialized = lance_table::rowids::write_row_ids(&sequence);
                 fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
@@ -396,7 +399,7 @@ impl UpdateJob {
             new_fragments: update_data.new_fragments,
             // This job only deletes rows, it does not modify any field values.
             fields_modified: vec![],
-            mem_wal_to_flush: None,
+            mem_wal_to_merge: None,
         };
         let transaction = Transaction::new(
             dataset.manifest.version,
@@ -526,7 +529,7 @@ mod tests {
     /// deleted.
     async fn make_test_dataset(
         version: LanceFileVersion,
-        enable_move_stable_row_ids: bool,
+        enable_stable_row_ids: bool,
     ) -> (Arc<Dataset>, TempDir) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -546,7 +549,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 10,
             data_storage_version: Some(version),
-            enable_move_stable_row_ids,
+            enable_stable_row_ids,
             ..Default::default()
         };
 
@@ -601,9 +604,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_all(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(false, true)] enable_move_stable_row_ids: bool,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
-        let (dataset, _test_dir) = make_test_dataset(version, enable_move_stable_row_ids).await;
+        let (dataset, _test_dir) = make_test_dataset(version, enable_stable_row_ids).await;
 
         let update_result = UpdateBuilder::new(dataset)
             .set("name", "'bar' || cast(id as string)")
@@ -645,9 +648,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_conditional(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(false, true)] enable_move_stable_row_ids: bool,
+        #[values(false, true)] enable_stable_row_ids: bool,
     ) {
-        let (dataset, _test_dir) = make_test_dataset(version, enable_move_stable_row_ids).await;
+        let (dataset, _test_dir) = make_test_dataset(version, enable_stable_row_ids).await;
 
         let original_fragments = dataset.get_fragments();
 
@@ -712,7 +715,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_update_concurrency(#[values(false, true)] enable_move_stable_row_ids: bool) {
+    async fn test_update_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -747,7 +750,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
-                enable_move_stable_row_ids,
+                enable_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])
@@ -808,9 +811,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_update_same_row_concurrency(
-        #[values(false, true)] enable_move_stable_row_ids: bool,
-    ) {
+    async fn test_update_same_row_concurrency(#[values(false, true)] enable_stable_row_ids: bool) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -843,7 +844,7 @@ mod tests {
                     ..Default::default()
                 }),
                 session: Some(session.clone()),
-                enable_move_stable_row_ids,
+                enable_stable_row_ids,
                 ..Default::default()
             })
             .execute(vec![initial_data])

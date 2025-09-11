@@ -4,6 +4,5 @@ nav:
   - Huggingface: huggingface.md
   - PostgreSQL: https://github.com/lancedb/pglance
   - PyTorch: pytorch.md
-  - Ray: ray.md
   - Tensorflow: tensorflow.md
   - Trino: https://github.com/lancedb/lance-trino

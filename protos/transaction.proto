@@ -5,6 +5,7 @@ syntax = "proto3";
 
 import "file.proto";
 import "table.proto";
+import "google/protobuf/any.proto";
 
 package lance.table;
 
@@ -103,6 +104,10 @@ message Transaction {
       UUID old_id = 1;
       // the id of the new index
       UUID new_id = 2;
+      // the new index details
+      google.protobuf.Any new_index_details = 3;
+      // the version of the new index
+      uint32 new_index_version = 4;
     }
 
     // A group of rewrite files that are all part of the same rewrite.
@@ -154,6 +159,28 @@ message Transaction {
     uint32 num_fragments = 1;
   }
 
+  // An operation that clones a dataset.
+  message Clone {
+    // - true:  Performs a metadata-only clone (copies manifest without data files).
+    //          The cloned dataset references original data through `base_paths`,
+    //          suitable for experimental scenarios or rapid metadata migration.
+    // - false: Performs a full deep clone using the underlying object storage's native
+    //          copy API (e.g., S3 CopyObject, GCS rewrite). This leverages server-side
+    //          bulk copy operations to bypass download/upload bottlenecks, achieving
+    //          near-linear speedup for large datasets (typically 3-10x faster than
+    //          manual file transfers). The operation maintains atomicity and data
+    //          integrity guarantees provided by the storage backend.
+    bool is_shallow = 1;
+    // the reference name in the source dataset
+    // for branch scenario, this is the branch name in the source dataset
+    // for non branch scenario(normal cloning), this is an optional tag name in the source dataset
+    optional string ref_name = 2;
+    // the version of the source dataset for cloning
+    uint64 ref_version = 3;
+    // the absolute base path of the source dataset for cloning
+    string ref_path = 4;
+  }
+  
   // An operation that updates rows but does not add or remove rows.
   message Update {
     // The fragments that have been removed. These are fragments where all rows
@@ -165,8 +192,8 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// The MemWAL (pre-image) that should be marked as flushed after this transaction
-    MemWalIndexDetails.MemWal mem_wal_to_flush = 5;
+    /// The MemWAL (pre-image) that should be marked as merged after this transaction
+    MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
   }
   
   // An operation that updates the table config.
@@ -217,6 +244,7 @@ message Transaction {
     UpdateConfig update_config = 110;
     DataReplacement data_replacement = 111;
     UpdateMemWalState update_mem_wal_state = 112;
+    Clone clone = 113;
   }
 
   // An operation to apply to the blob dataset

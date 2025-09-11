@@ -19,7 +19,6 @@ use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ScalarIndex;
 use lance_index::{
     metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
 };
@@ -79,7 +78,7 @@ fn bench_inverted(c: &mut Criterion) {
         })
     });
     let invert_index = rt
-        .block_on(InvertedIndex::load(store, None, LanceCache::no_cache()))
+        .block_on(InvertedIndex::load(store, None, &LanceCache::no_cache()))
         .unwrap();
 
     let params = FtsSearchParams::new().with_limit(Some(10));

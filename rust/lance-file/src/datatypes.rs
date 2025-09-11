@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
-use lance_arrow::bfloat16::ARROW_EXT_NAME_KEY;
 use lance_arrow::DataTypeExt;
+use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
 use lance_io::traits::Reader;

@@ -47,6 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
+from .indices import IndexConfig
 from .lance import (
     CleanupStats,
     Compaction,
@@ -57,6 +58,7 @@ from .lance import (
     _MergeInsertBuilder,
     _Scanner,
     _write_dataset,
+    indices,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
@@ -65,7 +67,7 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import td_to_micros
+from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -248,11 +250,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> print(plan) # doctest: +ELLIPSIS
         MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
           CoalescePartitionsExec
-            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
-              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+            ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, ...]
+              ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...]
                 CoalesceBatchesExec: target_batch_size=...
                   HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                    LanceRead: uri=test_dataset/data, projection=[id], ...
+                    CooperativeExec
+                      LanceRead: uri=test_dataset/data, projection=[id], ...
                     RepartitionExec: ...
                       StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
@@ -267,8 +270,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> print(plan) # doctest: +ELLIPSIS
         MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
           CoalescePartitionsExec
-            ProjectionExec: expr=[_rowaddr@1 as _rowaddr, id@2 as id, ...]
-              ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...]
+            ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, ...]
+              ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...]
                 CoalesceBatchesExec: target_batch_size=...
                   HashJoinExec: mode=CollectLeft, join_type=Right, ...
                     ...
@@ -330,15 +333,16 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
         >>> analysis = builder.analyze_plan(new_data)
         >>> print(analysis) # doctest: +ELLIPSIS
-            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...]
-              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...]
-                ProjectionExec: expr=[_rowaddr@1 as _rowaddr, ...], metrics=[...]
-                  ProjectionExec: expr=[id@1 IS NOT NULL as __common_expr_1, ...], ...
-                    CoalesceBatchesExec: ..., metrics=[...]
+            MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...], cumulative_cpu=...
+              CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...], cumulative_cpu=...
+                ProjectionExec: expr=[_rowid@1 as _rowid, ...], metrics=[...], cumulative_cpu=...
+                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...], cumulative_cpu=...
+                    CoalesceBatchesExec: ..., metrics=[...], cumulative_cpu=...
                       HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                        LanceRead: ..., metrics=[..., bytes_read=..., ...]
+                        CooperativeExec, metrics=[], cumulative_cpu=...
+                          LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
                         RepartitionExec: ...
-                          StreamingTableExec: ..., metrics=[]
+                          StreamingTableExec: ..., metrics=[], ...
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -357,7 +361,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - rows_scanned: total rows examined during the scan
         - iops: number of I/O operations performed
         - requests: number of storage requests made
-        """
+        """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
@@ -566,6 +570,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[Union[ColumnOrdering, str]]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -676,6 +681,15 @@ class LanceDataset(pa.dataset.Dataset):
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings. If a string is
             specified, it will assume ascending and nulls last ordering.
+        disable_scoring_autoprojection: bool, default False
+            Currently, when a search (vector or full text) is performed, the scoring
+            column (_distance, _score) is added to the end of the output even when a
+            projection is specified.  In the future, this will change.  The columns will
+            only be present if there is no projection or if they are explicitly
+            specified in the projection.
+
+            This parameter allows you to opt-in to the new behavior early, to avoid
+            being subject to breaking changes in the future.
 
 
         .. note::
@@ -736,6 +750,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.scan_stats_callback, scan_stats_callback)
         setopt(builder.strict_batch_size, strict_batch_size)
         setopt(builder.order_by, order_by)
+        setopt(builder.disable_scoring_autoprojection, disable_scoring_autoprojection)
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
             # No defaults, use user-provided, if any
@@ -817,6 +832,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -900,6 +916,15 @@ class LanceDataset(pa.dataset.Dataset):
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings. If a string is
             specified, it will assume ascending and nulls last ordering.
+        disable_scoring_autoprojection: bool, default False
+            Currently, when a search (vector or full text) is performed, the scoring
+            column (_distance, _score) is added to the end of the output even when a
+            projection is specified.  In the future, this will change.  The columns will
+            only be present if there is no projection or if they are explicitly
+            specified in the projection.
+
+            This parameter allows you to opt-in to the new behavior early, to avoid
+            being subject to breaking changes in the future.
 
         Notes
         -----
@@ -929,6 +954,7 @@ class LanceDataset(pa.dataset.Dataset):
             full_text_query=full_text_query,
             include_deleted_rows=include_deleted_rows,
             order_by=order_by,
+            disable_scoring_autoprojection=disable_scoring_autoprojection,
         ).to_table()
 
     @property
@@ -1015,6 +1041,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
+        disable_scoring_autoprojection: Optional[bool] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -1048,6 +1075,7 @@ class LanceDataset(pa.dataset.Dataset):
             full_text_query=full_text_query,
             strict_batch_size=strict_batch_size,
             order_by=order_by,
+            disable_scoring_autoprojection=disable_scoring_autoprojection,
         ).to_batches()
 
     def sample(
@@ -1158,6 +1186,7 @@ class LanceDataset(pa.dataset.Dataset):
         object. For more details, see :py:class:`lance.BlobFile`.
 
         Exactly one of ids, addresses, or indices must be specified.
+
         Parameters
         ----------
         blob_column : str
@@ -1369,12 +1398,14 @@ class LanceDataset(pa.dataset.Dataset):
 
     def add_columns(
         self,
-        transforms: Dict[str, str]
-        | BatchUDF
-        | ReaderLike
-        | pyarrow.Field
-        | List[pyarrow.Field]
-        | pyarrow.Schema,
+        transforms: (
+            Dict[str, str]
+            | BatchUDF
+            | ReaderLike
+            | pyarrow.Field
+            | List[pyarrow.Field]
+            | pyarrow.Schema
+        ),
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
@@ -1853,11 +1884,16 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["INVERTED"],
             Literal["FTS"],
             Literal["NGRAM"],
+            Literal["ZONEMAP"],
+            Literal["BLOOMFILTER"],
+            IndexConfig,
         ],
         name: Optional[str] = None,
         *,
         replace: bool = True,
         train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        fragment_uuid: Optional[str] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1907,13 +1943,20 @@ class LanceDataset(pa.dataset.Dataset):
           contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
           with a ``LABEL_LIST`` index.  This index can only speedup queries with
           ``array_has_any`` or ``array_has_all`` filters.
-        * ``NGRAM``. A special index that is used to index string columns.  This index
+        * ``NGRAM``. A special index that is used to index string columns. This index
           creates a bitmap for each ngram in the string.  By default we use trigrams.
           This index can currently speed up queries using the ``contains`` function
           in filters.
+        * ``ZONEMAP``. This inexact index breaks the column into fixed-size chunks
+          called zones and stores summary statistics for each zone (min, max,
+          null_count, nan_count, fragment_id, local_row_offset). It's very small but
+          only effective if the column is at least approximately in sorted order.
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
+        * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
+             but can only handle filters with equals and not equals and may require
+             more I/O than a btree or bitmap index```
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1928,7 +1971,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"FTS"`` or ``"INVERTED"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"``,
+            ``"INVERTED"`` or ``"BLOOMFILTER"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1938,8 +1982,19 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data to determine optimal
             structure. If False, an empty index will be created that can be
             populated later.
+        fragment_ids : List[int], optional
+            If provided, the index will be created only on the specified fragments.
+            This enables distributed/fragment-level indexing. When provided, the
+            method returns an IndexMetadata object but does not commit the index
+            to the dataset. The index can be committed later using the commit API.
+            This parameter is passed via kwargs internally.
+        fragment_uuid : str, optional
+            A UUID to use for fragment-level distributed indexing
+            multiple fragment-level indices need to share UUID for later merging.
+            If not provided, a new UUID will be generated. This parameter is passed via
+            kwargs internally.
 
-        with_position: bool, default True
+        with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
             query. This will significantly increase the index size.
@@ -1960,13 +2015,13 @@ class LanceDataset(pa.dataset.Dataset):
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
-        stem: bool, default False
+        stem: bool, default True
             This is for the ``INVERTED`` index. If True, the index will stem the
             tokens.
-        remove_stop_words: bool, default False
+        remove_stop_words: bool, default True
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
-        ascii_folding: bool, default False
+        ascii_folding: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
@@ -2016,59 +2071,82 @@ class LanceDataset(pa.dataset.Dataset):
         if column not in self.schema.names:
             raise KeyError(f"{column} not found in schema")
 
-        index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED"]:
-            raise NotImplementedError(
-                (
-                    'Only "BTREE", "LABEL_LIST", "INVERTED", "NGRAM", '
-                    'or "BITMAP" are supported for '
-                    f"scalar columns.  Received {index_type}",
+        # TODO: Add documentation of IndexConfig approach for creating
+        # indexes that need parameterization
+        if isinstance(index_type, str):
+            index_type = index_type.upper()
+            if index_type not in [
+                "BTREE",
+                "BITMAP",
+                "NGRAM",
+                "ZONEMAP",
+                "LABEL_LIST",
+                "INVERTED",
+                "BLOOMFILTER",
+            ]:
+                raise NotImplementedError(
+                    (
+                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
+                        'or "INVERTED" or "BLOOMFILTER" are supported for '
+                        f"scalar columns.  Received {index_type}",
+                    )
                 )
-            )
 
-        field = self.schema.field(column)
+            field = self.schema.field(column)
 
-        field_type = field.type
-        if hasattr(field_type, "storage_type"):
-            field_type = field_type.storage_type
+            field_type = field.type
+            if hasattr(field_type, "storage_type"):
+                field_type = field_type.storage_type
 
-        if index_type in ["BTREE", "BITMAP"]:
-            if (
-                not pa.types.is_integer(field_type)
-                and not pa.types.is_floating(field_type)
-                and not pa.types.is_boolean(field_type)
-                and not pa.types.is_string(field_type)
-                and not pa.types.is_temporal(field_type)
-                and not pa.types.is_fixed_size_binary(field_type)
-            ):
+            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+                if (
+                    not pa.types.is_integer(field_type)
+                    and not pa.types.is_floating(field_type)
+                    and not pa.types.is_boolean(field_type)
+                    and not pa.types.is_string(field_type)
+                    and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_fixed_size_binary(field_type)
+                ):
+                    raise TypeError(
+                        f"BTREE/BITMAP index column {column} must be int",
+                        ", float, bool, str, fixed-size-binary, or temporal ",
+                    )
+            elif index_type == "LABEL_LIST":
+                if not pa.types.is_list(field_type):
+                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+            elif index_type == "NGRAM":
+                if not pa.types.is_string(field_type) and not pa.types.is_large_string(
+                    field_type
+                ):
+                    raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type in ["INVERTED", "FTS"]:
+                value_type = field_type
+                if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+                    value_type = field_type.value_type
+                if not pa.types.is_string(value_type) and not pa.types.is_large_string(
+                    value_type
+                ):
+                    raise TypeError(
+                        f"INVERTED index column {column} must be string, large string"
+                        " or list of strings, but got {value_type}"
+                    )
+
+            if pa.types.is_duration(field_type):
                 raise TypeError(
-                    f"BTREE/BITMAP index column {column} must be int",
-                    ", float, bool, str, fixed-size-binary, or temporal ",
+                    f"Scalar index column {column} cannot currently be a duration"
                 )
-        elif index_type == "LABEL_LIST":
-            if not pa.types.is_list(field_type):
-                raise TypeError(f"LABEL_LIST index column {column} must be a list")
-        elif index_type == "NGRAM":
-            if not pa.types.is_string(field_type) and not pa.types.is_large_string(
-                field_type
-            ):
-                raise TypeError(f"NGRAM index column {column} must be a string")
-        elif index_type in ["INVERTED", "FTS"]:
-            value_type = field_type
-            if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
-                value_type = field_type.value_type
-            if not pa.types.is_string(value_type) and not pa.types.is_large_string(
-                value_type
-            ):
-                raise TypeError(
-                    f"INVERTED index column {column} must be string, large string"
-                    " or list of strings, but got {value_type}"
-                )
+        elif isinstance(index_type, IndexConfig):
+            config = json.dumps(index_type.parameters)
+            kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
+            index_type = "scalar"
+        else:
+            raise Exception("index_type must be str or IndexConfig")
 
-        if pa.types.is_duration(field_type):
-            raise TypeError(
-                f"Scalar index column {column} cannot currently be a duration"
-            )
+        # Add fragment_ids and fragment_uuid to kwargs if provided
+        if fragment_ids is not None:
+            kwargs["fragment_ids"] = fragment_ids
+        if fragment_uuid is not None:
+            kwargs["fragment_uuid"] = fragment_uuid
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
@@ -2098,6 +2176,8 @@ class LanceDataset(pa.dataset.Dataset):
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
         train: bool = True,
+        *,
+        target_partition_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -2121,6 +2201,7 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
+            Deprecated. Use target_partition_size instead.
         ivf_centroids : optional
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
@@ -2168,6 +2249,10 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        target_partition_size: int, optional
+            The target partition size. If set, the number of partitions will be computed
+            based on the target partition size.
+            Otherwise, the target partition size will be set by index type.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2340,7 +2425,11 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
             LOGGER.info("Doing one-pass ivfpq accelerated computations")
-
+            if num_partitions is None:
+                num_rows = self.count_rows()
+                num_partitions = _target_partition_size_to_num_partitions(
+                    num_rows, target_partition_size
+                )
             timers["ivf+pq_train:start"] = time.time()
             (
                 ivf_centroids,
@@ -2396,18 +2485,17 @@ class LanceDataset(pa.dataset.Dataset):
                     ivf_centroids = np.load(f)
                 num_partitions = ivf_centroids.shape[0]
 
-            if num_partitions is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
                 num_partitions = int(num_partitions)
-            elif not isinstance(num_partitions, int):
+            elif num_partitions is not None and not isinstance(num_partitions, int):
                 raise TypeError(
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
-            kwargs["num_partitions"] = num_partitions
+            if num_partitions is not None:
+                kwargs["num_partitions"] = num_partitions
+            if target_partition_size is not None:
+                kwargs["target_partition_size"] = target_partition_size
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -2448,6 +2536,11 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
                 timers["ivf_train:start"] = time.time()
+                if num_partitions is None:
+                    num_rows = self.count_rows()
+                    num_partitions = _target_partition_size_to_num_partitions(
+                        num_rows, target_partition_size
+                    )
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
@@ -2645,6 +2738,9 @@ class LanceDataset(pa.dataset.Dataset):
             The name of the index to prewarm.
         """
         return self._ds.prewarm_index(name)
+
+    def merge_index_metadata(self, index_uuid: str):
+        return self._ds.merge_index_metadata(index_uuid)
 
     def session(self) -> Session:
         """
@@ -3044,6 +3140,26 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return SqlQueryBuilder(self._ds.sql(sql))
 
+    def diff_meta(self, compared_version: int) -> List[Transaction]:
+        """
+        Get the transaction list between current version and compared version
+        as metadata differences.
+
+        Parameters
+        ----------
+        compared_version : int
+            The version to compare against, the compared_version must be greater than 0
+            and less than the current version.
+            Note that the compared_version may not exist in the dataset due to
+            clean-up action, in which case it would throw a `VersionNotFound` error.
+
+        Returns
+        -------
+        List[Transaction]
+            List of transactions representing the differences
+        """
+        return self._ds.diff_meta(compared_version)
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -3281,6 +3397,7 @@ class Index:
     fragment_ids: Set[int]
     index_version: int
     created_at: Optional[datetime] = None
+    base_id: Optional[int] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -3597,6 +3714,9 @@ class LanceOperation:
 
         old_id: str
         new_id: str
+        new_details_type_url: str
+        new_details_value: bytes
+        new_index_version: int
 
     @dataclass
     class Rewrite(BaseOperation):
@@ -3617,7 +3737,7 @@ class LanceOperation:
         """
 
         groups: Iterable[LanceOperation.RewriteGroup]
-        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+        rewritten_indices: Iterable[LanceOperation.RewrfittenIndex]
 
         def __post_init__(self):
             all_frags = [old for group in self.groups for old in group.old_fragments]
@@ -3731,6 +3851,7 @@ class ScannerBuilder:
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
         self._orderings = None
+        self._disable_scoring_autoprojection = False
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -4107,6 +4228,10 @@ class ScannerBuilder:
         self._orderings = orderings
         return self
 
+    def disable_scoring_autoprojection(self, disable: bool = True) -> ScannerBuilder:
+        self._disable_scoring_autoprojection = disable
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -4134,6 +4259,7 @@ class ScannerBuilder:
             self._scan_stats_callback,
             self._strict_batch_size,
             self._orderings,
+            self._disable_scoring_autoprojection,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -4568,11 +4694,11 @@ def write_dataset(
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
     data_storage_version: Optional[
-        Literal["stable", "2.0", "2.1", "next", "legacy", "0.1"]
+        Literal["stable", "2.0", "2.1", "2.2", "next", "legacy", "0.1"]
     ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
-    enable_move_stable_row_ids: bool = False,
+    enable_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
@@ -4629,8 +4755,8 @@ def write_dataset(
         versions on object stores. This parameter has no effect if the dataset
         already exists. To migrate an existing dataset, instead use the
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
-    enable_move_stable_row_ids : bool, optional
-        Experimental parameter: if set to true, the writer will use move-stable row ids.
+    enable_stable_row_ids : bool, optional
+        Experimental parameter: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
@@ -4692,7 +4818,7 @@ def write_dataset(
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
-        "enable_move_stable_row_ids": enable_move_stable_row_ids,
+        "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
         "transaction_properties": merged_properties,
     }

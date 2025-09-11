@@ -3,8 +3,7 @@
 
 use std::{collections::HashMap, env, hash::RandomState, sync::Arc};
 
-use arrow::array::AsArray;
-use arrow_array::{ArrayRef, UInt8Array};
+use arrow_array::{cast::AsArray, ArrayRef, UInt8Array};
 use arrow_schema::DataType;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use snafu::location;
@@ -28,7 +27,6 @@ use crate::{
         physical::{
             basic::BasicEncoder,
             binary::BinaryEncoder,
-            bitpack::{compute_compressed_bit_width_for_non_neg, BitpackedForNonNegArrayEncoder},
             dictionary::{AlreadyDictionaryEncoder, DictionaryEncoder},
             fixed_size_binary::FixedSizeBinaryEncoder,
             fixed_size_list::FslEncoder,
@@ -37,6 +35,11 @@ use crate::{
         },
     },
     version::LanceFileVersion,
+};
+
+#[cfg(feature = "bitpacking")]
+use crate::previous::encodings::physical::bitpack::{
+    compute_compressed_bit_width_for_non_neg, BitpackedForNonNegArrayEncoder,
 };
 
 use crate::constants::{
@@ -315,18 +318,18 @@ impl CoreArrayEncodingStrategy {
         if let Some(compression) = field_meta.and_then(Self::get_field_compression) {
             if compression.scheme == CompressionScheme::Fsst {
                 // User requested FSST
-                let raw_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, None));
+                let raw_encoder = Box::new(BinaryEncoder::try_new(bin_indices_encoder, None)?);
                 Ok(Box::new(FsstArrayEncoder::new(raw_encoder)))
             } else {
                 // Generic compression
-                Ok(Box::new(BinaryEncoder::new(
+                Ok(Box::new(BinaryEncoder::try_new(
                     bin_indices_encoder,
                     Some(compression),
-                )))
+                )?))
             }
         } else {
             // No user-specified compression, use FSST if we can
-            let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, None));
+            let bin_encoder = Box::new(BinaryEncoder::try_new(bin_indices_encoder, None)?);
             if Self::can_use_fsst(data_type, data_size, version) {
                 Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
             } else {
@@ -444,11 +447,20 @@ impl CoreArrayEncodingStrategy {
             }
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
                 if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
-                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
-                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
-                        compressed_bit_width as usize,
-                        data_type.clone(),
-                    )))
+                    #[cfg(feature = "bitpacking")]
+                    {
+                        let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                        Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                            compressed_bit_width as usize,
+                            data_type.clone(),
+                        )))
+                    }
+                    #[cfg(not(feature = "bitpacking"))]
+                    {
+                        Ok(Box::new(BasicEncoder::new(Box::new(
+                            ValueEncoder::default(),
+                        ))))
+                    }
                 } else {
                     Ok(Box::new(BasicEncoder::new(Box::new(
                         ValueEncoder::default(),
@@ -461,11 +473,20 @@ impl CoreArrayEncodingStrategy {
             // thinking about putting this sparse array in the metadata so bitpacking remain using one page buffer only.
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
                 if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
-                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
-                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
-                        compressed_bit_width as usize,
-                        data_type.clone(),
-                    )))
+                    #[cfg(feature = "bitpacking")]
+                    {
+                        let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                        Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                            compressed_bit_width as usize,
+                            data_type.clone(),
+                        )))
+                    }
+                    #[cfg(not(feature = "bitpacking"))]
+                    {
+                        Ok(Box::new(BasicEncoder::new(Box::new(
+                            ValueEncoder::default(),
+                        ))))
+                    }
                 } else {
                     Ok(Box::new(BasicEncoder::new(Box::new(
                         ValueEncoder::default(),

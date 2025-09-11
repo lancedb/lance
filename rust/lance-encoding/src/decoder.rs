@@ -2267,7 +2267,7 @@ impl SchedulerContext {
         &self.cache
     }
 
-    pub fn push(&mut self, name: &str, index: u32) -> ScopedSchedulerContext {
+    pub fn push(&'_ mut self, name: &str, index: u32) -> ScopedSchedulerContext<'_> {
         self.path.push(index);
         self.path_names.push(name.to_string());
         ScopedSchedulerContext { context: self }
@@ -2550,7 +2550,13 @@ pub async fn decode_batch(
     // polled twice.
 
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
-    let cache = cache.unwrap_or_else(|| Arc::new(LanceCache::with_capacity(128 * 1024 * 1024)));
+    let cache = if let Some(cache) = cache {
+        cache
+    } else {
+        Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ))
+    };
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
         &batch.top_level_columns,

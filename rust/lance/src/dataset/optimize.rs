@@ -672,8 +672,8 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
+    // If we aren't using stable row ids, then we need to remap indices.
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
     let mut scanner = dataset.scan();
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
@@ -693,7 +693,7 @@ async fn rewrite_files(
         scanner.with_row_id();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         let (data_no_row_ids, row_id_rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_move_stable_row_ids())?;
+            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
         (Some(row_id_rx), data_no_row_ids)
     } else {
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
@@ -723,8 +723,8 @@ async fn rewrite_files(
         params.max_bytes_per_file = max_bytes_per_file;
     }
 
-    if dataset.manifest.uses_move_stable_row_ids() {
-        params.enable_move_stable_row_ids = true;
+    if dataset.manifest.uses_stable_row_ids() {
+        params.enable_stable_row_ids = true;
     }
 
     let new_fragments = write_fragments_internal(
@@ -853,6 +853,7 @@ async fn rechunk_stable_row_ids(
         new_fragments
             .iter()
             .map(|frag| frag.physical_rows.unwrap() as u64),
+        false,
     )?;
 
     for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
@@ -880,9 +881,8 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // If we aren't using move-stable row ids, then we need to remap indices.
-    let needs_remapping =
-        !dataset.manifest.uses_move_stable_row_ids() && !options.defer_index_remap;
+    // If we aren't using stable row ids, then we need to remap indices.
+    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
     let mut metrics = CompactionMetrics::default();
@@ -924,10 +924,12 @@ pub async fn commit_compaction(
             .remap_indices(row_id_map, &affected_ids)
             .await?;
         remapped_indices
-            .iter()
+            .into_iter()
             .map(|rewritten| RewrittenIndex {
-                old_id: rewritten.original,
-                new_id: rewritten.new,
+                old_id: rewritten.old_id,
+                new_id: rewritten.new_id,
+                new_index_details: rewritten.index_details,
+                new_index_version: rewritten.index_version,
             })
             .collect()
     } else if !options.defer_index_remap {
@@ -992,7 +994,7 @@ mod tests {
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-    use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
@@ -1069,13 +1071,13 @@ mod tests {
         .unwrap()
     }
 
-    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     struct MockIndexRemapperExpectation {
         expected: HashMap<u64, Option<u64>>,
         answer: Vec<RemappedIndex>,
     }
 
-    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     struct MockIndexRemapper {
         expectations: Vec<MockIndexRemapperExpectation>,
     }
@@ -1597,7 +1599,7 @@ mod tests {
         let write_params = WriteParams {
             max_rows_per_file: 1000,
             data_storage_version: Some(data_storage_version),
-            enable_move_stable_row_ids: use_stable_row_id,
+            enable_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1670,15 +1672,12 @@ mod tests {
             assert_eq!(dataset.manifest.version, 6);
         }
 
-        assert_eq!(
-            dataset.manifest.uses_move_stable_row_ids(),
-            use_stable_row_id,
-        );
+        assert_eq!(dataset.manifest.uses_stable_row_ids(), use_stable_row_id,);
     }
 
     #[tokio::test]
     async fn test_stable_row_indices() {
-        // Validate behavior of indices after compaction with move-stable row ids.
+        // Validate behavior of indices after compaction with stable row ids.
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
                 RandomVector::new().vec_width(16).named("vec".to_owned()),
@@ -1688,7 +1687,7 @@ mod tests {
             data_gen.batch(500),
             "memory://test/table",
             Some(WriteParams {
-                enable_move_stable_row_ids: true,
+                enable_stable_row_ids: true,
                 max_rows_per_file: 100, // 5 files
                 ..Default::default()
             }),
@@ -1765,7 +1764,7 @@ mod tests {
         let _metrics = compact_files(&mut dataset, options, None).await.unwrap();
 
         // The indices should be unchanged after compaction, since we are using
-        // move-stable row ids.
+        // stable row ids.
         let current_indices = index_set(&dataset).await;
         assert_eq!(indices, current_indices);
 
@@ -2946,7 +2945,7 @@ mod tests {
                 &["doc"],
                 IndexType::Inverted,
                 index_name.clone(),
-                &ScalarIndexParams::default(),
+                &InvertedIndexParams::default(),
                 false,
             )
             .await
@@ -2974,19 +2973,19 @@ mod tests {
         // Initial scan
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count1 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word2.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count2 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word3.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let count3 = scanner.count_rows().await.unwrap();
@@ -2994,7 +2993,7 @@ mod tests {
         // Verify that after index creation and compaction, scan uses inverted index scan
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         let plan = scanner.explain_plan(true).await.unwrap();
@@ -3015,7 +3014,7 @@ mod tests {
                 &["doc"],
                 IndexType::Inverted,
                 index_name.clone(),
-                &ScalarIndexParams::default(),
+                &InvertedIndexParams::default(),
                 true,
             )
             .await
@@ -3024,19 +3023,19 @@ mod tests {
         // Verify that scans still work correctly and return the same counts
         let mut scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word1.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count1);
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word2.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count2);
         scanner = dataset.scan();
         scanner
-            .full_text_search(FullTextSearchQuery::new(test_word3.to_string()))
+            .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
         scanner.project::<String>(&[]).unwrap().with_row_id();
         assert_eq!(scanner.count_rows().await.unwrap(), count3);
@@ -3331,7 +3330,7 @@ mod tests {
                     stages: vec![
                         StageParams::Ivf(IvfBuildParams {
                             max_iters: 2,
-                            num_partitions: 2,
+                            num_partitions: Some(2),
                             sample_rate: 2,
                             ..Default::default()
                         }),

@@ -3,7 +3,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, LargeListArray, ListArray};
+use arrow_array::{cast::AsArray, make_array, Array, ArrayRef, LargeListArray, ListArray};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
@@ -202,7 +202,13 @@ impl StructuralDecodeArrayTask for StructuralListDecodeTask {
         match &self.data_type {
             DataType::List(child_field) => {
                 let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
+                let array = if !child_field.is_nullable() && array.null_count() == array.len() {
+                    make_array(array.into_data().into_builder().nulls(None).build()?)
+                } else {
+                    array
+                };
                 let list_array = ListArray::try_new(child_field.clone(), offsets, array, validity)?;
+
                 Ok(DecodedArray {
                     array: Arc::new(list_array),
                     repdef,
@@ -230,12 +236,12 @@ mod tests {
     use crate::constants::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
-    use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
+        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
         Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
         UInt64Array, UInt8Array,
     };
+
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
     use rstest::rstest;
@@ -509,6 +515,35 @@ mod tests {
         .await;
     }
 
+    #[test_log::test(tokio::test)]
+    async fn test_simple_list_all_null() {
+        let items = UInt64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 5, 8, 10]);
+        let offsets = OffsetBuffer::new(offsets);
+        let list_validity = NullBuffer::new(BooleanBuffer::from(vec![false, false, false]));
+
+        // The list array is nullable but the items are not.  Then, all lists are null.
+        let list_arr = ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt64, false)),
+            offsets,
+            Arc::new(items),
+            Some(list_validity),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(1..2)
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_arr)],
+            &test_cases,
+            HashMap::default(),
+        )
+        .await;
+    }
+
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_list_with_garbage_nulls(
@@ -552,6 +587,7 @@ mod tests {
     ) {
         // This is a simple pre-defined list that spans two pages.  This test is useful for
         // debugging the repetition index
+
         let items_builder = Int64Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         for i in 0..512 {
