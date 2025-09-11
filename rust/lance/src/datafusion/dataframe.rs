@@ -5,6 +5,7 @@ use std::{
     any::Any,
     fmt,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use arrow_schema::{Schema, SchemaRef};
@@ -24,13 +25,13 @@ use datafusion::{
         DisplayFormatType,
         PlanProperties,
         stream::RecordBatchStreamAdapter,
+        metrics::MetricValue,
     },
 };
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::tracing::{TRACE_EXECUTION, EXECUTION_PLAN_RUN};
-use tracing;
+use lance_core::utils::tracing::{TRACE_DATAFUSION, EXECUTION_PLAN_RUN};
 
 use crate::Dataset;
 
@@ -139,8 +140,13 @@ impl TableProvider for LanceTableProvider {
 
         let plan = scan.create_plan().await.map_err(DataFusionError::from)?;
         
-        // Wrap the plan with tracing to emit lance::execution events
-        Ok(Arc::new(TracedLanceExec::new(plan)))
+       
+        // This will emit events to lance::datafusion target when enabled
+        if std::env::var("LANCE_DATAFUSION_TRACING").is_ok() {
+            Ok(Arc::new(TracedLanceExec::new(plan)))
+        } else {
+            Ok(plan)
+        }
     }
 
     // Since we are using datafusion itself to apply the filters it should
@@ -157,11 +163,33 @@ impl TableProvider for LanceTableProvider {
     }
 }
 
-/// A wrapper around ExecutionPlan that adds lance::execution tracing events
+/// Statistics collected from DataFusion execution plans
+#[derive(Debug, Clone, Default)]
+pub struct DataFusionPlanStats {
+    pub execution_time_ms: u64,
+    pub io_stats: IoStats,
+    pub scan_stats: ScanStats,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IoStats {
+    pub iops: u64,
+    pub requests: u64,
+    pub bytes_read: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanStats {
+    pub rows_scanned: u64,
+    pub fragments_scanned: u64,
+    pub ranges_scanned: u64,
+}
+/// A wrapper around ExecutionPlan that adds lance::datafusion tracing events
 #[derive(Debug)]
 struct TracedLanceExec {
     input: Arc<dyn ExecutionPlan>,
     properties: PlanProperties,
+    start_time: Arc<Mutex<Option<Instant>>>,
 }
 
 impl TracedLanceExec {
@@ -169,6 +197,50 @@ impl TracedLanceExec {
         Self {
             properties: input.properties().clone(),
             input,
+            start_time: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Collect comprehensive metrics from the execution plan
+    fn collect_plan_stats(&self, start_time: Instant) -> DataFusionPlanStats {
+        let execution_time_ms = start_time.elapsed().as_millis() as u64;
+        
+        let mut stats = DataFusionPlanStats {
+            execution_time_ms,
+            ..Default::default()
+        };
+        
+        // Recursively collect metrics from all plan nodes
+        self.collect_metrics_recursive(self.input.as_ref(), &mut stats);
+        
+        
+        stats
+    }
+    
+    /// Recursively collect metrics from execution plan nodes
+    fn collect_metrics_recursive(&self, plan: &dyn ExecutionPlan, stats: &mut DataFusionPlanStats) {
+        if let Some(metrics) = plan.metrics() {
+            for metric in metrics.iter() {
+                match metric.value() {
+                    MetricValue::Count { name, count } => {
+                        match name.as_ref() {
+                            "iops" => stats.io_stats.iops += count.value() as u64,
+                            "requests" => stats.io_stats.requests += count.value() as u64,
+                            "bytes_read" => stats.io_stats.bytes_read += count.value() as u64,
+                            "rows_scanned" => stats.scan_stats.rows_scanned += count.value() as u64,
+                            "fragments_scanned" => stats.scan_stats.fragments_scanned += count.value() as u64,
+                            "ranges_scanned" => stats.scan_stats.ranges_scanned += count.value() as u64,
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        // Recursively process children
+        for child in plan.children() {
+            self.collect_metrics_recursive(child.as_ref(), stats);
         }
     }
 }
@@ -218,31 +290,30 @@ impl ExecutionPlan for TracedLanceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        // Record start time
+        let start_time = Instant::now();
+        *self.start_time.lock().unwrap() = Some(start_time);
+        
         let stream = self.input.execute(partition, context)?;
         let schema = stream.schema();
         
-        // Clone the input plan to access metrics after stream completion
-        let plan_for_metrics = self.input.clone();
-        
+        let traced_exec = Arc::new(TracedLanceExec::new(self.input.clone()));
         let traced_stream = stream.finally(move || {
-            if let Some(metrics) = plan_for_metrics.metrics() {
-                let mut values = [0u64; 4]; // iops, requests, bytes_read, rows_scanned
-                for metric in metrics.iter() {
-                    if let datafusion::physical_plan::metrics::MetricValue::Count { name, count } = metric.value() {
-                        match name.as_ref() {
-                            "iops" => values[0] = count.value() as u64,
-                            "requests" => values[1] = count.value() as u64, 
-                            "bytes_read" => values[2] = count.value() as u64,
-                            "rows_scanned" => values[3] = count.value() as u64,
-                            _ => {}
-                        }
-                    }
-                }
-                println!("iops: {}, requests: {}, bytes_read: {} ({:.1}MB), rows_scanned: {}", 
-                         values[0], values[1], values[2], values[2] as f64 / 1024.0 / 1024.0, values[3]);
-            } else {
-                println!("No metrics available");
-            }
+           
+            let stats = traced_exec.collect_plan_stats(start_time);
+            
+            // Emit tracing event following Lance conventions
+            tracing::trace!(
+                r#type = EXECUTION_PLAN_RUN,
+                output_rows = stats.scan_stats.rows_scanned,
+                iops = stats.io_stats.iops,
+                requests = stats.io_stats.requests,
+                bytes_read = stats.io_stats.bytes_read,
+                rows_scanned = stats.scan_stats.rows_scanned,
+                fragments_scanned = stats.scan_stats.fragments_scanned,
+                ranges_scanned = stats.scan_stats.ranges_scanned,
+                execution_time_ms = stats.execution_time_ms,
+            )
         });
         
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, traced_stream)))
