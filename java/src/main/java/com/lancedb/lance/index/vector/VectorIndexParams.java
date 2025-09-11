@@ -199,7 +199,11 @@ public class VectorIndexParams {
     }
   }
 
-  public String getDistanceType() {
+  public DistanceType getDistanceType() {
+    return distanceType;
+  }
+
+  public String getDistanceTypeString() {
     return distanceType.toString();
   }
 

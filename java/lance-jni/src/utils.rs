@@ -145,7 +145,7 @@ pub fn get_vector_index_params(
         let distance_type_obj: JString = env
             .call_method(
                 &vector_index_params_obj,
-                "getDistanceType",
+                "getDistanceTypeString",
                 "()Ljava/lang/String;",
                 &[],
             )?
