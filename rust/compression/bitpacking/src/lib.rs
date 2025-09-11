@@ -213,6 +213,9 @@ impl BitPacking for u8 {
         );
 
         match width {
+            0 => {
+                // Nothing to write when width is zero.
+            }
             1 => pack_8_1(
                 array_ref![input, 0, 1024],
                 array_mut_ref![output, 0, 1024 / 8],
@@ -265,6 +268,10 @@ impl BitPacking for u8 {
         );
 
         match width {
+            0 => {
+                // A zero-width packed chunk implies all zeros.
+                output.fill(0);
+            }
             1 => unpack_8_1(
                 array_ref![input, 0, 1024 / 8],
                 array_mut_ref![output, 0, 1024],
@@ -319,6 +326,9 @@ impl BitPacking for u16 {
         );
 
         match width {
+            0 => {
+                // Nothing to write when width is zero.
+            }
             1 => pack_16_1(
                 array_ref![input, 0, 1024],
                 array_mut_ref![output, 0, 1024 / 16],
@@ -404,6 +414,9 @@ impl BitPacking for u16 {
         );
 
         match width {
+            0 => {
+                output.fill(0);
+            }
             1 => unpack_16_1(
                 array_ref![input, 0, 1024 / 16],
                 array_mut_ref![output, 0, 1024],
@@ -491,6 +504,9 @@ impl BitPacking for u32 {
         );
 
         match width {
+            0 => {
+                // Nothing to write when width is zero.
+            }
             1 => pack_32_1(
                 array_ref![input, 0, 1024],
                 array_mut_ref![output, 0, 1024 / 32],
@@ -642,6 +658,9 @@ impl BitPacking for u32 {
         );
 
         match width {
+            0 => {
+                output.fill(0);
+            }
             1 => unpack_32_1(
                 array_ref![input, 0, 1024 / 32],
                 array_mut_ref![output, 0, 1024],
@@ -795,6 +814,9 @@ impl BitPacking for u64 {
         );
 
         match width {
+            0 => {
+                // Nothing to write when width is zero.
+            }
             1 => pack_64_1(
                 array_ref![input, 0, 1024],
                 array_mut_ref![output, 0, 1024 / 64],
@@ -1077,6 +1099,9 @@ impl BitPacking for u64 {
         );
 
         match width {
+            0 => {
+                output.fill(0);
+            }
             1 => unpack_64_1(
                 array_ref![input, 0, 1024 / 64],
                 array_mut_ref![output, 0, 1024],
