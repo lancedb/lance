@@ -40,6 +40,9 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
+// Currently all vector indexes are version 1
+pub const VECTOR_INDEX_VERSION: u32 = 1;
+
 pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
@@ -161,6 +164,34 @@ impl TryFrom<i32> for IndexType {
     }
 }
 
+impl TryFrom<&str> for IndexType {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "BTree" => Ok(Self::BTree),
+            "Bitmap" => Ok(Self::Bitmap),
+            "LabelList" => Ok(Self::LabelList),
+            "Inverted" => Ok(Self::Inverted),
+            "NGram" => Ok(Self::NGram),
+            "FragmentReuse" => Ok(Self::FragmentReuse),
+            "MemWal" => Ok(Self::MemWal),
+            "ZoneMap" => Ok(Self::ZoneMap),
+            "Vector" => Ok(Self::Vector),
+            "IVF_FLAT" => Ok(Self::IvfFlat),
+            "IVF_SQ" => Ok(Self::IvfSq),
+            "IVF_PQ" => Ok(Self::IvfPq),
+            "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
+            "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
+            "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            _ => Err(Error::invalid_input(
+                format!("invalid index type: {}", value),
+                location!(),
+            )),
+        }
+    }
+}
+
 impl IndexType {
     pub fn is_scalar(&self) -> bool {
         matches!(
@@ -222,12 +253,29 @@ impl IndexType {
             | Self::IvfRq => 1,
         }
     }
+
+    /// Returns the target partition size for the index type.
+    ///
+    /// This is used to compute the number of partitions for the index.
+    /// The partition size is optimized for the best performance of the index.
+    ///
+    /// This is for vector indices only.
+    pub fn target_partition_size(&self) -> usize {
+        match self {
+            Self::Vector => 8192,
+            Self::IvfFlat => 4096,
+            Self::IvfSq => 8192,
+            Self::IvfPq => 8192,
+            Self::IvfHnswFlat => 1 << 20,
+            Self::IvfHnswSq => 1 << 20,
+            Self::IvfHnswPq => 1 << 20,
+            _ => 8192,
+        }
+    }
 }
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-
-    fn index_type(&self) -> IndexType;
 
     fn index_name(&self) -> &str;
 }

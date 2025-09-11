@@ -34,8 +34,8 @@ def test_json_basic_write_read():
     with tempfile.TemporaryDirectory() as tmpdir:
         dataset_path = Path(tmpdir) / "json_test.lance"
 
-        # Write the dataset with version 2.2 (required for JSON support)
-        lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+        # Write the dataset
+        lance.write_dataset(table, dataset_path)
 
         # Read back the dataset
         dataset = lance.dataset(dataset_path)
@@ -95,8 +95,8 @@ def test_json_with_other_types():
     with tempfile.TemporaryDirectory() as tmpdir:
         dataset_path = Path(tmpdir) / "mixed_types.lance"
 
-        # Write and read with version 2.2 (required for JSON support)
-        lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+        # Write and read the dataset
+        lance.write_dataset(table, dataset_path)
         dataset = lance.dataset(dataset_path)
 
         # Verify all fields are preserved
@@ -128,7 +128,7 @@ def test_json_null_handling():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         dataset_path = Path(tmpdir) / "null_test.lance"
-        lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+        lance.write_dataset(table, dataset_path)
         dataset = lance.dataset(dataset_path)
 
         result = dataset.to_table()
@@ -168,7 +168,7 @@ def test_json_batch_operations():
             )
 
             if batch_num == 0:
-                lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+                lance.write_dataset(table, dataset_path)
             else:
                 lance.write_dataset(table, dataset_path, mode="append")
 
@@ -207,7 +207,7 @@ def test_json_path_queries():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "json_test.lance"
-        lance.write_dataset(table, ds_path, data_storage_version="2.2")
+        lance.write_dataset(table, ds_path)
         dataset = lance.dataset(ds_path)
 
         # Test json_extract
@@ -251,7 +251,7 @@ def test_json_get_functions():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "json_get_test.lance"
-        lance.write_dataset(table, ds_path, data_storage_version="2.2")
+        lance.write_dataset(table, ds_path)
         dataset = lance.dataset(ds_path)
 
         # Test json_get_string
@@ -291,7 +291,7 @@ def test_nested_json_access():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "nested_json_test.lance"
-        lance.write_dataset(table, ds_path, data_storage_version="2.2")
+        lance.write_dataset(table, ds_path)
         dataset = lance.dataset(ds_path)
 
         # Access nested fields using json_get recursively
@@ -336,7 +336,7 @@ def test_json_array_operations():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ds_path = Path(tmpdir) / "array_json_test.lance"
-        lance.write_dataset(table, ds_path, data_storage_version="2.2")
+        lance.write_dataset(table, ds_path)
         dataset = lance.dataset(ds_path)
 
         # Test array contains

@@ -2,9 +2,7 @@
 
 Lance provides comprehensive support for storing and querying JSON data, enabling you to work with semi-structured data efficiently. This guide covers how to store JSON data in Lance datasets and use JSON functions to query and filter your data.
 
-## Prerequisites
-
-JSON support requires Lance data storage version 2.2 or later:
+## Getting Started
 
 ```python
 import lance
@@ -16,13 +14,14 @@ json_data = {"name": "Alice", "age": 30, "city": "New York"}
 json_arr = pa.array([json.dumps(json_data)], type=pa.json_())
 table = pa.table({"id": [1], "data": json_arr})
 
-# Write with version 2.2 (required for JSON support)
-lance.write_dataset(table, "dataset.lance", data_storage_version="2.2")
+# Write the dataset
+lance.write_dataset(table, "dataset.lance")
 ```
 
 ## Storage Format
 
 Lance stores JSON data internally as JSONB (binary JSON) using the `lance.json` extension type. This provides:
+
 - Efficient storage through binary encoding
 - Fast query performance for nested field access
 - Compatibility with Apache Arrow's JSON type
@@ -41,7 +40,7 @@ Extracts a value from JSON using JSONPath syntax.
 
 **Syntax:** `json_extract(json_column, json_path)`
 
-**Returns:** JSON value as a string (including quotes for strings)
+**Returns:** JSON-formatted string representation of the extracted value
 
 **Example:**
 ```python
@@ -49,18 +48,23 @@ Extracts a value from JSON using JSONPath syntax.
 result = dataset.to_table(
     filter="json_extract(data, '$.user.name') = '\"Alice\"'"
 )
+# Returns: "\"Alice\"" for strings, "30" for numbers, "true" for booleans
 ```
 
 !!! note
-    String values returned by `json_extract` include JSON quotes. Compare with `'"Alice"'` not `'Alice'`.
+    `json_extract` returns values in JSON format. String values include quotes (e.g., `"Alice"`), 
+    numbers are returned as-is (e.g., `30`), and booleans as `true`/`false`.
 
 #### json_get
 
-Retrieves a field or array element from JSON, returning it as JSON.
+Retrieves a field or array element from JSON, returning it as JSONB for further processing.
 
-**Syntax:** `json_get(json_column, key)`
+**Syntax:** `json_get(json_column, key_or_index)`
 
-**Returns:** JSON value (can be used for nested access)
+**Parameters:**
+- `key_or_index`: Field name (string) or array index (numeric string like "0", "1")
+
+**Returns:** JSONB binary value (can be used for nested access)
 
 **Example:**
 ```python
@@ -69,39 +73,60 @@ Retrieves a field or array element from JSON, returning it as JSON.
 result = dataset.to_table(
     filter="json_get_string(json_get(json_get(data, 'user'), 'profile'), 'name') = 'Alice'"
 )
+
+# Access array elements by index
+# Sample data: ["first", "second", "third"]
+result = dataset.to_table(
+    filter="json_get_string(data, '0') = 'first'"  # Gets first array element
+)
 ```
 
 ### Type-Safe Value Extraction
 
-These functions extract values with type conversion and validation:
+These functions extract values with strict type conversion. The conversion uses JSONB's built-in strict mode, which requires values to be of compatible types:
 
 #### json_get_string
 
 Extracts a string value from JSON.
 
-**Syntax:** `json_get_string(json_column, key)`
+**Syntax:** `json_get_string(json_column, key_or_index)`
 
-**Returns:** String value (without JSON quotes)
+**Parameters:**
+- `key_or_index`: Field name or array index (as string)
+
+**Returns:** String value (without JSON quotes), null if conversion fails
+
+**Type Conversion:** Uses strict conversion - numbers and booleans are converted to their string representation
 
 **Example:**
 ```python
 result = dataset.to_table(
     filter="json_get_string(data, 'name') = 'Alice'"
 )
+
+# Array access example
+# Sample data: ["first", "second"]
+result = dataset.to_table(
+    filter="json_get_string(data, '1') = 'second'"  # Gets second array element
+)
 ```
 
 #### json_get_int
 
-Extracts an integer value with type coercion.
+Extracts an integer value with strict type conversion.
 
-**Syntax:** `json_get_int(json_column, key)`
+**Syntax:** `json_get_int(json_column, key_or_index)`
 
-**Returns:** 64-bit integer (converts strings if possible)
+**Returns:** 64-bit integer, null if conversion fails
+
+**Type Conversion:** Uses JSONB's strict `to_i64()` conversion:
+- Numbers are truncated to integers
+- Strings must be parseable as numbers
+- Booleans: true → 1, false → 0
 
 **Example:**
 ```python
-# Works with both numeric and string values
-# {"age": 30} or {"age": "30"} both work
+# {"age": 30} works, {"age": "30"} may work if JSONB allows string parsing
 result = dataset.to_table(
     filter="json_get_int(data, 'age') > 25"
 )
@@ -109,11 +134,16 @@ result = dataset.to_table(
 
 #### json_get_float
 
-Extracts a floating-point value with type coercion.
+Extracts a floating-point value with strict type conversion.
 
-**Syntax:** `json_get_float(json_column, key)`
+**Syntax:** `json_get_float(json_column, key_or_index)`
 
-**Returns:** 64-bit float (converts strings if possible)
+**Returns:** 64-bit float, null if conversion fails
+
+**Type Conversion:** Uses JSONB's strict `to_f64()` conversion:
+- Integers are converted to floats
+- Strings must be parseable as numbers
+- Booleans: true → 1.0, false → 0.0
 
 **Example:**
 ```python
@@ -124,11 +154,16 @@ result = dataset.to_table(
 
 #### json_get_bool
 
-Extracts a boolean value with type coercion.
+Extracts a boolean value with strict type conversion.
 
-**Syntax:** `json_get_bool(json_column, key)`
+**Syntax:** `json_get_bool(json_column, key_or_index)`
 
-**Returns:** Boolean (converts strings like "true"/"false", numbers)
+**Returns:** Boolean, null if conversion fails
+
+**Type Conversion:** Uses JSONB's strict `to_bool()` conversion:
+- Numbers: 0 → false, non-zero → true
+- Strings: "true" → true, "false" → false (exact match required)
+- Other values may fail conversion
 
 **Example:**
 ```python
@@ -163,6 +198,11 @@ Checks if a JSON array contains a specific value.
 
 **Returns:** Boolean
 
+**Comparison Logic:** 
+- Compares array elements as JSON strings
+- For string matching, tries both with and without quotes
+- Example: searching for 'python' matches both `"python"` and `python` in the array
+
 **Example:**
 ```python
 # Sample data: {"tags": ["python", "ml", "data"]}
@@ -177,13 +217,21 @@ Returns the length of a JSON array.
 
 **Syntax:** `json_array_length(json_column, json_path)`
 
-**Returns:** Integer (0 for non-arrays or missing paths)
+**Returns:** 
+- Integer: length of the array
+- null: if path doesn't exist
+- Error: if path points to a non-array value
 
 **Example:**
 ```python
 # Find records with more than 3 tags
 result = dataset.to_table(
     filter="json_array_length(data, '$.tags') > 3"
+)
+
+# Empty arrays return 0
+result = dataset.to_table(
+    filter="json_array_length(data, '$.empty_array') = 0"
 )
 ```
 
@@ -232,7 +280,7 @@ table = pa.table({
     "data": pa.array(json_strings, type=pa.json_())
 })
 
-lance.write_dataset(table, "nested.lance", data_storage_version="2.2")
+lance.write_dataset(table, "nested.lance")
 dataset = lance.dataset("nested.lance")
 
 # Query nested fields using JSONPath
@@ -261,7 +309,7 @@ products = pa.table({
     ], type=pa.json_())
 })
 
-lance.write_dataset(products, "products.lance", data_storage_version="2.2")
+lance.write_dataset(products, "products.lance")
 dataset = lance.dataset("products.lance")
 
 # Find products with specific specs
@@ -283,7 +331,7 @@ records = pa.table({
     ], type=pa.json_())
 })
 
-lance.write_dataset(records, "projects.lance", data_storage_version="2.2")
+lance.write_dataset(records, "projects.lance")
 dataset = lance.dataset("projects.lance")
 
 # Find projects with Python
@@ -299,10 +347,11 @@ complex_projects = dataset.to_table(
 
 ## Performance Considerations
 
-1. **Use specific extraction functions**: Functions like `json_get_string` are more efficient than `json_extract` for simple field access.
+1. **Choose the right function**: Use `json_get_*` functions for direct field access and type conversion; use `json_extract` for complex JSONPath queries.
 2. **Index frequently queried paths**: Consider creating computed columns for frequently accessed JSON paths to improve query performance.
 3. **Minimize deep nesting**: While Lance supports arbitrary nesting, flatter structures generally perform better.
-4. **Type-safe functions**: Use type-specific functions (`json_get_int`, `json_get_bool`) when you know the expected type, as they handle type coercion efficiently.
+4. **Understand type conversion**: The `json_get_*` functions use strict type conversion, which may fail if types don't match. Plan your schema accordingly.
+5. **Array access**: When working with JSON arrays, you can access elements by index using numeric strings (e.g., "0", "1") with `json_get` functions.
 
 ## Integration with DataFusion
 
@@ -310,7 +359,6 @@ All JSON functions are available when using Lance with Apache DataFusion for SQL
 
 ## Limitations
 
-- JSON support requires data storage version 2.2 or later
 - JSONPath support follows standard JSONPath syntax but may not support all advanced features
 - Large JSON documents may impact query performance
 - JSON functions are currently only available for filtering, not for projection in query results

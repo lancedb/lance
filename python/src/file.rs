@@ -44,11 +44,9 @@ use pyo3::{
     pyclass, pymethods, IntoPyObjectExt, PyObject, PyResult, Python,
 };
 use serde::Serialize;
-use std::{
-    collections::HashMap,
-    sync::{Mutex, MutexGuard},
-};
+use std::collections::HashMap;
 use std::{pin::Pin, sync::Arc};
+use tokio::sync::Mutex;
 use url::Url;
 
 #[pyclass(get_all)]
@@ -270,12 +268,6 @@ impl LanceFileWriter {
             inner: Arc::new(Mutex::new(Box::new(inner))),
         })
     }
-
-    fn inner_lock(&self) -> PyResult<MutexGuard<'_, Box<FileWriter>>> {
-        self.inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
 }
 
 #[pymethods]
@@ -306,34 +298,42 @@ impl LanceFileWriter {
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
-        RT.block_on(None, self.inner_lock()?.write_batch(&batch.0))?
-            .infer_error()
+        RT.block_on(None, async {
+            self.inner.lock().await.write_batch(&batch.0).await
+        })?
+        .infer_error()
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        RT.block_on(None, self.inner_lock()?.finish())?
+        RT.block_on(None, async { self.inner.lock().await.finish().await })?
             .infer_error()
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
-        RT.block_on(
-            None,
-            self.inner_lock()?.add_global_buffer(Bytes::from(bytes)),
-        )?
+        RT.block_on(None, async {
+            self.inner
+                .lock()
+                .await
+                .add_global_buffer(Bytes::from(bytes))
+                .await
+        })?
         .infer_error()
     }
 
     pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
-        self.inner_lock()?.add_schema_metadata(key, value);
+        RT.block_on(None, async {
+            self.inner.lock().await.add_schema_metadata(key, value)
+        })?;
         Ok(())
     }
 }
 
 impl Drop for LanceFileWriter {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.inner_lock() {
-            RT.runtime.block_on(inner.abort());
-        }
+        RT.runtime.block_on(async {
+            let mut inner = self.inner.lock().await;
+            inner.abort().await;
+        });
     }
 }
 
@@ -399,6 +399,51 @@ pub async fn object_store_from_uri_or_path(
 }
 
 #[pyclass]
+pub struct LanceFileSession {
+    object_store: Arc<ObjectStore>,
+    base_path: Path,
+}
+
+impl LanceFileSession {
+    pub async fn try_new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let (object_store, base_path) =
+            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        Ok(Self {
+            object_store,
+            base_path,
+        })
+    }
+}
+
+#[pymethods]
+impl LanceFileSession {
+    #[new]
+    #[pyo3(signature=(uri_or_path, storage_options=None))]
+    pub fn new(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        RT.block_on(None, Self::try_new(uri_or_path, storage_options))?
+    }
+
+    #[pyo3(signature=(path, columns=None))]
+    pub fn open_reader(
+        &self,
+        path: String,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<LanceFileReader> {
+        let path = self.base_path.child(path);
+        RT.block_on(
+            None,
+            LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+        )?
+    }
+}
+
+#[pyclass]
 pub struct LanceFileReader {
     inner: Arc<FileReader>,
 }
@@ -411,6 +456,14 @@ impl LanceFileReader {
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        Self::open_with_store(object_store, path, columns).await
+    }
+
+    async fn open_with_store(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Self> {
         let scheduler = ScanScheduler::new(
             object_store,
             SchedulerConfig {

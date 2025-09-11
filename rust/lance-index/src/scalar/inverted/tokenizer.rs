@@ -19,8 +19,10 @@ use jieba::JiebaTokenizerBuilder;
 #[cfg(feature = "tokenizer-lindera")]
 use lindera::LinderaTokenizerBuilder;
 
+use crate::pb;
+
 /// Tokenizer configs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
@@ -75,6 +77,26 @@ pub struct InvertedIndexParams {
     /// whether prefix only
     #[serde(default)]
     pub(crate) prefix_only: bool,
+}
+
+impl TryFrom<&InvertedIndexParams> for pb::InvertedIndexDetails {
+    type Error = Error;
+
+    fn try_from(params: &InvertedIndexParams) -> Result<Self> {
+        Ok(Self {
+            base_tokenizer: Some(params.base_tokenizer.clone()),
+            language: serde_json::to_string(&params.language)?,
+            with_position: params.with_position,
+            max_token_length: params.max_token_length.map(|l| l as u32),
+            lower_case: params.lower_case,
+            stem: params.stem,
+            remove_stop_words: params.remove_stop_words,
+            ascii_folding: params.ascii_folding,
+            min_ngram_length: params.min_ngram_length,
+            max_ngram_length: params.max_ngram_length,
+            prefix_only: params.prefix_only,
+        })
+    }
 }
 
 fn bool_true() -> bool {

@@ -12,14 +12,19 @@
 //! false positives that require rechecking.
 //!
 //!
-use super::btree::TrainingSource;
-use crate::scalar::SargableQuery;
-use crate::Any;
+use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
+use crate::scalar::registry::{
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+};
+use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
+use crate::{pb, Any};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
 use futures::TryStreamExt;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::ROW_ADDR;
+use lance_datafusion::chunker::chunk_concat_stream;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
@@ -42,6 +47,7 @@ const ZONEMAP_DEFAULT_SIZE: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "zonemap_size";
+const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
@@ -83,7 +89,7 @@ pub struct ZoneMapIndex {
     max_zonemap_size: u64,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl std::fmt::Debug for ZoneMapIndex {
@@ -305,11 +311,40 @@ impl ZoneMapIndex {
         }
     }
 
+    /// Load the scalar index from storage
+    async fn load(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
+        let zone_maps = index_file
+            .read_range(0..index_file.num_rows(), None)
+            .await?;
+        let file_schema = index_file.schema();
+
+        let max_zonemap_size: u64 = file_schema
+            .metadata
+            .get(ZONEMAP_SIZE_META_KEY)
+            .and_then(|bs| bs.parse().ok())
+            .unwrap_or(ZONEMAP_DEFAULT_SIZE);
+        Ok(Arc::new(Self::try_from_serialized(
+            zone_maps,
+            store,
+            fri,
+            index_cache,
+            max_zonemap_size,
+        )?))
+    }
+
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
         max_zonemap_size: u64,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
@@ -396,7 +431,7 @@ impl ZoneMapIndex {
                 max_zonemap_size,
                 store,
                 fri,
-                index_cache,
+                index_cache: WeakLanceCache::from(index_cache),
             });
         }
 
@@ -425,7 +460,7 @@ impl ZoneMapIndex {
             max_zonemap_size,
             store,
             fri,
-            index_cache,
+            index_cache: WeakLanceCache::from(index_cache),
         })
     }
 }
@@ -509,41 +544,12 @@ impl ScalarIndex for ZoneMapIndex {
         false
     }
 
-    /// Load the scalar index from storage
-    async fn load(
-        store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
-    ) -> Result<Arc<Self>>
-    where
-        Self: Sized,
-    {
-        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
-        let zone_maps = index_file
-            .read_range(0..index_file.num_rows(), None)
-            .await?;
-        let file_schema = index_file.schema();
-
-        let max_zonemap_size: u64 = file_schema
-            .metadata
-            .get(ZONEMAP_SIZE_META_KEY)
-            .and_then(|bs| bs.parse().ok())
-            .unwrap_or(ZONEMAP_DEFAULT_SIZE);
-        Ok(Arc::new(Self::try_from_serialized(
-            zone_maps,
-            store,
-            fri,
-            index_cache,
-            max_zonemap_size,
-        )?))
-    }
-
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
         _mapping: &HashMap<u64, Option<u64>>,
         _dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         Err(Error::InvalidInput {
             source: "ZoneMapIndex does not support remap".into(),
             location: location!(),
@@ -555,13 +561,13 @@ impl ScalarIndex for ZoneMapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         // Process the new data to create zones
         let batches_source = new_data;
         let value_type = batches_source.schema().field(0).data_type().clone();
 
         let mut builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderOptions::new(self.max_zonemap_size),
+            ZoneMapIndexBuilderParams::new(self.max_zonemap_size),
             value_type,
         )?;
 
@@ -576,7 +582,7 @@ impl ScalarIndex for ZoneMapIndex {
 
         // Create a new builder with all zones to write them out
         let mut combined_builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderOptions::new(self.max_zonemap_size),
+            ZoneMapIndexBuilderParams::new(self.max_zonemap_size),
             self.data_type.clone(),
         )?;
         combined_builder.maps = all_zones;
@@ -585,12 +591,26 @@ impl ScalarIndex for ZoneMapIndex {
         // Write the updated index to dest_store
         combined_builder.write_index(dest_store).await?;
 
-        Ok(())
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_version: ZONEMAP_INDEX_VERSION,
+        })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(
+            TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
+        )
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ZoneMapIndexBuilderOptions {
+fn default_rows_per_zone() -> u64 {
+    *DEFAULT_ROWS_PER_ZONE
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneMapIndexBuilderParams {
+    #[serde(default = "default_rows_per_zone")]
     rows_per_zone: u64,
 }
 
@@ -601,7 +621,7 @@ static DEFAULT_ROWS_PER_ZONE: LazyLock<u64> = LazyLock::new(|| {
         .expect("failed to parse Lance_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
 });
 
-impl Default for ZoneMapIndexBuilderOptions {
+impl Default for ZoneMapIndexBuilderParams {
     fn default() -> Self {
         Self {
             rows_per_zone: *DEFAULT_ROWS_PER_ZONE,
@@ -609,7 +629,7 @@ impl Default for ZoneMapIndexBuilderOptions {
     }
 }
 
-impl ZoneMapIndexBuilderOptions {
+impl ZoneMapIndexBuilderParams {
     fn new(rows_per_zone: u64) -> Self {
         Self { rows_per_zone }
     }
@@ -617,7 +637,7 @@ impl ZoneMapIndexBuilderOptions {
 
 // A builder for zonemap index
 pub struct ZoneMapIndexBuilder {
-    options: ZoneMapIndexBuilderOptions,
+    options: ZoneMapIndexBuilderParams,
 
     items_type: DataType,
     maps: Vec<ZoneMapStatistics>,
@@ -632,7 +652,7 @@ pub struct ZoneMapIndexBuilder {
 }
 
 impl ZoneMapIndexBuilder {
-    pub fn try_new(options: ZoneMapIndexBuilderOptions, items_type: DataType) -> Result<Self> {
+    pub fn try_new(options: ZoneMapIndexBuilderParams, items_type: DataType) -> Result<Self> {
         let min = MinAccumulator::try_new(&items_type)?;
         let max = MaxAccumulator::try_new(&items_type)?;
         Ok(Self {
@@ -711,8 +731,11 @@ impl ZoneMapIndexBuilder {
         Ok(())
     }
 
-    pub async fn train(&mut self, mut batches_source: SendableRecordBatchStream) -> Result<()> {
+    pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
         assert!(batches_source.schema().field_with_name(ROW_ADDR).is_ok());
+
+        let mut batches_source =
+            chunk_concat_stream(batches_source, self.options.rows_per_zone as usize);
 
         while let Some(batch) = batches_source.try_next().await? {
             if batch.num_rows() == 0 {
@@ -854,36 +877,129 @@ impl ZoneMapIndexBuilder {
     }
 }
 
-pub async fn train_zonemap_index(
-    data_source: Box<dyn TrainingSource + Send>,
-    index_store: &dyn IndexStore,
-    options: Option<ZoneMapIndexBuilderOptions>,
-) -> Result<()> {
-    // train_zonemap_index: calling scan_aligned_chunks
-    let batches_source = data_source.scan_aligned_chunks(4096).await?;
-    let value_type = batches_source.schema().field(0).data_type().clone();
+#[derive(Debug, Default)]
+pub struct ZoneMapIndexPlugin;
 
-    let mut builder = ZoneMapIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
+impl ZoneMapIndexPlugin {
+    async fn train_zonemap_index(
+        batches_source: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        options: Option<ZoneMapIndexBuilderParams>,
+    ) -> Result<()> {
+        // train_zonemap_index: calling scan_aligned_chunks
+        let value_type = batches_source.schema().field(0).data_type().clone();
 
-    builder.train(batches_source).await?;
+        let mut builder = ZoneMapIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
 
-    builder.write_index(index_store).await?;
-    Ok(())
+        builder.train(batches_source).await?;
+
+        builder.write_index(index_store).await?;
+        Ok(())
+    }
+}
+
+pub struct ZoneMapIndexTrainingRequest {
+    pub params: ZoneMapIndexBuilderParams,
+    pub criteria: TrainingCriteria,
+}
+
+impl ZoneMapIndexTrainingRequest {
+    pub fn new(params: ZoneMapIndexBuilderParams) -> Self {
+        Self {
+            params,
+            criteria: TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
+        }
+    }
+}
+
+impl TrainingRequest for ZoneMapIndexTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for ZoneMapIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        if field.data_type().is_nested() {
+            return Err(Error::InvalidInput {
+                source: "A zone map index can only be created on a non-nested field.".into(),
+                location: location!(),
+            });
+        }
+
+        let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
+
+        Ok(Box::new(ZoneMapIndexTrainingRequest::new(params)))
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        0
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(index_name, true)))
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+    ) -> Result<CreatedIndex> {
+        let request = (request as Box<dyn std::any::Any>)
+            .downcast::<ZoneMapIndexTrainingRequest>()
+            .map_err(|_| Error::InvalidInput {
+                source: "must provide training request created by new_training_request".into(),
+                location: location!(),
+            })?;
+        Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_version: ZONEMAP_INDEX_VERSION,
+        })
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::scalar::registry::VALUE_COLUMN_NAME;
     use crate::scalar::{zonemap::ZONEMAP_DEFAULT_SIZE, IndexStore};
     use std::sync::Arc;
 
-    use crate::scalar::zonemap::{train_zonemap_index, ZoneMapStatistics};
-    use arrow::datatypes::{Float32Type, UInt64Type};
+    use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
+    use arrow::datatypes::Float32Type;
     use arrow_array::{Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
-    use futures::{stream, TryStreamExt};
+    use futures::{stream, StreamExt, TryStreamExt};
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
@@ -892,23 +1008,40 @@ mod tests {
     use object_store::path::Path;
     use tempfile::tempdir;
 
-    use crate::scalar::lance_format::tests::MockTrainingSource;
-
     use crate::scalar::{
         lance_format::LanceIndexStore,
         zonemap::{
-            ZoneMapIndex, ZoneMapIndexBuilderOptions, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY,
+            ZoneMapIndex, ZoneMapIndexBuilderParams, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY,
         },
         SargableQuery, ScalarIndex, SearchResult,
     };
-
-    use crate::scalar::btree::TrainingSource;
 
     // Add missing imports for the tests
     use crate::metrics::NoOpMetricsCollector;
     use crate::Index; // Import Index trait to access calculate_included_frags
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
     use std::collections::Bound;
+
+    // Adds a _rowaddr column emulating each batch as a new fragment
+    fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
+        let schema = stream.schema();
+        let schema_with_row_addr = Arc::new(Schema::new(vec![
+            schema.field(0).clone(),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let schema = schema_with_row_addr.clone();
+        let stream = stream.enumerate().map(move |(frag_id, batch)| {
+            let batch = batch.unwrap();
+            let row_addr = Arc::new(UInt64Array::from_iter_values(
+                (0..batch.num_rows() as u64).map(|off| off + ((frag_id as u64) << 32)),
+            ));
+            Ok(RecordBatch::try_new(
+                schema_with_row_addr.clone(),
+                vec![batch.column(0).clone(), row_addr],
+            )?)
+        });
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+    }
 
     #[tokio::test]
     async fn test_empty_zonemap_index() {
@@ -922,8 +1055,8 @@ mod tests {
         let data = arrow_array::Int32Array::from(Vec::<i32>::new());
         let row_ids = arrow_array::UInt64Array::from(Vec::<u64>::new());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int32, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -933,19 +1066,14 @@ mod tests {
             stream::once(std::future::ready(Ok(data))),
         ));
 
-        let data_source = Box::new(MockTrainingSource::from(data_stream));
-        train_zonemap_index(
-            data_source,
-            test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::default()),
-        )
-        .await
-        .unwrap();
+        ZoneMapIndexPlugin::train_zonemap_index(data_stream, test_store.as_ref(), None)
+            .await
+            .unwrap();
 
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 0);
@@ -970,16 +1098,18 @@ mod tests {
 
         let stream = lance_datagen::gen_batch()
             .col(
-                "value",
+                VALUE_COLUMN_NAME,
                 array::rand::<Float32Type>().with_nulls(&[true, false, false, false, false]),
             )
-            .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(5000), BatchCount::from(10));
-        let data_source = Box::new(MockTrainingSource::from(stream));
-        train_zonemap_index(
-            data_source,
+
+        // Add _rowaddr column
+        let stream = add_row_addr(stream);
+
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::new(5000)),
+            Some(ZoneMapIndexBuilderParams::new(5000)),
         )
         .await
         .unwrap();
@@ -987,7 +1117,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 10);
@@ -1018,8 +1148,8 @@ mod tests {
         let new_row_addr =
             UInt64Array::from_iter_values((0..5000).map(|i| (10u64 << 32) | (i as u64)));
         let new_schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Float32, false), // Match original schema
-            Field::new("_rowaddr", DataType::UInt64, false), // Use _rowaddr as expected by the builder
+            Field::new(VALUE_COLUMN_NAME, DataType::Float32, false), // Match original schema
+            Field::new(ROW_ADDR, DataType::UInt64, false), // Use _rowaddr as expected by the builder
         ]));
         let new_data_batch = RecordBatch::try_new(
             new_schema.clone(),
@@ -1039,7 +1169,7 @@ mod tests {
             .unwrap();
 
         // Verify the updated index has more zones
-        let updated_index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let updated_index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load updated ZoneMapIndex");
 
@@ -1108,8 +1238,8 @@ mod tests {
         let float_data = arrow_array::Float32Array::from(values);
         let row_ids = UInt64Array::from_iter_values((0..float_data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Float32, true),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Float32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatch::try_new(
             schema.clone(),
@@ -1121,17 +1251,16 @@ mod tests {
             stream::once(std::future::ready(Ok(data))),
         ));
 
-        let data_source = Box::new(MockTrainingSource::from(data_stream));
-        train_zonemap_index(
-            data_source,
+        ZoneMapIndexPlugin::train_zonemap_index(
+            data_stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::new(100)),
+            Some(ZoneMapIndexBuilderParams::new(100)),
         )
         .await
         .unwrap();
 
         // Load the index
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
 
@@ -1288,8 +1417,8 @@ mod tests {
         let data = arrow_array::Int32Array::from_iter_values(0..=100);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int32, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1298,11 +1427,10 @@ mod tests {
             stream::once(std::future::ready(Ok(data))),
         ));
 
-        let data_source = Box::new(MockTrainingSource::from(data_stream));
-        train_zonemap_index(
-            data_source,
+        ZoneMapIndexPlugin::train_zonemap_index(
+            data_stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::new(100)),
+            Some(ZoneMapIndexBuilderParams::new(100)),
         )
         .await
         .unwrap();
@@ -1348,7 +1476,7 @@ mod tests {
         assert_eq!(metadata.get(ZONEMAP_SIZE_META_KEY).unwrap(), "100");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 2);
@@ -1505,8 +1633,8 @@ mod tests {
             arrow_array::Int64Array::from_iter_values(0..(ZONEMAP_DEFAULT_SIZE * 2 + 42) as i64);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int64, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Int64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1515,11 +1643,10 @@ mod tests {
             stream::once(std::future::ready(Ok(data))),
         ));
 
-        let data_source = Box::new(MockTrainingSource::from(data_stream));
-        train_zonemap_index(
-            data_source,
+        ZoneMapIndexPlugin::train_zonemap_index(
+            data_stream,
             test_store.as_ref(),
-            Some(ZoneMapIndexBuilderOptions::default()),
+            Some(ZoneMapIndexBuilderParams::default()),
         )
         .await
         .unwrap();
@@ -1527,7 +1654,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 3);
@@ -1622,8 +1749,8 @@ mod tests {
         ));
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int64, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Int64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         // Create multiple fragments with data that will produce expected zones
@@ -1641,7 +1768,8 @@ mod tests {
         let fragment1_data = arrow_array::Int64Array::from_iter_values(
             (ZONEMAP_DEFAULT_SIZE as i64)..((ZONEMAP_DEFAULT_SIZE * 2) as i64),
         );
-        let fragment1_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE);
+        let fragment1_row_ids =
+            UInt64Array::from_iter_values((0..ZONEMAP_DEFAULT_SIZE).map(|i| i + (1 << 32)));
         let fragment1_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],
@@ -1652,7 +1780,8 @@ mod tests {
         let fragment2_data = arrow_array::Int64Array::from_iter_values(
             ((ZONEMAP_DEFAULT_SIZE * 2) as i64)..((ZONEMAP_DEFAULT_SIZE * 2 + 42) as i64),
         );
-        let fragment2_row_ids = UInt64Array::from_iter_values((0..42).map(|i| i as u64));
+        let fragment2_row_ids =
+            UInt64Array::from_iter_values((0..42).map(|i| (i as u64) + (2 << 32)));
         let fragment2_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment2_data), Arc::new(fragment2_row_ids)],
@@ -1670,17 +1799,16 @@ mod tests {
                     Ok(fragment2_batch.clone()),
                 ]),
             ));
-            let data_source = Box::new(MockTrainingSource::from(data_stream));
-            train_zonemap_index(
-                data_source,
+            ZoneMapIndexPlugin::train_zonemap_index(
+                data_stream,
                 test_store.as_ref(),
-                Some(ZoneMapIndexBuilderOptions::new(5000)),
+                Some(ZoneMapIndexBuilderParams::new(5000)),
             )
             .await
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 5);
@@ -1756,14 +1884,12 @@ mod tests {
                         Ok(fragment2_batch.clone()),
                     ]),
                 ));
-            let verify_data_source = Box::new(MockTrainingSource::from(verify_data_stream));
-            let aligned_stream = verify_data_source.scan_aligned_chunks(4096).await.unwrap();
-            let batches: Vec<RecordBatch> = aligned_stream.try_collect().await.unwrap();
+            let batches: Vec<RecordBatch> = verify_data_stream.try_collect().await.unwrap();
 
             assert_eq!(batches.len(), 3);
 
             // Check fragment 0 _rowaddr values (should start from 0)
-            let fragment0_rowaddr_col = batches[0].column_by_name("_rowaddr").unwrap();
+            let fragment0_rowaddr_col = batches[0].column_by_name(ROW_ADDR).unwrap();
             let fragment0_rowaddrs = fragment0_rowaddr_col
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -1779,7 +1905,7 @@ mod tests {
             );
 
             // Check fragment 1 _rowaddr values (should start from fragment_id=1)
-            let fragment1_rowaddr_col = batches[1].column_by_name("_rowaddr").unwrap();
+            let fragment1_rowaddr_col = batches[1].column_by_name(ROW_ADDR).unwrap();
             let fragment1_rowaddrs = fragment1_rowaddr_col
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -1795,7 +1921,7 @@ mod tests {
             );
 
             // Check fragment 2 _rowaddr values (should start from fragment_id=2)
-            let fragment2_rowaddr_col = batches[2].column_by_name("_rowaddr").unwrap();
+            let fragment2_rowaddr_col = batches[2].column_by_name(ROW_ADDR).unwrap();
             let fragment2_rowaddrs = fragment2_rowaddr_col
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -1871,17 +1997,16 @@ mod tests {
                     Ok(fragment2_batch.clone()),
                 ]),
             ));
-            let data_source = Box::new(MockTrainingSource::from(data_stream));
-            train_zonemap_index(
-                data_source,
+            ZoneMapIndexPlugin::train_zonemap_index(
+                data_stream,
                 test_store.as_ref(),
-                Some(ZoneMapIndexBuilderOptions::default()),
+                Some(ZoneMapIndexBuilderParams::default()),
             )
             .await
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);
@@ -1941,17 +2066,16 @@ mod tests {
                     Ok(fragment2_batch.clone()),
                 ]),
             ));
-            let data_source = Box::new(MockTrainingSource::from(data_stream));
-            train_zonemap_index(
-                data_source,
+            ZoneMapIndexPlugin::train_zonemap_index(
+                data_stream,
                 test_store.as_ref(),
-                Some(ZoneMapIndexBuilderOptions::new(ZONEMAP_DEFAULT_SIZE * 3)),
+                Some(ZoneMapIndexBuilderParams::new(ZONEMAP_DEFAULT_SIZE * 3)),
             )
             .await
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);
@@ -2000,37 +2124,28 @@ mod tests {
     #[tokio::test]
     async fn test_fragment_id_assignment() {
         // Test that fragment IDs are properly assigned in _rowaddr values
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int32, false),
-            Field::new("row_ids", DataType::UInt64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Int32,
+            false,
+        )]));
 
         // Create multiple fragments
         let fragment0_data = arrow_array::Int32Array::from_iter_values(0..5);
-        let fragment0_row_ids = UInt64Array::from_iter_values((0..5).map(|i| i as u64));
-        let fragment0_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(fragment0_data), Arc::new(fragment0_row_ids)],
-        )
-        .unwrap();
+        let fragment0_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(fragment0_data)]).unwrap();
 
         let fragment1_data = arrow_array::Int32Array::from_iter_values(5..10);
-        let fragment1_row_ids = UInt64Array::from_iter_values((0..5).map(|i| i as u64));
-        let fragment1_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],
-        )
-        .unwrap();
+        let fragment1_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(fragment1_data)]).unwrap();
 
-        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        let aligned_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             stream::iter(vec![Ok(fragment0_batch), Ok(fragment1_batch)]),
         ));
 
-        let data_source = Box::new(MockTrainingSource::from(data_stream));
+        let aligned_stream = add_row_addr(aligned_stream);
 
-        // Use scan_aligned_chunks to get the data with _rowaddr
-        let aligned_stream = data_source.scan_aligned_chunks(100).await.unwrap();
         let batches: Vec<RecordBatch> = aligned_stream.try_collect().await.unwrap();
 
         assert_eq!(batches.len(), 2);

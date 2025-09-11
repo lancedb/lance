@@ -47,6 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
+from .indices import IndexConfig
 from .lance import (
     CleanupStats,
     Compaction,
@@ -57,6 +58,7 @@ from .lance import (
     _MergeInsertBuilder,
     _Scanner,
     _write_dataset,
+    indices,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
@@ -65,7 +67,7 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import td_to_micros
+from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -252,7 +254,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
               ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...]
                 CoalesceBatchesExec: target_batch_size=...
                   HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                    LanceRead: uri=test_dataset/data, projection=[id], ...
+                    CooperativeExec
+                      LanceRead: uri=test_dataset/data, projection=[id], ...
                     RepartitionExec: ...
                       StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
@@ -333,10 +336,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...], cumulative_cpu=...
               CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...], cumulative_cpu=...
                 ProjectionExec: expr=[_rowid@1 as _rowid, ...], metrics=[...], cumulative_cpu=...
-                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], ...
+                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...], cumulative_cpu=...
                     CoalesceBatchesExec: ..., metrics=[...], cumulative_cpu=...
                       HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                        LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
+                        CooperativeExec, metrics=[], cumulative_cpu=...
+                          LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
                         RepartitionExec: ...
                           StreamingTableExec: ..., metrics=[], ...
 
@@ -1881,11 +1885,14 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
+            IndexConfig,
         ],
         name: Optional[str] = None,
         *,
         replace: bool = True,
         train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        fragment_uuid: Optional[str] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1970,6 +1977,17 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data to determine optimal
             structure. If False, an empty index will be created that can be
             populated later.
+        fragment_ids : List[int], optional
+            If provided, the index will be created only on the specified fragments.
+            This enables distributed/fragment-level indexing. When provided, the
+            method returns an IndexMetadata object but does not commit the index
+            to the dataset. The index can be committed later using the commit API.
+            This parameter is passed via kwargs internally.
+        fragment_uuid : str, optional
+            A UUID to use for fragment-level distributed indexing
+            multiple fragment-level indices need to share UUID for later merging.
+            If not provided, a new UUID will be generated. This parameter is passed via
+            kwargs internally.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2048,66 +2066,81 @@ class LanceDataset(pa.dataset.Dataset):
         if column not in self.schema.names:
             raise KeyError(f"{column} not found in schema")
 
-        index_type = index_type.upper()
-        if index_type not in [
-            "BTREE",
-            "BITMAP",
-            "NGRAM",
-            "ZONEMAP",
-            "LABEL_LIST",
-            "INVERTED",
-        ]:
-            raise NotImplementedError(
-                (
-                    'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                    'or "INVERTED" are supported for '
-                    f"scalar columns.  Received {index_type}",
+        # TODO: Add documentation of IndexConfig approach for creating
+        # indexes that need parameterization
+        if isinstance(index_type, str):
+            index_type = index_type.upper()
+            if index_type not in [
+                "BTREE",
+                "BITMAP",
+                "NGRAM",
+                "ZONEMAP",
+                "LABEL_LIST",
+                "INVERTED",
+            ]:
+                raise NotImplementedError(
+                    (
+                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
+                        'or "INVERTED" are supported for '
+                        f"scalar columns.  Received {index_type}",
+                    )
                 )
-            )
 
-        field = self.schema.field(column)
+            field = self.schema.field(column)
 
-        field_type = field.type
-        if hasattr(field_type, "storage_type"):
-            field_type = field_type.storage_type
+            field_type = field.type
+            if hasattr(field_type, "storage_type"):
+                field_type = field_type.storage_type
 
-        if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
-            if (
-                not pa.types.is_integer(field_type)
-                and not pa.types.is_floating(field_type)
-                and not pa.types.is_boolean(field_type)
-                and not pa.types.is_string(field_type)
-                and not pa.types.is_temporal(field_type)
-                and not pa.types.is_fixed_size_binary(field_type)
-            ):
+            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+                if (
+                    not pa.types.is_integer(field_type)
+                    and not pa.types.is_floating(field_type)
+                    and not pa.types.is_boolean(field_type)
+                    and not pa.types.is_string(field_type)
+                    and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_fixed_size_binary(field_type)
+                ):
+                    raise TypeError(
+                        f"BTREE/BITMAP index column {column} must be int",
+                        ", float, bool, str, fixed-size-binary, or temporal ",
+                    )
+            elif index_type == "LABEL_LIST":
+                if not pa.types.is_list(field_type):
+                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+            elif index_type == "NGRAM":
+                if not pa.types.is_string(field_type) and not pa.types.is_large_string(
+                    field_type
+                ):
+                    raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type in ["INVERTED", "FTS"]:
+                value_type = field_type
+                if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+                    value_type = field_type.value_type
+                if not pa.types.is_string(value_type) and not pa.types.is_large_string(
+                    value_type
+                ):
+                    raise TypeError(
+                        f"INVERTED index column {column} must be string, large string"
+                        " or list of strings, but got {value_type}"
+                    )
+
+            if pa.types.is_duration(field_type):
                 raise TypeError(
-                    f"BTREE/BITMAP index column {column} must be int",
-                    ", float, bool, str, fixed-size-binary, or temporal ",
+                    f"Scalar index column {column} cannot currently be a duration"
                 )
-        elif index_type == "LABEL_LIST":
-            if not pa.types.is_list(field_type):
-                raise TypeError(f"LABEL_LIST index column {column} must be a list")
-        elif index_type == "NGRAM":
-            if not pa.types.is_string(field_type) and not pa.types.is_large_string(
-                field_type
-            ):
-                raise TypeError(f"NGRAM index column {column} must be a string")
-        elif index_type in ["INVERTED", "FTS"]:
-            value_type = field_type
-            if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
-                value_type = field_type.value_type
-            if not pa.types.is_string(value_type) and not pa.types.is_large_string(
-                value_type
-            ):
-                raise TypeError(
-                    f"INVERTED index column {column} must be string, large string"
-                    " or list of strings, but got {value_type}"
-                )
+        elif isinstance(index_type, IndexConfig):
+            config = json.dumps(index_type.parameters)
+            kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
+            index_type = "scalar"
+        else:
+            raise Exception("index_type must be str or IndexConfig")
 
-        if pa.types.is_duration(field_type):
-            raise TypeError(
-                f"Scalar index column {column} cannot currently be a duration"
-            )
+        # Add fragment_ids and fragment_uuid to kwargs if provided
+        if fragment_ids is not None:
+            kwargs["fragment_ids"] = fragment_ids
+        if fragment_uuid is not None:
+            kwargs["fragment_uuid"] = fragment_uuid
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
@@ -2137,6 +2170,8 @@ class LanceDataset(pa.dataset.Dataset):
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
         train: bool = True,
+        *,
+        target_partition_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -2160,6 +2195,7 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
+            Deprecated. Use target_partition_size instead.
         ivf_centroids : optional
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
@@ -2207,6 +2243,10 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        target_partition_size: int, optional
+            The target partition size. If set, the number of partitions will be computed
+            based on the target partition size.
+            Otherwise, the target partition size will be set by index type.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2380,7 +2420,11 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
             LOGGER.info("Doing one-pass ivfpq accelerated computations")
-
+            if num_partitions is None:
+                num_rows = self.count_rows()
+                num_partitions = _target_partition_size_to_num_partitions(
+                    num_rows, target_partition_size
+                )
             timers["ivf+pq_train:start"] = time.time()
             (
                 ivf_centroids,
@@ -2436,18 +2480,17 @@ class LanceDataset(pa.dataset.Dataset):
                     ivf_centroids = np.load(f)
                 num_partitions = ivf_centroids.shape[0]
 
-            if num_partitions is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
                 num_partitions = int(num_partitions)
-            elif not isinstance(num_partitions, int):
+            elif num_partitions is not None and not isinstance(num_partitions, int):
                 raise TypeError(
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
-            kwargs["num_partitions"] = num_partitions
+            if num_partitions is not None:
+                kwargs["num_partitions"] = num_partitions
+            if target_partition_size is not None:
+                kwargs["target_partition_size"] = target_partition_size
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -2488,6 +2531,11 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
                 timers["ivf_train:start"] = time.time()
+                if num_partitions is None:
+                    num_rows = self.count_rows()
+                    num_partitions = _target_partition_size_to_num_partitions(
+                        num_rows, target_partition_size
+                    )
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
@@ -2685,6 +2733,9 @@ class LanceDataset(pa.dataset.Dataset):
             The name of the index to prewarm.
         """
         return self._ds.prewarm_index(name)
+
+    def merge_index_metadata(self, index_uuid: str):
+        return self._ds.merge_index_metadata(index_uuid)
 
     def session(self) -> Session:
         """
@@ -3658,6 +3709,9 @@ class LanceOperation:
 
         old_id: str
         new_id: str
+        new_details_type_url: str
+        new_details_value: bytes
+        new_index_version: int
 
     @dataclass
     class Rewrite(BaseOperation):

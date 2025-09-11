@@ -62,7 +62,7 @@ def update_cargo_lock_files():
     lock_files = [
         "Cargo.lock",
         "python/Cargo.lock",
-        "java/core/lance-jni/Cargo.lock",
+        "java/lance-jni/Cargo.lock",
     ]
     
     for lock_file in lock_files:
@@ -80,7 +80,7 @@ def validate_version_consistency():
     # Check all creates with explicit versioning
     rust_crates = [
         "python/Cargo.toml",
-        "java/core/lance-jni/Cargo.toml",
+        "java/lance-jni/Cargo.toml",
     ]
     
     for crate_path in rust_crates:

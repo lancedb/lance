@@ -7,21 +7,21 @@ use arrow_array::{
     types::{UInt32Type, UInt64Type},
     RecordBatchReader,
 };
-use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::{io::ObjectStore, Dataset};
-use lance_core::{cache::LanceCache, Result};
+use lance_core::cache::LanceCache;
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen_batch, BatchCount, RowCount};
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{
-    btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
+    btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
     flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
+    registry::ScalarIndexPlugin,
     IndexStore, SargableQuery, ScalarIndex, SearchResult,
 };
+use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use tempfile::TempDir;
@@ -32,39 +32,15 @@ struct BenchmarkFixture {
     baseline_dataset: Arc<Dataset>,
 }
 
-struct BenchmarkDataSource {}
-
-impl BenchmarkDataSource {
-    fn test_data() -> impl RecordBatchReader {
-        gen_batch()
-            .col("values", array::step::<UInt32Type>())
-            .col("row_ids", array::step::<UInt64Type>())
-            .into_reader_rows(RowCount::from(1024), BatchCount::from(100 * 1024))
-    }
+fn test_data() -> impl RecordBatchReader {
+    gen_batch()
+        .col("values", array::step::<UInt32Type>())
+        .col("row_ids", array::step::<UInt64Type>())
+        .into_reader_rows(RowCount::from(1024), BatchCount::from(100 * 1024))
 }
 
-#[async_trait]
-impl TrainingSource for BenchmarkDataSource {
-    async fn scan_ordered_chunks(
-        self: Box<Self>,
-        _chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        Ok(reader_to_stream(Box::new(Self::test_data())))
-    }
-
-    async fn scan_unordered_chunks(
-        self: Box<Self>,
-        _chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        Ok(reader_to_stream(Box::new(Self::test_data())))
-    }
-
-    async fn scan_aligned_chunks(
-        self: Box<Self>,
-        _chunk_size: u32,
-    ) -> Result<SendableRecordBatchStream> {
-        Ok(reader_to_stream(Box::new(Self::test_data())))
-    }
+fn test_data_stream() -> SendableRecordBatchStream {
+    reader_to_stream(Box::new(test_data()))
 }
 
 impl BenchmarkFixture {
@@ -84,21 +60,17 @@ impl BenchmarkFixture {
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
         let test_path = tempdir.path().as_os_str().to_str().unwrap();
-        Arc::new(
-            Dataset::write(BenchmarkDataSource::test_data(), test_path, None)
-                .await
-                .unwrap(),
-        )
+        Arc::new(Dataset::write(test_data(), test_path, None).await.unwrap())
     }
 
     async fn train_scalar_index(index_store: &Arc<dyn IndexStore>) {
         let sub_index_trainer = FlatIndexMetadata::new(arrow_schema::DataType::UInt32);
 
         train_btree_index(
-            Box::new(BenchmarkDataSource {}),
+            test_data_stream(),
             &sub_index_trainer,
             index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE as u32,
+            DEFAULT_BTREE_BATCH_SIZE,
         )
         .await
         .unwrap();
@@ -135,7 +107,7 @@ async fn baseline_equality_search(fixture: &BenchmarkFixture) {
     assert_eq!(num_rows, 1);
 }
 
-async fn warm_indexed_equality_search(index: &BTreeIndex) {
+async fn warm_indexed_equality_search(index: &dyn ScalarIndex) {
     let result = index
         .search(
             &SargableQuery::Equals(ScalarValue::UInt32(Some(10000))),
@@ -167,7 +139,7 @@ async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
     assert_eq!(num_rows, 54857600);
 }
 
-async fn warm_indexed_inequality_search(index: &BTreeIndex) {
+async fn warm_indexed_inequality_search(index: &dyn ScalarIndex) {
     let result = index
         .search(
             &SargableQuery::Range(
@@ -186,7 +158,7 @@ async fn warm_indexed_inequality_search(index: &BTreeIndex) {
     assert_eq!(row_ids.len(), Some(54857600));
 }
 
-async fn warm_indexed_isin_search(index: &BTreeIndex) {
+async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
     let result = index
         .search(
             &SargableQuery::IsIn(vec![
@@ -224,12 +196,15 @@ fn bench_baseline(c: &mut Criterion) {
 fn bench_warm_indexed(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let fixture = rt.block_on(BenchmarkFixture::open());
+    let details =
+        prost_types::Any::from_msg(&lance_index::pb::BTreeIndexDetails::default()).unwrap();
 
     let index = rt
-        .block_on(BTreeIndex::load(
+        .block_on(BTreeIndexPlugin.load_index(
             fixture.index_store.clone(),
+            &details,
             None,
-            LanceCache::no_cache(),
+            &LanceCache::no_cache(),
         ))
         .unwrap();
 

@@ -924,10 +924,12 @@ pub async fn commit_compaction(
             .remap_indices(row_id_map, &affected_ids)
             .await?;
         remapped_indices
-            .iter()
+            .into_iter()
             .map(|rewritten| RewrittenIndex {
-                old_id: rewritten.original,
-                new_id: rewritten.new,
+                old_id: rewritten.old_id,
+                new_id: rewritten.new_id,
+                new_index_details: rewritten.index_details,
+                new_index_version: rewritten.index_version,
             })
             .collect()
     } else if !options.defer_index_remap {
@@ -992,7 +994,7 @@ mod tests {
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-    use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
@@ -1069,13 +1071,13 @@ mod tests {
         .unwrap()
     }
 
-    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     struct MockIndexRemapperExpectation {
         expected: HashMap<u64, Option<u64>>,
         answer: Vec<RemappedIndex>,
     }
 
-    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Default, Clone, PartialEq)]
     struct MockIndexRemapper {
         expectations: Vec<MockIndexRemapperExpectation>,
     }
@@ -2943,7 +2945,7 @@ mod tests {
                 &["doc"],
                 IndexType::Inverted,
                 index_name.clone(),
-                &ScalarIndexParams::default(),
+                &InvertedIndexParams::default(),
                 false,
             )
             .await
@@ -3012,7 +3014,7 @@ mod tests {
                 &["doc"],
                 IndexType::Inverted,
                 index_name.clone(),
-                &ScalarIndexParams::default(),
+                &InvertedIndexParams::default(),
                 true,
             )
             .await
@@ -3328,7 +3330,7 @@ mod tests {
                     stages: vec![
                         StageParams::Ivf(IvfBuildParams {
                             max_iters: 2,
-                            num_partitions: 2,
+                            num_partitions: Some(2),
                             sample_rate: 2,
                             ..Default::default()
                         }),

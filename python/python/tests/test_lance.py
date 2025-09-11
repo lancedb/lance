@@ -129,8 +129,6 @@ def test_create_index(tmp_path):
         dataset.create_index("emb", "IVF_PQ")
     with pytest.raises(ValueError):
         dataset.create_index("emb", "IVF_PQ", num_partitions=5)
-    with pytest.raises(ValueError):
-        dataset.create_index("emb", "IVF_PQ", num_sub_vectors=4)
     with pytest.raises(KeyError):
         dataset.create_index("foo", "IVF_PQ", num_partitions=5, num_sub_vectors=16)
     with pytest.raises(NotImplementedError):

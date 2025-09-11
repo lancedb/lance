@@ -201,20 +201,17 @@ impl Manifest {
             .iter()
             .map(|fragment| {
                 let mut cloned_fragment = fragment.clone();
-                cloned_fragment.files = cloned_fragment
-                    .files
-                    .into_iter()
-                    .map(|mut file| {
+                for file in &mut cloned_fragment.files {
+                    if file.base_id.is_none() {
                         file.base_id = Some(ref_base_id);
-                        file
-                    })
-                    .collect();
-
-                if let Some(mut deletion) = cloned_fragment.deletion_file.take() {
-                    deletion.base_id = Some(ref_base_id);
-                    cloned_fragment.deletion_file = Some(deletion);
+                    }
                 }
 
+                if let Some(deletion) = &mut cloned_fragment.deletion_file {
+                    if deletion.base_id.is_none() {
+                        deletion.base_id = Some(ref_base_id);
+                    }
+                }
                 cloned_fragment
             })
             .collect::<Vec<_>>();
@@ -840,7 +837,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            HashMap::new(),
         );
 
         let actual = manifest.fragments_by_offset_range(0..10);
@@ -908,7 +905,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            HashMap::new(),
         );
 
         assert_eq!(manifest.max_field_id(), 43);
@@ -932,7 +929,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
-            /*ref_main_location= */ HashMap::new(),
+            HashMap::new(),
         );
 
         let mut config = manifest.config.clone();

@@ -32,6 +32,24 @@ use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::DatasetIndexExt;
 use uuid::Uuid;
 
+#[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
+#[derive(Debug, Clone)]
+pub struct PyIndexConfig {
+    pub index_type: String,
+    pub config: String,
+}
+
+#[pymethods]
+impl PyIndexConfig {
+    #[new]
+    fn new(index_type: &str, config: &str) -> PyResult<Self> {
+        Ok(Self {
+            index_type: index_type.to_string(),
+            config: config.to_string(),
+        })
+    }
+}
+
 #[pyclass(name = "IvfModel", module = "lance.indices")]
 #[derive(Debug, Clone)]
 pub struct PyIvfModel {
@@ -109,7 +127,7 @@ async fn do_train_ivf_model(
     let params = IvfBuildParams {
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
-        num_partitions: num_partitions as usize,
+        num_partitions: Some(num_partitions as usize),
         ..Default::default()
     };
     let ivf_model = lance::index::vector::ivf::build_ivf_model(
@@ -453,6 +471,7 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     indices.add_class::<PyIvfModel>()?;
+    indices.add_class::<PyIndexConfig>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
     m.add_submodule(&indices)?;
     Ok(())

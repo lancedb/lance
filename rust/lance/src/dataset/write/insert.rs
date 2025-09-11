@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
-use arrow_schema::Field as ArrowField;
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
 use lance_core::datatypes::NullabilityComparison;
@@ -362,23 +361,6 @@ impl<'a> InsertBuilder<'a> {
         {
             log::info!("Enabling stable row ids because non-default storage is used");
             context.params.enable_stable_row_ids = true;
-        }
-
-        let schema_has_json = data_schema.fields_pre_order().any(|field| {
-            let arrow_field = ArrowField::from(field);
-            lance_arrow::json::has_json_fields(&arrow_field)
-        });
-
-        if schema_has_json && context.storage_version < LanceFileVersion::V2_2 {
-            return Err(Error::NotSupported {
-                source: format!(
-                    "JSON fields require Lance file format version 2.2 or later. \
-                     Current version: {}. Please specify data_storage_version='2.2' in WriteParams",
-                    context.storage_version
-                )
-                .into(),
-                location: location!(),
-            });
         }
 
         // Feature flags

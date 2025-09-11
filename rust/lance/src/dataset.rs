@@ -5,7 +5,6 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::Field as ArrowField;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
 use deepsize::DeepSizeOf;
@@ -85,6 +84,7 @@ use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
+use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::delta::DatasetDelta;
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -553,26 +553,6 @@ impl Dataset {
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
     ) -> Result<Self> {
-        let schema_has_json = manifest.schema.fields_pre_order().any(|field| {
-            let arrow_field = ArrowField::from(field);
-            lance_arrow::json::has_json_fields(&arrow_field)
-        });
-
-        if schema_has_json {
-            let storage_version = manifest.data_storage_format.lance_file_version()?;
-            if storage_version < lance_file::version::LanceFileVersion::V2_2 {
-                return Err(Error::NotSupported {
-                    source: format!(
-                        "Cannot read dataset with JSON fields from file format version {}. \
-                         JSON fields require Lance file format version 2.2 or later.",
-                        storage_version
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
-        }
-
         let tags = Tags::new(
             object_store.clone(),
             commit_handler.clone(),
@@ -879,15 +859,40 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
+        let mut builder = CleanupPolicyBuilder::default();
+        builder = builder.before_timestamp(utc_now() - older_than);
+        if let Some(v) = delete_unverified {
+            builder = builder.delete_unverified(v);
+        }
+        if let Some(v) = error_if_tagged_old_versions {
+            builder = builder.error_if_tagged_old_versions(v);
+        }
+
+        self.cleanup_with_policy(builder.build())
+    }
+
+    /// Removes old versions of the dataset from storage
+    ///
+    /// This function will remove all versions of the dataset that satisfies the given policy.
+    /// This function will not remove the current version of the dataset.
+    ///
+    /// Once a version is removed it can no longer be checked out or restored.  Any data unique
+    /// to that version will be lost.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
+    ///
+    /// # Returns
+    ///
+    /// * `RemovalStats` - Statistics about the removal operation
+    #[instrument(level = "debug", skip(self))]
+    pub fn cleanup_with_policy(
+        &self,
+        policy: CleanupPolicy,
+    ) -> BoxFuture<'_, Result<RemovalStats>> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        let before = utc_now() - older_than;
-        cleanup::cleanup_old_versions(
-            self,
-            before,
-            delete_unverified,
-            error_if_tagged_old_versions,
-        )
-        .boxed()
+        cleanup::cleanup_old_versions(self, policy).boxed()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1209,7 +1214,7 @@ impl Dataset {
             .await
     }
 
-    pub(crate) fn object_store(&self) -> &ObjectStore {
+    pub fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
 
@@ -1217,7 +1222,7 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    pub(crate) fn indices_dir(&self) -> Path {
+    pub fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
     }
 
@@ -1407,7 +1412,7 @@ impl Dataset {
 
     // Gets a filtered list of fragments from ids in O(N) time instead of using
     // `get_fragment` which would require O(N^2) time.
-    fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
         let mut fragments = Vec::with_capacity(ordered_ids.len());
         let mut id_iter = ordered_ids.iter();
         let mut id = id_iter.next();
@@ -2978,16 +2983,21 @@ mod tests {
         )
         .await;
 
+        let test_round = 3;
         // Generate clone paths
-        let clone_paths = (1..=1)
+        let clone_paths = (1..=test_round)
             .map(|i| test_dir.path().join(format!("clone{}", i)))
             .collect::<Vec<_>>();
-        let mut cloned_datasets = Vec::with_capacity(1);
+        let mut cloned_datasets = Vec::with_capacity(test_round);
 
         // Unified cloning procedure, write a fragment to each cloned dataset.
         for path in clone_paths.iter() {
             let clone_path = path.to_str().unwrap();
-            current_dataset.tags.create("v1", 1).await.unwrap();
+            current_dataset
+                .tags
+                .create("v1", current_dataset.latest_version_id().await.unwrap())
+                .await
+                .unwrap();
 
             current_dataset = current_dataset
                 .shallow_clone(clone_path, "v1", ObjectStoreParams::default())

@@ -4,6 +4,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[allow(unused_imports)]
 use lance_core::utils::cpu::{SimdSupport, SIMD_SUPPORT};
 
 pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];

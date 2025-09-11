@@ -12,7 +12,7 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::{DFSchema, SchemaExt};
+use datafusion::common::{exec_datafusion_err, DFSchema, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{col, lit, Expr};
@@ -59,7 +59,7 @@ use lance_index::scalar::inverted::query::{
     fill_fts_query_column, FtsQuery, FtsSearchParams, MatchQuery,
 };
 use lance_index::scalar::inverted::SCORE_COL;
-use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::ScalarIndexCriteria;
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
@@ -73,7 +73,6 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::wrap_json_stream_for_reading;
-use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -861,6 +860,7 @@ impl Scanner {
     }
 
     /// Set the prefetch size.
+    /// Ignored in v2 and newer format
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
         self.batch_readahead = nbatches;
         self
@@ -1817,7 +1817,11 @@ impl Scanner {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            plan = Arc::new(SortExec::new(LexOrdering::new(col_exprs), plan));
+            plan = Arc::new(SortExec::new(
+                LexOrdering::new(col_exprs)
+                    .ok_or(exec_datafusion_err!("Unexpected empty sort expressions"))?,
+                plan,
+            ));
         }
 
         // Stage 4: limit / offset
@@ -2167,7 +2171,7 @@ impl Scanner {
             .load_scalar_index(
                 ScalarIndexCriteria::default()
                     .for_column(column)
-                    .with_type(ScalarIndexType::Inverted),
+                    .supports_fts(),
             )
             .await?
             .ok_or(Error::invalid_input(
@@ -2309,20 +2313,17 @@ impl Scanner {
 
             let mut indexed_columns = Vec::new();
             for column in string_columns {
-                let index = self
+                let has_fts_index = self
                     .dataset
                     .load_scalar_index(
                         ScalarIndexCriteria::default()
                             .for_column(column)
-                            .with_type(ScalarIndexType::Inverted),
+                            .supports_fts(),
                     )
-                    .await?;
-                if let Some(index) = index {
-                    let index_type =
-                        detect_scalar_index_type(&self.dataset, &index, column).await?;
-                    if matches!(index_type, ScalarIndexType::Inverted) {
-                        indexed_columns.push(column.clone());
-                    }
+                    .await?
+                    .is_some();
+                if has_fts_index {
+                    indexed_columns.push(column.clone());
                 }
             }
 
@@ -2438,7 +2439,7 @@ impl Scanner {
                 };
 
                 Arc::new(
-                    SortExec::new(LexOrdering::new(vec![sort_expr]), fts_node)
+                    SortExec::new([sort_expr].into(), fts_node)
                         .with_fetch(self.limit.map(|l| l as usize)),
                 )
             }
@@ -2495,7 +2496,7 @@ impl Scanner {
                             &datafusion_expr::JoinType::Inner,
                             None,
                             datafusion_physical_plan::joins::PartitionMode::CollectLeft,
-                            false,
+                            NullEquality::NullEqualsNothing,
                         )?) as _);
                     } else {
                         must = Some(plan);
@@ -2567,7 +2568,7 @@ impl Scanner {
             .load_scalar_index(
                 ScalarIndexCriteria::default()
                     .for_column(&column)
-                    .with_type(ScalarIndexType::Inverted),
+                    .supports_fts(),
             )
             .await?
             .ok_or(Error::invalid_input(
@@ -2626,10 +2627,8 @@ impl Scanner {
                     nulls_first: false,
                 },
             };
-            match_plan = Arc::new(
-                SortExec::new(LexOrdering::new(vec![sort_expr]), match_plan)
-                    .with_fetch(params.limit),
-            );
+            match_plan =
+                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit));
         }
         Ok(match_plan)
     }
@@ -3158,7 +3157,7 @@ impl Scanner {
 
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
-            LexOrdering::new(vec![
+            [
                 PhysicalSortExpr {
                     expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
                     options: SortOptions {
@@ -3173,7 +3172,8 @@ impl Scanner {
                         nulls_first: false,
                     },
                 },
-            ]),
+            ]
+            .into(),
             knn_plan,
         )
         .with_fetch(Some(q.k));
@@ -3235,11 +3235,8 @@ impl Scanner {
             },
         };
         Ok(Arc::new(
-            SortExec::new(
-                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                inner_fanout_search,
-            )
-            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new([sort_expr, sort_expr_row_id].into(), inner_fanout_search)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
     }
 
@@ -3297,11 +3294,8 @@ impl Scanner {
                 },
             };
             let ann_node = Arc::new(
-                SortExec::new(
-                    LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                    ann_node,
-                )
-                .with_fetch(Some(q.k * over_fetch_factor as usize)),
+                SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
+                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
             );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
@@ -3323,11 +3317,8 @@ impl Scanner {
             },
         };
         let ann_node = Arc::new(
-            SortExec::new(
-                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                ann_node,
-            )
-            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         );
 
         Ok(ann_node)
@@ -7263,7 +7254,7 @@ mod test {
                     stages: vec![
                         StageParams::Ivf(IvfBuildParams {
                             max_iters: 2,
-                            num_partitions: 2,
+                            num_partitions: Some(2),
                             sample_rate: 2,
                             ..Default::default()
                         }),

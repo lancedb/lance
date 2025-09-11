@@ -12,6 +12,40 @@ use datafusion::physical_plan::ColumnarValue;
 use datafusion::prelude::create_udf;
 use std::sync::Arc;
 
+/// Represents the type of a JSONB value
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonbType {
+    Null = 0,
+    Boolean = 1,
+    Int64 = 2,
+    Float64 = 3,
+    String = 4,
+    Array = 5,
+    Object = 6,
+}
+
+impl JsonbType {
+    /// Convert from u8 value
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Null),
+            1 => Some(Self::Boolean),
+            2 => Some(Self::Int64),
+            3 => Some(Self::Float64),
+            4 => Some(Self::String),
+            5 => Some(Self::Array),
+            6 => Some(Self::Object),
+            _ => None,
+        }
+    }
+
+    /// Convert to u8 value for storage in Arrow arrays
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Common helper functions and types for JSON UDFs
 mod common {
     use super::*;
@@ -214,10 +248,44 @@ pub fn json_extract_udf() -> ScalarUDF {
     )
 }
 
+/// Create the json_extract_with_type UDF that returns JSONB bytes with type information
+///
+/// # Arguments
+/// * First parameter: JSONB binary data (LargeBinary)
+/// * Second parameter: JSONPath expression as string (Utf8)
+///
+/// # Returns
+/// A struct with two fields:
+/// - value: LargeBinary (the extracted JSONB value)
+/// - type_tag: UInt8 (type information: 0=null, 1=bool, 2=int64, 3=float64, 4=string, 5=array, 6=object)
+pub fn json_extract_with_type_udf() -> ScalarUDF {
+    use arrow_schema::Fields;
+
+    let return_type = DataType::Struct(Fields::from(vec![
+        arrow_schema::Field::new("value", DataType::LargeBinary, true),
+        arrow_schema::Field::new("type_tag", DataType::UInt8, false),
+    ]));
+
+    create_udf(
+        "json_extract_with_type",
+        vec![DataType::LargeBinary, DataType::Utf8],
+        return_type,
+        Volatility::Immutable,
+        Arc::new(json_extract_with_type_columnar_impl),
+    )
+}
+
 /// Implementation of json_extract function with ColumnarValue
 fn json_extract_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     let arrays = common::columnar_to_arrays(args);
     let result = json_extract_impl(&arrays)?;
+    Ok(ColumnarValue::Array(result))
+}
+
+/// Implementation of json_extract_with_type function with ColumnarValue
+fn json_extract_with_type_columnar_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    let arrays = common::columnar_to_arrays(args);
+    let result = json_extract_with_type_impl(&arrays)?;
     Ok(ColumnarValue::Array(result))
 }
 
@@ -244,6 +312,112 @@ fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     }
 
     Ok(Arc::new(builder.finish()))
+}
+
+/// Implementation of json_extract_with_type function
+fn json_extract_with_type_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
+    use arrow_array::builder::{LargeBinaryBuilder, UInt8Builder};
+    use arrow_array::StructArray;
+
+    common::validate_arg_count(args, 2, "json_extract_with_type")?;
+
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let path_array = common::extract_string_array(args, 1)?;
+
+    let mut value_builder = LargeBinaryBuilder::with_capacity(jsonb_array.len(), 1024);
+    let mut type_builder = UInt8Builder::with_capacity(jsonb_array.len());
+
+    for i in 0..jsonb_array.len() {
+        if jsonb_array.is_null(i) {
+            value_builder.append_null();
+            type_builder.append_value(JsonbType::Null.as_u8());
+        } else if let Some(path) = common::get_string_value_at(path_array, i) {
+            let jsonb_bytes = jsonb_array.value(i);
+            match extract_json_path_with_type(jsonb_bytes, path)? {
+                Some((value_bytes, type_tag)) => {
+                    value_builder.append_value(&value_bytes);
+                    type_builder.append_value(type_tag);
+                }
+                None => {
+                    value_builder.append_null();
+                    type_builder.append_value(JsonbType::Null.as_u8());
+                }
+            }
+        } else {
+            value_builder.append_null();
+            type_builder.append_value(JsonbType::Null.as_u8());
+        }
+    }
+
+    // Create struct array with two fields
+    let value_array = Arc::new(value_builder.finish()) as ArrayRef;
+    let type_array = Arc::new(type_builder.finish()) as ArrayRef;
+
+    let struct_array = StructArray::from(vec![
+        (
+            Arc::new(arrow_schema::Field::new(
+                "value",
+                DataType::LargeBinary,
+                true,
+            )),
+            value_array,
+        ),
+        (
+            Arc::new(arrow_schema::Field::new("type_tag", DataType::UInt8, false)),
+            type_array,
+        ),
+    ]);
+
+    Ok(Arc::new(struct_array))
+}
+
+/// Extract value from JSONB using JSONPath and return with type information
+/// Returns (JSONB bytes, type_tag) where type_tag represents the JsonbType
+fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<(Vec<u8>, u8)>> {
+    let json_path = common::parse_json_path(path)?;
+
+    let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
+    let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
+    match selector.select_values(&json_path) {
+        Ok(values) => {
+            if values.is_empty() {
+                Ok(None)
+            } else {
+                // Get the first matched value
+                let owned_value = &values[0];
+                let raw = owned_value.as_raw();
+
+                // Determine type using JsonbType enum
+                let jsonb_type = if raw.is_null().unwrap_or(false) {
+                    JsonbType::Null
+                } else if raw.is_boolean().unwrap_or(false) {
+                    JsonbType::Boolean
+                } else if raw.is_number().unwrap_or(false) {
+                    // Try to determine if it's an integer or float
+                    if raw.to_i64().is_ok() {
+                        JsonbType::Int64
+                    } else {
+                        JsonbType::Float64
+                    }
+                } else if raw.is_string().unwrap_or(false) {
+                    JsonbType::String
+                } else if raw.is_array().unwrap_or(false) {
+                    JsonbType::Array
+                } else if raw.is_object().unwrap_or(false) {
+                    JsonbType::Object
+                } else {
+                    JsonbType::String // default to string
+                };
+
+                // Return the JSONB bytes and type tag as u8
+                Ok(Some((owned_value.clone().to_vec(), jsonb_type.as_u8())))
+            }
+        }
+        Err(e) => Err(common::execution_error(format!(
+            "Failed to select values from path '{}': {}",
+            path, e
+        ))),
+    }
 }
 
 /// Extract value from JSONB using JSONPath
@@ -810,6 +984,28 @@ mod tests {
 
     fn create_test_jsonb(json_str: &str) -> Vec<u8> {
         jsonb::parse_value(json_str.as_bytes()).unwrap().to_vec()
+    }
+
+    #[test]
+    fn test_jsonb_type_enum() {
+        // Test enum conversion to/from u8
+        assert_eq!(JsonbType::Null.as_u8(), 0);
+        assert_eq!(JsonbType::Boolean.as_u8(), 1);
+        assert_eq!(JsonbType::Int64.as_u8(), 2);
+        assert_eq!(JsonbType::Float64.as_u8(), 3);
+        assert_eq!(JsonbType::String.as_u8(), 4);
+        assert_eq!(JsonbType::Array.as_u8(), 5);
+        assert_eq!(JsonbType::Object.as_u8(), 6);
+
+        // Test from_u8 conversion
+        assert_eq!(JsonbType::from_u8(0), Some(JsonbType::Null));
+        assert_eq!(JsonbType::from_u8(1), Some(JsonbType::Boolean));
+        assert_eq!(JsonbType::from_u8(2), Some(JsonbType::Int64));
+        assert_eq!(JsonbType::from_u8(3), Some(JsonbType::Float64));
+        assert_eq!(JsonbType::from_u8(4), Some(JsonbType::String));
+        assert_eq!(JsonbType::from_u8(5), Some(JsonbType::Array));
+        assert_eq!(JsonbType::from_u8(6), Some(JsonbType::Object));
+        assert_eq!(JsonbType::from_u8(7), None); // Invalid value
     }
 
     #[tokio::test]

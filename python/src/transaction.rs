@@ -101,6 +101,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
     }
 }
 
+impl<'py> IntoPyObject<'py> for PyLance<Index> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
+    }
+}
+
 impl FromPyObject<'_> for PyLance<DataReplacementGroup> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let fragment_id = ob.getattr("fragment_id")?.extract::<u64>()?;
@@ -177,7 +187,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
                 };
                 Ok(Self(op))
             }
@@ -495,7 +505,18 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
         let new_id = Uuid::parse_str(&new_id)
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
-        Ok(Self(RewrittenIndex { old_id, new_id }))
+        let new_details_type_url: String = ob.getattr("new_details_type_url")?.extract()?;
+        let new_details_value: Vec<u8> = ob.getattr("new_details_value")?.extract()?;
+        let new_index_version: u32 = ob.getattr("new_index_version")?.extract()?;
+        Ok(Self(RewrittenIndex {
+            old_id,
+            new_id,
+            new_index_details: prost_types::Any {
+                type_url: new_details_type_url,
+                value: new_details_value,
+            },
+            new_index_version,
+        }))
     }
 }
 
