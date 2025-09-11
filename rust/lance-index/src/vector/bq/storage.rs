@@ -243,6 +243,10 @@ fn quantize_dist_table(dist_table: &[f32]) -> (f32, f32, Vec<u8>) {
         .minmax_by(|a, b| a.total_cmp(b))
         .into_option()
         .unwrap();
+    // this happens if the query is all zeros
+    if qmin == qmax {
+        return (qmin, qmax, vec![0; dist_table.len()]);
+    }
     let factor = 255.0 / (qmax - qmin);
     let quantized_dist_table = dist_table
         .iter()

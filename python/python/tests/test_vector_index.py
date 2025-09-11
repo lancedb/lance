@@ -643,6 +643,53 @@ def test_create_ivf_sq_index(dataset, tmp_path):
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
 
+def test_create_ivf_rq_index():
+    ds = lance.write_dataset(create_table(), "memory://")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RABIT",
+        num_partitions=4,
+        num_bits=1,
+    )
+    assert ds.list_indices()[0]["fields"] == ["vector"]
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Creating empty vector indices with train=False is not yet implemented",
+    ):
+        ds.delete("id>=0")
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_RABIT",
+            num_partitions=4,
+            num_bits=1,
+            replace=True,
+        )
+
+    zero_vectors = np.zeros((1000, 128)).astype(np.float32).tolist()
+    tbl = pa.Table.from_pydict(
+        {"vector": pa.array(zero_vectors, type=pa.list_(pa.float32(), 128))}
+    )
+    ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RABIT",
+        num_partitions=4,
+        num_bits=1,
+    )
+
+    res = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.zeros(128),
+            "k": 10,
+        }
+    )
+    assert res.num_rows == 10
+    assert res["_distance"].to_numpy().min() == 0.0
+    assert res["_distance"].to_numpy().max() == 0.0
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")

@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_array::{Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch};
 use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
@@ -181,18 +181,20 @@ impl Transformer for RQTransformer {
 
         let scale_factors = match self.distance_type {
             DistanceType::L2 => Float32Array::from_iter_values(
-                res_norm_square
-                    .values()
-                    .iter()
-                    .zip(ip_rq_res.values())
-                    .map(|(res_norm_square, ip_rq_res)| -2.0 * res_norm_square / ip_rq_res),
+                res_norm_square.values().iter().zip(ip_rq_res.values()).map(
+                    |(res_norm_square, ip_rq_res)| {
+                        (-2.0 * res_norm_square)
+                            .div_checked(*ip_rq_res)
+                            .unwrap_or_default()
+                    },
+                ),
             ),
             DistanceType::Dot => Float32Array::from_iter_values(
-                res_norm_square
-                    .values()
-                    .iter()
-                    .zip(ip_rq_res.values())
-                    .map(|(res_norm_square, ip_rq_res)| -res_norm_square / ip_rq_res),
+                res_norm_square.values().iter().zip(ip_rq_res.values()).map(
+                    |(res_norm_square, ip_rq_res)| {
+                        -res_norm_square.div_checked(*ip_rq_res).unwrap_or_default()
+                    },
+                ),
             ),
             _ => {
                 return Err(Error::Index {
