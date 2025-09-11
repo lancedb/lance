@@ -1520,7 +1520,7 @@ impl DatasetIndexInternalExt for Dataset {
                 });
             }
 
-            field_names.push(source_field.name.as_str().to_string());
+            field_names.push(source_field.name.as_str());
         }
 
         if field_names.is_empty() {
@@ -1530,15 +1530,14 @@ impl DatasetIndexInternalExt for Dataset {
             });
         }
 
-        let column_name = field_names[0].as_str();
         if let Some(index_details) = &source_index.index_details {
             let index_details_wrapper = IndexDetails(index_details.clone());
 
             if index_details_wrapper.is_vector() {
-                vector::initialize_vector_index(self, source_dataset, source_index, column_name)
+                vector::initialize_vector_index(self, source_dataset, source_index, &field_names)
                     .await?;
             } else {
-                scalar::initialize_scalar_index(self, source_dataset, source_index, column_name)
+                scalar::initialize_scalar_index(self, source_dataset, source_index, &field_names)
                     .await?;
             }
         } else {

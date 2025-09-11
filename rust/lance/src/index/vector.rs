@@ -974,8 +974,18 @@ pub async fn initialize_vector_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
     source_index: &lance_table::format::Index,
-    column_name: &str,
+    field_names: &[&str],
 ) -> Result<()> {
+    if field_names.is_empty() || field_names.len() > 1 {
+        return Err(Error::Index {
+            message: format!("Unsupported fields for vector index: {:?}", field_names),
+            location: location!(),
+        });
+    }
+
+    // Vector indices currently support only single fields, use the first one
+    let column_name = field_names[0];
+
     let source_vector_index = source_dataset
         .open_vector_index(
             column_name,
@@ -1244,9 +1254,14 @@ mod tests {
             .unwrap();
 
         // Initialize IVF_PQ index on target
-        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
-            .await
-            .unwrap();
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created
         let target_indices = target_dataset.load_indices().await.unwrap();
@@ -1454,9 +1469,14 @@ mod tests {
             .unwrap();
 
         // Initialize IVF_FLAT index on target
-        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
-            .await
-            .unwrap();
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created
         let target_indices = target_dataset.load_indices().await.unwrap();
@@ -1645,9 +1665,14 @@ mod tests {
             .unwrap();
 
         // Initialize IVF_PQ index on empty target
-        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
-            .await
-            .unwrap();
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created even though dataset is empty
         let target_indices = target_dataset.load_indices().await.unwrap();
@@ -1877,9 +1902,14 @@ mod tests {
             .unwrap();
 
         // Initialize IVF_SQ index on target
-        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
-            .await
-            .unwrap();
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created
         let target_indices = target_dataset.load_indices().await.unwrap();
@@ -2103,9 +2133,14 @@ mod tests {
             .unwrap();
 
         // Initialize IVF_HNSW_PQ index on target
-        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
-            .await
-            .unwrap();
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created
         let target_indices = target_dataset.load_indices().await.unwrap();
@@ -2356,9 +2391,14 @@ mod tests {
             .unwrap();
 
         // Initialize IVF_HNSW_SQ index on target
-        initialize_vector_index(&mut target_dataset, &source_dataset, source_index, "vector")
-            .await
-            .unwrap();
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created
         let target_indices = target_dataset.load_indices().await.unwrap();

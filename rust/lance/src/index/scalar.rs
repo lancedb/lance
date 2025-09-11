@@ -470,8 +470,18 @@ pub async fn initialize_scalar_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
     source_index: &Index,
-    column_name: &str,
+    field_names: &[&str],
 ) -> Result<()> {
+    if field_names.is_empty() || field_names.len() > 1 {
+        return Err(Error::Index {
+            message: format!("Unsupported fields for scalar index: {:?}", field_names),
+            location: location!(),
+        });
+    }
+
+    // Scalar indices currently support only single fields, use the first one
+    let column_name = field_names[0];
+
     let source_scalar_index = source_dataset
         .open_scalar_index(
             column_name,
@@ -786,7 +796,7 @@ mod tests {
             .unwrap();
 
         // Initialize BTree index on target
-        super::initialize_scalar_index(&mut target_dataset, &source_dataset, source_index, "id")
+        super::initialize_scalar_index(&mut target_dataset, &source_dataset, source_index, &["id"])
             .await
             .unwrap();
 
@@ -891,7 +901,7 @@ mod tests {
             &mut target_dataset,
             &source_dataset,
             source_index,
-            "category",
+            &["category"],
         )
         .await
         .unwrap();
@@ -971,9 +981,14 @@ mod tests {
             .unwrap();
 
         // Initialize Inverted index on target
-        super::initialize_scalar_index(&mut target_dataset, &source_dataset, source_index, "text")
-            .await
-            .unwrap();
+        super::initialize_scalar_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["text"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created
         let target_indices = target_dataset.load_indices().await.unwrap();
@@ -1105,9 +1120,14 @@ mod tests {
             .unwrap();
 
         // Initialize ZoneMap index on target
-        super::initialize_scalar_index(&mut target_dataset, &source_dataset, source_index, "value")
-            .await
-            .unwrap();
+        super::initialize_scalar_index(
+            &mut target_dataset,
+            &source_dataset,
+            source_index,
+            &["value"],
+        )
+        .await
+        .unwrap();
 
         // Verify index was created
         let target_indices = target_dataset.load_indices().await.unwrap();
