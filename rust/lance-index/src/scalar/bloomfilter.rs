@@ -88,7 +88,7 @@ impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         _fri: Option<Arc<FragReuseIndex>>,
-        _index_cache: LanceCache,
+        _index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
         let bloom_data = index_file
@@ -1234,7 +1234,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?
@@ -1346,7 +1346,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
         assert_eq!(index.zones.len(), 0);
@@ -1392,7 +1392,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
@@ -1474,7 +1474,7 @@ mod tests {
         .unwrap();
 
         // Read the index file back and check its contents
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
@@ -1559,7 +1559,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
@@ -1647,7 +1647,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
@@ -1737,7 +1737,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
@@ -1819,7 +1819,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
@@ -1887,7 +1887,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
@@ -1947,7 +1947,7 @@ mod tests {
         .unwrap();
 
         // Load the Date32 index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load Date32 BloomFilterIndex");
 
@@ -2007,7 +2007,7 @@ mod tests {
         .unwrap();
 
         // Load the Timestamp index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load Timestamp BloomFilterIndex");
 
@@ -2089,7 +2089,7 @@ mod tests {
         .unwrap();
 
         // Load the Time64 index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load Time64 BloomFilterIndex");
 
@@ -2140,7 +2140,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = BloomFilterIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BloomFilterIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load BloomFilterIndex");
 
