@@ -12,7 +12,9 @@ use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-use crate::scalar::{BloomFilterQuery, CreatedIndex, UpdateCriteria};
+use crate::scalar::{
+    BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
+};
 use crate::{pb, Any};
 use arrow_array::{Array, UInt64Array};
 use lance_core::utils::mask::RowIdTreeMap;
@@ -539,6 +541,14 @@ impl ScalarIndex for BloomFilterIndex {
         UpdateCriteria::only_new_data(
             TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
         )
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let params = serde_json::to_value(BloomFilterIndexBuilderParams {
+            number_of_items: self.number_of_items,
+            probability: self.probability,
+        })?;
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(params))
     }
 }
 

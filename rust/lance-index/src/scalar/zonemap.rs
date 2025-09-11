@@ -618,7 +618,7 @@ impl ScalarIndex for ZoneMapIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.max_zonemap_size))?;
+        let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(params))
     }
 }
