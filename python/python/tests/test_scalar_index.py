@@ -1454,7 +1454,7 @@ def test_zonemap_index(tmp_path: Path):
 
     # Verify zonemap statistics
     zonemap_stats = index_stats["indices"][0]
-    assert zonemap_stats["max_zonemap_size"] == 8192
+    assert zonemap_stats["rows_per_zone"] == 8192
     assert zonemap_stats["num_zones"] == 2  # Should have 2 zones (8192 rows + 1 row)
     assert zonemap_stats["type"] == "ZoneMap"
 
