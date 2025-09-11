@@ -23,6 +23,7 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
 use lance::dataset::refs::TagContents;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
@@ -259,6 +260,11 @@ impl BlockingDataset {
         metadata_map: HashMap<u32, HashMap<String, String>>,
     ) -> Result<()> {
         RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
+        Ok(())
+    }
+
+    pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
+        RT.block_on(compact_files(&mut self.inner, options, None))?;
         Ok(())
     }
 
@@ -1717,4 +1723,138 @@ fn inner_replace_field_metadata(
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
     dataset_guard.replace_field_metadata(field_metadata_map)
+}
+
+//////////////////////////////
+// Compaction Methods       //
+//////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCompact(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    compaction_options: JObject, // CompactionOptions
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_compact(&mut env, java_dataset, compaction_options)
+    )
+}
+
+fn inner_compact(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    compaction_options: JObject, // CompactionOptions
+) -> Result<()> {
+    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.compact(rust_options)?;
+    Ok(())
+}
+
+fn convert_java_compaction_options_to_rust(
+    env: &mut JNIEnv,
+    java_options: JObject,
+) -> Result<RustCompactionOptions> {
+    // Get targetRowsPerFragment field
+    let target_rows_per_fragment = env
+        .call_method(&java_options, "getTargetRowsPerFragment", "()I", &[])?
+        .i()? as usize;
+
+    // Get maxRowsPerGroup field
+    let max_rows_per_group = env
+        .call_method(&java_options, "getMaxRowsPerGroup", "()I", &[])?
+        .i()? as usize;
+
+    // Get maxBytesPerFile field (Optional<Integer>)
+    let max_bytes_per_file_opt = env
+        .call_method(
+            &java_options,
+            "getMaxBytesPerFile",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_bytes_per_file = if env
+        .call_method(&max_bytes_per_file_opt, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let bytes_obj = env
+            .call_method(max_bytes_per_file_opt, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let bytes = env.call_method(bytes_obj, "intValue", "()I", &[])?.i()? as usize;
+        Some(bytes)
+    } else {
+        None
+    };
+
+    // Get materializeDeletions field
+    let materialize_deletions = env
+        .call_method(&java_options, "isMaterializeDeletions", "()Z", &[])?
+        .z()?;
+
+    // Get materializeDeletionsThreshold field
+    let materialize_deletions_threshold = env
+        .call_method(
+            &java_options,
+            "getMaterializeDeletionsThreshold",
+            "()F",
+            &[],
+        )?
+        .f()?;
+
+    // Get numThreads field (Optional<Integer>)
+    let num_threads_opt = env
+        .call_method(
+            &java_options,
+            "getNumThreads",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let num_threads = if env
+        .call_method(&num_threads_opt, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let threads_obj = env
+            .call_method(num_threads_opt, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let threads = env.call_method(threads_obj, "intValue", "()I", &[])?.i()? as usize;
+        Some(threads)
+    } else {
+        None
+    };
+
+    // Get batchSize field (Optional<Integer>)
+    let batch_size_opt = env
+        .call_method(&java_options, "getBatchSize", "()Ljava/util/Optional;", &[])?
+        .l()?;
+    let batch_size = if env
+        .call_method(&batch_size_opt, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let batch_obj = env
+            .call_method(batch_size_opt, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let batch = env.call_method(batch_obj, "intValue", "()I", &[])?.i()? as usize;
+        Some(batch)
+    } else {
+        None
+    };
+
+    // Get deferIndexRemap field
+    let defer_index_remap = env
+        .call_method(&java_options, "isDeferIndexRemap", "()Z", &[])?
+        .z()?;
+
+    Ok(RustCompactionOptions {
+        target_rows_per_fragment,
+        max_rows_per_group,
+        max_bytes_per_file,
+        materialize_deletions,
+        materialize_deletions_threshold,
+        num_threads,
+        batch_size,
+        defer_index_remap,
+    })
 }

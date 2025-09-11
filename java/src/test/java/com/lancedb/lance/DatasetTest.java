@@ -1021,4 +1021,265 @@ public class DatasetTest {
       }
     }
   }
+
+  @Test
+  void testCompact(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Write data to create multiple small fragments for compaction
+      try (Dataset dataset2 = testDataset.write(1, 10)) {
+        assertEquals(10, dataset2.countRows());
+        long initialVersion = dataset2.version();
+
+        // Test compact with default options
+        dataset2.compact();
+
+        // Verify that compaction happened (version should increase)
+        assertTrue(dataset2.version() > initialVersion);
+
+        // Verify data integrity - row count should remain the same
+        assertEquals(10, dataset2.countRows());
+
+        // Test compact with custom options
+        CompactionOptions customOptions =
+            CompactionOptions.builder()
+                .setTargetRowsPerFragment(20)
+                .setMaxRowsPerGroup(1024)
+                .setMaterializeDeletions(true)
+                .setMaterializeDeletionsThreshold(0.1f)
+                .build();
+
+        long preCustomCompactVersion = dataset2.version();
+        dataset2.compact(customOptions);
+
+        // Verify data integrity after custom compaction
+        assertEquals(10, dataset2.countRows());
+
+        // Test that CompactionOptions getters work correctly
+        assertEquals(20, customOptions.getTargetRowsPerFragment());
+        assertEquals(1024, customOptions.getMaxRowsPerGroup());
+        assertTrue(customOptions.isMaterializeDeletions());
+        assertEquals(0.1f, customOptions.getMaterializeDeletionsThreshold(), 0.001f);
+        assertFalse(customOptions.getMaxBytesPerFile().isPresent());
+        assertFalse(customOptions.getNumThreads().isPresent());
+        assertFalse(customOptions.getBatchSize().isPresent());
+        assertFalse(customOptions.isDeferIndexRemap());
+      }
+    }
+  }
+
+  @Test
+  void testCompactWithDeletions(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Write data and then delete some rows to test deletion materialization
+      try (Dataset dataset2 = testDataset.write(1, 20)) {
+        assertEquals(20, dataset2.countRows());
+
+        // Delete some rows to create deletions for materialization
+        dataset2.delete("id < 5");
+        assertEquals(15, dataset2.countRows());
+
+        long versionBeforeCompact = dataset2.version();
+
+        // Compact with deletion materialization
+        CompactionOptions options =
+            CompactionOptions.builder()
+                .setMaterializeDeletions(true)
+                .setMaterializeDeletionsThreshold(0.2f) // 20% threshold
+                .build();
+
+        dataset2.compact(options);
+
+        // Verify that compaction happened
+        assertTrue(dataset2.version() > versionBeforeCompact);
+
+        // Verify data integrity - should still have 15 rows after compaction
+        assertEquals(15, dataset2.countRows());
+
+        // Verify deleted rows are still gone
+        assertEquals(0, dataset2.countRows("id < 5"));
+        assertEquals(15, dataset2.countRows("id >= 5"));
+      }
+    }
+  }
+
+  @Test
+  void testCompactWithMaxBytesAndBatchSize(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Write larger dataset to test maxBytesPerFile and batchSize
+      try (Dataset dataset2 = testDataset.write(1, 50)) {
+        assertEquals(50, dataset2.countRows());
+        long initialVersion = dataset2.version();
+
+        // Test compact with maxBytesPerFile and batchSize options
+        CompactionOptions options =
+            CompactionOptions.builder()
+                .setTargetRowsPerFragment(100)
+                .setMaxBytesPerFile(1024 * 1024) // 1MB limit
+                .setBatchSize(10) // Process 10 rows at a time
+                .setNumThreads(2) // Use 2 threads
+                .setMaterializeDeletions(false)
+                .setDeferIndexRemap(true)
+                .build();
+
+        dataset2.compact(options);
+
+        // Verify that compaction happened
+        assertTrue(dataset2.version() > initialVersion);
+
+        // Verify data integrity
+        assertEquals(50, dataset2.countRows());
+
+        // Test that all options are set correctly
+        assertEquals(100, options.getTargetRowsPerFragment());
+        assertTrue(options.getMaxBytesPerFile().isPresent());
+        assertEquals(1024 * 1024, options.getMaxBytesPerFile().get().intValue());
+        assertTrue(options.getBatchSize().isPresent());
+        assertEquals(10, options.getBatchSize().get().intValue());
+        assertTrue(options.getNumThreads().isPresent());
+        assertEquals(2, options.getNumThreads().get().intValue());
+        assertFalse(options.isMaterializeDeletions());
+        assertTrue(options.isDeferIndexRemap());
+      }
+    }
+  }
+
+  @Test
+  void testMultipleCompactions(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Write initial data
+      try (Dataset dataset2 = testDataset.write(1, 30)) {
+        assertEquals(30, dataset2.countRows());
+        long version1 = dataset2.version();
+
+        // First compaction with default options
+        dataset2.compact();
+        long version2 = dataset2.version();
+        assertTrue(version2 > version1);
+        assertEquals(30, dataset2.countRows());
+
+        // Delete some rows
+        dataset2.delete("id < 10");
+        assertEquals(20, dataset2.countRows());
+        long version3 = dataset2.version();
+        assertTrue(version3 > version2);
+
+        // Second compaction with deletion materialization
+        CompactionOptions deletionOptions =
+            CompactionOptions.builder()
+                .setMaterializeDeletions(true)
+                .setMaterializeDeletionsThreshold(0.3f)
+                .build();
+
+        dataset2.compact(deletionOptions);
+        long version4 = dataset2.version();
+        assertTrue(version4 > version3);
+        assertEquals(20, dataset2.countRows());
+
+        // Verify deleted rows are still gone
+        assertEquals(0, dataset2.countRows("id < 10"));
+
+        // Third compaction with different target fragment size
+        CompactionOptions fragmentOptions =
+            CompactionOptions.builder()
+                .setTargetRowsPerFragment(5)
+                .setMaxRowsPerGroup(512)
+                .build();
+
+        dataset2.compact(fragmentOptions);
+        long version5 = dataset2.version();
+        assertTrue(version5 > version4);
+        assertEquals(20, dataset2.countRows());
+
+        // Verify multiple compactions preserve data integrity
+        assertEquals(0, dataset2.countRows("id < 10"));
+        assertEquals(20, dataset2.countRows("id >= 10"));
+
+        // Verify we can still query the data correctly
+        assertEquals(10, dataset2.countRows("id >= 10 AND id < 20"));
+        assertEquals(10, dataset2.countRows("id >= 20"));
+      }
+    }
+  }
+
+  @Test
+  void testCompactWithAllOptions(@TempDir Path tempDir) {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      // Write data and create some deletions
+      try (Dataset dataset2 = testDataset.write(1, 25)) {
+        assertEquals(25, dataset2.countRows());
+
+        // Delete some rows to test deletion materialization
+        dataset2.delete("id % 5 = 0"); // Delete every 5th row
+        assertEquals(20, dataset2.countRows()); // Should have 20 rows left
+
+        long versionBeforeCompact = dataset2.version();
+
+        // Test compaction with all options set
+        CompactionOptions allOptions =
+            CompactionOptions.builder()
+                .setTargetRowsPerFragment(15)
+                .setMaxRowsPerGroup(256)
+                .setMaxBytesPerFile(512 * 1024) // 512KB
+                .setMaterializeDeletions(true)
+                .setMaterializeDeletionsThreshold(0.15f) // 15% threshold
+                .setNumThreads(1)
+                .setBatchSize(5)
+                .setDeferIndexRemap(false)
+                .build();
+
+        dataset2.compact(allOptions);
+
+        // Verify compaction occurred
+        assertTrue(dataset2.version() > versionBeforeCompact);
+        assertEquals(20, dataset2.countRows());
+
+        // Verify deleted rows remain deleted
+        assertEquals(0, dataset2.countRows("id % 5 = 0"));
+        assertEquals(20, dataset2.countRows("id % 5 != 0"));
+
+        // Verify all CompactionOptions settings are preserved
+        assertEquals(15, allOptions.getTargetRowsPerFragment());
+        assertEquals(256, allOptions.getMaxRowsPerGroup());
+        assertTrue(allOptions.getMaxBytesPerFile().isPresent());
+        assertEquals(512 * 1024, allOptions.getMaxBytesPerFile().get().intValue());
+        assertTrue(allOptions.isMaterializeDeletions());
+        assertEquals(0.15f, allOptions.getMaterializeDeletionsThreshold(), 0.001f);
+        assertTrue(allOptions.getNumThreads().isPresent());
+        assertEquals(1, allOptions.getNumThreads().get().intValue());
+        assertTrue(allOptions.getBatchSize().isPresent());
+        assertEquals(5, allOptions.getBatchSize().get().intValue());
+        assertFalse(allOptions.isDeferIndexRemap());
+      }
+    }
+  }
 }
