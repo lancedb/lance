@@ -1160,10 +1160,7 @@ mod tests {
 
         // Verify ZoneMap statistics show correct rows_per_zone
         let stats = target_scalar_index.statistics().unwrap();
-        let max_zonemap_size = stats["max_zonemap_size"].as_u64().unwrap();
-        assert_eq!(
-            max_zonemap_size, 200,
-            "ZoneMap max_zonemap_size should be 200"
-        );
+        let rows_per_zone = stats["rows_per_zone"].as_u64().unwrap();
+        assert_eq!(rows_per_zone, 200, "ZoneMap rows_per_zone should be 200");
     }
 }
