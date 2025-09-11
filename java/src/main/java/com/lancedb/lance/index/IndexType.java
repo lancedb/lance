@@ -23,6 +23,7 @@ public enum IndexType {
   FRAGMENT_REUSE(6),
   MEM_WAL(7),
   ZONEMAP(8),
+  BLOOM_FILTER(9),
   VECTOR(100),
   IVF_FLAT(101),
   IVF_SQ(102),
