@@ -42,16 +42,49 @@ use crate::{
     },
 };
 use crate::{metrics::MetricsCollector, Index, IndexType};
-use crate::{pb, scalar::expression::ScalarQueryParser};
+use crate::{pb, scalar::expression::ScalarQueryParser, scalar::IndexReader};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
 const MAX_BITMAP_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
 
-// Read in chunks to avoid overflow one binary array
-const MAX_ROWS_PER_CHUNK: usize = 2 * 1024; // 64kib per int32
+const MAX_ROWS_PER_CHUNK: usize = 2 * 1024;
 
 const BITMAP_INDEX_VERSION: u32 = 0;
+
+// We only need to open a file reader if we need to load a bitmap. If all
+// bitmaps are cached we don't open it. If we do open it we should only open it once.
+#[derive(Clone)]
+struct LazyIndexReader {
+    index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
+    store: Arc<dyn IndexStore>,
+}
+
+impl std::fmt::Debug for LazyIndexReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyIndexReader")
+            .field("store", &self.store)
+            .finish()
+    }
+}
+
+impl LazyIndexReader {
+    fn new(store: Arc<dyn IndexStore>) -> Self {
+        Self {
+            index_reader: Arc::new(tokio::sync::Mutex::new(None)),
+            store,
+        }
+    }
+
+    async fn get(&self) -> Result<Arc<dyn IndexReader>> {
+        let mut reader = self.index_reader.lock().await;
+        if reader.is_none() {
+            let index_reader = self.store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+            *reader = Some(index_reader);
+        }
+        Ok(reader.as_ref().unwrap().clone())
+    }
+}
 
 /// A scalar index that stores a bitmap for each possible value
 ///
@@ -73,9 +106,10 @@ pub struct BitmapIndex {
     index_cache: WeakLanceCache,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+
+    lazy_reader: LazyIndexReader,
 }
 
-/// Cache key for bitmap entries
 #[derive(Debug, Clone)]
 pub struct BitmapKey {
     value: OrderableScalarValue,
@@ -98,6 +132,7 @@ impl BitmapIndex {
         index_cache: WeakLanceCache,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
+        let lazy_reader = LazyIndexReader::new(store.clone());
         Self {
             index_map,
             null_map,
@@ -105,6 +140,7 @@ impl BitmapIndex {
             store,
             index_cache,
             frag_reuse_index,
+            lazy_reader,
         }
     }
 
@@ -117,10 +153,8 @@ impl BitmapIndex {
         let total_rows = page_lookup_file.num_rows();
 
         if total_rows == 0 {
-            let serialized_lookup = page_lookup_file
-                .read_range(0..page_lookup_file.num_rows(), Some(&["keys"]))
-                .await?;
-            let data_type = serialized_lookup.schema().field(0).data_type().clone();
+            let schema = page_lookup_file.schema();
+            let data_type = schema.fields[0].data_type();
             return Ok(Arc::new(Self::new(
                 BTreeMap::new(),
                 RowIdTreeMap::default(),
@@ -137,7 +171,6 @@ impl BitmapIndex {
         let mut null_location: Option<usize> = None;
         let mut global_row_idx = 0;
 
-        // First pass: Read ONLY column 0 (keys) to build index map
         for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
             let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
             let chunk = page_lookup_file
@@ -148,7 +181,6 @@ impl BitmapIndex {
                 continue;
             }
 
-            // Set value_type from first chunk if not already set
             if value_type.is_none() {
                 value_type = Some(chunk.schema().field(0).data_type().clone());
             }
@@ -168,14 +200,13 @@ impl BitmapIndex {
             }
         }
 
-        // Load ONLY the null bitmap if it exists (single row read)
         if let Some(null_loc) = null_location {
             let batch = page_lookup_file
-                .read_range(null_loc..null_loc + 1, None)
+                .read_range(null_loc..null_loc + 1, Some(&["bitmaps"]))
                 .await?;
-            
+
             let binary_bitmaps = batch
-                .column(1)
+                .column(0)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| Error::Internal {
@@ -184,12 +215,12 @@ impl BitmapIndex {
                 })?;
             let bitmap_bytes = binary_bitmaps.value(0);
             let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
-            
+
             // Apply fragment remapping if needed
             if let Some(fri) = &frag_reuse_index {
                 bitmap = fri.remap_row_ids_tree_map(&bitmap);
             }
-            
+
             null_map = bitmap;
         }
 
@@ -205,35 +236,27 @@ impl BitmapIndex {
         )))
     }
 
-    /// Load a specific bitmap on demand
     async fn load_bitmap(&self, key: &OrderableScalarValue) -> Result<Arc<RowIdTreeMap>> {
-        // Handle null bitmap directly from memory
         if key.0.is_null() {
             return Ok(Arc::new(self.null_map.clone()));
         }
 
-        // Check cache first for non-null values
         let cache_key = BitmapKey { value: key.clone() };
 
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
             return Ok(cached);
         }
 
-        // For non-null values, check if they exist
         let row_offset = match self.index_map.get(key) {
             Some(loc) => *loc,
             None => return Ok(Arc::new(RowIdTreeMap::default())),
         };
 
-        // Load the bitmap from disk - read just the single row we need
-        let page_lookup_file = self.store.open_index_file(BITMAP_LOOKUP_NAME).await?;
-
-        // Read just the specific row
+        let page_lookup_file = self.lazy_reader.get().await?;
         let batch = page_lookup_file
             .read_range(row_offset..row_offset + 1, None)
             .await?;
 
-        // Extract the bitmap from column 1
         let binary_bitmaps = batch
             .column(1)
             .as_any()
@@ -245,29 +268,23 @@ impl BitmapIndex {
         let bitmap_bytes = binary_bitmaps.value(0); // First (and only) row
         let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
-        // Apply fragment remapping if needed
         if let Some(fri) = &self.frag_reuse_index {
             bitmap = fri.remap_row_ids_tree_map(&bitmap);
         }
 
-        // Cache it (cache takes ownership of Arc)
         self.index_cache
             .insert_with_key(&cache_key, Arc::new(bitmap.clone()))
             .await;
 
         Ok(Arc::new(bitmap))
     }
-
 }
 
 impl DeepSizeOf for BitmapIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         let mut total_size = 0;
 
-        // Size of value locations map
         total_size += self.index_map.deep_size_of_children(context);
-
-        // Size of Arc<dyn IndexStore> contents
         total_size += self.store.deep_size_of_children(context);
 
         total_size
@@ -297,14 +314,13 @@ impl Index for BitmapIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let page_lookup_file = self.store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+        let page_lookup_file = self.lazy_reader.get().await?;
         let total_rows = page_lookup_file.num_rows();
 
         if total_rows == 0 {
             return Ok(());
         }
 
-        // Read and process in chunks to avoid offset overflow
         for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
             let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
             let chunk = page_lookup_file
@@ -325,7 +341,6 @@ impl Index for BitmapIndex {
             for idx in 0..chunk.num_rows() {
                 let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
 
-                // Skip null bitmap as it's already in memory
                 if key.0.is_null() {
                     continue;
                 }
@@ -333,12 +348,10 @@ impl Index for BitmapIndex {
                 let bitmap_bytes = bitmap_binary_array.value(idx);
                 let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
-                // Apply fragment remapping if needed
                 if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
                     bitmap = frag_reuse_index_ref.remap_row_ids_tree_map(&bitmap);
                 }
 
-                // Force insert into cache (will overwrite if exists)
                 let cache_key = BitmapKey { value: key };
                 self.index_cache
                     .insert_with_key(&cache_key, Arc::new(bitmap))
@@ -355,8 +368,7 @@ impl Index for BitmapIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         let stats = BitmapStatistics {
-            num_bitmaps: self.index_map.len()
-                + if !self.null_map.is_empty() { 1 } else { 0 },
+            num_bitmaps: self.index_map.len() + if !self.null_map.is_empty() { 1 } else { 0 },
         };
         serde_json::to_value(stats).map_err(|e| Error::Internal {
             message: format!("failed to serialize bitmap index statistics: {}", e),
@@ -462,7 +474,6 @@ impl ScalarIndex for BitmapIndex {
     ) -> Result<CreatedIndex> {
         let mut state = HashMap::new();
 
-        // Load and remap each bitmap
         for key in self.index_map.keys() {
             let bitmap = self.load_bitmap(key).await?;
             let remapped_bitmap =
@@ -476,7 +487,6 @@ impl ScalarIndex for BitmapIndex {
             state.insert(key.0.clone(), remapped_bitmap);
         }
 
-        // Handle null bitmap if exists
         if !self.null_map.is_empty() {
             let remapped_null =
                 RowIdTreeMap::from_iter(self.null_map.row_ids().unwrap().filter_map(|addr| {
@@ -505,13 +515,11 @@ impl ScalarIndex for BitmapIndex {
     ) -> Result<CreatedIndex> {
         let mut state = HashMap::new();
 
-        // Load all existing bitmaps
         for key in self.index_map.keys() {
             let bitmap = self.load_bitmap(key).await?;
             state.insert(key.0.clone(), (*bitmap).clone());
         }
 
-        // Also add null bitmap if exists
         if !self.null_map.is_empty() {
             let ex_null = new_null_array(&self.value_type, 1);
             let ex_null = ScalarValue::try_from_array(ex_null.as_ref(), 0)?;
@@ -572,7 +580,6 @@ impl BitmapIndexPlugin {
             bitmap.serialize_into(&mut bytes).unwrap();
             let bitmap_size = bytes.len();
 
-            // If adding this bitmap would overflow, flush current batch
             if cur_bytes + bitmap_size > MAX_BITMAP_ARRAY_LENGTH {
                 let keys_array = ScalarValue::iter_to_array(cur_keys.clone().into_iter()).unwrap();
                 let mut binary_builder = BinaryBuilder::new();
@@ -594,7 +601,6 @@ impl BitmapIndexPlugin {
             cur_bytes += bitmap_size;
         }
 
-        // Flush any remaining
         if !cur_keys.is_empty() {
             let keys_array = ScalarValue::iter_to_array(cur_keys).unwrap();
             let mut binary_builder = BinaryBuilder::new();
@@ -607,7 +613,6 @@ impl BitmapIndexPlugin {
             bitmap_index_file.write_record_batch(record_batch).await?;
         }
 
-        // Finish file once at the end - this creates the file even if we wrote no batches
         bitmap_index_file.finish().await?;
 
         Ok(())
@@ -640,7 +645,6 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<()> {
-        // mapping from item to list of the row ids where it is present
         let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
 
         Self::do_train_bitmap_index(data, dictionary, index_store).await
