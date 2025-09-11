@@ -378,7 +378,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        LABEL_LIST_INDEX_VERSION
     }
 
     fn new_query_parser(

@@ -1511,7 +1511,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        BTREE_INDEX_VERSION
     }
 
     fn new_query_parser(
