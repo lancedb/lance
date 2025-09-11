@@ -928,7 +928,7 @@ mod tests {
         let dataset_root_dir = "file:///var/balabala/dataset1".to_string();
         let dataset_location = DatasetLocation::new(
             dataset_root_dir.clone(),
-            Path::from(dataset_root_dir.clone()),
+            Path::from(dataset_root_dir),
             Some("random_branch".to_string()),
         )
         .unwrap();
