@@ -4,7 +4,10 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
-use crate::utils::{extract_storage_options, extract_write_params, get_index_params, to_rust_map};
+use crate::utils::{
+    extract_storage_options, extract_write_params, get_scalar_index_params,
+    get_vector_index_params, to_rust_map,
+};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -631,12 +634,51 @@ fn inner_create_index(
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let name = env.get_string_opt(&name_jobj)?;
-    let params = get_index_params(env, params_jobj)?;
     let replace = replace_jobj != 0;
     let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
+
+    // Handle scalar vs vector indices differently and get params before borrowing dataset
+    let params_result: Result<Box<dyn IndexParams>> = match index_type {
+        IndexType::Scalar
+        | IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::LabelList
+        | IndexType::Inverted
+        | IndexType::NGram
+        | IndexType::ZoneMap
+        | IndexType::BloomFilter => {
+            // For scalar indices, create a scalar IndexParams
+            let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
+            let scalar_params = lance_index::scalar::ScalarIndexParams {
+                index_type: index_type_str,
+                params: params_opt,
+            };
+            Ok(Box::new(scalar_params))
+        }
+        IndexType::FragmentReuse | IndexType::MemWal => {
+            // System indices - not user-creatable
+            Err(Error::input_error(format!(
+                "Cannot create system index type: {:?}. System indices are managed internally.",
+                index_type
+            )))
+        }
+        IndexType::Vector
+        | IndexType::IvfFlat
+        | IndexType::IvfSq
+        | IndexType::IvfPq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswFlat => {
+            // For vector indices, use the existing parameter handling
+            get_vector_index_params(env, params_jobj)
+        }
+    };
+
+    let params = params_result?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.create_index(&columns_slice, index_type, name, params.as_ref(), replace)?;
+
     Ok(())
 }
 

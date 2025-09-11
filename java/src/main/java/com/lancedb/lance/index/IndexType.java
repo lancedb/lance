@@ -19,12 +19,18 @@ public enum IndexType {
   BITMAP(2),
   LABEL_LIST(3),
   INVERTED(4),
+  NGRAM(5),
+  FRAGMENT_REUSE(6),
+  MEM_WAL(7),
+  ZONEMAP(8),
+  BLOOM_FILTER(9),
   VECTOR(100),
   IVF_FLAT(101),
   IVF_SQ(102),
   IVF_PQ(103),
   IVF_HNSW_SQ(104),
-  IVF_HNSW_PQ(105);
+  IVF_HNSW_PQ(105),
+  IVF_HNSW_FLAT(106);
 
   private final int value;
 
