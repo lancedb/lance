@@ -442,7 +442,7 @@ impl RefOperations<BranchContents> for Branches {
 
         self.object_store().delete(&branch_file).await?;
         // Clean up empty branch directories
-        self.cleanup_empty_directories(branch).await
+        self.cleanup_branch_directories(branch).await
     }
 
     async fn list_ordered(&self, order: Option<Ordering>) -> Result<Vec<(String, BranchContents)>> {
@@ -462,63 +462,59 @@ impl RefOperations<BranchContents> for Branches {
 
 impl Branches {
     /// Clean up empty parent directories using 4-step algorithm
-    async fn cleanup_empty_directories(&self, branch: &str) -> Result<()> {
+    async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         // Step 1: Get all branch_name as a vector
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
-        let remaining_used_dir = Self::find_longest_prefix_str(branch, &remaining_branches);
 
-        let unused_dir = branch.strip_prefix(remaining_used_dir);
-        if let Some(unused_dir_inner) = unused_dir {
-            if let Some(dir) = unused_dir_inner.split('/').next() {
-                let dir_location = self
-                    .refs
-                    .dataset_location
-                    .switch_branch(Some(dir.to_string()))?;
-                if let Err(e) = self
-                    .refs
-                    .object_store
-                    .remove_dir_all(dir_location.base_path().clone())
-                    .await
-                {
-                    match &e {
-                        Error::IO { source, .. } => {
-                            if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                                if io_err.kind() == ErrorKind::NotFound {
-                                    log::debug!("Branch directory already deleted: {}", io_err);
-                                } else {
-                                    return Err(e);
-                                }
+        if let Some(delete_path) = self.get_cleanup_path(branch, &remaining_branches)? {
+            if let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await {
+                match &e {
+                    Error::IO { source, .. } => {
+                        if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                            if io_err.kind() == ErrorKind::NotFound {
+                                log::debug!("Branch directory already deleted: {}", io_err);
                             } else {
                                 return Err(e);
                             }
+                        } else {
+                            return Err(e);
                         }
-                        _ => return Err(e),
                     }
+                    _ => return Err(e),
                 }
             }
         }
         Ok(())
     }
 
-    fn find_longest_prefix_str<'a>(reference: &'a str, candidates: &[&str]) -> &'a str {
-        if reference.is_empty() || candidates.is_empty() {
-            return "";
-        }
-
-        let mut longest_length = 0;
-        for &candidate in candidates {
-            let common_len = reference
+    fn get_cleanup_path(&self, branch: &str, remaining_branches: &[&str]) -> Result<Option<Path>> {
+        let mut longest_used_length = 0;
+        for &candidate in remaining_branches {
+            let common_len = branch
                 .chars()
                 .zip(candidate.chars())
                 .take_while(|(a, b)| a == b)
                 .count();
 
-            if common_len > longest_length {
-                longest_length = common_len;
+            if common_len > longest_used_length {
+                longest_used_length = common_len;
             }
         }
-        &reference[..longest_length]
+        if longest_used_length == branch.len() {
+            return Ok(None);
+        }
+
+        let unused_dir = &branch[longest_used_length..];
+        if let Some(dir) = unused_dir.split('/').next() {
+            let dir_location = self
+                .refs
+                .dataset_location
+                .switch_branch(Some(dir.to_string()))?;
+            Ok(Some(dir_location.base_path().clone()))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -563,7 +559,7 @@ pub fn dataset_base_path(
     if let Some(branch_name) = branch {
         dataset_location
             .switch_branch(Some(branch_name))
-            .map(|loc| loc.base_path().clone())
+            .map(|location| location.base_path().clone())
     } else {
         // current workspace may not be the root
         Ok(dataset_location.root_path().clone())
