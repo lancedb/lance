@@ -65,7 +65,7 @@ public class JNITest {
   @Test
   public void testIvfFlatIndexParams() {
     JniTestHelper.parseIndexParams(
-        new IndexParams.Builder()
+        IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.ivfFlat(10, DistanceType.L2))
             .build());
   }
@@ -73,7 +73,7 @@ public class JNITest {
   @Test
   public void testIvfPqIndexParams() {
     JniTestHelper.parseIndexParams(
-        new IndexParams.Builder()
+        IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.ivfPq(10, 8, 4, DistanceType.L2, 50))
             .build());
   }
@@ -96,7 +96,7 @@ public class JNITest {
             .build();
 
     JniTestHelper.parseIndexParams(
-        new IndexParams.Builder()
+        IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.withIvfPqParams(DistanceType.Cosine, ivf, pq))
             .build());
   }
@@ -114,7 +114,7 @@ public class JNITest {
     PQBuildParams pq = new PQBuildParams.Builder().setNumSubVectors(16).setNumBits(8).build();
 
     JniTestHelper.parseIndexParams(
-        new IndexParams.Builder()
+        IndexParams.builder()
             .setVectorIndexParams(
                 VectorIndexParams.withIvfHnswPqParams(DistanceType.L2, ivf, hnsw, pq))
             .build());
@@ -133,7 +133,7 @@ public class JNITest {
         new SQBuildParams.Builder().setNumBits((short) 16).setSampleRate(512).build();
 
     JniTestHelper.parseIndexParams(
-        new IndexParams.Builder()
+        IndexParams.builder()
             .setVectorIndexParams(
                 VectorIndexParams.withIvfHnswSqParams(DistanceType.Dot, ivf, hnsw, sq))
             .build());
