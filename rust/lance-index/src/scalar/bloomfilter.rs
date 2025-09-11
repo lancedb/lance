@@ -2064,7 +2064,7 @@ mod tests {
 
         // Test Time64 with microsecond precision (stored as i64)
         let time_values: Vec<i64> = (0..100)
-            .map(|i| (i as i64) * 3600_000_000) // Hours in microseconds
+            .map(|i| (i as i64) * 3_600_000_000) // Hours in microseconds
             .collect();
 
         let time_data = arrow_array::Time64MicrosecondArray::from(time_values.clone());

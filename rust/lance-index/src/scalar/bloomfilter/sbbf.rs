@@ -313,7 +313,7 @@ const SEED: u64 = 0;
 
 #[inline]
 fn hash_as_bytes<A: AsBytes + ?Sized>(value: &A) -> u64 {
-    XxHash64::oneshot(SEED, &value.as_bytes())
+    XxHash64::oneshot(SEED, value.as_bytes().as_ref())
 }
 
 /// Builder for creating SBBF instances with a fluent API
@@ -452,7 +452,7 @@ mod tests {
         // Test different numeric types
         let i32_val = 42i32;
         let i64_val = 12345i64;
-        let f64_val = 3.14f64;
+        let f64_val = std::f64::consts::PI;
         let bool_val = true;
 
         sbbf.insert(&i32_val);
