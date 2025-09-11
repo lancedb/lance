@@ -520,10 +520,11 @@ impl ScalarIndex for BloomFilterIndex {
         all_blocks.extend(new_blocks);
 
         // Create a new builder with all blocks to write them out
-        let mut combined_builder = BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
-            number_of_items: self.number_of_items,
-            probability: self.probability,
-        })?;
+        let mut combined_builder =
+            BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
+                number_of_items: self.number_of_items,
+                probability: self.probability,
+            })?;
         combined_builder.blocks = all_blocks;
 
         // Write the updated index to dest_store
