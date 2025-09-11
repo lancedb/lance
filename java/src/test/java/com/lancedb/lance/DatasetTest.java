@@ -1204,10 +1204,7 @@ public class DatasetTest {
 
         // Third compaction with different target fragment size
         CompactionOptions fragmentOptions =
-            CompactionOptions.builder()
-                .setTargetRowsPerFragment(5)
-                .setMaxRowsPerGroup(512)
-                .build();
+            CompactionOptions.builder().setTargetRowsPerFragment(5).setMaxRowsPerGroup(512).build();
 
         dataset2.compact(fragmentOptions);
         long version5 = dataset2.version();
