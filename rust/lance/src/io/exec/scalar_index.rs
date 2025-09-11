@@ -35,7 +35,8 @@ use lance_core::{
 use lance_datafusion::{
     chunker::break_stream,
     utils::{
-        ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
+        ExecutionPlanMetricsSetExt, MAX_MATCHED_ROWS_METRIC, MIN_MATCHED_ROWS_METRIC,
+        SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
     },
 };
 use lance_index::{
@@ -160,6 +161,15 @@ impl ScalarIndexExec {
             let _timer = search_time.timer();
             expr.evaluate(dataset.as_ref(), &metrics).await?
         };
+        // Only add the metric if we can calculate it.  Otherwise it gets a default value of 0.
+        if let Some(min_matched) = query_result.min_matched() {
+            let min_matched_rows = plan_metrics.new_count(MIN_MATCHED_ROWS_METRIC, 0);
+            min_matched_rows.add(min_matched as usize);
+        }
+        if let Some(max_matched) = query_result.max_matched() {
+            let max_matched_rows = plan_metrics.new_count(MAX_MATCHED_ROWS_METRIC, 0);
+            max_matched_rows.add(max_matched as usize);
+        }
         let fragments_covered_by_result =
             Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
         {
