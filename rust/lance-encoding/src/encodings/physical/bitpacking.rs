@@ -183,7 +183,8 @@ impl InlineBitpacking {
         data: LanceBuffer,
         num_values: u64,
     ) -> Result<DataBlock> {
-        assert!(data.len() >= 8);
+        // Ensure at least the header is present
+        assert!(data.len() >= std::mem::size_of::<T>());
         assert!(num_values <= ELEMS_PER_CHUNK);
 
         // This macro decompresses a chunk(1024 values) of bitpacked values.
@@ -195,10 +196,8 @@ impl InlineBitpacking {
         let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<T>()];
         let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>());
         let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
-
         // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
         assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
-
         unsafe {
             BitPacking::unchecked_unpack(bit_width_value as usize, chunk, &mut decompressed);
         }
@@ -523,6 +522,6 @@ mod test {
         let mut metadata = HashMap::new();
         metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
 
-        check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+        check_round_trip_encoding_of_data(arrays, &test_cases, metadata.clone()).await;
     }
 }
