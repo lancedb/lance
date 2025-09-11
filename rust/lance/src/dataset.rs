@@ -629,32 +629,8 @@ impl Dataset {
             dataset_location.clone(),
         );
 
-        let schema_has_json = manifest.schema.fields_pre_order().any(|field| {
-            let arrow_field = ArrowField::from(field);
-            lance_arrow::json::has_json_fields(&arrow_field)
-        });
-
-        if schema_has_json {
-            let storage_version = manifest.data_storage_format.lance_file_version()?;
-            if storage_version < lance_file::version::LanceFileVersion::V2_2 {
-                return Err(Error::NotSupported {
-                    source: format!(
-                        "Cannot read dataset with JSON fields from file format version {}. \
-                         JSON fields require Lance file format version 2.2 or later.",
-                        storage_version
-                    )
-                    .into(),
-                    location: location!(),
-                });
-            }
-        }
-
-        let metadata_cache = Arc::new(
-            session
-                .metadata_cache
-                .for_dataset(dataset_location.base_uri()),
-        );
-        let index_cache = Arc::new(session.index_cache.for_dataset(dataset_location.base_uri()));
+        let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
+        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         Ok(Self {
             object_store,
