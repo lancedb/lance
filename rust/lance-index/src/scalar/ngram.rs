@@ -1269,7 +1269,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        NGRAM_INDEX_VERSION
     }
 
     fn new_query_parser(
