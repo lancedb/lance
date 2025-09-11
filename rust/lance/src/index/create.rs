@@ -165,7 +165,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         if let Ok(json_value) =
                             serde_json::from_str::<serde_json::Value>(params_json)
                         {
-                            base_params.with_params(json_value)
+                            base_params.with_params(&json_value)
                         } else {
                             base_params
                         }

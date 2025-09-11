@@ -21,16 +21,16 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
-use lance_index::scalar::inverted::{InvertedIndexPlugin, METADATA_FILE};
+use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
     VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::CreatedIndex;
 use lance_index::scalar::{
     bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams,
 };
+use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, Index};
 use log::info;
@@ -283,12 +283,12 @@ pub(super) async fn build_scalar_index(
         training_request.criteria(),
         None,
         train,
-        fragment_ids,
+        fragment_ids.clone(),
     )
     .await?;
 
     plugin
-        .train_index(training_data, &index_store, training_request)
+        .train_index(training_data, &index_store, training_request, fragment_ids)
         .await
 }
 
@@ -740,7 +740,7 @@ mod tests {
         let params_json = serde_json::to_value(&btree_params).unwrap();
         let index_params =
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree)
-                .with_params(params_json);
+                .with_params(&params_json);
 
         source_dataset
             .create_index(
@@ -1064,7 +1064,7 @@ mod tests {
         let params_json = serde_json::to_value(&zonemap_params).unwrap();
         let index_params =
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
-                .with_params(params_json);
+                .with_params(&params_json);
 
         source_dataset
             .create_index(

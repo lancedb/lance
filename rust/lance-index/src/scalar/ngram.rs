@@ -1289,6 +1289,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
+        _fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
