@@ -3,6 +3,9 @@
 
 import logging
 import os
+import re
+import subprocess
+import sys
 from unittest import mock
 
 import pytest
@@ -72,3 +75,39 @@ def test_logger_output(tmp_path, caplog):
     with caplog.at_level(logging.INFO):
         LOGGER.info("Test log message")
     assert "Test log message" in caplog.text
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="subprocess does not work correctly in CI on Windows",
+)
+def test_timestamp_precision():
+    def get_sample_log_line(precision: str):
+        output = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import lance; import pyarrow as pa;\
+                     lance.write_dataset(pa.table({'x': range(100)}), 'memory://test')",
+            ],
+            capture_output=True,
+            check=True,
+            env={
+                "LANCE_LOG": "debug",
+                "LANCE_LOG_TS_PRECISION": precision,
+            },
+        )
+        return output.stderr.decode("utf-8").splitlines()[0]
+
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z.*", get_sample_log_line("ns")
+    )
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z.*", get_sample_log_line("us")
+    )
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z.*", get_sample_log_line("ms")
+    )
+    assert re.match(
+        r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z.*", get_sample_log_line("s")
+    )

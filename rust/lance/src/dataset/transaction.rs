@@ -210,8 +210,8 @@ pub enum Operation {
         new_fragments: Vec<Fragment>,
         /// The fields that have been modified
         fields_modified: Vec<u32>,
-        /// The MemWAL (pre-image) that should be marked as flushed after this transaction
-        mem_wal_to_flush: Option<MemWal>,
+        /// The MemWAL (pre-image) that should be marked as merged after this transaction
+        mem_wal_to_merge: Option<MemWal>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -371,21 +371,21 @@ impl PartialEq for Operation {
                     updated_fragments: a_updated,
                     new_fragments: a_new,
                     fields_modified: a_fields,
-                    mem_wal_to_flush: a_mem_wal_to_flush,
+                    mem_wal_to_merge: a_mem_wal_to_merge,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
                     updated_fragments: b_updated,
                     new_fragments: b_new,
                     fields_modified: b_fields,
-                    mem_wal_to_flush: b_mem_wal_to_flush,
+                    mem_wal_to_merge: b_mem_wal_to_merge,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
-                    && a_mem_wal_to_flush == b_mem_wal_to_flush
+                    && a_mem_wal_to_merge == b_mem_wal_to_merge
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -1394,7 +1394,7 @@ impl Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush,
+                mem_wal_to_merge,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
                     if removed_fragment_ids.contains(&f.id) {
@@ -1423,17 +1423,17 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
-                if let Some(mem_wal_to_flush) = mem_wal_to_flush {
+                if let Some(mem_wal_to_merge) = mem_wal_to_merge {
                     update_mem_wal_index_in_indices_list(
                         self.read_version,
                         current_manifest.map_or(1, |m| m.version + 1),
                         &mut final_indices,
                         vec![],
                         vec![MemWal {
-                            state: lance_index::mem_wal::State::Flushed,
-                            ..mem_wal_to_flush.clone()
+                            state: lance_index::mem_wal::State::Merged,
+                            ..mem_wal_to_merge.clone()
                         }],
-                        vec![mem_wal_to_flush.clone()],
+                        vec![mem_wal_to_merge.clone()],
                     )?;
                 }
             }
@@ -2238,7 +2238,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush,
+                mem_wal_to_merge,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2250,7 +2250,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
-                mem_wal_to_flush: mem_wal_to_flush.map(|m| MemWal::try_from(m).unwrap()),
+                mem_wal_to_merge: mem_wal_to_merge.map(|m| MemWal::try_from(m).unwrap()),
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -2527,7 +2527,7 @@ impl From<&Transaction> for pb::Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush,
+                mem_wal_to_merge,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -2536,7 +2536,7 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 fields_modified: fields_modified.clone(),
-                mem_wal_to_flush: mem_wal_to_flush
+                mem_wal_to_merge: mem_wal_to_merge
                     .as_ref()
                     .map(pb::mem_wal_index_details::MemWal::from),
             }),

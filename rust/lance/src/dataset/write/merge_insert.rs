@@ -21,11 +21,29 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 
 use assign_action::merge_insert_action;
 
+use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
+use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::utils::CapturedRowIds;
+use crate::{
+    datafusion::dataframe::SessionContextExt,
+    dataset::{
+        fragment::{FileFragment, FragReadConfig},
+        transaction::{Operation, Transaction},
+        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+    },
+    index::DatasetIndexInternalExt,
+    io::exec::{
+        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
+    },
+    Dataset,
+};
 use arrow_array::{
     cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchIterator, StructArray,
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::common::NullEquality;
 use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
@@ -45,49 +63,23 @@ use datafusion::{
     prelude::DataFrame,
     scalar::ScalarValue,
 };
-use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{
-    chunker::chunk_stream,
-    dataframe::DataFrameExt,
-    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
-    utils::reader_to_stream,
-};
-use std::{
-    collections::{BTreeMap, HashSet},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, Mutex,
-    },
-    time::Duration,
-};
-
-use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
-use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::utils::CapturedRowIds;
-use crate::{
-    datafusion::dataframe::SessionContextExt,
-    dataset::{
-        fragment::{FileFragment, FragReadConfig},
-        transaction::{Operation, Transaction},
-        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
-    },
-    index::DatasetIndexInternalExt,
-    io::exec::{
-        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
-    },
-    Dataset,
-};
 use datafusion_physical_expr::expressions::Column;
 use futures::{
     stream::{self},
     Stream, StreamExt, TryStreamExt,
 };
+use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
     utils::{futures::Capacity, mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
+};
+use lance_datafusion::{
+    chunker::chunk_stream,
+    dataframe::DataFrameExt,
+    exec::{analyze_plan, get_session_context, LanceExecutionOptions},
+    utils::reader_to_stream,
 };
 use lance_datafusion::{
     exec::{execute_plan, OneShotExec},
@@ -101,6 +93,14 @@ use lance_table::format::{Fragment, Index, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 use tokio::task::JoinSet;
 
 mod assign_action;
@@ -231,9 +231,9 @@ struct MergeInsertParams {
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
     retry_timeout: Duration,
-    // If set, this MemWAL should be marked as flushed, and will be committed to replace the
+    // If set, this MemWAL should be marked as merged, and will be committed to replace the
     // MemWAL that is currently in the index with the same ID.
-    mem_wal_to_flush: Option<MemWal>,
+    mem_wal_to_merge: Option<MemWal>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -320,7 +320,7 @@ impl MergeInsertBuilder {
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
                 conflict_retries: 10,
                 retry_timeout: Duration::from_secs(30),
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
                 skip_auto_cleanup: false,
             },
         })
@@ -382,9 +382,9 @@ impl MergeInsertBuilder {
         self
     }
 
-    /// Indicate that this merge-insert uses data in a sealed MemTable.
-    /// Once write is completed, the corresponding MemTable should also be marked as flushed.
-    pub async fn mark_mem_wal_as_flushed(
+    /// Indicate that this merge-insert uses data in a flushed MemTable.
+    /// Once write is completed, the corresponding MemTable should also be marked as merged.
+    pub async fn mark_mem_wal_as_merged(
         &mut self,
         mem_wal_id: MemWalId,
         expected_owner_id: &str,
@@ -396,9 +396,9 @@ impl MergeInsertBuilder {
         {
             if let Some(generations) = mem_wal_index.mem_wal_map.get(mem_wal_id.region.as_str()) {
                 if let Some(mem_wal) = generations.get(&mem_wal_id.generation) {
-                    mem_wal.check_state(lance_index::mem_wal::State::Sealed)?;
+                    mem_wal.check_state(lance_index::mem_wal::State::Flushed)?;
                     mem_wal.check_expected_owner_id(expected_owner_id)?;
-                    self.params.mem_wal_to_flush = Some(mem_wal.clone());
+                    self.params.mem_wal_to_merge = Some(mem_wal.clone());
                     Ok(self)
                 } else {
                     Err(Error::invalid_input(
@@ -631,7 +631,7 @@ impl MergeInsertJob {
                 &JoinType::Full,
                 None,
                 PartitionMode::CollectLeft,
-                true,
+                NullEquality::NullEqualsNull,
             )
             .unwrap(),
         );
@@ -1358,7 +1358,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                mem_wal_to_flush: self.params.mem_wal_to_flush,
+                mem_wal_to_merge: self.params.mem_wal_to_merge,
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1428,7 +1428,7 @@ impl MergeInsertJob {
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
                 fields_modified: vec![],
-                mem_wal_to_flush: self.params.mem_wal_to_flush,
+                mem_wal_to_merge: self.params.mem_wal_to_merge,
             };
 
             let affected_rows = Some(RowIdTreeMap::from(removed_row_addrs));
@@ -3814,8 +3814,9 @@ mod tests {
       ProjectionExec: expr=[key@3 IS NOT NULL as __common_expr_1, _rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key]
         CoalesceBatchesExec...
           HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
-            row_id=true, row_addr=true, full_filter=--, refine_filter=--
+            CooperativeExec
+              LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, \
+              row_id=true, row_addr=true, full_filter=--, refine_filter=--
             RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
               StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
@@ -3861,7 +3862,8 @@ mod tests {
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+          CooperativeExec
+            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();
@@ -3907,7 +3909,8 @@ mod tests {
     ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, CASE WHEN key@3 IS NOT NULL AND _rowaddr@1 IS NOT NULL AND value@2 > 20 THEN 1 ELSE 0 END as __action]
       CoalesceBatchesExec...
         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4]
-          LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+          CooperativeExec
+            LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
         ).await.unwrap();

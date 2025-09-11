@@ -789,7 +789,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
-        let mem_wal_to_flush = self.params.mem_wal_to_flush.clone();
+        let mem_wal_to_merge = self.params.mem_wal_to_merge.clone();
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
             state.updating_row_ids.clone()
@@ -853,7 +853,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
-                mem_wal_to_flush,
+                mem_wal_to_merge,
             };
 
             // Step 5: Create and store the transaction

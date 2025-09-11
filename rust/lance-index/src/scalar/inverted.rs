@@ -184,7 +184,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             InvertedIndex::load(index_store, frag_reuse_index, cache).await?

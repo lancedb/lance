@@ -86,7 +86,7 @@ impl BitmapIndex {
     pub(crate) async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        _index_cache: LanceCache,
+        _index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
@@ -544,7 +544,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
@@ -638,7 +638,7 @@ pub mod tests {
 
         // Load the index using BitmapIndex::load
         tracing::info!("Loading index from disk...");
-        let loaded_index = BitmapIndex::load(Arc::new(test_store), None, LanceCache::no_cache())
+        let loaded_index = BitmapIndex::load(Arc::new(test_store), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load bitmap index");
 
@@ -786,7 +786,7 @@ pub mod tests {
             .unwrap();
 
         // Reload and check
-        let reloaded_idx = BitmapIndex::load(test_store, None, LanceCache::no_cache())
+        let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())
             .await
             .expect("Failed to load bitmap index");
 

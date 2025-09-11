@@ -78,7 +78,7 @@ fn bench_inverted(c: &mut Criterion) {
         })
     });
     let invert_index = rt
-        .block_on(InvertedIndex::load(store, None, LanceCache::no_cache()))
+        .block_on(InvertedIndex::load(store, None, &LanceCache::no_cache()))
         .unwrap();
 
     let params = FtsSearchParams::new().with_limit(Some(10));

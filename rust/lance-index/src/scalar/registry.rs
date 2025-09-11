@@ -149,7 +149,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
     /// Optional hook that plugins can use if they need to be aware of the registry

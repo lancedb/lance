@@ -43,6 +43,12 @@ impl Deref for GlobalIndexCache {
     }
 }
 
+impl DeepSizeOf for GlobalIndexCache {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.0.deep_size_of_children(context)
+    }
+}
+
 /// A type-safe wrapper around a LanceCache that enforces namespaces and keys
 /// for dataset-specific index data.
 pub struct DSIndexCache(pub(crate) LanceCache);

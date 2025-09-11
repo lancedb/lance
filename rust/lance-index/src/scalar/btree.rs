@@ -33,7 +33,7 @@ use datafusion::physical_plan::{
     union::UnionExec, ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
+use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
 use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
@@ -41,7 +41,7 @@ use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
 use lance_core::{
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
         mask::RowIdTreeMap,
@@ -755,7 +755,7 @@ impl CacheKey for BTreePageKey {
 #[derive(Clone, Debug)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
@@ -775,7 +775,7 @@ impl BTreeIndex {
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
-        index_cache: LanceCache,
+        index_cache: WeakLanceCache,
         sub_index: Arc<dyn BTreeSubIndex>,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
@@ -850,7 +850,7 @@ impl BTreeIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
         batch_size: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
@@ -864,7 +864,7 @@ impl BTreeIndex {
                 map,
                 null_pages,
                 store,
-                index_cache,
+                WeakLanceCache::from(index_cache),
                 sub_index,
                 batch_size,
                 frag_reuse_index,
@@ -914,7 +914,7 @@ impl BTreeIndex {
             map,
             null_pages,
             store,
-            index_cache,
+            WeakLanceCache::from(index_cache),
             sub_index,
             batch_size,
             frag_reuse_index,
@@ -924,7 +924,7 @@ impl BTreeIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
         let num_rows_in_lookup = page_lookup_file.num_rows();
@@ -1007,10 +1007,7 @@ impl BTreeIndex {
         // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
         // them back into a single partition.
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
-        let ordered = Arc::new(SortPreservingMergeExec::new(
-            LexOrdering::new(vec![sort_expr]),
-            all_data,
-        ));
+        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
 
         let unchunked = execute_plan(
             ordered,
@@ -1088,7 +1085,8 @@ impl Index for BTreeIndex {
             .buffer_unordered(get_num_compute_intensive_cpus());
 
         while let Some((page_idx, page)) = pages.try_next().await? {
-            self.index_cache
+            let inserted = self
+                .index_cache
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
@@ -1096,6 +1094,13 @@ impl Index for BTreeIndex {
                     Arc::new(CachedScalarIndex::new(page)),
                 )
                 .await;
+
+            if !inserted {
+                return Err(Error::Internal {
+                    message: "Failed to prewarm index: cache is no longer available".to_string(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())
@@ -2080,7 +2085,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
@@ -2099,7 +2104,7 @@ mod tests {
         physical_plan::{sorts::sort::SortExec, stream::RecordBatchStreamAdapter, ExecutionPlan},
     };
     use datafusion_common::{DataFusionError, ScalarValue};
-    use datafusion_physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_expr::{expressions::col, PhysicalSortExpr};
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap};
@@ -2163,7 +2168,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -2182,7 +2187,7 @@ mod tests {
             .await
             .unwrap();
 
-        let remap_index = BTreeIndex::load(remap_store.clone(), None, LanceCache::no_cache())
+        let remap_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -2233,7 +2238,7 @@ mod tests {
             .into_df_exec(RowCount::from(10), BatchCount::from(100));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
-        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let stream = break_stream(stream, 64);
         let stream = stream.map_err(DataFusionError::from);
@@ -2246,7 +2251,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(test_store, None, LanceCache::no_cache())
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -2275,7 +2280,7 @@ mod tests {
             .into_df_exec(RowCount::from(1000), BatchCount::from(10));
         let schema = data.schema();
         let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
-        let plan = Arc::new(SortExec::new(LexOrdering::new(vec![sort_expr]), data));
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let stream = break_stream(stream, 64);
         let stream = stream.map_err(DataFusionError::from);
@@ -2287,13 +2292,10 @@ mod tests {
             .await
             .unwrap();
 
-        let index = BTreeIndex::load(
-            test_store,
-            None,
-            LanceCache::with_capacity(100 * 1024 * 1024),
-        )
-        .await
-        .unwrap();
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(test_store, None, cache.as_ref())
+            .await
+            .unwrap();
 
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(0.0)));
         let metrics = LocalMetricsCollector::default();

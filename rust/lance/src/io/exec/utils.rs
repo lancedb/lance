@@ -431,6 +431,7 @@ mod tests {
 
     use arrow_array::{types::UInt32Type, RecordBatchReader};
     use arrow_schema::SortOptions;
+    use datafusion::common::NullEquality;
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
@@ -467,7 +468,7 @@ mod tests {
                 None,
                 JoinType::Inner,
                 vec![SortOptions::default()],
-                true,
+                NullEquality::NullEqualsNull,
             )
             .unwrap(),
         );

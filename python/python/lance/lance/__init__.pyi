@@ -106,6 +106,14 @@ class LanceFileWriter:
     def add_schema_metadata(self, key: str, value: str) -> None: ...
     def add_global_buffer(self, data: bytes) -> int: ...
 
+class LanceFileSession:
+    def __init__(
+        self, base_path: str, storage_options: Optional[Dict[str, str]] = None
+    ): ...
+    def open_reader(
+        self, path: str, columns: Optional[List[str]] = None
+    ) -> LanceFileReader: ...
+
 class LanceFileReader:
     def __init__(
         self,

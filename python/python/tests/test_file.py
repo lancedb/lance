@@ -7,7 +7,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from lance.file import LanceFileReader, LanceFileWriter
+from lance.file import LanceFileReader, LanceFileSession, LanceFileWriter
 
 
 def test_file_read_projection(tmp_path):
@@ -286,6 +286,21 @@ def test_round_trip_parquet(tmp_path):
     reader = LanceFileReader(str(lance_path))
     round_tripped = reader.read_all().to_table()
     assert round_tripped == table
+
+
+def test_read_with_session(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(path) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    with LanceFileWriter(tmp_path / "bar.lance") as writer:
+        writer.write_batch(pa.table({"a": [4, 5, 6]}))
+
+    session = LanceFileSession(tmp_path)
+    reader = session.open_reader("foo.lance")
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+
+    reader = session.open_reader("bar.lance")
+    assert reader.read_all().to_table() == pa.table({"a": [4, 5, 6]})
 
 
 def test_list_field_name(tmp_path):
