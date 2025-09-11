@@ -548,7 +548,7 @@ impl ScalarIndex for BloomFilterIndex {
             number_of_items: self.number_of_items,
             probability: self.probability,
         })?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(params))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(&params))
     }
 }
 
@@ -1208,6 +1208,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        _fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()

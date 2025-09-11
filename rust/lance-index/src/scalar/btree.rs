@@ -1253,7 +1253,7 @@ impl ScalarIndex for BTreeIndex {
         let params = serde_json::to_value(BTreeParameters {
             zone_size: Some(self.batch_size),
         })?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(params))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
 }
 
@@ -1534,6 +1534,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        _fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
