@@ -310,13 +310,13 @@ impl From<RabitQuantizer> for Quantizer {
     }
 }
 
-fn random_normal_matrix(n: usize) -> ndarray::Array2<f32> {
+fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
     let mut rng = rand::rng();
     let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
     ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
 }
 
-fn householder_qr(a: ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Array2<f32>) {
+fn householder_qr(a: ndarray::Array2<f64>) -> (ndarray::Array2<f64>, ndarray::Array2<f64>) {
     let (m, n) = a.dim();
     let mut q = ndarray::Array2::eye(m);
     let mut r = a;
@@ -325,7 +325,7 @@ fn householder_qr(a: ndarray::Array2<f32>) -> (ndarray::Array2<f32>, ndarray::Ar
         let mut x = r.slice(s![k.., k]).to_owned();
         let x_norm = x.dot(&x).sqrt();
 
-        if x_norm < f32::EPSILON {
+        if x_norm < f64::EPSILON {
             continue;
         }
 
@@ -365,6 +365,52 @@ where
     let a = random_normal_matrix(n);
     let (q, _) = householder_qr(a);
 
-    // cast f32 matrix to T::Native matrix
-    q.mapv(|v| T::Native::from_f32(v).unwrap())
+    // cast f64 matrix to T::Native matrix
+    q.mapv(|v| T::Native::from_f64(v).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_relative_eq;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(8)]
+    #[case(16)]
+    #[case(32)]
+    fn test_householder_qr(#[case] n: usize) {
+        let a = random_normal_matrix(n);
+        let (m, n) = a.dim();
+
+        let (q, r) = householder_qr(a.clone());
+
+        // Check Q is orthogonal: Q^T * Q should be identity
+        let q_t_q = q.t().dot(&q);
+        for i in 0..m {
+            for j in 0..m {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_relative_eq!(q_t_q[[i, j]], expected, epsilon = 1e-5);
+            }
+        }
+
+        // Check QR decomposition: Q * R should equal original matrix
+        let qr = q.dot(&r);
+        for i in 0..m {
+            for j in 0..n {
+                assert_relative_eq!(qr[[i, j]], a[[i, j]], epsilon = 1e-5);
+            }
+        }
+
+        // Check R is upper triangular
+        for i in 1..n.min(m) {
+            for j in 0..i {
+                assert_relative_eq!(r[[i, j]], 0.0, epsilon = 1e-5);
+            }
+        }
+
+        // Additional check: Q should have shape (m, m) and R should have shape (m, n)
+        assert_eq!(q.dim(), (m, m));
+        assert_eq!(r.dim(), (m, n));
+    }
 }
