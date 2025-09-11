@@ -16,7 +16,9 @@ use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
+use crate::scalar::{
+    BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
+};
 use crate::{pb, Any};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
@@ -614,6 +616,11 @@ impl ScalarIndex for ZoneMapIndex {
             TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
         )
     }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.max_zonemap_size))?;
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(params))
+    }
 }
 
 fn default_rows_per_zone() -> u64 {
@@ -642,8 +649,12 @@ impl Default for ZoneMapIndexBuilderParams {
 }
 
 impl ZoneMapIndexBuilderParams {
-    fn new(rows_per_zone: u64) -> Self {
+    pub fn new(rows_per_zone: u64) -> Self {
         Self { rows_per_zone }
+    }
+
+    pub fn rows_per_zone(&self) -> u64 {
+        self.rows_per_zone
     }
 }
 

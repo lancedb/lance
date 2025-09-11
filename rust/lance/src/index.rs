@@ -967,6 +967,13 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
 
     /// Return the fragments that are covered by each of the deltas of the index.
     async fn indexed_fragments(&self, idx_name: &str) -> Result<Vec<Vec<Fragment>>>;
+
+    /// Initialize a specific index on this dataset based on an index from a source dataset.
+    async fn initialize_index(&mut self, source_dataset: &Dataset, index_name: &str) -> Result<()>;
+
+    /// Initialize all indices on this dataset based on indices from a source dataset.
+    /// This will call `initialize_index` for each non-system index in the source dataset.
+    async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
 #[async_trait]
@@ -1460,6 +1467,110 @@ impl DatasetIndexInternalExt for Dataset {
                 Ok(indexed_frags)
             })
             .collect()
+    }
+
+    async fn initialize_index(&mut self, source_dataset: &Dataset, index_name: &str) -> Result<()> {
+        let source_indices = source_dataset.load_indices_by_name(index_name).await?;
+
+        if source_indices.is_empty() {
+            return Err(Error::Index {
+                message: format!("Index '{}' not found in source dataset", index_name),
+                location: location!(),
+            });
+        }
+
+        let source_index = source_indices
+            .iter()
+            .min_by_key(|idx| idx.created_at)
+            .ok_or_else(|| Error::Index {
+                message: format!("Could not determine oldest index for '{}'", index_name),
+                location: location!(),
+            })?;
+
+        let mut field_names = Vec::new();
+        for field_id in source_index.fields.iter() {
+            let source_field = source_dataset
+                .schema()
+                .field_by_id(*field_id)
+                .ok_or_else(|| Error::Index {
+                    message: format!("Field with id {} not found in source dataset", field_id),
+                    location: location!(),
+                })?;
+
+            let target_field =
+                self.schema()
+                    .field(&source_field.name)
+                    .ok_or_else(|| Error::Index {
+                        message: format!(
+                            "Field '{}' required by index '{}' not found in target dataset",
+                            source_field.name, index_name
+                        ),
+                        location: location!(),
+                    })?;
+
+            if source_field.data_type() != target_field.data_type() {
+                return Err(Error::Index {
+                    message: format!(
+                        "Field '{}' has different types in source ({:?}) and target ({:?}) datasets",
+                        source_field.name,
+                        source_field.data_type(),
+                        target_field.data_type()
+                    ),
+                    location: location!(),
+                });
+            }
+
+            field_names.push(source_field.name.as_str());
+        }
+
+        if field_names.is_empty() {
+            return Err(Error::Index {
+                message: format!("Index '{}' has no fields", index_name),
+                location: location!(),
+            });
+        }
+
+        if let Some(index_details) = &source_index.index_details {
+            let index_details_wrapper = IndexDetails(index_details.clone());
+
+            if index_details_wrapper.is_vector() {
+                vector::initialize_vector_index(self, source_dataset, source_index, &field_names)
+                    .await?;
+            } else {
+                scalar::initialize_scalar_index(self, source_dataset, source_index, &field_names)
+                    .await?;
+            }
+        } else {
+            log::warn!(
+                "Index '{}' has no index_details, skipping",
+                source_index.name
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()> {
+        let source_indices = source_dataset.load_indices().await?;
+        let non_system_indices: Vec<_> = source_indices
+            .iter()
+            .filter(|idx| !lance_index::is_system_index(idx))
+            .collect();
+
+        if non_system_indices.is_empty() {
+            return Ok(());
+        }
+
+        let mut unique_index_names = HashSet::new();
+        for index in non_system_indices.iter() {
+            unique_index_names.insert(index.name.clone());
+        }
+
+        for index_name in unique_index_names {
+            self.initialize_index(source_dataset, &index_name).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -3560,5 +3671,313 @@ mod tests {
             scalar_results.num_rows(),
             "Scalar query should return results on final dataset"
         );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_indices() {
+        use crate::dataset::Dataset;
+        use arrow_array::types::Float32Type;
+        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
+        use lance_linalg::distance::MetricType;
+        use std::collections::HashSet;
+        use tempfile::tempdir;
+
+        // Create source dataset with various index types
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Generate test data using lance_datagen (need at least 256 rows for PQ training)
+        let source_reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .col(
+                "text",
+                array::cycle_utf8_literals(&["hello world", "foo bar", "test data"]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+
+        // Create source dataset
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create indices on source dataset
+        // 1. Vector index
+        let vector_params = VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 10);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &vector_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // 2. FTS index
+        let fts_params = InvertedIndexParams::default();
+        source_dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".to_string()),
+                &fts_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // 3. Scalar index
+        let scalar_params = ScalarIndexParams::default();
+        source_dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload source dataset to get updated index metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+
+        // Verify source has 3 indices
+        let source_indices = source_dataset.load_indices().await.unwrap();
+        assert_eq!(
+            source_indices.len(),
+            3,
+            "Source dataset should have 3 indices"
+        );
+
+        // Create target dataset with same schema but different data (need at least 256 rows for PQ)
+        let target_reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .col(
+                "text",
+                array::cycle_utf8_literals(&["foo bar", "test data", "hello world"]),
+            )
+            .col("id", array::step_custom::<Int32Type>(100, 1))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize indices from source dataset
+        target_dataset
+            .initialize_indices(&source_dataset)
+            .await
+            .unwrap();
+
+        // Verify target has same indices
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(
+            target_indices.len(),
+            3,
+            "Target dataset should have 3 indices after initialization"
+        );
+
+        // Check index names match
+        let source_names: HashSet<String> =
+            source_indices.iter().map(|idx| idx.name.clone()).collect();
+        let target_names: HashSet<String> =
+            target_indices.iter().map(|idx| idx.name.clone()).collect();
+        assert_eq!(
+            source_names, target_names,
+            "Index names should match between source and target"
+        );
+
+        // Verify indices are functional by running queries
+        // 1. Test vector index
+        let query_vector = generate_random_array(8);
+        let search_results = target_dataset
+            .scan()
+            .nearest("vector", &query_vector, 5)
+            .unwrap()
+            .limit(Some(5), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(
+            search_results.num_rows() > 0,
+            "Vector index should be functional"
+        );
+
+        // 2. Test scalar index
+        let scalar_results = target_dataset
+            .scan()
+            .filter("id = 125")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_results.num_rows(),
+            1,
+            "Scalar index should find exact match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_indices_with_missing_field() {
+        use crate::dataset::Dataset;
+        use arrow_array::types::Int32Type;
+        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_index::scalar::ScalarIndexParams;
+        use tempfile::tempdir;
+
+        // Test that initialize_indices handles missing fields gracefully
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset with extra field
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("extra", array::cycle_utf8_literals(&["test"]))
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create index on extra field in source
+        source_dataset
+            .create_index(
+                &["extra"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create target dataset without extra field
+        let target_reader = lance_datagen::gen_batch()
+            .col("id", array::step_custom::<Int32Type>(10, 1))
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize indices should skip the index on missing field with an error
+        let result = target_dataset.initialize_indices(&source_dataset).await;
+
+        // Should fail when field is missing
+        assert!(result.is_err(), "Should error when field is missing");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in target dataset"));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_single_index() {
+        use crate::dataset::Dataset;
+        use crate::index::vector::VectorIndexParams;
+        use arrow_array::types::{Float32Type, Int32Type};
+        use lance_datagen::{array, BatchCount, RowCount};
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_linalg::distance::MetricType;
+        use tempfile::tempdir;
+
+        let test_dir = tempdir().unwrap();
+        let source_uri = test_dir.path().join("source").to_str().unwrap().to_string();
+        let target_uri = test_dir.path().join("target").to_str().unwrap().to_string();
+
+        // Create source dataset (need at least 256 rows for PQ training)
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("name", array::rand_utf8(4.into(), false))
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Create multiple indices on source
+        let scalar_params = ScalarIndexParams::default();
+        source_dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_index".to_string()),
+                &scalar_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let vector_params = VectorIndexParams::ivf_pq(16, 8, 4, MetricType::L2, 50);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_index".to_string()),
+                &vector_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Reload source dataset to get updated index metadata
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+
+        // Create target dataset with same schema
+        let target_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("name", array::rand_utf8(4.into(), false))
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        // Initialize only the vector index
+        target_dataset
+            .initialize_index(&source_dataset, "vector_index")
+            .await
+            .unwrap();
+
+        // Verify only vector index was created
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 1, "Should have only 1 index");
+        assert_eq!(
+            target_indices[0].name, "vector_index",
+            "Should have the vector index"
+        );
+
+        // Initialize the scalar index
+        target_dataset
+            .initialize_index(&source_dataset, "id_index")
+            .await
+            .unwrap();
+
+        // Verify both indices now exist
+        let target_indices = target_dataset.load_indices().await.unwrap();
+        assert_eq!(target_indices.len(), 2, "Should have 2 indices");
+
+        let index_names: HashSet<String> =
+            target_indices.iter().map(|idx| idx.name.clone()).collect();
+        assert!(
+            index_names.contains("vector_index"),
+            "Should have vector index"
+        );
+        assert!(index_names.contains("id_index"), "Should have id index");
+
+        // Test error case - non-existent index
+        let result = target_dataset
+            .initialize_index(&source_dataset, "non_existent")
+            .await;
+        assert!(result.is_err(), "Should error for non-existent index");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in source dataset"));
     }
 }
