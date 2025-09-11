@@ -463,11 +463,12 @@ impl RefOperations<BranchContents> for Branches {
 impl Branches {
     /// Clean up empty parent directories using 4-step algorithm
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
-        // Step 1: Get all branch_name as a vector
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
 
-        if let Some(delete_path) = self.get_cleanup_path(branch, &remaining_branches)? {
+        if let Some(delete_path) =
+            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.dataset_location)?
+        {
             if let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await {
                 match &e {
                     Error::IO { source, .. } => {
@@ -488,7 +489,11 @@ impl Branches {
         Ok(())
     }
 
-    fn get_cleanup_path(&self, branch: &str, remaining_branches: &[&str]) -> Result<Option<Path>> {
+    fn get_cleanup_path(
+        branch: &str,
+        remaining_branches: &[&str],
+        dataset_location: &DatasetLocation,
+    ) -> Result<Option<Path>> {
         let mut longest_used_length = 0;
         for &candidate in remaining_branches {
             let common_len = branch
@@ -501,16 +506,20 @@ impl Branches {
                 longest_used_length = common_len;
             }
         }
+        // Means this branch path is used as a prefix of other branches
         if longest_used_length == branch.len() {
             return Ok(None);
         }
 
-        let unused_dir = &branch[longest_used_length..];
-        if let Some(dir) = unused_dir.split('/').next() {
-            let dir_location = self
-                .refs
-                .dataset_location
-                .switch_branch(Some(dir.to_string()))?;
+        let mut used_relative_path = &branch[..longest_used_length];
+        if let Some(last_slash_index) = used_relative_path.rfind('/') {
+            used_relative_path = &used_relative_path[..last_slash_index];
+        }
+        let unused_dir = &branch[used_relative_path.len()..].trim_start_matches('/');
+        if let Some(sub_dir) = unused_dir.split('/').next() {
+            let relative_dir = format!("{}/{}", used_relative_path, sub_dir);
+            // Use dataset_location to generate the cleanup path
+            let dir_location = dataset_location.switch_branch(Some(relative_dir))?;
             Ok(Some(dir_location.base_path().clone()))
         } else {
             Ok(None)
@@ -893,5 +902,63 @@ mod tests {
         assert_eq!(deserialized.branch, tag_contents.branch);
         assert_eq!(deserialized.version, tag_contents.version);
         assert_eq!(deserialized.manifest_size, tag_contents.manifest_size);
+    }
+
+    #[rstest]
+    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
+    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
+    #[case("a/b/c", &["a/b/d", "a/e"], Some("a/b/c"))]
+    #[case("feature/auth", &["feature/auth/sub"], None)]
+    #[case("feature", &["feature/sub1", "feature/sub2"], None)]
+    #[case("a/b", &["a/b/c", "a/b/d"], None)]
+    #[case("main", &[], Some("main"))]
+    #[case("a", &["a"], None)]
+    #[case("single", &["other"], Some("single"))]
+    #[case("feature/auth/login/oauth", &["feature/auth/login/basic", "feature/auth/signup"], Some("feature/auth/login/oauth"))]
+    #[case("feature/user-auth", &["feature/user-signup"], Some("feature/user-auth"))]
+    #[case("release/2024.01", &["release/2024.02"], Some("release/2024.01"))]
+    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
+    #[case("feature", &["bugfix", "hotfix"], Some("feature"))]
+    #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
+    fn test_get_cleanup_path(
+        #[case] branch_to_delete: &str,
+        #[case] remaining_branches: &[&str],
+        #[case] expected_relative_cleanup_path: Option<&str>,
+    ) {
+        let dataset_root_dir = "file:///var/balabala/dataset1".to_string();
+        let dataset_location = DatasetLocation::new(
+            dataset_root_dir.clone(),
+            Path::from(dataset_root_dir.clone()),
+            Some("random_branch".to_string()),
+        )
+        .unwrap();
+
+        let result =
+            Branches::get_cleanup_path(branch_to_delete, remaining_branches, &dataset_location)
+                .unwrap();
+
+        match expected_relative_cleanup_path {
+            Some(expected_relative) => {
+                assert!(
+                    result.is_some(),
+                    "Expected cleanup path but got None for branch: {}",
+                    branch_to_delete
+                );
+                let expected_full_path = dataset_location
+                    .switch_branch(Some(expected_relative.to_string()))
+                    .unwrap()
+                    .base_path()
+                    .clone();
+                assert_eq!(result.unwrap().as_ref(), expected_full_path.as_ref());
+            }
+            None => {
+                assert!(
+                    result.is_none(),
+                    "Expected no cleanup but got: {:?} for branch: {}",
+                    result,
+                    branch_to_delete
+                );
+            }
+        }
     }
 }

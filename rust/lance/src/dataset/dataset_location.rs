@@ -276,6 +276,23 @@ mod tests {
             another_multi_branch.base.uri,
             "file:///data/tree/bugfix/login/issue"
         );
+
+        // Test switching to a branch with multiple slashes
+        let slash_branch_location = location
+            .switch_branch(Some("feature///auth/module".to_string()))
+            .unwrap();
+        assert_eq!(
+            slash_branch_location.branch,
+            Some("feature///auth/module".to_string())
+        );
+        assert_eq!(
+            slash_branch_location.base.uri,
+            "file:///data/tree/feature/auth/module"
+        );
+        assert_eq!(
+            slash_branch_location.base.path.as_ref(),
+            "data/tree/feature/auth/module"
+        )
     }
 
     #[test]
@@ -314,18 +331,18 @@ mod tests {
     fn test_dataset_location_blobs_with_branch() {
         // Test blobs location with branch
         let branch_location = DatasetLocation::new(
-            "file:///data/tree/mybranch".to_string(),
-            Path::from("data/tree/mybranch"),
-            Some("mybranch".to_string()),
+            "file:///data/tree/branch".to_string(),
+            Path::from("data/tree/branch"),
+            Some("branch".to_string()),
         )
         .unwrap();
 
         let blobs_location = branch_location.blobs_location().unwrap();
         assert_eq!(
             blobs_location.base.uri,
-            format!("file:///data/tree/mybranch/{}", BLOB_DIR)
+            format!("file:///data/tree/branch/{}", BLOB_DIR)
         );
-        assert_eq!(blobs_location.branch, Some("mybranch".to_string()));
+        assert_eq!(blobs_location.branch, Some("branch".to_string()));
         assert_eq!(blobs_location.root.uri, "file:///data");
     }
 
