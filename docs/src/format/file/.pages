@@ -1,2 +1,4 @@
 nav:
-  - index.md
+  - Specification: index.md
+  - Encoding: encoding.md
+  - Versioning: versioning.md
