@@ -271,6 +271,7 @@ impl VectorIndexParams {
             (1, _, Some(StageParams::Ivf(_))) => IndexType::IvfFlat,
             (2, _, Some(StageParams::PQ(_))) => IndexType::IvfPq,
             (2, _, Some(StageParams::SQ(_))) => IndexType::IvfSq,
+            (2, _, Some(StageParams::RQ(_))) => IndexType::IvfRq,
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
