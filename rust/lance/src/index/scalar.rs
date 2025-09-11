@@ -21,7 +21,6 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
-use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::inverted::{InvertedIndexPlugin, METADATA_FILE};
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
@@ -290,30 +289,6 @@ pub(super) async fn build_scalar_index(
 
     plugin
         .train_index(training_data, &index_store, training_request)
-        .await
-}
-
-/// Build a Scalar Index
-#[instrument(level = "debug", skip_all)]
-pub(super) async fn build_inverted_index(
-    dataset: &Dataset,
-    column: &str,
-    uuid: &str,
-    params: &InvertedIndexParams,
-    train: bool,
-    fragment_ids: Option<Vec<u32>>,
-) -> Result<CreatedIndex> {
-    let data = load_training_data(
-        dataset,
-        column,
-        &TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-        None,
-        train,
-        fragment_ids.clone(),
-    )
-    .await?;
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
-    InvertedIndexPlugin::train_inverted_index(data, &index_store, params.clone(), fragment_ids)
         .await
 }
 

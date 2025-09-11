@@ -15,7 +15,7 @@ use crate::{
         Dataset,
     },
     index::{
-        scalar::{build_inverted_index, build_scalar_index},
+        scalar::build_scalar_index,
         vector::{
             build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
         },
@@ -217,23 +217,17 @@ impl<'a> CreateIndexBuilder<'a> {
                         location: location!(),
                     })?;
 
-                build_inverted_index(
+                let params =
+                    ScalarIndexParams::new("inverted".to_string()).with_params(inverted_params);
+                build_scalar_index(
                     self.dataset,
                     column,
                     &index_id.to_string(),
-                    inverted_params,
+                    &params,
                     train,
                     self.fragments.clone(),
                 )
-                .await?;
-                // Return a CreatedIndex for consistency
-                CreatedIndex {
-                    index_details: prost_types::Any::from_msg(
-                        &lance_index::pb::InvertedIndexDetails::try_from(inverted_params)?,
-                    )
-                    .unwrap(),
-                    index_version: lance_index::scalar::inverted::INVERTED_INDEX_VERSION,
-                }
+                .await?
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.

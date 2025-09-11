@@ -109,15 +109,18 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
-        if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return Err(Error::InvalidInput {
+        match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => (),
+            DataType::List(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            DataType::LargeList(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            _ => return Err(Error::InvalidInput {
                 source: format!(
-                    "A ngram index can only be created on a Utf8 or LargeUtf8 field.  Column has type {:?}",
+                    "An inverted index can only be created on a Utf8 or LargeUtf8 field. Column has type {:?}",
                     field.data_type()
                 )
-                .into(),
+                    .into(),
                 location: location!(),
-            });
+            })
         }
 
         let params = serde_json::from_str::<InvertedIndexParams>(params)?;
