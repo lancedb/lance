@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 /// Options for optimizing all indices.
 #[derive(Debug)]
@@ -28,12 +17,66 @@ pub struct OptimizeOptions {
     /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
     /// and accumulate a few delta indices, then merge them into the snapshot.
     pub num_indices_to_merge: usize,
+
+    /// the index names to optimize. If None, all indices will be optimized.
+    pub index_names: Option<Vec<String>>,
+
+    /// whether to retrain the whole index. Default: false.
+    ///
+    /// If true, the index will be retrained based on the current data,
+    /// `num_indices_to_merge` will be ignored, and all indices will be merged into one.
+    /// If false, the index will be optimized by merging `num_indices_to_merge` indices.
+    ///
+    /// This is useful when the data distribution has changed significantly,
+    /// and we want to retrain the index to improve the search quality.
+    /// This would be faster than re-create the index from scratch.
+    ///
+    /// NOTE: this option is only supported for v3 vector indices.
+    pub retrain: bool,
 }
 
 impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
             num_indices_to_merge: 1,
+            index_names: None,
+            retrain: false,
         }
+    }
+}
+
+impl OptimizeOptions {
+    pub fn new() -> Self {
+        Self {
+            num_indices_to_merge: 1,
+            index_names: None,
+            retrain: false,
+        }
+    }
+
+    pub fn append() -> Self {
+        Self {
+            num_indices_to_merge: 0,
+            index_names: None,
+            retrain: false,
+        }
+    }
+
+    pub fn retrain() -> Self {
+        Self {
+            num_indices_to_merge: 0,
+            index_names: None,
+            retrain: true,
+        }
+    }
+
+    pub fn num_indices_to_merge(mut self, num: usize) -> Self {
+        self.num_indices_to_merge = num;
+        self
+    }
+
+    pub fn index_names(mut self, names: Vec<String>) -> Self {
+        self.index_names = Some(names);
+        self
     }
 }

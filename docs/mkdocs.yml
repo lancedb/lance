@@ -1,0 +1,72 @@
+site_name: Lance
+site_description: Modern columnar data format for ML and LLMs
+site_url: https://lancedb.github.io/lance/
+docs_dir: src
+
+repo_name: lancedb/lance
+repo_url: https://github.com/lancedb/lance
+
+theme:
+  name: material
+  logo: logo/white.png
+  favicon: logo/logo.png
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.instant
+    - navigation.indexes
+    - navigation.tracking
+    - navigation.top
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - awesome-pages
+  - mkdocs_protobuf:
+      proto_dir: ../protos
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/lancedb/lance
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/zMM32dvNtd
+    - icon: fontawesome/brands/twitter
+      link: https://twitter.com/lancedb
+

@@ -1,28 +1,21 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Metadata for index
 
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 use super::pb;
 use lance_core::{Error, Result};
 
 /// Index metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Index {
     /// Unique ID across all dataset versions.
     pub uuid: Uuid,
@@ -38,14 +31,59 @@ pub struct Index {
 
     /// The fragment ids this index covers.
     ///
+    /// This may contain fragment ids that no longer exist in the dataset.
+    ///
     /// If this is None, then this is unknown.
     pub fragment_bitmap: Option<RoaringBitmap>,
+
+    /// Metadata specific to the index type
+    ///
+    /// This is an Option because older versions of Lance may not have this defined.  However, it should always
+    /// be present in newer versions.
+    pub index_details: Option<Arc<prost_types::Any>>,
+
+    /// The index version.
+    pub index_version: i32,
+
+    /// Timestamp when the index was created
+    ///
+    /// This field is optional for backward compatibility. For existing indices created before
+    /// this field was added, this will be None.
+    pub created_at: Option<DateTime<Utc>>,
+
+    /// The base path index of the index files. Used when the index is imported or referred from another dataset.
+    /// Lance uses it as key of the base_paths field in Manifest to determine the actual base path of the index files.
+    pub base_id: Option<u32>,
 }
 
-impl TryFrom<&pb::IndexMetadata> for Index {
+impl Index {
+    pub fn effective_fragment_bitmap(
+        &self,
+        existing_fragments: &RoaringBitmap,
+    ) -> Option<RoaringBitmap> {
+        let fragment_bitmap = self.fragment_bitmap.as_ref()?;
+        Some(fragment_bitmap & existing_fragments)
+    }
+}
+
+impl DeepSizeOf for Index {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.uuid.as_bytes().deep_size_of_children(context)
+            + self.fields.deep_size_of_children(context)
+            + self.name.deep_size_of_children(context)
+            + self.dataset_version.deep_size_of_children(context)
+            + self
+                .fragment_bitmap
+                .as_ref()
+                .map(|fragment_bitmap| fragment_bitmap.serialized_size())
+                .unwrap_or(0)
+    }
+}
+
+impl TryFrom<pb::IndexMetadata> for Index {
     type Error = Error;
 
-    fn try_from(proto: &pb::IndexMetadata) -> Result<Self> {
+    fn try_from(proto: pb::IndexMetadata) -> Result<Self> {
         let fragment_bitmap = if proto.fragment_bitmap.is_empty() {
             None
         } else {
@@ -55,18 +93,23 @@ impl TryFrom<&pb::IndexMetadata> for Index {
         };
 
         Ok(Self {
-            uuid: proto
-                .uuid
-                .as_ref()
-                .map(Uuid::try_from)
-                .ok_or_else(|| Error::IO {
-                    message: "uuid field does not exist in Index metadata".to_string(),
-                    location: location!(),
-                })??,
-            name: proto.name.clone(),
-            fields: proto.fields.clone(),
+            uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
+                Error::io(
+                    "uuid field does not exist in Index metadata".to_string(),
+                    location!(),
+                )
+            })??,
+            name: proto.name,
+            fields: proto.fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
+            index_details: proto.index_details.map(Arc::new),
+            index_version: proto.index_version.unwrap_or_default(),
+            created_at: proto.created_at.map(|ts| {
+                DateTime::from_timestamp_millis(ts as i64)
+                    .expect("Invalid timestamp in index metadata")
+            }),
+            base_id: proto.base_id,
         })
     }
 }
@@ -89,14 +132,13 @@ impl From<&Index> for pb::IndexMetadata {
             fields: idx.fields.clone(),
             dataset_version: idx.dataset_version,
             fragment_bitmap,
+            index_details: idx
+                .index_details
+                .as_ref()
+                .map(|details| details.as_ref().clone()),
+            index_version: Some(idx.index_version),
+            created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
+            base_id: idx.base_id,
         }
     }
 }
-//
-// impl From<&Vec<Index>> for pb::IndexSection {
-//     fn from(indices: &Vec<Index>) -> Self {
-//         Self {
-//             indices: indices.iter().map(pb::IndexMetadata::from).collect(),
-//         }
-//     }
-// }

@@ -1,18 +1,7 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 /// A level of SIMD support for some feature
 pub enum SimdSupport {
@@ -21,31 +10,41 @@ pub enum SimdSupport {
     Sse,
     Avx2,
     Avx512,
+    Lsx,
+    Lasx,
 }
 
-lazy_static! {
-    /// Support for FP16 SIMD operations
-    pub static ref FP16_SIMD_SUPPORT: SimdSupport = {
-        #[cfg(target_arch = "aarch64")]
-        {
-            if aarch64::has_neon_f16_support() {
-                SimdSupport::Neon
-            } else {
-                SimdSupport::None
-            }
+/// Support for FP16 SIMD operations
+pub static FP16_SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if aarch64::has_neon_f16_support() {
+            SimdSupport::Neon
+        } else {
+            SimdSupport::None
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if x86::has_avx512_f16_support() {
-                SimdSupport::Avx512
-            } else if is_x86_feature_detected!("avx2") {
-                SimdSupport::Avx2
-            } else {
-                SimdSupport::None
-            }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86::has_avx512_f16_support() {
+            SimdSupport::Avx512
+        } else if is_x86_feature_detected!("avx2") {
+            SimdSupport::Avx2
+        } else {
+            SimdSupport::None
         }
-    };
-}
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        if loongarch64::has_lasx_support() {
+            SimdSupport::Lasx
+        } else if loongarch64::has_lsx_support() {
+            SimdSupport::Lsx
+        } else {
+            SimdSupport::None
+        }
+    }
+});
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
@@ -88,5 +87,34 @@ mod aarch64 {
         // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/aarch64/mod.rs#L533
         let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
         flags & libc::HWCAP_FPHP != 0
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+mod aarch64 {
+    pub fn has_neon_f16_support() -> bool {
+        // https://github.com/lancedb/lance/issues/2411
+        false
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+mod loongarch64 {
+    pub fn has_lsx_support() -> bool {
+        // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/loongarch64/mod.rs#L263
+        let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        flags & libc::HWCAP_LOONGARCH_LSX != 0
+    }
+    pub fn has_lasx_support() -> bool {
+        // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/loongarch64/mod.rs#L264
+        let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        flags & libc::HWCAP_LOONGARCH_LASX != 0
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "android"))]
+mod aarch64 {
+    pub fn has_neon_f16_support() -> bool {
+        false
     }
 }

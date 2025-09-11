@@ -1,27 +1,18 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::types::Float32Type;
+mod sq;
+
 use arrow_array::Float32Array;
-use std::sync::Arc;
+use arrow_array::{types::Float32Type, FixedSizeListArray};
+use lance_arrow::FixedSizeListArrayExt;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_index::vector::ivf::{Ivf, IvfImpl};
-use lance_linalg::{distance::MetricType, MatrixView};
+use lance_index::vector::ivf::IvfTransformer;
+use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
 
 fn bench_partitions(c: &mut Criterion) {
@@ -31,22 +22,19 @@ fn bench_partitions(c: &mut Criterion) {
     let query: Float32Array = generate_random_array_with_seed::<Float32Type>(DIMENSION, SEED);
 
     for num_centroids in &[10240, 65536] {
-        let centroids = Arc::new(generate_random_array_with_seed::<Float32Type>(
-            num_centroids * DIMENSION,
-            SEED,
-        ));
-        let matrix = MatrixView::<Float32Type>::new(centroids.clone(), DIMENSION);
+        let centroids =
+            generate_random_array_with_seed::<Float32Type>(num_centroids * DIMENSION, SEED);
+        let fsl = FixedSizeListArray::try_new_from_values(centroids, DIMENSION as i32).unwrap();
 
         for k in &[1, 10, 50] {
-            let ivf = IvfImpl::new(matrix.clone(), MetricType::L2, "vector", vec![], None);
-
+            let ivf = IvfTransformer::new(fsl.clone(), DistanceType::L2, vec![]);
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
                     let _ = ivf.find_partitions(&query, *k);
                 })
             });
 
-            let ivf = IvfImpl::new(matrix.clone(), MetricType::Cosine, "vector", vec![], None);
+            let ivf = IvfTransformer::new(fsl.clone(), DistanceType::Cosine, vec![]);
             c.bench_function(
                 format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
                 |b| {
@@ -56,6 +44,14 @@ fn bench_partitions(c: &mut Criterion) {
                 },
             );
         }
+
+        let ivf = IvfTransformer::new(fsl.clone(), DistanceType::L2, vec![]);
+        let batch = generate_random_array_with_seed::<Float32Type>(DIMENSION * 4096, SEED);
+        let fsl = FixedSizeListArray::try_new_from_values(batch, DIMENSION as i32).unwrap();
+        c.bench_function(
+            format!("compute_partitions: IVF{},L2,n={}", num_centroids, 4096).as_str(),
+            |b| b.iter(|| ivf.compute_partitions(&fsl)),
+        );
     }
 }
 

@@ -1,15 +1,5 @@
-#  Copyright 2023 Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 
 """Tests for predicate pushdown"""
@@ -91,10 +81,15 @@ def test_sql_predicates(dataset):
         ("int >= 50", 50),
         ("int = 50", 1),
         ("int != 50", 99),
+        ("int BETWEEN 50 AND 60", 11),
         ("float < 30.0", 45),
         ("str = 'aa'", 16),
         ("str in ('aa', 'bb')", 26),
         ("rec.bool", 50),
+        ("rec.bool is true", 50),
+        ("rec.bool is not true", 50),
+        ("rec.bool is false", 50),
+        ("rec.bool is not false", 50),
         ("rec.date = cast('2021-01-01' as date)", 1),
         ("rec.dt = cast('2021-01-01 00:00:00' as timestamp(6))", 1),
         ("rec.dt = cast('2021-01-01 00:00:00' as timestamp)", 1),
@@ -111,6 +106,22 @@ def test_sql_predicates(dataset):
 
     for expr, expected_num_rows in predicates_nrows:
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
+
+
+def test_illegal_predicates(dataset):
+    bad_parse = [
+        "str BETWEEN 10 AND 20",
+        "str > 10",
+        "str AN",
+        "🥞",
+    ]
+    for expr in bad_parse:
+        with pytest.raises(ValueError, match="Invalid user input: *"):
+            dataset.to_table(filter=expr)
+    with pytest.raises(ValueError, match="No field named foo"):
+        dataset.to_table(filter="foo = 7")
+    with pytest.raises(ValueError, match="does not return a boolean"):
+        dataset.to_table(filter="int")
 
 
 def test_compound(dataset):
@@ -177,9 +188,9 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
         result, pd.DataFrame([{"ALLCAPSNAME": 1, "other": 3}])
     )
 
-    table = pa.table({
-        "Nested with Space": pa.array([{"Inner With Caps": i} for i in range(3)])
-    })
+    table = pa.table(
+        {"Nested with Space": pa.array([{"Inner With Caps": i} for i in range(3)])}
+    )
     _ = lance.write_dataset(table, tmp_path / "test_escaped_name_nested_and_capped")
 
     dataset = lance.dataset(tmp_path / "test_escaped_name_nested_and_capped")
@@ -193,9 +204,9 @@ def test_escaped_name(tmp_path: Path, provide_pandas: bool):
 
 def test_functions(tmp_path: Path):
     # Ensure that we can use complex functions
-    table = pa.table({
-        "genres": [["action", "comedy"], ["anime", "drama"], ["adventure"]]
-    })
+    table = pa.table(
+        {"genres": [["action", "comedy"], ["anime", "drama"], ["adventure"]]}
+    )
     expected = table.slice(1, 2)
     dataset = lance.write_dataset(table, tmp_path / "test_neg_expr")
     assert (
@@ -238,6 +249,24 @@ def create_table_for_duckdb(nvec=10000, ndim=768):
     return tbl
 
 
+def test_datatypes(tmp_path):
+    table = pa.table(
+        {
+            "binary": pa.array([b"abc", None], type=pa.binary()),
+            "largebin": pa.array([b"abc", None], type=pa.large_binary()),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+
+    for filter, expected_matches in [
+        ("binary = X'616263'", 1),
+        ("binary is NULL", 1),
+        ("largebin = X'616263'", 1),
+        ("largebin is NULL", 1),
+    ]:
+        assert dataset.count_rows(filter=filter) == expected_matches
+
+
 def test_duckdb(tmp_path):
     duckdb = pytest.importorskip("duckdb")
     tbl = create_table_for_duckdb()
@@ -266,3 +295,35 @@ def test_duckdb(tmp_path):
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()
     expected = expected[expected.meta == "aa"].reset_index(drop=True)
     tm.assert_frame_equal(actual, expected)
+
+
+def test_struct_field_order(tmp_path):
+    """
+    This test regresses some old behavior where the order of struct fields would get
+    messed up due to late materialization and we would get {y,x} instead of {x,y}
+    """
+    data = pa.table({"struct": [{"x": i, "y": i} for i in range(10)]})
+    dataset = lance.write_dataset(data, tmp_path)
+
+    for late_materialization in [True, False]:
+        result = dataset.to_table(
+            filter="struct.y > 5", late_materialization=late_materialization
+        )
+        expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
+        assert result == expected
+
+
+@pytest.mark.skip(
+    reason="enable this in recurring test https://github.com/lancedb/lance/pull/4190"
+    " as it requires release mode"
+)
+def test_filter_depth_limit():
+    column_name = "a_very_long_column_name"
+    ds = lance.write_dataset(pa.table({column_name: [1, 2]}), "memory://")
+    ds.create_scalar_index(column_name, "BTREE")
+
+    filter = " AND ".join([f"{column_name} = {i}" for i in range(500)])
+    ds.to_table(filter=filter)
+    with pytest.raises(ValueError, match="the filter expression is too long"):
+        filter = " AND ".join([f"{column_name} = {i}" for i in range(501)])
+        ds.to_table(filter=filter)

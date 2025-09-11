@@ -1,27 +1,123 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+use lance_datafusion::utils::{
+    ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+    IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+};
+use lance_index::metrics::MetricsCollector;
+use lance_io::scheduler::ScanScheduler;
+use lance_table::format::Index;
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+use pin_project::pin_project;
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
-use arrow_array::RecordBatch;
+use arrow::array::AsArray;
+use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
-use lance_core::utils::futures::{Capacity, SharedStream, SharedStreamExt};
+use lance_core::utils::futures::{Capacity, SharedStreamExt};
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
+use lance_core::{Result, ROW_ID};
+use lance_index::prefilter::FilterLoader;
+use snafu::location;
+
+use crate::index::prefilter::DatasetPreFilter;
+use crate::Dataset;
+
+#[derive(Debug, Clone)]
+pub enum PreFilterSource {
+    /// The prefilter input is an array of row ids that match the filter condition
+    FilteredRowIds(Arc<dyn ExecutionPlan>),
+    /// The prefilter input is a selection vector from an index query
+    ScalarIndexQuery(Arc<dyn ExecutionPlan>),
+    /// There is no prefilter
+    None,
+}
+
+pub(crate) fn build_prefilter(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    index_meta: &[Index],
+) -> Result<Arc<DatasetPreFilter>> {
+    let prefilter_loader = match &prefilter_source {
+        PreFilterSource::FilteredRowIds(src_node) => {
+            let stream = src_node.execute(partition, context)?;
+            Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+        }
+        PreFilterSource::ScalarIndexQuery(src_node) => {
+            let stream = src_node.execute(partition, context)?;
+            Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+        }
+        PreFilterSource::None => None,
+    };
+    Ok(Arc::new(DatasetPreFilter::new(
+        ds,
+        index_meta,
+        prefilter_loader,
+    )))
+}
+
+// Utility to convert an input (containing row ids) into a prefilter
+pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
+
+#[async_trait]
+impl FilterLoader for FilteredRowIdsToPrefilter {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+        let mut allow_list = RowIdTreeMap::new();
+        while let Some(batch) = self.0.next().await {
+            let batch = batch?;
+            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
+                message: "input batch missing row id column even though it is in the schema for the stream".into(),
+                location: location!(),
+            })?;
+            let row_ids = row_ids
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("row id column in input batch had incorrect type");
+            allow_list.extend(row_ids.iter().flatten())
+        }
+        Ok(RowIdMask::from_allowed(allow_list))
+    }
+}
+
+// Utility to convert a serialized selection vector into a prefilter
+pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
+
+#[async_trait]
+impl FilterLoader for SelectionVectorToPrefilter {
+    async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
+        let batch = self
+            .0
+            .try_next()
+            .await?
+            .ok_or_else(|| Error::Internal {
+                message: "Selection vector source for prefilter did not yield any batches".into(),
+                location: location!(),
+            })
+            .unwrap();
+        RowIdMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+            Error::Internal {
+                message: format!(
+                    "Expected selection vector input to yield binary arrays but got {}",
+                    batch["result"].data_type()
+                ),
+                location: location!(),
+            }
+        })?)
+    }
+}
 
 struct InnerState {
     cached: Option<SendableRecordBatchStream>,
@@ -75,6 +171,9 @@ impl DisplayAs for ReplayExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "Replay: capacity={:?}", self.capacity)
             }
+            DisplayFormatType::TreeRender => {
+                write!(f, "Replay\ncapacity={:?}", self.capacity)
+            }
         }
     }
 }
@@ -85,7 +184,7 @@ impl DisplayAs for ReplayExec {
 // for that shared stream to be a SendableRecordBatchStream, it needs to be
 // using DataFusionError.  So we need to adapt the stream back to a
 // SendableRecordBatchStream.
-struct ShareableRecordBatchStream(SendableRecordBatchStream);
+pub struct ShareableRecordBatchStream(pub SendableRecordBatchStream);
 
 impl Stream for ShareableRecordBatchStream {
     type Item = CloneableResult<RecordBatch>;
@@ -104,12 +203,21 @@ impl Stream for ShareableRecordBatchStream {
     }
 }
 
-struct ShareableRecordBatchStreamAdapter {
+pub struct ShareableRecordBatchStreamAdapter<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin>
+{
     schema: SchemaRef,
-    stream: SharedStream<'static, CloneableResult<RecordBatch>>,
+    stream: S,
 }
 
-impl Stream for ShareableRecordBatchStreamAdapter {
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> ShareableRecordBatchStreamAdapter<S> {
+    pub fn new(schema: SchemaRef, stream: S) -> Self {
+        Self { schema, stream }
+    }
+}
+
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
+    for ShareableRecordBatchStreamAdapter<S>
+{
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(
@@ -127,13 +235,82 @@ impl Stream for ShareableRecordBatchStreamAdapter {
     }
 }
 
-impl RecordBatchStream for ShareableRecordBatchStreamAdapter {
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
+    for ShareableRecordBatchStreamAdapter<S>
+{
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+#[pin_project]
+pub struct InstrumentedRecordBatchStreamAdapter<S> {
+    schema: SchemaRef,
+
+    #[pin]
+    stream: S,
+    baseline_metrics: BaselineMetrics,
+    batch_count: Count,
+}
+
+impl<S> InstrumentedRecordBatchStreamAdapter<S> {
+    pub fn new(
+        schema: SchemaRef,
+        stream: S,
+        partition: usize,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> Self {
+        let batch_count = Count::new();
+        MetricBuilder::new(metrics)
+            .with_partition(partition)
+            .build(MetricValue::Count {
+                name: Cow::Borrowed("output_batches"),
+                count: batch_count.clone(),
+            });
+        Self {
+            schema,
+            stream,
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+            batch_count,
+        }
+    }
+}
+
+impl<S> Stream for InstrumentedRecordBatchStreamAdapter<S>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>>,
+{
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.as_mut().project();
+        let timer = this.baseline_metrics.elapsed_compute().timer();
+        let poll = this.stream.poll_next(cx);
+        timer.done();
+        if let Poll::Ready(Some(Ok(_))) = &poll {
+            this.batch_count.add(1);
+        }
+        this.baseline_metrics.record_poll(poll)
+    }
+}
+
+impl<S> RecordBatchStream for InstrumentedRecordBatchStreamAdapter<S>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>>,
+{
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 }
 
 impl ExecutionPlan for ReplayExec {
+    fn name(&self) -> &str {
+        "ReplayExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -142,16 +319,8 @@ impl ExecutionPlan for ReplayExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> datafusion_physical_expr::Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion_physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
@@ -159,6 +328,12 @@ impl ExecutionPlan for ReplayExec {
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         unimplemented!()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // We aren't doing any work here, and it would be a little confusing
+        // to have multiple replay queues.
+        vec![false]
     }
 
     fn execute(
@@ -175,7 +350,7 @@ impl ExecutionPlan for ReplayExec {
             Ok(cached)
         } else {
             let input = self.input.execute(partition, context)?;
-            let schema = input.schema().clone();
+            let schema = input.schema();
             let input = ShareableRecordBatchStream(input);
             let (to_return, to_cache) = input.boxed().share(self.capacity);
             inner_state.cached = Some(Box::pin(ShareableRecordBatchStreamAdapter {
@@ -188,6 +363,65 @@ impl ExecutionPlan for ReplayExec {
             }))
         }
     }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        self.input.properties()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IoMetrics {
+    iops: Count,
+    requests: Count,
+    bytes_read: Count,
+}
+
+impl IoMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        let iops = metrics.new_count(IOPS_METRIC, partition);
+        let requests = metrics.new_count(REQUESTS_METRIC, partition);
+        let bytes_read = metrics.new_count(BYTES_READ_METRIC, partition);
+        Self {
+            iops,
+            requests,
+            bytes_read,
+        }
+    }
+
+    pub fn record_final(&self, scan_scheduler: &ScanScheduler) {
+        let stats = scan_scheduler.stats();
+        self.iops.add(stats.iops as usize);
+        self.requests.add(stats.requests as usize);
+        self.bytes_read.add(stats.bytes_read as usize);
+    }
+}
+
+pub struct IndexMetrics {
+    indices_loaded: Count,
+    parts_loaded: Count,
+    index_comparisons: Count,
+}
+
+impl IndexMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
+            parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
+            index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
+        }
+    }
+}
+
+impl MetricsCollector for IndexMetrics {
+    fn record_parts_loaded(&self, num_shards: usize) {
+        self.parts_loaded.add(num_shards);
+    }
+    fn record_index_loads(&self, num_indexes: usize) {
+        self.indices_loaded.add(num_indexes);
+    }
+    fn record_comparisons(&self, num_comparisons: usize) {
+        self.index_comparisons.add(num_comparisons);
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +431,7 @@ mod tests {
 
     use arrow_array::{types::UInt32Type, RecordBatchReader};
     use arrow_schema::SortOptions;
+    use datafusion::common::NullEquality;
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
@@ -213,10 +448,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_replay() {
-        let data = lance_datagen::gen()
-            .col(Some("x".to_string()), array::step::<UInt32Type>())
+        let data = lance_datagen::gen_batch()
+            .col("x", array::step::<UInt32Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(16));
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::iter(data).map_err(datafusion::error::DataFusionError::from),
@@ -233,7 +468,7 @@ mod tests {
                 None,
                 JoinType::Inner,
                 vec![SortOptions::default()],
-                true,
+                NullEquality::NullEqualsNull,
             )
             .unwrap(),
         );

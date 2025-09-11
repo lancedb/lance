@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::iter::{repeat_with, Sum};
 use std::time::Duration;
@@ -36,7 +25,10 @@ fn dot_scalar<T: Float + Sum>(x: &[T], y: &[T]) -> T {
     x.iter().zip(y.iter()).map(|(&xi, &yi)| xi * yi).sum::<T>()
 }
 
-fn run_bench<T: ArrowFloatType + Dot>(c: &mut Criterion) {
+fn run_bench<T: ArrowFloatType>(c: &mut Criterion)
+where
+    T::Native: Dot,
+{
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 
@@ -94,12 +86,12 @@ fn bench_distance(c: &mut Criterion) {
         });
     });
 
-    let mut rng = rand::thread_rng();
-    let key = repeat_with(|| rng.gen::<u16>())
+    let mut rng = rand::rng();
+    let key = repeat_with(|| rng.random::<u16>())
         .map(bf16::from_bits)
         .take(DIMENSION)
         .collect::<Vec<_>>();
-    let target = repeat_with(|| rng.gen::<u16>())
+    let target = repeat_with(|| rng.random::<u16>())
         .map(bf16::from_bits)
         .take(TOTAL * DIMENSION)
         .collect::<Vec<_>>();
@@ -124,7 +116,7 @@ fn bench_distance(c: &mut Criterion) {
             let x = key.values().as_ref();
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
                 let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
-                Some(Float32Type::dot(x, y))
+                Some(f32::dot(x, y))
             }))
         });
     });

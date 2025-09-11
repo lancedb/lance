@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Var-length binary encoding.
 //!
@@ -37,7 +26,8 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use snafu::{location, Location};
+use lance_arrow::BufferExt;
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use super::ReadBatchParams;
@@ -99,7 +89,7 @@ impl<'a> BinaryEncoder<'a> {
 }
 
 #[async_trait]
-impl<'a> Encoder for BinaryEncoder<'a> {
+impl Encoder for BinaryEncoder<'_> {
     async fn encode(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
@@ -109,10 +99,10 @@ impl<'a> Encoder for BinaryEncoder<'a> {
             DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(arrs).await,
             DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
             _ => {
-                return Err(lance_core::Error::IO {
-                    message: format!("Binary encoder does not support {}", data_type),
-                    location: location!(),
-                })
+                return Err(lance_core::Error::io(
+                    format!("Binary encoder does not support {}", data_type),
+                    location!(),
+                ));
             }
         }
     }
@@ -148,7 +138,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     /// use lance_io::{local::LocalObjectReader, encodings::binary::BinaryDecoder, traits::Reader};
     ///
     /// async {
-    ///     let reader = LocalObjectReader::open_local_path("/tmp/foo.lance", 2048).await.unwrap();
+    ///     let reader = LocalObjectReader::open_local_path("/tmp/foo.lance", 2048, None).await.unwrap();
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
     /// };
     /// ```
@@ -235,7 +225,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
                 .null_bit_buffer(null_buf);
         }
 
-        let buf = bytes.into();
+        let buf = Buffer::from_bytes_bytes(bytes, /*bytes_per_value=*/ 1);
         let array_data = data_builder
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(buf)
@@ -297,7 +287,7 @@ fn plan_take_chunks(
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> Decoder for BinaryDecoder<'_, T> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(..).await
     }
@@ -351,7 +341,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
                     .await?;
                 Result::Ok((chunk, chunk_offset, array))
             })
-            .buffered(num_cpus::get())
+            .buffered(self.reader.io_parallelism())
             .try_for_each(|(chunk, chunk_offset, array)| {
                 let array: &GenericByteArray<T> = array.as_bytes();
 
@@ -405,7 +395,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: usize) -> Self::Output {
@@ -414,7 +404,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
@@ -423,7 +413,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'a, T>
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: RangeTo<usize>) -> Self::Output {
@@ -432,7 +422,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _: RangeFull) -> Self::Output {
@@ -441,12 +431,14 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, params: ReadBatchParams) -> Self::Output {
         match params {
             ReadBatchParams::Range(r) => self.get(r).await,
+            // Ranges not supported in v1 files
+            ReadBatchParams::Ranges(_) => unimplemented!(),
             ReadBatchParams::RangeFull => self.get(..).await,
             ReadBatchParams::RangeTo(r) => self.get(r).await,
             ReadBatchParams::RangeFrom(r) => self.get(r).await,
@@ -456,7 +448,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'a, T> 
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: Range<usize>) -> Self::Output {
@@ -478,8 +470,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{
-        cast::AsArray, new_empty_array, types::GenericStringType, BinaryArray, GenericStringArray,
-        LargeStringArray, OffsetSizeTrait, StringArray,
+        types::GenericStringType, BinaryArray, GenericStringArray, LargeStringArray, StringArray,
     };
     use arrow_select::concat::concat;
 
@@ -506,7 +497,7 @@ mod tests {
 
         let pos = write_test_data(&path, arrs).await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let read_len = arrs.iter().map(|a| a.len()).sum();
@@ -568,13 +559,13 @@ mod tests {
         let path = temp_dir.path().join("foo");
         let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
 
-        // Write some gabage to reset "tell()".
+        // Write some garbage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         let pos = encoder.encode(&[&data]).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -617,7 +608,7 @@ mod tests {
         let path = temp_dir.path().join("foo");
 
         let pos = write_test_data(&path, &[&data]).await.unwrap();
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -639,7 +630,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("foo");
         let pos = write_test_data(&path, &[&data]).await.unwrap();
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -670,7 +661,7 @@ mod tests {
         let path = temp_dir.path().join("foo");
         let pos = write_test_data(&path, &[&data]).await.unwrap();
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -750,7 +741,7 @@ mod tests {
             pos
         };
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         let decoder = BinaryDecoder::<BinaryType>::new(reader.as_ref(), pos, data.len(), true);

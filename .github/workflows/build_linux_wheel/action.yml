@@ -3,7 +3,7 @@ name: build-linux-wheel
 description: "Build a manylinux wheel for lance"
 inputs:
   python-minor-version:
-    description: "8, 9, 10, 11, 12"
+    description: "9, 10, 11, 12"
     required: true
   args:
     description: "--release"
@@ -14,6 +14,10 @@ inputs:
     # Note: this does *not* mean the host is arm64, since we might be cross-compiling.
     required: false
     default: "false"
+  manylinux:
+    description: "The manylinux version to build for"
+    required: false
+    default: "2_17"
 runs:
   using: "composite"
   steps:
@@ -21,18 +25,36 @@ runs:
       shell: bash
       run: |
         echo "ARM BUILD: ${{ inputs.arm-build }}"
-    - name: Build x86_64 Manylinux wheel
-      if: ${{ inputs.arm-build == 'false' }}
+    - name: Build x86_64 Manylinux2014 wheel
+      if: ${{ inputs.arm-build == 'false' && inputs.manylinux == '2_17' }}
       uses: PyO3/maturin-action@v1
       with:
         command: build
         working-directory: python
         target: x86_64-unknown-linux-gnu
-        manylinux: "2_17"
+        manylinux: ${{ inputs.manylinux }}
         args: ${{ inputs.args }}
         before-script-linux: |
           set -e
           yum install -y openssl-devel \
+            && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$(uname -m).zip > /tmp/protoc.zip \
+            && unzip /tmp/protoc.zip -d /usr/local \
+            && rm /tmp/protoc.zip
+    - name: Build x86_64 Manylinux {manylinux} wheel
+      if: ${{ inputs.arm-build == 'false' && inputs.manylinux != '2_17' }}
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        working-directory: python
+        target: x86_64-unknown-linux-gnu
+        manylinux: ${{ inputs.manylinux }}
+        docker-options: |
+          -e CC=clang
+          -e CXX=clang++
+        args: ${{ inputs.args }}
+        before-script-linux: |
+          set -e
+          yum install -y openssl-devel clang \
             && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$(uname -m).zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip
@@ -43,16 +65,11 @@ runs:
         command: build
         working-directory: python
         target: aarch64-unknown-linux-gnu
-        manylinux: "2_24"
+        manylinux: ${{ inputs.manylinux }}
         args: ${{ inputs.args }}
         before-script-linux: |
           set -e
-          apt install -y unzip
-          if [ $(uname -m) = "x86_64" ]; then
-            PROTOC_ARCH="x86_64"
-          else
-            PROTOC_ARCH="aarch_64"
-          fi
-          curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$PROTOC_ARCH.zip > /tmp/protoc.zip \
+          yum install -y openssl-devel clang \
+            && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-aarch_64.zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip

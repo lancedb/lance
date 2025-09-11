@@ -23,7 +23,7 @@ use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple
 
 use super::*;
 
-fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
+fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionOptions> {
     let mut opts = CompactionOptions::default();
 
     for (key, value) in options.into_iter() {
@@ -36,6 +36,9 @@ fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
             "max_rows_per_group" => {
                 opts.max_rows_per_group = value.extract()?;
             }
+            "max_bytes_per_file" => {
+                opts.max_bytes_per_file = value.extract()?;
+            }
             "materialize_deletions" => {
                 opts.materialize_deletions = value.extract()?;
             }
@@ -43,9 +46,10 @@ fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
                 opts.materialize_deletions_threshold = value.extract()?;
             }
             "num_threads" => {
-                opts.num_threads = value
-                    .extract::<Option<usize>>()?
-                    .unwrap_or_else(num_cpus::get);
+                opts.num_threads = value.extract()?;
+            }
+            "batch_size" => {
+                opts.batch_size = value.extract()?;
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -63,15 +67,13 @@ fn unwrap_dataset(dataset: PyObject) -> PyResult<Py<Dataset>> {
     Python::with_gil(|py| dataset.getattr(py, "_ds")?.extract::<Py<Dataset>>(py))
 }
 
-fn wrap_fragment(py: Python<'_>, fragment: &Fragment) -> PyResult<PyObject> {
+fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
     let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
     let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
         PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
     })?;
 
-    Ok(fragment_metadata
-        .call_method1("from_json", (fragment_json,))?
-        .to_object(py))
+    fragment_metadata.call_method1("from_json", (fragment_json,))
 }
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]
@@ -89,6 +91,16 @@ pub struct PyCompactionMetrics {
     /// number of fragments.
     #[pyo3(get)]
     pub files_added: usize,
+}
+
+#[pymethods]
+impl PyCompactionMetrics {
+    fn __repr__(&self) -> PyResult<String> {
+        Ok(format!(
+            "CompactionMetrics(fragments_removed={}, fragments_added={}, files_removed={}, files_added={})",
+            self.fragments_removed, self.fragments_added, self.files_removed, self.files_added
+        ))
+    }
 }
 
 impl From<CompactionMetrics> for PyCompactionMetrics {
@@ -176,7 +188,7 @@ impl PyCompactionPlan {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new(py, vec![state]).extract()?;
+        let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.optimize")?
             .getattr("CompactionPlan")?
             .getattr("from_json")?
@@ -205,7 +217,7 @@ impl PyCompactionTask {
         let fragment_reprs: String = self
             .fragments(py)?
             .iter()
-            .map(|f| f.call_method0(py, "__repr__")?.extract(py))
+            .map(|f| f.call_method0("__repr__")?.extract())
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
         Ok(format!(
@@ -222,7 +234,7 @@ impl PyCompactionTask {
 
     /// List[lance.fragment.FragmentMetadata] : The fragments that will be compacted.
     #[getter]
-    pub fn fragments(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    pub fn fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         self.0
             .task
             .fragments
@@ -288,7 +300,7 @@ impl PyCompactionTask {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new(py, vec![state]).extract()?;
+        let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.optimize")?
             .getattr("CompactionTask")?
             .getattr("from_json")?
@@ -323,13 +335,13 @@ impl PyRewriteResult {
         let orig_fragment_reprs: String = self
             .original_fragments(py)?
             .iter()
-            .map(|f| f.call_method0(py, "__repr__")?.extract(py))
+            .map(|f| f.call_method0("__repr__")?.extract())
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
         let new_fragment_reprs: String = self
             .original_fragments(py)?
             .iter()
-            .map(|f| f.call_method0(py, "__repr__")?.extract(py))
+            .map(|f| f.call_method0("__repr__")?.extract())
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
 
@@ -347,7 +359,7 @@ impl PyRewriteResult {
 
     /// List[lance.fragment.FragmentMetadata] : The metadata for fragments that are being replaced.
     #[getter]
-    pub fn original_fragments(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    pub fn original_fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         self.0
             .original_fragments
             .iter()
@@ -357,7 +369,7 @@ impl PyRewriteResult {
 
     /// List[lance.fragment.FragmentMetadata] : The metadata for fragments that are being added.
     #[getter]
-    pub fn new_fragments(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    pub fn new_fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         self.0
             .new_fragments
             .iter()
@@ -403,7 +415,7 @@ impl PyRewriteResult {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new(py, vec![state]).extract()?;
+        let state = PyTuple::new(py, vec![state])?.extract()?;
         let from_json = PyModule::import(py, "lance.optimize")?
             .getattr("RewriteResult")?
             .getattr("from_json")?
@@ -458,7 +470,7 @@ impl PyCompaction {
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
         let opts = Python::with_gil(|py| {
-            let options = options.downcast::<PyDict>(py)?;
+            let options = options.downcast_bound::<PyDict>(py)?;
             parse_compaction_options(options)
         })?;
         let mut new_ds = dataset.ds.as_ref().clone();
@@ -495,7 +507,7 @@ impl PyCompaction {
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
         let opts = Python::with_gil(|py| {
-            let options = options.downcast::<PyDict>(py)?;
+            let options = options.downcast_bound::<PyDict>(py)?;
             parse_compaction_options(options)
         })?;
         let plan = RT
@@ -533,10 +545,13 @@ impl PyCompaction {
         let dataset = Python::with_gil(|py| dataset_ref.borrow(py).clone());
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
         let mut new_ds = dataset.ds.as_ref().clone();
+        // TODO: pass compaction option from plan and execute time
+        let options: CompactionOptions = CompactionOptions::default();
         let fut = commit_compaction(
             &mut new_ds,
             rewrites,
             Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
         );
         let metrics = RT
             .block_on(None, fut)?

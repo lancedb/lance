@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Build IVF model
 
@@ -21,7 +10,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
@@ -29,8 +18,14 @@ use lance_io::stream::RecordBatchStream;
 /// Parameters to build IVF partitions
 #[derive(Debug, Clone)]
 pub struct IvfBuildParams {
+    /// Deprecated: use `target_partition_size` instead.
     /// Number of partitions to build.
-    pub num_partitions: usize,
+    pub num_partitions: Option<usize>,
+
+    /// Target partition size.
+    /// If set, the number of partitions will be computed based on the target partition size.
+    /// Otherwise, the `target_partition_size` will be set by index type.
+    pub target_partition_size: Option<usize>,
 
     // ---- kmeans parameters
     /// Max number of iterations to train kmeans.
@@ -39,14 +34,18 @@ pub struct IvfBuildParams {
     /// Use provided IVF centroids.
     pub centroids: Option<Arc<FixedSizeListArray>>,
 
+    /// Retrain centroids.
+    /// If true, the centroids will be retrained based on provided `centroids`.
+    pub retrain: bool,
+
     pub sample_rate: usize,
 
     /// Precomputed partitions file (row_id -> partition_id)
     /// mutually exclusive with `precomputed_shuffle_buffers`
-    pub precomputed_partitons_file: Option<String>,
+    pub precomputed_partitions_file: Option<String>,
 
     /// Precomputed shuffle buffers (row_id -> partition_id, pq_code)
-    /// mutually exclusive with `precomputed_partitons_file`
+    /// mutually exclusive with `precomputed_partitions_file`
     /// requires `centroids` to be set
     ///
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
@@ -56,22 +55,24 @@ pub struct IvfBuildParams {
 
     pub shuffle_partition_concurrency: usize,
 
-    /// Use residual vectors to build sub-vector.
-    pub use_residual: bool,
+    /// Storage options used to load precomputed partitions.
+    pub storage_options: Option<HashMap<String, String>>,
 }
 
 impl Default for IvfBuildParams {
     fn default() -> Self {
         Self {
-            num_partitions: 32,
+            num_partitions: None,
+            target_partition_size: None,
             max_iters: 50,
             centroids: None,
+            retrain: false,
             sample_rate: 256, // See faiss
-            precomputed_partitons_file: None,
+            precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
-            use_residual: true,
+            storage_options: None,
         }
     }
 }
@@ -80,7 +81,14 @@ impl IvfBuildParams {
     /// Create a new instance of `IvfBuildParams`.
     pub fn new(num_partitions: usize) -> Self {
         Self {
-            num_partitions,
+            num_partitions: Some(num_partitions),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_target_partition_size(target_partition_size: usize) -> Self {
+        Self {
+            target_partition_size: Some(target_partition_size),
             ..Default::default()
         }
     }
@@ -101,11 +109,18 @@ impl IvfBuildParams {
             });
         }
         Ok(Self {
-            num_partitions,
+            num_partitions: Some(num_partitions),
             centroids: Some(centroids),
             ..Default::default()
         })
     }
+}
+
+pub fn recommended_num_partitions(num_rows: usize, target_partition_size: usize) -> usize {
+    // The maximum number of partitions is 4096 to avoid slow KMeans clustering,
+    // bump it once we have better clustering algorithms.
+    const MAX_PARTITIONS: usize = 4096;
+    (num_rows / target_partition_size).clamp(1, MAX_PARTITIONS)
 }
 
 /// Load precomputed partitions from disk.

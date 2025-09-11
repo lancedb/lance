@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! L2 (Euclidean) distance.
 //!
@@ -19,48 +8,44 @@ use std::iter::Sum;
 use std::ops::AddAssign;
 use std::sync::Arc;
 
+use crate::{Error, Result};
 use arrow_array::{
     cast::AsArray,
-    types::{Float16Type, Float32Type, Float64Type},
+    types::{Float16Type, Float32Type, Float64Type, Int8Type},
     Array, FixedSizeListArray, Float32Array,
 };
 use arrow_schema::DataType;
 use half::{bf16, f16};
-use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatArray, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::assume_eq;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::{AsPrimitive, Float};
-
-use crate::simd::{
-    f32::{f32x16, f32x8},
-    SIMD,
-};
-use crate::{Error, Result};
-
-use super::Normalize;
+use num_traits::{AsPrimitive, Num};
 
 /// Calculate the L2 distance between two vectors.
 ///
-pub trait L2: ArrowFloatType + Normalize {
+pub trait L2: Num {
     /// Calculate the L2 distance between two vectors.
-    fn l2(x: &[Self::Native], y: &[Self::Native]) -> f32;
+    fn l2(x: &[Self], y: &[Self]) -> f32;
 
-    fn l2_batch<'a>(
-        x: &'a [Self::Native],
-        y: &'a [Self::Native],
-        dimension: usize,
-    ) -> Box<dyn Iterator<Item = f32> + 'a> {
-        Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v)))
+    fn l2_batch(x: &[Self], y: &[Self], dimension: usize) -> impl Iterator<Item = f32> {
+        y.chunks_exact(dimension).map(|v| Self::l2(x, v))
     }
 }
 
 #[inline]
-pub fn l2<T: FloatToArrayType>(from: &[T], to: &[T]) -> f32
-where
-    T::ArrowType: L2,
-{
-    T::ArrowType::l2(from, to)
+pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
+    T::l2(from, to)
+}
+
+/// Calculate L2 distance between two uint8 slices.
+#[inline]
+pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
+    key.iter()
+        .zip(target.iter())
+        .map(|(&x, &y)| (x.abs_diff(y) as u32).pow(2))
+        .sum::<u32>() as f32
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
@@ -71,7 +56,7 @@ where
 #[inline]
 pub fn l2_scalar<
     T: AsPrimitive<Output>,
-    Output: Float + Sum + AddAssign + 'static,
+    Output: Num + Copy + Sum + AddAssign + 'static,
     const LANES: usize,
 >(
     from: &[T],
@@ -105,11 +90,18 @@ pub fn l2_scalar<
     s + sums.iter().copied().sum()
 }
 
-impl L2 for BFloat16Type {
+impl L2 for u8 {
     #[inline]
-    fn l2(x: &[bf16], y: &[bf16]) -> f32 {
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        l2_distance_uint_scalar(x, y)
+    }
+}
+
+impl L2 for bf16 {
+    #[inline]
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
         // TODO: add SIMD support
-        l2_scalar::<bf16, f32, 16>(x, y)
+        l2_scalar::<Self, f32, 16>(x, y)
     }
 }
 
@@ -122,16 +114,20 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn l2_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn l2_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn l2_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
-impl L2 for Float16Type {
+impl L2 for f16 {
     #[inline]
-    fn l2(x: &[f16], y: &[f16]) -> f32 {
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -139,7 +135,7 @@ impl L2 for Float16Type {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {
@@ -149,66 +145,39 @@ impl L2 for Float16Type {
             SimdSupport::Avx2 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => l2_scalar::<f16, f32, 16>(x, y),
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                kernel::l2_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                kernel::l2_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            _ => l2_scalar::<Self, f32, 16>(x, y),
         }
     }
 }
 
-impl L2 for Float32Type {
+impl L2 for f32 {
     #[inline]
-    fn l2(x: &[f32], y: &[f32]) -> f32 {
-        l2_scalar::<f32, f32, 32>(x, y)
-    }
-
-    fn l2_batch<'a>(
-        x: &'a [Self::Native],
-        y: &'a [Self::Native],
-        dimension: usize,
-    ) -> Box<dyn Iterator<Item = Self::Native> + 'a> {
-        use self::f32::l2_once;
-        // Dispatch based on the dimension.
-        match dimension {
-            8 => Box::new(
-                y.chunks_exact(dimension)
-                    .map(move |v| l2_once::<f32x8, 8>(x, v)),
-            ),
-            16 => Box::new(
-                y.chunks_exact(dimension)
-                    .map(move |v| l2_once::<f32x16, 16>(x, v)),
-            ),
-            _ => Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v))),
-        }
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        // 16 = 512 (avx512) / 8 bits / 4 (sizeof(f32))
+        // See https://github.com/lancedb/lance/pull/2450.
+        l2_scalar::<Self, Self, 16>(x, y)
     }
 }
 
-impl L2 for Float64Type {
+impl L2 for f64 {
     #[inline]
-    fn l2(x: &[f64], y: &[f64]) -> f32 {
-        // TODO: add SIMD support
-        // TODO: should we let this return f64 to avoid overflow?
-        l2_scalar::<f64, f64, 8>(x, y) as f32
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        l2_scalar::<Self, Self, 8>(x, y) as f32
     }
 }
 
 /// Compute L2 distance between two vectors.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
-    Float32Type::l2(from, to)
-}
-
-// f32 kernels for L2
-mod f32 {
-    use super::*;
-
-    #[inline]
-    pub fn l2_once<S: SIMD<f32, N>, const N: usize>(x: &[f32], y: &[f32]) -> f32 {
-        debug_assert_eq!(x.len(), N);
-        debug_assert_eq!(y.len(), N);
-        let x = unsafe { S::load_unaligned(x.as_ptr()) };
-        let y = unsafe { S::load_unaligned(y.as_ptr()) };
-        let s = x - y;
-        (s * s).reduce_sum()
-    }
+    l2(from, to)
 }
 
 /// Compute L2 distance between a vector and a batch of vectors.
@@ -222,24 +191,24 @@ mod f32 {
 /// Returns
 ///
 /// An iterator of pair-wise distance between `from` vector to each vector in the batch.
-pub fn l2_distance_batch<'a, T: FloatToArrayType>(
+pub fn l2_distance_batch<'a, T: L2>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a>
-where
-    T::ArrowType: L2,
-{
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+) -> impl Iterator<Item = f32> + 'a {
+    assume_eq!(from.len(), dimension);
+    assume_eq!(to.len() % dimension, 0);
 
-    Box::new(T::ArrowType::l2_batch(from, to, dimension))
+    T::l2_batch(from, to, dimension)
 }
 
-fn do_l2_distance_arrow_batch<T: ArrowFloatType + L2>(
+fn do_l2_distance_arrow_batch<T: ArrowFloatType>(
     from: &T::ArrayType,
     to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>> {
+) -> Result<Arc<Float32Array>>
+where
+    T::Native: L2,
+{
     let dimension = to.value_length() as usize;
     debug_assert_eq!(from.len(), dimension);
 
@@ -281,6 +250,14 @@ pub fn l2_distance_arrow_batch(
         DataType::Float16 => do_l2_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        DataType::Int8 => do_l2_distance_arrow_batch::<Float32Type>(
+            &from
+                .as_primitive::<Int8Type>()
+                .into_iter()
+                .map(|x| x.unwrap() as f32)
+                .collect(),
+            &to.convert_to_floating_point()?,
+        ),
         _ => Err(Error::ComputeError(format!(
             "Unsupported data type: {}",
             from.data_type()
@@ -293,7 +270,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::Float32Array;
+    use num_traits::ToPrimitive;
     use proptest::prelude::*;
 
     use crate::test_utils::{
@@ -407,10 +384,7 @@ mod tests {
             .sum::<f64>()
     }
 
-    fn do_l2_test<T: FloatToArrayType>(x: &[T], y: &[T]) -> std::result::Result<(), TestCaseError>
-    where
-        T::ArrowType: L2,
-    {
+    fn do_l2_test<T: L2 + ToPrimitive>(x: &[T], y: &[T]) -> std::result::Result<(), TestCaseError> {
         let x_f64 = x.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<f64>>();
         let y_f64 = y.iter().map(|v| v.to_f64().unwrap()).collect::<Vec<f64>>();
 
@@ -452,5 +426,23 @@ mod tests {
         fn test_l2_distance_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
             do_l2_test(&x, &y)?;
         }
+    }
+
+    #[test]
+    fn test_uint8_l2_edge_cases() {
+        let q = vec![0_u8; 2048];
+        let v = vec![0_u8; 2048];
+        assert_eq!(l2_distance_uint_scalar(&q, &v), 0.0);
+
+        let q = vec![0_u8; 2048];
+        let v = vec![255_u8; 2048];
+        assert_eq!(
+            l2_distance_uint_scalar(&q, &v),
+            (255_u32.pow(2) * 2048) as f32
+        );
+        assert_eq!(
+            l2_distance_uint_scalar(&v, &q),
+            (255_u32.pow(2) * 2048) as f32
+        );
     }
 }

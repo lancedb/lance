@@ -1,16 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 import pickle
 import random
 import re
@@ -47,14 +36,93 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
+def test_optimize_max_bytes(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    arr = pa.array(range(4 * 1024 * 1024))
+    arr = pa.FixedSizeListArray.from_arrays(arr, 1024)
+    data = pa.table({"a": arr})
+
+    dataset = lance.write_dataset(
+        data, base_dir, max_rows_per_file=2 * 1024, data_storage_version="stable"
+    )
+    assert len(dataset.get_fragments()) == 2
+
+    # max_bytes_per_file is too small and we get tiny files
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=100 * 1024,
+        materialize_deletions=False,
+        max_bytes_per_file=1000,
+        batch_size=128,
+    )
+
+    # We get 4 fragments here because we don't actually write any data to the file
+    # until we've accumulated 8MiB for a page.
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 4
+    assert metrics.files_removed == 2
+    assert metrics.files_added == 4
+
+    num_frags = len(dataset.get_fragments())
+    assert num_frags == 4
+
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=2 * 1024,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    # Same test but use Compaction.plan
+    plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=100 * 1024, max_bytes_per_file=1000, batch_size=128
+        ),
+    )
+    results = [task.execute(dataset) for task in plan.tasks]
+    metrics = Compaction.commit(dataset, results)
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 4
+    assert metrics.files_removed == 2
+    assert metrics.files_added == 4
+
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=2 * 1024,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    # In this test max_bytes_per_file is still too small but the batch size
+    # is so large we read the entire input in a single batch
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=100 * 1024,
+        materialize_deletions=False,
+        max_bytes_per_file=1000,
+        batch_size=2 * 1024,
+    )
+
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 2
+    assert metrics.files_removed == 2
+    assert metrics.files_added == 2
+
+    num_frags = len(dataset.get_fragments())
+    assert num_frags == 2
+
+
 def create_table(min, max, nvec, ndim=8):
     mat = np.random.uniform(min, max, (nvec, ndim))
     tbl = vec_to_table(data=mat)
     # Add id column for filtering
-    tbl = pa.Table.from_pydict({
-        "vector": tbl.column(0).chunk(0),
-        "id": np.arange(0, nvec),
-    })
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": tbl.column(0).chunk(0),
+            "id": np.arange(0, nvec),
+        }
+    )
     return tbl
 
 
@@ -62,7 +130,7 @@ def test_compact_with_write(tmp_path: Path):
     # This test creates a dataset with a manifest containing fragments
     # that are not in sorted order (by id)
     #
-    # We do this by runnign compaction concurrently with append
+    # We do this by running compaction concurrently with append
     #
     # This is because compaction first reserves a fragment id.  Then the
     # concurrent writes grab later ids and commit them.  Then the compaction
@@ -125,7 +193,7 @@ def test_index_remapping(tmp_path: Path):
             results = dataset.to_table(nearest=query).column("vector")
             assert has_target(query["q"], results)
             plan = dataset.scanner(nearest=query).explain_plan()
-            assert ("KNNFlat" in plan) == has_knn_combined
+            assert ("KNNVectorDistance" in plan) == has_knn_combined
 
     # Original state is 2 indexed fragments of size 150.  This should not require
     # a combined scan
@@ -245,3 +313,49 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert metrics.fragments_added == 1
     # Compaction occurs in two transactions so it increments the version by 2.
     assert dataset.version == 3
+
+
+def test_migration_via_fragment_apis(tmp_path):
+    """
+    This test is a regression of a case where we were using fragment APIs to migrate
+    from v1 to v2 but that left the dataset in a state where it had v2 files but wasn't
+    marked with the v2 writer flag.
+    """
+    data = pa.table({"a": range(800), "b": range(800)})
+
+    # Create v1 dataset
+    ds = lance.write_dataset(
+        data, tmp_path / "dataset", max_rows_per_file=200, data_storage_version="legacy"
+    )
+
+    # Create empty v2 dataset
+    lance.write_dataset(
+        data_obj=[],
+        uri=tmp_path / "dataset2",
+        schema=ds.schema,
+        data_storage_version="stable",
+    )
+
+    # Add v2 files
+    fragments = []
+    for frag in ds.get_fragments():
+        reader = ds.scanner(fragments=[frag])
+        fragments.append(
+            lance.LanceFragment.create(
+                dataset_uri=tmp_path / "dataset2",
+                data=reader,
+                fragment_id=frag.fragment_id,
+                data_storage_version="stable",
+            )
+        )
+
+    # Commit
+    operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
+    ds2 = lance.LanceDataset.commit(tmp_path / "dataset2", operation)
+
+    # Compact, dataset should still be v2
+    ds2.optimize.compact_files()
+
+    ds2 = lance.dataset(tmp_path / "dataset2")
+
+    assert ds2.data_storage_version == "2.0"

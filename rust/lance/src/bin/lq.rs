@@ -1,23 +1,14 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+#![allow(clippy::print_stdout)]
 
 use arrow::util::pretty::print_batches;
 use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::StreamExt;
 use futures::TryStreamExt;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance::dataset::Dataset;
 use lance::index::vector::VectorIndexParams;
@@ -70,7 +61,7 @@ enum Commands {
         #[arg(short = 't', long = "type", value_enum, value_name = "TYPE")]
         index_type: Option<IndexType>,
 
-        /// Nunber of IVF partitions. Only useful when the index type is 'ivf-pq'.
+        /// Number of IVF partitions. Only useful when the index type is 'ivf-pq'.
         #[arg(short = 'p', long, default_value_t = 64, value_name = "NUM")]
         num_partitions: usize,
 
@@ -81,9 +72,6 @@ enum Commands {
         /// Distance metric type. Only support 'l2' and 'cosine'.
         #[arg(short = 'm', long, value_name = "DISTANCE")]
         metric_type: Option<String>,
-
-        #[arg(long, default_value_t = false)]
-        use_opq: bool,
     },
 }
 
@@ -110,7 +98,7 @@ async fn main() -> Result<()> {
                 dataset.version().version,
                 dataset.versions().await.unwrap().len()
             );
-            println!("Total records: {}", dataset.count_rows().await.unwrap());
+            println!("Total records: {}", dataset.count_rows(None).await.unwrap());
             println!("Schema:\n{}", dataset.schema());
 
             Ok(())
@@ -136,7 +124,6 @@ async fn main() -> Result<()> {
             num_partitions,
             num_sub_vectors,
             metric_type,
-            use_opq,
         } => {
             let mut dataset = Dataset::open(uri).await.unwrap();
             match action {
@@ -149,7 +136,6 @@ async fn main() -> Result<()> {
                         num_partitions,
                         num_sub_vectors,
                         metric_type,
-                        *use_opq,
                     )
                     .await
                 }
@@ -167,7 +153,6 @@ async fn create_index(
     num_partitions: &usize,
     num_sub_vectors: &usize,
     metric_type: &Option<String>,
-    use_opq: bool,
 ) -> Result<()> {
     let col = column.as_ref().ok_or_else(|| Error::Index {
         message: "Must specify column".to_string(),
@@ -190,22 +175,12 @@ async fn create_index(
             });
         }
     };
-    #[cfg(not(feature = "opq"))]
-    match use_opq {
-        false => (),
-        true => {
-            return Err(Error::Index {
-                message: "Feature 'opq' not installed.".to_string(),
-                location: location!(),
-            });
-        }
-    };
     dataset
         .create_index(
             &[col],
             lance_index::IndexType::Vector,
             name.clone(),
-            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, use_opq, mt, 100),
+            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, mt, 100),
             true,
         )
         .await

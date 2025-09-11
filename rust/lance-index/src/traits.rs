@@ -1,29 +1,84 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lance_core::Result;
+use datafusion::execution::SendableRecordBatchStream;
+use lance_core::{Error, Result};
+use snafu::location;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
 use lance_table::format::Index;
+use uuid::Uuid;
+
+/// A set of criteria used to filter potential indices to use for a query
+#[derive(Debug, Default)]
+pub struct ScalarIndexCriteria<'a> {
+    /// Only consider indices for this column (this also means the index
+    /// maps to a single column)
+    pub for_column: Option<&'a str>,
+    /// Only consider indices with this name
+    pub has_name: Option<&'a str>,
+    /// If true, only consider indices that support FTS
+    pub must_support_fts: bool,
+    /// If true, only consider indices that support exact equality
+    pub must_support_exact_equality: bool,
+}
+
+impl<'a> ScalarIndexCriteria<'a> {
+    /// Only consider indices for this column (this also means the index
+    /// maps to a single column)
+    pub fn for_column(mut self, column: &'a str) -> Self {
+        self.for_column = Some(column);
+        self
+    }
+
+    /// Only consider indices with this name
+    pub fn with_name(mut self, name: &'a str) -> Self {
+        self.has_name = Some(name);
+        self
+    }
+
+    /// Only consider indices that support FTS
+    pub fn supports_fts(mut self) -> Self {
+        self.must_support_fts = true;
+        self
+    }
+
+    /// Only consider indices that support exact equality
+    ///
+    /// This will disqualify, for example, the ngram and inverted indices
+    /// or an index like a bloom filter
+    pub fn supports_exact_equality(mut self) -> Self {
+        self.must_support_exact_equality = true;
+        self
+    }
+}
 
 // Extends Lance Dataset with secondary index.
-///
 #[async_trait]
 pub trait DatasetIndexExt {
+    type IndexBuilder<'a>
+    where
+        Self: 'a;
+
+    /// Create a builder for creating an index on columns.
+    ///
+    /// This returns a builder that can be configured with additional options
+    /// like `name()`, `replace()`, and `train()` before awaiting to execute.
+    ///
+    /// # Parameters
+    /// - `columns`: the columns to build the indices on.
+    /// - `index_type`: specify [`IndexType`].
+    /// - `params`: index parameters.
+    fn create_index_builder<'a>(
+        &'a mut self,
+        columns: &'a [&'a str],
+        index_type: IndexType,
+        params: &'a dyn IndexParams,
+    ) -> Self::IndexBuilder<'a>;
+
     /// Create indices on columns.
     ///
     /// Upon finish, a new dataset version is generated.
@@ -44,6 +99,26 @@ pub trait DatasetIndexExt {
         params: &dyn IndexParams,
         replace: bool,
     ) -> Result<()>;
+
+    /// Drop indices by name.
+    ///
+    /// Upon finish, a new dataset version is generated.
+    ///
+    /// Parameters:
+    ///
+    /// - `name`: the name of the index to drop.
+    async fn drop_index(&mut self, name: &str) -> Result<()>;
+
+    /// Prewarm an index by name.
+    ///
+    /// This will load the index into memory and cache it.
+    ///
+    /// Generally, this should only be called when it is known the entire index will
+    /// fit into the index cache.
+    ///
+    /// This is a hint that is not enforced by all indices today.  Some indices may choose
+    /// to ignore this hint.
+    async fn prewarm_index(&self, name: &str) -> Result<()>;
 
     /// Read all indices of this Dataset version.
     ///
@@ -83,7 +158,35 @@ pub trait DatasetIndexExt {
     }
 
     /// Loads a specific index with the given index name.
-    async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<Index>>;
+    /// This function only works for indices that are unique.
+    /// If there are multiple indices sharing the same name, please use [load_indices_by_name]
+    ///
+    /// Returns
+    /// -------
+    /// - `Ok(Some(index))`: if the index exists, returns the index.
+    /// - `Ok(None)`: if the index does not exist.
+    /// - `Err(e)`: Index error if there are multiple indexes sharing the same name.
+    ///
+    async fn load_index_by_name(&self, name: &str) -> Result<Option<Index>> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            Ok(None)
+        } else if indices.len() == 1 {
+            Ok(Some(indices[0].clone()))
+        } else {
+            Err(Error::Index {
+                message: format!("Found multiple indices of the same name: {:?}, please use load_indices_by_name", 
+                    indices.iter().map(|idx| &idx.name).collect::<Vec<_>>()),
+                location: location!(),
+            })
+        }
+    }
+
+    /// Loads a specific index with the given index name.
+    async fn load_scalar_index<'a, 'b>(
+        &'a self,
+        criteria: ScalarIndexCriteria<'b>,
+    ) -> Result<Option<Index>>;
 
     /// Optimize indices.
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()>;
@@ -92,4 +195,18 @@ pub trait DatasetIndexExt {
     ///
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    async fn commit_existing_index(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        index_id: Uuid,
+    ) -> Result<()>;
+
+    async fn read_index_partition(
+        &self,
+        index_name: &str,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream>;
 }

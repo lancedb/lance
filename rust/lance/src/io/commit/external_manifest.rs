@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 /// Keep the tests in `lance` crate because it has dependency on [Dataset].
 #[cfg(test)]
@@ -24,10 +13,11 @@ mod test {
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
     };
-    use lance_table::io::commit::{latest_manifest_path, manifest_path, CommitHandler};
+    use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
-    use snafu::{location, Location};
+    use object_store::path::Path;
+    use snafu::location;
     use tokio::sync::Mutex;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -82,18 +72,25 @@ mod test {
         }
 
         /// Put the manifest path for a given uri and version, should fail if the version already exists
-        async fn put_if_not_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+        async fn put_if_not_exists(
+            &self,
+            uri: &str,
+            version: u64,
+            path: &str,
+            _size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
-                Some(_) => Err(Error::IO {
-                    message: format!(
+                Some(_) => Err(Error::io(
+                    format!(
                         "manifest already exists for uri: {}, version: {}",
                         uri, version
                     ),
-                    location: location!(),
-                }),
+                    location!(),
+                )),
                 None => {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
@@ -102,7 +99,14 @@ mod test {
         }
 
         /// Put the manifest path for a given uri and version, should fail if the version already exists
-        async fn put_if_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+        async fn put_if_exists(
+            &self,
+            uri: &str,
+            version: u64,
+            path: &str,
+            _size: u64,
+            _e_tag: Option<String>,
+        ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let mut store = self.store.lock().await;
@@ -111,13 +115,13 @@ mod test {
                     store.insert((uri.to_string(), version), path.to_string());
                     Ok(())
                 }
-                None => Err(Error::IO {
-                    message: format!(
+                None => Err(Error::io(
+                    format!(
                         "manifest already exists for uri: {}, version: {}",
                         uri, version
                     ),
-                    location: location!(),
-                }),
+                    location!(),
+                )),
             }
         }
     }
@@ -172,6 +176,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_can_create_dataset_with_external_store() {
         let sleepy_store = SleepyExternalManifestStore::new();
         let handler = ExternalManifestCommitHandler {
@@ -194,7 +199,7 @@ mod test {
             .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 100);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 100);
     }
 
     #[cfg(not(windows))]
@@ -247,11 +252,38 @@ mod test {
                 .load()
                 .await
                 .unwrap();
-            assert_eq!(ds.count_rows().await.unwrap(), 60);
+            assert_eq!(ds.count_rows(None).await.unwrap(), 60);
+
+            // No temporary manifests left over
+            let manifest_path = dir.path().join("_versions/");
+            let unexpected_entries = std::fs::read_dir(manifest_path)
+                .unwrap()
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    !entry
+                        .file_name()
+                        .as_os_str()
+                        .to_string_lossy()
+                        .ends_with(".manifest")
+                })
+                // There is a bug in local fs where concurrent commits can leave behind
+                // temporary `x.manifest#n` files. This might be a bug in object-store.
+                // TODO: fix this.
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    !entry
+                        .file_name()
+                        .as_os_str()
+                        .to_string_lossy()
+                        .contains(".manifest#")
+                })
+                .collect::<Vec<_>>();
+            assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
         }
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_out_of_sync_dataset_can_recover() {
         let sleepy_store = SleepyExternalManifestStore::new();
         let inner_store = sleepy_store.store.clone();
@@ -282,11 +314,23 @@ mod test {
 
         // manually simulate last version is out of sync
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
-        localfs.delete(&manifest_path(&ds.base, 6)).await.unwrap();
+        // Move version 6 to a temporary location, put that in the store.
+        let base_path = Path::parse(ds_uri).unwrap();
+        let version_six_staging_location =
+            base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
-            .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
+            .rename(
+                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
+                &version_six_staging_location,
+            )
             .await
             .unwrap();
+        {
+            inner_store.lock().await.insert(
+                (ds.base.to_string(), 6),
+                version_six_staging_location.to_string(),
+            );
+        }
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
             .list(Some(&ds.base))
@@ -309,7 +353,7 @@ mod test {
         // Open without external store handler, should not see the out-of-sync commit
         let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 5);
-        assert_eq!(ds.count_rows().await.unwrap(), 50);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 50);
 
         // Open with external store handler, should sync the out-of-sync commit on open
         let ds = DatasetBuilder::from_uri(ds_uri)
@@ -318,11 +362,26 @@ mod test {
             .await
             .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         // Open without external store handler again, should see the newly sync'd commit
         let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
+
+        // No temporary manifests left over
+        let manifest_path = dir.path().join("_versions/");
+        let unexpected_entries = std::fs::read_dir(manifest_path)
+            .unwrap()
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                !entry
+                    .file_name()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .ends_with(".manifest")
+            })
+            .collect::<Vec<_>>();
+        assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
     }
 }

@@ -1,22 +1,11 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 
-import logging
 from typing import Optional, Tuple
 
 from lance.dependencies import torch
+from lance.log import LOGGER
 
 __all__ = [
     "pairwise_cosine",
@@ -126,6 +115,17 @@ def cosine_distance(
 
 
 @torch.jit.script
+def argmin_l2(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    x = x.reshape(1, x.shape[0], -1)
+    y = y.reshape(1, y.shape[0], -1)
+    dists = torch.cdist(x, y, p=2.0).reshape(-1, y.shape[1])
+    min_dists, idx = torch.min(dists, dim=1, keepdim=True)
+    # We are using squared L2 distance today.
+    # TODO: change this to L2 distance (which is a breaking change?)
+    return min_dists.pow(2), idx
+
+
+@torch.jit.script
 def pairwise_l2(
     x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -188,8 +188,7 @@ def _l2_distance(
     if y2 is None:
         y2 = (y * y).sum(dim=1)
     for sub_vectors in x.split(split_size):
-        dists = pairwise_l2(sub_vectors, y, y2)
-        min_dists, idx = torch.min(dists, dim=1, keepdim=True)
+        min_dists, idx = argmin_l2(sub_vectors, y)
         part_ids.append(idx)
         distances.append(min_dists)
 
@@ -221,12 +220,12 @@ def l2_distance(
     A tuple of Tensors, for centroids id, and distance to the centroids.
     """
     split = _suggest_batch_size(centroids)
-    while split >= 256:
+    while split >= 128:
         try:
             return _l2_distance(vectors, centroids, split_size=split, y2=y2)
         except RuntimeError as e:  # noqa: PERF203
             if "CUDA out of memory" in str(e):
-                logging.warning(
+                LOGGER.warning(
                     "L2: batch split=%s out of memory, attempt to use reduced split %s",
                     split,
                     split // 2,
@@ -261,5 +260,7 @@ def dot_distance(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.
     dists = 1 - x @ y.T
     idx = torch.argmin(dists, dim=1, keepdim=True)
     dists = dists.take_along_dim(idx, dim=1).reshape(-1)
-    idx = torch.where(dists.isnan(), torch.nan, idx)
-    return idx.reshape(-1), dists.reshape(-1)
+    idx = idx.reshape(-1)
+    dists = dists.reshape(-1)
+    idx = torch.where(dists.isnan(), -1, idx)
+    return idx, dists

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance extensions for [DataFrame].
 
@@ -127,8 +116,8 @@ impl BatchStreamGrouper {
     }
 
     /// Get the output schema of the stream.
-    pub fn schema(&self) -> Arc<Schema> {
-        self.input.schema()
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
     }
 
     /// Given a record batch, find the distinct ranges of partition values.
@@ -139,7 +128,7 @@ impl BatchStreamGrouper {
         let column = batch.column_by_name(&self.partition_column).ok_or(
             datafusion::error::DataFusionError::Execution("Partition column not found".into()),
         )?;
-        let ranges = partition(&[column.clone()])?.ranges();
+        let ranges = partition(std::slice::from_ref(column))?.ranges();
         ranges
             .into_iter()
             .rev()

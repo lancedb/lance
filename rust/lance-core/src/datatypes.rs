@@ -1,41 +1,53 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance data types, [Schema] and [Field]
 
 use std::fmt::{self, Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::ArrayRef;
-use arrow_schema::{DataType, Field as ArrowField, TimeUnit};
-use lance_arrow::bfloat16::{
-    is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
-};
-use snafu::{location, Location};
+use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
+use deepsize::DeepSizeOf;
+use lance_arrow::bfloat16::{is_bfloat16_field, BFLOAT16_EXT_NAME};
+use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
+use snafu::location;
 
 mod field;
 mod schema;
 
 use crate::{Error, Result};
-pub use field::Encoding;
-pub use field::Field;
-pub use field::SchemaCompareOptions;
-pub use schema::Schema;
+pub use field::{
+    Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions, StorageClass,
+    LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
+};
+pub use schema::{OnMissing, Projectable, Projection, Schema};
+
+// NOTE: BLOB_META_KEY is used in lance-core's field.rs, so it must stay here
+// to avoid circular dependency with lance-encoding
+pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+
+pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+    ])
+});
+
+pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
+    ArrowField::new(
+        "description",
+        DataType::Struct(BLOB_DESC_FIELDS.clone()),
+        true,
+    )
+});
+
+pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct LogicalType(String);
 
 impl fmt::Display for LogicalType {
@@ -189,6 +201,7 @@ impl TryFrom<&LogicalType> for DataType {
             "binary" => Some(Binary),
             "large_string" => Some(LargeUtf8),
             "large_binary" => Some(LargeBinary),
+            "json" => Some(LargeBinary),
             "date32:day" => Some(Date32),
             "date64:ms" => Some(Date64),
             "time32:s" => Some(Time32(TimeUnit::Second)),
@@ -206,19 +219,26 @@ impl TryFrom<&LogicalType> for DataType {
             let splits = lt.0.split(':').collect::<Vec<_>>();
             match splits[0] {
                 "fixed_size_list" => {
-                    if splits.len() != 3 {
+                    if splits.len() < 3 {
                         return Err(Error::Schema {
                             message: format!("Unsupported logical type: {}", lt),
                             location: location!(),
                         });
                     }
 
-                    let size: i32 = splits[2].parse::<i32>().map_err(|e: _| Error::Schema {
-                        message: e.to_string(),
-                        location: location!(),
-                    })?;
+                    let size: i32 =
+                        splits
+                            .last()
+                            .unwrap()
+                            .parse::<i32>()
+                            .map_err(|e: _| Error::Schema {
+                                message: e.to_string(),
+                                location: location!(),
+                            })?;
 
-                    match splits[1] {
+                    let inner_type = splits[1..splits.len() - 1].join(":");
+
+                    match inner_type.as_str() {
                         BFLOAT16_EXT_NAME => {
                             let field = ArrowField::new("item", Self::FixedSizeBinary(2), true)
                                 .with_metadata(
@@ -257,7 +277,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "dict" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupport dictionary type: {}", lt),
+                            message: format!("Unsupported dictionary type: {}", lt),
                             location: location!(),
                         })
                     } else {
@@ -269,7 +289,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "decimal" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupport decimal type: {}", lt),
+                            message: format!("Unsupported decimal type: {}", lt),
                             location: location!(),
                         })
                     } else {
@@ -333,6 +353,15 @@ pub struct Dictionary {
     pub length: usize,
 
     pub values: Option<ArrayRef>,
+}
+
+impl DeepSizeOf for Dictionary {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.values
+            .as_ref()
+            .map(|v| v.get_array_memory_size())
+            .unwrap_or(0)
+    }
 }
 
 impl PartialEq for Dictionary {

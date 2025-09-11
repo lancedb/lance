@@ -12,6 +12,10 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+
+object_store = { workspace = true }
+opendal = { workspace = true, optional = true }
+object_store_opendal = { workspace = true, optional = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
@@ -24,34 +28,47 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
-aws-config.workspace = true
-aws-credential-types.workspace = true
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+deepsize.workspace = true
 futures.workspace = true
-lazy_static.workspace = true
-num_cpus.workspace = true
-object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
+log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
+serde.workspace = true
 shellexpand.workspace = true
 snafu.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
 tracing.workspace = true
 url.workspace = true
+path_abs.workspace = true
+rand.workspace = true
+async-priority-channel = "0.2.0"
 
 [dev-dependencies]
 criterion.workspace = true
-parquet.workspace = true
-pprof.workspace = true
-rand.workspace = true
 tempfile.workspace = true
+test-log.workspace = true
+mockall.workspace = true
+rstest.workspace = true
 
-[build-dependencies]
-prost-build.workspace = true
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof.workspace = true
 
 [[bench]]
 name = "scheduler"
 harness = false
+
+[features]
+default = ["aws", "azure", "gcp"]
+gcs-test = []
+gcp = ["object_store/gcp", "dep:opendal", "opendal/services-gcs", "dep:object_store_opendal"]
+aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
+azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "dep:object_store_opendal"]
+oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
+
+[lints]
+workspace = true

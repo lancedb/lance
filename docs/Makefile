@@ -1,30 +1,26 @@
-# Minimal makefile for Sphinx documentation
-#
+.PHONY: help serve build clean install dev-install check-links sync
 
-# You can set these variables from the command line, and also
-# from the environment for the first two.
-SPHINXOPTS    ?=
-SPHINXBUILD   ?= sphinx-build
-SOURCEDIR     = .
-BUILDDIR      = _build
-LINKCHECKDIR  = build/linkcheck
-
-# Put it first so that "make" without argument is like "make help".
 help:
-	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@echo "Available commands:"
+	@echo "  make serve        - Serve documentation locally (auto-installs deps)"
+	@echo "  make build        - Build documentation (auto-installs deps)"
+	@echo "  make clean        - Clean build artifacts"
+	@echo "  make check-links  - Check for broken links"
+	@echo "  make sync         - Sync dependencies with pyproject.toml"
 
-.PHONY: help Makefile
+sync:
+	uv sync --all-extras
 
-nbconvert:
-	jupyter-nbconvert --to rst --output-dir notebooks ../notebooks/*.ipynb
+serve:
+	uv run mkdocs serve
 
-# Catch-all target: route all unknown targets to Sphinx using the new
-# "make mode" option.  $(O) is meant as a shortcut for $(SPHINXOPTS).
-%: Makefile
-	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+build:
+	uv run mkdocs build
 
-checklinks:
-	$(SPHINXBUILD) -b linkcheck "$(SOURCEDIR)" $(LINKCHECKDIR)
-	@echo
-	@echo "Check finished. Report is in $(LINKCHECKDIR)."
-.PHONY: checklinks
+clean:
+	rm -rf site/
+	rm -rf .cache/
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+
+check-links:
+	uv run mkdocs-linkcheck src

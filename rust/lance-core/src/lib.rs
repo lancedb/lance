@@ -1,31 +1,34 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Field as ArrowField};
+use std::sync::LazyLock;
 
 pub mod cache;
+pub mod container;
 pub mod datatypes;
 pub mod error;
+pub mod traits;
 pub mod utils;
 
-pub use error::{Error, Result};
+pub use error::{ArrowResult, Error, Result};
 
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";
+/// Column name for the meta row address.
+pub const ROW_ADDR: &str = "_rowaddr";
+/// Column name for the meta row offset.
+pub const ROW_OFFSET: &str = "_rowoffset";
 
-lazy_static::lazy_static! {
-    /// Row ID field. This is nullable because its validity bitmap is sometimes used
-    /// as a selection vector.
-    pub static ref ROW_ID_FIELD: ArrowField = ArrowField::new(ROW_ID, DataType::UInt64, true);
-}
+/// Row ID field. This is nullable because its validity bitmap is sometimes used
+/// as a selection vector.
+pub static ROW_ID_FIELD: LazyLock<ArrowField> =
+    LazyLock::new(|| ArrowField::new(ROW_ID, DataType::UInt64, true));
+/// Row address field. This is nullable because its validity bitmap is sometimes used
+/// as a selection vector.
+pub static ROW_ADDR_FIELD: LazyLock<ArrowField> =
+    LazyLock::new(|| ArrowField::new(ROW_ADDR, DataType::UInt64, true));
+/// Row offset field. This is nullable merely for compatibility with the other
+/// fields.
+pub static ROW_OFFSET_FIELD: LazyLock<ArrowField> =
+    LazyLock::new(|| ArrowField::new(ROW_OFFSET, DataType::UInt64, true));

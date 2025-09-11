@@ -1,37 +1,19 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{iter::Sum, ops::AddAssign};
 
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use half::{bf16, f16};
-use lance_arrow::{bfloat16::BFloat16Type, ArrowFloatType, FloatToArrayType};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::{AsPrimitive, Float};
-
-use crate::simd::{
-    f32::{f32x16, f32x8},
-    SIMD,
-};
+use num_traits::{AsPrimitive, Float, Num};
 
 /// L2 normalization
-pub trait Normalize: ArrowFloatType {
+pub trait Normalize: Num {
     /// L2 Normalization over a Vector.
-    fn norm_l2(vector: &[Self::Native]) -> f32;
+    fn norm_l2(vector: &[Self]) -> f32;
 }
 
 #[cfg(feature = "fp16kernels")]
@@ -43,16 +25,27 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn norm_l2_f16_avx512(ptr: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn norm_l2_f16_avx2(ptr: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn norm_l2_f16_lsx(ptr: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn norm_l2_f16_lasx(ptr: *const f16, len: u32) -> f32;
     }
 }
 
-impl Normalize for Float16Type {
+impl Normalize for u8 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, f32, 16>(vector)
+    }
+}
+
+impl Normalize for f16 {
+    #[inline]
+    fn norm_l2(vector: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -60,7 +53,7 @@ impl Normalize for Float16Type {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {
@@ -70,47 +63,37 @@ impl Normalize for Float16Type {
             SimdSupport::Avx2 => unsafe {
                 kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
             },
-            _ => norm_l2_impl::<f16, f32, 32>(vector),
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                kernel::norm_l2_f16_lasx(vector.as_ptr(), vector.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                kernel::norm_l2_f16_lsx(vector.as_ptr(), vector.len() as u32)
+            },
+            _ => norm_l2_impl::<Self, f32, 32>(vector),
         }
     }
 }
 
-impl Normalize for BFloat16Type {
+impl Normalize for bf16 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
-        norm_l2_impl::<bf16, f32, 32>(vector)
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, f32, 32>(vector)
     }
 }
 
-impl Normalize for Float32Type {
+impl Normalize for f32 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
-        let dim = vector.len();
-        if dim % 16 == 0 {
-            let mut sum = f32x16::zeros();
-            for i in (0..dim).step_by(16) {
-                let x = unsafe { f32x16::load_unaligned(vector.as_ptr().add(i)) };
-                sum += x * x;
-            }
-            sum.reduce_sum().sqrt()
-        } else if dim % 8 == 0 {
-            let mut sum = f32x8::zeros();
-            for i in (0..dim).step_by(8) {
-                let x = unsafe { f32x8::load_unaligned(vector.as_ptr().add(i)) };
-                sum += x * x;
-            }
-            sum.reduce_sum().sqrt()
-        } else {
-            // Fallback to scalar
-            norm_l2_impl::<f32, f32, 16>(vector)
-        }
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, Self, 16>(vector)
     }
 }
 
-impl Normalize for Float64Type {
+impl Normalize for f64 {
     #[inline]
-    fn norm_l2(vector: &[Self::Native]) -> f32 {
-        norm_l2_impl::<f64, f64, 8>(vector) as f32
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, Self, 8>(vector) as f32
     }
 }
 
@@ -147,17 +130,15 @@ pub fn norm_l2_impl<
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn norm_l2<T: FloatToArrayType>(vector: &[T]) -> f32
-where
-    T::ArrowType: Normalize,
-{
-    T::ArrowType::norm_l2(vector)
+pub fn norm_l2<T: Normalize>(vector: &[T]) -> f32 {
+    T::norm_l2(vector)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::{arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64};
+    use num_traits::ToPrimitive;
     use proptest::prelude::*;
 
     /// Reference implementation of L2 norm.
@@ -165,10 +146,9 @@ mod tests {
         data.iter().map(|v| (*v * *v)).sum::<f64>().sqrt() as f32
     }
 
-    fn do_norm_l2_test<T: FloatToArrayType>(data: &[T]) -> std::result::Result<(), TestCaseError>
-    where
-        T::ArrowType: Normalize,
-    {
+    fn do_norm_l2_test<T: Normalize + ToPrimitive>(
+        data: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
         let f64_data = data
             .iter()
             .map(|v| v.to_f64().unwrap())

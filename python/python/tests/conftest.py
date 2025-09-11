@@ -1,17 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-import os
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 import sys
 
 import pytest
@@ -22,16 +10,6 @@ def provide_pandas(request, monkeypatch):
     if not request.param:
         monkeypatch.setitem(sys.modules, "pd", None)
     return request.param
-
-
-@pytest.fixture
-def s3_bucket() -> str:
-    return os.environ.get("TEST_S3_BUCKET", "lance-integtest")
-
-
-@pytest.fixture
-def ddb_table() -> str:
-    return os.environ.get("TEST_DDB_TABLE", "lance-integtest")
 
 
 def disable_items_with_mark(items, mark, reason):
@@ -52,11 +30,40 @@ def pytest_addoption(parser):
         default=False,
         help="Run integration tests (requires S3 buckets to be setup with access)",
     )
+    parser.addoption(
+        "--run-slow",
+        action="store_true",
+        default=False,
+        help="Run slow tests",
+    )
+    parser.addoption(
+        "--run-forward",
+        action="store_true",
+        default=False,
+        help="Run forward compatibility tests (requires files to be generated already)",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "forward: mark tests that require forward compatibility datagen files",
+    )
+    config.addinivalue_line(
+        "markers", "integration: mark test that requires object storage integration"
+    )
+    config.addinivalue_line(
+        "markers", "slow: mark tests that require large CPU or RAM resources"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
     if not config.getoption("--run-integration"):
         disable_items_with_mark(items, "integration", "--run-integration not specified")
+    if not config.getoption("--run-slow"):
+        disable_items_with_mark(items, "slow", "--run-slow not specified")
+    if not config.getoption("--run-forward"):
+        disable_items_with_mark(items, "forward", "--run-forward not specified")
     try:
         import torch
 

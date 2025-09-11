@@ -1,64 +1,64 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
     any::Any,
     sync::{Arc, Mutex},
 };
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
+    catalog::{streaming::StreamingTable, Session},
     dataframe::DataFrame,
-    datasource::{streaming::StreamingTable, TableProvider},
+    datasource::TableProvider,
     error::DataFusionError,
-    execution::{
-        context::{SessionContext, SessionState},
-        TaskContext,
-    },
+    execution::{context::SessionContext, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream},
 };
-use lance_core::ROW_ID;
+use lance_arrow::SchemaExt;
+use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
+#[derive(Debug)]
 pub struct LanceTableProvider {
     dataset: Arc<Dataset>,
     full_schema: Arc<Schema>,
     row_id_idx: Option<usize>,
+    row_addr_idx: Option<usize>,
+    ordered: bool,
 }
 
 impl LanceTableProvider {
-    fn new(dataset: Arc<Dataset>, with_row_id: bool) -> Self {
-        let full_schema = if with_row_id {
-            let mut full_schema = dataset.schema().clone();
-            full_schema
-                .extend(&[Field::new(ROW_ID, DataType::UInt64, false)])
-                .unwrap();
-            full_schema
-        } else {
-            dataset.schema().clone()
-        };
+    pub fn new(dataset: Arc<Dataset>, with_row_id: bool, with_row_addr: bool) -> Self {
+        Self::new_with_ordering(dataset, with_row_id, with_row_addr, true)
+    }
+
+    pub fn new_with_ordering(
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+        ordered: bool,
+    ) -> Self {
+        let mut full_schema = Schema::from(dataset.schema());
+        let mut row_id_idx = None;
+        let mut row_addr_idx = None;
+        if with_row_id {
+            full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
+            row_id_idx = Some(full_schema.fields.len() - 1);
+        }
+        if with_row_addr {
+            full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
+            row_addr_idx = Some(full_schema.fields.len() - 1);
+        }
         Self {
             dataset,
-            full_schema: Arc::new(Schema::from(&full_schema)),
-            row_id_idx: if with_row_id {
-                Some(full_schema.fields.len() - 1)
-            } else {
-                None
-            },
+            full_schema: Arc::new(full_schema),
+            row_id_idx,
+            row_addr_idx,
+            ordered,
         }
     }
 }
@@ -79,25 +79,34 @@ impl TableProvider for LanceTableProvider {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
-        if let Some(projection) = projection {
-            let mut columns = Vec::with_capacity(projection.len());
-            for field_idx in projection {
-                if Some(*field_idx) == self.row_id_idx {
-                    scan.with_row_id();
-                } else {
-                    columns.push(self.full_schema.field(*field_idx).name());
+        match projection {
+            Some(projection) if projection.is_empty() => {
+                scan.empty_project()?;
+            }
+            Some(projection) => {
+                let mut columns = Vec::with_capacity(projection.len());
+                for field_idx in projection {
+                    if Some(*field_idx) == self.row_id_idx {
+                        scan.with_row_id();
+                    } else if Some(*field_idx) == self.row_addr_idx {
+                        scan.with_row_address();
+                    } else {
+                        columns.push(self.full_schema.field(*field_idx).name());
+                    }
+                }
+                if !columns.is_empty() {
+                    scan.project(&columns)?;
                 }
             }
-            if !columns.is_empty() {
-                scan.project(&columns)?;
-            }
+            _ => {}
         }
+
         let combined_filter = match filters.len() {
             0 => None,
             1 => Some(filters[0].clone()),
@@ -113,6 +122,7 @@ impl TableProvider for LanceTableProvider {
             scan.filter_expr(combined_filter);
         }
         scan.limit(limit.map(|l| l as i64), None)?;
+        scan.scan_in_order(self.ordered);
 
         scan.create_plan().await.map_err(DataFusionError::from)
     }
@@ -137,6 +147,14 @@ pub trait SessionContextExt {
         &self,
         dataset: Arc<Dataset>,
         with_row_id: bool,
+        with_row_addr: bool,
+    ) -> datafusion::common::Result<DataFrame>;
+    /// Creates a DataFrame for reading a Lance dataset without ordering
+    fn read_lance_unordered(
+        &self,
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame>;
     /// Creates a DataFrame for reading a stream of data
     ///
@@ -154,11 +172,19 @@ struct OneShotPartitionStream {
 
 impl OneShotPartitionStream {
     fn new(data: SendableRecordBatchStream) -> Self {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),
             schema,
         }
+    }
+}
+
+impl std::fmt::Debug for OneShotPartitionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotPartitionStream")
+            .field("schema", &self.schema)
+            .finish()
     }
 }
 
@@ -180,17 +206,91 @@ impl SessionContextExt for SessionContext {
         &self,
         dataset: Arc<Dataset>,
         with_row_id: bool,
+        with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame> {
-        self.read_table(Arc::new(LanceTableProvider::new(dataset, with_row_id)))
+        self.read_table(Arc::new(LanceTableProvider::new(
+            dataset,
+            with_row_id,
+            with_row_addr,
+        )))
+    }
+
+    fn read_lance_unordered(
+        &self,
+        dataset: Arc<Dataset>,
+        with_row_id: bool,
+        with_row_addr: bool,
+    ) -> datafusion::common::Result<DataFrame> {
+        self.read_table(Arc::new(LanceTableProvider::new_with_ordering(
+            dataset,
+            with_row_id,
+            with_row_addr,
+            false,
+        )))
     }
 
     fn read_one_shot(
         &self,
         data: SendableRecordBatchStream,
     ) -> datafusion::common::Result<DataFrame> {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::AsArray,
+        datatypes::{Int32Type, Int64Type},
+    };
+    use datafusion::prelude::SessionContext;
+    use lance_datagen::array;
+    use tempfile::tempdir;
+
+    use crate::{
+        datafusion::LanceTableProvider,
+        utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
+    };
+
+    #[tokio::test]
+    pub async fn test_table_provider() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let data = lance_datagen::gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .col("y", array::step_custom::<Int32Type>(0, 2))
+            .into_dataset(
+                test_uri,
+                FragmentCount::from(10),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+
+        ctx.register_table(
+            "foo",
+            Arc::new(LanceTableProvider::new(Arc::new(data), true, true)),
+        )
+        .unwrap();
+
+        let df = ctx
+            .sql("SELECT SUM(x) FROM foo WHERE y > 100")
+            .await
+            .unwrap();
+
+        let results = df.collect().await.unwrap();
+        assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        assert_eq!(results.num_columns(), 1);
+        assert_eq!(results.num_rows(), 1);
+        // SUM(0..100) - SUM(0..50) = 3675
+        assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
     }
 }

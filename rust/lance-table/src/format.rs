@@ -1,19 +1,8 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_buffer::ToByteSlice;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 mod fragment;
@@ -22,7 +11,10 @@ mod manifest;
 
 pub use fragment::*;
 pub use index::Index;
-pub use manifest::{Manifest, SelfDescribingFileReader, WriterVersion};
+pub use manifest::{
+    is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
+    WriterVersion, DETACHED_VERSION_MASK,
+};
 
 use lance_core::{Error, Result};
 
@@ -49,10 +41,10 @@ impl TryFrom<&pb::Uuid> for Uuid {
 
     fn try_from(p: &pb::Uuid) -> Result<Self> {
         if p.uuid.len() != 16 {
-            return Err(Error::IO {
-                message: "Protobuf UUID is malformed".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io(
+                "Protobuf UUID is malformed".to_string(),
+                location!(),
+            ));
         }
         let mut buf: [u8; 16] = [0; 16];
         buf.copy_from_slice(p.uuid.to_byte_slice());

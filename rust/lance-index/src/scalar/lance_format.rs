@@ -1,33 +1,30 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
+use std::cmp::min;
+use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+
+use deepsize::DeepSizeOf;
+use futures::TryStreamExt;
+use lance_core::{cache::LanceCache, Error, Result};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_file::{
     reader::FileReader,
-    writer::{FileWriter, FileWriterOptions, ManifestProvider},
+    writer::{FileWriter, ManifestProvider},
 };
-use snafu::{location, Location};
-
-use lance_core::{Error, Result};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
-use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
+use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 
 use super::{IndexReader, IndexStore, IndexWriter};
@@ -39,16 +36,36 @@ use super::{IndexReader, IndexStore, IndexWriter};
 /// each collection in a file in the lance format.
 #[derive(Debug)]
 pub struct LanceIndexStore {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     index_dir: Path,
+    metadata_cache: Arc<LanceCache>,
+    scheduler: Arc<ScanScheduler>,
+}
+
+impl DeepSizeOf for LanceIndexStore {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.object_store.deep_size_of_children(context)
+            + self.index_dir.as_ref().deep_size_of_children(context)
+            + self.metadata_cache.deep_size_of_children(context)
+    }
 }
 
 impl LanceIndexStore {
     /// Create a new index store at the given directory
-    pub fn new(object_store: ObjectStore, index_dir: Path) -> Self {
+    pub fn new(
+        object_store: Arc<ObjectStore>,
+        index_dir: Path,
+        metadata_cache: Arc<LanceCache>,
+    ) -> Self {
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
         Self {
             object_store,
             index_dir,
+            metadata_cache,
+            scheduler,
         }
     }
 }
@@ -64,22 +81,123 @@ impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
+
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        Self::finish_with_metadata(self, &metadata)
+            .await
+            .map(|_| ())
+    }
+}
+
+#[async_trait]
+impl IndexWriter for v2::writer::FileWriter {
+    async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
+        let offset = self.tell().await?;
+        self.write_batch(&batch).await?;
+        Ok(offset)
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        Self::finish(self).await.map(|_| ())
+    }
+
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        metadata.into_iter().for_each(|(k, v)| {
+            self.add_schema_metadata(k, v);
+        });
+        Self::finish(self).await.map(|_| ())
+    }
 }
 
 #[async_trait]
 impl IndexReader for FileReader {
-    async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
-        self.read_batch(
-            offset as i32,
-            ReadBatchParams::RangeFull,
-            self.schema(),
-            None,
-        )
-        .await
+    async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
+        self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
+            .await
     }
 
-    async fn num_batches(&self) -> u32 {
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let projection = match projection {
+            Some(projection) => self.schema().project(projection)?,
+            None => self.schema().clone(),
+        };
+        self.read_range(range, &projection).await
+    }
+
+    async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.num_batches() as u32
+    }
+
+    fn num_rows(&self) -> usize {
+        self.len()
+    }
+
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        Self::schema(self)
+    }
+}
+
+#[async_trait]
+impl IndexReader for v2::reader::FileReader {
+    async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
+        let start = offset * batch_size;
+        let end = start + batch_size;
+        let end = end.min(self.num_rows());
+        self.read_range(start as usize..end as usize, None).await
+    }
+
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        if range.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(
+                self.schema().as_ref().into(),
+            )));
+        }
+        let projection = if let Some(projection) = projection {
+            v2::reader::ReaderProjection::from_column_names(
+                self.metadata().version(),
+                self.schema(),
+                projection,
+            )?
+        } else {
+            v2::reader::ReaderProjection::from_whole_schema(
+                self.schema(),
+                self.metadata().version(),
+            )
+        };
+        let batches = self
+            .read_stream_projected(
+                ReadBatchParams::Range(range),
+                u32::MAX,
+                u32::MAX,
+                projection,
+                FilterExpression::no_filter(),
+            )?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(batches.len(), 1);
+        Ok(batches[0].clone())
+    }
+
+    // V2 format has removed the row group concept,
+    // so here we assume each batch is with 4096 rows.
+    async fn num_batches(&self, batch_size: u64) -> u32 {
+        Self::num_rows(self).div_ceil(batch_size) as u32
+    }
+
+    fn num_rows(&self) -> usize {
+        Self::num_rows(self) as usize
+    }
+
+    fn schema(&self) -> &lance_core::datatypes::Schema {
+        Self::schema(self)
     }
 }
 
@@ -89,6 +207,10 @@ impl IndexStore for LanceIndexStore {
         self
     }
 
+    fn io_parallelism(&self) -> usize {
+        self.object_store.io_parallelism()
+    }
+
     async fn new_index_file(
         &self,
         name: &str,
@@ -96,269 +218,366 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
-        let writer = FileWriter::<ManifestDescribing>::try_new(
-            &self.object_store,
-            &path,
+        let writer = self.object_store.create(&path).await?;
+        let writer = v2::writer::FileWriter::try_new(
+            writer,
             schema,
-            &FileWriterOptions::default(),
-        )
-        .await?;
+            v2::writer::FileWriterOptions::default(),
+        )?;
         Ok(Box::new(writer))
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        // TODO: Should probably provide file metadata cache here
-        let file_reader =
-            FileReader::try_new_self_described(&self.object_store, &path, None).await?;
-        Ok(Arc::new(file_reader))
+        let file_scheduler = self
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await?;
+        match v2::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &self.metadata_cache,
+            FileReaderOptions::default(),
+        )
+        .await
+        {
+            Ok(reader) => Ok(Arc::new(reader)),
+            Err(e) => {
+                // If the error is a version conflict we can try to read the file with v1 reader
+                if let Error::VersionConflict { .. } = e {
+                    let path = self.index_dir.child(name);
+                    let file_reader = FileReader::try_new_self_described(
+                        &self.object_store,
+                        &path,
+                        Some(&self.metadata_cache),
+                    )
+                    .await?;
+                    Ok(Arc::new(file_reader))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
         let path = self.index_dir.child(name);
 
         let other_store = dest_store.as_any().downcast_ref::<Self>();
-        if let Some(dest_lance_store) = other_store {
-            // If both this store and the destination are lance stores we can use object_store's copy
-            // This does blindly assume that both stores are using the same underlying object_store
-            // but there is no easy way to verify this and it happens to always be true at the moment
-            let dest_path = dest_lance_store.index_dir.child(name);
-            self.object_store.copy(&path, &dest_path).await
-        } else {
-            let reader = self.open_index_file(name).await?;
-            let num_batches = reader.num_batches().await;
-            if num_batches == 0 {
-                return Err(Error::Internal {
-                    message:
-                        "Cannot copy an empty index file because the schema cannot be determined"
-                            .into(),
-                    location: location!(),
-                });
+        match other_store {
+            Some(dest_store) if dest_store.object_store.scheme() == self.object_store.scheme() => {
+                // If both this store and the destination are lance stores we can use object_store's copy
+                // This does blindly assume that both stores are using the same underlying object_store
+                // but there is no easy way to verify this and it happens to always be true at the moment
+                let dest_path = dest_store.index_dir.child(name);
+                self.object_store.copy(&path, &dest_path).await
             }
-            let first_batch = reader.read_record_batch(0).await?;
-            let schema = first_batch.schema();
-            let mut writer = dest_store.new_index_file(name, schema).await?;
-            writer.write_record_batch(first_batch).await?;
-            for batch_index in 1..num_batches {
-                writer
-                    .write_record_batch(reader.read_record_batch(batch_index).await?)
+            _ => {
+                let reader = self.open_index_file(name).await?;
+                let mut writer = dest_store
+                    .new_index_file(name, Arc::new(reader.schema().into()))
                     .await?;
+
+                for offset in (0..reader.num_rows()).step_by(4096) {
+                    let next_offset = min(offset + 4096, reader.num_rows());
+                    let batch = reader.read_range(offset..next_offset, None).await?;
+                    writer.write_record_batch(batch).await?;
+                }
+                writer.finish().await?;
+
+                Ok(())
             }
-            writer.finish().await?;
-            Ok(())
         }
+    }
+
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()> {
+        let path = self.index_dir.child(name);
+        let new_path = self.index_dir.child(new_name);
+        self.object_store.copy(&path, &new_path).await?;
+        self.object_store.delete(&path).await
+    }
+
+    async fn delete_index_file(&self, name: &str) -> Result<()> {
+        let path = self.index_dir.child(name);
+        self.object_store.delete(&path).await
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
 
-    use std::{ops::Bound, path::Path};
+    use std::{collections::HashMap, ops::Bound, path::Path};
 
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::bitmap::BitmapIndexPlugin;
+    use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
+    use crate::scalar::label_list::LabelListIndexPlugin;
+    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
-        btree::{train_btree_index, BTreeIndex, BtreeTrainingSource},
+        bitmap::BitmapIndex,
+        btree::{train_btree_index, DEFAULT_BTREE_BATCH_SIZE},
         flat::FlatIndexMetadata,
-        ScalarIndex, ScalarQuery,
+        LabelListQuery, SargableQuery, ScalarIndex,
     };
 
     use super::*;
+    use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
     use arrow_array::{
         cast::AsArray,
-        types::{Float32Type, Int32Type, UInt64Type},
-        RecordBatchIterator, RecordBatchReader, UInt64Array,
+        types::{Int32Type, UInt64Type},
+        RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
     };
+    use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
-    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_datagen::{array, gen, BatchCount, RowCount};
+    use futures::FutureExt;
+    use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::ROW_ID;
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path.to_owned()))
-    }
-
-    struct MockTrainingSource {
-        data: SendableRecordBatchStream,
-    }
-
-    impl MockTrainingSource {
-        async fn new(data: impl RecordBatchReader + Send + 'static) -> Self {
-            Self {
-                data: lance_datafusion::utils::reader_to_stream(Box::new(data))
-                    .await
-                    .unwrap()
-                    .0,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl BtreeTrainingSource for MockTrainingSource {
-        async fn scan_ordered_chunks(
-            self: Box<Self>,
-            _chunk_size: u32,
-        ) -> Result<SendableRecordBatchStream> {
-            Ok(self.data)
-        }
+            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
     async fn train_index(
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
-        value_type: DataType,
+        custom_batch_size: Option<u64>,
     ) {
-        let sub_index_trainer = FlatIndexMetadata::new(value_type);
-
-        let data = Box::new(MockTrainingSource::new(data).await);
-        train_btree_index(data, &sub_index_trainer, index_store.as_ref())
+        let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+        let params = BTreeParameters {
+            zone_size: Some(batch_size),
+        };
+        let params = serde_json::to_string(&params).unwrap();
+        let btree_plugin = BTreeIndexPlugin;
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let request = btree_plugin
+            .new_training_request(
+                &params,
+                &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            )
+            .unwrap();
+        btree_plugin
+            .train_index(data, index_store.as_ref(), request)
             .await
             .unwrap();
+    }
+
+    fn default_details<T: prost::Message + prost::Name + std::default::Default>() -> prost_types::Any
+    {
+        prost_types::Any::from_msg(&T::default()).unwrap()
     }
 
     #[tokio::test]
     async fn test_basic_btree() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let data = gen()
-            .col(Some("values".to_string()), array::step::<Int32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
-
-        let row_ids = index
-            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+        train_index(&index_store, data, None).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<crate::pb::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
-        assert_eq!(1, row_ids.len());
-        assert_eq!(Some(10000), row_ids.values().into_iter().copied().next());
-
-        let row_ids = index
-            .search(&ScalarQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::Int32(Some(-100))),
-            ))
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
-        assert_eq!(0, row_ids.len());
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(10000));
 
-        let row_ids = index
-            .search(&ScalarQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::Int32(Some(100))),
-            ))
+        let result = index
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(-100))),
+                ),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
 
-        assert_eq!(100, row_ids.len());
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
+        assert_eq!(Some(0), row_ids.len());
+
+        let result = index
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(100))),
+                ),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
+        assert_eq!(Some(100), row_ids.len());
     }
 
     #[tokio::test]
     async fn test_btree_update() {
         let index_dir = tempdir().unwrap();
         let index_store = test_store(&index_dir);
-        let data = gen()
-            .col(Some("values".to_string()), array::step::<Int32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        train_index(&index_store, data, None).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<crate::pb::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
 
-        let data = gen()
-            .col(Some("values".to_string()), array::step::<Int32Type>())
-            .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+        let data = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::step_custom::<Int32Type>(4096 * 100, 1),
+            )
+            .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = tempdir().unwrap();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data))
-                    .await
-                    .unwrap()
-                    .0,
+                lance_datafusion::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
             )
             .await
             .unwrap();
-        let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
-
-        let row_ids = updated_index
-            .search(&ScalarQuery::Equals(ScalarValue::Int32(Some(10000))))
+        let updated_index = BTreeIndexPlugin
+            .load_index(
+                updated_index_store,
+                &default_details::<crate::pb::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
-        assert_eq!(2, row_ids.len());
-        assert_eq!(
-            vec![10000, 10000],
-            row_ids.values().into_iter().copied().collect::<Vec<_>>()
-        );
+        let result = updated_index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(10000));
+
+        let result = updated_index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(500_000))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(500_000));
     }
 
-    async fn check(index: &BTreeIndex, query: ScalarQuery, expected: &[u64]) {
-        let results = index.search(&query).await.unwrap();
-        let expected_arr = UInt64Array::from_iter_values(expected.iter().copied());
-        assert_eq!(results, expected_arr);
+    async fn check(index: &Arc<dyn ScalarIndex>, query: SargableQuery, expected: &[u64]) {
+        let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert!(results.is_exact());
+        let expected_arr = RowIdTreeMap::from_iter(expected);
+        assert_eq!(results.row_ids(), &expected_arr);
     }
 
     #[tokio::test]
     async fn test_btree_with_gaps() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch_one = gen()
+        let batch_one = gen_batch()
             .col(
-                Some("values".to_string()),
+                VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![0, 1, 2, 3]),
-            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
-        let batch_two = gen()
+        let batch_two = gen_batch()
             .col(
-                Some("values".to_string()),
+                VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
             )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![40, 50, 60, 70]),
-            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
-        let batch_three = gen()
+        let batch_three = gen_batch()
             .col(
-                Some("values".to_string()),
+                VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
-            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
             .into_batch_rows(RowCount::from(4));
-        let batch_four = gen()
+        let batch_four = gen_batch()
             .col(
-                Some("values".to_string()),
+                VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
             )
             .col(
-                Some("row_ids".to_string()),
+                ROW_ID,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Int32, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        train_index(&index_store, data, DataType::Int32).await;
-        let index = BTreeIndex::load(index_store).await.unwrap();
+        train_index(&index_store, data, Some(4)).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<crate::pb::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
 
         // The above should create four pages
         //
@@ -372,14 +591,14 @@ mod tests {
         // No results (off the left side)
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(-3))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(-3))),
             &[],
         )
         .await;
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Included(ScalarValue::Int32(Some(-3))),
             ),
@@ -389,7 +608,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(-10))),
                 Bound::Included(ScalarValue::Int32(Some(-3))),
             ),
@@ -400,7 +619,7 @@ mod tests {
         // Hitting the middle of a bucket
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(4))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(4))),
             &[2],
         )
         .await;
@@ -408,7 +627,7 @@ mod tests {
         // Hitting a gap between two buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(7))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(7))),
             &[],
         )
         .await;
@@ -416,7 +635,7 @@ mod tests {
         // Hitting the lowest of the overlapping buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(11))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(11))),
             &[50, 60],
         )
         .await;
@@ -424,7 +643,7 @@ mod tests {
         // Hitting the 15 shared on all three buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(15))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(15))),
             &[70, 400, 500, 600, 700, 4000],
         )
         .await;
@@ -432,7 +651,7 @@ mod tests {
         // Hitting the upper part of the three overlapping buckets
         check(
             &index,
-            ScalarQuery::Equals(ScalarValue::Int32(Some(20))),
+            SargableQuery::Equals(ScalarValue::Int32(Some(20))),
             &[6000, 7000],
         )
         .await;
@@ -440,7 +659,7 @@ mod tests {
         // Ranges that capture multiple buckets
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -450,7 +669,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -460,7 +679,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Unbounded,
             ),
@@ -472,7 +691,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -482,7 +701,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Included(ScalarValue::Int32(Some(4))),
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -492,7 +711,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Unbounded,
             ),
@@ -504,7 +723,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Included(ScalarValue::Int32(Some(11))),
             ),
@@ -514,7 +733,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(4))),
                 Bound::Excluded(ScalarValue::Int32(Some(11))),
             ),
@@ -524,7 +743,7 @@ mod tests {
 
         check(
             &index,
-            ScalarQuery::Range(
+            SargableQuery::Range(
                 Bound::Excluded(ScalarValue::Int32(Some(-50))),
                 Bound::Excluded(ScalarValue::Int32(Some(1000))),
             ),
@@ -548,15 +767,16 @@ mod tests {
             DataType::Date32,
             DataType::Time64(TimeUnit::Nanosecond),
             DataType::Time32(TimeUnit::Second),
+            DataType::FixedSizeBinary(16),
             // Not supported today, error from datafusion:
             // Min/max accumulator not implemented for Duration(Nanosecond)
             // DataType::Duration(TimeUnit::Nanosecond),
         ] {
             let tempdir = tempdir().unwrap();
             let index_store = test_store(&tempdir);
-            let data: RecordBatch = gen()
-                .col(Some("values".to_string()), array::rand_type(data_type))
-                .col(Some("row_ids".to_string()), array::step::<UInt64Type>())
+            let data: RecordBatch = gen_batch()
+                .col(VALUE_COLUMN_NAME, array::rand_type(data_type))
+                .col(ROW_ID, array::step::<UInt64Type>())
                 .into_batch_rows(RowCount::from(4096 * 3))
                 .unwrap();
 
@@ -592,51 +812,703 @@ mod tests {
                 data.schema().clone(),
             );
 
-            train_index(&index_store, training_data, data_type.clone()).await;
-            let index = BTreeIndex::load(index_store).await.unwrap();
-
-            let row_ids = index
-                .search(&ScalarQuery::Equals(sample_value))
+            train_index(&index_store, training_data, None).await;
+            let index = BTreeIndexPlugin
+                .load_index(
+                    index_store,
+                    &default_details::<crate::pb::BTreeIndexDetails>(),
+                    None,
+                    &LanceCache::no_cache(),
+                )
                 .await
                 .unwrap();
+
+            let result = index
+                .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
+                .await
+                .unwrap();
+
+            assert!(result.is_exact());
+            let row_ids = result.row_ids();
 
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
             assert!(!row_ids.is_empty());
-            assert!(row_ids.len() < data.num_rows());
-            assert!(row_ids.values().iter().any(|val| *val == sample_row_id));
+            assert!(row_ids.len().unwrap() < data.num_rows() as u64);
+            assert!(row_ids.contains(sample_row_id));
         }
     }
 
     #[tokio::test]
-    async fn btree_reject_nan() {
+    async fn btree_entire_null_page() {
         let tempdir = tempdir().unwrap();
         let index_store = test_store(&tempdir);
-        let batch = gen()
+        let batch = gen_batch()
             .col(
-                Some("values".to_string()),
-                array::cycle::<Float32Type>(vec![0.0, f32::NAN]),
+                VALUE_COLUMN_NAME,
+                array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
-            .col(
-                Some("row_ids".to_string()),
-                array::cycle::<UInt64Type>(vec![0, 1]),
-            )
-            .into_batch_rows(RowCount::from(2));
+            .col(ROW_ID, array::step::<UInt64Type>())
+            .into_batch_rows(RowCount::from(4096));
+        assert_eq!(
+            batch.as_ref().unwrap()[VALUE_COLUMN_NAME].null_count(),
+            4096
+        );
         let batches = vec![batch];
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Float32, false),
-            Field::new("row_ids", DataType::UInt64, false),
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        let sub_index_trainer = FlatIndexMetadata::new(DataType::Float32);
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let sub_index_trainer = FlatIndexMetadata::new(DataType::Utf8);
 
-        let data = Box::new(MockTrainingSource::new(data).await);
-        // Until DF handles NaN reliably we need to make sure we reject input
-        // containing NaN
-        assert!(
-            train_btree_index(data, &sub_index_trainer, index_store.as_ref())
-                .await
-                .is_err()
-        );
+        train_btree_index(
+            data,
+            &sub_index_trainer,
+            index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<crate::pb::BTreeIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Utf8(Some("foo".to_string()))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
+        assert!(row_ids.is_empty());
+
+        let result = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert_eq!(row_ids.len(), Some(4096));
+    }
+
+    async fn train_bitmap(
+        index_store: &Arc<dyn IndexStore>,
+        data: impl RecordBatchReader + Send + Sync + 'static,
+    ) {
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let request = BitmapIndexPlugin
+            .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
+            .unwrap();
+        BitmapIndexPlugin
+            .train_index(data, index_store.as_ref(), request)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_working() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("abcd"), None, Some("abcd")])),
+                Arc::new(UInt64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("apple"),
+                    Some("hello"),
+                    Some("abcd"),
+                ])),
+                Arc::new(UInt64Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+
+        let batches = vec![batch1, batch2];
+        let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        train_bitmap(&index_store, data).await;
+
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Utf8(None)),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(2));
+
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Utf8(Some("abcd".to_string()))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert_eq!(Some(3), row_ids.len());
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(3));
+        assert!(row_ids.contains(6));
+    }
+
+    #[tokio::test]
+    async fn test_basic_bitmap() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(10000))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(10000));
+
+        let result = index
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(-100))),
+                ),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert!(row_ids.is_empty());
+
+        let result = index
+            .search(
+                &SargableQuery::Range(
+                    Bound::Unbounded,
+                    Bound::Excluded(ScalarValue::Int32(Some(100))),
+                ),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert_eq!(Some(100), row_ids.len());
+    }
+
+    async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
+        let results = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert!(results.is_exact());
+        let expected_arr = RowIdTreeMap::from_iter(expected);
+        assert_eq!(results.row_ids(), &expected_arr);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_with_gaps() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let batch_one = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
+            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_two = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
+            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_three = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
+            )
+            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .into_batch_rows(RowCount::from(4));
+        let batch_four = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
+            )
+            .col(
+                ROW_ID,
+                array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
+            )
+            .into_batch_rows(RowCount::from(4));
+        let batches = vec![batch_one, batch_two, batch_three, batch_four];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let data = RecordBatchIterator::new(batches, schema);
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // The above should create four pages
+        //
+        // 0 - 5
+        // 10 - 15
+        // 15 - 15
+        // 15 - 20
+        //
+        // This will help us test various indexing corner cases
+
+        // No results (off the left side)
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(-3))),
+            &[],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
+            &[],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(-10))),
+                Bound::Included(ScalarValue::Int32(Some(-3))),
+            ),
+            &[],
+        )
+        .await;
+
+        // Hitting the middle of a bucket
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(4))),
+            &[2],
+        )
+        .await;
+
+        // Hitting a gap between two buckets
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+            &[],
+        )
+        .await;
+
+        // Hitting the lowest of the overlapping buckets
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(11))),
+            &[50, 60],
+        )
+        .await;
+
+        // Hitting the 15 shared on all three buckets
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(15))),
+            &[70, 400, 500, 600, 700, 4000],
+        )
+        .await;
+
+        // Hitting the upper part of the three overlapping buckets
+        check_bitmap(
+            &index,
+            SargableQuery::Equals(ScalarValue::Int32(Some(20))),
+            &[6000, 7000],
+        )
+        .await;
+
+        // Ranges that capture multiple buckets
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[0, 1, 2, 3, 40, 50, 60],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[0, 1, 2, 3, 40],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[2, 3, 40, 50, 60],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(4))),
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[2, 3, 40],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Unbounded,
+            ),
+            &[
+                3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Included(ScalarValue::Int32(Some(11))),
+            ),
+            &[3, 40, 50, 60],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(4))),
+                Bound::Excluded(ScalarValue::Int32(Some(11))),
+            ),
+            &[3, 40],
+        )
+        .await;
+
+        check_bitmap(
+            &index,
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(-50))),
+                Bound::Excluded(ScalarValue::Int32(Some(1000))),
+            ),
+            &[
+                0, 1, 2, 3, 40, 50, 60, 70, 400, 500, 600, 700, 4000, 5000, 6000, 7000,
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_update() {
+        let index_dir = tempdir().unwrap();
+        let index_store = test_store(&index_dir);
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step_custom::<Int32Type>(4096, 1))
+            .col(ROW_ID, array::step_custom::<UInt64Type>(4096, 1))
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+
+        let updated_index_dir = tempdir().unwrap();
+        let updated_index_store = test_store(&updated_index_dir);
+        index
+            .update(
+                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                updated_index_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        let updated_index = BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let result = updated_index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(5000))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+        assert_eq!(Some(1), row_ids.len());
+        assert!(row_ids.contains(5000));
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_remap() {
+        let index_dir = tempdir().unwrap();
+        let index_store = test_store(&index_dir);
+        let data = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
+            .col(ROW_ID, array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+        train_bitmap(&index_store, data).await;
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let mapping = (0..50)
+            .map(|i| {
+                let map_result = if i == 5 {
+                    Some(65)
+                } else if i == 7 {
+                    None
+                } else {
+                    Some(i)
+                };
+                (i, map_result)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let remapped_dir = tempdir().unwrap();
+        let remapped_store = test_store(&remapped_dir);
+        index
+            .remap(&mapping, remapped_store.as_ref())
+            .await
+            .unwrap();
+        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Remapped to new value
+        assert!(remapped_index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+                &NoOpMetricsCollector
+            )
+            .await
+            .unwrap()
+            .row_ids()
+            .contains(65));
+        // Deleted
+        assert!(remapped_index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(7))),
+                &NoOpMetricsCollector
+            )
+            .await
+            .unwrap()
+            .row_ids()
+            .is_empty());
+        // Not remapped
+        assert!(remapped_index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(3))),
+                &NoOpMetricsCollector
+            )
+            .await
+            .unwrap()
+            .row_ids()
+            .contains(3));
+    }
+
+    async fn train_tag(
+        index_store: &Arc<dyn IndexStore>,
+        data: impl RecordBatchReader + Send + Sync + 'static,
+    ) {
+        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let request = LabelListIndexPlugin
+            .new_training_request(
+                "{}",
+                &Field::new(
+                    VALUE_COLUMN_NAME,
+                    DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+                    false,
+                ),
+            )
+            .unwrap();
+        LabelListIndexPlugin
+            .train_index(data, index_store.as_ref(), request)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_label_list_index() {
+        let tempdir = tempdir().unwrap();
+        let index_store = test_store(&tempdir);
+        let data = gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                array::rand_type(&DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::UInt8,
+                    false,
+                )))),
+            )
+            .col(ROW_ID, array::step::<UInt64Type>())
+            .into_batch_rows(RowCount::from(40960))
+            .unwrap();
+
+        let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+
+        // This is probably enough data that we can be assured each tag is used at least once
+        train_tag(&index_store, batch_reader).await;
+
+        // We scan through each list, if it was a match we run match_fn to check
+        // if the match was correct if it was not a match we run no_match_fn to check
+        // if the no-match was correct
+        type MatchFn = Box<dyn Fn(&ScalarBuffer<u8>) -> bool>;
+        let check = |query: LabelListQuery, match_fn: MatchFn, no_match_fn: MatchFn| {
+            let index_store = index_store.clone();
+            let data = data.clone();
+            async move {
+                let index = LabelListIndexPlugin
+                    .load_index(
+                        index_store,
+                        &default_details::<crate::pb::LabelListIndexDetails>(),
+                        None,
+                        &LanceCache::no_cache(),
+                    )
+                    .await
+                    .unwrap();
+                let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+                assert!(result.is_exact());
+                let row_ids = result.row_ids();
+
+                let row_ids_set = row_ids
+                    .row_ids()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect::<std::collections::HashSet<_>>();
+
+                for (list, row_id) in data
+                    .column(0)
+                    .as_list::<i32>()
+                    .iter()
+                    .zip(data.column(1).as_primitive::<UInt64Type>())
+                {
+                    let list = list.unwrap();
+                    let row_id = row_id.unwrap();
+                    let vals = list.as_primitive::<UInt8Type>().values();
+                    if row_ids_set.contains(&row_id) {
+                        assert!(match_fn(vals));
+                    } else {
+                        assert!(no_match_fn(vals));
+                    }
+                }
+            }
+        };
+
+        // Simple check for 1 value (doesn't matter intersection vs union)
+        check(
+            LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
+        )
+        .await;
+        check(
+            LabelListQuery::HasAllLabels(vec![ScalarValue::UInt8(Some(1))]),
+            Box::new(|vals| vals.contains(&1)),
+            Box::new(|vals| !vals.contains(&1)),
+        )
+        .await;
+        // Set intersection
+        check(
+            LabelListQuery::HasAllLabels(vec![
+                ScalarValue::UInt8(Some(1)),
+                ScalarValue::UInt8(Some(2)),
+            ]),
+            // Match must have 1 and 2
+            Box::new(|vals| vals.contains(&1) && vals.contains(&2)),
+            // No-match must either not have 1 or not have 2
+            Box::new(|vals| !vals.contains(&1) || !vals.contains(&2)),
+        )
+        .await;
+        // Set union
+        check(
+            LabelListQuery::HasAnyLabel(vec![
+                ScalarValue::UInt8(Some(1)),
+                ScalarValue::UInt8(Some(2)),
+            ]),
+            // Match either have 1 or have 2
+            Box::new(|vals| vals.contains(&1) || vals.contains(&2)),
+            // No-match must not have 1 and not have 2
+            Box::new(|vals| !vals.contains(&1) && !vals.contains(&2)),
+        )
+        .await;
     }
 }

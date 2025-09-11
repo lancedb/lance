@@ -1,13 +1,16 @@
-use std::{ops::Range, sync::Arc};
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
-use lance_file::writer::ManifestProvider;
+use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
+use std::collections::HashMap;
+use std::{ops::Range, sync::Arc};
 use tracing::instrument;
 
 use lance_core::{datatypes::Schema, Error, Result};
@@ -19,38 +22,55 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{pb, Index, Manifest, MAGIC};
+use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
+
+use super::commit::ManifestLocation;
 
 /// Read Manifest on URI.
 ///
 /// This only reads manifest files. It does not read data files.
 #[instrument(level = "debug", skip(object_store))]
-pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
-    let file_size = object_store.inner.head(path).await?.size;
-    const PREFETCH_SIZE: usize = 64 * 1024;
-    let initial_start = std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize;
+pub async fn read_manifest(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Manifest> {
+    let file_size = if let Some(known_size) = known_size {
+        known_size
+    } else {
+        object_store.inner.head(path).await?.size
+    };
+    const PREFETCH_SIZE: u64 = 64 * 1024;
+    let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
     let range = Range {
         start: initial_start,
         end: file_size,
     };
     let buf = object_store.inner.get_range(path, range).await?;
+
+    // In case of corruption, the known_size might be wrong. We can retry without
+    // the size to be more robust.
+    if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
+        return Box::pin(read_manifest(object_store, path, None)).await;
+    }
+
     if buf.len() < 16 {
-        return Err(Error::IO {
-            message: "Invalid format: file size is smaller than 16 bytes".to_string(),
-            location: location!(),
-        });
+        return Err(Error::io(
+            "Invalid format: file size is smaller than 16 bytes".to_string(),
+            location!(),
+        ));
     }
     if !buf.ends_with(MAGIC) {
-        return Err(Error::IO {
-            message: "Invalid format: magic number does not match".to_string(),
-            location: location!(),
-        });
+        return Err(Error::io(
+            "Invalid format: magic number does not match".to_string(),
+            location!(),
+        ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
-    let manifest_len = file_size - manifest_pos;
+    let manifest_len = file_size as usize - manifest_pos;
 
     let buf: Bytes = if manifest_len <= buf.len() {
-        // The prefetch catpured the entire manifest. We just need to trim the buffer.
+        // The prefetch captured the entire manifest. We just need to trim the buffer.
         buf.slice(buf.len() - manifest_len..buf.len())
     } else {
         // The prefetch only captured part of the manifest. We need to make an
@@ -60,7 +80,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
             .get_range(
                 path,
                 Range {
-                    start: manifest_pos,
+                    start: manifest_pos as u64,
                     end: file_size - PREFETCH_SIZE,
                 },
             )
@@ -76,35 +96,42 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "Invalid format: manifest length does not match. Expected {}, got {}",
                 recorded_length,
                 buf.len()
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     let proto = pb::Manifest::decode(buf)?;
-    Ok(Manifest::from(proto))
+    Manifest::try_from(proto)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
 pub async fn read_manifest_indexes(
     object_store: &ObjectStore,
-    path: &Path,
+    location: &ManifestLocation,
     manifest: &Manifest,
 ) -> Result<Vec<Index>> {
     if let Some(pos) = manifest.index_section.as_ref() {
-        let reader = object_store.open(path).await?;
+        let reader = if let Some(size) = location.size {
+            object_store
+                .open_with_size(&location.path, size as usize)
+                .await?
+        } else {
+            object_store.open(&location.path).await?
+        };
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
-        Ok(section
+        let indices = section
             .indices
-            .iter()
+            .into_iter()
             .map(Index::try_from)
-            .collect::<Result<Vec<_>>>()?)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(indices)
     } else {
         Ok(vec![])
     }
@@ -135,20 +162,25 @@ pub async fn write_manifest(
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
+    let is_legacy_storage = manifest.should_use_legacy_format();
     for field_id in 0..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
-            if field.data_type().is_dictionary() {
-                let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
-                    message: format!("Lance field {} misses dictionary info", field.name),
-                    location: location!(),
+            if field.data_type().is_dictionary() && is_legacy_storage {
+                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                    Error::io(
+                        format!("Lance field {} misses dictionary info", field.name),
+                        location!(),
+                    )
                 })?;
 
-                let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
-                    message: format!(
+                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                    Error::io(
+                        format!(
                         "Lance field {} is dictionary type, but misses the dictionary value array",
                         field.name
                     ),
-                    location: location!(),
+                        location!(),
+                    )
                 })?;
 
                 let data_type = value_arr.data_type();
@@ -162,13 +194,13 @@ pub async fn write_manifest(
                         encoder.encode(&[value_arr]).await?
                     }
                     _ => {
-                        return Err(Error::IO {
-                            message: format!(
+                        return Err(Error::io(
+                            format!(
                                 "Does not support {} as dictionary value type",
                                 value_arr.data_type()
                             ),
-                            location: location!(),
-                        });
+                            location!(),
+                        ));
                     }
                 };
                 dict_info.offset = pos;
@@ -190,7 +222,13 @@ impl ManifestProvider for ManifestDescribing {
         object_writer: &mut ObjectWriter,
         schema: &Schema,
     ) -> Result<Option<usize>> {
-        let mut manifest = Manifest::new(schema.clone(), Arc::new(vec![]));
+        let mut manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Legacy),
+            /*blob_dataset_version= */ None,
+            HashMap::new(),
+        );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
     }
@@ -200,14 +238,12 @@ impl ManifestProvider for ManifestDescribing {
 mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use lance_core::datatypes::Schema;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::{reader::FileReader, writer::FileWriter};
-    use rand::{distributions::Alphanumeric, Rng};
+    use rand::{distr::Alphanumeric, Rng};
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -219,13 +255,13 @@ mod test {
         let mut writer = store.create(&path).await.unwrap();
 
         // Write prefix we should ignore
-        let prefix: Vec<u8> = rand::thread_rng()
+        let prefix: Vec<u8> = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(prefix_size)
             .collect();
         writer.write_all(&prefix).await.unwrap();
 
-        let long_name: String = rand::thread_rng()
+        let long_name: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(manifest_min_size)
             .map(char::from)
@@ -234,7 +270,17 @@ mod test {
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(schema, Arc::new(vec![]));
+
+        let mut config = HashMap::new();
+        config.insert("key".to_string(), "value".to_string());
+
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+            HashMap::new(),
+        );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
             .unwrap();
@@ -244,7 +290,7 @@ mod test {
             .unwrap();
         writer.shutdown().await.unwrap();
 
-        let roundtripped_manifest = read_manifest(&store, &path).await.unwrap();
+        let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
 
         assert_eq!(manifest, roundtripped_manifest);
 
@@ -279,14 +325,17 @@ mod test {
         .unwrap();
 
         let array = Int32Array::from_iter_values(0..10);
-        let batch =
-            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         let mut metadata = HashMap::new();
         metadata.insert(String::from("lance:extra"), String::from("for_test"));
         file_writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = FileReader::try_new_self_described(&store, &path, None)
+        let reader = store.open(&path).await.unwrap();
+        let reader = FileReader::try_new_self_described_from_reader(reader.into(), None)
             .await
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());

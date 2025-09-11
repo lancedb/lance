@@ -6,6 +6,7 @@ on:
       - main
   pull_request:
     paths:
+      - Cargo.*
       - python/**
       - rust/**
       - protos/**
@@ -24,122 +25,146 @@ env:
   CARGO_TERM_COLOR: always
   # Disable full debug symbol generation to speed up CI build and keep memory down
   # "1" means line tables only, which is useful for panic tracebacks.
-  RUSTFLAGS: "-C debuginfo=1"
+  RUSTFLAGS: "-C debuginfo=line-tables-only"
   RUST_BACKTRACE: "1"
   CI: "true"
+  # Color output for pytest is off by default.
+  PYTEST_ADDOPTS: "--color=yes"
+  FORCE_COLOR: "1"
+  # Change this to bust all caches (may be needed periodically if the caches accumulate
+  # a lot of cruft).
+  CACHE_PREFIX: "2"
 
 jobs:
   lint:
     timeout-minutes: 45
-    runs-on: "ubuntu-22.04"
+    runs-on: "ubuntu-24.04"
     defaults:
       run:
         shell: bash
         working-directory: python
     env:
       # Need up-to-date compilers for kernels
-      CC: gcc-12
-      CXX: g++-12
+      CC: clang-18
+      CXX: clang++-18
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        lfs: true
-    - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: python
-    - name: Install linting tools
-      run: |
-        pip install ruff==0.2.2 maturin tensorflow tqdm
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
-    - name: Lint Python
-      run: |
-        ruff format --preview --check python
-        ruff check --preview python
-    - name: Install dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y protobuf-compiler libssl-dev
-    - name: Lint Rust
-      run: |
-        cargo fmt --all -- --check
-        cargo clippy --all-features --tests -- -D warnings
-    - name: Build
-      run: |
-        python -m venv venv
-        source venv/bin/activate
-        pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-        maturin develop --extras tests
-    - name: Run doctest
-      run: |
-        source venv/bin/activate
-        pytest --doctest-modules python/lance
-
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11 # Ray does not support 3.12 yet.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Install linting tools
+        run: |
+          pip install ruff==0.11.2 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Lint Python
+        run: |
+          ruff format --check --diff python
+          ruff check python
+          pyright
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Lint Rust
+        run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo fmt --all -- --check
+          cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
+      - name: Build
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
+          pip install maturin
+          maturin develop --locked --extras tests,ray
+      - name: Run doctest
+        run: |
+          source venv/bin/activate
+          pytest --doctest-modules python/lance
   linux:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: [ "8", "11", "12" ] # 3.11 because tensorflow does not support 3.12 yet.
+        python-minor-version: ["9", "12"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
-    runs-on: "ubuntu-22.04"
+    runs-on: "ubuntu-24.04"
     defaults:
       run:
         shell: bash
         working-directory: python
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.${{ matrix.python-minor-version }}
-    - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: python
-        prefix-key: "manylinux2014"  # use this to flush the cache
-    - uses: ./.github/workflows/build_linux_wheel
-    - uses: ./.github/workflows/run_tests
-    # Make sure wheels are not included in the Rust cache
-    - name: Delete wheels
-      run: sudo rm -rf target/wheels
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.${{ matrix.python-minor-version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - uses: ./.github/workflows/build_linux_wheel
+      - uses: ./.github/workflows/run_tests
+      - name: Generate forward compatibility files
+        run: python python/tests/forward_compat/datagen.py
+      - name: Run forward compatibility tests (pylance 0.16.0)
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install pytest pylance==0.16.0
+          pytest python/tests/forward_compat --run-forward
+      - name: Run forward compatibility tests (pylance 0.29.1.beta2)
+        run: |
+          source venv/bin/activate
+          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
+          pytest python/tests/forward_compat --run-forward
+
   linux-arm:
     timeout-minutes: 45
-    name: Python Linux 3.${{ matrix.python-minor-version }} ARM
-    strategy:
-      matrix:
-        python-minor-version: [ "12" ]
-    runs-on: buildjet-4vcpu-ubuntu-2204-arm
+    runs-on: ubuntu-2404-4x-arm64
+    name: Python Linux 3.12 ARM
     defaults:
       run:
         shell: bash
         working-directory: python
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      run: |
-        sudo apt update
-        sudo apt install wget software-properties-common
-        sudo add-apt-repository ppa:deadsnakes/ppa
-        sudo apt install python3.${{ matrix.python-minor-version }}
-        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
-        sudo apt install python3-pip
-        sudo apt install python3.${{ matrix.python-minor-version }}-distutils
-    - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: python
-        prefix-key: "manylinux2014"  # use this to flush the cache
-    - uses: ./.github/workflows/build_linux_wheel
-      with:
-        arm-build: "true"
-    - uses: ./.github/workflows/run_tests
-    # Make sure wheels are not included in the Rust cache
-    - name: Delete wheels
-      run: sudo rm -rf target/wheels
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - uses: ./.github/workflows/build_linux_wheel
+        with:
+          arm-build: "true"
+          manylinux: "2_28"
+      - name: Install dependencies
+        run: |
+          sudo apt update -y -qq
+          sudo apt install -y libhdf5-dev
+      - uses: ./.github/workflows/run_tests
   mac:
     timeout-minutes: 45
     name: Python macOS 3.12 ARM
@@ -149,22 +174,25 @@ jobs:
         shell: bash
         working-directory: python
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.12"
-    - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: python
-    - uses: ./.github/workflows/build_mac_wheel
-    - uses: ./.github/workflows/run_tests
-    # Make sure wheels are not included in the Rust cache
-    - name: Delete wheels
-      run: rm -rf target/wheels
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - uses: ./.github/workflows/build_mac_wheel
+      - uses: ./.github/workflows/run_tests
+        with:
+          skip-torch: "true"
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -180,6 +208,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
       - uses: ./.github/workflows/build_windows_wheel
       - uses: ./.github/workflows/run_tests
   aws-integtest:
@@ -189,58 +220,24 @@ jobs:
       run:
         shell: bash
         working-directory: python
-    services:
-      minio:
-        image: lazybit/minio
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ACCESS_KEY: ACCESSKEY
-          MINIO_SECRET_KEY: SECRETKEY
-        options: --name=minio --health-cmd "curl http://localhost:9000/minio/health/live"
-      dynamodb-local:
-        image: amazon/dynamodb-local
-        ports:
-          - 8000:8000
-        env:
-          AWS_ACCESS_KEY_ID: ACCESSKEY
-          AWS_SECRET_ACCESS_KEY: SECRETKEY
-    env:
-      AWS_ACCESS_KEY_ID: ACCESSKEY
-      AWS_SECRET_ACCESS_KEY: SECRETKEY
-      AWS_REGION: us-west-2
-      # this one is for s3
-      AWS_ENDPOINT: http://localhost:9000
-      # this one is for dynamodb
-      DYNAMODB_ENDPOINT: http://localhost:8000
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.12"
-    - name: create s3
-      run: aws s3 mb s3://lance-integtest --endpoint http://localhost:9000
-    - name: create ddb
-      run: |
-        aws dynamodb create-table \
-          --table-name lance-integtest \
-          --attribute-definitions '[{"AttributeName": "base_uri", "AttributeType": "S"}, {"AttributeName": "version", "AttributeType": "N"}]' \
-          --key-schema '[{"AttributeName": "base_uri", "KeyType": "HASH"}, {"AttributeName": "version", "KeyType": "RANGE"}]' \
-          --provisioned-throughput '{"ReadCapacityUnits": 10, "WriteCapacityUnits": 10}' \
-          --endpoint-url http://localhost:8000
-    - uses: Swatinem/rust-cache@v2
-      with:
-        workspaces: python
-        prefix-key: "manylinux2014"  # use this to flush the cache
-    - uses: ./.github/workflows/build_linux_wheel
-    - name: Install dependencies
-      run:
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
-    - uses: ./.github/workflows/run_integtests
-    # Make sure wheels are not included in the Rust cache
-    - name: Delete wheels
-      run: sudo rm -rf target/wheels
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11" # TODO: upgrade when ray supports 3.12
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - uses: ./.github/workflows/build_linux_wheel
+      - name: Install dependencies
+        run: |
+          pip install ray[data]
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - uses: ./.github/workflows/run_integtests

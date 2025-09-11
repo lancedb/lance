@@ -1,22 +1,18 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
-mod knn;
+//! Execution nodes
+//!
+//! WARNING: Internal API with no stability guarantees.
+
+mod filter;
+pub mod filtered_read;
+pub mod fts;
+pub(crate) mod knn;
 mod optimizer;
-mod planner;
 mod projection;
 mod pushdown_scan;
+mod rowids;
 pub mod scalar_index;
 mod scan;
 mod take;
@@ -24,9 +20,15 @@ mod take;
 pub mod testing;
 pub mod utils;
 
-pub use knn::*;
-pub use planner::{FilterPlan, Planner};
-pub use projection::ProjectionExec;
+pub use filter::LanceFilterExec;
+pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
+pub use lance_datafusion::planner::Planner;
+pub use lance_index::scalar::expression::FilterPlan;
+pub use optimizer::get_physical_optimizer;
+pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
-pub use scan::LanceScanExec;
+pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
+pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
+pub use utils::PreFilterSource;
+pub(crate) use utils::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};

@@ -1,28 +1,27 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::types::UInt32Type;
-use arrow_array::{cast::AsArray, Array, FixedSizeListArray, RecordBatch};
-use arrow_schema::Field;
-use async_trait::async_trait;
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
-use lance_core::{Error, Result};
-use lance_linalg::MatrixView;
-use snafu::{location, Location};
+use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
+use std::{iter, ops::MulAssign};
 
-use super::transform::Transformer;
+use crate::vector::kmeans::{compute_partitions, KMeansAlgoFloat};
+use arrow_array::ArrowNumericType;
+use arrow_array::{
+    cast::AsArray,
+    types::{Float16Type, Float32Type, Float64Type, UInt32Type},
+    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array,
+};
+use arrow_schema::DataType;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::{Error, Result};
+use lance_linalg::distance::{DistanceType, Dot, L2};
+use lance_table::utils::LanceIteratorExtension;
+use num_traits::{Float, FromPrimitive, Num};
+use snafu::location;
+use tracing::instrument;
+
+use super::{transform::Transformer, PQ_CODE_COLUMN};
 
 pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 
@@ -31,8 +30,9 @@ pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 /// The residual vector is the difference between the original vector and the centroid.
 ///
 #[derive(Clone)]
-pub struct ResidualTransform<T: ArrowFloatType> {
-    centroids: MatrixView<T>,
+pub struct ResidualTransform {
+    /// Flattened centroids.
+    centroids: FixedSizeListArray,
 
     /// Partition Column
     part_col: String,
@@ -41,14 +41,14 @@ pub struct ResidualTransform<T: ArrowFloatType> {
     vec_col: String,
 }
 
-impl<T: ArrowFloatType> std::fmt::Debug for ResidualTransform<T> {
+impl std::fmt::Debug for ResidualTransform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ResidualTransform")
     }
 }
 
-impl<T: ArrowFloatType> ResidualTransform<T> {
-    pub fn new(centroids: MatrixView<T>, part_col: &str, column: &str) -> Self {
+impl ResidualTransform {
+    pub fn new(centroids: FixedSizeListArray, part_col: &str, column: &str) -> Self {
         Self {
             centroids,
             part_col: part_col.to_owned(),
@@ -57,12 +57,115 @@ impl<T: ArrowFloatType> ResidualTransform<T> {
     }
 }
 
-#[async_trait]
-impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
+fn do_compute_residual<T: ArrowNumericType>(
+    centroids: &FixedSizeListArray,
+    vectors: &FixedSizeListArray,
+    distance_type: Option<DistanceType>,
+    partitions: Option<&UInt32Array>,
+) -> Result<FixedSizeListArray>
+where
+    T::Native: Num + Float + L2 + Dot + MulAssign + DivAssign + AddAssign + FromPrimitive,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
+{
+    let dimension = centroids.value_length() as usize;
+    let centroids = centroids.values().as_primitive::<T>();
+    let vectors = vectors.values().as_primitive::<T>();
+
+    let part_ids = partitions.cloned().unwrap_or_else(|| {
+        compute_partitions::<T, KMeansAlgoFloat<T>>(
+            centroids,
+            vectors,
+            dimension,
+            distance_type.expect("provide either partitions or distance type"),
+        )
+        .0
+        .into()
+    });
+    let part_ids = part_ids.values();
+
+    let vectors_slice = vectors.values();
+    let centroids_slice = centroids.values();
+    let residuals = vectors_slice
+        .chunks_exact(dimension)
+        .enumerate()
+        .flat_map(|(idx, vector)| {
+            let part_id = part_ids[idx] as usize;
+            let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
+            iter::zip(vector, c).map(|(v, cent)| *v - *cent)
+        })
+        .exact_size(vectors.len())
+        .collect::<Vec<_>>();
+    let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals);
+    debug_assert_eq!(residual_arr.len(), vectors.len());
+    Ok(FixedSizeListArray::try_new_from_values(
+        residual_arr,
+        dimension as i32,
+    )?)
+}
+
+/// Compute residual vectors from the original vectors and centroids.
+///
+/// ## Parameter
+/// - `centroids`: The KMeans centroids.
+/// - `vectors`: The original vectors to compute residual vectors.
+/// - `distance_type`: The distance type to compute the residual vector.
+/// - `partitions`: The partition ID for each vector, if present.
+pub(crate) fn compute_residual(
+    centroids: &FixedSizeListArray,
+    vectors: &FixedSizeListArray,
+    distance_type: Option<DistanceType>,
+    partitions: Option<&UInt32Array>,
+) -> Result<FixedSizeListArray> {
+    if centroids.value_length() != vectors.value_length() {
+        return Err(Error::Index {
+            message: format!(
+                "Compute residual vector: centroid and vector length mismatch: centroid: {}, vector: {}",
+                centroids.value_length(),
+                vectors.value_length(),
+            ),
+            location: location!(),
+        });
+    }
+    // TODO: Bf16 is not supported yet.
+    match (centroids.value_type(), vectors.value_type()) {
+        (DataType::Float16, DataType::Float16) => {
+            do_compute_residual::<Float16Type>(centroids, vectors, distance_type, partitions)
+        }
+        (DataType::Float32, DataType::Float32) => {
+            do_compute_residual::<Float32Type>(centroids, vectors, distance_type, partitions)
+        }
+        (DataType::Float64, DataType::Float64) => {
+            do_compute_residual::<Float64Type>(centroids, vectors, distance_type, partitions)
+        }
+        (DataType::Float32, DataType::Int8) => {
+            do_compute_residual::<Float32Type>(
+                centroids,
+                &vectors.convert_to_floating_point()?,
+                distance_type,
+                partitions)
+        }
+        _ => Err(Error::Index {
+            message: format!(
+                "Compute residual vector: centroids and vector type mismatch: centroid: {}, vector: {}",
+                centroids.value_type(),
+                vectors.value_type(),
+            ),
+            location: location!(),
+        })
+    }
+}
+
+impl Transformer for ResidualTransform {
     /// Replace the original vector in the [`RecordBatch`] to residual vectors.
     ///
     /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if batch.column_by_name(PQ_CODE_COLUMN).is_some() {
+            // If the PQ code column is present, we don't need to compute residual vectors.
+            return Ok(batch.clone());
+        }
+
         let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {
             message: format!(
                 "Compute residual vector: partition id column not found: {}",
@@ -86,46 +189,21 @@ impl<T: ArrowFloatType> Transformer for ResidualTransform<T> {
             location: location!(),
         })?;
 
-        // BFloat16Array is not supported via `as_primitive()` cast yet, so we have to do
-        // `downcast_ref()` for now.
-        let flatten_data = original_vectors
-            .values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Compute residual vector: original vector column {} is not expected type: expect: {}, got {}",
-                    self.vec_col,
-                    T::FLOAT_TYPE,
-                    original_vectors.value_type(),
-                ),
-                location: location!(),
-            })?;
-        let dim = original_vectors.value_length();
-        let mut residual_arr: Vec<T::Native> = Vec::with_capacity(flatten_data.len());
-        flatten_data
-            .as_slice()
-            .chunks_exact(dim as usize)
-            .zip(part_ids.as_primitive::<UInt32Type>().values().iter())
-            .for_each(|(vector, &part_id)| {
-                let centroid = self.centroids.row(part_id as usize).unwrap();
-                // TODO: SIMD
-                residual_arr.extend(
-                    vector
-                        .iter()
-                        .zip(centroid.iter())
-                        .map(|(v, cent)| *v - *cent),
-                );
-            });
+        let part_ids_ref = part_ids.as_primitive::<UInt32Type>();
         let residual_arr =
-            FixedSizeListArray::try_new_from_values(T::ArrayType::from(residual_arr), dim)?;
+            compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
         // Replace original column with residual column.
-        let batch = batch.drop_column(&self.vec_col)?;
+        let batch = if residual_arr.data_type() != original.data_type() {
+            batch.replace_column_schema_by_name(
+                &self.vec_col,
+                residual_arr.data_type().clone(),
+                Arc::new(residual_arr),
+            )?
+        } else {
+            batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?
+        };
 
-        let residual_field = Field::new(RESIDUAL_COLUMN, residual_arr.data_type().clone(), false);
-
-        let batch = batch.try_with_column(residual_field, Arc::new(residual_arr))?;
         Ok(batch)
     }
 }

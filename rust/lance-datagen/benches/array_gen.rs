@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, Int8Type};
 use criterion::{
     criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup, Criterion,
@@ -25,8 +28,8 @@ fn bench_gen<M: Measurement>(
 
     group.bench_function(id, |b| {
         b.iter(|| {
-            let reader = lance_datagen::gen()
-                .col(None, gen_factory())
+            let reader = lance_datagen::gen_batch()
+                .anon_col(gen_factory())
                 .into_reader_bytes(
                     ByteCount::from(BYTES_PER_BATCH),
                     num_batches,
@@ -116,16 +119,19 @@ fn bench_rand_gen(c: &mut Criterion) {
         lance_datagen::array::rand::<Int64Type>()
     });
     bench_gen(&mut group, "rand_varbin", || {
-        lance_datagen::array::rand_varbin(ByteCount::from(12))
+        lance_datagen::array::rand_fixedbin(ByteCount::from(12), false)
     });
     bench_gen(&mut group, "rand_utf8", || {
-        lance_datagen::array::rand_utf8(ByteCount::from(12))
+        lance_datagen::array::rand_utf8(ByteCount::from(12), false)
     });
     bench_gen(&mut group, "rand_vec", || {
         lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(512))
     });
     bench_gen(&mut group, "rand_dict_i32_utf8", || {
-        lance_datagen::array::dict::<Int32Type>(lance_datagen::array::rand_utf8(ByteCount::from(8)))
+        lance_datagen::array::dict::<Int32Type>(lance_datagen::array::rand_utf8(
+            ByteCount::from(8),
+            false,
+        ))
     });
     group.finish();
 }

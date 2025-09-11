@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Lance Columnar Data Format
 //!
@@ -79,9 +68,12 @@
 //!
 //! ```
 //!
+
+use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::{datatypes, error};
 pub use lance_core::{Error, Result};
+use std::sync::LazyLock;
 
 pub mod arrow;
 pub mod datafusion;
@@ -93,6 +85,7 @@ pub mod table;
 pub mod utils;
 
 pub use dataset::Dataset;
+use lance_index::vector::DIST_COL;
 
 /// Creates and loads a [`Dataset`] from the given path.
 /// Infers the storage backend to use from the scheme in the given table path.
@@ -101,3 +94,6 @@ pub use dataset::Dataset;
 pub async fn open_dataset<T: AsRef<str>>(table_uri: T) -> Result<Dataset> {
     DatasetBuilder::from_uri(table_uri.as_ref()).load().await
 }
+
+pub static DIST_FIELD: LazyLock<arrow_schema::Field> =
+    LazyLock::new(|| arrow_schema::Field::new(DIST_COL, DataType::Float32, true));

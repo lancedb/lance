@@ -1,14 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use async_cell::sync::AsyncCell;
 use futures::Future;
-use snafu::{location, Location};
+use snafu::location;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// An async background task whose output can be shared across threads (via cloning)
 ///
 /// SharedPrerequisite is very similar to a shared future except:
 ///  * It must be created by spawning a new task (runs in the background)
 ///  * Shared future doesn't support Result.  This class handles errors by
-///      serializing them to string.
+///    serializing them to string.
 ///  * This class can optionally cache the output so that it can be accessed synchronously
 pub struct SharedPrerequisite<T: Clone>(Arc<AsyncCell<std::result::Result<T, String>>>);
 
@@ -21,7 +25,6 @@ impl<T: Clone> SharedPrerequisite<T> {
         self.0
             .get()
             .await
-            .clone()
             .map_err(|err| crate::Error::PrerequisiteFailed {
                 message: err,
                 location: location!(),
@@ -35,9 +38,9 @@ impl<T: Clone> SharedPrerequisite<T> {
         self.0
             .try_get()
             // There was no call to wait_ready and the value was accessed to early
-            .expect("SharedPrequisite cached value accessed without call to wait_ready")
+            .expect("SharedPrerequisite cached value accessed without call to wait_ready")
             // There was no call to wait_ready and the value was actually ready, but failed
-            .expect("SharedPrequisite cached value accessed without call to wait_ready")
+            .expect("SharedPrerequisite cached value accessed without call to wait_ready")
     }
 
     /// Asynchronously wait for the output to be ready
@@ -62,10 +65,13 @@ impl<T: Clone> SharedPrerequisite<T> {
     {
         let cell = AsyncCell::<std::result::Result<T, String>>::shared();
         let dst = cell.clone();
-        tokio::spawn(async move {
-            let res = future.await;
-            dst.set(res.map_err(|err| err.to_string()));
-        });
+        tokio::spawn(
+            (async move {
+                let res = future.await;
+                dst.set(res.map_err(|err| err.to_string()));
+            })
+            .in_current_span(),
+        );
         Arc::new(Self(cell))
     }
 }

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Poor-man's SIMD
 //!
@@ -27,8 +16,10 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 pub mod f32;
 pub mod i32;
+pub mod u8;
 
 use num_traits::{Float, Num};
+use u8::u8x16;
 
 /// Lance SIMD lib
 ///
@@ -43,7 +34,6 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     + Clone
     + Sized
     + for<'a> From<&'a [T]>
-    + for<'a> From<&'a [T; N]>
 {
     const LANES: usize = N;
 
@@ -52,8 +42,6 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
 
     /// Create a new instance with all lanes set to zero.
     fn zeros() -> Self;
-
-    /// Gather elements from the slice, using i32 indices.
 
     /// Load aligned data from aligned memory.
     ///
@@ -106,4 +94,8 @@ pub trait FloatSimd<F: Float, const N: usize>: SIMD<F, N> {
     ///
     /// c = a * b + c
     fn multiply_add(&mut self, a: Self, b: Self);
+}
+
+pub trait Shuffle {
+    fn shuffle(&self, indices: u8x16) -> Self;
 }

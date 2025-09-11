@@ -1,23 +1,12 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Serialization and deserialization of Arrow Schema to JSON.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use snafu::{location, Location};
+use snafu::location;
 
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
@@ -25,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::datatypes::LogicalType;
 use lance_core::error::{Error, Result};
 
+/// JSON representation of an Apache Arrow [DataType].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonDataType {
+pub struct JsonDataType {
     #[serde(rename = "type")]
     type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,6 +49,8 @@ impl TryFrom<&DataType> for JsonDataType {
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
             | DataType::Utf8
             | DataType::Binary
             | DataType::LargeUtf8
@@ -74,7 +66,6 @@ impl TryFrom<&DataType> for JsonDataType {
                 let logical_type: LogicalType = dt.try_into()?;
                 (logical_type.to_string(), None)
             }
-
             DataType::List(f) => {
                 let fields = vec![JsonField::try_from(f.as_ref())?];
                 ("list".to_string(), Some(fields))
@@ -88,6 +79,13 @@ impl TryFrom<&DataType> for JsonDataType {
                 return Ok(Self {
                     type_: "fixed_size_list".to_string(),
                     fields: Some(fields),
+                    length: Some(*len as usize),
+                });
+            }
+            DataType::FixedSizeBinary(len) => {
+                return Ok(Self {
+                    type_: "fixed_size_binary".to_string(),
+                    fields: None,
                     length: Some(*len as usize),
                 });
             }
@@ -121,7 +119,7 @@ impl TryFrom<&JsonDataType> for DataType {
         let type_name = value.type_.as_str();
         match type_name {
             "null" | "bool" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16"
-            | "uint32" | "halffloat" | "float" | "double" | "string" | "binary"
+            | "uint32" | "uint64" | "halffloat" | "float" | "double" | "string" | "binary"
             | "large_string" | "large_binary" | "date32:day" | "date64:ms" => {
                 let logical_type: LogicalType = type_name.into();
                 (&logical_type).try_into()
@@ -130,7 +128,8 @@ impl TryFrom<&JsonDataType> for DataType {
                 || dt.starts_with("time64:")
                 || dt.starts_with("timestamp:")
                 || dt.starts_with("duration:")
-                || dt.starts_with("dict:") =>
+                || dt.starts_with("dict:")
+                || dt.starts_with("decimal:") =>
             {
                 let logical_type: LogicalType = dt.into();
                 (&logical_type).try_into()
@@ -165,6 +164,13 @@ impl TryFrom<&JsonDataType> for DataType {
                     _ => unreachable!(),
                 }
             }
+            "fixed_size_binary" => {
+                let length = value.length.ok_or_else(|| Error::Arrow {
+                    message: "Json conversion: FixedSizeBinary type requires a length".to_string(),
+                    location: location!(),
+                })?;
+                Ok(Self::FixedSizeBinary(length as i32))
+            }
             _ => Err(Error::Arrow {
                 message: format!("Json conversion: Unsupported type: {value:?}"),
                 location: location!(),
@@ -173,12 +179,16 @@ impl TryFrom<&JsonDataType> for DataType {
     }
 }
 
+/// JSON representation of an Apache Arrow [Field].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonField {
+pub struct JsonField {
     name: String,
     #[serde(rename = "type")]
     type_: JsonDataType,
     nullable: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<HashMap<String, String>>,
 }
 
 impl TryFrom<&Field> for JsonField {
@@ -187,10 +197,17 @@ impl TryFrom<&Field> for JsonField {
     fn try_from(field: &Field) -> Result<Self> {
         let data_type = JsonDataType::try_new(field.data_type())?;
 
+        let metadata = if field.metadata().is_empty() {
+            None
+        } else {
+            Some(field.metadata().clone())
+        };
+
         Ok(Self {
-            name: field.name().to_string(),
+            name: field.name().clone(),
             nullable: field.is_nullable(),
             type_: data_type,
+            metadata,
         })
     }
 }
@@ -200,7 +217,11 @@ impl TryFrom<&JsonField> for Field {
 
     fn try_from(value: &JsonField) -> Result<Self> {
         let data_type = DataType::try_from(&value.type_)?;
-        Ok(Self::new(&value.name, data_type, value.nullable))
+        let mut field = Self::new(&value.name, data_type, value.nullable);
+        if let Some(metadata) = value.metadata.clone() {
+            field.set_metadata(metadata);
+        }
+        Ok(field)
     }
 }
 
@@ -284,10 +305,7 @@ impl ArrowJsonExt for Schema {
 mod test {
     use super::*;
 
-    use std::sync::Arc;
-
     use arrow_schema::TimeUnit;
-    use serde_json;
     use serde_json::{json, Value};
 
     fn assert_type_json_str(dt: DataType, val: Value) {
@@ -326,6 +344,10 @@ mod test {
         assert_primitive_types(DataType::Date32, "date32:day");
         assert_primitive_types(DataType::Date64, "date64:ms");
         assert_primitive_types(DataType::Time32(TimeUnit::Second), "time32:s");
+        assert_primitive_types(DataType::Decimal128(38, 10), "decimal:128:38:10");
+        assert_primitive_types(DataType::Decimal256(76, 20), "decimal:256:76:20");
+        assert_primitive_types(DataType::Decimal128(18, 6), "decimal:128:18:6");
+        assert_primitive_types(DataType::Decimal256(50, 15), "decimal:256:50:15");
     }
 
     #[test]
@@ -365,6 +387,14 @@ mod test {
                     "length": 32
                 }
             ),
+        );
+
+        assert_type_json_str(
+            DataType::FixedSizeBinary(32),
+            json!({
+                "type": "fixed_size_binary",
+                "length": 32
+            }),
         );
 
         assert_type_json_str(
@@ -450,5 +480,56 @@ mod test {
 
         let actual = Schema::from_json(&json_str).unwrap();
         assert_eq!(schema, actual);
+    }
+
+    #[test]
+    fn test_metadata_roundtrip() {
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("sk_1".to_string(), "sv_1".to_string());
+
+        let mut field1_metadata = HashMap::new();
+        field1_metadata.insert("fk_1".to_string(), "fv_1".to_string());
+
+        let field1 = Field::new("a", DataType::UInt8, false).with_metadata(field1_metadata.clone());
+        let field2 = Field::new("b", DataType::Int32, true);
+
+        let schema = Schema::new_with_metadata(vec![field1, field2], schema_metadata.clone());
+
+        let json_str = schema.to_json().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&json_str).unwrap(),
+            json!({
+                "fields": [
+                    {
+                        "name": "a",
+                        "type": {
+                            "type": "uint8"
+                        },
+                        "nullable": false,
+                        "metadata": {
+                            "fk_1": "fv_1"
+                        }
+                    },
+                    {
+                        "name": "b",
+                        "type": {
+                            "type": "int32"
+                        },
+                        "nullable": true
+                    }
+                ],
+                "metadata": {
+                    "sk_1": "sv_1"
+                }
+            })
+        );
+
+        let actual = Schema::from_json(&json_str).unwrap();
+        assert_eq!(schema, actual);
+
+        assert_eq!(actual.metadata, schema_metadata);
+
+        assert_eq!(actual.field(0).metadata(), &field1_metadata);
+        assert_eq!(actual.field(1).metadata(), &HashMap::new());
     }
 }

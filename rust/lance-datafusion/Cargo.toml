@@ -10,22 +10,37 @@ categories.workspace = true
 description = "Internal utilities used by other lance modules to simplify working with datafusion"
 
 [dependencies]
-arrow.workspace = true
-arrow-array.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-buffer.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 arrow-ord.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
+datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
-datafusion-substrait.workspace = true
+datafusion-substrait = { workspace = true, optional = true }
 futures.workspace = true
+jsonb = { workspace = true }
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
+lance-datagen.workspace = true
+log.workspace = true
+pin-project.workspace = true
 prost.workspace = true
 snafu.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-substrait-expr.workspace = true
+substrait-expr = { version = "0.2.3" }
+lance-datagen.workspace = true
 
+[features]
+substrait = ["dep:datafusion-substrait"]
+
+[lints]
+workspace = true

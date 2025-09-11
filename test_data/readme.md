@@ -22,3 +22,12 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   or older then bugs may occur when searching this kind of dataset.  There is
   no good workaround for readers.  Writers should make sure to recompute the
   fragment bitmap when updating indices that were sourced from old versions.
+* `v0.10.5/corrupt_schema`: This dataset had `add_columns` and `drop_columns`
+  applied to it. In earlier versions of Lance, the field ids were not handled
+  correctly, so there are duplicate field ids in the schema. There aren't great
+  workarounds for readers. Writers should make sure to check the field ids in
+  the schema and re-compute them if necessary.
+* `v0.27.1/pq_in_schema`: This dataset uses the old method of storing the PQ
+  metadata in the schema metadata in the index file. We switched to storing them
+  in a global buffer in https://github.com/lancedb/lance/pull/3829, but still
+  need to be able to read the old format.

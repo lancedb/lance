@@ -1,38 +1,158 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{Array, FixedSizeListArray};
+use arrow::{
+    array::AsArray,
+    datatypes::{Float16Type, Float32Type, Float64Type},
+};
+use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
-use lance_arrow::{ArrowFloatType, FloatType};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
-use lance_linalg::MatrixView;
+use lance_linalg::distance::DistanceType;
 use prost::bytes;
-use rand::distributions::Standard;
-use rand::prelude::*;
-use snafu::{location, Location};
-use std::sync::Arc;
+use snafu::location;
+use std::sync::LazyLock;
+use std::{ops::Range, sync::Arc};
 
 use super::pb;
 use crate::pb::Tensor;
+use crate::vector::flat::storage::FlatFloatStorage;
+use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
+use crate::vector::hnsw::HNSW;
+use crate::vector::v3::subindex::IvfSubIndex;
 
-fn to_pb_data_type<T: ArrowFloatType>() -> pb::tensor::DataType {
-    match T::FLOAT_TYPE {
-        FloatType::BFloat16 => pb::tensor::DataType::Bfloat16,
-        FloatType::Float16 => pb::tensor::DataType::Float16,
-        FloatType::Float32 => pb::tensor::DataType::Float32,
-        FloatType::Float64 => pb::tensor::DataType::Float64,
+enum SimpleIndexStatus {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(|| {
+    if let Ok(v) = std::env::var("LANCE_USE_HNSW_SPEEDUP_INDEXING") {
+        if v == "enabled" {
+            SimpleIndexStatus::Enabled
+        } else if v == "disabled" {
+            SimpleIndexStatus::Disabled
+        } else {
+            SimpleIndexStatus::Auto
+        }
+    } else {
+        SimpleIndexStatus::Auto
+    }
+});
+
+#[derive(Debug)]
+pub struct SimpleIndex {
+    store: FlatFloatStorage,
+    index: HNSW,
+}
+
+impl SimpleIndex {
+    pub fn try_new(store: FlatFloatStorage) -> Result<Self> {
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().ef_construction(15).num_edges(12),
+        )?;
+        Ok(Self { store, index: hnsw })
+    }
+
+    // train HNSW over the centroids to speed up finding the nearest clusters,
+    // only train if all conditions are met:
+    //  - the centroids are float32s or uint8s
+    //  - `num_centroids * dimension >= 1_000_000`
+    //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
+    //      so set the threshold to 1_000_000.
+    pub fn may_train_index(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> Result<Option<Self>> {
+        match *USE_HNSW_SPEEDUP_INDEXING {
+            SimpleIndexStatus::Auto => {
+                if centroids.len() < 1_000_000 {
+                    return Ok(None);
+                }
+            }
+            SimpleIndexStatus::Disabled => return Ok(None),
+            _ => {}
+        }
+
+        match centroids.data_type() {
+            DataType::Float32 => {
+                let fsl =
+                    FixedSizeListArray::try_new_from_values(centroids.clone(), dimension as i32)?;
+                let store = FlatFloatStorage::new(fsl, distance_type);
+                Self::try_new(store).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
+        let res = self.index.search_basic(
+            query,
+            1,
+            &HnswQueryParams {
+                ef: 15,
+                lower_bound: None,
+                upper_bound: None,
+            },
+            None,
+            &self.store,
+        )?;
+        Ok((res[0].id, res[0].dist.0))
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
+    match array.data_type() {
+        DataType::FixedSizeList(_, _) => {
+            let array = array.as_fixed_size_list();
+            return prefetch_arrow_array(array.values());
+        }
+        DataType::Float16 => {
+            let array = array.as_primitive::<Float16Type>();
+            do_prefetch(array.values().as_ptr_range())
+        }
+        DataType::Float32 => {
+            let array = array.as_primitive::<Float32Type>();
+            do_prefetch(array.values().as_ptr_range())
+        }
+        DataType::Float64 => {
+            let array = array.as_primitive::<Float64Type>();
+            do_prefetch(array.values().as_ptr_range())
+        }
+        _ => {
+            return Err(Error::io(
+                format!("unsupported prefetch on {} type", array.data_type()),
+                location!(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[inline]
+pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
+    // TODO use rust intrinsics instead of x86 intrinsics
+    // TODO finish this
+    unsafe {
+        let (ptr, end_ptr) = (ptrs.start as *const i8, ptrs.end as *const i8);
+        let mut current_ptr = ptr;
+        while current_ptr < end_ptr {
+            const CACHE_LINE_SIZE: usize = 64;
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch(current_ptr, _MM_HINT_T0);
+            }
+            current_ptr = current_ptr.add(CACHE_LINE_SIZE);
+        }
     }
 }
 
@@ -76,21 +196,6 @@ impl TryFrom<DataType> for pb::tensor::DataType {
 
     fn try_from(dt: DataType) -> Result<Self> {
         (&dt).try_into()
-    }
-}
-
-impl<T: ArrowFloatType> From<&MatrixView<T>> for pb::Tensor
-where
-    Standard: Distribution<<T as ArrowFloatType>::Native>,
-{
-    fn from(mat: &MatrixView<T>) -> Self {
-        let flat_array = mat.data().as_ref().clone();
-
-        Self {
-            data_type: to_pb_data_type::<T>() as i32,
-            shape: vec![mat.num_rows() as u32, mat.num_columns() as u32],
-            data: flat_array.into_data().buffers()[0].to_vec(),
-        }
     }
 }
 
@@ -149,50 +254,44 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
     }
 }
 
+/// Check if all vectors in the FixedSizeListArray are finite
+/// null values are considered as not finite
+/// returns a BooleanArray
+/// with the same length as the FixedSizeListArray
+/// with true for finite values and false for non-finite values
+pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
+    let is_finite = fsl
+        .iter()
+        .map(|v| match v {
+            Some(v) => match v.data_type() {
+                DataType::Float16 => {
+                    let v = v.as_primitive::<Float16Type>();
+                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                }
+                DataType::Float32 => {
+                    let v = v.as_primitive::<Float32Type>();
+                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                }
+                DataType::Float64 => {
+                    let v = v.as_primitive::<Float64Type>();
+                    v.null_count() == 0 && v.values().iter().all(|v| v.is_finite())
+                }
+                _ => v.null_count() == 0,
+            },
+            None => false,
+        })
+        .collect::<Vec<_>>();
+    BooleanArray::from(is_finite)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use arrow_array::{types::*, Float16Array, Float32Array, Float64Array};
+    use arrow_array::{Float16Array, Float32Array, Float64Array};
     use half::f16;
-    use lance_arrow::bfloat16::BFloat16Type;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
-
-    #[test]
-    fn test_to_pb_data_type() {
-        assert_eq!(
-            to_pb_data_type::<Float32Type>(),
-            pb::tensor::DataType::Float32
-        );
-        assert_eq!(
-            to_pb_data_type::<Float64Type>(),
-            pb::tensor::DataType::Float64
-        );
-        assert_eq!(
-            to_pb_data_type::<Float16Type>(),
-            pb::tensor::DataType::Float16
-        );
-        assert_eq!(
-            to_pb_data_type::<BFloat16Type>(),
-            pb::tensor::DataType::Bfloat16
-        );
-    }
-
-    #[test]
-    fn test_matrix_to_tensor() {
-        let mat = MatrixView::<Float32Type>::new(Arc::new(vec![0.0; 20].into()), 5);
-        let tensor = pb::Tensor::from(&mat);
-        assert_eq!(tensor.data_type, pb::tensor::DataType::Float32 as i32);
-        assert_eq!(tensor.shape, vec![4, 5]);
-        assert_eq!(tensor.data.len(), 20 * 4);
-
-        let mat = MatrixView::<Float64Type>::new(Arc::new(vec![0.0; 20].into()), 5);
-        let tensor = pb::Tensor::from(&mat);
-        assert_eq!(tensor.data_type, pb::tensor::DataType::Float64 as i32);
-        assert_eq!(tensor.shape, vec![4, 5]);
-        assert_eq!(tensor.data.len(), 20 * 8);
-    }
 
     #[test]
     fn test_fsl_to_tensor() {

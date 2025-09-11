@@ -1,18 +1,7 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::min;
+use std::{cmp::min, num::NonZero, sync::atomic::AtomicU64};
 
 use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
@@ -21,9 +10,11 @@ use arrow_array::{
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
+use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use prost::Message;
-use snafu::{location, Location};
+use serde::{Deserialize, Serialize};
+use snafu::location;
 
 use crate::{
     encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},
@@ -57,10 +48,10 @@ pub async fn read_binary_array(
             reader, position, length, nullable,
         )),
         _ => {
-            return Err(Error::IO {
-                message: format!("Unsupported binary type: {data_type}",),
-                location: location!(),
-            })
+            return Err(Error::io(
+                format!("Unsupported binary type: {}", data_type),
+                location!(),
+            ));
         }
     };
     let fut = decoder.as_ref().get(params.into());
@@ -88,17 +79,16 @@ pub async fn read_fixed_stride_array(
 }
 
 /// Read a protobuf message at file position 'pos'.
-// TODO: pub(crate)
+///
+/// We write protobuf by first writing the length of the message as a u32,
+/// followed by the message itself.
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
     if pos > file_size {
-        return Err(Error::IO {
-            message: "file size is too small".to_string(),
-            location: location!(),
-        });
+        return Err(Error::io("file size is too small".to_string(), location!()));
     }
 
-    let range = pos..min(pos + 4096, file_size);
+    let range = pos..min(pos + reader.block_size(), file_size);
     let buf = reader.get_range(range.clone()).await?;
     let msg_len = LittleEndian::read_u32(&buf) as usize;
 
@@ -116,31 +106,54 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 /// Read a Protobuf-backed struct at file position: `pos`.
 // TODO: pub(crate)
 pub async fn read_struct<
-    'm,
     M: Message + Default + 'static,
-    T: ProtoStruct<Proto = M> + From<M>,
+    T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
 >(
     reader: &dyn Reader,
     pos: usize,
 ) -> Result<T> {
     let msg = read_message::<M>(reader, pos).await?;
-    let obj = T::from(msg);
-    Ok(obj)
+    T::try_from(msg)
+}
+
+pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
+    let file_size = reader.size().await?;
+    let block_size = reader.block_size();
+    let begin = file_size.saturating_sub(block_size);
+    reader.get_range(begin..file_size).await
 }
 
 pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "does not have sufficient data, len: {}, bytes: {:?}",
                 len, bytes
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
     let offset_bytes = bytes.slice(len - 16..len - 8);
     Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
+}
+
+/// Read the version from the footer bytes
+pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
+    let len = bytes.len();
+    if len < 8 {
+        return Err(Error::io(
+            format!(
+                "does not have sufficient data, len: {}, bytes: {:?}",
+                len, bytes
+            ),
+            location!(),
+        ));
+    }
+
+    let major_version = LittleEndian::read_u16(bytes.slice(len - 8..len - 6).as_ref());
+    let minor_version = LittleEndian::read_u16(bytes.slice(len - 6..len - 4).as_ref());
+    Ok((major_version, minor_version))
 }
 
 /// Read protobuf from a buffer.
@@ -150,25 +163,112 @@ pub fn read_message_from_buf<M: Message + Default>(buf: &Bytes) -> Result<M> {
 }
 
 /// Read a Protobuf-backed struct from a buffer.
-pub fn read_struct_from_buf<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
+pub fn read_struct_from_buf<
+    M: Message + Default,
+    T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
+>(
     buf: &Bytes,
 ) -> Result<T> {
     let msg: M = read_message_from_buf(buf)?;
-    Ok(T::from(msg))
+    T::try_from(msg)
+}
+
+/// A cached file size.
+///
+/// This wraps an atomic u64 to allow setting the cached file size without
+/// needed a mutable reference.
+///
+/// Zero is interpreted as unknown.
+#[derive(Debug, DeepSizeOf)]
+pub struct CachedFileSize(AtomicU64);
+
+impl<'de> Deserialize<'de> for CachedFileSize {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let size = Option::<u64>::deserialize(deserializer)?.unwrap_or(0);
+        Ok(Self::new(size))
+    }
+}
+
+impl Serialize for CachedFileSize {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let size = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        if size == 0 {
+            serializer.serialize_none()
+        } else {
+            serializer.serialize_u64(size)
+        }
+    }
+}
+
+impl From<Option<NonZero<u64>>> for CachedFileSize {
+    fn from(size: Option<NonZero<u64>>) -> Self {
+        match size {
+            Some(size) => Self(AtomicU64::new(size.into())),
+            None => Self(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for CachedFileSize {
+    fn default() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+impl Clone for CachedFileSize {
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(
+            self.0.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+}
+
+impl PartialEq for CachedFileSize {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+            == other.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Eq for CachedFileSize {}
+
+impl CachedFileSize {
+    pub fn new(size: u64) -> Self {
+        Self(AtomicU64::new(size))
+    }
+
+    pub fn unknown() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    pub fn get(&self) -> Option<NonZero<u64>> {
+        NonZero::new(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn set(&self, size: NonZero<u64>) {
+        self.0
+            .store(size.into(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use bytes::Bytes;
-    use object_store::{memory::InMemory, path::Path};
+    use object_store::path::Path;
 
     use crate::{
         object_reader::CloudObjectReader,
+        object_store::{ObjectStore, DEFAULT_DOWNLOAD_RETRY_COUNT},
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
+        Error, Result,
     };
 
     // Bytes is a prost::Message, since we don't have any .proto files in this crate we
@@ -186,15 +286,16 @@ mod tests {
         }
     }
 
-    impl From<Bytes> for BytesWrapper {
-        fn from(value: Bytes) -> Self {
-            Self(value)
+    impl TryFrom<Bytes> for BytesWrapper {
+        type Error = Error;
+        fn try_from(value: Bytes) -> Result<Self> {
+            Ok(Self(value))
         }
     }
 
     #[tokio::test]
     async fn test_write_proto_structs() {
-        let store = InMemory::new();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
@@ -206,7 +307,9 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(Arc::new(store), path, 1024).unwrap();
+        let object_reader =
+            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+                .unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
     }

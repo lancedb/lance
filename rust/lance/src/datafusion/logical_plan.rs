@@ -1,15 +1,19 @@
-use std::{any::Any, sync::Arc};
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     datasource::TableProvider,
     error::Result as DatafusionResult,
-    execution::context::SessionState,
     logical_expr::{LogicalPlan, TableType},
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
+use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 
 use crate::Dataset;
 
@@ -31,25 +35,29 @@ impl TableProvider for Dataset {
         None
     }
 
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         None
     }
 
     async fn scan(
         &self,
-        _: &SessionState,
+        _: &dyn Session,
         projection: Option<&Vec<usize>>,
         _: &[Expr],
         limit: Option<usize>,
     ) -> DatafusionResult<Arc<dyn ExecutionPlan>> {
-        let mut scanner = self.scan();
+        let scanner = self.scan();
 
         let schema_ref = self.schema();
         let projections = if let Some(projection) = projection {
             if projection.len() != schema_ref.fields.len() {
                 let arrow_schema: ArrowSchema = schema_ref.into();
                 let arrow_schema = arrow_schema.project(projection)?;
-                schema_ref.project_by_schema(&arrow_schema)?
+                schema_ref.project_by_schema(
+                    &arrow_schema,
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?
             } else {
                 schema_ref.clone()
             }
@@ -57,10 +65,9 @@ impl TableProvider for Dataset {
             schema_ref.clone()
         };
 
-        if let Some(limit) = limit {
-            scanner.limit(Some(limit as i64), None)?;
-        }
-        let plan: Arc<dyn ExecutionPlan> = scanner.scan(false, false, projections.into());
+        let scan_range = limit.map(|l| (0..l as u64));
+        let plan: Arc<dyn ExecutionPlan> =
+            scanner.scan(false, false, false, scan_range, projections.into());
 
         Ok(plan)
     }
@@ -76,6 +83,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
     use datafusion::prelude::*;
+    use datafusion_physical_plan::coop::CooperativeExec;
     use tempfile::tempdir;
 
     fn create_batches() -> (SchemaRef, Vec<RecordBatch>) {
@@ -150,6 +158,13 @@ mod tests {
         ctx.register_table("my_table", Arc::new(dataset)).unwrap();
         let df = ctx.sql("SELECT vector, utf8 FROM my_table").await.unwrap();
         let physical_plan = df.clone().create_physical_plan().await.unwrap();
+
+        // DataFusion will create a cooperative execution plan, so we need to get its inner plan
+        let physical_plan = physical_plan
+            .as_any()
+            .downcast_ref::<CooperativeExec>()
+            .unwrap()
+            .children()[0];
 
         assert!(physical_plan
             .as_any()

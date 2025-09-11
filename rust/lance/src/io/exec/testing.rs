@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Testing Node
 //!
@@ -19,31 +8,50 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
+    common::Statistics,
     execution::context::TaskContext,
-    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
+    physical_plan::{
+        execution_plan::{Boundedness, EmissionType},
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    },
 };
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use futures::StreamExt;
 
 #[derive(Debug)]
 pub struct TestingExec {
     pub(crate) batches: Vec<RecordBatch>,
+    properties: PlanProperties,
 }
 
 impl TestingExec {
     pub(crate) fn new(batches: Vec<RecordBatch>) -> Self {
-        Self { batches }
-    }
-}
-
-impl DisplayAs for TestingExec {
-    fn fmt_as(&self, t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => todo!(),
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(batches[0].schema()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            batches,
+            properties,
         }
     }
 }
 
+impl DisplayAs for TestingExec {
+    fn fmt_as(&self, _t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        todo!()
+    }
+}
+
 impl ExecutionPlan for TestingExec {
+    fn name(&self) -> &str {
+        "TestingExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -52,15 +60,7 @@ impl ExecutionPlan for TestingExec {
         self.batches[0].schema()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        todo!()
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        todo!()
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -76,10 +76,16 @@ impl ExecutionPlan for TestingExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        todo!()
+        let stream = futures::stream::iter(self.batches.clone().into_iter().map(Ok));
+        let stream = RecordBatchStreamAdapter::new(self.schema(), stream.boxed());
+        Ok(Box::pin(stream))
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        todo!()
+        Ok(Statistics::new_unknown(self.schema().as_ref()))
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
     }
 }

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Reading TFRecord files into Arrow data
 //!
@@ -20,14 +9,16 @@
 use arrow::buffer::OffsetBuffer;
 use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::{ArrayRef, FixedSizeListArray, ListArray};
+use arrow_buffer::ArrowNativeType;
 use arrow_buffer::ScalarBuffer;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use half::{bf16, f16};
-use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
-use prost::Message;
+use lance_arrow::bfloat16::BFLOAT16_EXT_NAME;
+use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
+use prost_old::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -42,6 +33,20 @@ use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
 use tfrecord::record_reader::RecordStream;
 use tfrecord::{Example, Feature};
+
+trait OldProstResultExt<T> {
+    fn map_prost_err(self, location: Location) -> Result<T>;
+}
+
+impl<T> OldProstResultExt<T> for std::result::Result<T, prost_old::DecodeError> {
+    fn map_prost_err(self, location: Location) -> Result<T> {
+        self.map_err(|err| Error::IO {
+            source: Box::new(err),
+            location,
+        })
+    }
+}
+
 /// Infer the Arrow schema from a TFRecord file.
 ///
 /// The featured named by `tensor_features` will be assumed to be binary fields
@@ -68,15 +73,12 @@ pub async fn infer_tfrecord_schema(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let mut records = RecordStream::<Example, _>::from_reader(data, Default::default());
     let mut i = 0;
     while let Some(record) = records.next().await {
-        let record = record.map_err(|err| Error::IO {
-            message: err.to_string(),
-            location: location!(),
-        })?;
+        let record = record.map_err(|err| Error::io(err.to_string(), location!()))?;
 
         if let Some(features) = record.features {
             for (name, feature) in features.feature {
@@ -133,7 +135,7 @@ pub async fn read_tfrecord(
         .get(&path)
         .await?
         .into_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+        .map_err(std::io::Error::other)
         .into_async_read();
     let schema_ref = schema.clone();
     let batch_stream = RecordStream::<Example, _>::from_reader(data, Default::default())
@@ -211,24 +213,24 @@ impl FeatureMeta {
                 FeatureType::Binary => FeatureType::Binary,
                 FeatureType::Tensor { .. } => Self::extract_tensor(data.value[0].as_slice())?,
                 _ => {
-                    return Err(Error::IO {
-                        message: format!(
+                    return Err(Error::io(
+                        format!(
                             "Data type mismatch: expected {:?}, got {:?}",
                             self.feature_type,
                             feature.kind.as_ref().unwrap()
                         ),
-                        location: location!(),
-                    })
+                        location!(),
+                    ))
                 }
             },
             Kind::FloatList(_) => FeatureType::Float,
             Kind::Int64List(_) => FeatureType::Integer,
         };
         if self.feature_type != feature_type {
-            return Err(Error::IO {
-                message: format!("inconsistent feature type for field {:?}", feature_type),
-                location: location!(),
-            });
+            return Err(Error::io(
+                format!("inconsistent feature type for field {:?}", feature_type),
+                location!(),
+            ));
         }
         if feature_is_repeated(feature) {
             self.repeated = true;
@@ -237,7 +239,7 @@ impl FeatureMeta {
     }
 
     fn extract_tensor(data: &[u8]) -> Result<FeatureType> {
-        let tensor_proto = TensorProto::decode(data)?;
+        let tensor_proto = TensorProto::decode(data).map_prost_err(location!())?;
         Ok(FeatureType::Tensor {
             shape: tensor_proto
                 .tensor_shape
@@ -265,10 +267,10 @@ fn tensor_dtype_to_arrow(tensor_dtype: &TensorDataType) -> Result<DataType> {
         TensorDataType::DtFloat => DataType::Float32,
         TensorDataType::DtDouble => DataType::Float64,
         _ => {
-            return Err(Error::IO {
-                message: format!("unsupported tensor data type {:?}", tensor_dtype),
-                location: location!(),
-            });
+            return Err(Error::io(
+                format!("unsupported tensor data type {:?}", tensor_dtype),
+                location!(),
+            ));
         }
     })
 }
@@ -544,10 +546,10 @@ fn convert_leaf(
         TypeInfo {
             fsl_size: Some(_), ..
         } => convert_fixedshape_tensor(&features, type_info)?,
-        _ => Err(Error::IO {
-            message: format!("unsupported type {:?}", type_info.leaf_type),
-            location: location!(),
-        })?,
+        _ => Err(Error::io(
+            format!("unsupported type {:?}", type_info.leaf_type),
+            location!(),
+        ))?,
     };
 
     Ok((values, offsets))
@@ -630,7 +632,7 @@ fn convert_fixedshape_tensor(
         DataType::Float16 => {
             let mut values = Float16Builder::with_capacity(features.len());
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.half_val.is_empty() {
@@ -658,7 +660,7 @@ fn convert_fixedshape_tensor(
             let mut values = FixedSizeBinaryBuilder::with_capacity(features.len(), 2);
 
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.half_val.is_empty() {
@@ -686,7 +688,7 @@ fn convert_fixedshape_tensor(
         DataType::Float32 => {
             let mut values = Float32Builder::with_capacity(features.len());
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.float_val.is_empty() {
@@ -708,7 +710,7 @@ fn convert_fixedshape_tensor(
         DataType::Float64 => {
             let mut values = Float64Builder::with_capacity(features.len());
             for tensors in tensor_iter {
-                if let Some(tensors) = tensors? {
+                if let Some(tensors) = tensors.map_prost_err(location!())? {
                     for tensor in tensors {
                         validate_tensor(&tensor, type_info)?;
                         if tensor.float_val.is_empty() {
@@ -727,10 +729,10 @@ fn convert_fixedshape_tensor(
             }
             Arc::new(values.finish())
         }
-        _ => Err(Error::IO {
-            message: format!("unsupported type {:?}", type_info.leaf_type),
-            location: location!(),
-        })?,
+        _ => Err(Error::io(
+            format!("unsupported type {:?}", type_info.leaf_type),
+            location!(),
+        ))?,
     };
 
     Ok((values, offsets))
@@ -740,26 +742,26 @@ fn validate_tensor(tensor: &TensorProto, type_info: &TypeInfo) -> Result<()> {
     let tensor_shape = tensor.tensor_shape.as_ref().unwrap();
     let length = tensor_shape.dim.iter().map(|d| d.size as i32).product();
     if type_info.fsl_size != Some(length) {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "tensor length mismatch: expected {}, got {}",
                 type_info.fsl_size.unwrap(),
                 length
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     let data_type = tensor_dtype_to_arrow(&tensor.dtype())?;
     if data_type != type_info.leaf_type {
-        return Err(Error::IO {
-            message: format!(
+        return Err(Error::io(
+            format!(
                 "tensor type mismatch: expected {:?}, got {:?}",
                 type_info.leaf_type,
                 tensor.dtype()
             ),
-            location: location!(),
-        });
+            location!(),
+        ));
     }
 
     Ok(())
@@ -778,13 +780,13 @@ fn append_primitive_from_slice<T>(
     // TensorProto to tell us the original endianness, so it's possible there
     // could be a mismatch here.
     let (prefix, middle, suffix) = unsafe { slice.align_to::<T::Native>() };
-    for val in prefix.chunks_exact(T::get_byte_width()) {
+    for val in prefix.chunks_exact(T::Native::get_byte_width()) {
         builder.append_value(parse_val(val));
     }
 
     builder.append_slice(middle);
 
-    for val in suffix.chunks_exact(T::get_byte_width()) {
+    for val in suffix.chunks_exact(T::Native::get_byte_width()) {
         builder.append_value(parse_val(val));
     }
 }

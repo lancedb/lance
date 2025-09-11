@@ -1,20 +1,14 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+#![allow(clippy::print_stdout)]
 
 use bytes::Bytes;
 use lance_core::Result;
-use lance_io::{object_store::ObjectStore, scheduler::StoreScheduler};
+use lance_io::{
+    object_store::ObjectStore,
+    scheduler::{ScanScheduler, SchedulerConfig},
+    utils::CachedFileSize,
+};
 use object_store::path::Path;
 use rand::{seq::SliceRandom, RngCore};
 use std::{fmt::Display, process::Command, sync::Arc};
@@ -50,10 +44,10 @@ async fn create_data(num_bytes: u64) -> (Arc<ObjectStore>, Path) {
     let tmp_file = path.child("foo.file");
 
     let mut some_data = vec![0; num_bytes as usize];
-    rand::thread_rng().fill_bytes(&mut some_data);
+    rand::rng().fill_bytes(&mut some_data);
     obj_store.put(&tmp_file, &some_data).await.unwrap();
 
-    (Arc::new(obj_store), tmp_file)
+    (obj_store, tmp_file)
 }
 
 const DATA_SIZE: u64 = 128 * 1024 * 1024;
@@ -98,9 +92,14 @@ fn bench_full_read(c: &mut Criterion) {
                             .output()
                             .unwrap();
                     }
+                    std::env::set_var("IO_THREADS", io_parallelism.to_string());
                     runtime.block_on(async {
-                        let scheduler = StoreScheduler::new(obj_store, params.io_parallelism);
-                        let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
+                        let scheduler =
+                            ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+                        let file_scheduler = scheduler
+                            .open_file(&tmp_file, &CachedFileSize::unknown())
+                            .await
+                            .unwrap();
 
                         let (tx, rx) = mpsc::channel(1024);
                         let drainer = tokio::spawn(drain_task(rx));
@@ -108,7 +107,7 @@ fn bench_full_read(c: &mut Criterion) {
                         while offset < DATA_SIZE {
                             #[allow(clippy::single_range_in_vec_init)]
                             let req = vec![offset..(offset + params.page_size)];
-                            let req = file_scheduler.submit_request(req);
+                            let req = file_scheduler.submit_request(req, 0);
                             tx.send(req).await.unwrap();
                             offset += params.page_size;
                         }
@@ -157,7 +156,7 @@ fn bench_random_read(c: &mut Criterion) {
     for io_parallelism in [1, 16, 32, 64] {
         for item_size in [8, 1024, 4096] {
             let num_indices = DATA_SIZE as u32 / item_size;
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let mut indices = (0..num_indices).collect::<Vec<_>>();
             let (shuffled, _) = indices.partial_shuffle(&mut rng, INDICES_PER_ITER);
             let mut indices = shuffled.to_vec();
@@ -184,9 +183,16 @@ fn bench_random_read(c: &mut Criterion) {
                                 .output()
                                 .unwrap();
                         }
+                        std::env::set_var("IO_THREADS", params.io_parallelism.to_string());
                         runtime.block_on(async {
-                            let scheduler = StoreScheduler::new(obj_store, params.io_parallelism);
-                            let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
+                            let scheduler = ScanScheduler::new(
+                                obj_store,
+                                SchedulerConfig::default_for_testing(),
+                            );
+                            let file_scheduler = scheduler
+                                .open_file(&tmp_file, &CachedFileSize::unknown())
+                                .await
+                                .unwrap();
 
                             let (tx, rx) = mpsc::channel(1024);
                             let drainer = tokio::spawn(drain_task(rx));
@@ -200,7 +206,7 @@ fn bench_random_read(c: &mut Criterion) {
                                     })
                                     .collect::<Vec<_>>();
                                 idx += INDICES_PER_BATCH as usize;
-                                let req = file_scheduler.submit_request(iops);
+                                let req = file_scheduler.submit_request(iops, 0);
                                 tx.send(req).await.unwrap();
                             }
                             drop(tx);

@@ -1,16 +1,5 @@
-#  Copyright (c) 2024. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 """Bfloat16 support."""
 
@@ -92,11 +81,11 @@ class BFloat16Array(pa.ExtensionArray):
 
 
 class BFloat16Scalar(pa.ExtensionScalar):
-    def as_py(self) -> Optional[BFloat16]:
+    def as_py(self, **kwargs) -> Optional[BFloat16]:
         if self.value is None:
             return None
         else:
-            return BFloat16.from_bytes(self.value.as_py())
+            return BFloat16.from_bytes(self.value.as_py(**kwargs))
 
     def __eq__(self, other: Any):
         from ml_dtypes import bfloat16
@@ -116,12 +105,12 @@ class BFloat16Type(pa.ExtensionType):
         pa.ExtensionType.__init__(self, pa.binary(2), "lance.bfloat16")
 
     def __arrow_ext_serialize__(self):
-        # TODO: encode endianess
+        # TODO: encode endianness
         return b""
 
     @classmethod
     def __arrow_ext_deserialize__(self, storage_type, serialized):
-        # TODO: decode endianess
+        # TODO: decode endianness
         return BFloat16Type()
 
     def __arrow_ext_class__(self):

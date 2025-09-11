@@ -1,16 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import glob
 import os
@@ -19,9 +8,12 @@ import sys
 import uuid
 
 import pytest
-from lance.tracing import trace_to_chrome
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="test fails in CI on Windows but passes locally on Windows",
+)
 def test_tracing():
     trace_files_before = set(glob.glob("trace-*.json"))
     subprocess.run(
@@ -31,6 +23,9 @@ def test_tracing():
             "from lance.tracing import trace_to_chrome; trace_to_chrome()",
         ],
         check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
     )
     trace_files_after = set(glob.glob("trace-*.json"))
     assert len(trace_files_before) + 1 == len(trace_files_after)
@@ -50,12 +45,84 @@ def test_tracing():
             + f"trace_to_chrome(file='{trace_name}')",
         ],
         check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
     )
 
     assert os.path.exists(trace_name)
     os.remove(trace_name)
 
 
-def test_tracing_invalid_level():
-    with pytest.raises(ValueError):
-        trace_to_chrome(level="invalid")
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="test fails in CI on Windows but passes locally on Windows",
+)
+def test_tracing_callback(tmp_path):
+    script = tmp_path / "script.py"
+    script.write_text(
+        """import lance
+import pyarrow as pa
+import time
+
+from lance.tracing import capture_trace_events
+
+def wait_until(condition, timeout=1, interval=0.01):
+    start = time.time()
+    while time.time() - start < timeout:
+        if condition():
+            return
+        time.sleep(interval)
+    raise TimeoutError(f"Condition not met after {timeout} seconds")
+
+events = []
+def callback(evt):
+    events.append(evt)
+
+capture_trace_events(callback)
+
+lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
+wait_until(lambda: len(events) == 6)
+
+assert events[0].target == "lance::dataset_events"
+assert events[0].args["event"] == "loading"
+assert events[0].args["uri"] == "memory://test"
+
+assert events[1].target == "lance::dataset_events"
+assert events[1].args["event"] == "writing"
+assert events[1].args["uri"] == "memory://test"
+assert events[1].args["mode"] == "Create"
+
+assert events[2].target == "lance::file_audit"
+assert events[2].args["mode"] == "create"
+assert events[2].args["type"] == "data"
+
+assert events[3].target == "lance::dataset_events"
+assert events[3].args["event"] == "loading"
+assert events[3].args["uri"] == "memory://test"
+
+assert events[4].target == "lance::file_audit"
+assert events[4].args["mode"] == "create"
+assert events[4].args["type"] == "manifest"
+
+assert events[5].target == "lance::dataset_events"
+assert events[5].args["event"] == "committed"
+assert events[5].args["uri"] == "memory://test"
+assert events[5].args["read_version"] == "0"
+assert events[5].args["committed_version"] == "1"
+assert events[5].args["detached"] == "false"
+assert events[5].args["operation"] == "Overwrite"
+
+for e in events:
+    assert e.args["timestamp"] is not None
+    assert e.args["client_version"] == lance.__version__
+"""
+    )
+    subprocess.run(
+        [sys.executable, script],
+        capture_output=True,
+        check=True,
+        env={
+            "LANCE_LOG": "debug",
+        },
+    )

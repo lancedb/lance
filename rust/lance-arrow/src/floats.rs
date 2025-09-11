@@ -1,21 +1,11 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Floats Array
 
 use std::fmt::{Debug, Display};
 use std::iter::Sum;
+use std::sync::Arc;
 use std::{
     fmt::Formatter,
     ops::{AddAssign, DivAssign},
@@ -95,6 +85,8 @@ pub trait ArrowFloatType: Debug {
         + Display;
 
     const FLOAT_TYPE: FloatType;
+    const MIN: Self::Native;
+    const MAX: Self::Native;
 
     /// Arrow Float Array Type.
     type ArrayType: FloatArray<Self>;
@@ -140,6 +132,8 @@ impl ArrowFloatType for BFloat16Type {
     type Native = bf16;
 
     const FLOAT_TYPE: FloatType = FloatType::BFloat16;
+    const MIN: Self::Native = bf16::MIN;
+    const MAX: Self::Native = bf16::MAX;
 
     type ArrayType = BFloat16Array;
 }
@@ -148,6 +142,8 @@ impl ArrowFloatType for Float16Type {
     type Native = f16;
 
     const FLOAT_TYPE: FloatType = FloatType::Float16;
+    const MIN: Self::Native = f16::MIN;
+    const MAX: Self::Native = f16::MAX;
 
     type ArrayType = Float16Array;
 }
@@ -156,6 +152,8 @@ impl ArrowFloatType for Float32Type {
     type Native = f32;
 
     const FLOAT_TYPE: FloatType = FloatType::Float32;
+    const MIN: Self::Native = f32::MIN;
+    const MAX: Self::Native = f32::MAX;
 
     type ArrayType = Float32Array;
 }
@@ -164,6 +162,8 @@ impl ArrowFloatType for Float64Type {
     type Native = f64;
 
     const FLOAT_TYPE: FloatType = FloatType::Float64;
+    const MIN: Self::Native = f64::MIN;
+    const MAX: Self::Native = f64::MAX;
 
     type ArrayType = Float64Array;
 }
@@ -203,16 +203,16 @@ impl FloatArray<Float64Type> for Float64Array {
 }
 
 /// Convert a float32 array to another float array.
-pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Result<Box<dyn Array>> {
+pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Result<Arc<dyn Array>> {
     match float_type {
-        FloatType::BFloat16 => Ok(Box::new(BFloat16Array::from_iter_values(
+        FloatType::BFloat16 => Ok(Arc::new(BFloat16Array::from_iter_values(
             input.values().iter().map(|v| bf16::from_f32(*v)),
         ))),
-        FloatType::Float16 => Ok(Box::new(Float16Array::from_iter_values(
+        FloatType::Float16 => Ok(Arc::new(Float16Array::from_iter_values(
             input.values().iter().map(|v| f16::from_f32(*v)),
         ))),
-        FloatType::Float32 => Ok(Box::new(input.clone())),
-        FloatType::Float64 => Ok(Box::new(Float64Array::from_iter_values(
+        FloatType::Float32 => Ok(Arc::new(input.clone())),
+        FloatType::Float64 => Ok(Arc::new(Float64Array::from_iter_values(
             input.values().iter().map(|v| *v as f64),
         ))),
     }

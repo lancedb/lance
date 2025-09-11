@@ -1,21 +1,10 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Optimized local I/Os
 
 use std::fs::File;
-use std::io::{ErrorKind, SeekFrom};
+use std::io::{ErrorKind, Read, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -27,12 +16,15 @@ use std::os::windows::fs::FileExt;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncSeekExt;
+use tokio::sync::OnceCell;
 use tracing::instrument;
 
+use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::traits::{Reader, Writer};
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
@@ -57,7 +49,30 @@ pub fn remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Copy a file from one location to another, supporting cross-filesystem copies.
+///
+/// Unlike hard links, this function works across filesystem boundaries.
+pub fn copy_file(from: &Path, to: &Path) -> Result<()> {
+    let from_path = to_local_path(from);
+    let to_path = to_local_path(to);
+
+    // Ensure the parent directory exists
+    if let Some(parent) = std::path::Path::new(&to_path).parent() {
+        std::fs::create_dir_all(parent).map_err(Error::from)?;
+    }
+
+    std::fs::copy(&from_path, &to_path).map_err(|err| match err.kind() {
+        ErrorKind::NotFound => Error::NotFound {
+            uri: from.to_string(),
+            location: location!(),
+        },
+        _ => Error::from(err),
+    })?;
+    Ok(())
+}
+
 /// [ObjectReader] for local file system.
+#[derive(Debug)]
 pub struct LocalObjectReader {
     /// File handler.
     file: Arc<File>,
@@ -65,31 +80,39 @@ pub struct LocalObjectReader {
     /// Fie path.
     path: Path,
 
+    /// Known size of the file. This is either passed in on construction or
+    /// cached on the first metadata call.
+    size: OnceCell<usize>,
+
     /// Block size, in bytes.
     block_size: usize,
+}
+
+impl DeepSizeOf for LocalObjectReader {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // Skipping `file` as it should just be a file handle
+        self.path.as_ref().deep_size_of_children(context)
+    }
 }
 
 impl LocalObjectReader {
     pub async fn open_local_path(
         path: impl AsRef<std::path::Path>,
         block_size: usize,
+        known_size: Option<usize>,
     ) -> Result<Box<dyn Reader>> {
         let path = path.as_ref().to_owned();
         let object_store_path = Path::from_filesystem_path(&path)?;
-        tokio::task::spawn_blocking(move || {
-            let local_file = File::open(&path)?;
-            Ok(Box::new(Self {
-                file: Arc::new(local_file),
-                path: object_store_path,
-                block_size,
-            }) as Box<dyn Reader>)
-        })
-        .await?
+        Self::open(&object_store_path, block_size, known_size).await
     }
 
     /// Open a local object reader, with default prefetch size.
     #[instrument(level = "debug")]
-    pub async fn open(path: &Path, block_size: usize) -> Result<Box<dyn Reader>> {
+    pub async fn open(
+        path: &Path,
+        block_size: usize,
+        known_size: Option<usize>,
+    ) -> Result<Box<dyn Reader>> {
         let path = path.clone();
         let local_path = to_local_path(&path);
         tokio::task::spawn_blocking(move || {
@@ -98,15 +121,14 @@ impl LocalObjectReader {
                     uri: path.to_string(),
                     location: location!(),
                 },
-                _ => Error::IO {
-                    message: e.to_string(),
-                    location: location!(),
-                },
+                _ => e.into(),
             })?;
+            let size = OnceCell::new_with(known_size);
             Ok(Box::new(Self {
                 file: Arc::new(file),
                 block_size,
-                path: path.clone(),
+                size,
+                path,
             }) as Box<dyn Reader>)
         })
         .await?
@@ -123,14 +145,31 @@ impl Reader for LocalObjectReader {
         self.block_size
     }
 
+    fn io_parallelism(&self) -> usize {
+        DEFAULT_LOCAL_IO_PARALLELISM
+    }
+
     /// Returns the file size.
-    async fn size(&self) -> Result<usize> {
-        Ok(self.file.metadata()?.len() as usize)
+    async fn size(&self) -> object_store::Result<usize> {
+        let file = self.file.clone();
+        self.size
+            .get_or_try_init(|| async move {
+                let metadata = tokio::task::spawn_blocking(move || {
+                    file.metadata().map_err(|err| object_store::Error::Generic {
+                        store: "LocalFileSystem",
+                        source: err.into(),
+                    })
+                })
+                .await??;
+                Ok(metadata.len() as usize)
+            })
+            .await
+            .cloned()
     }
 
     /// Reads a range of data.
     #[instrument(level = "debug", skip(self))]
-    async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
+    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
             let mut buf = BytesMut::with_capacity(range.len());
@@ -145,6 +184,26 @@ impl Reader for LocalObjectReader {
             Ok(buf.freeze())
         })
         .await?
+        .map_err(|err: std::io::Error| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: err.into(),
+        })
+    }
+
+    /// Reads the entire file.
+    #[instrument(level = "debug", skip(self))]
+    async fn get_all(&self) -> object_store::Result<Bytes> {
+        let mut file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            file.read_to_end(buf.as_mut())?;
+            Ok(Bytes::from(buf))
+        })
+        .await?
+        .map_err(|err: std::io::Error| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: err.into(),
+        })
     }
 }
 

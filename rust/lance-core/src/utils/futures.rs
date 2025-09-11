@@ -1,16 +1,5 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
     collections::VecDeque,
@@ -19,6 +8,7 @@ use std::{
 };
 
 use futures::{stream::BoxStream, Stream, StreamExt};
+use pin_project::pin_project;
 use tokio::sync::Semaphore;
 use tokio_util::sync::PollSemaphore;
 
@@ -85,7 +75,7 @@ impl<'a, T: Clone> SharedStream<'a, T> {
     }
 }
 
-impl<'a, T: Clone> Stream for SharedStream<'a, T> {
+impl<T: Clone> Stream for SharedStream<'_, T> {
     type Item = T;
 
     fn poll_next(
@@ -132,7 +122,12 @@ impl<'a, T: Clone> Stream for SharedStream<'a, T> {
             if let Some(polling_side) = inner_state.polling.as_ref() {
                 if *polling_side != self.side {
                     // Another task is already polling the inner stream, so we don't need to do anything
-                    debug_assert!(inner_state.waker.is_none());
+
+                    // Per rust docs:
+                    //   Note that on multiple calls to poll, only the Waker from the Context
+                    //   passed to the most recent call should be scheduled to receive a wakeup.
+                    //
+                    // So it is safe to replace a potentially stale waker here.
                     inner_state.waker = Some(cx.waker().clone());
                     return std::task::Poll::Pending;
                 }
@@ -219,6 +214,53 @@ where
 impl<'a, T: Clone> SharedStreamExt<'a> for BoxStream<'a, T> {
     fn share(self, capacity: Capacity) -> (SharedStream<'a, T>, SharedStream<'a, T>) {
         SharedStream::new(self, capacity)
+    }
+}
+
+#[pin_project]
+pub struct FinallyStream<S: Stream, F: FnOnce()> {
+    #[pin]
+    stream: S,
+    f: Option<F>,
+}
+
+impl<S: Stream, F: FnOnce()> FinallyStream<S, F> {
+    pub fn new(stream: S, f: F) -> Self {
+        Self { stream, f: Some(f) }
+    }
+}
+
+impl<S: Stream, F: FnOnce()> Stream for FinallyStream<S, F> {
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        let res = this.stream.poll_next(cx);
+        if matches!(res, std::task::Poll::Ready(None)) {
+            // It's possible that None is polled multiple times, but we only call the function once
+            if let Some(f) = this.f.take() {
+                f();
+            }
+        }
+        res
+    }
+}
+
+pub trait FinallyStreamExt<S: Stream>: Stream + Sized {
+    fn finally<F: FnOnce()>(self, f: F) -> FinallyStream<Self, F> {
+        FinallyStream {
+            stream: self,
+            f: Some(f),
+        }
+    }
+}
+
+impl<S: Stream> FinallyStreamExt<S> for S {
+    fn finally<F: FnOnce()>(self, f: F) -> FinallyStream<Self, F> {
+        FinallyStream::new(self, f)
     }
 }
 

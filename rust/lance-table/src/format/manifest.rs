@@ -1,36 +1,30 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::prelude::*;
+use deepsize::DeepSizeOf;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
-use lance_io::traits::ProtoStruct;
+use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
+use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
+use prost::Message;
 use prost_types::Timestamp;
 
 use super::Fragment;
+use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
 use crate::format::pb;
-use lance_core::cache::FileMetadataCache;
-use lance_core::datatypes::Schema;
+use lance_core::cache::LanceCache;
+use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_struct;
-use snafu::{location, Location};
+use snafu::location;
 
 /// Manifest of a dataset
 ///
@@ -38,10 +32,13 @@ use snafu::{location, Location};
 ///  * Version
 ///  * Fragments.
 ///  * Indices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
+
+    /// Local schema, only containing fields with the default storage class (not blobs)
+    pub local_schema: Schema,
 
     /// Dataset version
     pub version: u64,
@@ -50,6 +47,9 @@ pub struct Manifest {
     pub writer_version: Option<WriterVersion>,
 
     /// Fragments, the pieces to build the dataset.
+    ///
+    /// This list is stored in order, sorted by fragment id.  However, the fragment id
+    /// sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
 
     /// The file position of the version aux data.
@@ -70,8 +70,9 @@ pub struct Manifest {
     /// The writer flags
     pub writer_feature_flags: u64,
 
-    /// The max fragment id used so far
-    pub max_fragment_id: u32,
+    /// The max fragment id used so far  
+    /// None means never set, Some(0) means max ID used so far is 0
+    pub max_fragment_id: Option<u32>,
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
@@ -79,6 +80,28 @@ pub struct Manifest {
     /// Precomputed logic offset of each fragment
     /// accelerating the fragment search using offset ranges.
     fragment_offsets: Vec<usize>,
+
+    /// The max row id used so far.
+    pub next_row_id: u64,
+
+    /// The storage format of the data files.
+    pub data_storage_format: DataStorageFormat,
+
+    /// Table configuration.
+    pub config: HashMap<String, String>,
+
+    /// Blob dataset version
+    pub blob_dataset_version: Option<u64>,
+
+    /* external base paths */
+    pub base_paths: HashMap<u32, BasePath>,
+}
+
+// We use the most significant bit to indicate that a transaction is detached
+pub const DETACHED_VERSION_MASK: u64 = 0x8000_0000_0000_0000;
+
+pub fn is_detached_version(version: u64) -> bool {
+    version & DETACHED_VERSION_MASK != 0
 }
 
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
@@ -95,10 +118,19 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
 }
 
 impl Manifest {
-    pub fn new(schema: Schema, fragments: Arc<Vec<Fragment>>) -> Self {
+    pub fn new(
+        schema: Schema,
+        fragments: Arc<Vec<Fragment>>,
+        data_storage_format: DataStorageFormat,
+        blob_dataset_version: Option<u64>,
+        base_paths: HashMap<u32, BasePath>,
+    ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let local_schema = schema.retain_storage_class(StorageClass::Default);
+
         Self {
             schema,
+            local_schema,
             version: 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
@@ -108,9 +140,14 @@ impl Manifest {
             tag: None,
             reader_feature_flags: 0,
             writer_feature_flags: 0,
-            max_fragment_id: 0,
+            max_fragment_id: None,
             transaction_file: None,
             fragment_offsets,
+            next_row_id: 0,
+            data_storage_format,
+            config: HashMap::new(),
+            blob_dataset_version,
+            base_paths,
         }
     }
 
@@ -118,11 +155,16 @@ impl Manifest {
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
+        new_blob_version: Option<u64>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let local_schema = schema.retain_storage_class(StorageClass::Default);
+
+        let blob_dataset_version = new_blob_version.or(previous.blob_dataset_version);
 
         Self {
             schema,
+            local_schema,
             version: previous.version + 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
@@ -135,6 +177,75 @@ impl Manifest {
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             fragment_offsets,
+            next_row_id: previous.next_row_id,
+            data_storage_format: previous.data_storage_format.clone(),
+            config: previous.config.clone(),
+            blob_dataset_version,
+            base_paths: previous.base_paths.clone(),
+        }
+    }
+
+    /// Performs a shallow_clone of the manifest entirely in memory without:
+    /// - Any persistent storage operations
+    /// - Modifications to the original data
+    pub fn shallow_clone(
+        &self,
+        ref_name: Option<String>,
+        ref_path: String,
+        ref_base_id: u32,
+        transaction_file: String,
+    ) -> Self {
+        let cloned_fragments = self
+            .fragments
+            .as_ref()
+            .iter()
+            .map(|fragment| {
+                let mut cloned_fragment = fragment.clone();
+                for file in &mut cloned_fragment.files {
+                    if file.base_id.is_none() {
+                        file.base_id = Some(ref_base_id);
+                    }
+                }
+
+                if let Some(deletion) = &mut cloned_fragment.deletion_file {
+                    if deletion.base_id.is_none() {
+                        deletion.base_id = Some(ref_base_id);
+                    }
+                }
+                cloned_fragment
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            schema: self.schema.clone(),
+            local_schema: self.local_schema.clone(),
+            version: self.version,
+            writer_version: self.writer_version.clone(),
+            fragments: Arc::new(cloned_fragments),
+            version_aux_data: self.version_aux_data,
+            index_section: None, // These will be set on commit
+            timestamp_nanos: self.timestamp_nanos,
+            tag: None,
+            reader_feature_flags: 0, // These will be set on commit
+            writer_feature_flags: 0, // These will be set on commit
+            max_fragment_id: self.max_fragment_id,
+            transaction_file: Some(transaction_file),
+            fragment_offsets: self.fragment_offsets.clone(),
+            next_row_id: self.next_row_id,
+            data_storage_format: self.data_storage_format.clone(),
+            config: self.config.clone(),
+            blob_dataset_version: self.blob_dataset_version,
+            base_paths: {
+                let mut base_paths = self.base_paths.clone();
+                let base_path = BasePath {
+                    id: ref_base_id,
+                    name: ref_name,
+                    is_dataset_root: true,
+                    path: ref_path,
+                };
+                base_paths.insert(ref_base_id, base_path);
+                base_paths
+            },
         }
     }
 
@@ -154,47 +265,116 @@ impl Manifest {
         self.timestamp_nanos = nanos;
     }
 
+    /// Set the `config` from an iterator
+    pub fn update_config(&mut self, upsert_values: impl IntoIterator<Item = (String, String)>) {
+        self.config.extend(upsert_values);
+    }
+
+    /// Delete `config` keys using a slice of keys
+    pub fn delete_config_keys(&mut self, delete_keys: &[&str]) {
+        self.config
+            .retain(|key, _| !delete_keys.contains(&key.as_str()));
+    }
+
+    /// Replaces the schema metadata with the given key-value pairs.
+    pub fn replace_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
+        self.schema.metadata = new_metadata;
+    }
+
+    /// Replaces the metadata of the field with the given id with the given key-value pairs.
+    ///
+    /// If the field does not exist in the schema, this is a no-op.
+    pub fn replace_field_metadata(
+        &mut self,
+        field_id: i32,
+        new_metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        if let Some(field) = self.schema.field_by_id_mut(field_id) {
+            field.metadata = new_metadata;
+            Ok(())
+        } else {
+            Err(Error::invalid_input(
+                format!(
+                    "Field with id {} does not exist for replace_field_metadata",
+                    field_id
+                ),
+                location!(),
+            ))
+        }
+    }
+
     /// Check the current fragment list and update the high water mark
     pub fn update_max_fragment_id(&mut self) {
+        // If there are no fragments, don't update max_fragment_id
+        if self.fragments.is_empty() {
+            return;
+        }
+
         let max_fragment_id = self
             .fragments
             .iter()
             .map(|f| f.id)
             .max()
-            .unwrap_or_default()
+            .unwrap() // Safe because we checked fragments is not empty
             .try_into()
             .unwrap();
 
-        if max_fragment_id > self.max_fragment_id {
-            self.max_fragment_id = max_fragment_id;
+        match self.max_fragment_id {
+            None => {
+                // First time being set
+                self.max_fragment_id = Some(max_fragment_id);
+            }
+            Some(current_max) => {
+                // Only update if the computed max is greater than current
+                // This preserves the high water mark even when fragments are deleted
+                if max_fragment_id > current_max {
+                    self.max_fragment_id = Some(max_fragment_id);
+                }
+            }
         }
     }
 
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
     ///
-    /// This will return None if there are no fragments.
+    /// This will return None if there are no fragments and max_fragment_id was never set.
     pub fn max_fragment_id(&self) -> Option<u64> {
-        if self.max_fragment_id == 0 {
-            // It might not have been updated, so the best we can do is recompute
-            // it from the fragment list.
-            self.fragments.iter().map(|f| f.id).max()
+        if let Some(max_id) = self.max_fragment_id {
+            // Return the stored high water mark
+            Some(max_id.into())
         } else {
-            Some(self.max_fragment_id.into())
+            // Not yet set, compute from fragment list
+            self.fragments.iter().map(|f| f.id).max()
         }
+    }
+
+    /// Get the max used field id
+    ///
+    /// This is different than [Schema::max_field_id] because it also considers
+    /// the field ids in the data files that have been dropped from the schema.
+    pub fn max_field_id(&self) -> i32 {
+        let schema_max_id = self.schema.max_field_id().unwrap_or(-1);
+        let fragment_max_id = self
+            .fragments
+            .iter()
+            .flat_map(|f| f.files.iter().flat_map(|file| file.fields.as_slice()))
+            .max()
+            .copied();
+        let fragment_max_id = fragment_max_id.unwrap_or(-1);
+        schema_max_id.max(fragment_max_id)
     }
 
     /// Return the fragments that are newer than the given manifest.
     /// Note this does not support recycling of fragment ids.
     pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "fragments_since: given version {} is newer than manifest version {}",
                     since.version, self.version
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let start = since.max_fragment_id();
         Ok(self
@@ -241,12 +421,72 @@ impl Manifest {
 
         fragments
     }
+
+    /// Whether the dataset uses stable row ids.
+    pub fn uses_stable_row_ids(&self) -> bool {
+        self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+    }
+
+    /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
+    /// and can be used to create a dataset
+    pub fn serialized(&self) -> Vec<u8> {
+        let pb_manifest: pb::Manifest = self.into();
+        pb_manifest.encode_to_vec()
+    }
+
+    pub fn should_use_legacy_format(&self) -> bool {
+        self.data_storage_format.version == LEGACY_FORMAT_VERSION
+    }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct BasePath {
+    pub id: u32,
+    pub name: Option<String>,
+    pub is_dataset_root: bool,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct DataStorageFormat {
+    pub file_format: String,
+    pub version: String,
+}
+
+const LANCE_FORMAT_NAME: &str = "lance";
+
+impl DataStorageFormat {
+    pub fn new(version: LanceFileVersion) -> Self {
+        Self {
+            file_format: LANCE_FORMAT_NAME.to_string(),
+            version: version.resolve().to_string(),
+        }
+    }
+
+    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
+        self.version.parse::<LanceFileVersion>()
+    }
+}
+
+impl Default for DataStorageFormat {
+    fn default() -> Self {
+        Self::new(LanceFileVersion::default())
+    }
+}
+
+impl From<pb::manifest::DataStorageFormat> for DataStorageFormat {
+    fn from(pb: pb::manifest::DataStorageFormat) -> Self {
+        Self {
+            file_format: pb.file_format,
+            version: pb.version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,8 +563,21 @@ impl ProtoStruct for Manifest {
     type Proto = pb::Manifest;
 }
 
-impl From<pb::Manifest> for Manifest {
-    fn from(p: pb::Manifest) -> Self {
+impl From<pb::BasePath> for BasePath {
+    fn from(p: pb::BasePath) -> Self {
+        Self {
+            id: p.id,
+            name: p.name,
+            is_dataset_root: p.is_dataset_root,
+            path: p.path,
+        }
+    }
+}
+
+impl TryFrom<pb::Manifest> for Manifest {
+    type Error = Error;
+
+    fn try_from(p: pb::Manifest) -> Result<Self> {
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -337,17 +590,52 @@ impl From<pb::Manifest> for Manifest {
             }
             _ => None,
         };
-        let fragments = Arc::new(p.fragments.iter().map(Fragment::from).collect::<Vec<_>>());
+        let fragments = Arc::new(
+            p.fragments
+                .into_iter()
+                .map(Fragment::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        );
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
             metadata: p.metadata,
         };
-        Self {
-            schema: Schema::from(fields_with_meta),
+
+        if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
+            && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
+        {
+            return Err(Error::Internal {
+                message: "All fragments must have row ids".into(),
+                location: location!(),
+            });
+        }
+
+        let data_storage_format = match p.data_format {
+            None => {
+                if let Some(inferred_version) = Fragment::try_infer_version(fragments.as_ref())? {
+                    // If there are fragments, they are a better indicator
+                    DataStorageFormat::new(inferred_version)
+                } else {
+                    // No fragments to inspect, best we can do is look at writer flags
+                    if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
+                        DataStorageFormat::new(LanceFileVersion::Stable)
+                    } else {
+                        DataStorageFormat::new(LanceFileVersion::Legacy)
+                    }
+                }
+            }
+            Some(format) => DataStorageFormat::from(format),
+        };
+
+        let schema = Schema::from(fields_with_meta);
+        let local_schema = schema.retain_storage_class(StorageClass::Default);
+
+        Ok(Self {
+            schema,
+            local_schema,
             version: p.version,
             writer_version,
-            fragments,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
@@ -355,13 +643,27 @@ impl From<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
             } else {
                 Some(p.transaction_file)
             },
             fragment_offsets,
-        }
+            next_row_id: p.next_row_id,
+            data_storage_format,
+            config: p.config,
+            blob_dataset_version: if p.blob_dataset_version == 0 {
+                None
+            } else {
+                Some(p.blob_dataset_version)
+            },
+            base_paths: p
+                .base_paths
+                .iter()
+                .map(|item| (item.id, item.clone().into()))
+                .collect(),
+        })
     }
 }
 
@@ -398,6 +700,23 @@ impl From<&Manifest> for pb::Manifest {
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
+            next_row_id: m.next_row_id,
+            data_format: Some(pb::manifest::DataStorageFormat {
+                file_format: m.data_storage_format.file_format.clone(),
+                version: m.data_storage_format.version.clone(),
+            }),
+            config: m.config.clone(),
+            blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
+            base_paths: m
+                .base_paths
+                .values()
+                .map(|base_path| pb::BasePath {
+                    id: base_path.id,
+                    name: base_path.name.clone(),
+                    is_dataset_root: base_path.is_dataset_root,
+                    path: base_path.path.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -414,7 +733,18 @@ pub trait SelfDescribingFileReader {
     async fn try_new_self_described(
         object_store: &ObjectStore,
         path: &Path,
-        cache: Option<&FileMetadataCache>,
+        cache: Option<&LanceCache>,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let reader = object_store.open(path).await?;
+        Self::try_new_self_described_from_reader(reader.into(), cache).await
+    }
+
+    async fn try_new_self_described_from_reader(
+        reader: Arc<dyn Reader>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self>
     where
         Self: Sized;
@@ -422,34 +752,46 @@ pub trait SelfDescribingFileReader {
 
 #[async_trait]
 impl SelfDescribingFileReader for FileReader {
-    async fn try_new_self_described(
-        object_store: &ObjectStore,
-        path: &Path,
-        cache: Option<&FileMetadataCache>,
+    async fn try_new_self_described_from_reader(
+        reader: Arc<dyn Reader>,
+        cache: Option<&LanceCache>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(path).await?;
-        let metadata = Self::read_metadata(object_reader.as_ref(), cache).await?;
+        let metadata = Self::read_metadata(reader.as_ref(), cache).await?;
         let manifest_position = metadata.manifest_position.ok_or(Error::Internal {
             message: format!(
                 "Attempt to open file at {} as self-describing but it did not contain a manifest",
-                path
+                reader.path(),
             ),
             location: location!(),
         })?;
-        let mut manifest: Manifest = read_struct(object_reader.as_ref(), manifest_position).await?;
-        populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
+        let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
+        if manifest.should_use_legacy_format() {
+            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+        }
         let schema = manifest.schema;
-        Self::try_new_from_reader(path, object_reader, metadata, schema, 0, 0, cache).await
+        let max_field_id = schema.max_field_id().unwrap_or_default();
+        Self::try_new_from_reader(
+            reader.path(),
+            reader.clone(),
+            Some(metadata),
+            schema,
+            0,
+            0,
+            max_field_id,
+            cache,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::format::DataFile;
+
     use super::*;
 
-    use super::Fragment;
-    use arrow_schema::{Field, Schema as ArrowSchema};
-    use lance_core::datatypes::Schema;
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::datatypes::Field;
 
     #[test]
     fn test_writer_version() {
@@ -479,15 +821,24 @@ mod tests {
 
     #[test]
     fn test_fragments_by_offset_range() {
-        let arrow_schema =
-            ArrowSchema::new(vec![Field::new("a", arrow_schema::DataType::Int64, false)]);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let fragments = vec![
-            Fragment::with_file(0, "path1", &schema, Some(10)),
-            Fragment::with_file(1, "path2", &schema, Some(15)),
-            Fragment::with_file(2, "path3", &schema, Some(20)),
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+            Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
         ];
-        let manifest = Manifest::new(schema, Arc::new(fragments));
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+            HashMap::new(),
+        );
 
         let actual = manifest.fragments_by_offset_range(0..10);
         assert_eq!(actual.len(), 1);
@@ -513,5 +864,83 @@ mod tests {
         assert!(actual.is_empty());
 
         assert!(manifest.fragments_by_offset_range(200..400).is_empty());
+    }
+
+    #[test]
+    fn test_max_field_id() {
+        // Validate that max field id handles varying field ids by fragment.
+        let mut field0 =
+            Field::try_from(ArrowField::new("a", arrow_schema::DataType::Int64, false)).unwrap();
+        field0.set_id(-1, &mut 0);
+        let mut field2 =
+            Field::try_from(ArrowField::new("b", arrow_schema::DataType::Int64, false)).unwrap();
+        field2.set_id(-1, &mut 2);
+
+        let schema = Schema {
+            fields: vec![field0, field2],
+            metadata: Default::default(),
+        };
+        let fragments = vec![
+            Fragment {
+                id: 0,
+                files: vec![DataFile::new_legacy_from_fields("path1", vec![0, 1, 2])],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: None,
+            },
+            Fragment {
+                id: 1,
+                files: vec![
+                    DataFile::new_legacy_from_fields("path2", vec![0, 1, 43]),
+                    DataFile::new_legacy_from_fields("path3", vec![2]),
+                ],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: None,
+            },
+        ];
+
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+            HashMap::new(),
+        );
+
+        assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn test_config() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let fragments = vec![
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+            Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
+        ];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+            HashMap::new(),
+        );
+
+        let mut config = manifest.config.clone();
+        config.insert("lance.test".to_string(), "value".to_string());
+        config.insert("other-key".to_string(), "other-value".to_string());
+
+        manifest.update_config(config.clone());
+        assert_eq!(manifest.config, config.clone());
+
+        config.remove("other-key");
+        manifest.delete_config_keys(&["other-key"]);
+        assert_eq!(manifest.config, config);
     }
 }

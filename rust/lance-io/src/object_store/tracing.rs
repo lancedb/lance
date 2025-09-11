@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Wrappers around object_store that apply tracing
 
@@ -19,54 +8,37 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::StreamExt;
+use lance_core::utils::tracing::StreamTracingExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, PutOptions, PutResult,
-    Result as OSResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
-use pin_project::pin_project;
-use tokio::io::AsyncWrite;
-use tracing::{debug_span, instrument, Span};
+use tracing::{debug_span, instrument, Instrument, Span};
 
-#[pin_project]
-pub struct TracedAsyncWrite {
+#[derive(Debug)]
+pub struct TracedMultipartUpload {
     write_span: Span,
-    finish_span: Option<Span>,
-    #[pin]
-    target: Box<dyn AsyncWrite + Unpin + Send>,
+    target: Box<dyn MultipartUpload>,
 }
 
-impl AsyncWrite for TracedAsyncWrite {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        let this = self.project();
-        let _guard = this.write_span.enter();
-        this.target.poll_write(cx, buf)
+#[async_trait::async_trait]
+impl MultipartUpload for TracedMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let write_span = self.write_span.clone();
+        let fut = self.target.put_part(data);
+        Box::pin(fut.instrument(write_span))
     }
 
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        let this = self.project();
-        let _guard = this.write_span.enter();
-        this.target.poll_flush(cx)
+    #[instrument(level = "debug")]
+    async fn complete(&mut self) -> OSResult<PutResult> {
+        self.target.complete().await
     }
 
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        let this = self.project();
-        // TODO: Replace with get_or_insert_with when
-        let _guard = this
-            .finish_span
-            .get_or_insert_with(|| debug_span!("put_multipart_finish"))
-            .enter();
-        this.target.poll_shutdown(cx)
+    #[instrument(level = "debug")]
+    async fn abort(&mut self) -> OSResult<()> {
+        self.target.abort().await
     }
 }
 
@@ -82,9 +54,10 @@ impl std::fmt::Display for TracedObjectStore {
 }
 
 #[async_trait::async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl object_store::ObjectStore for TracedObjectStore {
     #[instrument(level = "debug", skip(self, bytes))]
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
+    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
     }
 
@@ -92,7 +65,7 @@ impl object_store::ObjectStore for TracedObjectStore {
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.target.put_opts(location, bytes, opts).await
@@ -101,21 +74,29 @@ impl object_store::ObjectStore for TracedObjectStore {
     async fn put_multipart(
         &self,
         location: &Path,
-    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-        let (multipart_id, async_write) = self.target.put_multipart(location).await?;
-        Ok((
-            multipart_id,
-            Box::new(TracedAsyncWrite {
-                write_span: debug_span!("put_multipart"),
-                finish_span: None,
-                target: async_write,
-            }) as Box<dyn AsyncWrite + Unpin + Send>,
-        ))
+    ) -> OSResult<Box<dyn object_store::MultipartUpload>> {
+        let upload = self.target.put_multipart(location).await?;
+        Ok(Box::new(TracedMultipartUpload {
+            target: upload,
+            write_span: debug_span!("put_multipart"),
+        }))
     }
 
-    #[instrument(level = "debug", skip(self))]
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        self.target.abort_multipart(location, multipart_id).await
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn object_store::MultipartUpload>> {
+        let upload = self.target.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(TracedMultipartUpload {
+            target: upload,
+            write_span: debug_span!("put_multipart_opts"),
+        }))
+    }
+
+    #[instrument(level = "debug", skip(self, location))]
+    async fn get(&self, location: &Path) -> OSResult<GetResult> {
+        self.target.get(location).await
     }
 
     #[instrument(level = "debug", skip(self, options))]
@@ -124,12 +105,12 @@ impl object_store::ObjectStore for TracedObjectStore {
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         self.target.get_range(location, range).await
     }
 
     #[instrument(level = "debug", skip(self, ranges))]
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         self.target.get_ranges(location, ranges).await
     }
 
@@ -143,9 +124,32 @@ impl object_store::ObjectStore for TracedObjectStore {
         self.target.delete(location).await
     }
 
+    #[instrument(level = "debug", skip_all)]
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OSResult<Path>>,
+    ) -> BoxStream<'a, OSResult<Path>> {
+        self.target
+            .delete_stream(locations)
+            .stream_in_current_span()
+            .boxed()
+    }
+
     #[instrument(level = "debug", skip(self))]
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.target.list(prefix)
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list(prefix).stream_in_current_span().boxed()
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target
+            .list_with_offset(prefix, offset)
+            .stream_in_current_span()
+            .boxed()
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -161,6 +165,11 @@ impl object_store::ObjectStore for TracedObjectStore {
     #[instrument(level = "debug", skip(self))]
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.rename(from, to).await
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.target.rename_if_not_exists(from, to).await
     }
 
     #[instrument(level = "debug", skip(self))]

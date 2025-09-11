@@ -1,17 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::collections::HashMap;
 
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
-use lance_arrow::bfloat16::ARROW_EXT_NAME_KEY;
 use lance_arrow::DataTypeExt;
+use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
 use lance_io::traits::Reader;
 use lance_io::utils::{read_binary_array, read_fixed_stride_array};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::format::pb;
 
+#[allow(clippy::fallible_impl_from)]
 impl From<&pb::Field> for Field {
     fn from(field: &pb::Field) -> Self {
         let mut lance_metadata: HashMap<String, String> = field
@@ -41,6 +45,8 @@ impl From<&pb::Field> for Field {
             nullable: field.nullable,
             children: vec![],
             dictionary: field.dictionary.as_ref().map(Dictionary::from),
+            storage_class: field.storage_class.parse().unwrap(),
+            unenforced_primary_key: field.unenforced_primary_key,
         }
     }
 }
@@ -73,6 +79,8 @@ impl From<&Field> for pb::Field {
                 .map(|name| name.to_owned())
                 .unwrap_or_default(),
             r#type: 0,
+            storage_class: field.storage_class.to_string(),
+            unenforced_primary_key: field.unenforced_primary_key,
         }
     }
 }
@@ -244,10 +252,7 @@ async fn load_field_dictionary<'a>(field: &mut Field, reader: &dyn Reader) -> Re
 
 /// Load dictionary value array from manifest files.
 // TODO: pub(crate)
-pub async fn populate_schema_dictionary<'a>(
-    schema: &mut Schema,
-    reader: &dyn Reader,
-) -> Result<()> {
+pub async fn populate_schema_dictionary(schema: &mut Schema, reader: &dyn Reader) -> Result<()> {
     for field in schema.fields.as_mut_slice() {
         load_field_dictionary(field, reader).await?;
     }

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Dictionary encoding.
 //!
@@ -26,7 +15,7 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     traits::{Reader, Writer},
@@ -73,7 +62,7 @@ impl<'a> DictionaryEncoder<'a> {
 }
 
 #[async_trait]
-impl<'a> Encoder for DictionaryEncoder<'a> {
+impl Encoder for DictionaryEncoder<'_> {
     async fn encode(&mut self, array: &[&dyn Array]) -> Result<usize> {
         use DataType::*;
 
@@ -182,7 +171,7 @@ impl<'a> DictionaryDecoder<'a> {
 }
 
 #[async_trait]
-impl<'a> Decoder for DictionaryDecoder<'a> {
+impl Decoder for DictionaryDecoder<'_> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.decode_impl(..).await
     }
@@ -193,7 +182,7 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
+impl AsyncIndex<usize> for DictionaryDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _index: usize) -> Self::Output {
@@ -207,7 +196,7 @@ impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
+impl AsyncIndex<ReadBatchParams> for DictionaryDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, params: ReadBatchParams) -> Self::Output {
@@ -219,9 +208,8 @@ impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
 mod tests {
     use super::*;
 
-    use crate::encodings::plain::PlainEncoder;
     use crate::local::LocalObjectReader;
-    use arrow_array::{Array, StringArray};
+    use arrow_array::StringArray;
     use arrow_buffer::ArrowNativeType;
     use tokio::io::AsyncWriteExt;
 
@@ -258,7 +246,7 @@ mod tests {
             object_writer.shutdown().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048)
+        let reader = LocalObjectReader::open_local_path(&path, 2048, None)
             .await
             .unwrap();
         let decoder = DictionaryDecoder::new(

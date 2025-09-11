@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Testing utilities
 
@@ -22,15 +11,14 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
-    Error as OSError, GetOptions, GetResult, ListResult, MultipartId, ObjectMeta, ObjectStore,
-    PutOptions, PutResult, Result as OSResult,
+    Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::io::AsyncWrite;
 
 // A policy function takes in the name of the operation (e.g. "put") and the location
 // that is being accessed / modified and returns an optional error.
@@ -69,7 +57,7 @@ pub struct ProxyObjectStorePolicy {
     /// be returned instead.
     before_policies: HashMap<String, PolicyFn>,
     /// Policies which run after calls that return ObjectMeta.  The policy can
-    /// tranform the returned ObjectMeta to mock out file listing results.
+    /// transform the returned ObjectMeta to mock out file listing results.
     object_meta_policies: HashMap<String, ObjectMetaPolicyFn>,
 }
 
@@ -86,7 +74,7 @@ impl ProxyObjectStorePolicy {
     }
 
     pub fn clear_before_policy(&mut self, name: &str) {
-        self.before_policies.remove(&name.to_string());
+        self.before_policies.remove(name);
     }
 
     pub fn set_obj_meta_policy(&mut self, name: &str, policy: ObjectMetaPolicyFn) {
@@ -136,32 +124,23 @@ impl std::fmt::Display for ProxyObjectStore {
 
 #[async_trait]
 impl ObjectStore for ProxyObjectStore {
-    async fn put(&self, location: &Path, bytes: Bytes) -> OSResult<PutResult> {
-        self.before_method("put", location)?;
-        self.target.put(location, bytes).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
-        bytes: Bytes,
+        bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         self.before_method("put", location)?;
         self.target.put_opts(location, bytes, opts).await
     }
 
-    async fn put_multipart(
+    async fn put_multipart_opts(
         &self,
         location: &Path,
-    ) -> OSResult<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
         self.before_method("put_multipart", location)?;
-        self.target.put_multipart(location).await
-    }
-
-    async fn abort_multipart(&self, location: &Path, multipart_id: &MultipartId) -> OSResult<()> {
-        self.before_method("abort_multipart", location)?;
-        self.target.abort_multipart(location, multipart_id).await
+        self.target.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -169,12 +148,12 @@ impl ObjectStore for ProxyObjectStore {
         self.target.get_opts(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> OSResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         self.before_method("get_range", location)?;
         self.target.get_range(location, range).await
     }
 
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> OSResult<Vec<Bytes>> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         self.before_method("get_ranges", location)?;
         self.target.get_ranges(location, ranges).await
     }
@@ -190,10 +169,20 @@ impl ObjectStore for ProxyObjectStore {
         self.target.delete(location).await
     }
 
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OSResult<ObjectMeta>> {
-        self.target
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        let target = self.target.clone();
+        let policy = Arc::clone(&self.policy);
+
+        target
             .list(prefix)
-            .and_then(|meta| future::ready(self.transform_meta("list", meta)))
+            .and_then(move |meta| {
+                let policy = policy.lock().unwrap();
+                let mut meta = meta;
+                for p in policy.object_meta_policies.values() {
+                    meta = p("list", meta).map_err(OSError::from).unwrap();
+                }
+                future::ready(Ok(meta))
+            })
             .boxed()
     }
 
@@ -239,7 +228,7 @@ impl Default for MockClock<'_> {
     }
 }
 
-impl<'a> MockClock<'a> {
+impl MockClock<'_> {
     pub fn new() -> Self {
         Default::default()
     }
@@ -249,7 +238,7 @@ impl<'a> MockClock<'a> {
     }
 }
 
-impl<'a> Drop for MockClock<'a> {
+impl Drop for MockClock<'_> {
     fn drop(&mut self) {
         // Reset the clock to the epoch
         mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());

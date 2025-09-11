@@ -1,45 +1,31 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, Array, RecordBatch};
 use arrow_schema::Field;
-use async_trait::async_trait;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
+use tracing::instrument;
 
 use super::ProductQuantizer;
+use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
 
 /// Product Quantizer Transformer
 ///
 /// It transforms a column of vectors into a column of PQ codes.
 pub struct PQTransformer {
-    quantizer: Arc<dyn ProductQuantizer>,
+    quantizer: ProductQuantizer,
     input_column: String,
     output_column: String,
 }
 
 impl PQTransformer {
-    pub fn new(
-        quantizer: Arc<dyn ProductQuantizer>,
-        input_column: &str,
-        output_column: &str,
-    ) -> Self {
+    pub fn new(quantizer: ProductQuantizer, input_column: &str, output_column: &str) -> Self {
         Self {
             quantizer,
             input_column: input_column.to_owned(),
@@ -58,9 +44,12 @@ impl Debug for PQTransformer {
     }
 }
 
-#[async_trait]
 impl Transformer for PQTransformer {
-    async fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    #[instrument(name = "PQTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        if batch.column_by_name(&self.output_column).is_some() {
+            return Ok(batch.clone());
+        }
         let input_arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
@@ -78,7 +67,7 @@ impl Transformer for PQTransformer {
             ),
             location: location!(),
         })?;
-        let pq_code = self.quantizer.transform(&data).await?;
+        let pq_code = self.quantizer.quantize(&data)?;
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
         let batch = batch.drop_column(&self.input_column)?;
@@ -93,7 +82,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Schema};
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_linalg::distance::MetricType;
+    use lance_linalg::distance::DistanceType;
 
     use crate::vector::pq::PQBuildParams;
 
@@ -103,7 +92,7 @@ mod tests {
         let dim = 16;
         let arr = Arc::new(FixedSizeListArray::try_new_from_values(values, 16).unwrap());
         let params = PQBuildParams::new(1, 8);
-        let pq = params.build(arr.as_ref(), MetricType::L2).await.unwrap();
+        let pq = ProductQuantizer::build(arr.as_ref(), DistanceType::L2, &params).unwrap();
 
         let schema = Schema::new(vec![
             Field::new(
@@ -120,7 +109,7 @@ mod tests {
         .unwrap();
 
         let transformer = PQTransformer::new(pq, "vec", "pq_code");
-        let batch = transformer.transform(&batch).await.unwrap();
+        let batch = transformer.transform(&batch).unwrap();
         assert!(batch.column_by_name("vec").is_none());
         assert!(batch.column_by_name("pq_code").is_some());
         assert!(batch.column_by_name("other").is_some());

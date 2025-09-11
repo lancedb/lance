@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Utilities for working with datafusion expressions
 
@@ -18,24 +7,8 @@ use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{cast::AsArray, ArrayRef};
-use arrow_schema::{DataType, Schema, TimeUnit};
-use datafusion::{
-    datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
-};
-use datafusion_common::{
-    tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, ScalarValue, TableReference,
-};
-use prost::Message;
-use snafu::{location, Location};
-
-use datafusion_substrait::substrait::proto::{
-    expression_reference::ExprType,
-    plan_rel::RelType,
-    read_rel::{NamedTable, ReadType},
-    rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
-};
-use lance_core::{Error, Result};
+use arrow_schema::{DataType, TimeUnit};
+use datafusion_common::ScalarValue;
 
 const MS_PER_DAY: i64 = 86400000;
 
@@ -246,6 +219,11 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(val.clone())),
             _ => None,
         },
+        ScalarValue::LargeUtf8(val) => match ty {
+            DataType::Utf8 => Some(ScalarValue::Utf8(val.clone())),
+            DataType::LargeUtf8 => Some(value.clone()),
+            _ => None,
+        },
         ScalarValue::Boolean(_) => match ty {
             DataType::Boolean => Some(value.clone()),
             _ => None,
@@ -415,141 +393,40 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
                 _ => None,
             }
         }
+        ScalarValue::FixedSizeBinary(len, value) => match ty {
+            DataType::FixedSizeBinary(len2) => {
+                if len == len2 {
+                    Some(ScalarValue::FixedSizeBinary(*len, value.clone()))
+                } else {
+                    None
+                }
+            }
+            DataType::Binary => Some(ScalarValue::Binary(value.clone())),
+            _ => None,
+        },
+        ScalarValue::Binary(value) => match ty {
+            DataType::Binary => Some(ScalarValue::Binary(value.clone())),
+            DataType::LargeBinary => Some(ScalarValue::LargeBinary(value.clone())),
+            DataType::FixedSizeBinary(len) => {
+                if let Some(value) = value {
+                    if value.len() == *len as usize {
+                        Some(ScalarValue::FixedSizeBinary(*len, Some(value.clone())))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
         _ => None,
     }
-}
-
-/// Convert a Substrait ExtendedExpressions message into a DF Expr
-///
-/// The ExtendedExpressions message must contain a single scalar expression
-pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<Expr> {
-    let envelope = ExtendedExpression::decode(expr)?;
-    if envelope.referred_expr.is_empty() {
-        return Err(Error::InvalidInput {
-            source: "the provided substrait expression is empty (contains no expressions)".into(),
-            location: location!(),
-        });
-    }
-    if envelope.referred_expr.len() > 1 {
-        return Err(Error::InvalidInput {
-            source: format!(
-                "the provided substrait expression had {} expressions when only 1 was expected",
-                envelope.referred_expr.len()
-            )
-            .into(),
-            location: location!(),
-        });
-    }
-    let expr = match &envelope.referred_expr[0].expr_type {
-        None => Err(Error::InvalidInput {
-            source: "the provided substrait had an expression but was missing an expr_type".into(),
-            location: location!(),
-        }),
-        Some(ExprType::Expression(expr)) => Ok(expr.clone()),
-        _ => Err(Error::InvalidInput {
-            source: "the provided substrait was not a scalar expression".into(),
-            location: location!(),
-        }),
-    }?;
-
-    // Datafusion's substrait consumer only supports Plan (not ExtendedExpression) and so
-    // we need to create a dummy plan with a single project node
-    let plan = Plan {
-        version: None,
-        extensions: envelope.extensions.clone(),
-        advanced_extensions: envelope.advanced_extensions.clone(),
-        expected_type_urls: envelope.expected_type_urls.clone(),
-        extension_uris: envelope.extension_uris.clone(),
-        relations: vec![PlanRel {
-            rel_type: Some(RelType::Root(RelRoot {
-                input: Some(Rel {
-                    rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
-                        common: None,
-                        input: Some(Box::new(Rel {
-                            rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
-                                common: None,
-                                base_schema: envelope.base_schema.clone(),
-                                filter: None,
-                                best_effort_filter: None,
-                                projection: None,
-                                advanced_extension: None,
-                                read_type: Some(ReadType::NamedTable(NamedTable {
-                                    names: vec!["dummy".to_string()],
-                                    advanced_extension: None,
-                                })),
-                            }))),
-                        })),
-                        expressions: vec![expr],
-                        advanced_extension: None,
-                    }))),
-                }),
-                // Not technically accurate but pretty sure DF ignores this
-                names: vec![],
-            })),
-        }],
-    };
-
-    let session_context = SessionContext::new();
-    let dummy_table = Arc::new(EmptyTable::new(input_schema));
-    session_context.register_table(
-        TableReference::Bare {
-            table: "dummy".into(),
-        },
-        dummy_table,
-    )?;
-    let df_plan =
-        datafusion_substrait::logical_plan::consumer::from_substrait_plan(&session_context, &plan)
-            .await?;
-
-    let expr = df_plan.expressions().pop().unwrap();
-
-    // When DF parses the above plan it turns column references into qualified references
-    // into `dummy` (e.g. we get `WHERE dummy.x < 0` instead of `WHERE x < 0`)  We want
-    // these to be unqualified references instead and so we need a quick trasnformation pass
-
-    let expr = expr.transform(&|node| match node {
-        Expr::Column(column) => {
-            if let Some(relation) = column.relation {
-                match relation {
-                    TableReference::Bare { table } => {
-                        if table == "dummy" {
-                            Ok(Transformed::Yes(Expr::Column(Column {
-                                relation: None,
-                                name: column.name,
-                            })))
-                        } else {
-                            // This should not be possible
-                            Err(DataFusionError::Substrait(format!(
-                                "Unexpected reference to table {} found when parsing filter",
-                                table
-                            )))
-                        }
-                    }
-                            // This should not be possible
-                            _ => Err(DataFusionError::Substrait("Unexpected partially or fully qualified table reference encountered when parsing filter".into()))
-                }
-            } else {
-                Ok(Transformed::No(Expr::Column(column)))
-            }
-        }
-        _ => Ok(Transformed::No(node)),
-    })?;
-    Ok(expr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use arrow_schema::{Field, TimeUnit};
-    use datafusion::logical_expr::{BinaryExpr, Operator};
-    use datafusion_common::Column;
-    use prost::Message;
-    use substrait_expr::{
-        builder::{schema::SchemaBuildersExt, BuilderParams, ExpressionsBuilder},
-        functions::functions_comparison::FunctionsComparisonExt,
-        helpers::{literals::literal, schema::SchemaInfo},
-    };
 
     #[test]
     fn test_temporal_coerce() {
@@ -824,44 +701,5 @@ mod tests {
             ),
             Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
         );
-    }
-
-    #[tokio::test]
-    async fn test_substrait_conversion() {
-        let schema = SchemaInfo::new_full()
-            .field("x", substrait_expr::helpers::types::i32(true))
-            .build();
-        let expr_builder = ExpressionsBuilder::new(schema, BuilderParams::default());
-        expr_builder
-            .add_expression(
-                "filter_mask",
-                expr_builder
-                    .functions()
-                    .lt(
-                        expr_builder.fields().resolve_by_name("x").unwrap(),
-                        literal(0_i32),
-                    )
-                    .build()
-                    .unwrap(),
-            )
-            .unwrap();
-        let expr = expr_builder.build();
-        let expr_bytes = expr.encode_to_vec();
-
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
-
-        let df_expr = parse_substrait(expr_bytes.as_slice(), schema)
-            .await
-            .unwrap();
-
-        let expected = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column {
-                relation: None,
-                name: "x".to_string(),
-            })),
-            op: Operator::Lt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)))),
-        });
-        assert_eq!(df_expr, expected);
     }
 }

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -22,14 +11,16 @@ use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
 use lance_core::error::{box_error, CorruptFileSnafu};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DELETION, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{location, Location, ResultExt};
+use snafu::{location, ResultExt};
+use tracing::{info, instrument};
 
-use crate::format::{DeletionFile, DeletionFileType, Fragment};
+use crate::format::{DeletionFile, DeletionFileType};
 
 pub(crate) const DELETION_DIRS: &str = "_deletions";
 
@@ -66,15 +57,16 @@ pub async fn write_deletion_file(
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionFile>> {
-    match removed_rows {
-        DeletionVector::NoDeletions => Ok(None),
+    let deletion_file = match removed_rows {
+        DeletionVector::NoDeletions => None,
         DeletionVector::Set(set) => {
-            let id = rand::thread_rng().gen::<u64>();
+            let id = rand::rng().random::<u64>();
             let deletion_file = DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(set.len()),
+                base_id: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 
@@ -98,54 +90,65 @@ pub async fn write_deletion_file(
                 // Drop writer so out is no longer borrowed.
             }
 
-            object_store.inner.put(&path, out.into()).await?;
+            object_store.put(&path, &out).await?;
 
-            Ok(Some(deletion_file))
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
+
+            Some(deletion_file)
         }
         DeletionVector::Bitmap(bitmap) => {
-            let id = rand::thread_rng().gen::<u64>();
+            let id = rand::rng().random::<u64>();
             let deletion_file = DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
+                base_id: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 
             let mut out: Vec<u8> = Vec::new();
             bitmap.serialize_into(&mut out)?;
 
-            object_store.inner.put(&path, out.into()).await?;
+            object_store.put(&path, &out).await?;
 
-            Ok(Some(deletion_file))
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
+
+            Some(deletion_file)
         }
-    }
+    };
+    Ok(deletion_file)
 }
 
-/// Read a deletion file for a fragment.
-///
-/// Returns the deletion vector if one was present. Otherwise returns `Ok(None)`.
-///
-/// Will return an error if the file is present but invalid.
+#[instrument(
+    level = "debug",
+    skip(base, object_store),
+    fields(
+        base = base.as_ref(),
+        bytes_read = tracing::field::Empty
+    )
+)]
 pub async fn read_deletion_file(
+    fragment_id: u64,
+    deletion_file: &DeletionFile,
     base: &Path,
-    fragment: &Fragment,
     object_store: &ObjectStore,
-) -> Result<Option<DeletionVector>> {
-    let Some(deletion_file) = &fragment.deletion_file else {
-        return Ok(None);
-    };
-
+) -> Result<DeletionVector> {
+    let span = tracing::Span::current();
     match deletion_file.file_type {
         DeletionFileType::Array => {
-            let path = deletion_file_path(base, fragment.id, deletion_file);
+            let path = deletion_file_path(base, fragment_id, deletion_file);
 
-            let data = object_store.inner.get(&path).await?.bytes().await?;
+            let data = object_store.read_one_all(&path).await?;
+            span.record("bytes_read", data.len());
             let data = std::io::Cursor::new(data);
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path: path.clone() })?;
+                .context(CorruptFileSnafu {
+                    path: path.clone(),
+                    location: location!(),
+                })?;
 
             if batches.len() != 1 {
                 return Err(Error::corrupt_file(
@@ -189,18 +192,22 @@ pub async fn read_deletion_file(
                 }
             }
 
-            Ok(Some(DeletionVector::Set(set)))
+            Ok(DeletionVector::Set(set))
         }
         DeletionFileType::Bitmap => {
-            let path = deletion_file_path(base, fragment.id, deletion_file);
+            let path = deletion_file_path(base, fragment_id, deletion_file);
 
-            let data = object_store.inner.get(&path).await?.bytes().await?;
+            let data = object_store.read_one_all(&path).await?;
+            span.record("bytes_read", data.len());
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path })?;
+                .context(CorruptFileSnafu {
+                    path,
+                    location: location!(),
+                })?;
 
-            Ok(Some(DeletionVector::Bitmap(bitmap)))
+            Ok(DeletionVector::Bitmap(bitmap))
         }
     }
 }
@@ -332,11 +339,8 @@ mod test {
             .await
             .unwrap();
 
-        let mut fragment = Fragment::new(fragment_id);
-        fragment.deletion_file = file;
-        let read_dv = read_deletion_file(&path, &fragment, &object_store)
+        let read_dv = read_deletion_file(fragment_id, &file.unwrap(), &path, &object_store)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(read_dv, dv);
     }
@@ -354,11 +358,8 @@ mod test {
             .await
             .unwrap();
 
-        let mut fragment = Fragment::new(fragment_id);
-        fragment.deletion_file = file;
-        let read_dv = read_deletion_file(&path, &fragment, &object_store)
+        let read_dv = read_deletion_file(fragment_id, &file.unwrap(), &path, &object_store)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(read_dv, dv);
     }

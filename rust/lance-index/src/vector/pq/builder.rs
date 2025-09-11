@@ -1,41 +1,26 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Product Quantizer Builder
 //!
 
 use std::sync::Arc;
 
-use crate::pb;
+use crate::vector::quantizer::QuantizerBuildParams;
+use arrow::array::PrimitiveBuilder;
 use arrow_array::types::{Float16Type, Float64Type};
-use arrow_array::{
-    cast::AsArray, types::Float32Type, Array, ArrayRef, Float32Array, PrimitiveArray,
-};
-use arrow_array::{ArrowNumericType, FixedSizeListArray};
+use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
+use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
-use futures::{stream, StreamExt, TryStreamExt};
-use lance_arrow::{ArrowFloatType, FloatArray};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{Dot, L2};
-use lance_linalg::{distance::MetricType, MatrixView};
-use rand::SeedableRng;
-use snafu::{location, Location};
+use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::{Dot, Normalize, L2};
+use snafu::location;
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
-use crate::pb::Pq;
-use crate::vector::{kmeans::train_kmeans, pq::ProductQuantizerImpl};
+use crate::vector::kmeans::train_kmeans;
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
@@ -46,15 +31,12 @@ pub struct PQBuildParams {
     /// The number of bits to present one PQ centroid.
     pub num_bits: usize,
 
-    /// Train as optimized product quantization.
-    pub use_opq: bool,
-
     /// The max number of iterations for kmeans training.
     pub max_iters: usize,
 
-    /// Max number of iterations to train Optimized Product Quantization,
-    /// if `use_opq` is true.
-    pub max_opq_iters: usize,
+    /// Run kmeans `REDOS` times and take the best result.
+    /// Default to 1.
+    pub kmeans_redos: usize,
 
     /// User provided codebook.
     pub codebook: Option<ArrayRef>,
@@ -68,12 +50,21 @@ impl Default for PQBuildParams {
         Self {
             num_sub_vectors: 16,
             num_bits: 8,
-            use_opq: false,
             max_iters: 50,
-            max_opq_iters: 50,
+            kmeans_redos: 1,
             codebook: None,
             sample_rate: 256,
         }
+    }
+}
+
+impl QuantizerBuildParams for PQBuildParams {
+    fn sample_size(&self) -> usize {
+        self.sample_rate * 2_usize.pow(self.num_bits as u32)
+    }
+
+    fn use_residual(distance_type: DistanceType) -> bool {
+        matches!(distance_type, DistanceType::L2 | DistanceType::Cosine)
     }
 }
 
@@ -95,67 +86,77 @@ impl PQBuildParams {
         }
     }
 
-    pub async fn build_from_matrix<T: ArrowFloatType + Dot + L2 + 'static>(
+    fn build_from_fsl<T: ArrowNumericType>(
         &self,
-        data: &MatrixView<T>,
-        metric_type: MetricType,
-    ) -> Result<Arc<dyn ProductQuantizer + 'static>> {
+        data: &FixedSizeListArray,
+        distance_type: DistanceType,
+    ) -> Result<ProductQuantizer>
+    where
+        T::Native: Dot + L2 + Normalize,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
         assert_ne!(
-            metric_type,
-            MetricType::Cosine,
+            distance_type,
+            DistanceType::Cosine,
             "PQ code does not support cosine"
         );
 
-        const REDOS: usize = 1;
-
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
+        let sub_vectors = divide_to_subvectors::<T>(data, self.num_sub_vectors)?;
         let num_centroids = 2_usize.pow(self.num_bits as u32);
-        let dimension = data.num_columns();
+        let dimension = data.value_length() as usize;
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
-        let d = stream::iter(sub_vectors.into_iter())
-            .map(|sub_vec| async move {
-                let rng = rand::rngs::SmallRng::from_entropy();
+        let d = sub_vectors
+            .into_iter()
+            .enumerate()
+            .map(|(sub_vec_idx, sub_vec)| {
                 train_kmeans::<T>(
-                    sub_vec.as_ref(),
-                    None,
+                    self.codebook.as_ref().map(|cb| {
+                        let sub_vec_centroids = FixedSizeListArray::try_new_from_values(
+                            cb.as_fixed_size_list().values().as_primitive::<T>().slice(
+                                sub_vec_idx * num_centroids * sub_vector_dimension,
+                                num_centroids * sub_vector_dimension,
+                            ),
+                            sub_vector_dimension as i32,
+                        )
+                        .unwrap();
+                        Arc::new(sub_vec_centroids)
+                    }),
+                    &sub_vec,
                     sub_vector_dimension,
                     num_centroids,
                     self.max_iters as u32,
-                    REDOS,
-                    rng.clone(),
-                    metric_type,
+                    self.kmeans_redos,
+                    distance_type,
                     self.sample_rate,
                 )
-                .await
+                .map(|kmeans| kmeans.centroids)
             })
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await?;
-        let mut codebook_builder = Vec::with_capacity(num_centroids * dimension);
+            .collect::<Result<Vec<_>>>()?;
+        let mut codebook_builder = PrimitiveBuilder::<T>::with_capacity(num_centroids * dimension);
         for centroid in d.iter() {
-            codebook_builder.extend_from_slice(centroid.as_slice());
+            let c = centroid
+                .as_any()
+                .downcast_ref::<PrimitiveArray<T>>()
+                .expect("failed to downcast to PrimitiveArray");
+            codebook_builder.append_slice(c.values());
         }
 
-        let pd_centroids = T::ArrayType::from(codebook_builder);
+        let pd_centroids = codebook_builder.finish();
 
-        Ok(Arc::new(ProductQuantizerImpl::<T>::new(
+        Ok(ProductQuantizer::new(
             self.num_sub_vectors,
             self.num_bits as u32,
             dimension,
-            Arc::new(pd_centroids),
-            metric_type,
-        )))
+            FixedSizeListArray::try_new_from_values(pd_centroids, dimension as i32)?,
+            distance_type,
+        ))
     }
 
     /// Build a [ProductQuantizer] from the given data.
     ///
     /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
-    pub async fn build(
-        &self,
-        data: &dyn Array,
-        metric_type: MetricType,
-    ) -> Result<Arc<dyn ProductQuantizer>> {
+    pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
@@ -164,82 +165,28 @@ impl PQBuildParams {
             ),
             location: location!(),
         })?;
+
+        let num_centroids = 2_usize.pow(self.num_bits as u32);
+        if data.len() < num_centroids {
+            return Err(Error::Index {
+                message: format!(
+                    "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
+                    num_centroids,
+                    data.len()
+                ),
+                location: location!(),
+            });
+        }
+
         // TODO: support bf16 later.
         match fsl.value_type() {
-            DataType::Float16 => {
-                let data = MatrixView::<Float16Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
-            DataType::Float32 => {
-                let data = MatrixView::<Float32Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
-            DataType::Float64 => {
-                let data = MatrixView::<Float64Type>::try_from(fsl)?;
-                self.build_from_matrix(&data, metric_type).await
-            }
+            DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type),
+            DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type),
+            DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type),
             _ => Err(Error::Index {
                 message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
                 location: location!(),
             }),
         }
-    }
-}
-
-fn create_typed_pq<
-    T: ArrowFloatType<ArrayType = PrimitiveArray<T>> + ArrowNumericType + L2 + Dot,
->(
-    proto: &Pq,
-    metric_type: MetricType,
-    array: &dyn Array,
-) -> Arc<dyn ProductQuantizer> {
-    Arc::new(ProductQuantizerImpl::<T>::new(
-        proto.num_sub_vectors as usize,
-        proto.num_bits,
-        proto.dimension as usize,
-        Arc::new(array.as_primitive::<T>().clone()),
-        metric_type,
-    ))
-}
-
-/// Load ProductQuantizer from Protobuf
-pub fn from_proto(proto: &Pq, metric_type: MetricType) -> Result<Arc<dyn ProductQuantizer>> {
-    let mt = if metric_type == MetricType::Cosine {
-        MetricType::L2
-    } else {
-        metric_type
-    };
-
-    if let Some(tensor) = &proto.codebook_tensor {
-        let fsl = FixedSizeListArray::try_from(tensor)?;
-
-        match pb::tensor::DataType::try_from(tensor.data_type)? {
-            pb::tensor::DataType::Bfloat16 => {
-                unimplemented!()
-            }
-            pb::tensor::DataType::Float16 => {
-                Ok(create_typed_pq::<Float16Type>(proto, mt, fsl.values()))
-            }
-            pb::tensor::DataType::Float32 => {
-                Ok(create_typed_pq::<Float32Type>(proto, mt, fsl.values()))
-            }
-            pb::tensor::DataType::Float64 => {
-                Ok(create_typed_pq::<Float64Type>(proto, mt, fsl.values()))
-            }
-            _ => Err(Error::Index {
-                message: format!("PQ builder: unsupported data type: {:?}", tensor.data_type),
-                location: location!(),
-            }),
-        }
-    } else {
-        Ok(Arc::new(ProductQuantizerImpl::<Float32Type>::new(
-            proto.num_sub_vectors as usize,
-            proto.num_bits,
-            proto.dimension as usize,
-            Arc::new(Float32Array::from_iter_values(
-                proto.codebook.iter().copied(),
-            )),
-            metric_type,
-        )))
     }
 }

@@ -19,7 +19,7 @@ no-default-features = true
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
-lance-datagen = { workspace = true }
+lance-encoding = { workspace = true }
 lance-file = { workspace = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
@@ -28,6 +28,7 @@ lance-table = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
@@ -39,14 +40,17 @@ bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
-dashmap = "5"
+dashmap = "6"
+deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
-object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
+object_store = { workspace = true }
 aws-credential-types.workspace = true
+aws-credential-types.optional = true
 pin-project.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 roaring.workspace = true
 tokio.workspace = true
 url.workspace = true
@@ -54,35 +58,38 @@ rand.workspace = true
 futures.workspace = true
 uuid.workspace = true
 arrow.workspace = true
-num_cpus.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true
+datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
+datafusion-physical-plan.workspace = true
+datafusion-expr.workspace = true
+either.workspace = true
 lapack = { version = "0.19.0", optional = true }
-lru_time_cache = "0.11"
-ordered-float = "3.6.0"
 snafu = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 moka.workspace = true
+permutation = { version = "0.4.0" }
+tantivy.workspace = true
 tfrecord = { version = "0.15.0", optional = true, features = ["async"] }
+prost_old = { version = "0.12.6", package = "prost", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tempfile.workspace = true
 tracing.workspace = true
-lazy_static = { workspace = true }
+humantime = { workspace = true }
 async_cell = "0.2.2"
+tokio-stream = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
 lzma-sys = { version = "0.1" }
 
-[build-dependencies]
-prost-build.workspace = true
-
 [dev-dependencies]
 lance-test-macros = { workspace = true }
+lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
@@ -92,16 +99,34 @@ all_asserts = "2.3.1"
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-env_logger = "0.10.0"
+env_logger = "0.11.7"
+test-log.workspace = true
 tracing-chrome = "0.7.1"
+rstest = { workspace = true }
+# For S3 / DynamoDB tests
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+
 
 [features]
+default = ["aws", "azure", "gcp", "oss"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
-cli = ["clap", "lzma-sys/static"]
-tensorflow = ["tfrecord"]
-dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
+cli = ["dep:clap", "lzma-sys/static"]
+tensorflow = ["dep:tfrecord", "dep:prost_old"]
+dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
+substrait = ["lance-datafusion/substrait"]
+protoc = [
+    "lance-encoding/protoc",
+    "lance-file/protoc",
+    "lance-index/protoc",
+    "lance-table/protoc",
+]
+aws = ["lance-io/aws", "dep:aws-credential-types"]
+gcp = ["lance-io/gcp"]
+azure = ["lance-io/azure"]
+oss = ["lance-io/oss"]
 
 [[bin]]
 name = "lq"
@@ -122,3 +147,10 @@ harness = false
 [[bench]]
 name = "ivf_pq"
 harness = false
+
+[[bench]]
+name = "take"
+harness = false
+
+[lints]
+workspace = true

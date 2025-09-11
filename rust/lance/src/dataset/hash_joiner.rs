@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! HashJoiner
 
@@ -23,7 +12,8 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
 use dashmap::{DashMap, ReadOnlyView};
 use futures::{StreamExt, TryStreamExt};
-use snafu::{location, Location};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use snafu::location;
 use tokio::task;
 
 use crate::datatypes::lance_supports_nulls;
@@ -63,10 +53,7 @@ impl HashJoiner {
         .await
         .unwrap()?;
         if batches.is_empty() {
-            return Err(Error::IO {
-                message: "HashJoiner: No data".to_string(),
-                location: location!(),
-            });
+            return Err(Error::io("HashJoiner: No data".to_string(), location!()));
         };
 
         let map = DashMap::new();
@@ -92,7 +79,7 @@ impl HashJoiner {
         let map = Arc::new(map);
 
         futures::stream::iter(batches.iter().enumerate().map(Ok::<_, Error>))
-            .try_for_each_concurrent(num_cpus::get(), |(batch_i, batch)| {
+            .try_for_each_concurrent(get_num_compute_intensive_cpus(), |(batch_i, batch)| {
                 // A clone of map we can send to a new thread
                 let map = map.clone();
                 async move {
@@ -108,10 +95,7 @@ impl HashJoiner {
                     match task_result {
                         Ok(Ok(_)) => Ok(()),
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::IO {
-                            message: format!("HashJoiner: {}", err),
-                            location: location!(),
-                        }),
+                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
                     }
                 }
             })
@@ -191,10 +175,10 @@ impl HashJoiner {
                     let task_result = task::spawn_blocking(move || {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
                         interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::IO {
-                                message: format!("HashJoiner: {}", err),
-                                location: location!(),
-                            })
+                            .map_err(|err| Error::io(
+                                format!("HashJoiner: {}", err),
+                                location!(),
+                            ))
                     })
                     .await;
                     match task_result {
@@ -209,14 +193,14 @@ impl HashJoiner {
                             Ok(array)
                         },
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::IO {
-                            message: format!("HashJoiner: {}", err),
-                            location: location!(),
-                        }),
+                        Err(err) => Err(Error::io(
+                            format!("HashJoiner: {}", err),
+                            location!(),
+                        )),
                     }
                 }
             })
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -228,8 +212,6 @@ impl HashJoiner {
 mod tests {
 
     use super::*;
-
-    use std::sync::Arc;
 
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};

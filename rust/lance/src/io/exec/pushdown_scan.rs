@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
@@ -18,30 +7,37 @@ use std::{any::Any, sync::Arc};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
+use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::execution_props::ExecutionProps;
-use datafusion::physical_plan::ColumnarValue;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::{ColumnarValue, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
-        Partitioning, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     },
     prelude::Expr,
 };
+use datafusion_functions::core::expr_ext::FieldAccessor;
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
-use lance_arrow::RecordBatchExt;
-use lance_core::ROW_ID_FIELD;
+use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_file::v2::reader::FileReaderOptions;
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
-use snafu::{location, Location};
+use snafu::location;
 
-use crate::dataset::scanner::{DEFAULT_BATCH_READAHEAD, DEFAULT_FRAGMENT_READAHEAD};
+use crate::dataset::fragment::FragReadConfig;
+use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
 use crate::Error;
 use crate::{
     dataset::{
@@ -52,6 +48,7 @@ use crate::{
     Dataset,
 };
 
+use super::utils::InstrumentedRecordBatchStreamAdapter;
 use super::Planner;
 
 #[derive(Debug, Clone)]
@@ -65,22 +62,29 @@ pub struct ScanConfig {
     /// If true, a row id column will be added to the output. This will be the
     /// first column.
     pub with_row_id: bool,
+    /// If true, a row address column will be added to the output. This will be
+    /// the first column after row id.
+    pub with_row_address: bool,
     /// If true, the scan will emit batches that contain deleted rows but have
     /// a null _rowid. This option is only valid if with_row_id is true.
     pub make_deletions_null: bool,
     /// If true (default), the scan will emit batches in the same order as the
     /// fragments. If false, the scan may emit batches in an arbitrary order.
     pub ordered_output: bool,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
-            batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
+            batch_readahead: get_num_compute_intensive_cpus(),
+            fragment_readahead: LEGACY_DEFAULT_FRAGMENT_READAHEAD,
             with_row_id: false,
+            with_row_address: false,
             make_deletions_null: false,
             ordered_output: true,
+            file_reader_options: None,
         }
     }
 }
@@ -93,6 +97,9 @@ pub struct LancePushdownScanExec {
     predicate_projection: Arc<Schema>,
     predicate: Expr,
     config: ScanConfig,
+    output_schema: Arc<ArrowSchema>,
+    properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl LancePushdownScanExec {
@@ -105,10 +112,9 @@ impl LancePushdownScanExec {
     ) -> Result<Self> {
         // This should be infallible.
         let columns: Vec<_> = predicate
-            .to_columns()
-            .unwrap()
+            .column_refs()
             .into_iter()
-            .map(|col| col.name)
+            .map(|col| col.name.as_str())
             .collect();
         let dataset_schema = dataset.schema();
         let predicate_projection = Arc::new(dataset_schema.project(&columns)
@@ -120,6 +126,22 @@ impl LancePushdownScanExec {
             ));
         }
 
+        let mut output_schema: ArrowSchema = projection.as_ref().into();
+        if config.with_row_address {
+            output_schema = output_schema.try_with_column_at(0, ROW_ADDR_FIELD.clone())?;
+        }
+        if config.with_row_id {
+            output_schema = output_schema.try_with_column_at(0, ROW_ID_FIELD.clone())?;
+        }
+        let output_schema = Arc::new(output_schema);
+
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
         Ok(Self {
             dataset,
             fragments,
@@ -127,53 +149,54 @@ impl LancePushdownScanExec {
             predicate,
             predicate_projection,
             config,
+            output_schema,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
 
 impl ExecutionPlan for LancePushdownScanExec {
+    fn name(&self) -> &str {
+        "LancePushdownScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn schema(&self) -> SchemaRef {
-        let schema: ArrowSchema = self.projection.as_ref().into();
-        if self.config.with_row_id {
-            let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields.len() + 1);
-            fields.push(Arc::new(ROW_ID_FIELD.clone()));
-            fields.extend(schema.fields.iter().cloned());
-            Arc::new(ArrowSchema::new(fields))
-        } else {
-            Arc::new(schema)
-        }
+        self.output_schema.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "LancePushdownScanExec does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        todo!()
+        Ok(Statistics::new_unknown(self.output_schema.as_ref()))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         // To get a stream with a static lifetime, we clone self put it into
@@ -209,31 +232,48 @@ impl ExecutionPlan for LancePushdownScanExec {
             .buffered(self.config.fragment_readahead)
             .try_flatten();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             batch_stream,
+            partition,
+            &self.metrics,
         )))
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 }
 
 impl DisplayAs for LancePushdownScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let columns = self
+            .projection
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .projection
-                    .fields
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 write!(
                     f,
-                    "LancePushdownScan: uri={}, projection=[{}], predicate={}, row_id={}, ordered={}",
+                    "LancePushdownScan: uri={}, projection=[{}], predicate={}, row_id={}, row_addr={}, ordered={}",
                     self.dataset.data_dir(),
                     columns,
                     self.predicate,
                     self.config.with_row_id,
+                    self.config.with_row_address,
+                    self.config.ordered_output
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "LancePushdownScan\nuri={}\nprojection=[{}]\npredicate={}\nrow_id={}\nrow_addr={}\nordered={}",
+                    self.dataset.data_dir(),
+                    columns,
+                    self.predicate,
+                    self.config.with_row_id,
+                    self.config.with_row_address,
                     self.config.ordered_output
                 )
             }
@@ -265,13 +305,19 @@ impl FragmentScanner {
 
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
-        let mut reader = fragment.open(dataset.schema(), false).await?;
+        let mut frag_config = FragReadConfig::default();
+        if let Some(file_reader_options) = config.file_reader_options.clone() {
+            frag_config = frag_config.with_file_reader_options(file_reader_options);
+        }
+        let mut reader = fragment.open(dataset.schema(), frag_config).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
 
         // We only need the statistics for the predicate projection.
-        let stats = reader.read_page_stats(Some(&predicate_projection)).await?;
+        let stats = reader
+            .legacy_read_page_stats(Some(&predicate_projection))
+            .await?;
 
         Ok(Self {
             fragment,
@@ -298,7 +344,7 @@ impl FragmentScanner {
             .filter(|(_, predicate)| {
                 futures::future::ready(!matches!(
                     predicate,
-                    Expr::Literal(ScalarValue::Boolean(Some(false)))
+                    Expr::Literal(ScalarValue::Boolean(Some(false)), _)
                 ))
             })
             .map(move |(batch_id, predicate)| {
@@ -330,19 +376,22 @@ impl FragmentScanner {
 
     async fn read_batch(&self, batch_id: usize, predicate: Expr) -> Result<Option<RecordBatch>> {
         match predicate {
-            Expr::Literal(ScalarValue::Boolean(Some(true))) => {
+            Expr::Literal(ScalarValue::Boolean(Some(true)), _) => {
                 // Predicate is always true, we just need to load the projection.
                 let mut projection_reader = self.reader.clone();
                 if self.config.with_row_id {
                     projection_reader.with_row_id();
                 }
+                if self.config.with_row_address {
+                    projection_reader.with_row_address();
+                }
                 let batch = projection_reader
-                    .read_batch_projected(batch_id, .., &self.projection)
+                    .legacy_read_batch_projected(batch_id, .., &self.projection)
                     .await?;
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
             }
-            Expr::Literal(ScalarValue::Boolean(Some(false))) => {
+            Expr::Literal(ScalarValue::Boolean(Some(false)), _) => {
                 // Predicate is always false, we can skip this batch.
                 Ok(None)
             }
@@ -353,10 +402,9 @@ impl FragmentScanner {
                 // 1. Load needed filter columns, which might be a subset of all filter
                 //    columns if statistics obviated the need for some columns.
                 let columns: Vec<_> = predicate
-                    .to_columns()
-                    .unwrap()
+                    .column_refs()
                     .into_iter()
-                    .map(|col| col.name)
+                    .map(|col| col.name.as_str())
                     .collect();
                 let predicate_projection =
                     Arc::new(self.fragment.dataset().schema().project(&columns).unwrap());
@@ -365,10 +413,13 @@ impl FragmentScanner {
                 // Make deletions null so we can have correct indices when we
                 // request additional columns. See ColumnarValue::Array branch below.
                 reader.with_make_deletions_null();
-                reader.with_row_id();
+                if self.config.with_row_id {
+                    reader.with_row_id();
+                }
+                reader.with_row_address();
 
                 let batch = reader
-                    .read_batch_projected(batch_id, .., &predicate_projection)
+                    .legacy_read_batch_projected(batch_id, .., &predicate_projection)
                     .await?;
 
                 // 2. Evaluate predicate
@@ -400,10 +451,10 @@ impl FragmentScanner {
                         // null earlier.
                         let selection: UInt32Array = array
                             .iter()
-                            .zip(batch[ROW_ID].as_primitive::<UInt64Type>())
+                            .zip(batch[ROW_ADDR].as_primitive::<UInt64Type>())
                             .enumerate()
-                            .filter_map(|(i, (matched, row_id))| {
-                                if matched.unwrap_or_default() && row_id.is_some() {
+                            .filter_map(|(i, (matched, row_addr))| {
+                                if matched.unwrap_or_default() && row_addr.is_some() {
                                     Some(i as u32)
                                 } else {
                                     None
@@ -438,10 +489,11 @@ impl FragmentScanner {
                     .collect();
 
                 let remainder_batch = if !remaining_fields.is_empty() {
-                    let remaining_projection = self.projection.project_by_ids(&remaining_fields);
+                    let remaining_projection =
+                        self.projection.project_by_ids(&remaining_fields, true);
                     Some(
                         self.reader
-                            .read_batch_projected(
+                            .legacy_read_batch_projected(
                                 batch_id,
                                 selection.clone(),
                                 &remaining_projection,
@@ -458,7 +510,7 @@ impl FragmentScanner {
                     batch.take(indices)?
                 } else {
                     // It's possible there were some deleted rows.
-                    if let Some(deletion_mask) = batch[ROW_ID].nulls() {
+                    if let Some(deletion_mask) = batch[ROW_ADDR].nulls() {
                         filter_record_batch(
                             &batch,
                             &BooleanArray::new(deletion_mask.clone().into_inner(), None),
@@ -483,13 +535,7 @@ impl FragmentScanner {
 
     fn final_projection(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let row_id_column = batch.column_by_name(ROW_ID).cloned();
-
-        if self.projection.fields.is_empty() && row_id_column.is_some() {
-            return Ok(RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()])),
-                vec![row_id_column.unwrap()],
-            )?);
-        }
+        let row_addr_column = batch.column_by_name(ROW_ADDR).cloned();
 
         let mut batch = batch
             .project_by_schema(&self.projection.as_ref().into())
@@ -503,8 +549,12 @@ impl FragmentScanner {
                 location: location!(),
             })?;
 
-        // Row id wasn't part of the projection, so we need to add it back if it
-        // was requested. We always put it at the front.
+        // Row id nor row address weren't part of the projection, so we need to
+        // add them back if they were requested. We always put them at the front.
+        if self.config.with_row_address {
+            batch =
+                batch.try_with_column_at(0, ROW_ADDR_FIELD.clone(), row_addr_column.unwrap())?;
+        }
         if self.config.with_row_id {
             batch = batch.try_with_column_at(0, ROW_ID_FIELD.clone(), row_id_column.unwrap())?;
         }
@@ -614,11 +664,16 @@ impl FragmentScanner {
     }
 
     fn simplified_predicates(&self) -> Result<Vec<Expr>> {
-        let num_batches = self.reader.num_batches();
+        let num_batches = self.reader.legacy_num_batches();
 
         if let Some(stats) = &self.stats {
-            let batch_sizes: Vec<usize> = (0..num_batches)
-                .map(|batch_id| self.reader.num_rows_in_batch(batch_id))
+            let batch_sizes: Vec<usize> = (0..num_batches as u32)
+                .map(|batch_id| {
+                    self.reader
+                        .legacy_num_rows_in_batch(batch_id)
+                        .expect("Operation does not yet support v2 fragments")
+                        as usize
+                })
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
@@ -653,18 +708,21 @@ impl FragmentScanner {
 #[cfg(test)]
 mod test {
     use arrow_array::{
-        types::{Float32Type, Int32Type, UInt64Type},
+        types::{Float32Type, Int32Type},
         ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
         RecordBatchIterator, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::TimeUnit;
+    use arrow_schema::{Field, TimeUnit};
     use arrow_select::concat::concat_batches;
-    use datafusion::prelude::{col, lit, Column, SessionContext};
+    use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+    use lance_file::version::LanceFileVersion;
+    use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     use crate::dataset::WriteParams;
+    use lance_datafusion::logical_expr::ExprExt;
 
     use super::*;
 
@@ -690,7 +748,16 @@ mod test {
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
@@ -737,7 +804,16 @@ mod test {
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
@@ -802,16 +878,27 @@ mod test {
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let dataset = Arc::new(Dataset::write(batches, test_uri, None).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write(
+                batches,
+                test_uri,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::Legacy),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
 
         let fragments = dataset.fragments().clone();
         // [x.b, y.a]
-        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4]));
+        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4], true));
 
         let predicate = col("x")
-            .field("a")
+            .field_newstyle("a")
             .lt(lit(8))
-            .and(col("y").field("b").gt(lit(3)));
+            .and(col("y").field_newstyle("b").gt(lit(3)));
 
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
@@ -836,7 +923,7 @@ mod test {
         assert_eq!(results[0].schema().as_ref(), expected_schema.as_ref());
 
         // Also try where projection is same as filter columns
-        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[1, 5]));
+        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[1, 5], true));
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
             fragments,
@@ -884,6 +971,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 100,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let dataset = Arc::new(
@@ -1014,10 +1102,11 @@ mod test {
 
     async fn test_dataset() -> Dataset {
         let data = test_data();
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
         let params = WriteParams {
             max_rows_per_group: 3,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, "memory://test", Some(params))
@@ -1047,7 +1136,7 @@ mod test {
         let dataset = Arc::new(test_dataset().await);
 
         let predicate = col("struct")
-            .field("int")
+            .field_newstyle("int")
             .gt(lit(4))
             .and(col(Column::from_name("str")).is_not_null());
 
@@ -1127,7 +1216,12 @@ mod test {
         let scan = LancePushdownScanExec::try_new(
             dataset.clone(),
             dataset.fragments().clone(),
-            Arc::new(dataset.schema().clone().project_by_ids(&projection_indices)),
+            Arc::new(
+                dataset
+                    .schema()
+                    .clone()
+                    .project_by_ids(&projection_indices, true),
+            ),
             predicate,
             scan_config,
         )
@@ -1189,7 +1283,7 @@ mod test {
                         4.0,
                         5.0,
                         6.0,
-                        std::f32::NAN,
+                        f32::NAN,
                         3.0,
                         6.0,
                     ])),
@@ -1223,6 +1317,7 @@ mod test {
 
             let write_params = WriteParams {
                 max_rows_per_group: 3,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             };
             Dataset::write(reader, uri, Some(write_params))
@@ -1346,6 +1441,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 10,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1408,6 +1504,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 4,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1442,7 +1539,7 @@ mod test {
             let ints = result["int"].as_primitive::<Int32Type>();
             let expected =
                 Int32Array::from_iter_values(expected_int.into_iter().filter(|x| x < &max_value));
-            assert_eq!(ints, &expected);
+            assert_eq!(ints, &expected, "Failed with max_value = {}", max_value);
 
             let floats = result["float"].as_primitive::<Float32Type>();
             let expected = Float32Array::from_iter_values(

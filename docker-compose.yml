@@ -1,0 +1,17 @@
+version: "3.9"
+services:
+  localstack:
+    image: localstack/localstack:4.0
+    ports:
+      - 4566:4566
+    environment:
+      - SERVICES=s3,dynamodb,kms
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # Note: localstack doesn't actually validate these.
+      - AWS_ACCESS_KEY_ID=ACCESS_KEY
+      - AWS_SECRET_ACCESS_KEY=SECRET_KEY
+    healthcheck:
+      test: [ "CMD", "curl", "-s", "http://localhost:4566/_localstack/health" ]
+      interval: 5s
+      retries: 3
+      start_period: 10s

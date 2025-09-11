@@ -3,7 +3,7 @@ name: build_wheel
 description: "Build a lance wheel"
 inputs:
   python-minor-version:
-    description: "8, 9, 10, 11"
+    description: "9, 10, 11, 12"
     required: true
   args:
     description: "--release"
@@ -22,4 +22,3 @@ runs:
         command: build
         args: ${{ inputs.args }}
         working-directory: python
-        interpreter: 3.${{ inputs.python-minor-version }}

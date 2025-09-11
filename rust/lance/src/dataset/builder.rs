@@ -1,56 +1,61 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
-use object_store::{aws::AwsCredentialProvider, DynObjectStore};
-use snafu::{location, Location};
-use tracing::instrument;
-use url::Url;
-
-use super::{ReadParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
+use super::refs::{Ref, Tags};
+use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::{
     error::{Error, Result},
     session::Session,
     Dataset,
 };
+use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
+use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::v2::reader::FileReaderOptions;
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, StorageOptions, DEFAULT_CLOUD_IO_PARALLELISM,
+};
+use lance_table::{
+    format::Manifest,
+    io::commit::{commit_handler_from_url, CommitHandler},
+};
+#[cfg(feature = "aws")]
+use object_store::aws::AwsCredentialProvider;
+use object_store::{path::Path, DynObjectStore};
+use prost::Message;
+use snafu::location;
+use tracing::{info, instrument};
+use url::Url;
 /// builder for loading a [`Dataset`].
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
     /// Cache size for index cache. If it is zero, index cache is disabled.
-    index_cache_size: usize,
+    index_cache_size_bytes: usize,
     /// Metadata cache size for the fragment metadata. If it is zero, metadata
     /// cache is disabled.
-    metadata_cache_size: usize,
+    metadata_cache_size_bytes: usize,
+    /// Optional pre-loaded manifest to avoid loading it again.
+    manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     options: ObjectStoreParams,
-    version: Option<u64>,
+    version: Option<Ref>,
     table_uri: String,
+    file_reader_options: Option<FileReaderOptions>,
 }
 
 impl DatasetBuilder {
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
         Self {
-            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
-            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
+            index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
+            metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             table_uri: table_uri.as_ref().to_string(),
             options: ObjectStoreParams::default(),
             commit_handler: None,
             session: None,
             version: None,
+            manifest: None,
+            file_reader_options: None,
         }
     }
 }
@@ -59,14 +64,34 @@ impl DatasetBuilder {
 // https://github.com/delta-io/delta-rs/main/crates/deltalake-core/src/table/builder.rs
 impl DatasetBuilder {
     /// Set the cache size for indices. Set to zero, to disable the cache.
+    pub fn with_index_cache_size_bytes(mut self, cache_size: usize) -> Self {
+        self.index_cache_size_bytes = cache_size;
+        self
+    }
+
+    /// Set the cache size for indices. Set to zero, to disable the cache.
+    #[deprecated(since = "0.30.0", note = "Use `with_index_cache_size_bytes` instead")]
     pub fn with_index_cache_size(mut self, cache_size: usize) -> Self {
-        self.index_cache_size = cache_size;
+        let assumed_entry_size = 20 * 1024 * 1024; // 20 MiB per entry
+        self.index_cache_size_bytes = cache_size * assumed_entry_size;
+        self
+    }
+
+    /// Size of the metadata cache in bytes. This cache stores metadata in memory
+    /// for faster open table and scans. The default is 1 GiB.
+    pub fn with_metadata_cache_size_bytes(mut self, cache_size: usize) -> Self {
+        self.metadata_cache_size_bytes = cache_size;
         self
     }
 
     /// Set the cache size for the file metadata. Set to zero to disable this cache.
+    #[deprecated(
+        since = "0.30.0",
+        note = "Use `with_metadata_cache_size_bytes` instead"
+    )]
     pub fn with_metadata_cache_size(mut self, cache_size: usize) -> Self {
-        self.metadata_cache_size = cache_size;
+        let assumed_entry_size = 4 * 1024 * 1024; // 4MB per entry
+        self.metadata_cache_size_bytes = cache_size * assumed_entry_size;
         self
     }
 
@@ -79,9 +104,15 @@ impl DatasetBuilder {
         self
     }
 
-    /// Sets `version` to the builder
+    /// Sets `version` for the builder using a version number
     pub fn with_version(mut self, version: u64) -> Self {
-        self.version = Some(version);
+        self.version = Some(Ref::from(version));
+        self
+    }
+
+    /// Sets `version` for the builder using a tag
+    pub fn with_tag(mut self, tag: &str) -> Self {
+        self.version = Some(Ref::from(tag));
         self
     }
 
@@ -99,12 +130,15 @@ impl DatasetBuilder {
 
     /// Sets the aws credentials provider.
     /// This only applies to aws object store.
+    #[cfg(feature = "aws")]
     pub fn with_aws_credentials_provider(mut self, credentials: AwsCredentialProvider) -> Self {
         self.options.aws_credentials = Some(credentials);
         self
     }
 
     /// Directly set the object store to use.
+    #[deprecated(note = "Implement an ObjectStoreProvider instead")]
+    #[allow(deprecated)]
     pub fn with_object_store(
         mut self,
         object_store: Arc<DynObjectStore>,
@@ -114,6 +148,15 @@ impl DatasetBuilder {
         self.options.object_store = Some((object_store, location));
         self.commit_handler = Some(commit_handler);
         self
+    }
+
+    /// Use a serialized manifest instead of loading it from the object store.
+    ///
+    /// This is common when transferring a dataset across IPC boundaries.
+    pub fn with_serialized_manifest(mut self, manifest: &[u8]) -> Result<Self> {
+        let manifest = Manifest::try_from(lance_table::format::pb::Manifest::decode(manifest)?)?;
+        self.manifest = Some(manifest);
+        Ok(self)
     }
 
     /// Set options used to initialize storage backend
@@ -146,8 +189,8 @@ impl DatasetBuilder {
     /// Set options based on [ReadParams].
     pub fn with_read_params(mut self, read_params: ReadParams) -> Self {
         self = self
-            .with_index_cache_size(read_params.index_cache_size)
-            .with_metadata_cache_size(read_params.metadata_cache_size);
+            .with_index_cache_size_bytes(read_params.index_cache_size_bytes)
+            .with_metadata_cache_size_bytes(read_params.metadata_cache_size_bytes);
 
         if let Some(options) = read_params.store_options {
             self.options = options;
@@ -158,6 +201,23 @@ impl DatasetBuilder {
         }
 
         if let Some(commit_handler) = read_params.commit_handler {
+            self.commit_handler = Some(commit_handler);
+        }
+
+        if let Some(file_reader_options) = read_params.file_reader_options {
+            self.file_reader_options = Some(file_reader_options);
+        }
+
+        self
+    }
+
+    /// Set options based on [WriteParams].
+    pub fn with_write_params(mut self, write_params: WriteParams) -> Self {
+        if let Some(options) = write_params.store_params {
+            self.options = options;
+        }
+
+        if let Some(commit_handler) = write_params.commit_handler {
             self.commit_handler = Some(commit_handler);
         }
 
@@ -175,67 +235,141 @@ impl DatasetBuilder {
     }
 
     /// Build a lance object store for the given config
-    pub async fn build_object_store(self) -> Result<(ObjectStore, Arc<dyn CommitHandler>)> {
+    pub async fn build_object_store(
+        self,
+    ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
         let commit_handler = match self.commit_handler {
             Some(commit_handler) => Ok(commit_handler),
             None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
         }?;
 
+        let storage_options = self
+            .options
+            .storage_options
+            .clone()
+            .map(StorageOptions::new)
+            .unwrap_or_default();
+        let download_retry_count = storage_options.download_retry_count();
+
+        let store_registry = self
+            .session
+            .as_ref()
+            .map(|s| s.store_registry())
+            .unwrap_or_default();
+
+        #[allow(deprecated)]
         match &self.options.object_store {
             Some(store) => Ok((
-                ObjectStore::new(
+                Arc::new(ObjectStore::new(
                     store.0.clone(),
                     store.1.clone(),
                     self.options.block_size,
                     self.options.object_store_wrapper,
-                ),
+                    self.options.use_constant_size_upload_parts,
+                    store.1.scheme() != "file",
+                    // If user supplied an object store then we just assume it's probably
+                    // cloud-like
+                    DEFAULT_CLOUD_IO_PARALLELISM,
+                    download_retry_count,
+                    None, // No storage_options available here
+                )),
+                Path::from(store.1.path()),
                 commit_handler,
             )),
             None => {
-                let (store, _path) =
-                    ObjectStore::from_uri_and_params(&self.table_uri, &self.options).await?;
-                Ok((store, commit_handler))
+                let (store, path) = ObjectStore::from_uri_and_params(
+                    store_registry,
+                    &self.table_uri,
+                    &self.options,
+                )
+                .await?;
+                Ok((store, path, commit_handler))
             }
         }
     }
 
     #[instrument(skip_all)]
     pub async fn load(mut self) -> Result<Dataset> {
-        let session = match self.session.take() {
-            Some(session) => session,
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=self.table_uri);
+        let session = match self.session.as_ref() {
+            Some(session) => session.clone(),
             None => Arc::new(Session::new(
-                self.index_cache_size,
-                self.metadata_cache_size,
+                self.index_cache_size_bytes,
+                self.metadata_cache_size_bytes,
+                Default::default(),
             )),
         };
 
-        let version = self.version;
+        let mut version: Option<u64> = None;
+        let cloned_ref = self.version.clone();
+        let table_uri = self.table_uri.clone();
 
-        let (object_store, commit_handler) = self.build_object_store().await?;
-        let base_path = object_store.base_path();
-        let manifest = match version {
-            Some(version) => {
-                commit_handler
-                    .resolve_version(base_path, version, &object_store.inner)
-                    .await?
+        // How do we detect which version scheme is in use?
+
+        let manifest = self.manifest.take();
+
+        let file_reader_options = self.file_reader_options.clone();
+        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+
+        if let Some(r) = cloned_ref {
+            version = match r {
+                Ref::Version(v) => Some(v),
+                Ref::Tag(t) => {
+                    let tags = Tags::new(
+                        object_store.clone(),
+                        commit_handler.clone(),
+                        base_path.clone(),
+                    );
+                    Some(tags.get_version(t.as_str()).await?)
+                }
             }
-            None => commit_handler
-                .resolve_latest_version(base_path, &object_store.inner)
-                .await
-                .map_err(|e| Error::DatasetNotFound {
-                    path: base_path.to_string(),
-                    source: Box::new(e),
-                    location: location!(),
-                })?,
+        }
+
+        let (manifest, location) = if let Some(mut manifest) = manifest {
+            let location = commit_handler
+                .resolve_version_location(&base_path, manifest.version, &object_store.inner)
+                .await?;
+            if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
+                let reader = object_store.open(&location.path).await?;
+                populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+            }
+            (manifest, location)
+        } else {
+            let manifest_location = match version {
+                Some(version) => {
+                    commit_handler
+                        .resolve_version_location(&base_path, version, &object_store.inner)
+                        .await?
+                }
+                None => commit_handler
+                    .resolve_latest_location(&base_path, &object_store)
+                    .await
+                    .map_err(|e| Error::DatasetNotFound {
+                        source: Box::new(e),
+                        path: base_path.to_string(),
+                        location: location!(),
+                    })?,
+            };
+
+            let manifest = Dataset::load_manifest(
+                &object_store,
+                &manifest_location,
+                &table_uri,
+                session.as_ref(),
+            )
+            .await?;
+            (manifest, manifest_location)
         };
 
         Dataset::checkout_manifest(
-            Arc::new(object_store.clone()),
-            base_path.clone(),
-            &manifest,
+            object_store,
+            base_path,
+            table_uri,
+            Arc::new(manifest),
+            location,
             session,
             commit_handler,
+            file_reader_options,
         )
-        .await
     }
 }

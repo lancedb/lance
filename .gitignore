@@ -48,6 +48,8 @@ cmake-build-*
 
 python/lance/_*.cpp
 
+bin/
+
 
 *.parquet
 *.parq
@@ -61,15 +63,12 @@ logs
 
 docs/_build
 docs/api/python
+docs/site
+docs/build
 
 **/.ipynb_checkpoints/
 docs/notebooks
 
-
-integration/duckdb/*-build
-integration/duckdb/lance.duckdb_extension.*.zip
-
-notebooks/lance.duckdb_extension
 notebooks/sift
 notebooks/image_data/data
 benchmarks/sift/sift
@@ -87,7 +86,6 @@ wheelhouse
 
 # Rust
 target
-Cargo.lock
 **/sccache.log
 
 # c++ lsp
@@ -95,3 +93,13 @@ Cargo.lock
 
 python/venv
 test_data/venv
+
+**/*.profraw
+*.lance
+
+# Pytest benchmarks
+.benchmarks/
+
+# Auto-built docs
+docs/src/format/namespace/**
+docs/src/integrations/spark/**

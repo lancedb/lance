@@ -15,9 +15,12 @@ arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
+half = { workspace = true }
 hex = "0.4.3"
 rand = { workspace = true }
-rand_xoshiro = "0.6.0"
+rand_xoshiro = { workspace = true }
+random_word = { version = "0.5", features = ["en"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -31,3 +34,6 @@ bench = false
 [[bench]]
 name = "array_gen"
 harness = false
+
+[lints]
+workspace = true

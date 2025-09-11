@@ -3,13 +3,13 @@
 
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Modern columnar data format for ML. Convert from Parquet in 2-lines of code for 100x faster random access, a vector index, data versioning, and more.<br/>**
-**Compatible with pandas, DuckDB, Polars, and pyarrow with more integrations on the way.**
+**Modern columnar data format for ML. Convert from Parquet in 2-lines of code for 100x faster random access, zero-cost schema evolution, rich secondary indices, versioning, and more.<br/>**
+**Compatible with Pandas, DuckDB, Polars, Pyarrow, and Ray with more integrations on the way.**
 
 <a href="https://lancedb.github.io/lance/">Documentation</a> •
 <a href="https://blog.lancedb.com/">Blog</a> •
 <a href="https://discord.gg/zMM32dvNtd">Discord</a> •
-<a href="https://twitter.com/lancedb">Twitter</a>
+<a href="https://x.com/lancedb">X</a>
 
 [CI]: https://github.com/lancedb/lance/actions/workflows/rust.yml
 [CI Badge]: https://github.com/lancedb/lance/actions/workflows/rust.yml/badge.svg
@@ -44,7 +44,10 @@ The key features of Lance include:
 
 * **Zero-copy, automatic versioning:** manage versions of your data without needing extra infrastructure.
 
-* **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB and more on the way.
+* **Ecosystem integrations:** Apache Arrow, Pandas, Polars, DuckDB, Ray, Spark and more on the way.
+
+> [!TIP]
+> Lance is in active development and we welcome contributions. Please see our [contributing guide](https://lancedb.github.io/lance/community/contributing) for more information.
 
 ## Quick Start
 
@@ -53,6 +56,18 @@ The key features of Lance include:
 ```shell
 pip install pylance
 ```
+
+To install a preview release:
+
+```shell
+pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance
+```
+
+> [!TIP]
+> Preview releases are released more often than full releases and contain the
+> latest features and bug fixes. They receive the same level of testing as full releases.
+> We guarantee they will remain published and available for download for at
+> least 6 months. When you want to pin to a specific version, prefer a stable release.
 
 **Converting to Lance**
 
@@ -152,12 +167,13 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 | Directory          | Description              |
 |--------------------|--------------------------|
 | [rust](./rust)     | Core Rust implementation |
-| [python](./python) | Python bindings (pyo3)   |
+| [python](./python) | Python bindings (PyO3)   |
+| [java](./java)     | Java bindings (JNI)      |
 | [docs](./docs)     | Documentation source     |
 
 ## What makes Lance different
 
-Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format.html).
+Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format).
 
 **Vector index**: Vector index for similarity search over embedding space.
 Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Apple Silicon (mps)``).
@@ -166,12 +182,12 @@ Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Appl
 
 **Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
 
-**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation .
+**Versioning**: A Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation.
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
 
-**Rich secondary indices** (ROADMAP):
-  - Inverted index for fuzzy search over many label / annotation fields.
+**Rich secondary indices**: Support `BTree`, `Bitmap`, `Full text search`, `Label list`,
+`NGrams`, and more.
 
 ## Benchmarks
 
@@ -181,17 +197,17 @@ We used the SIFT dataset to benchmark our results with 1M vectors of 128D
 
 1. For 100 randomly sampled query vectors, we get <1ms average response time (on a 2023 m2 MacBook Air)
 
-![avg_latency.png](docs/avg_latency.png)
+![avg_latency.png](docs/src/images/avg_latency.png)
 
 2. ANNs are always a trade-off between recall and performance
 
-![avg_latency.png](docs/recall_vs_latency.png)
+![avg_latency.png](docs/src/images/recall_vs_latency.png)
 
 ### Vs. parquet
 
 We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/XMLs. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
 
-![](docs/lance_perf.png)
+![](docs/src/images/lance_perf.png)
 
 ## Why are you building yet another data format?!
 
@@ -212,7 +228,7 @@ graph LR
 
 People use different data representations to varying stages for the performance or limited by the tooling available.
 Academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning, which
-is difficult to integrated into data infrastructure and slow to train over cloud storage.
+is difficult to integrate into data infrastructure and slow to train over cloud storage.
 While industry uses data lakes (Parquet-based techniques, i.e., Delta Lake, Iceberg) or data warehouses (AWS Redshift
 or Google BigQuery) to collect and analyze data, they have to convert the data into training-friendly formats, such
 as [Rikai](https://github.com/eto-ai/rikai)/[Petastorm](https://github.com/uber/petastorm)
@@ -237,11 +253,16 @@ A comparison of different data formats in each stage of ML development cycle.
 
 Lance is currently used in production by:
 * [LanceDB](https://github.com/lancedb/lancedb), a serverless, low-latency vector database for ML applications
+* [LanceDB Enterprise](https://docs.lancedb.com/enterprise/introduction), hyperscale LanceDB with enterprise SLA.
+* Leading multimodal Gen AI companies for training over petabyte-scale multimodal data.
 * Self-driving car company for large-scale storage, retrieval and processing of multi-modal data.
 * E-commerce company for billion-scale+ vector personalized search.
 * and more.
 
-## Presentations and Talks
+## Presentations, Blogs and Talks
 
+* [Designing a Table Format for ML Workloads](https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/), Feb 2025.
+* [Transforming Multimodal Data Management with LanceDB, Ray Summit](https://www.youtube.com/watch?v=xmTFEzAh8ho), Oct 2024.
+* [Lance v2: A columnar container format for modern data](https://blog.lancedb.com/lance-v2/), Apr 2024.
 * [Lance Deep Dive](https://drive.google.com/file/d/1Orh9rK0Mpj9zN_gnQF1eJJFpAc6lStGm/view?usp=drive_link). July 2023.
 * [Lance: A New Columnar Data Format](https://docs.google.com/presentation/d/1a4nAiQAkPDBtOfXFpPg7lbeDAxcNDVKgoUkw3cUs2rE/edit#slide=id.p), [Scipy 2022, Austin, TX](https://www.scipy2022.scipy.org/posters). July, 2022.

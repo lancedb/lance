@@ -1,21 +1,11 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use deepsize::DeepSizeOf;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -90,17 +80,26 @@ impl<W: Writer + ?Sized> WriteExt for W {
 }
 
 #[async_trait]
-pub trait Reader: Send + Sync {
+pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn path(&self) -> &Path;
 
     /// Suggest optimal I/O size per storage device.
     fn block_size(&self) -> usize;
 
+    /// Suggest optimal I/O parallelism per storage device.
+    fn io_parallelism(&self) -> usize;
+
     /// Object/File Size.
-    async fn size(&self) -> Result<usize>;
+    async fn size(&self) -> object_store::Result<usize>;
 
     /// Read a range of bytes from the object.
     ///
     /// TODO: change to read_at()?
-    async fn get_range(&self, range: Range<usize>) -> Result<Bytes>;
+    async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
+
+    /// Read all bytes from the object.
+    ///
+    /// By default this reads the size in a separate IOP but some implementations
+    /// may not need the size beforehand.
+    async fn get_all(&self) -> object_store::Result<Bytes>;
 }

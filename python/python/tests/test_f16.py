@@ -1,26 +1,23 @@
-#  Copyright 2023 Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 from pathlib import Path
 
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
+
+torch = pytest.importorskip("torch")
 
 
-def test_f16_embeddings(tmp_path: Path):
-    DIM = 32
-    TOTAL = 1000
+@pytest.mark.parametrize("accelerator", [None, "cuda"])
+def test_f16_embeddings(tmp_path: Path, accelerator: str):
+    if not torch.cuda.is_available() and accelerator == "cuda":
+        pytest.skip("CUDA not available")
+
+    DIM = 16
+    TOTAL = 256
     values = np.random.random(TOTAL * DIM).astype(np.float16)
     fsl = pa.FixedSizeListArray.from_arrays(values, DIM)
     data = pa.Table.from_arrays([fsl, np.arange(TOTAL)], names=["vec", "id"])
@@ -29,7 +26,12 @@ def test_f16_embeddings(tmp_path: Path):
     assert ds.schema.field("vec").type.value_type == pa.float16()
 
     ds = ds.create_index(
-        "vec", "IVF_PQ", replace=True, num_partitions=2, num_sub_vectors=2
+        "vec",
+        "IVF_PQ",
+        replace=True,
+        num_partitions=2,
+        num_sub_vectors=2,
+        accelerator=accelerator,
     )
 
     # Can use float32 to search

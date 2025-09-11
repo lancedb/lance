@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 mod statistics;
 
@@ -22,11 +11,12 @@ use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
+use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use lance_arrow::*;
-use lance_core::datatypes::{Encoding, Field, Schema, SchemaCompareOptions};
+use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::{Error, Result};
 use lance_io::encodings::{
     binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder, Encoder,
@@ -35,7 +25,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::{WriteExt, Writer};
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::format::metadata::{Metadata, StatisticsMetadata};
@@ -64,8 +54,10 @@ pub trait ManifestProvider {
 }
 
 /// Implementation of ManifestProvider that does not store the schema
+#[cfg(test)]
 pub(crate) struct NotSelfDescribing {}
 
+#[cfg(test)]
 #[async_trait]
 impl ManifestProvider for NotSelfDescribing {
     async fn store_schema(_: &mut ObjectWriter, _: &Schema) -> Result<Option<usize>> {
@@ -129,7 +121,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         };
 
         let stats_collector = if !collect_stats_for_fields.is_empty() {
-            let stats_schema = schema.project_by_ids(&collect_stats_for_fields);
+            let stats_schema = schema.project_by_ids(&collect_stats_for_fields, true);
             statistics::StatisticsCollector::try_new(&stats_schema)
         } else {
             None
@@ -146,16 +138,51 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         })
     }
 
+    /// Return the schema of the file writer.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
+        if !field.nullable && arr.null_count() > 0 {
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+        }
+
+        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
+            Self::verify_field_nullability(child_arr, child_field)?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
+        for (col, field) in batch.columns().iter().zip(self.schema.fields.iter()) {
+            Self::verify_field_nullability(&col.to_data(), field)?;
+        }
+        Ok(())
+    }
+
     /// Write a [RecordBatch] to the open file.
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
         for batch in batches {
             // Compare, ignore metadata and dictionary
             //   dictionary should have been checked earlier and could be an expensive check
             let schema = Schema::try_from(batch.schema().as_ref())?;
-            schema.check_compatible(&self.schema, &SchemaCompareOptions::default())?;
+            schema.check_compatible(
+                &self.schema,
+                &SchemaCompareOptions {
+                    compare_nullability: NullabilityComparison::Ignore,
+                    ..Default::default()
+                },
+            )?;
+            self.verify_nullability_constraints(batch)?;
         }
 
         // If we are collecting stats for this column, collect them.
@@ -176,9 +203,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
             let arrs = batches
                 .iter()
                 .map(|batch| {
-                    batch.column_by_name(&field.name).ok_or_else(|| Error::IO {
-                        message: format!("FileWriter::write: Field '{}' not found", field.name),
-                        location: location!(),
+                    batch.column_by_name(&field.name).ok_or_else(|| {
+                        Error::io(
+                            format!("FileWriter::write: Field '{}' not found", field.name),
+                            location!(),
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -205,7 +234,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         Ok(())
     }
 
-    /// Add schema metedata, as (key, value) pair to the file.
+    /// Add schema metadata, as (key, value) pair to the file.
     pub fn add_metadata(&mut self, key: &str, value: &str) {
         self.schema
             .metadata
@@ -242,11 +271,6 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     /// Total bytes written so far
     pub async fn tell(&mut self) -> Result<usize> {
         self.object_writer.tell().await
-    }
-
-    /// Returns the in-flight multipart ID.
-    pub fn multipart_id(&self) -> &str {
-        &self.object_writer.multipart_id
     }
 
     /// Return the id of the next batch to be written.
@@ -606,17 +630,21 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         for field_id in 0..max_field_id + 1 {
             if let Some(field) = schema.mut_field_by_id(field_id) {
                 if field.data_type().is_dictionary() {
-                    let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
-                        message: format!("Lance field {} misses dictionary info", field.name),
-                        location: location!(),
+                    let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                        Error::io(
+                            format!("Lance field {} misses dictionary info", field.name),
+                            // and wrap it in here.
+                            location!(),
+                        )
                     })?;
 
-                    let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
-                        message: format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array",
-                        field.name
-                    ),
-                        location: location!(),
+                    let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                        Error::io(
+                            format!(
+                        "Lance field {} is dictionary type, but misses the dictionary value array", 
+                        field.name),
+                            location!(),
+                        )
                     })?;
 
                     let data_type = value_arr.data_type();
@@ -630,13 +658,13 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
                             encoder.encode(&[value_arr]).await?
                         }
                         _ => {
-                            return Err(Error::IO {
-                                message: format!(
+                            return Err(Error::io(
+                                format!(
                                     "Does not support {} as dictionary value type",
                                     value_arr.data_type()
                                 ),
-                                location: location!(),
-                            });
+                                location!(),
+                            ));
                         }
                     };
                     dict_info.offset = pos;
@@ -729,10 +757,9 @@ mod tests {
     };
     use arrow_buffer::i256;
     use arrow_schema::{
-        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
+        Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
     };
     use arrow_select::concat::concat_batches;
-    use object_store::path::Path;
 
     use crate::reader::FileReader;
 
@@ -913,14 +940,14 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -950,14 +977,14 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -995,14 +1022,14 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
-        let actual = reader
-            .read_batch(0, .., reader.schema(), None)
-            .await
-            .unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
     }
 
@@ -1210,7 +1237,7 @@ mod tests {
         for i in 0..reader.num_batches() {
             batches.push(
                 reader
-                    .read_batch(i as i32, .., reader.schema(), None)
+                    .read_batch(i as i32, .., reader.schema())
                     .await
                     .unwrap(),
             );
@@ -1254,5 +1281,51 @@ mod tests {
 
         let batch = read_file_as_one_batch(&store, &path, schema).await;
         assert_eq!(batch.column_by_name("i").unwrap().as_ref(), &array);
+    }
+
+    #[tokio::test]
+    async fn test_write_schema_with_holes() {
+        let store = ObjectStore::memory();
+        let path = Path::from("test");
+
+        let mut field0 = Field::try_from(&ArrowField::new("a", DataType::Int32, true)).unwrap();
+        field0.set_id(-1, &mut 0);
+        assert_eq!(field0.id, 0);
+        let mut field2 = Field::try_from(&ArrowField::new("b", DataType::Int32, true)).unwrap();
+        field2.set_id(-1, &mut 2);
+        assert_eq!(field2.id, 2);
+        // There is a hole at field id 1.
+        let schema = Schema {
+            fields: vec![field0, field2],
+            metadata: Default::default(),
+        };
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let data = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+
+        let mut file_writer = FileWriter::<NotSelfDescribing>::try_new(
+            &store,
+            &path,
+            schema.clone(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        file_writer.write(&[data]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let page_table = file_writer.page_table;
+        assert!(page_table.get(0, 0).is_some());
+        assert!(page_table.get(2, 0).is_some());
     }
 }

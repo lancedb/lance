@@ -1,16 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 #
 # The following code is originally from https://github.com/pola-rs/polars/blob/ea4389c31b0e87ddf20a85e4c3797b285966edb6/py-polars/polars/dependencies.py
 # and is licensed under the MIT license:
@@ -19,6 +8,7 @@
 # https://github.com/pola-rs/polars/blob/main/LICENSE
 #
 # It has been modified by the Lance developers to fit the needs of the Lance project.
+
 
 from __future__ import annotations
 
@@ -34,6 +24,8 @@ _NUMPY_AVAILABLE = True
 _PANDAS_AVAILABLE = True
 _POLARS_AVAILABLE = True
 _TORCH_AVAILABLE = True
+_CAGRA_AVAILABLE = True
+_RAFT_COMMON_AVAILABLE = True
 _HUGGING_FACE_AVAILABLE = True
 _TENSORFLOW_AVAILABLE = True
 
@@ -195,37 +187,37 @@ def _might_be(cls: type, type_: str) -> bool:
 
 def _check_for_numpy(obj: Any, *, check_type: bool = True) -> bool:
     return _NUMPY_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "numpy"
+        cast("Hashable", type(obj) if check_type else obj), "numpy"
     )
 
 
 def _check_for_pandas(obj: Any, *, check_type: bool = True) -> bool:
     return _PANDAS_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "pandas"
+        cast("Hashable", type(obj) if check_type else obj), "pandas"
     )
 
 
 def _check_for_polars(obj: Any, *, check_type: bool = True) -> bool:
     return _POLARS_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "polars"
+        cast("Hashable", type(obj) if check_type else obj), "polars"
     )
 
 
 def _check_for_torch(obj: Any, *, check_type: bool = True) -> bool:
     return _TORCH_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "torch"
+        cast("Hashable", type(obj) if check_type else obj), "torch"
     )
 
 
 def _check_for_hugging_face(obj: Any, *, check_type: bool = True) -> bool:
     return _HUGGING_FACE_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "datasets"
+        cast("Hashable", type(obj) if check_type else obj), "datasets"
     )
 
 
 def _check_for_tensorflow(obj: Any, *, check_type: bool = True) -> bool:
     return _TENSORFLOW_AVAILABLE and _might_be(
-        cast(Hashable, type(obj) if check_type else obj), "tensorflow"
+        cast("Hashable", type(obj) if check_type else obj), "tensorflow"
     )
 
 

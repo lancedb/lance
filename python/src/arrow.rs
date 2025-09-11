@@ -19,7 +19,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
 use lance::arrow::bfloat16::BFloat16Array;
-use lance_arrow::bfloat16::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+use lance::arrow::bfloat16::BFLOAT16_EXT_NAME;
+use lance::arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use pyo3::{exceptions::PyValueError, prelude::*, pyclass::CompareOp, types::PyType};
 
 #[pyclass]
@@ -33,7 +34,7 @@ impl BFloat16 {
     }
 
     #[classmethod]
-    fn from_bytes(_cls: &PyType, bytes: &[u8]) -> PyResult<Self> {
+    fn from_bytes(_cls: &Bound<'_, PyType>, bytes: &[u8]) -> PyResult<Self> {
         if bytes.len() != 2 {
             PyValueError::new_err(format!(
                 "BFloat16::from_bytes: expected 2 bytes, got {}",

@@ -1,16 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 
 """Tensorflow Dataset (`tf.data <https://www.tensorflow.org/guide/data>`_)
@@ -23,7 +12,6 @@ implementation for Lance.
 
 from __future__ import annotations
 
-import logging
 from functools import partial
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -36,6 +24,7 @@ from lance.dependencies import _check_for_numpy
 from lance.dependencies import numpy as np
 from lance.dependencies import tensorflow as tf
 from lance.fragment import FragmentMetadata, LanceFragment
+from lance.log import LOGGER
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -226,7 +215,7 @@ def from_lance(
                 ):
                     yield LanceFragment(dataset, int(f))
                 elif isinstance(f, FragmentMetadata):
-                    yield LanceFragment(dataset, f.fragment_id)
+                    yield LanceFragment(dataset, f.id)
                 elif isinstance(f, LanceFragment):
                     yield f
                 else:
@@ -242,7 +231,7 @@ def from_lance(
     if output_signature is None:
         schema = scanner.projected_schema
         output_signature = schema_to_spec(schema)
-    logging.debug("Output signature: %s", output_signature)
+    LOGGER.debug("Output signature: %s", output_signature)
 
     def generator():
         for batch in scanner.to_batches():
@@ -264,9 +253,9 @@ def lance_fragments(dataset: Union[str, Path, LanceDataset]) -> tf.data.Dataset:
     """
     if not isinstance(dataset, LanceDataset):
         dataset = lance.dataset(dataset)
-    return tf.data.Dataset.from_tensor_slices([
-        f.fragment_id for f in dataset.get_fragments()
-    ])
+    return tf.data.Dataset.from_tensor_slices(
+        [f.fragment_id for f in dataset.get_fragments()]
+    )
 
 
 def _ith_batch(i: int, batch_size: int, total_size: int) -> Tuple[int, int]:
@@ -326,7 +315,7 @@ def lance_take_batches(
     dataset: Union[str, Path, LanceDataset],
     batch_ranges: Iterable[Tuple[int, int]],
     *,
-    columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    columns: Optional[List[str]] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
     batch_readahead: int = 10,
 ) -> tf.data.Dataset:
@@ -367,7 +356,7 @@ def lance_take_batches(
     if output_signature is None:
         schema = dataset.scanner(columns=columns).projected_schema
         output_signature = schema_to_spec(schema)
-    logging.debug("Output signature: %s", output_signature)
+    LOGGER.debug("Output signature: %s", output_signature)
 
     def gen_ranges():
         for start, end in batch_ranges:

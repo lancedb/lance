@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
 use std::{any::Any, ops::Bound, sync::Arc};
@@ -23,13 +12,20 @@ use async_trait::async_trait;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
+use deepsize::DeepSizeOf;
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::Result;
+use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
+use snafu::location;
 
+use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
+use super::{AnyQuery, MetricsCollector, SargableQuery, SearchResult};
+use crate::scalar::btree::{BTREE_IDS_COLUMN, BTREE_VALUES_COLUMN};
+use crate::scalar::registry::VALUE_COLUMN_NAME;
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
-
-use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex, ScalarQuery};
 
 /// A flat index is just a batch of value/row-id pairs
 ///
@@ -40,6 +36,13 @@ use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex, ScalarQuery};
 #[derive(Debug)]
 pub struct FlatIndex {
     data: Arc<RecordBatch>,
+    has_nulls: bool,
+}
+
+impl DeepSizeOf for FlatIndex {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.data.get_array_memory_size()
+    }
 }
 
 impl FlatIndex {
@@ -76,7 +79,7 @@ fn remap_batch(batch: RecordBatch, mapping: &HashMap<u64, Option<u64>>) -> Resul
     );
     let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
     Ok(RecordBatch::try_new(
-        batch.schema().clone(),
+        batch.schema(),
         vec![new_vals, new_ids],
     )?)
 }
@@ -89,11 +92,29 @@ pub struct FlatIndexMetadata {
     schema: Arc<Schema>,
 }
 
+impl DeepSizeOf for FlatIndexMetadata {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.schema.metadata.deep_size_of_children(context)
+            + self
+                .schema
+                .fields
+                .iter()
+                // This undercounts slightly because it doesn't account for the size of the
+                // field data types
+                .map(|f| {
+                    std::mem::size_of::<Field>()
+                        + f.name().deep_size_of_children(context)
+                        + f.metadata().deep_size_of_children(context)
+                })
+                .sum::<usize>()
+    }
+}
+
 impl FlatIndexMetadata {
     pub fn new(value_type: DataType) -> Self {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("values", value_type, true),
-            Field::new("row_ids", DataType::UInt64, true),
+            Field::new(BTREE_VALUES_COLUMN, value_type, true),
+            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, true),
         ]));
         Self { schema }
     }
@@ -110,13 +131,18 @@ impl BTreeSubIndex for FlatIndexMetadata {
         // the schema
         Ok(RecordBatch::try_new(
             self.schema.clone(),
-            vec![batch.column(0).clone(), batch.column(1).clone()],
+            vec![
+                batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
+                batch.column_by_name(ROW_ID).expect_ok()?.clone(),
+            ],
         )?)
     }
 
     async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>> {
+        let has_nulls = serialized.column(0).null_count() > 0;
         Ok(Arc::new(FlatIndex {
             data: Arc::new(serialized),
+            has_nulls,
         }))
     }
 
@@ -143,8 +169,20 @@ impl Index for FlatIndex {
         self
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::NotSupported {
+            source: "FlatIndex is not vector index".into(),
+            location: location!(),
+        })
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Scalar
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        // There is nothing to pre-warm
+        Ok(())
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -158,7 +196,7 @@ impl Index for FlatIndex {
             .ids()
             .as_primitive::<UInt64Type>()
             .iter()
-            .map(|row_id| RowAddress::new_from_id(row_id.unwrap()).fragment_id())
+            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
             .collect::<Vec<_>>();
         frag_ids.sort();
         frag_ids.dedup();
@@ -168,16 +206,32 @@ impl Index for FlatIndex {
 
 #[async_trait]
 impl ScalarIndex for FlatIndex {
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        metrics.record_comparisons(self.data.num_rows());
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
-        let predicate = match query {
-            ScalarQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?,
-            ScalarQuery::IsNull() => arrow::compute::is_null(self.values())?,
-            ScalarQuery::IsIn(values) => {
+        let mut predicate = match query {
+            SargableQuery::Equals(value) => {
+                if value.is_null() {
+                    arrow::compute::is_null(self.values())?
+                } else {
+                    arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
+                }
+            }
+            SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
+            SargableQuery::IsIn(values) => {
+                let mut has_null = false;
                 let choices = values
                     .iter()
-                    .map(|val| lit(val.clone()))
+                    .map(|val| {
+                        has_null |= val.is_null();
+                        lit(val.clone())
+                    })
                     .collect::<Vec<_>>();
                 let in_list_expr = in_list(
                     Arc::new(Column::new("values", 0)),
@@ -186,14 +240,22 @@ impl ScalarIndex for FlatIndex {
                     &self.data.schema(),
                 )?;
                 let result_col = in_list_expr.evaluate(&self.data)?;
-                result_col
+                let predicate = result_col
                     .into_array(self.data.num_rows())?
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .expect("InList evaluation should return boolean array")
-                    .clone()
+                    .clone();
+
+                // Arrow's in_list does not handle nulls so we need to join them in here if user asked for them
+                if has_null && self.has_nulls {
+                    let nulls = arrow::compute::is_null(self.values())?;
+                    arrow::compute::or(&predicate, &nulls)?
+                } else {
+                    predicate
+                }
             }
-            ScalarQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
+            SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
                 (Bound::Unbounded, Bound::Unbounded) => {
                     panic!("Scalar range query received with no upper or lower bound")
                 }
@@ -226,94 +288,100 @@ impl ScalarIndex for FlatIndex {
                     &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
                 )?,
             },
+            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for flat index, build a inverted index for it",
+                location!(),
+            )),
         };
-        Ok(arrow_select::filter::filter(self.ids(), &predicate)?
+        if self.has_nulls && matches!(query, SargableQuery::Range(_, _)) {
+            // Arrow's comparison kernels do not return false for nulls.  They consider nulls to
+            // be less than any value.  So we need to filter out the nulls manually.
+            let valid_values = arrow::compute::is_not_null(self.values())?;
+            predicate = arrow::compute::and(&valid_values, &predicate)?;
+        }
+        let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
+        let matching_ids = matching_ids
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .expect("Result of arrow_select::filter::filter did not match input type")
-            .clone())
+            .expect("Result of arrow_select::filter::filter did not match input type");
+        Ok(SearchResult::Exact(RowIdTreeMap::from_iter(
+            matching_ids.values(),
+        )))
     }
 
-    // Note that there is no write/train method for flat index at the moment and so it isn't
-    // really possible for this method to be called.  If there was we assume it will write all
-    // data as a single batch named data.lance
-    async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
-        let batches = store.open_index_file("data.lance").await?;
-        let batch = batches.read_record_batch(0).await?;
-        Ok(Arc::new(Self {
-            data: Arc::new(batch),
-        }))
+    fn can_remap(&self) -> bool {
+        true
     }
 
     // Same as above, this is dead code at the moment but should work
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
-        dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        let remapped = remap_batch((*self.data).clone(), mapping)?;
-        let mut writer = dest_store
-            .new_index_file("data.lance", remapped.schema())
-            .await?;
-        writer.write_record_batch(remapped).await?;
-        writer.finish().await?;
-        Ok(())
+        _mapping: &HashMap<u64, Option<u64>>,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        unimplemented!()
     }
 
     async fn update(
         &self,
         _new_data: SendableRecordBatchStream,
         _dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         // If this was desired, then you would need to merge new_data and data and write it back out
-        todo!()
+        unimplemented!()
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        unimplemented!()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::metrics::NoOpMetricsCollector;
+
     use super::*;
     use arrow_array::types::Int32Type;
-    use arrow_array::types::UInt64Type;
     use datafusion_common::ScalarValue;
-    use lance_datagen::{array, gen, RowCount};
+    use lance_datagen::{array, gen_batch, RowCount};
 
     fn example_index() -> FlatIndex {
-        let batch = gen()
+        let batch = gen_batch()
             .col(
-                Some("values".to_string()),
+                "values",
                 array::cycle::<Int32Type>(vec![10, 100, 1000, 1234]),
             )
-            .col(
-                Some("ids".to_string()),
-                array::cycle::<UInt64Type>(vec![5, 0, 3, 100]),
-            )
+            .col("ids", array::cycle::<UInt64Type>(vec![5, 0, 3, 100]))
             .into_batch_rows(RowCount::from(4))
             .unwrap();
 
         FlatIndex {
             data: Arc::new(batch),
+            has_nulls: false,
         }
     }
 
-    async fn check_index(query: &ScalarQuery, expected: &[u64]) {
+    async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
-        let actual = index.search(query).await.unwrap();
-        let expected = UInt64Array::from_iter_values(expected.iter().copied());
-        assert_eq!(actual, expected);
+        let actual = index.search(query, &NoOpMetricsCollector).await.unwrap();
+        let SearchResult::Exact(actual_row_ids) = actual else {
+            panic! {"Expected exact search result"}
+        };
+        let expected = RowIdTreeMap::from_iter(expected);
+        assert_eq!(actual_row_ids, expected);
     }
 
     #[tokio::test]
     async fn test_equality() {
-        check_index(&ScalarQuery::Equals(ScalarValue::from(100)), &[0]).await;
-        check_index(&ScalarQuery::Equals(ScalarValue::from(10)), &[5]).await;
-        check_index(&ScalarQuery::Equals(ScalarValue::from(5)), &[]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(100)), &[0]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(10)), &[5]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(5)), &[]).await;
     }
 
     #[tokio::test]
     async fn test_range() {
         check_index(
-            &ScalarQuery::Range(
+            &SargableQuery::Range(
                 Bound::Included(ScalarValue::from(100)),
                 Bound::Excluded(ScalarValue::from(1234)),
             ),
@@ -321,17 +389,17 @@ mod tests {
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::from(1000))),
+            &SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::from(1000))),
             &[5, 0],
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Included(ScalarValue::from(0)), Bound::Unbounded),
+            &SargableQuery::Range(Bound::Included(ScalarValue::from(0)), Bound::Unbounded),
             &[5, 0, 3, 100],
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Included(ScalarValue::from(100000)), Bound::Unbounded),
+            &SargableQuery::Range(Bound::Included(ScalarValue::from(100000)), Bound::Unbounded),
             &[],
         )
         .await;
@@ -340,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_in() {
         check_index(
-            &ScalarQuery::IsIn(vec![
+            &SargableQuery::IsIn(vec![
                 ScalarValue::from(100),
                 ScalarValue::from(1234),
                 ScalarValue::from(3000),
@@ -363,15 +431,9 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = gen()
-            .col(
-                Some("values".to_string()),
-                array::cycle::<Int32Type>(vec![10, 100, 1234]),
-            )
-            .col(
-                Some("ids".to_string()),
-                array::cycle::<UInt64Type>(vec![5, 2000, 100]),
-            )
+        let expected = gen_batch()
+            .col("values", array::cycle::<Int32Type>(vec![10, 100, 1234]))
+            .col("ids", array::cycle::<UInt64Type>(vec![5, 2000, 100]))
             .into_batch_rows(RowCount::from(3))
             .unwrap();
         assert_eq!(remapped, expected);

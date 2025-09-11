@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 // Keep the tests in `lance` crate because it has dependency on [Dataset].
 //
@@ -18,65 +7,69 @@
 // since these tests applies to all external manifest stores,
 // we should move them to a common place
 // https://github.com/lancedb/lance/issues/1208
-//
-// The tests are linux only because
-// GHA Mac runner doesn't have docker, which is required to run dynamodb-local
 // Windows FS can't handle concurrent copy
-#[cfg(all(test, target_os = "linux", feature = "dynamodb_tests"))]
+#[cfg(all(test, not(target_os = "windows")))]
 mod test {
+    macro_rules! base_uri {
+        () => {
+            "base_uri"
+        };
+    }
+    macro_rules! version {
+        () => {
+            "version"
+        };
+    }
+
     use std::sync::Arc;
 
     use aws_credential_types::Credentials;
     use aws_sdk_dynamodb::{
         config::Region,
         types::{
-            AttributeDefinition, KeySchemaElement, ProvisionedThroughput, ScalarAttributeType,
+            AttributeDefinition, KeySchemaElement, KeyType, ProvisionedThroughput,
+            ScalarAttributeType,
         },
+        Client,
     };
-    use futures::{future::join_all, StreamExt, TryStreamExt};
+    use futures::future::join_all;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
 
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
-        io::{
-            commit::{
-                external_manifest::ExternalManifestCommitHandler, latest_manifest_path,
-                manifest_path, CommitHandler,
-            },
-            object_store::ObjectStoreParams,
-        },
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         Dataset,
+    };
+    use lance_table::io::commit::{
+        dynamodb::DynamoDBExternalManifestStore,
+        external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
+        CommitHandler, ManifestNamingScheme,
     };
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
         ReadParams {
-            store_options: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
 
     fn write_params(handler: Arc<dyn CommitHandler>) -> WriteParams {
         WriteParams {
-            store_params: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
 
     async fn make_dynamodb_store() -> Arc<dyn ExternalManifestStore> {
         let dynamodb_local_config = aws_sdk_dynamodb::config::Builder::new()
+            .behavior_version_latest()
             .endpoint_url(
                 // url for dynamodb-local
-                "http://localhost:8000",
+                "http://localhost:4566",
             )
             .region(Some(Region::new("us-east-1")))
-            .credentials_provider(Credentials::new("DUMMYKEY", "DUMMYKEY", None, None, ""))
+            .credentials_provider(Credentials::new("ACCESS_KEY", "SECRET_KEY", None, None, ""))
             .build();
 
         let table_name = uuid::Uuid::new_v4().to_string();
@@ -89,31 +82,36 @@ mod test {
                 KeySchemaElement::builder()
                     .attribute_name(base_uri!())
                     .key_type(KeyType::Hash)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .key_schema(
                 KeySchemaElement::builder()
                     .attribute_name(version!())
                     .key_type(KeyType::Range)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name(base_uri!())
                     .attribute_type(ScalarAttributeType::S)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name(version!())
                     .attribute_type(ScalarAttributeType::N)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .provisioned_throughput(
                 ProvisionedThroughput::builder()
                     .read_capacity_units(10)
                     .write_capacity_units(10)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await
@@ -137,16 +135,19 @@ mod test {
             .to_string()
             .starts_with("Not found: dynamodb not found: base_uri: test; version: 1"));
         // try to use the API for finalizing should return err when the version is DNE
-        assert!(store.put_if_exists("test", 1, "test").await.is_err());
+        assert!(store
+            .put_if_exists("test", 1, "test", 4, None)
+            .await
+            .is_err());
 
         // Put a new version should work
         assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized")
+            .put_if_not_exists("test", 1, "test.unfinalized", 4, None)
             .await
             .is_ok());
         // put again should get err
         assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized_1")
+            .put_if_not_exists("test", 1, "test.unfinalized_1", 4, None)
             .await
             .is_err());
 
@@ -159,7 +160,7 @@ mod test {
 
         // Put a new version should work again
         assert!(store
-            .put_if_not_exists("test", 2, "test.unfinalized_2")
+            .put_if_not_exists("test", 2, "test.unfinalized_2", 4, None)
             .await
             .is_ok());
         // latest should see update
@@ -169,7 +170,10 @@ mod test {
         );
 
         // try to finalize should work on existing version
-        assert!(store.put_if_exists("test", 2, "test").await.is_ok());
+        assert!(store
+            .put_if_exists("test", 2, "test", 4, None)
+            .await
+            .is_ok());
 
         // latest should see update
         assert_eq!(
@@ -178,6 +182,9 @@ mod test {
         );
         // get should see new data
         assert_eq!(store.get("test", 2).await.unwrap(), "test");
+
+        store.delete("test").await.unwrap();
+        assert_eq!(store.get_latest_version("test").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -196,7 +203,7 @@ mod test {
             external_manifest_store: store,
         };
         let options = read_params(Arc::new(handler));
-        Dataset::open_with_params(ds_uri, &options).await.expect(
+        DatasetBuilder::from_uri(ds_uri).with_read_params(options).load().await.expect(
             "If this fails, it means the external store handler does not correctly handle the case when a dataset exist, but it has never used external store before."
         );
     }
@@ -219,10 +226,12 @@ mod test {
             .unwrap();
 
         // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 100);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 100);
     }
 
     #[tokio::test]
@@ -267,10 +276,12 @@ mod test {
         assert!(errors.is_empty(), "{:?}", errors);
 
         // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
     }
 
     #[tokio::test]
@@ -303,46 +314,60 @@ mod test {
 
         // manually simulate last version is out of sync
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
-        localfs.delete(&manifest_path(&ds.base, 6)).await.unwrap();
+        // Move version 6 to a temporary location, put that in the store.
+        let base_path = Path::parse(ds_uri).unwrap();
+        let version_six_staging_location =
+            base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
-            .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
+            .rename(
+                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
+                &version_six_staging_location,
+            )
             .await
             .unwrap();
-        // set the store back to dataset path with -{uuid} suffix
-        let mut version_six = localfs
-            .list(Some(&ds.base))
+        let size = localfs
+            .head(&version_six_staging_location)
             .await
             .unwrap()
-            .try_filter(|p| {
-                let p = p.clone();
-                async move { p.location.filename().unwrap().starts_with("6.manifest-") }
-            })
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(version_six.len(), 1);
-        let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
+            .size as u64;
         store
-            .put_if_exists(ds.base.as_ref(), 6, version_six_staging_location.as_ref())
+            .put_if_exists(
+                ds.base.as_ref(),
+                6,
+                version_six_staging_location.as_ref(),
+                size,
+                None,
+            )
             .await
             .unwrap();
 
         // Open without external store handler, should not see the out-of-sync commit
         let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(params)
+            .load()
+            .await
+            .unwrap();
         assert_eq!(ds.version().version, 5);
-        assert_eq!(ds.count_rows().await.unwrap(), 50);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 50);
 
         // Open with external store handler, should sync the out-of-sync commit on open
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         // Open without external store handler again, should see the newly sync'd commit
         let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(params)
+            .load()
+            .await
+            .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
     }
 }

@@ -1,0 +1,9 @@
+from typing import Callable, Optional
+
+class TraceEvent:
+    target: str
+    message: str
+
+def trace_to_chrome(file: Optional[str] = None): ...
+def capture_trace_events(callback: Callable[[TraceEvent], None]): ...
+def shutdown_tracing(): ...

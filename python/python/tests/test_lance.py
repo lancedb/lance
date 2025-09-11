@@ -1,16 +1,5 @@
-#  Copyright (c) 2023. Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import lance
 import lance.arrow
@@ -140,8 +129,6 @@ def test_create_index(tmp_path):
         dataset.create_index("emb", "IVF_PQ")
     with pytest.raises(ValueError):
         dataset.create_index("emb", "IVF_PQ", num_partitions=5)
-    with pytest.raises(ValueError):
-        dataset.create_index("emb", "IVF_PQ", num_sub_vectors=4)
     with pytest.raises(KeyError):
         dataset.create_index("foo", "IVF_PQ", num_partitions=5, num_sub_vectors=16)
     with pytest.raises(NotImplementedError):
@@ -163,7 +150,7 @@ def test_create_index_shuffle_params(tmp_path):
         shuffle_partition_concurrency=10,
     )
 
-    validate_vector_index(dataset, "emb")
+    validate_vector_index(dataset, "emb", sample_size=100)
 
 
 def _create_dataset(uri, num_batches=1):
@@ -182,10 +169,12 @@ def _create_dataset(uri, num_batches=1):
 
 
 def test_schema_to_json():
-    schema = pa.schema([
-        pa.field("embedding", pa.list_(pa.float32(), 32), False),
-        pa.field("id", pa.int64(), True),
-    ])
+    schema = pa.schema(
+        [
+            pa.field("embedding", pa.list_(pa.float32(), 32), False),
+            pa.field("id", pa.int64(), True),
+        ]
+    )
     json_schema = lance.schema_to_json(schema)
     assert json_schema == {
         "fields": [
@@ -222,15 +211,19 @@ def sample_data_all_types():
     storage = pa.FixedSizeListArray.from_arrays(inner, 6)
     tensor_array = pa.ExtensionArray.from_storage(tensor_type, storage)
 
-    return pa.table({
-        # TODO: add remaining types
-        "str": pa.array([str(i) for i in range(nrows)]),
-        "float16": pa.array(
-            [np.float16(1.0 + i / 10) for i in range(nrows)], pa.float16()
-        ),
-        "bfloat16": lance.arrow.bfloat16_array([1.0 + i / 10 for i in range(nrows)]),
-        "tensor": tensor_array,
-    })
+    return pa.table(
+        {
+            # TODO: add remaining types
+            "str": pa.array([str(i) for i in range(nrows)]),
+            "float16": pa.array(
+                [np.float16(1.0 + i / 10) for i in range(nrows)], pa.float16()
+            ),
+            "bfloat16": lance.arrow.bfloat16_array(
+                [1.0 + i / 10 for i in range(nrows)]
+            ),
+            "tensor": tensor_array,
+        }
+    )
 
 
 def test_roundtrip_types(tmp_path, sample_data_all_types):
@@ -244,3 +237,43 @@ def test_roundtrip_schema(tmp_path):
     data = pa.table({"a": [1.0, 2.0]}).to_batches()
     dataset = lance.write_dataset(data, tmp_path, schema=schema)
     assert dataset.schema == schema
+
+
+def test_io_counters(tmp_path):
+    starting_iops = lance.iops_counter()
+    starting_bytes = lance.bytes_read_counter()
+    dataset = lance.write_dataset(pa.table({"a": [1, 2, 3]}), tmp_path)
+    dataset.to_table()
+    assert lance.iops_counter() > starting_iops
+    assert lance.bytes_read_counter() > starting_bytes
+
+
+@pytest.mark.parametrize(
+    "row_param, column_name",
+    [("with_row_id", "_rowid"), ("with_row_address", "_rowaddr")],
+)
+def test_with_row_id(tmp_path, row_param, column_name):
+    path = tmp_path / "test_with_inner_column.lance"
+    data = pa.table(
+        {
+            "data_item_id": pa.array([1001, 1002, 1003]),
+            "a": pa.array([1, 2, 3]),
+        }
+    )
+
+    lance.write_dataset(data, path)
+    lance_ds = lance.dataset(path)
+
+    scanner_args = {row_param: True, "columns": ["data_item_id", column_name]}
+    table = lance_ds.scanner(**scanner_args).to_table()
+    assert table.column(column_name).type == pa.uint64()
+
+    scanner_args = {row_param: True, "columns": ["data_item_id"]}
+    table = lance_ds.scanner(**scanner_args).to_table()
+    assert column_name in table.column_names
+    assert table.column(column_name).type == pa.uint64()
+
+    table = lance_ds.scanner(
+        **{row_param: False, "columns": ["data_item_id", column_name]}
+    ).to_table()
+    assert column_name in table.column_names

@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use futures::Stream;
 use pin_project::pin_project;
@@ -44,6 +33,11 @@ pub trait StreamTracingExt {
     where
         Self: Stream,
         Self: Sized;
+
+    fn stream_in_span(self, span: Span) -> InstrumentedStream<Self>
+    where
+        Self: Stream,
+        Self: Sized;
 }
 
 impl<S: Stream> StreamTracingExt for S {
@@ -52,9 +46,41 @@ impl<S: Stream> StreamTracingExt for S {
         Self: Stream,
         Self: Sized,
     {
-        InstrumentedStream {
-            stream: self,
-            span: Span::current(),
-        }
+        self.stream_in_span(Span::current())
+    }
+
+    fn stream_in_span(self, span: Span) -> InstrumentedStream<Self>
+    where
+        Self: Stream,
+        Self: Sized,
+    {
+        InstrumentedStream { stream: self, span }
     }
 }
+
+pub const TRACE_FILE_AUDIT: &str = "lance::file_audit";
+pub const AUDIT_MODE_CREATE: &str = "create";
+pub const AUDIT_MODE_DELETE: &str = "delete";
+pub const AUDIT_MODE_DELETE_UNVERIFIED: &str = "delete_unverified";
+pub const AUDIT_TYPE_DELETION: &str = "deletion";
+pub const AUDIT_TYPE_MANIFEST: &str = "manifest";
+pub const AUDIT_TYPE_INDEX: &str = "index";
+pub const AUDIT_TYPE_DATA: &str = "data";
+pub const TRACE_FILE_CREATE: &str = "create";
+pub const TRACE_IO_EVENTS: &str = "lance::io_events";
+pub const IO_TYPE_OPEN_SCALAR: &str = "open_scalar_index";
+pub const IO_TYPE_OPEN_VECTOR: &str = "open_vector_index";
+pub const IO_TYPE_OPEN_FRAG_REUSE: &str = "open_frag_reuse_index";
+pub const IO_TYPE_OPEN_MEM_WAL: &str = "open_mem_wal_index";
+pub const IO_TYPE_LOAD_VECTOR_PART: &str = "load_vector_part";
+pub const IO_TYPE_LOAD_SCALAR_PART: &str = "load_scalar_part";
+pub const TRACE_EXECUTION: &str = "lance::execution";
+pub const EXECUTION_PLAN_RUN: &str = "plan_run";
+pub const TRACE_DATASET_EVENTS: &str = "lance::dataset_events";
+pub const DATASET_WRITING_EVENT: &str = "writing";
+pub const DATASET_COMMITTED_EVENT: &str = "committed";
+pub const DATASET_DROPPING_COLUMN_EVENT: &str = "dropping_column";
+pub const DATASET_DELETING_EVENT: &str = "deleting";
+pub const DATASET_COMPACTING_EVENT: &str = "compacting";
+pub const DATASET_CLEANING_EVENT: &str = "cleaning";
+pub const DATASET_LOADING_EVENT: &str = "loading";

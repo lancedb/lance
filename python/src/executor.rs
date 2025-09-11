@@ -31,6 +31,9 @@ pub struct BackgroundExecutor {
 }
 
 impl BackgroundExecutor {
+    pub fn get_runtime_handle(&self) -> Option<tokio::runtime::Handle> {
+        Some(self.runtime.handle().clone())
+    }
     /// Creates a tokio runtime and spawns a thread to run it.
     pub fn new() -> Self {
         // Create a new Runtime to run tasks

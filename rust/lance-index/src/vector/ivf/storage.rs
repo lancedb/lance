@@ -1,60 +1,148 @@
-// Copyright 2024 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Range;
-use std::sync::Arc;
 
-use arrow_array::FixedSizeListArray;
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt32Array};
+use deepsize::DeepSizeOf;
+use itertools::Itertools;
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
+use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use log::debug;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::pb::Ivf as PbIvf;
 
-const IVF_METADATA_KEY: &str = "lance:ivf";
+pub const IVF_METADATA_KEY: &str = "lance:ivf";
+pub const IVF_PARTITION_KEY: &str = "lance:ivf:partition";
 
-#[warn(dead_code)]
-#[derive(Debug, PartialEq)]
-pub struct IvfData {
-    /// Centroids of the IVF indices. Can be empty.
-    centroids: Option<Arc<FixedSizeListArray>>,
+/// Ivf Model
+#[derive(Debug, Clone, PartialEq)]
+pub struct IvfModel {
+    /// Centroids of each partition.
+    ///
+    /// It is a 2-D `(num_partitions * dimension)` of vector array.
+    pub centroids: Option<FixedSizeListArray>,
 
-    /// Length of each partition.
-    lengths: Vec<u32>,
+    /// Offset of each partition in the file.
+    pub offsets: Vec<usize>,
 
-    /// pre-computed row offset for each partition, do not persist.
-    partition_row_offsets: Vec<usize>,
+    /// Number of vectors in each partition.
+    pub lengths: Vec<u32>,
+
+    /// Kmeans loss
+    pub loss: Option<f64>,
 }
 
-/// The IVF metadata stored in the Lance Schema
-#[derive(Serialize, Deserialize, Debug)]
-struct IvfMetadata {
-    // The file position to store the protobuf binary of IVF metadata.
-    pb_position: usize,
+impl DeepSizeOf for IvfModel {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.centroids
+            .as_ref()
+            .map(|centroids| centroids.get_array_memory_size())
+            .unwrap_or_default()
+            + self.lengths.deep_size_of_children(context)
+            + self.offsets.deep_size_of_children(context)
+    }
 }
 
-impl IvfData {
+impl IvfModel {
     pub fn empty() -> Self {
         Self {
             centroids: None,
+            offsets: vec![],
             lengths: vec![],
-            partition_row_offsets: vec![0],
+            loss: None,
         }
+    }
+
+    pub fn new(centroids: FixedSizeListArray, loss: Option<f64>) -> Self {
+        Self {
+            centroids: Some(centroids),
+            offsets: vec![],
+            lengths: vec![],
+            loss,
+        }
+    }
+
+    pub fn centroid(&self, partition: usize) -> Option<ArrayRef> {
+        self.centroids.as_ref().map(|c| c.value(partition))
+    }
+
+    /// Ivf model dimension.
+    pub fn dimension(&self) -> usize {
+        self.centroids
+            .as_ref()
+            .map(|c| c.value_length() as usize)
+            .unwrap_or(0)
+    }
+
+    /// Number of IVF partitions.
+    pub fn num_partitions(&self) -> usize {
+        self.centroids
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or_else(|| self.offsets.len())
+    }
+
+    pub fn partition_size(&self, part: usize) -> usize {
+        self.lengths[part] as usize
+    }
+
+    pub fn num_rows(&self) -> u64 {
+        self.lengths.iter().map(|x| *x as u64).sum()
+    }
+
+    pub fn loss(&self) -> Option<f64> {
+        self.loss
+    }
+
+    /// Use the query vector to find `nprobes` closest partitions.
+    pub fn find_partitions(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+        distance_type: DistanceType,
+    ) -> Result<UInt32Array> {
+        let internal = crate::vector::ivf::new_ivf_transformer(
+            self.centroids.clone().unwrap(),
+            distance_type,
+            vec![],
+        );
+        internal.find_partitions(query, nprobes)
+    }
+
+    /// Add the offset and length of one partition.
+    pub fn add_partition(&mut self, len: u32) {
+        self.offsets.push(
+            self.offsets.last().cloned().unwrap_or_default()
+                + self.lengths.last().cloned().unwrap_or_default() as usize,
+        );
+        self.lengths.push(len);
+    }
+
+    /// Add the offset and length of one partition with the given offset.
+    /// this is used for old index format of IVF_PQ.
+    pub fn add_partition_with_offset(&mut self, offset: usize, len: u32) {
+        self.offsets.push(offset);
+        self.lengths.push(len);
+    }
+
+    /// Get a reference to all centroids as a [`FixedSizeListArray`].
+    ///
+    /// Returns `None` if the model does not contain centroids
+    pub fn centroids_array(&self) -> Option<&FixedSizeListArray> {
+        self.centroids.as_ref()
+    }
+
+    pub fn row_range(&self, partition: usize) -> Range<usize> {
+        let start = self.offsets[partition];
+        let end = start + self.lengths[partition] as usize;
+        start..end
     }
 
     pub async fn load(reader: &FileReader) -> Result<Self> {
@@ -85,80 +173,85 @@ impl IvfData {
         writer.add_metadata(IVF_METADATA_KEY, &serde_json::to_string(&ivf_metadata)?);
         Ok(())
     }
+}
 
-    pub fn add_partition(&mut self, num_rows: u32) {
-        self.lengths.push(num_rows);
-        let last_offset = self.partition_row_offsets.last().copied().unwrap_or(0);
-        self.partition_row_offsets
-            .push(last_offset + num_rows as usize);
-    }
+/// Convert IvfModel to protobuf.
+impl TryFrom<&IvfModel> for PbIvf {
+    type Error = Error;
 
-    pub fn has_centroids(&self) -> bool {
-        self.centroids.is_some()
-    }
+    fn try_from(ivf: &IvfModel) -> Result<Self> {
+        let lengths = ivf.lengths.clone();
 
-    pub fn num_partitions(&self) -> usize {
-        self.lengths.len()
-    }
-
-    /// Range of the rows for one partition.
-    pub fn row_range(&self, partition: usize) -> Range<usize> {
-        let start = self.partition_row_offsets[partition];
-        let end = self.partition_row_offsets[partition + 1];
-        start..end
+        Ok(Self {
+            centroids: vec![], // Deprecated
+            lengths,
+            offsets: ivf.offsets.iter().map(|x| *x as u64).collect(),
+            centroids_tensor: ivf.centroids.as_ref().map(|c| c.try_into()).transpose()?,
+            loss: ivf.loss,
+        })
     }
 }
 
-impl TryFrom<PbIvf> for IvfData {
+/// Convert IvfModel to protobuf.
+impl TryFrom<PbIvf> for IvfModel {
     type Error = Error;
 
     fn try_from(proto: PbIvf) -> Result<Self> {
         let centroids = if let Some(tensor) = proto.centroids_tensor.as_ref() {
+            // For new index format and IVFIndex
             debug!("Ivf: loading IVF centroids from index format v2");
-            Some(Arc::new(FixedSizeListArray::try_from(tensor)?))
+            Some(FixedSizeListArray::try_from(tensor)?)
+        } else if !proto.centroids.is_empty() {
+            // For backward-compatibility
+            debug!("Ivf: loading IVF centroids from index format v1");
+            let f32_centroids = Float32Array::from(proto.centroids.clone());
+            let dimension = f32_centroids.len() / proto.lengths.len();
+            Some(FixedSizeListArray::try_new_from_values(
+                f32_centroids,
+                dimension as i32,
+            )?)
         } else {
+            // We also use IvfModel to track the offsets/lengths of sub-index like HNSW
+            // which does not have centroids.
             None
         };
         // We are not using offsets from the protobuf, which was the file offset in the
         // v1 index format. It will be deprecated soon.
         //
         // This new offset uses the row offset in the lance file.
-        let offsets = [0]
-            .iter()
-            .chain(proto.lengths.iter())
-            .scan(0_usize, |state, &x| {
-                *state += x as usize;
-                Some(*state)
-            });
+        let offsets = match proto.offsets.len() {
+            0 => proto
+                .lengths
+                .iter()
+                .scan(0_usize, |state, &x| {
+                    let old = *state;
+                    *state += x as usize;
+                    Some(old)
+                })
+                .collect_vec(),
+            _ => proto.offsets.iter().map(|x| *x as usize).collect(),
+        };
+        assert_eq!(offsets.len(), proto.lengths.len());
         Ok(Self {
             centroids,
-            lengths: proto.lengths.clone(),
-            partition_row_offsets: offsets.collect(),
+            offsets,
+            lengths: proto.lengths,
+            loss: proto.loss,
         })
     }
 }
 
-impl TryFrom<&IvfData> for PbIvf {
-    type Error = Error;
-
-    fn try_from(meta: &IvfData) -> Result<Self> {
-        let lengths = meta.lengths.clone();
-
-        Ok(Self {
-            centroids: vec![], // Deprecated
-            lengths,
-            offsets: vec![], // Deprecated
-            centroids_tensor: meta
-                .centroids
-                .as_ref()
-                .map(|c| c.as_ref().try_into())
-                .transpose()?,
-        })
-    }
+/// The IVF metadata stored in the Lance Schema
+#[derive(Serialize, Deserialize, Debug)]
+struct IvfMetadata {
+    // The file position to store the protobuf binary of IVF metadata.
+    pb_position: usize,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow_array::{Float32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_core::datatypes::Schema;
@@ -166,11 +259,13 @@ mod tests {
     use lance_table::format::SelfDescribingFileReader;
     use object_store::path::Path;
 
+    use crate::pb;
+
     use super::*;
 
     #[test]
     fn test_ivf_find_rows() {
-        let mut ivf = IvfData::empty();
+        let mut ivf = IvfModel::empty();
         ivf.add_partition(20);
         ivf.add_partition(50);
 
@@ -180,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_and_load() {
-        let mut ivf = IvfData::empty();
+        let mut ivf = IvfModel::empty();
         ivf.add_partition(20);
         ivf.add_partition(50);
 
@@ -210,8 +305,47 @@ mod tests {
             .unwrap();
         assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));
 
-        let ivf2 = IvfData::load(&reader).await.unwrap();
+        let ivf2 = IvfModel::load(&reader).await.unwrap();
         assert_eq!(ivf, ivf2);
         assert_eq!(ivf2.num_partitions(), 2);
+    }
+
+    #[test]
+    fn test_load_v1_format_ivf() {
+        // in v1 format, the centroids are stored as a flat array in field `centroids`.
+        let pb_ivf = pb::Ivf {
+            centroids: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            lengths: vec![2, 2],
+            offsets: vec![0, 2],
+            centroids_tensor: None,
+            loss: None,
+        };
+
+        let ivf = IvfModel::try_from(pb_ivf).unwrap();
+        assert_eq!(ivf.num_partitions(), 2);
+        assert_eq!(ivf.dimension(), 3);
+        assert_eq!(ivf.centroids.as_ref().unwrap().len(), 2);
+        assert_eq!(ivf.centroids.as_ref().unwrap().value_length(), 3);
+    }
+
+    #[test]
+    fn test_centroids_array_getter() {
+        use arrow_array::Float32Array;
+        // two centroids, dim = 2
+        let values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+        let centroids = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let ivf = IvfModel::new(centroids.clone(), None);
+        let out = ivf.centroids_array().unwrap();
+
+        // Validate that the returned array has expected structure
+        assert_eq!(out.len(), centroids.len());
+        assert_eq!(out.value_length(), centroids.value_length());
+
+        // Validate centroid accessor returns correct values for the first partition
+        let first = ivf.centroid(0).unwrap();
+        let first_vals = first.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(first_vals.len(), 2);
+        assert_eq!(first_vals.value(0), 1.0);
+        assert_eq!(first_vals.value(1), 2.0);
     }
 }

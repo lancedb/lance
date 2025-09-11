@@ -48,7 +48,8 @@ def ground_truth(
 
 def compute_recall(gt: np.ndarray, result: np.ndarray) -> float:
     recalls = [
-        np.isin(rst, gt_vector).sum() / rst.shape[0] for (rst, gt_vector) in zip(result, gt)
+        np.isin(rst, gt_vector).sum() / rst.shape[0]
+        for (rst, gt_vector) in zip(result, gt)
     ]
     return np.mean(recalls)
 

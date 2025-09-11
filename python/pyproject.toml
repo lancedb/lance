@@ -1,24 +1,25 @@
 [project]
 name = "pylance"
-dependencies = ["pyarrow>=12,<15.0.1", "numpy>=1.22"]
+dynamic = ["version"]
+dependencies = ["pyarrow>=14", "numpy>=1.22"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
-repository = "https://github.com/eto-ai/lance"
+repository = "https://github.com/lancedb/lance"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 keywords = [
     "data-format",
     "data-science",
     "machine-learning",
     "arrow",
-    "data-analytics"
+    "data-analytics",
 ]
 categories = [
     "database-implementations",
     "data-structures",
     "development-tools",
-    "science"
+    "science",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -29,7 +30,6 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -47,31 +47,52 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
+    "boto3",
     "datasets",
-    "duckdb; python_version<'3.12'", # TODO: remove when duckdb supports 3.12
+    "duckdb",
     "ml_dtypes",
     "pillow",
     "pandas",
     "polars[pyarrow,pandas]",
+    "psutil",
     "pytest",
-    "tensorflow; python_version<'3.12'", # TODO: remove when tensorflow supports 3.12
+    # Workardound for https://github.com/lancedb/lance/issues/4472
+    #
+    # tensorflow is broken on 2.20.0 with macOS ARM.
+    "tensorflow<=2.19.0",
     "tqdm",
+    # Need to align with the datafusion version we use at lance rust
+    "datafusion==49.0.0",
 ]
-dev = ["ruff==0.2.2"]
+dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 
 [tool.ruff]
-lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "CPY001", "B019"]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 
 [tool.ruff.lint.per-file-ignores]
-"*.pyi" = ["E302"]
+"*.pyi" = ["E301", "E302"]
 
-[tool.mypy]
-python_version = "3.11"
-check_untyped_defs = true
-warn_redundant_casts = true
-warn_unused_ignores = true
+[tool.pyright]
+pythonVersion = "3.12"
+# TODO: expand this list as we fix more files.
+include = [
+    "python/lance/util.py",
+    "python/lance/debug.py",
+    "python/lance/tracing.py",
+    "python/lance/dependencies.py",
+    "python/lance/schema.py",
+    "python/lance/file.py",
+    "python/lance/util.py",
+]
+# Dependencies like pyarrow make this difficult to enforce strictly.
+reportMissingTypeStubs = "warning"
+reportImportCycles = "error"
+reportUnusedImport = "error"
+reportPropertyTypeMismatch = "error"
+reportUnnecessaryCast = "error"
+
 
 [tool.pytest.ini_options]
 markers = [
@@ -80,10 +101,13 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
+    "recurring: marks tests as recurring tests",
 ]
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
+    # Boto3
+    'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
     # Pytorch 2.2 on Python 2.12

@@ -1,35 +1,23 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Dot product.
 
 use std::iter::Sum;
-use std::ops::{AddAssign, Neg};
+use std::ops::AddAssign;
 use std::sync::Arc;
 
 use crate::Error;
-use arrow_array::types::{Float16Type, Float64Type};
+use arrow_array::types::{Float16Type, Float64Type, Int8Type};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 use half::{bf16, f16};
-use lance_arrow::bfloat16::BFloat16Type;
-use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use lance_core::assume_eq;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::real::Real;
-use num_traits::AsPrimitive;
+use num_traits::{real::Real, AsPrimitive, Num};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -75,32 +63,26 @@ fn dot_scalar<
 
 /// Dot product.
 #[inline]
-pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
-where
-    T::ArrowType: Dot,
-{
-    T::ArrowType::dot(from, to)
+pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
+    T::dot(from, to)
 }
 
-/// Negative dot distance.
+/// Negative [Dot] distance.
 #[inline]
-pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
-where
-    T::ArrowType: Dot,
-{
-    T::ArrowType::dot(from, to).neg()
+pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
+    1.0 - T::dot(from, to)
 }
 
 /// Dot product
-pub trait Dot: ArrowFloatType {
+pub trait Dot: Num {
     /// Dot product.
-    fn dot(x: &[Self::Native], y: &[Self::Native]) -> f32;
+    fn dot(x: &[Self], y: &[Self]) -> f32;
 }
 
-impl Dot for BFloat16Type {
+impl Dot for bf16 {
     #[inline]
-    fn dot(x: &[bf16], y: &[bf16]) -> f32 {
-        dot_scalar::<bf16, f32, 32>(x, y)
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        dot_scalar::<Self, f32, 32>(x, y)
     }
 }
 
@@ -113,16 +95,20 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn dot_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn dot_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn dot_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_f16_lsx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn dot_f16_lasx(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
     }
 }
 
-impl Dot for Float16Type {
+impl Dot for f16 {
     #[inline]
-    fn dot(x: &[f16], y: &[f16]) -> f32 {
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -130,7 +116,7 @@ impl Dot for Float16Type {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {
@@ -140,14 +126,22 @@ impl Dot for Float16Type {
             SimdSupport::Avx2 => unsafe {
                 kernel::dot_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => dot_scalar::<f16, f32, 16>(x, y),
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                kernel::dot_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                kernel::dot_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            _ => dot_scalar::<Self, f32, 32>(x, y),
         }
     }
 }
 
-impl Dot for Float32Type {
+impl Dot for f32 {
     #[inline]
-    fn dot(x: &[f32], y: &[f32]) -> f32 {
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
         // Manually unrolled 8 times to get enough registers.
         // TODO: avx512 can unroll more
         let x_unrolled_chunks = x.chunks_exact(64);
@@ -201,31 +195,42 @@ impl Dot for Float32Type {
     }
 }
 
-impl Dot for Float64Type {
+impl Dot for f64 {
     #[inline]
-    fn dot(x: &[f64], y: &[f64]) -> f32 {
-        dot_scalar::<f64, f64, 8>(x, y) as f32
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        dot_scalar::<Self, Self, 8>(x, y) as f32
+    }
+}
+
+impl Dot for u8 {
+    #[inline]
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        // TODO: this is not optimized for auto vectorization yet.
+        x.iter()
+            .zip(y.iter())
+            .map(|(&x_i, &y_i)| x_i as u32 * y_i as u32)
+            .sum::<u32>() as f32
     }
 }
 
 /// Negative dot product, to present the relative order of dot distance.
-pub fn dot_distance_batch<'a, T: FloatToArrayType>(
+pub fn dot_distance_batch<'a, T: Dot>(
     from: &'a [T],
     to: &'a [T],
     dimension: usize,
-) -> Box<dyn Iterator<Item = f32> + 'a>
-where
-    T::ArrowType: Dot,
-{
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+) -> Box<dyn Iterator<Item = f32> + 'a> {
+    assume_eq!(from.len(), dimension);
+    assume_eq!(to.len() % dimension, 0);
     Box::new(to.chunks_exact(dimension).map(|v| dot_distance(from, v)))
 }
 
-fn do_dot_distance_arrow_batch<T: ArrowFloatType + Dot>(
+fn do_dot_distance_arrow_batch<T: ArrowFloatType>(
     from: &T::ArrayType,
     to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>> {
+) -> Result<Arc<Float32Array>>
+where
+    T::Native: Dot,
+{
     let dimension = to.value_length() as usize;
     debug_assert_eq!(from.len(), dimension);
 
@@ -274,6 +279,14 @@ pub fn dot_distance_arrow_batch(
         DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
         DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
         DataType::Float64 => do_dot_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
+        DataType::Int8 => do_dot_distance_arrow_batch::<Float32Type>(
+            &from
+                .as_primitive::<Int8Type>()
+                .into_iter()
+                .map(|x| x.unwrap() as f32)
+                .collect(),
+            &to.convert_to_floating_point()?,
+        ),
         _ => Err(Error::InvalidArgumentError(format!(
             "Unsupported data type: {:?}",
             from.data_type()
@@ -283,7 +296,6 @@ pub fn dot_distance_arrow_batch(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
@@ -296,20 +308,20 @@ mod tests {
         let x: Vec<f32> = (0..20).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..120).map(|v| v as f32).collect();
 
-        assert_eq!(Float32Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f32::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f32> = (0..512).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..612).map(|v| v as f32).collect();
 
-        assert_eq!(Float32Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f32::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f16> = (0..20).map(|v| f16::from_i32(v).unwrap()).collect();
         let y: Vec<f16> = (100..120).map(|v| f16::from_i32(v).unwrap()).collect();
-        assert_eq!(Float16Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f16::dot(&x, &y), dot(&x, &y));
 
         let x: Vec<f64> = (20..40).map(|v| f64::from_i32(v).unwrap()).collect();
         let y: Vec<f64> = (120..140).map(|v| f64::from_i32(v).unwrap()).collect();
-        assert_eq!(Float64Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(f64::dot(&x, &y), dot(&x, &y));
     }
 
     /// Reference implementation of dot product.
@@ -317,15 +329,24 @@ mod tests {
         x.iter().zip(y.iter()).map(|(&x, &y)| x * y).sum::<f64>() as f32
     }
 
-    // Accuracy of dot product depends on the size of the components
-    // of the vector.
-    // Imagine that each `x_i` can vary by `є * |x_i|`. Similarly for `y_i`.
-    // (Basically, it's accurate to ±(1 + є) * |x_i|).
-    // Error for `sum(x, y)` is `є_x + є_y`. Error for multiple is `є_x * x + є_y * y`.
-    // See: https://www.geol.lsu.edu/jlorenzo/geophysics/uncertainties/Uncertaintiespart2.html
-    // The multiplication of `x_i` and `y_i` can vary by `(є * |x_i|) * |y_i| + (є * |y_i|) * |x_i|`.
-    // This simplifies to `2 * є * (|x_i| + |y_i|)`.
-    // So the error for the sum of all the multiplications is `є * sum(|x_i| + |y_i|)`.
+    /// Error bound for vector dot product
+    /// http://ftp.demec.ufpr.br/CFD/bibliografia/Higham_2002_Accuracy%20and%20Stability%20of%20Numerical%20Algorithms.pdf
+    /// Chapter 3 (page 61) equation 3.5
+    /// A float point calculation error is bounded by:
+    /// (kє/(1-kє)) Sum_i(|x_i||y_i|) if kє < 1
+    /// We are currently using a SIMD version of naive product and summation.
+    /// Therefore, k = 2n-1 (n multiplications, n-1 additions).
+    /// For f16 and bf16, kє can be >=1.
+    /// When that happens, we will use a simpler estimation method:
+    /// Imagine that each `x_i` can vary by `є * |x_i|`, similarly for `y_i`.
+    /// (Basically, it's accurate to ±(1 + є) * |x_i|).
+    /// Error for `sum(x, y)` is `є_x + є_y`.
+    /// Error for multiple is `є_x * x + є_y * y + є_x * є_y`,
+    /// which simplifies to `є_x * x + є_y * y`
+    /// See: https://www.geol.lsu.edu/jlorenzo/geophysics/uncertainties/Uncertaintiespart2.html
+    /// The multiplication of `x_i` and `y_i` can vary by `є|x_i||y_i| + є|y_i||x_i|`.
+    /// This simplifies to `2є|x_i||y_i|`.
+    /// So the error for the sum of all the multiplications is `2є Sum_i(|x_i||y_i|)`.
     fn max_error<T: Float + AsPrimitive<f64>>(x: &[f64], y: &[f64]) -> f32 {
         let dot = x
             .iter()
@@ -333,13 +354,20 @@ mod tests {
             .zip(y.iter().cloned())
             .map(|(x, y)| x.abs() * y.abs())
             .sum::<f64>();
-        (2.0 * T::epsilon().as_() * dot) as f32
+        let k = ((2 * x.len()) - 1) as f64;
+        let k_epsilon = k * T::epsilon().as_();
+
+        if k_epsilon < 1.0 {
+            (k_epsilon * dot) as f32
+        } else {
+            (2.0 * T::epsilon().as_() * dot) as f32
+        }
     }
 
-    fn do_dot_test<T: FloatToArrayType>(x: &[T], y: &[T]) -> std::result::Result<(), TestCaseError>
-    where
-        T::ArrowType: Dot,
-    {
+    fn do_dot_test<T: Dot + AsPrimitive<f64> + Float>(
+        x: &[T],
+        y: &[T],
+    ) -> std::result::Result<(), TestCaseError> {
         let f64_x = x.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
         let f64_y = y.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
 

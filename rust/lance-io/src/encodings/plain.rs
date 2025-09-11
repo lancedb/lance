@@ -1,16 +1,5 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Plain encoding
 //!
@@ -18,7 +7,6 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
@@ -41,15 +29,10 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::encodings::{AsyncIndex, Decoder};
-
-/// Parallelism factor decides how many run parallel I/O issued per CPU core.
-/// This is a heuristic value, with the assumption NVME and S3/GCS can
-/// handles large mount of parallel I/O & large disk-queue.
-const PARALLELISM_FACTOR: usize = 4;
 
 /// Encoder for plain encoding.
 ///
@@ -59,7 +42,7 @@ pub struct PlainEncoder<'a> {
 }
 
 impl<'a> PlainEncoder<'a> {
-    pub fn new(writer: &'a mut dyn Writer, data_type: &'a DataType) -> PlainEncoder<'a> {
+    pub fn new(writer: &'a mut dyn Writer, data_type: &'a DataType) -> Self {
         PlainEncoder { writer, data_type }
     }
 
@@ -216,25 +199,18 @@ pub fn bytes_to_array(
     {
         // this code is taken from
         // https://github.com/apache/arrow-rs/blob/master/arrow-data/src/data.rs#L748-L768
-        let len_plus_offset = bytes.len() + offset;
+        let len_plus_offset = len + offset;
         let min_buffer_size = len_plus_offset.saturating_mul(*byte_width);
 
         // alignment or size isn't right -- just make a copy
-        if (bytes.len() < min_buffer_size) || (bytes.as_ptr().align_offset(*alignment) != 0) {
-            bytes.into()
+        if bytes.len() < min_buffer_size {
+            Buffer::copy_bytes_bytes(bytes, min_buffer_size)
         } else {
-            // SAFETY: the alignment is correct we can make this conversion
-            unsafe {
-                Buffer::from_custom_allocation(
-                    NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
-                    bytes.len(),
-                    Arc::new(bytes),
-                )
-            }
+            Buffer::from_bytes_bytes(bytes, *alignment as u64)
         }
     } else {
         // cases we don't handle, just copy
-        bytes.into()
+        Buffer::from_slice_ref(bytes)
     };
 
     let array_data = ArrayDataBuilder::new(data_type.clone())
@@ -252,7 +228,7 @@ impl<'a> PlainDecoder<'a> {
         data_type: &'a DataType,
         position: usize,
         length: usize,
-    ) -> Result<PlainDecoder<'a>> {
+    ) -> Result<Self> {
         Ok(PlainDecoder {
             reader,
             data_type,
@@ -265,13 +241,13 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            return Err(Error::IO {
-                message: format!(
+            return Err(Error::io(
+                format!(
                     "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
                     start, end, self.length
                 ),
-                location: location!(),
-            });
+                location!(),
+            ));
         }
         let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {
@@ -380,7 +356,7 @@ impl<'a> PlainDecoder<'a> {
                 let shifted_indices = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
-            .buffered(num_cpus::get())
+            .buffered(self.reader.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
@@ -417,7 +393,7 @@ fn make_chunked_requests(
 }
 
 #[async_trait]
-impl<'a> Decoder for PlainDecoder<'a> {
+impl Decoder for PlainDecoder<'_> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(0..self.length).await
     }
@@ -446,7 +422,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let adjusted_offsets = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
-            .buffered(num_cpus::get() * PARALLELISM_FACTOR)
+            .buffered(self.reader.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
@@ -520,6 +496,8 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
     async fn get(&self, params: ReadBatchParams) -> Self::Output {
         match params {
             ReadBatchParams::Range(r) => self.get(r).await,
+            // Ranges not supported in v1 files
+            ReadBatchParams::Ranges(_) => unimplemented!(),
             ReadBatchParams::RangeFull => self.get(..).await,
             ReadBatchParams::RangeTo(r) => self.get(r).await,
             ReadBatchParams::RangeFrom(r) => self.get(r).await,
@@ -531,13 +509,9 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
 #[cfg(test)]
 mod tests {
     use std::ops::Deref;
-    use std::sync::Arc;
 
     use arrow_array::*;
-    use arrow_buffer::Buffer;
-    use arrow_schema::Field;
     use rand::prelude::*;
-    use tempfile;
 
     use super::*;
     use crate::local::LocalObjectReader;
@@ -565,8 +539,8 @@ mod tests {
         }
 
         let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
-        let mut rng = rand::thread_rng();
-        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        let mut rng = rand::rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.random()).collect();
         for t in float_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let mut arrs: Vec<ArrayRef> = Vec::new();
@@ -596,7 +570,7 @@ mod tests {
             writer.flush().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 1024)
+        let reader = LocalObjectReader::open_local_path(&path, 1024, None)
             .await
             .unwrap();
         assert!(reader.size().await.unwrap() > 0);
@@ -663,6 +637,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bytes_to_array_padding() {
+        let bytes = Bytes::from_static(&[0x01, 0x00, 0x02, 0x00, 0x03]);
+        let arr = bytes_to_array(&DataType::UInt16, bytes, 3, 0).unwrap();
+
+        let expected = UInt16Array::from(vec![1, 2, 3]);
+        assert_eq!(arr.as_ref(), &expected);
+
+        // Underlying data is padded to the nearest multiple of two bytes (for u16).
+        let data = arr.to_data();
+        let buf = &data.buffers()[0];
+        let repr = format!("{:?}", buf);
+        assert!(
+            repr.contains("[1, 0, 2, 0, 3, 0]"),
+            "Underlying buffer contains unexpected data: {}",
+            repr
+        );
+    }
+
+    #[tokio::test]
     async fn test_encode_decode_nested_fixed_size_list() {
         // FixedSizeList of FixedSizeList
         let inner = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, true)), 2);
@@ -720,7 +713,7 @@ mod tests {
             writer.flush().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048)
+        let reader = LocalObjectReader::open_local_path(&path, 2048, None)
             .await
             .unwrap();
         assert!(reader.size().await.unwrap() > 0);
@@ -768,7 +761,7 @@ mod tests {
             writer.shutdown().await.unwrap();
         }
 
-        let reader = LocalObjectReader::open_local_path(&path, 2048)
+        let reader = LocalObjectReader::open_local_path(&path, 2048, None)
             .await
             .unwrap();
         assert!(reader.size().await.unwrap() > 0);
@@ -787,7 +780,7 @@ mod tests {
         );
     }
 
-    // Re-eanble the following tests once the Lance FileReader / FileWrite is migrated.
+    // Re-enable the following tests once the Lance FileReader / FileWrite is migrated.
 
     // #[tokio::test]
     // async fn test_boolean_slice() {

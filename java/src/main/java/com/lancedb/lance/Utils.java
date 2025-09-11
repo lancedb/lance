@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import org.apache.arrow.c.ArrowSchema;
@@ -19,13 +18,33 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+
 /** Utility. */
 public class Utils {
 
-  /** Convert Arrow Schema to FFI Arrow Schema. */
+  /**
+   * Convert schema to ArrowSchema for JNI processing.
+   *
+   * @param schema schema
+   * @param allocator buffer allocator
+   * @return ArrowSchema
+   */
   public static ArrowSchema toFfi(Schema schema, BufferAllocator allocator) {
-    var arrowSchema = ArrowSchema.allocateNew(allocator);
+    ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
     Data.exportSchema(allocator, schema, null, arrowSchema);
     return arrowSchema;
+  }
+
+  /**
+   * Convert optional array to optional list for JNI processing.
+   *
+   * @param optionalArray Optional array
+   * @return Optional list
+   */
+  public static Optional<List<String>> convert(Optional<String[]> optionalArray) {
+    return optionalArray.map(Arrays::asList);
   }
 }

@@ -1,20 +1,96 @@
-// Copyright 2023 Lance Developers.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Extension to arrow schema
 
-use arrow_schema::{ArrowError, Field, FieldRef, Schema};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema};
+
+pub enum Indentation {
+    OneLine,
+    MultiLine(u8),
+}
+
+impl Indentation {
+    fn value(&self) -> String {
+        match self {
+            Self::OneLine => "".to_string(),
+            Self::MultiLine(spaces) => " ".repeat(*spaces as usize),
+        }
+    }
+
+    fn deepen(&self) -> Self {
+        match self {
+            Self::OneLine => Self::OneLine,
+            Self::MultiLine(spaces) => Self::MultiLine(spaces + 2),
+        }
+    }
+}
+
+/// Extends the functionality of [arrow_schema::Field].
+pub trait FieldExt {
+    /// Create a compact string representation of the field
+    ///
+    /// This is intended for display purposes and not for serialization
+    fn to_compact_string(&self, indent: Indentation) -> String;
+
+    fn is_packed_struct(&self) -> bool;
+}
+
+impl FieldExt for Field {
+    fn to_compact_string(&self, indent: Indentation) -> String {
+        let mut result = format!("{}: ", self.name().clone());
+        match self.data_type() {
+            DataType::Struct(fields) => {
+                result += "{";
+                result += &indent.value();
+                for (field_idx, field) in fields.iter().enumerate() {
+                    result += field.to_compact_string(indent.deepen()).as_str();
+                    if field_idx < fields.len() - 1 {
+                        result += ",";
+                    }
+                    result += indent.value().as_str();
+                }
+                result += "}";
+            }
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field) => {
+                result += "[";
+                result += field.to_compact_string(indent.deepen()).as_str();
+                result += "]";
+            }
+            DataType::FixedSizeList(child, dimension) => {
+                result += &format!(
+                    "[{}; {}]",
+                    child.to_compact_string(indent.deepen()),
+                    dimension
+                );
+            }
+            DataType::Dictionary(key_type, value_type) => {
+                result += &value_type.to_string();
+                result += "@";
+                result += &key_type.to_string();
+            }
+            _ => {
+                result += &self.data_type().to_string();
+            }
+        }
+        if self.is_nullable() {
+            result += "?";
+        }
+        result
+    }
+
+    // Check if field has metadata `packed` set to true, this check is case insensitive.
+    fn is_packed_struct(&self) -> bool {
+        let field_metadata = self.metadata();
+        field_metadata
+            .get("packed")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
+    }
+}
 
 /// Extends the functionality of [arrow_schema::Schema].
 pub trait SchemaExt {
@@ -28,6 +104,13 @@ pub trait SchemaExt {
     ) -> std::result::Result<Schema, ArrowError>;
 
     fn field_names(&self) -> Vec<&String>;
+
+    fn without_column(&self, column_name: &str) -> Schema;
+
+    /// Create a compact string representation of the schema
+    ///
+    /// This is intended for display purposes and not for serialization
+    fn to_compact_string(&self, indent: Indentation) -> String;
 }
 
 impl SchemaExt for Schema {
@@ -61,7 +144,35 @@ impl SchemaExt for Schema {
         Ok(Self::new_with_metadata(fields, self.metadata.clone()))
     }
 
+    /// Project the schema to remove the given column.
+    ///
+    /// This only works on top-level fields right now. If a field does not exist,
+    /// the schema will be returned as is.
+    fn without_column(&self, column_name: &str) -> Schema {
+        let fields: Vec<FieldRef> = self
+            .fields()
+            .iter()
+            .filter(|f| f.name() != column_name)
+            .cloned()
+            .collect();
+        Self::new_with_metadata(fields, self.metadata.clone())
+    }
+
     fn field_names(&self) -> Vec<&String> {
         self.fields().iter().map(|f| f.name()).collect()
+    }
+
+    fn to_compact_string(&self, indent: Indentation) -> String {
+        let mut result = "{".to_string();
+        result += &indent.value();
+        for (field_idx, field) in self.fields.iter().enumerate() {
+            result += field.to_compact_string(indent.deepen()).as_str();
+            if field_idx < self.fields.len() - 1 {
+                result += ",";
+            }
+            result += indent.value().as_str();
+        }
+        result += "}";
+        result
     }
 }
