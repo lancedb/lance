@@ -25,7 +25,9 @@ use serde::Serialize;
 use snafu::location;
 use tracing::instrument;
 
-use super::{btree::OrderableScalarValue, SargableQuery, SearchResult};
+use super::{
+    btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
+};
 use super::{AnyQuery, IndexStore, ScalarIndex};
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -370,6 +372,10 @@ impl ScalarIndex for BitmapIndex {
 
     fn update_criteria(&self) -> UpdateCriteria {
         UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap))
     }
 }
 
