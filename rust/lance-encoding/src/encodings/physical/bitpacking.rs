@@ -537,7 +537,7 @@ mod test {
         // next 1024 small varied values to avoid RLE and trigger bitpacking.
         let mut vals = vec![0i32; 1024];
         for i in 0..1024 {
-            vals.push((i % 16) as i32);
+            vals.push(i % 16);
         }
 
         let arrays = vec![Arc::new(Int32Array::from(vals)) as Arc<dyn Array>];
