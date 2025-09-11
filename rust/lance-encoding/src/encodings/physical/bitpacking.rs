@@ -524,4 +524,29 @@ mod test {
 
         check_round_trip_encoding_of_data(arrays, &test_cases, metadata.clone()).await;
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_miniblock_bitpack_zero_chunk_selection() {
+        use arrow_array::Int32Array;
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("inline_bitpacking")
+            .with_file_version(LanceFileVersion::V2_1);
+
+        // Build 2048 values: first 1024 all zeros (bit_width=0),
+        // next 1024 small varied values to avoid RLE and trigger bitpacking.
+        let mut vals = vec![0i32; 1024];
+        for i in 0..1024 {
+            vals.push((i % 16) as i32);
+        }
+
+        let arrays = vec![Arc::new(Int32Array::from(vals)) as Arc<dyn Array>];
+
+        // Disable BSS and RLE to prefer bitpacking in selection
+        let mut metadata = HashMap::new();
+        metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+        metadata.insert("lance-encoding:rle-threshold".to_string(), "0".to_string());
+
+        check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+    }
 }
