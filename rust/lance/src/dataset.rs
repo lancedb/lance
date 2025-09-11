@@ -5,7 +5,6 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::Field as ArrowField;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
 use deepsize::DeepSizeOf;
