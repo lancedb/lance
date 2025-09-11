@@ -13,10 +13,10 @@ use crate::{
     frag_reuse::FragReuseIndex,
     pb,
     scalar::{
-        bitmap::BitmapIndexPlugin, btree::BTreeIndexPlugin, expression::ScalarQueryParser,
-        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore,
-        ScalarIndex,
+        bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
+        expression::ScalarQueryParser, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
+        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin,
+        CreatedIndex, IndexStore, ScalarIndex,
     },
 };
 
@@ -199,6 +199,7 @@ impl ScalarIndexPluginRegistry {
         registry.add_plugin::<pb::LabelListIndexDetails, LabelListIndexPlugin>();
         registry.add_plugin::<pb::NGramIndexDetails, NGramIndexPlugin>();
         registry.add_plugin::<pb::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
+        registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pb::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
 

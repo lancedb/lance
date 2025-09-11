@@ -1885,6 +1885,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
+            Literal["BLOOMFILTER"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -1953,6 +1954,9 @@ class LanceDataset(pa.dataset.Dataset):
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
+        * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
+             but can only handle filters with equals and not equals and may require
+             more I/O than a btree or bitmap index```
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1967,7 +1971,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"`` or ``"INVERTED"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"``,
+            ``"INVERTED"`` or ``"BLOOMFILTER"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2077,11 +2082,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "ZONEMAP",
                 "LABEL_LIST",
                 "INVERTED",
+                "BLOOMFILTER",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        'or "INVERTED" are supported for '
+                        'or "INVERTED" or "BLOOMFILTER" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )
