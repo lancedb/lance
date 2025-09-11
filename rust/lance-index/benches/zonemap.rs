@@ -13,9 +13,7 @@ use lance_core::ROW_ADDR;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pb;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::zonemap::{
-    ZoneMapIndexBuilder, ZoneMapIndexBuilderParams, ZoneMapIndexPlugin,
-};
+use lance_index::scalar::zonemap::{ZoneMapIndexBuilder, ZoneMapIndexBuilderParams, ZoneMapIndexPlugin};
 use lance_index::scalar::{registry::ScalarIndexPlugin, SargableQuery};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
