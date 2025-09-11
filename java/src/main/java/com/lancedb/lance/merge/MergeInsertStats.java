@@ -13,6 +13,8 @@
  */
 package com.lancedb.lance.merge;
 
+import com.google.common.base.MoreObjects;
+
 public final class MergeInsertStats {
   private final long numInsertedRows;
   private final long numUpdatedRows;
@@ -62,19 +64,13 @@ public final class MergeInsertStats {
 
   @Override
   public String toString() {
-    return "MergeInsertStats{"
-        + "numInsertedRows="
-        + numInsertedRows
-        + ", numUpdatedRows="
-        + numUpdatedRows
-        + ", numDeletedRows="
-        + numDeletedRows
-        + ", numAttempts="
-        + numAttempts
-        + ", bytesWritten="
-        + bytesWritten
-        + ", numFilesWritten="
-        + numFilesWritten
-        + '}';
+    return MoreObjects.toStringHelper(this)
+        .add("numInsertedRows", numInsertedRows)
+        .add("numUpdatedRows", numUpdatedRows)
+        .add("numDeletedRows", numDeletedRows)
+        .add("numAttempts", numAttempts)
+        .add("bytesWritten", bytesWritten)
+        .add("numFilesWritten", numFilesWritten)
+        .toString();
   }
 }

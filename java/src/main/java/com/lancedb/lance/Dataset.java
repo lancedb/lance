@@ -18,7 +18,7 @@ import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
-import com.lancedb.lance.merge.MergeInsert;
+import com.lancedb.lance.merge.MergeInsertParams;
 import com.lancedb.lance.merge.MergeInsertResult;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceSchema;
@@ -972,11 +972,11 @@ public class Dataset implements Closeable {
    * <p>It is important that after merge insert, the current dataset is changed and should be
    * closed. The merged new dataset is contained in the MergeInsertResult.
    *
-   * @param mergeInsert MergeInsert options
+   * @param mergeInsert merge insert options
    * @param source ArrowArrayStream source data
    * @return MergeInsertResult containing the new merged Dataset.
    */
-  public MergeInsertResult mergeInsert(MergeInsert mergeInsert, ArrowArrayStream source) {
+  public MergeInsertResult mergeInsert(MergeInsertParams mergeInsert, ArrowArrayStream source) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       MergeInsertResult result = nativeMergeInsert(mergeInsert, source.memoryAddress());
 
@@ -987,12 +987,12 @@ public class Dataset implements Closeable {
         newDataset.allocator = allocator;
       }
 
-      return new MergeInsertResult(newDataset, result.stats());
+      return result;
     }
   }
 
   private native MergeInsertResult nativeMergeInsert(
-      MergeInsert mergeInsert, long arrowStreamMemoryAddress);
+      MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   private native void nativeCreateTag(String tag, long version);
 

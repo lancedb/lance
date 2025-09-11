@@ -13,24 +13,30 @@
  */
 package com.lancedb.lance.merge;
 
-import java.util.List;
+import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
 
-public class MergeInsert {
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Optional;
+
+public class MergeInsertParams {
   private final List<String> on;
 
   private WhenMatched whenMatched = WhenMatched.DoNothing;
-  private String whenMatchedUpdateExpr = "";
+  private Optional<String> whenMatchedUpdateExpr = Optional.empty();
 
   private WhenNotMatched whenNotMatched = WhenNotMatched.InsertAll;
 
   private WhenNotMatchedBySource whenNotMatchedBySource = WhenNotMatchedBySource.Keep;
-  private String whenNotMatchedBySourceDeleteExpr = "";
+  private Optional<String> whenNotMatchedBySourceDeleteExpr = Optional.empty();
+  private Optional<ByteBuffer> whenNotMatchedBySourceDeleteSubstraitExpr = Optional.empty();
 
   private int conflictRetries = 10;
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
 
-  public MergeInsert(List<String> on) {
+  public MergeInsertParams(List<String> on) {
     this.on = on;
   }
 
@@ -40,9 +46,9 @@ public class MergeInsert {
    *
    * <p>This can be used to achieve upsert behavior.
    *
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withMatchedUpdateAll() {
+  public MergeInsertParams withMatchedUpdateAll() {
     this.whenMatched = WhenMatched.UpdateAll;
     return this;
   }
@@ -53,9 +59,9 @@ public class MergeInsert {
    *
    * <p>This can be used to achieve find-or-create behavior.
    *
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withMatchedDoNothing() {
+  public MergeInsertParams withMatchedDoNothing() {
     this.whenMatched = WhenMatched.DoNothing;
     return this;
   }
@@ -72,11 +78,12 @@ public class MergeInsert {
    * source.column1 = target.column1 AND source.column2 = target.column2</code>
    *
    * @param expr The expression to evaluate on the rows in the source table and target table.
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withMatchedUpdateIf(String expr) {
+  public MergeInsertParams withMatchedUpdateIf(String expr) {
+    Preconditions.checkNotNull(expr);
     this.whenMatched = WhenMatched.UpdateIf;
-    this.whenMatchedUpdateExpr = expr;
+    this.whenMatchedUpdateExpr = Optional.of(expr);
     return this;
   }
 
@@ -84,9 +91,9 @@ public class MergeInsert {
    * Specify what should happen when a source row has no match in the target.
    *
    * @param whenNotMatched The action to take when a source row has no match in the target.
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withNotMatched(WhenNotMatched whenNotMatched) {
+  public MergeInsertParams withNotMatched(WhenNotMatched whenNotMatched) {
     this.whenNotMatched = whenNotMatched;
     return this;
   }
@@ -94,9 +101,9 @@ public class MergeInsert {
   /**
    * Specify that when a target row has no match in the source, the row is kept in the target table.
    *
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withNotMatchedBySourceKeep() {
+  public MergeInsertParams withNotMatchedBySourceKeep() {
     this.whenNotMatchedBySource = WhenNotMatchedBySource.Keep;
     return this;
   }
@@ -105,9 +112,9 @@ public class MergeInsert {
    * Specify that when a target row has no match in the source, the row is deleted from the target
    * table.
    *
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withNotMatchedBySourceDelete() {
+  public MergeInsertParams withNotMatchedBySourceDelete() {
     this.whenNotMatchedBySource = WhenNotMatchedBySource.Delete;
     return this;
   }
@@ -116,12 +123,29 @@ public class MergeInsert {
    * Specify that when a target row has no match in the source and the expression evaluates to true,
    * the row is deleted from the target table.
    *
-   * @param expr The expression to evaluate on the rows in the target table.
-   * @return This MergeInsert instance
+   * @param expr The sql expression to evaluate on the rows in the target table.
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withNotMatchedBySourceDeleteIf(String expr) {
+  public MergeInsertParams withNotMatchedBySourceDeleteIf(String expr) {
+    Preconditions.checkNotNull(expr);
     this.whenNotMatchedBySource = WhenNotMatchedBySource.DeleteIf;
-    this.whenNotMatchedBySourceDeleteExpr = expr;
+    this.whenNotMatchedBySourceDeleteExpr = Optional.of(expr);
+    this.whenNotMatchedBySourceDeleteSubstraitExpr = Optional.empty();
+    return this;
+  }
+
+  /**
+   * Specify that when a target row has no match in the source and the expression evaluates to true,
+   * the row is deleted from the target table.
+   *
+   * @param expr The substrait expression to evaluate on the rows in the target table.
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withNotMatchedBySourceDeleteSubstraitIf(ByteBuffer expr) {
+    Preconditions.checkNotNull(expr);
+    this.whenNotMatchedBySource = WhenNotMatchedBySource.DeleteIf;
+    this.whenNotMatchedBySourceDeleteExpr = Optional.empty();
+    this.whenNotMatchedBySourceDeleteSubstraitExpr = Optional.of(expr);
     return this;
   }
 
@@ -135,9 +159,9 @@ public class MergeInsert {
    * <p>Default is 10.
    *
    * @param retries Number of times to retry the operation if there is contention.
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withConflictRetries(int retries) {
+  public MergeInsertParams withConflictRetries(int retries) {
     this.conflictRetries = retries;
     return this;
   }
@@ -153,9 +177,9 @@ public class MergeInsert {
    * <p>Default is 30000.
    *
    * @param timeoutMs Timeout in milliseconds used to limit retries.
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withRetryTimeoutMs(long timeoutMs) {
+  public MergeInsertParams withRetryTimeoutMs(long timeoutMs) {
     this.retryTimeoutMs = timeoutMs;
     return this;
   }
@@ -166,9 +190,9 @@ public class MergeInsert {
    * the clean up would just try and log a failure anyway.
    *
    * @param skipAutoCleanup Whether to skip auto cleanup during commits.
-   * @return This MergeInsert instance
+   * @return This MergeInsertParams instance
    */
-  public MergeInsert withSkipAutoCleanup(boolean skipAutoCleanup) {
+  public MergeInsertParams withSkipAutoCleanup(boolean skipAutoCleanup) {
     this.skipAutoCleanup = skipAutoCleanup;
     return this;
   }
@@ -185,7 +209,7 @@ public class MergeInsert {
     return whenMatched.name();
   }
 
-  public String whenMatchedUpdateExpr() {
+  public Optional<String> whenMatchedUpdateExpr() {
     return whenMatchedUpdateExpr;
   }
 
@@ -205,8 +229,12 @@ public class MergeInsert {
     return whenNotMatchedBySource.name();
   }
 
-  public String whenNotMatchedBySourceDeleteExpr() {
+  public Optional<String> whenNotMatchedBySourceDeleteExpr() {
     return whenNotMatchedBySourceDeleteExpr;
+  }
+
+  public Optional<ByteBuffer> whenNotMatchedBySourceDeleteSubstraitExpr() {
+    return whenNotMatchedBySourceDeleteSubstraitExpr;
   }
 
   public int conflictRetries() {
@@ -219,6 +247,26 @@ public class MergeInsert {
 
   public boolean skipAutoCleanup() {
     return skipAutoCleanup;
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("on", on)
+        .add("whenMatched", whenMatched)
+        .add("whenMatchedUpdateExpr", whenMatchedUpdateExpr.orElse(null))
+        .add("whenNotMatched", whenNotMatched)
+        .add("whenNotMatchedBySource", whenNotMatchedBySource)
+        .add("whenNotMatchedBySourceDeleteExpr", whenNotMatchedBySourceDeleteExpr.orElse(null))
+        .add(
+            "whenNotMatchedBySourceDeleteSubstraitExpr",
+            whenNotMatchedBySourceDeleteSubstraitExpr
+                .map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]")
+                .orElse(null))
+        .add("conflictRetries", conflictRetries)
+        .add("retryTimeoutMs", retryTimeoutMs)
+        .add("skipAutoCleanup", skipAutoCleanup)
+        .toString();
   }
 
   public enum WhenMatched {

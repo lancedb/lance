@@ -6,26 +6,23 @@ use crate::error::Result;
 use crate::traits::{FromJString, IntoJava};
 use crate::{Error, JNIEnvExt, RT};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::Schema;
-use datafusion_common::DFSchema;
-use datafusion_sql::parser::DFParserBuilder;
-use datafusion_sql::planner::{PlannerContext, SqlToRel};
 use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use jni::JNIEnv;
+use lance::dataset::scanner::LanceFilter;
 use lance::dataset::{
     MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
-use lance_datafusion::planner::LanceContextProvider;
+use lance_core::datatypes::Schema;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeMergeInsert<'a>(
     mut env: JNIEnv<'a>,
-    jdataset: JObject,
-    jparam: JObject,
-    batch_address: jlong,
+    jdataset: JObject,    // Dataset object
+    jparam: JObject,      // MergeInsertParams object
+    batch_address: jlong, // ArrowArrayStream address for source
 ) -> JObject<'a> {
     ok_or_throw!(
         env,
@@ -56,9 +53,9 @@ fn inner_merge_insert<'local>(
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
 
         let when_not_matched_by_source = extract_when_not_matched_by_source(
-            Schema::from(dataset.inner.schema()),
+            dataset.inner.schema(),
             when_not_matched_by_source_str.as_str(),
-            when_not_matched_by_source_delete_expr.as_str(),
+            when_not_matched_by_source_delete_expr,
         )?;
 
         let merge_insert_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone().inner), on)?
@@ -99,16 +96,23 @@ fn extract_when_matched<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> R
         .into();
     let when_matched = when_matched.extract(env)?;
 
-    let when_matched_update_expr: JString = env
-        .call_method(jparam, "whenMatchedUpdateExpr", "()Ljava/lang/String;", &[])?
-        .l()?
-        .into();
-    let when_matched_update_expr = when_matched_update_expr.extract(env)?;
+    let when_matched_update_expr = env
+        .call_method(
+            jparam,
+            "whenMatchedUpdateExpr",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let when_matched_update_expr = env.get_string_opt(&when_matched_update_expr)?;
 
     match when_matched.as_str() {
         "UpdateAll" => Ok(WhenMatched::UpdateAll),
         "DoNothing" => Ok(WhenMatched::DoNothing),
-        "UpdateIf" => Ok(WhenMatched::UpdateIf(when_matched_update_expr)),
+        "UpdateIf" => match when_matched_update_expr {
+            Some(expr) => Ok(WhenMatched::UpdateIf(expr)),
+            None => Err(Error::input_error("No matched updated expr".to_string())),
+        },
         _ => Err(Error::input_error(format!(
             "Illegal when_matched: {when_matched}",
         ))),
@@ -153,45 +157,51 @@ fn extract_when_not_matched_by_source_str<'local>(
 fn extract_when_not_matched_by_source_delete_expr<'local>(
     env: &mut JNIEnv<'local>,
     jparam: &JObject,
-) -> Result<String> {
-    let when_not_matched_by_source_delete_expr: JString = env
+) -> Result<Option<LanceFilter>> {
+    let when_not_matched_by_source_delete_expr = env
         .call_method(
             jparam,
             "whenNotMatchedBySourceDeleteExpr",
-            "()Ljava/lang/String;",
+            "()Ljava/util/Optional;",
             &[],
         )?
-        .l()?
-        .into();
-    when_not_matched_by_source_delete_expr.extract(env)
+        .l()?;
+
+    if let Some(expr) = env.get_string_opt(&when_not_matched_by_source_delete_expr)? {
+        return Ok(Some(LanceFilter::Sql(expr)));
+    }
+
+    let when_not_matched_by_source_delete_substrait_expr = env
+        .call_method(
+            jparam,
+            "whenNotMatchedBySourceDeleteSubstraitExpr",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+
+    match env.get_bytes_opt(&when_not_matched_by_source_delete_substrait_expr)? {
+        Some(expr) => Ok(Some(LanceFilter::Substrait(expr.to_vec()))),
+        None => Ok(None),
+    }
 }
 
 fn extract_when_not_matched_by_source(
-    schema: Schema,
+    schema: &Schema,
     when_not_matched_by_source: &str,
-    when_not_matched_by_source_delete_expr: &str,
+    when_not_matched_by_source_delete_expr: Option<LanceFilter>,
 ) -> Result<WhenNotMatchedBySource> {
     match when_not_matched_by_source {
         "Keep" => Ok(WhenNotMatchedBySource::Keep),
         "Delete" => Ok(WhenNotMatchedBySource::Delete),
-        "DeleteIf" => {
-            let sql_expr = DFParserBuilder::new(when_not_matched_by_source_delete_expr)
-                .build()
-                .unwrap()
-                .parser
-                .parse_expr()
-                .unwrap();
-
-            let expr = SqlToRel::new(&LanceContextProvider::default())
-                .sql_to_expr(
-                    sql_expr,
-                    &DFSchema::try_from(schema).unwrap(),
-                    &mut PlannerContext::default(),
-                )
-                .unwrap();
-
-            Ok(WhenNotMatchedBySource::DeleteIf(expr))
-        }
+        "DeleteIf" => match when_not_matched_by_source_delete_expr {
+            Some(expr) => Ok(WhenNotMatchedBySource::DeleteIf(
+                expr.to_datafusion(schema, schema)?,
+            )),
+            None => Err(Error::input_error(format!(
+                "No delete expr when not matched by source is: {when_not_matched_by_source}",
+            ))),
+        },
         _ => Err(Error::input_error(format!(
             "Illegal when_not_matched_by_source: {when_not_matched_by_source}",
         ))),
