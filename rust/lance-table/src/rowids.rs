@@ -586,17 +586,24 @@ pub fn rechunk_sequences(
         .flat_map(|sequence| sequence.0.into_iter())
         .peekable();
 
+    let too_few_segments_error = || {
+        Error::invalid_input(
+            "Got too few segments for the provided chunk lengths",
+            location!(),
+        )
+    };
+
+    let too_many_segments_error = || {
+        Error::invalid_input(
+            "Got too many segments for the provided chunk lengths",
+            location!(),
+        )
+    };
+
     let mut segment_offset = 0_u64;
     for chunk_size in chunk_size_iter {
         let mut sequence = RowIdSequence(Vec::new());
         let mut remaining = chunk_size;
-
-        let too_many_segments_error = || {
-            Error::invalid_input(
-                "Got too many segments for the provided chunk lengths",
-                location!(),
-            )
-        };
 
         while remaining > 0 {
             let remaining_in_segment = segment_iter
@@ -613,10 +620,7 @@ pub fn rechunk_sequences(
                     if allow_incomplete {
                         break;
                     } else {
-                        return Err(Error::invalid_input(
-                            "Got too few segments for the provided chunk lengths",
-                            location!(),
-                        ));
+                        return Err(too_few_segments_error());
                     }
                 }
             }
@@ -627,7 +631,7 @@ pub fn rechunk_sequences(
                     // Segment is larger than remaining space - slice it
                     let segment = segment_iter
                         .peek()
-                        .ok_or_else(too_many_segments_error)?
+                        .ok_or_else(too_few_segments_error)?
                         .slice(segment_offset as usize, remaining as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset += remaining;
@@ -639,7 +643,7 @@ pub fn rechunk_sequences(
                     // Less case: remaining -= remaining_in_segment (remaining becomes positive)
                     let segment = segment_iter
                         .next()
-                        .ok_or_else(too_many_segments_error)?
+                        .ok_or_else(too_few_segments_error)?
                         .slice(segment_offset as usize, remaining_in_segment as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset = 0;
@@ -652,10 +656,7 @@ pub fn rechunk_sequences(
     }
 
     if segment_iter.peek().is_some() {
-        return Err(Error::invalid_input(
-            "Got too few segments for the provided chunk lengths",
-            location!(),
-        ));
+        return Err(too_many_segments_error());
     }
 
     Ok(chunked_sequences)
