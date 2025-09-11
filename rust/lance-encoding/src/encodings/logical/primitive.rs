@@ -2585,10 +2585,17 @@ impl DecodePageTask for VariableFullZipDecodeTask {
             block_info: BlockInfo::new(),
         };
         let decomopressed = self.decompressor.decompress(block)?;
-        let rep = self.rep.to_vec();
-        let def = self.def.to_vec();
-        let unraveler =
-            RepDefUnraveler::new(Some(rep), Some(def), self.details.def_meaning.clone());
+        let rep = if self.rep.is_empty() {
+            None
+        } else {
+            Some(self.rep.to_vec())
+        };
+        let def = if self.def.is_empty() {
+            None
+        } else {
+            Some(self.def.to_vec())
+        };
+        let unraveler = RepDefUnraveler::new(rep, def, self.details.def_meaning.clone());
         Ok(DecodedPage {
             data: decomopressed,
             repdef: unraveler,
@@ -3293,8 +3300,8 @@ impl PrimitiveStructuralEncoder {
     // P - Padding inserted to ensure each buffer is 8-byte aligned and the buffer size is a multiple
     //     of 8 bytes (so that the next chunk is 8-byte aligned).
     //
-    // Each block has a u16 word of metadata.  The upper 12 bits contain 1/6 the
-    // # of bytes in the block (if the block does not have an even number of bytes
+    // Each block has a u16 word of metadata.  The upper 12 bits contain the
+    // # of 8-byte words in the block (if the block does not fill the final word
     // then up to 7 bytes of padding are added).  The lower 4 bits describe the log_2
     // number of values (e.g. if there are 1024 then the lower 4 bits will be
     // 0xA)  All blocks except the last must have power-of-two number of values.
@@ -3417,7 +3424,7 @@ impl PrimitiveStructuralEncoder {
             }
 
             let chunk_bytes = data_buffer.len() - start_pos;
-            assert!(chunk_bytes <= 16 * 1024);
+            assert!(chunk_bytes <= 32 * 1024);
             assert!(chunk_bytes > 0);
             assert_eq!(chunk_bytes % 8, 0);
             // We subtract 1 here from chunk_bytes because we want to be able to express
