@@ -15,8 +15,6 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.merge.MergeInsertParams;
 import com.lancedb.lance.merge.MergeInsertResult;
-import com.lancedb.lance.operation.OperationTestBase;
-
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
@@ -43,7 +41,7 @@ import java.util.List;
 import java.util.TreeMap;
 import java.util.UUID;
 
-public class MergeInsertTest extends OperationTestBase {
+public class MergeInsertTest {
   @TempDir private Path tempDir;
   private RootAllocator allocator;
   private TestUtils.SimpleTestDataset testDataset;
