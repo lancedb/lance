@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.merge.MergeInsertParams;
 import com.lancedb.lance.merge.MergeInsertResult;
+
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
