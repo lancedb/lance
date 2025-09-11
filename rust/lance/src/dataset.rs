@@ -629,8 +629,12 @@ impl Dataset {
             dataset_location.clone(),
         );
 
-        let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
-        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
+        let metadata_cache = Arc::new(
+            session
+                .metadata_cache
+                .for_dataset(dataset_location.base_uri()),
+        );
+        let index_cache = Arc::new(session.index_cache.for_dataset(dataset_location.base_uri()));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         Ok(Self {
             object_store,
