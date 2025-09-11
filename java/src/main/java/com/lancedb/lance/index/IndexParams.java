@@ -22,33 +22,19 @@ import java.util.Optional;
 
 /** Parameters for creating an index. */
 public class IndexParams {
-  private final DistanceType distanceType;
   private final Optional<VectorIndexParams> vectorIndexParams;
   private final Optional<ScalarIndexParams> scalarIndexParams;
 
   private IndexParams(Builder builder) {
-    this.distanceType = builder.distanceType;
     this.vectorIndexParams = builder.vectorIndexParams;
     this.scalarIndexParams = builder.scalarIndexParams;
   }
 
   public static class Builder {
-    private DistanceType distanceType = DistanceType.L2;
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
     private Optional<ScalarIndexParams> scalarIndexParams = Optional.empty();
 
     public Builder() {}
-
-    /**
-     * Set the distance type for calculating the distance between vectors. Default to L2.
-     *
-     * @param distanceType distance type
-     * @return this builder
-     */
-    public Builder setDistanceType(DistanceType distanceType) {
-      this.distanceType = distanceType;
-      return this;
-    }
 
     /**
      * Vector index parameters for creating a vector index.
@@ -77,10 +63,6 @@ public class IndexParams {
     }
   }
 
-  public String getDistanceType() {
-    return distanceType.toString();
-  }
-
   public Optional<VectorIndexParams> getVectorIndexParams() {
     return vectorIndexParams;
   }
@@ -92,7 +74,6 @@ public class IndexParams {
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
-        .add("distanceType", distanceType)
         .add("vectorIndexParams", vectorIndexParams.orElse(null))
         .add("scalarIndexParams", scalarIndexParams.orElse(null))
         .toString();

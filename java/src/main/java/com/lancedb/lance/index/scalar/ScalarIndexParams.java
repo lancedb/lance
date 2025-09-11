@@ -19,39 +19,59 @@ import java.util.Optional;
 
 /** Parameters for creating scalar indices. */
 public class ScalarIndexParams {
-  private final Optional<BTreeIndexParams> btreeParams;
-  private final Optional<ZonemapIndexParams> zonemapParams;
+  private final String indexType;
+  private final Optional<String> jsonParams;
 
   private ScalarIndexParams(Builder builder) {
-    this.btreeParams = builder.btreeParams;
-    this.zonemapParams = builder.zonemapParams;
+    this.indexType = builder.indexType;
+    this.jsonParams = builder.jsonParams;
+  }
+
+  /**
+   * Create a new ScalarIndexParams with the given index type and no parameters.
+   *
+   * @param indexType the index type (e.g., "btree", "zonemap", "bitmap", "inverted", "labellist",
+   *     "ngram")
+   * @return ScalarIndexParams
+   */
+  public static ScalarIndexParams create(String indexType) {
+    return new Builder(indexType).build();
+  }
+
+  /**
+   * Create a new ScalarIndexParams with the given index type and JSON parameters.
+   *
+   * @param indexType the index type (e.g., "btree", "zonemap", "bitmap", "inverted", "labellist",
+   *     "ngram")
+   * @param jsonParams JSON string containing index-specific parameters
+   * @return ScalarIndexParams
+   */
+  public static ScalarIndexParams create(String indexType, String jsonParams) {
+    return new Builder(indexType).setJsonParams(jsonParams).build();
   }
 
   public static class Builder {
-    private Optional<BTreeIndexParams> btreeParams = Optional.empty();
-    private Optional<ZonemapIndexParams> zonemapParams = Optional.empty();
-
-    public Builder() {}
+    private final String indexType;
+    private Optional<String> jsonParams = Optional.empty();
 
     /**
-     * Set B-Tree index parameters.
+     * Create a new builder for scalar index parameters.
      *
-     * @param btreeParams B-Tree index parameters
-     * @return this builder
+     * @param indexType the index type (e.g., "btree", "zonemap", "bitmap", "inverted", "labellist",
+     *     "ngram")
      */
-    public Builder setBTreeParams(BTreeIndexParams btreeParams) {
-      this.btreeParams = Optional.of(btreeParams);
-      return this;
+    public Builder(String indexType) {
+      this.indexType = indexType;
     }
 
     /**
-     * Set Zonemap index parameters.
+     * Set the parameters for the index as a JSON string.
      *
-     * @param zonemapParams Zonemap index parameters
+     * @param jsonParams JSON string containing index-specific parameters
      * @return this builder
      */
-    public Builder setZonemapParams(ZonemapIndexParams zonemapParams) {
-      this.zonemapParams = Optional.of(zonemapParams);
+    public Builder setJsonParams(String jsonParams) {
+      this.jsonParams = Optional.of(jsonParams);
       return this;
     }
 
@@ -60,19 +80,19 @@ public class ScalarIndexParams {
     }
   }
 
-  public Optional<BTreeIndexParams> getBTreeParams() {
-    return btreeParams;
+  public String getIndexType() {
+    return indexType;
   }
 
-  public Optional<ZonemapIndexParams> getZonemapParams() {
-    return zonemapParams;
+  public Optional<String> getJsonParams() {
+    return jsonParams;
   }
 
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
-        .add("btreeParams", btreeParams.orElse(null))
-        .add("zonemapParams", zonemapParams.orElse(null))
+        .add("indexType", indexType)
+        .add("jsonParams", jsonParams.orElse(null))
         .toString();
   }
 }

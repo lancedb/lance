@@ -119,18 +119,6 @@ pub fn get_index_params(
     env: &mut JNIEnv,
     index_params_obj: JObject,
 ) -> Result<Box<dyn IndexParams>> {
-    let distance_type_obj: JString = env
-        .call_method(
-            &index_params_obj,
-            "getDistanceType",
-            "()Ljava/lang/String;",
-            &[],
-        )?
-        .l()?
-        .into();
-    let distance_type_str: String = env.get_string(&distance_type_obj)?.into();
-    let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
-
     let vector_index_params_option_object = env
         .call_method(
             index_params_obj,
@@ -152,6 +140,19 @@ pub fn get_index_params(
                 &[],
             )?
             .l()?;
+
+        // Get distance type from VectorIndexParams
+        let distance_type_obj: JString = env
+            .call_method(
+                &vector_index_params_obj,
+                "getDistanceType",
+                "()Ljava/lang/String;",
+                &[],
+            )?
+            .l()?
+            .into();
+        let distance_type_str: String = env.get_string(&distance_type_obj)?.into();
+        let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
 
         let ivf_params_obj = env
             .call_method(
@@ -275,37 +276,46 @@ pub fn get_index_params(
 pub fn get_scalar_index_params(
     env: &mut JNIEnv,
     index_params_obj: JObject,
-    index_type: lance_index::IndexType,
-) -> Result<String> {
-    // For scalar indices, we return a simple JSON string with parameters
-    match index_type {
-        lance_index::IndexType::BTree => {
-            let scalar_params = env.get_optional_from_method(
-                &index_params_obj,
-                "getScalarIndexParams",
-                |env, scalar_obj| {
-                    env.get_optional_from_method(&scalar_obj, "getBTreeParams", |env, btree_obj| {
-                        let batch_size = env
-                            .call_method(&btree_obj, "getBatchSize", "()J", &[])?
-                            .j()?;
-                        Ok(format!(r#"{{"zone_size": {}}}"#, batch_size))
-                    })
-                },
-            )?;
+) -> Result<(String, Option<String>)> {
+    let scalar_params_option_object = env
+        .call_method(
+            index_params_obj,
+            "getScalarIndexParams",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
-            match scalar_params {
-                Some(Some(params_str)) => Ok(params_str),
-                _ => Ok(r#"{"zone_size": 4096}"#.to_string()), // Default batch size
-            }
-        }
-        lance_index::IndexType::ZoneMap => {
-            // ZoneMap uses default parameters for now
-            Ok(r#"{}"#.to_string())
-        }
-        _ => Err(Error::input_error(format!(
-            "Unsupported scalar index type: {:?}",
-            index_type
-        ))),
+    if env
+        .call_method(&scalar_params_option_object, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let scalar_params_obj = env
+            .call_method(
+                &scalar_params_option_object,
+                "get",
+                "()Ljava/lang/Object;",
+                &[],
+            )?
+            .l()?;
+
+        let index_type = env.get_string_from_method(&scalar_params_obj, "getIndexType")?;
+
+        let params = env.get_optional_from_method(
+            &scalar_params_obj,
+            "getJsonParams",
+            |env, params_obj| {
+                let params_str: JString = params_obj.into();
+                let params_string: String = env.get_string(&params_str)?.into();
+                Ok(params_string)
+            },
+        )?;
+
+        Ok((index_type, params))
+    } else {
+        Err(Error::input_error(
+            "ScalarIndexParams not present".to_string(),
+        ))
     }
 }
 

@@ -15,9 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
-import com.lancedb.lance.index.scalar.BTreeIndexParams;
 import com.lancedb.lance.index.scalar.ScalarIndexParams;
-import com.lancedb.lance.index.scalar.ZonemapIndexParams;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -51,10 +49,7 @@ public class ScalarIndexTest {
           Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build())) {
 
         // Create BTree scalar index parameters
-        BTreeIndexParams btreeParams = new BTreeIndexParams.Builder().setBatchSize(2048L).build();
-
-        ScalarIndexParams scalarParams =
-            new ScalarIndexParams.Builder().setBTreeParams(btreeParams).build();
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
 
         IndexParams indexParams =
             new IndexParams.Builder().setScalarIndexParams(scalarParams).build();
@@ -87,11 +82,8 @@ public class ScalarIndexTest {
       try (Dataset dataset =
           Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build())) {
 
-        // Create Zonemap scalar index parameters
-        ZonemapIndexParams zonemapParams = new ZonemapIndexParams.Builder().build();
-
-        ScalarIndexParams scalarParams =
-            new ScalarIndexParams.Builder().setZonemapParams(zonemapParams).build();
+        // Create Zonemap scalar index parameters (no additional params needed)
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("zonemap");
 
         IndexParams indexParams =
             new IndexParams.Builder().setScalarIndexParams(scalarParams).build();

@@ -199,8 +199,8 @@ public class VectorIndexParams {
     }
   }
 
-  public DistanceType getDistanceType() {
-    return distanceType;
+  public String getDistanceType() {
+    return distanceType.toString();
   }
 
   public IvfBuildParams getIvfParams() {

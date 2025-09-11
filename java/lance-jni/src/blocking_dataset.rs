@@ -641,10 +641,12 @@ fn inner_create_index(
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
         IndexType::BTree | IndexType::ZoneMap => {
             // For scalar indices, create a scalar IndexParams
-            let params_str = get_scalar_index_params(env, params_jobj, index_type)?;
-            Ok(Box::new(lance_index::scalar::ScalarIndexParams::new(
-                params_str,
-            )))
+            let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
+            let scalar_params = lance_index::scalar::ScalarIndexParams {
+                index_type: index_type_str,
+                params: params_opt,
+            };
+            Ok(Box::new(scalar_params))
         }
         _ => {
             // For vector indices, use the existing parameter handling
