@@ -115,7 +115,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
     Ok(query)
 }
 
-pub fn get_index_params(
+pub fn get_vector_index_params(
     env: &mut JNIEnv,
     index_params_obj: JObject,
 ) -> Result<Box<dyn IndexParams>> {

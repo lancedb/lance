@@ -5,8 +5,8 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
-    extract_storage_options, extract_write_params, get_index_params, get_scalar_index_params,
-    to_rust_map,
+    extract_storage_options, extract_write_params, get_scalar_index_params,
+    get_vector_index_params, to_rust_map,
 };
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
@@ -639,7 +639,13 @@ fn inner_create_index(
 
     // Handle scalar vs vector indices differently and get params before borrowing dataset
     let params_result: Result<Box<dyn IndexParams>> = match index_type {
-        IndexType::BTree | IndexType::ZoneMap => {
+        IndexType::Scalar
+        | IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::LabelList
+        | IndexType::Inverted
+        | IndexType::NGram
+        | IndexType::ZoneMap => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
@@ -648,9 +654,22 @@ fn inner_create_index(
             };
             Ok(Box::new(scalar_params))
         }
-        _ => {
+        IndexType::FragmentReuse | IndexType::MemWal => {
+            // System indices - not user-creatable
+            Err(Error::input_error(format!(
+                "Cannot create system index type: {:?}. System indices are managed internally.",
+                index_type
+            )))
+        }
+        IndexType::Vector
+        | IndexType::IvfFlat
+        | IndexType::IvfSq
+        | IndexType::IvfPq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswFlat => {
             // For vector indices, use the existing parameter handling
-            get_index_params(env, params_jobj)
+            get_vector_index_params(env, params_jobj)
         }
     };
 

@@ -30,6 +30,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
 public class ScalarIndexTest {
 
   @TempDir Path tempDir;
@@ -51,8 +53,7 @@ public class ScalarIndexTest {
         // Create BTree scalar index parameters
         ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
 
-        IndexParams indexParams =
-            new IndexParams.Builder().setScalarIndexParams(scalarParams).build();
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
 
         // Create BTree index on 'id' column
         dataset.createIndex(
@@ -62,8 +63,15 @@ public class ScalarIndexTest {
             indexParams,
             false);
 
-        // Verify index was created
-        assert dataset.listIndexes().contains("btree_id_index");
+        // Verify index was created and is in the list
+        assertTrue(
+            dataset.listIndexes().contains("btree_id_index"),
+            "Expected 'btree_id_index' to be in the list of indexes: " + dataset.listIndexes());
+
+        // TODO: Verify zone_size parameter was applied
+        // Currently the Java API doesn't expose index configuration details,
+        // but we could add a getIndexDetails() method in the future to verify
+        // that the zone_size parameter was correctly set to 2048
       }
     }
   }
@@ -82,11 +90,11 @@ public class ScalarIndexTest {
       try (Dataset dataset =
           Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build())) {
 
-        // Create Zonemap scalar index parameters (no additional params needed)
-        ScalarIndexParams scalarParams = ScalarIndexParams.create("zonemap");
+        // Create Zonemap scalar index parameters with rows_per_zone setting
+        ScalarIndexParams scalarParams =
+            ScalarIndexParams.create("zonemap", "{\"rows_per_zone\": 1024}");
 
-        IndexParams indexParams =
-            new IndexParams.Builder().setScalarIndexParams(scalarParams).build();
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
 
         // Create Zonemap index on 'value' column
         dataset.createIndex(
@@ -97,7 +105,15 @@ public class ScalarIndexTest {
             false);
 
         // Verify index was created
-        assert dataset.listIndexes().contains("zonemap_value_index");
+        assertTrue(
+            dataset.listIndexes().contains("zonemap_value_index"),
+            "Expected 'zonemap_value_index' to be in the list of indexes: "
+                + dataset.listIndexes());
+
+        // TODO: Verify rows_per_zone parameter was applied
+        // Currently the Java API doesn't expose index configuration details,
+        // but we could add a getIndexDetails() method in the future to verify
+        // that the rows_per_zone parameter was correctly set to 1024
       }
     }
   }

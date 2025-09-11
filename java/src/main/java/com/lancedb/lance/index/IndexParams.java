@@ -30,11 +30,20 @@ public class IndexParams {
     this.scalarIndexParams = builder.scalarIndexParams;
   }
 
+  /**
+   * Create a new builder for IndexParams.
+   *
+   * @return a new Builder instance
+   */
+  public static Builder builder() {
+    return new Builder();
+  }
+
   public static class Builder {
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
     private Optional<ScalarIndexParams> scalarIndexParams = Optional.empty();
 
-    public Builder() {}
+    private Builder() {}
 
     /**
      * Vector index parameters for creating a vector index.
