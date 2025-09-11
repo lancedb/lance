@@ -44,9 +44,6 @@ pub struct RabitQuantizationMetadata {
     pub rotate_mat: Option<FixedSizeListArray>,
     pub rotate_mat_position: u32,
     pub num_bits: u8,
-    // number of vectors in the vector store,
-    // we need to store this because we need to add padding to the vector codes
-    // pub n: usize,
     pub packed: bool,
 }
 
@@ -171,9 +168,6 @@ pub struct RabitDistCalculator<'a> {
     scale_factors: &'a [f32],
     query_factor: f32,
 
-    // sq_min: f32,
-    // sq_scale: f32,
-    // sq_sum: f32,
     sum_q: f32,
     sqrt_d: f32,
 }
@@ -214,11 +208,27 @@ pub fn build_dist_table_direct<T: ArrowFloatType>(qc: &[T::Native]) -> Vec<f32>
 where
     T::Native: AsPrimitive<f32>,
 {
+    // every 4 bits (SEGMENT_LENGTH) is a segment, and we need to compute the distance between the segment and all the codes
+    // so there are dim/4 segments, and the number of codes is 16 (2^{SEGMENT_LENGTH}),
+    // so we have dim/4 * 16 = dim * 4 elements in the dist_table
     let mut dist_table = vec![0.0; qc.len() * 4];
     qc.chunks_exact(SEGMENT_LENGTH)
         .zip(dist_table.chunks_exact_mut(SEGMENT_NUM_CODES))
         .for_each(|(sub_vec, dist_table)| {
-            (1..16).for_each(|j| {
+            // skip 0 because it's always 0
+            (1..SEGMENT_NUM_CODES).for_each(|j| {
+                // this is a little bit tricky,
+                // j represents a subset of 4 bits, that if the i-th bit of `j` is 1,
+                // then we need to add the distance of the i-th dim of the segment.
+                // but we don't need to check all bits of `j`,
+                // because `j` = `j - lowbit(j)` + `lowbit(j)`,
+                // where `j-lowbit(j)` is less than `j`,
+                // which means dist_table[j-lowbit(j)] is already computed,
+                // and we can use it to compute dist_table[j]
+                // for example, if j = 0b1010, then j - lowbit(j) = 0b1000,
+                // and dist_table[0b1000] is already computed,
+                // so dist_table[0b1010] = dist_table[0b1000] + sub_vec[LOWBIT_IDX[0b1010]];
+                // where lowbit(0b1010) = 0b10, LOWBIT_IDX[0b1010] = LOWBIT_IDX[0b10] = 1.
                 dist_table[j] = dist_table[j - lowbit(j)] + sub_vec[LOWBIT_IDX[j]].as_();
             })
         });
@@ -292,7 +302,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn distance_all(&self, _: usize) -> Vec<f32> {
         let code_len = self.dim * (self.num_bits as usize) / 8;
         let n = self.codes.len() / code_len;
@@ -427,24 +437,15 @@ impl VectorStore for RabitQuantizationStorage {
     }
 }
 
-const LOWBIT_IDX: [usize; 16] = [
-    0, /*0000*/
-    0, /*0001*/
-    1, /*0010*/
-    0, /*0011*/
-    2, /*0100*/
-    0, /*0101*/
-    1, /*0110*/
-    0, /*0111*/
-    3, /*1000*/
-    0, /*1001*/
-    1, /*1010*/
-    0, /*1011*/
-    2, /*1100*/
-    0, /*1101*/
-    1, /*1110*/
-    0, /*1111*/
-]; // all possible combination for a 4 bit string
+const LOWBIT_IDX: [usize; 16] = {
+    let mut array = [0; 16];
+    let mut i = 1;
+    while i < 16 {
+        array[i] = i.trailing_zeros() as usize;
+        i += 1;
+    }
+    array
+};
 
 fn get_column(
     quantization_code: &[u8],

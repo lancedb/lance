@@ -844,7 +844,6 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let start = Instant::now();
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
                         let key = normalize_arrow(&query.key)?.0;
@@ -862,7 +861,6 @@ impl ANNIvfSubIndexExec {
                             DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
                         })
                         .await?;
-                    log::info!("partition {} took {:?}", part_id, start.elapsed());
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     state.record_batch(&batch);
                     Ok(batch)

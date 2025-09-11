@@ -3422,11 +3422,7 @@ impl Scanner {
 
     #[instrument(level = "info", skip(self))]
     pub async fn analyze_plan(&self) -> Result<String> {
-        let start = Instant::now();
         let plan = self.create_plan().await?;
-        log::info!("create plan took {:?}", start.elapsed());
-
-        let start = Instant::now();
         let res = analyze_plan(
             plan,
             LanceExecutionOptions {
@@ -3435,7 +3431,6 @@ impl Scanner {
             },
         )
         .await;
-        log::info!("analyze plan took {:?}", start.elapsed());
         res
     }
 

@@ -88,20 +88,20 @@ fn compute_distances(c: &mut Criterion) {
             },
         );
 
-        // c.bench_function(
-        //     format!(
-        //         "RQ{}: compute_distances_single: {},DIM={}",
-        //         num_bits, TOTAL, DIM
-        //     )
-        //     .as_str(),
-        //     |b| {
-        //         b.iter(|| {
-        //             for i in 0..TOTAL {
-        //                 black_box(dist_calc.distance(i as u32));
-        //             }
-        //         })
-        //     },
-        // );
+        c.bench_function(
+            format!(
+                "RQ{}: compute_distances_single: {},DIM={}",
+                num_bits, TOTAL, DIM
+            )
+            .as_str(),
+            |b| {
+                b.iter(|| {
+                    for i in 0..TOTAL {
+                        black_box(dist_calc.distance(i as u32));
+                    }
+                })
+            },
+        );
     }
 }
 
