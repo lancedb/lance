@@ -2735,7 +2735,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         index_uuid: str,
         index_type: str,
-        prefetch_batch: Optional[int] = None,
+        batch_readhead: Optional[int] = None,
     ):
         """
         Merge an index which is not commit at present.
@@ -2747,7 +2747,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type: str
             The type of the index.
             Only "BTREE" and "INVERTED" are supported now.
-        prefetch_batch: int, optional
+        batch_readhead: int, optional
             The number of prefetch batches of sub-page files for merging.
             Default 1.
         """
@@ -2762,7 +2762,7 @@ class LanceDataset(pa.dataset.Dataset):
                     f"merge index metadata.  Received {index_type}",
                 )
             )
-        return self._ds.merge_index_metadata(index_uuid, index_type, prefetch_batch)
+        return self._ds.merge_index_metadata(index_uuid, index_type, batch_readhead)
 
     def session(self) -> Session:
         """

@@ -1670,48 +1670,33 @@ impl Dataset {
             .infer_error()
     }
 
-    #[pyo3(signature = (index_uuid, index_type, prefetch_batch))]
+    #[pyo3(signature = (index_uuid, index_type, batch_readhead))]
     fn merge_index_metadata(
         &self,
         index_uuid: &str,
         index_type: &str,
-        prefetch_batch: Option<usize>,
+        batch_readhead: Option<usize>,
     ) -> PyResult<()> {
         RT.block_on(None, async {
             let store = LanceIndexStore::from_dataset_for_new(self.ds.as_ref(), index_uuid)?;
             let index_dir = self.ds.indices_dir().child(index_uuid);
             match index_type.to_uppercase().as_str() {
                 "INVERTED" => {
-                    // List all partition metadata files in the index directory
-                    let part_metadata_files =
-                        lance_index::scalar::inverted::builder::list_metadata_files(
-                            self.ds.object_store(),
-                            &index_dir,
-                        )
-                        .await?;
-
-                    // Call merge_metadata_files function for inverted index
-                    lance_index::scalar::inverted::builder::merge_metadata_files(
+                    // Call merge_index_files function for inverted index
+                    lance_index::scalar::inverted::builder::merge_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
                         Arc::new(store),
-                        &part_metadata_files,
                     )
                     .await
                 }
                 "BTREE" => {
-                    // List all partition page / lookup files in the index directory
-                    let (part_page_files, part_lookup_files) =
-                        lance_index::scalar::btree::list_page_lookup_files(
-                            self.ds.object_store(),
-                            &index_dir,
-                        )
-                        .await?;
-
-                    // Call merge_metadata_files function for btree index
-                    lance_index::scalar::btree::merge_metadata_files(
+                    // Call merge_index_files function for btree index
+                    lance_index::scalar::btree::merge_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
                         Arc::new(store),
-                        &part_page_files,
-                        &part_lookup_files,
-                        prefetch_batch,
+                        batch_readhead,
                     )
                     .await
                 }

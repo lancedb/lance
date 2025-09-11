@@ -530,6 +530,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         _request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        assert!(_fragment_ids.is_none());
         Self::train_bitmap_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BitmapIndexDetails::default()).unwrap(),

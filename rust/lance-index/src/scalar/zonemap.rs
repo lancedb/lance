@@ -963,6 +963,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        assert!(_fragment_ids.is_none());
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
             .map_err(|_| Error::InvalidInput {

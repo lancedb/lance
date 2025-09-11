@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -1437,9 +1437,21 @@ pub async fn train_btree_index(
     Ok(())
 }
 
+pub async fn merge_index_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    store: Arc<dyn IndexStore>,
+    batch_readhead: Option<usize>,
+) -> Result<()> {
+    // List all partition page / lookup files in the index directory
+    let (part_page_files, part_lookup_files) =
+        list_page_lookup_files(object_store, index_dir).await?;
+    merge_metadata_files(store, &part_page_files, &part_lookup_files, batch_readhead).await
+}
+
 /// List and filter files from the index directory
 /// Returns (page_files, lookup_files)
-pub async fn list_page_lookup_files(
+async fn list_page_lookup_files(
     object_store: &ObjectStore,
     index_dir: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
@@ -1482,11 +1494,11 @@ pub async fn list_page_lookup_files(
 ///
 /// In a distributed environment, each worker node writes partition page / lookup files for the partitions it processes,
 /// and this function merges these files into a final metadata file.
-pub async fn merge_metadata_files(
+async fn merge_metadata_files(
     store: Arc<dyn IndexStore>,
     part_page_files: &[String],
     part_lookup_files: &[String],
-    prefetch_batch: Option<usize>,
+    batch_readhead: Option<usize>,
 ) -> Result<()> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
         return Err(Error::Internal {
@@ -1496,6 +1508,16 @@ pub async fn merge_metadata_files(
     }
 
     // Step 1: Create lookup map for page files by partition ID
+    if part_lookup_files.len() != part_page_files.len() {
+        return Err(Error::Internal {
+            message: format!(
+                "Number of partition lookup files ({}) does not match number of partition page files ({})",
+                part_lookup_files.len(),
+                part_page_files.len()
+            ),
+            location: location!(),
+        });
+    }
     let mut page_files_map = HashMap::new();
     for page_file in part_page_files {
         let partition_id = extract_partition_id(page_file)?;
@@ -1526,8 +1548,12 @@ pub async fn merge_metadata_files(
         .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
 
     // Get the value type from lookup schema (min column)
-    let lookup_batch = first_lookup_reader.read_range(0..1, None).await?;
-    let value_type = lookup_batch.column(0).data_type().clone();
+    let value_type = first_lookup_reader
+        .schema()
+        .fields
+        .first()
+        .unwrap()
+        .data_type();
 
     // Get page schema first
     let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
@@ -1540,20 +1566,15 @@ pub async fn merge_metadata_files(
         .new_index_file(BTREE_PAGES_NAME, arrow_schema.clone())
         .await?;
 
-    let mut prefetch_config = PrefetchConfig::default();
-    if let Some(batch) = prefetch_batch {
-        prefetch_config = prefetch_config.with_prefetch_batch(batch);
-    }
-
     // Step 4: Merge pages and create lookup entries
-    let lookup_entries = merge_page(
+    let lookup_entries = merge_pages(
         part_lookup_files,
         &page_files_map,
         &store,
         batch_size,
         &mut page_file,
         arrow_schema.clone(),
-        prefetch_config,
+        batch_readhead,
     )
     .await?;
 
@@ -1603,31 +1624,29 @@ pub async fn merge_metadata_files(
     Ok(())
 }
 
-async fn merge_page(
+/// Merge pages using DataFusion's SortPreservingMerge
+/// with fixed-size output streams which implementation is the K-way merge algorithm
+async fn merge_pages(
     part_lookup_files: &[String],
     page_files_map: &HashMap<u64, &String>,
     store: &Arc<dyn IndexStore>,
     batch_size: u64,
     page_file: &mut Box<dyn IndexWriter>,
     arrow_schema: Arc<Schema>,
-    prefetch_config: PrefetchConfig,
+    batch_readhead: Option<usize>,
 ) -> Result<Vec<(ScalarValue, ScalarValue, u32, u32)>> {
     let mut lookup_entries = Vec::new();
     let mut page_idx = 0u32;
 
     let start_time = std::time::Instant::now();
     debug!(
-        "Starting multi-way merge with {} partitions using prefetch manager",
+        "Starting DataFusion SortPreservingMerge with {} partitions",
         part_lookup_files.len()
     );
 
-    // Directly create iterators and read first element
-    let mut partition_map = HashMap::new();
-    let mut heap = BinaryHeap::new();
+    // Create input streams for each partition
+    let mut input_streams = Vec::new();
 
-    debug!("Initializing {} partitions", part_lookup_files.len());
-
-    // Initialize all partitions
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
         let page_file_name =
@@ -1639,71 +1658,85 @@ async fn merge_page(
                 })?)
             .clone();
 
-        let mut iterator = PartitionIterator::new(
-            store.clone(),
-            page_file_name,
-            batch_size,
-            prefetch_config.clone(),
-        )
-        .await?;
+        let reader = store.open_index_file(&page_file_name).await?;
 
-        let first_element = iterator.next().await?;
+        let stream = reader
+            .read_stream(batch_size as u32, batch_readhead.unwrap_or(1) as u32, None)
+            .await?;
 
-        if let Some((value, row_id)) = first_element {
-            // Put the first element into the heap with cached orderable value
-            let orderable_value = OrderableScalarValue(value.clone());
-            heap.push(HeapElement {
-                value,
-                row_id,
-                partition_id,
-                orderable_value,
-            });
-        }
-
-        partition_map.insert(partition_id, iterator);
+        input_streams.push(stream);
     }
 
-    debug!(
-        "Initialized {} partitions, heap size: {}",
-        partition_map.len(),
-        heap.len()
-    );
+    if input_streams.is_empty() {
+        return Ok(lookup_entries);
+    }
 
-    let mut current_batch_rows = Vec::with_capacity(batch_size as usize);
+    // Convert streams into execution plans
+    let mut input_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+    let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
+    let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+
+    for stream in input_streams {
+        // Convert Lance RecordBatchStream to DataFusion SendableRecordBatchStream
+        let df_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            new_schema.clone(),
+            stream.map(|result| result.map_err(|e| DataFusionError::ArrowError(e.into(), None))),
+        ));
+
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::new(df_stream));
+        input_plans.push(plan);
+    }
+
+    // Create UnionExec to combine all inputs
+    let union_exec = Arc::new(UnionExec::new(input_plans));
+
+    // Create sort expression for the first column (value column)
+    let value_column_index = new_schema.index_of(VALUE_COLUMN_NAME)?;
+    let sort_expr = PhysicalSortExpr {
+        expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
+        options: SortOptions {
+            descending: false,
+            nulls_first: true,
+        },
+    };
+
+    // Create SortPreservingMergeExec
+    let merge_exec = Arc::new(SortPreservingMergeExec::new(
+        LexOrdering::new(vec![sort_expr]),
+        union_exec,
+    ));
+
+    // Execute the plan
+    let merged_stream = execute_plan(
+        merge_exec,
+        LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        },
+    )?;
+
+    // Use chunk_concat_stream to ensure fixed-size output batches
+    let chunked_stream = chunk_concat_stream(merged_stream, batch_size as usize);
+    let mut chunked_stream = Box::pin(chunked_stream);
     let mut total_merged = 0usize;
 
-    // Multi-way merge main loop
-    while let Some(min_element) = heap.pop() {
-        // Add current minimum element to batch
-        current_batch_rows.push((min_element.value, min_element.row_id));
-        total_merged += 1;
+    // Process the chunked stream - each batch will have exactly batch_size rows
+    // (except possibly the last one)
+    while let Some(batch_result) = chunked_stream.next().await {
+        let batch = batch_result?;
 
-        // Read next element from corresponding partition
-        if let Some(iterator) = partition_map.get_mut(&min_element.partition_id) {
-            if let Some((next_value, next_row_id)) = iterator.next().await? {
-                let orderable_value = OrderableScalarValue(next_value.clone());
-                heap.push(HeapElement {
-                    value: next_value,
-                    row_id: next_row_id,
-                    partition_id: min_element.partition_id,
-                    orderable_value,
-                });
-            }
+        // Convert the entire batch to lookup entries at once
+        let mut current_batch_rows = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let value = ScalarValue::try_from_array(batch.column(0), row_idx)?;
+            let row_id = ScalarValue::try_from_array(batch.column(1), row_idx)?;
+            current_batch_rows.push((value, row_id));
         }
 
-        if current_batch_rows.len() >= batch_size as usize {
-            write_batch_and_lookup_entry(
-                &mut current_batch_rows,
-                page_file,
-                &arrow_schema,
-                &mut lookup_entries,
-                &mut page_idx,
-            )
-            .await?;
-        }
-    }
+        total_merged += current_batch_rows.len();
 
-    if !current_batch_rows.is_empty() {
+        // Write the batch (it's already the right size due to chunk_concat_stream)
         write_batch_and_lookup_entry(
             &mut current_batch_rows,
             page_file,
@@ -1714,20 +1747,14 @@ async fn merge_page(
         .await?;
     }
 
-    let elapsed = start_time.elapsed();
-    let rows_per_second = if elapsed.as_secs_f64() > 0.0 {
-        total_merged as f64 / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
-
+    let duration = start_time.elapsed();
     debug!(
-        "Completed multi-way merge: merged {} rows into {} lookup entries in {:.2}s ({:.0} rows/s)",
+        "DataFusion merge completed: merged {} records in {:?}, {} lookup entries",
         total_merged,
-        lookup_entries.len(),
-        elapsed.as_secs_f64(),
-        rows_per_second
+        duration,
+        lookup_entries.len()
     );
+
     Ok(lookup_entries)
 }
 
@@ -1896,252 +1923,6 @@ pub(crate) fn part_page_data_file_path(partition_id: u64) -> String {
 
 pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, BTREE_LOOKUP_NAME)
-}
-
-/// Prefetch configuration for partition iterators
-#[derive(Debug, Clone)]
-pub struct PrefetchConfig {
-    /// Number of batches to prefetch ahead (0 means no prefetching)
-    pub prefetch_batches: usize,
-}
-
-impl Default for PrefetchConfig {
-    fn default() -> Self {
-        Self {
-            prefetch_batches: 1,
-        }
-    }
-}
-
-impl PrefetchConfig {
-    /// Set the prefetch batch count
-    pub fn with_prefetch_batch(&self, batch_count: usize) -> Self {
-        Self {
-            prefetch_batches: batch_count,
-        }
-    }
-}
-
-/// Buffer entry for prefetch queue
-#[derive(Debug)]
-struct BufferEntry {
-    batch: RecordBatch,
-    start_row: usize,
-    end_row: usize,
-}
-
-/// Partition iterator for loading partition data in batches with integrated prefetching
-struct PartitionIterator {
-    reader: Arc<dyn IndexReader>,
-    current_batch: Option<RecordBatch>,
-    current_position: usize,
-    rows_read: usize,
-    batch_size: u64,
-    prefetch_buffer: Arc<tokio::sync::Mutex<VecDeque<BufferEntry>>>,
-    prefetch_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl PartitionIterator {
-    async fn new(
-        store: Arc<dyn IndexStore>,
-        page_file_name: String,
-        batch_size: u64,
-        prefetch_config: PrefetchConfig,
-    ) -> Result<Self> {
-        let reader = store.open_index_file(&page_file_name).await?;
-        let total_rows = reader.num_rows();
-
-        // Create shared prefetch buffer
-        let prefetch_buffer = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
-
-        // Start prefetch task
-        let prefetch_task = if prefetch_config.prefetch_batches > 0 {
-            let reader_clone = reader.clone();
-            let buffer_clone = prefetch_buffer.clone();
-            let batch_size_clone = batch_size as usize;
-            let prefetch_batches = prefetch_config.prefetch_batches;
-
-            Some(tokio::spawn(async move {
-                let mut current_pos = 0;
-
-                while current_pos < total_rows {
-                    let effective_batch_size = prefetch_batches * batch_size_clone;
-                    let end_pos = std::cmp::min(current_pos + effective_batch_size, total_rows);
-
-                    match reader_clone.read_range(current_pos..end_pos, None).await {
-                        Ok(batch) => {
-                            let entry = BufferEntry {
-                                start_row: current_pos,
-                                end_row: current_pos + batch.num_rows(),
-                                batch,
-                            };
-
-                            // Add data to buffer with size control
-                            {
-                                let mut buffer_guard = buffer_clone.lock().await;
-                                const MAX_BUFFER_SIZE: usize = 4;
-
-                                // Only add if buffer is not full
-                                if buffer_guard.len() < MAX_BUFFER_SIZE {
-                                    buffer_guard.push_back(entry);
-                                } else {
-                                    // Buffer is full, skip this prefetch to avoid memory bloat
-                                    break;
-                                }
-                            }
-
-                            current_pos = end_pos;
-                        }
-                        Err(_) => {
-                            // Read failed, wait before retry
-                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                        }
-                    }
-
-                    // Add some delay to avoid excessive resource consumption
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }
-            }))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            reader,
-            current_batch: None,
-            current_position: 0,
-            rows_read: 0,
-            batch_size,
-            prefetch_buffer,
-            prefetch_task,
-        })
-    }
-
-    /// Get the next element with integrated prefetching
-    async fn next(&mut self) -> Result<Option<(ScalarValue, ScalarValue)>> {
-        // Load new batch if current one is exhausted
-        if self.needs_new_batch() {
-            if self.rows_read >= self.reader.num_rows() {
-                return Ok(None);
-            }
-            self.load_next_batch().await?;
-        }
-
-        // Extract next value from current batch
-        if let Some(batch) = &self.current_batch {
-            let value = ScalarValue::try_from_array(batch.column(0), self.current_position)?;
-            let row_id = ScalarValue::try_from_array(batch.column(1), self.current_position)?;
-            self.current_position += 1;
-            self.rows_read += 1;
-            Ok(Some((value, row_id)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Check if we need to load a new batch
-    fn needs_new_batch(&self) -> bool {
-        self.current_batch.is_none()
-            || self.current_position >= self.current_batch.as_ref().unwrap().num_rows()
-    }
-
-    async fn load_next_batch(&mut self) -> Result<()> {
-        let remaining_rows = self.reader.num_rows() - self.rows_read;
-        if remaining_rows == 0 {
-            self.current_batch = None;
-            return Ok(());
-        }
-
-        let rows_to_read = std::cmp::min(self.batch_size as usize, remaining_rows);
-        let end_row = self.rows_read + rows_to_read;
-
-        // First try to get data from prefetch buffer
-        let batch = if let Some(entry) = self.try_get_from_buffer(self.rows_read, end_row).await {
-            // Get required data by slicing from prefetch buffer
-            let slice_start = self.rows_read - entry.start_row;
-            let slice_len = rows_to_read;
-            entry.batch.slice(slice_start, slice_len)
-        } else {
-            // Fallback to direct read
-            self.reader
-                .read_range(self.rows_read..end_row, None)
-                .await?
-        };
-
-        self.current_batch = Some(batch);
-        self.current_position = 0;
-
-        Ok(())
-    }
-
-    /// Try to get data from prefetch buffer
-    async fn try_get_from_buffer(&self, start_row: usize, end_row: usize) -> Option<BufferEntry> {
-        let mut buffer_guard = self.prefetch_buffer.lock().await;
-
-        // Clean up expired buffer entries (entries that are no longer needed)
-        while let Some(entry) = buffer_guard.front() {
-            if entry.end_row <= start_row {
-                buffer_guard.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        // Find entry that contains the required data range
-        if let Some(index) = buffer_guard
-            .iter()
-            .position(|entry| entry.start_row <= start_row && entry.end_row >= end_row)
-        {
-            buffer_guard.remove(index)
-        } else {
-            None
-        }
-    }
-
-    #[allow(dead_code)]
-    fn get_reader(&self) -> Arc<dyn IndexReader> {
-        self.reader.clone()
-    }
-}
-
-impl Drop for PartitionIterator {
-    fn drop(&mut self) {
-        // Cancel the prefetch task when the iterator is dropped
-        if let Some(task) = &self.prefetch_task {
-            task.abort();
-        }
-    }
-}
-
-/// Heap elements, used for priority queues in multi-way merging
-#[derive(Debug)]
-struct HeapElement {
-    value: ScalarValue,
-    row_id: ScalarValue,
-    partition_id: u64,
-    orderable_value: OrderableScalarValue,
-}
-
-impl PartialEq for HeapElement {
-    fn eq(&self, other: &Self) -> bool {
-        self.orderable_value.eq(&other.orderable_value)
-    }
-}
-
-impl Eq for HeapElement {}
-
-impl PartialOrd for HeapElement {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapElement {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Note: BinaryHeap is a maximum heap, we need a minimum heap,
-        // so reverse the comparison result
-        other.orderable_value.cmp(&self.orderable_value)
-    }
 }
 
 /// A stream that reads the original training data back out of the index
@@ -2340,16 +2121,9 @@ mod tests {
     };
 
     use super::{
-        part_lookup_file_path, part_page_data_file_path, train_btree_index, HeapElement,
-        OrderableScalarValue, DEFAULT_BTREE_BATCH_SIZE,
+        part_lookup_file_path, part_page_data_file_path, train_btree_index, OrderableScalarValue,
+        DEFAULT_BTREE_BATCH_SIZE,
     };
-
-    use datafusion::arrow::array::Int32Array;
-    use datafusion::arrow::datatypes::{Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
-    use std::cmp::Ordering as CmpOrdering;
-    use std::collections::BinaryHeap;
-
     #[test]
     fn test_scalar_value_size() {
         let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
@@ -3190,190 +2964,5 @@ mod tests {
         // The cleanup function should handle both valid and invalid file patterns gracefully
         // This test mainly verifies that the function doesn't panic and handles edge cases
         super::cleanup_partition_files(&test_store, &lookup_files, &page_files).await;
-    }
-
-    #[test]
-    fn test_heap_element_comparison() {
-        // Create HeapElements with different values
-        let element1 = HeapElement {
-            value: ScalarValue::Int32(Some(10)),
-            row_id: ScalarValue::UInt64(Some(1)),
-            partition_id: 0,
-            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(10))),
-        };
-
-        let element2 = HeapElement {
-            value: ScalarValue::Int32(Some(5)),
-            row_id: ScalarValue::UInt64(Some(2)),
-            partition_id: 0,
-            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(5))),
-        };
-
-        let element3 = HeapElement {
-            value: ScalarValue::Int32(Some(15)),
-            row_id: ScalarValue::UInt64(Some(3)),
-            partition_id: 0,
-            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(15))),
-        };
-
-        // Test direct comparison - note that BinaryHeap is a max heap,
-        // but we want min heap behavior, so smaller values should be "greater"
-        assert_eq!(element1.cmp(&element2), CmpOrdering::Less); // 10 < 5 in min heap (5 should come first)
-        assert_eq!(element2.cmp(&element1), CmpOrdering::Greater); // 5 > 10 in min heap
-        assert_eq!(element1.cmp(&element3), CmpOrdering::Greater); // 10 > 15 in min heap (10 should come first)
-
-        // Test with BinaryHeap to ensure min heap behavior
-        let mut heap = BinaryHeap::new();
-        heap.push(element1);
-        heap.push(element2);
-        heap.push(element3);
-
-        // Should pop in ascending order (min heap behavior)
-        let first = heap.pop().unwrap();
-        assert_eq!(first.value, ScalarValue::Int32(Some(5)));
-
-        let second = heap.pop().unwrap();
-        assert_eq!(second.value, ScalarValue::Int32(Some(10)));
-
-        let third = heap.pop().unwrap();
-        assert_eq!(third.value, ScalarValue::Int32(Some(15)));
-
-        // Test with null values
-        let null_element = HeapElement {
-            value: ScalarValue::Int32(None),
-            row_id: ScalarValue::UInt64(Some(4)),
-            partition_id: 0,
-            orderable_value: OrderableScalarValue(ScalarValue::Int32(None)),
-        };
-
-        let non_null_element = HeapElement {
-            value: ScalarValue::Int32(Some(1)),
-            row_id: ScalarValue::UInt64(Some(5)),
-            partition_id: 0,
-            orderable_value: OrderableScalarValue(ScalarValue::Int32(Some(1))),
-        };
-
-        // Null values should come before non-null values in min heap
-        assert_eq!(null_element.cmp(&non_null_element), CmpOrdering::Greater);
-        assert_eq!(non_null_element.cmp(&null_element), CmpOrdering::Less);
-
-        // Test heap with null values
-        let mut heap_with_null = BinaryHeap::new();
-        heap_with_null.push(non_null_element);
-        heap_with_null.push(null_element);
-
-        // Null should come first
-        let first_with_null = heap_with_null.pop().unwrap();
-        assert_eq!(first_with_null.value, ScalarValue::Int32(None));
-
-        let second_with_null = heap_with_null.pop().unwrap();
-        assert_eq!(second_with_null.value, ScalarValue::Int32(Some(1)));
-    }
-
-    #[tokio::test]
-    async fn test_partition_iterator() {
-        // Create test environment
-        let tmpdir = Arc::new(tempdir().unwrap());
-        let test_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            Path::from_filesystem_path(tmpdir.path()).unwrap(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        // Create test data with more rows to test iteration
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, false),
-            Field::new("row_id", DataType::UInt64, false),
-        ]));
-
-        let values = Int32Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80]);
-        let row_ids = arrow::array::UInt64Array::from(vec![1u64, 2, 3, 4, 5, 6, 7, 8]);
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
-            .unwrap();
-
-        // Write test data to index file
-        let page_file_name = "test_partition_pages.lance".to_string();
-        let mut index_writer = test_store
-            .new_index_file(&page_file_name, schema.clone())
-            .await
-            .unwrap();
-        index_writer.write_record_batch(batch).await.unwrap();
-        index_writer.finish().await.unwrap();
-
-        // Test PartitionIterator creation and basic methods
-        let batch_size = 3u64; // Small batch size to test multiple iterations
-
-        // Create PartitionIterator
-        let mut partition_iterator = super::PartitionIterator::new(
-            test_store.clone(),
-            page_file_name,
-            batch_size,
-            super::PrefetchConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        // Test that iterator was created with correct initial state
-        assert_eq!(partition_iterator.batch_size, batch_size);
-        assert_eq!(partition_iterator.current_position, 0);
-        assert_eq!(partition_iterator.rows_read, 0);
-        assert!(partition_iterator.current_batch.is_none());
-
-        // Test get_reader method
-        let reader = partition_iterator.get_reader();
-        assert_eq!(reader.num_rows(), 8); // We wrote 8 rows
-
-        // Test iteration through data
-        let mut collected_values = Vec::new();
-        let mut collected_row_ids = Vec::new();
-        let mut iteration_count = 0;
-
-        // Iterate through all data
-        while let Some((value, row_id)) = partition_iterator.next().await.unwrap() {
-            collected_values.push(value);
-            collected_row_ids.push(row_id);
-            iteration_count += 1;
-
-            // Prevent infinite loop in case of bugs
-            if iteration_count > 20 {
-                panic!("Too many iterations, possible infinite loop");
-            }
-        }
-
-        // Verify we got all the data
-        assert_eq!(collected_values.len(), 8);
-        assert_eq!(collected_row_ids.len(), 8);
-
-        // Verify the actual values (they should match what we wrote)
-        let expected_values = vec![
-            ScalarValue::Int32(Some(10)),
-            ScalarValue::Int32(Some(20)),
-            ScalarValue::Int32(Some(30)),
-            ScalarValue::Int32(Some(40)),
-            ScalarValue::Int32(Some(50)),
-            ScalarValue::Int32(Some(60)),
-            ScalarValue::Int32(Some(70)),
-            ScalarValue::Int32(Some(80)),
-        ];
-
-        let expected_row_ids = vec![
-            ScalarValue::UInt64(Some(1)),
-            ScalarValue::UInt64(Some(2)),
-            ScalarValue::UInt64(Some(3)),
-            ScalarValue::UInt64(Some(4)),
-            ScalarValue::UInt64(Some(5)),
-            ScalarValue::UInt64(Some(6)),
-            ScalarValue::UInt64(Some(7)),
-            ScalarValue::UInt64(Some(8)),
-        ];
-
-        assert_eq!(collected_values, expected_values);
-        assert_eq!(collected_row_ids, expected_row_ids);
-
-        // Test that iterator is exhausted
-        assert!(partition_iterator.next().await.unwrap().is_none());
-
-        // Verify final state
-        assert_eq!(partition_iterator.rows_read, 8);
     }
 }

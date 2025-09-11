@@ -122,12 +122,10 @@ def btree_comparison_datasets(tmp_path):
 
     fragments = fragment_ds.get_fragments()
     fragment_ids = [fragment.fragment_id for fragment in fragments]
-    print(f"Fragment IDs: {fragment_ids}")
 
     # Create fragment-level indices
     for fragment in fragments:
         fragment_id = fragment.fragment_id
-        print(f"Creating B-tree index for fragment {fragment_id}")
 
         fragment_ds.create_scalar_index(
             column="id",
@@ -3111,6 +3109,18 @@ def test_distribute_btree_index_build(tmp_path):
             fragment_ids=[fragment_id],
         )
 
+    # test that the dataset should be searchable
+    # when the index not committed yet
+    # Test that the index works for searching
+    # Test exact equality queries
+    test_id = 100  # Should be in first fragment
+    results = ds.scanner(
+        filter=f"id = {test_id}",
+        columns=["id", "text"],
+    ).to_table()
+
+    assert results.num_rows == 1, f"No results found for id = {test_id}"
+
     # Merge the B-tree index metadata
     ds.merge_index_metadata(index_id, index_type="BTREE")
 
@@ -3166,7 +3176,7 @@ def test_distribute_btree_index_build(tmp_path):
         columns=["id", "text"],
     ).to_table()
 
-    assert results.num_rows > 0, f"No results found for id = {test_id}"
+    assert results.num_rows == 1, f"No results found for id = {test_id}"
 
     # Test range queries across fragments
     results_range = ds_committed.scanner(
@@ -3241,33 +3251,6 @@ def test_btree_fragment_ids_parameter_validation(tmp_path):
     except Exception as e:
         # It's acceptable for this to fail with an appropriate error
         print(f"Expected error for invalid fragment ID: {e}")
-
-
-def test_btree_backward_compatibility_no_fragment_ids(tmp_path):
-    """
-    Test that B-tree indexing remains backward compatible
-    when fragment_ids is not provided.
-    """
-    ds = generate_multi_fragment_dataset(
-        tmp_path, num_fragments=2, rows_per_fragment=10000
-    )
-
-    # This should work exactly as before (full dataset indexing)
-    ds.create_scalar_index(
-        column="id",
-        index_type="BTREE",
-        name="full_dataset_btree_idx",
-    )
-
-    # Verify the index was created
-    indices = ds.list_indices()
-    assert len(indices) == 1
-    assert indices[0]["name"] == "full_dataset_btree_idx"
-    assert indices[0]["type"] == "BTree"
-
-    # Test that the index works
-    results = ds.scanner(filter="id = 50").to_table()
-    assert results.num_rows > 0
 
 
 @pytest.mark.parametrize(
