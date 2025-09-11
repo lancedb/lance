@@ -178,7 +178,7 @@ mod tests {
         // each code is 2 bytes (16 dim), so code_len = 2
         let code_len = 2;
 
-        let codes = vec![
+        let codes = [
             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, // codes[0..8]
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // codes[8..16]
             0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, // codes[16..24]
@@ -187,8 +187,8 @@ mod tests {
         let codes = codes.repeat(n * code_len / codes.len());
 
         let mut dist_table = vec![0u8; 16 * 4];
-        for i in 0..dist_table.len() {
-            dist_table[i] = (i % 16 + 1) as u8;
+        for (i, dist) in dist_table.iter_mut().enumerate() {
+            *dist = (i % 16 + 1) as u8;
         }
 
         // Test the function
