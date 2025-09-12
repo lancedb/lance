@@ -23,12 +23,12 @@ on:
       dry_run:
         description: 'Dry run (simulate the release without pushing)'
         required: true
-        default: true
+        default: false
         type: boolean
       draft_release:
         description: 'Create a draft release on GitHub'
         required: true
-        default: true
+        default: false
         type: boolean
 
 jobs:
