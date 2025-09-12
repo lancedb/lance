@@ -93,11 +93,11 @@ impl LazyIndexReader {
 #[derive(Clone, Debug)]
 pub struct BitmapIndex {
     /// Maps each unique value to its bitmap location in the index file
-    /// The usize value is the global row index in the bitmap_page_lookup.lance file
+    /// The usize value is the row offset in the bitmap_page_lookup.lance file
     /// for quickly locating the row and reading it out
     index_map: BTreeMap<OrderableScalarValue, usize>,
 
-    null_map: RowIdTreeMap,
+    null_map: Arc<RowIdTreeMap>,
 
     value_type: DataType,
 
@@ -126,7 +126,7 @@ impl CacheKey for BitmapKey {
 impl BitmapIndex {
     fn new(
         index_map: BTreeMap<OrderableScalarValue, usize>,
-        null_map: RowIdTreeMap,
+        null_map: Arc<RowIdTreeMap>,
         value_type: DataType,
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
@@ -157,7 +157,7 @@ impl BitmapIndex {
             let data_type = schema.fields[0].data_type();
             return Ok(Arc::new(Self::new(
                 BTreeMap::new(),
-                RowIdTreeMap::default(),
+                Arc::new(RowIdTreeMap::default()),
                 data_type,
                 store,
                 WeakLanceCache::from(index_cache),
@@ -166,10 +166,10 @@ impl BitmapIndex {
         }
 
         let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
-        let mut null_map = RowIdTreeMap::default();
+        let mut null_map = Arc::new(RowIdTreeMap::default());
         let mut value_type: Option<DataType> = None;
         let mut null_location: Option<usize> = None;
-        let mut global_row_idx = 0;
+        let mut row_offset = 0;
 
         for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
             let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
@@ -191,12 +191,12 @@ impl BitmapIndex {
                 let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
 
                 if key.0.is_null() {
-                    null_location = Some(global_row_idx);
+                    null_location = Some(row_offset);
                 } else {
-                    index_map.insert(key, global_row_idx);
+                    index_map.insert(key, row_offset);
                 }
 
-                global_row_idx += 1;
+                row_offset += 1;
             }
         }
 
@@ -221,7 +221,7 @@ impl BitmapIndex {
                 bitmap = fri.remap_row_ids_tree_map(&bitmap);
             }
 
-            null_map = bitmap;
+            null_map = Arc::new(bitmap);
         }
 
         let final_value_type = value_type.expect_ok()?;
@@ -236,15 +236,24 @@ impl BitmapIndex {
         )))
     }
 
-    async fn load_bitmap(&self, key: &OrderableScalarValue) -> Result<Arc<RowIdTreeMap>> {
+    async fn load_bitmap(
+        &self,
+        key: &OrderableScalarValue,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<Arc<RowIdTreeMap>> {
         if key.0.is_null() {
-            return Ok(Arc::new(self.null_map.clone()));
+            return Ok(self.null_map.clone());
         }
 
         let cache_key = BitmapKey { value: key.clone() };
 
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
             return Ok(cached);
+        }
+
+        // Record that we're loading a partition from disk
+        if let Some(metrics) = metrics {
+            metrics.record_part_load();
         }
 
         let row_offset = match self.index_map.get(key) {
@@ -254,11 +263,11 @@ impl BitmapIndex {
 
         let page_lookup_file = self.lazy_reader.get().await?;
         let batch = page_lookup_file
-            .read_range(row_offset..row_offset + 1, None)
+            .read_range(row_offset..row_offset + 1, Some(&["bitmaps"]))
             .await?;
 
         let binary_bitmaps = batch
-            .column(1)
+            .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| Error::Internal {
@@ -395,10 +404,10 @@ impl ScalarIndex for BitmapIndex {
             SargableQuery::Equals(val) => {
                 metrics.record_comparisons(1);
                 if val.is_null() {
-                    self.null_map.clone()
+                    (*self.null_map).clone()
                 } else {
                     let key = OrderableScalarValue(val.clone());
-                    let bitmap = self.load_bitmap(&key).await?;
+                    let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
                     (*bitmap).clone()
                 }
             }
@@ -415,41 +424,61 @@ impl ScalarIndex for BitmapIndex {
                     Bound::Unbounded => Bound::Unbounded,
                 };
 
-                let offsets: Vec<_> = self
+                let keys: Vec<_> = self
                     .index_map
                     .range((range_start, range_end))
-                    .map(|(k, v)| (k.clone(), *v))
+                    .map(|(k, _v)| k.clone())
                     .collect();
 
-                metrics.record_comparisons(offsets.len());
+                metrics.record_comparisons(keys.len());
 
-                let mut union_bitmap = RowIdTreeMap::default();
-                for (key, _offset) in offsets {
-                    let bitmap = self.load_bitmap(&key).await?;
-                    union_bitmap |= (*bitmap).clone();
+                if keys.is_empty() {
+                    RowIdTreeMap::default()
+                } else {
+                    let mut bitmaps = Vec::new();
+                    for key in keys {
+                        let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
+                        bitmaps.push(bitmap);
+                    }
+
+                    let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
+                    RowIdTreeMap::union_all(&bitmap_refs)
                 }
-                union_bitmap
             }
             SargableQuery::IsIn(values) => {
-                let mut union_bitmap = RowIdTreeMap::default();
                 metrics.record_comparisons(values.len());
+
+                let mut bitmaps = Vec::new();
+                let mut has_null = false;
+
                 for val in values {
                     if val.is_null() {
-                        union_bitmap |= self.null_map.clone();
+                        has_null = true;
                     } else {
                         let key = OrderableScalarValue(val.clone());
                         if self.index_map.contains_key(&key) {
-                            let bitmap = self.load_bitmap(&key).await?;
-                            union_bitmap |= (*bitmap).clone();
+                            let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
+                            bitmaps.push(bitmap);
                         }
                     }
                 }
 
-                union_bitmap
+                // Add null bitmap if needed
+                if has_null && !self.null_map.is_empty() {
+                    bitmaps.push(self.null_map.clone());
+                }
+
+                if bitmaps.is_empty() {
+                    RowIdTreeMap::default()
+                } else {
+                    // Convert Arc<RowIdTreeMap> to &RowIdTreeMap for union_all
+                    let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
+                    RowIdTreeMap::union_all(&bitmap_refs)
+                }
             }
             SargableQuery::IsNull() => {
                 metrics.record_comparisons(1);
-                self.null_map.clone()
+                (*self.null_map).clone()
             }
             SargableQuery::FullTextSearch(_) => {
                 return Err(Error::NotSupported {
@@ -475,7 +504,7 @@ impl ScalarIndex for BitmapIndex {
         let mut state = HashMap::new();
 
         for key in self.index_map.keys() {
-            let bitmap = self.load_bitmap(key).await?;
+            let bitmap = self.load_bitmap(key, None).await?;
             let remapped_bitmap =
                 RowIdTreeMap::from_iter(bitmap.row_ids().unwrap().filter_map(|addr| {
                     let addr_as_u64 = u64::from(addr);
@@ -515,15 +544,16 @@ impl ScalarIndex for BitmapIndex {
     ) -> Result<CreatedIndex> {
         let mut state = HashMap::new();
 
+        // Initialize builder with existing data
         for key in self.index_map.keys() {
-            let bitmap = self.load_bitmap(key).await?;
+            let bitmap = self.load_bitmap(key, None).await?;
             state.insert(key.0.clone(), (*bitmap).clone());
         }
 
         if !self.null_map.is_empty() {
             let ex_null = new_null_array(&self.value_type, 1);
             let ex_null = ScalarValue::try_from_array(ex_null.as_ref(), 0)?;
-            state.insert(ex_null, self.null_map.clone());
+            state.insert(ex_null, (*self.null_map).clone());
         }
 
         BitmapIndexPlugin::do_train_bitmap_index(new_data, state, dest_store).await?;
@@ -601,6 +631,7 @@ impl BitmapIndexPlugin {
             cur_bytes += bitmap_size;
         }
 
+        // Flush any remaining
         if !cur_keys.is_empty() {
             let keys_array = ScalarValue::iter_to_array(cur_keys).unwrap();
             let mut binary_builder = BinaryBuilder::new();
@@ -613,6 +644,7 @@ impl BitmapIndexPlugin {
             bitmap_index_file.write_record_batch(record_batch).await?;
         }
 
+        // Finish file once at the end - this creates the file even if we wrote no batches
         bitmap_index_file.finish().await?;
 
         Ok(())
@@ -645,6 +677,7 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<()> {
+        // mapping from item to list of the row ids where it is present
         let dictionary: HashMap<ScalarValue, RowIdTreeMap> = HashMap::new();
 
         Self::do_train_bitmap_index(data, dictionary, index_store).await
@@ -916,7 +949,7 @@ pub mod tests {
             let key = OrderableScalarValue(ScalarValue::UInt32(Some(key_val)));
             // Load the bitmap for this key
             let bitmap = loaded_index
-                .load_bitmap(&key)
+                .load_bitmap(&key, None)
                 .await
                 .unwrap_or_else(|_| panic!("Key {} should exist", key_val));
 
