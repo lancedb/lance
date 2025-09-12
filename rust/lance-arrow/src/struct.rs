@@ -65,13 +65,7 @@ fn normalized_struct_array_data(data: ArrayData) -> Result<ArrayData, ArrowError
                 )));
             }
             let new_offset = offset + parent_offset;
-            println!(
-                "new_offset: {} (parent_offset: {} offset: {})",
-                new_offset, parent_offset, offset
-            );
-            d.clone()
-                .into_builder()
-                .offset(new_offset)
+            d.into_builder().offset(new_offset)
                 .len(parent_len)
                 .build()
         })
@@ -94,7 +88,7 @@ impl StructArrayExt for StructArray {
         }
 
         let data = normalized_struct_array_data(self.to_data())?;
-        Ok(StructArray::from(data))
+        Ok(Self::from(data))
     }
 
     fn pushdown_nulls(&self) -> Result<Self, ArrowError>
