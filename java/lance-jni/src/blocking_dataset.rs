@@ -23,7 +23,8 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::{RefOperations, TagContents};
+use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
+use lance::dataset::refs::TagContents;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
@@ -181,7 +182,7 @@ impl BlockingDataset {
     }
 
     pub fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.create(tag, version, None))?;
+        RT.block_on(self.inner.tags.create(tag, version))?;
         Ok(())
     }
 
@@ -191,12 +192,12 @@ impl BlockingDataset {
     }
 
     pub fn update_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.update(tag, version, None))?;
+        RT.block_on(self.inner.tags.update(tag, version))?;
         Ok(())
     }
 
     pub fn get_version(&self, tag: &str) -> Result<u64> {
-        let version = RT.block_on(self.inner.tags.get(tag))?.version;
+        let version = RT.block_on(self.inner.tags.get_version(tag))?;
         Ok(version)
     }
 
@@ -259,6 +260,11 @@ impl BlockingDataset {
         metadata_map: HashMap<u32, HashMap<String, String>>,
     ) -> Result<()> {
         RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
+        Ok(())
+    }
+
+    pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
+        RT.block_on(compact_files(&mut self.inner, options, None))?;
         Ok(())
     }
 
@@ -1717,4 +1723,97 @@ fn inner_replace_field_metadata(
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
     dataset_guard.replace_field_metadata(field_metadata_map)
+}
+
+//////////////////////////////
+// Compaction Methods       //
+//////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCompact(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    compaction_options: JObject, // CompactionOptions
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_compact(&mut env, java_dataset, compaction_options)
+    )
+}
+
+fn inner_compact(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    compaction_options: JObject, // CompactionOptions
+) -> Result<()> {
+    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.compact(rust_options)?;
+    Ok(())
+}
+
+fn convert_java_compaction_options_to_rust(
+    env: &mut JNIEnv,
+    java_options: JObject,
+) -> Result<RustCompactionOptions> {
+    // Extract all field values directly from Java object fields to minimize JNI calls
+    let target_rows_per_fragment = env
+        .get_field(&java_options, "targetRowsPerFragment", "I")?
+        .i()? as usize;
+
+    let max_rows_per_group = env.get_field(&java_options, "maxRowsPerGroup", "I")?.i()? as usize;
+
+    let materialize_deletions = env
+        .get_field(&java_options, "materializeDeletions", "Z")?
+        .z()?;
+
+    let materialize_deletions_threshold = env
+        .get_field(&java_options, "materializeDeletionsThreshold", "F")?
+        .f()?;
+
+    let defer_index_remap = env.get_field(&java_options, "deferIndexRemap", "Z")?.z()?;
+
+    // Extract Optional<Integer> fields efficiently
+    let max_bytes_per_file =
+        extract_optional_integer(env, &java_options, "maxBytesPerFile")?.map(|i| i as usize);
+
+    let num_threads =
+        extract_optional_integer(env, &java_options, "numThreads")?.map(|i| i as usize);
+
+    let batch_size = extract_optional_integer(env, &java_options, "batchSize")?.map(|i| i as usize);
+
+    Ok(RustCompactionOptions {
+        target_rows_per_fragment,
+        max_rows_per_group,
+        max_bytes_per_file,
+        materialize_deletions,
+        materialize_deletions_threshold,
+        num_threads,
+        batch_size,
+        defer_index_remap,
+    })
+}
+
+// Helper function to efficiently extract Optional<Integer> fields
+fn extract_optional_integer(
+    env: &mut JNIEnv,
+    java_obj: &JObject,
+    field_name: &str,
+) -> Result<Option<i32>> {
+    let optional_field = env
+        .get_field(java_obj, field_name, "Ljava/util/Optional;")?
+        .l()?;
+
+    if env
+        .call_method(&optional_field, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let integer_obj = env
+            .call_method(optional_field, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let value = env.call_method(integer_obj, "intValue", "()I", &[])?.i()?;
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
 }

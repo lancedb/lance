@@ -769,6 +769,33 @@ public class Dataset implements Closeable {
   private native Map<String, String> nativeGetConfig();
 
   /**
+   * Compact the dataset to improve performance.
+   *
+   * <p>This operation performs several optimizations:
+   *
+   * <ul>
+   *   <li>Removes deleted rows from fragments
+   *   <li>Removes dropped columns from fragments
+   *   <li>Merges fragments that are too small
+   * </ul>
+   *
+   * @param options compaction options to control the behavior
+   */
+  public void compact(CompactionOptions options) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeCompact(options);
+    }
+  }
+
+  /** Compact the dataset with default options. */
+  public void compact() {
+    compact(CompactionOptions.builder().build());
+  }
+
+  private native void nativeCompact(CompactionOptions options);
+
+  /**
    * Update the config of the dataset. This operation will only overwrite and NOT delete the
    * existing config.
    *
