@@ -17,7 +17,7 @@
 //! compressed so that we can locate them later.
 
 #[cfg(feature = "bitpacking")]
-use crate::encodings::physical::bitpacking::InlineBitpacking;
+use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
     buffer::LanceBuffer,
     compression_config::{BssMode, CompressionFieldParams, CompressionParams},
@@ -56,7 +56,7 @@ use crate::{
     statistics::{GetStat, Stat},
 };
 
-use arrow_array::types::UInt64Type;
+use arrow_array::{cast::AsArray, types::UInt64Type};
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
@@ -203,7 +203,7 @@ fn try_bitpack_for_block(
 
     let bit_widths = data.expect_stat(Stat::BitWidth);
     let widths = bit_widths.as_primitive::<UInt64Type>();
-    let has_all_zeros = widths.values().iter().any(|&w| w == 0);
+    let has_all_zeros = widths.values().contains(&0);
     let too_small =
         widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
 
