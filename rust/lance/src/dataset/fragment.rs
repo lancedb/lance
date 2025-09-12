@@ -1589,7 +1589,7 @@ impl FileFragment {
         // Hash join
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         while let Some(batch) = updater.next().await? {
-            let updated_batch = joiner.collect_update(batch, batch[left_on].clone()).await?;
+            let updated_batch = joiner.collect_with_fallback(batch, batch[left_on].clone()).await?;
             updater.update(updated_batch).await?;
         }
 

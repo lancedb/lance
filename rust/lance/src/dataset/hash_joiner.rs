@@ -211,7 +211,7 @@ impl HashJoiner {
     /// invalid join column values in left table will be filled with origin values in left table
     ///
     /// Will run in parallel over columns using all available cores.
-    pub(super) async fn collect_update(
+    pub(super) async fn collect_with_fallback(
         &self,
         left_batch: &RecordBatch,
         index_column: ArrayRef,
@@ -228,7 +228,7 @@ impl HashJoiner {
         }
         // Index to use for fall back to left table values
         let left_batch_index = self.batches.len();
-        // Indices are a pair of (batch_i, row_i). We'll add values in left table at the end,
+        // Indices are a pair of (batch_i, row_i). We'll add values in the left table at the end,
         // and when no match is found we fall back to left table values.
         let indices = column_to_rows(index_column)?
             .into_iter()

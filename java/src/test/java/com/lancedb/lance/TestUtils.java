@@ -14,6 +14,7 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.fragment.FragmentMergeResult;
+import com.lancedb.lance.fragment.FragmentUpdateResult;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -21,6 +22,7 @@ import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.TimeStampSecTZVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -60,7 +62,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class TestUtils {
   private abstract static class TestDataset {
     protected final BufferAllocator allocator;
-    private final String datasetPath;
+    protected final String datasetPath;
 
     public TestDataset(BufferAllocator allocator, String datasetPath) {
       this.allocator = allocator;
@@ -427,6 +429,117 @@ public class TestUtils {
             ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
           Data.exportArrayStream(allocator, reader, stream);
           return fragment.mergeColumns(stream, "_rowid", "_rowid");
+        } catch (Exception e) {
+          throw new RuntimeException("Cannot read arrow stream.", e);
+        }
+      }
+    }
+  }
+
+  public static class UpdateColumnTestDataset extends TestDataset {
+    private static final Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8()),
+                Field.nullable("timeStamp", new ArrowType.Timestamp(TimeUnit.SECOND, "UTC"))),
+            null);
+
+    private static final Schema updateSchema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("_rowid", new ArrowType.Int(64, false)),
+                Field.nullable("id", new ArrowType.Int(32, true)),
+                Field.nullable("name", new ArrowType.Utf8())),
+            null);
+
+    public UpdateColumnTestDataset(BufferAllocator allocator, String datasetPath) {
+      super(allocator, datasetPath);
+    }
+
+    @Override
+    public Schema getSchema() {
+      return schema;
+    }
+
+    @Override
+    public FragmentMetadata createNewFragment(int rowCount) {
+      List<FragmentMetadata> fragmentMetas = createNewFragment(rowCount, Integer.MAX_VALUE);
+      assertEquals(1, fragmentMetas.size());
+      FragmentMetadata fragmentMeta = fragmentMetas.get(0);
+      assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+      return fragmentMeta;
+    }
+
+    @Override
+    public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      List<FragmentMetadata> fragmentMetas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
+        root.allocateNew();
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        TimeStampSecTZVector timeStampSecVector =
+            (TimeStampSecTZVector) root.getVector("timeStamp");
+        for (int i = 0; i < rowCount / 2; i++) {
+          idVector.setSafe(i, i);
+          String name = "Person " + i;
+          nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
+          timeStampSecVector.setSafe(i, i);
+        }
+        for (int i = rowCount / 2; i < rowCount; i++) {
+          idVector.setSafe(i, i);
+          nameVector.setNull(i);
+          timeStampSecVector.setSafe(i, 0, i);
+        }
+        root.setRowCount(rowCount);
+        fragmentMetas =
+            Fragment.create(
+                datasetPath,
+                allocator,
+                root,
+                new WriteParams.Builder()
+                    .withEnableStableRowIds(true)
+                    .withMaxRowsPerFile(maxRowsPerFile)
+                    .build());
+      }
+      return fragmentMetas;
+    }
+    /**
+     * Test method to merge columns. Note that for simplicity, the merged column rowid is fixed with
+     * [0, mergeNum). Please only use this method to test the first fragment.
+     *
+     * @param fragment fragment to merge.
+     * @param mergeNum number of new rows.
+     * @return merge result
+     */
+    public FragmentUpdateResult updateColumn(Fragment fragment, int mergeNum) {
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(updateSchema, allocator)) {
+        root.allocateNew();
+        UInt8Vector rowidVec = (UInt8Vector) root.getVector("_rowid");
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        for (int i = 0; i < mergeNum; i++) {
+          rowidVec.setSafe(i, i);
+          idVector.setSafe(i, 2 * i);
+          String name = "Update " + i;
+          nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
+        }
+        root.setRowCount(mergeNum);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+          writer.start();
+          writer.writeBatch();
+          writer.end();
+        } catch (IOException e) {
+          throw new RuntimeException("Cannot write schema root", e);
+        }
+        byte[] arrowData = out.toByteArray();
+        try (ArrowStreamReader reader =
+                new ArrowStreamReader(
+                    new ByteArrayReadableSeekableByteChannel(arrowData), allocator);
+            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          Data.exportArrayStream(allocator, reader, stream);
+          return fragment.updateColumns(stream);
         } catch (Exception e) {
           throw new RuntimeException("Cannot read arrow stream.", e);
         }
