@@ -17,6 +17,8 @@ import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.operation.Append;
 import com.lancedb.lance.operation.Overwrite;
+import com.lancedb.lance.operation.UpdateConfig;
+import com.lancedb.lance.operation.UpdateMap;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.LanceField;
 import com.lancedb.lance.schema.SqlExpressions;
@@ -792,7 +794,15 @@ public class DatasetTest {
       Map<String, String> updateConfig = new HashMap<>();
       updateConfig.put("key1", "value1");
       updateConfig.put("key2", "value2");
-      dataset.updateConfig(updateConfig);
+
+      UpdateMap configUpdate = UpdateMap.builder().updates(updateConfig).replace(false).build();
+
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().configUpdates(configUpdate).build())
+              .build()
+              .commit();
       originalConfig.putAll(updateConfig);
       assertEquals(2, dataset.version());
       Map<String, String> currentConfig = dataset.getConfig();
@@ -803,7 +813,15 @@ public class DatasetTest {
 
       Map<String, String> updateConfig2 = new HashMap<>();
       updateConfig2.put("key1", "value3");
-      dataset.updateConfig(updateConfig2);
+
+      UpdateMap configUpdate2 = UpdateMap.builder().updates(updateConfig2).replace(false).build();
+
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().configUpdates(configUpdate2).build())
+              .build()
+              .commit();
       currentConfig = dataset.getConfig();
       originalConfig.putAll(updateConfig2);
       assertEquals(3, dataset.version());
@@ -827,7 +845,15 @@ public class DatasetTest {
       Map<String, String> config = new HashMap<>();
       config.put("key1", "value1");
       config.put("key2", "value2");
-      dataset.updateConfig(config);
+
+      UpdateMap configUpdate = UpdateMap.builder().updates(config).replace(false).build();
+
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().configUpdates(configUpdate).build())
+              .build()
+              .commit();
       assertEquals(2, dataset.version());
       Map<String, String> currentConfig = dataset.getConfig();
       assertTrue(currentConfig.keySet().containsAll(config.keySet()));
@@ -876,7 +902,15 @@ public class DatasetTest {
       Map<String, String> replaceMetadata = new HashMap<>();
       replaceMetadata.put("key1", "value1");
       replaceMetadata.put("key2", "value2");
-      dataset.replaceSchemaMetadata(replaceMetadata);
+      UpdateMap schemaMetadataReplace =
+          UpdateMap.builder().updates(replaceMetadata).replace(true).build();
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(
+                  UpdateConfig.builder().schemaMetadataUpdates(schemaMetadataReplace).build())
+              .build()
+              .commit();
       assertEquals(2, dataset.version());
       Map<String, String> currentMetadata = dataset.getSchema().getCustomMetadata();
       for (String configKey : currentMetadata.keySet()) {
@@ -886,7 +920,16 @@ public class DatasetTest {
 
       Map<String, String> replaceConfig2 = new HashMap<>();
       replaceConfig2.put("key1", "value3");
-      dataset.replaceSchemaMetadata(replaceConfig2);
+      Map<String, String> schemaUpdates = new HashMap<>();
+      schemaUpdates.put("key1", "value3");
+      UpdateMap schemaMetadataUpdate =
+          UpdateMap.builder().updates(schemaUpdates).replace(true).build();
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().schemaMetadataUpdates(schemaMetadataUpdate).build())
+              .build()
+              .commit();
       currentMetadata = dataset.getSchema().getCustomMetadata();
       assertEquals(3, dataset.version());
       assertEquals(1, currentMetadata.size());
@@ -907,7 +950,15 @@ public class DatasetTest {
       Map<String, String> replaceMetadata = new HashMap<>();
       replaceMetadata.put("key1", "value1");
       replaceMetadata.put("key2", "value2");
-      dataset.replaceFieldMetadata(Collections.singletonMap(field.getId(), replaceMetadata));
+      Map<Integer, UpdateMap> fieldMetadataUpdates = new HashMap<>();
+      UpdateMap fieldUpdateMap = UpdateMap.builder().updates(replaceMetadata).replace(true).build();
+      fieldMetadataUpdates.put(field.getId(), fieldUpdateMap);
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().fieldMetadataUpdates(fieldMetadataUpdates).build())
+              .build()
+              .commit();
       assertEquals(2, dataset.version());
       Map<String, String> currentMetadata = dataset.getSchema().getFields().get(0).getMetadata();
       for (String configKey : currentMetadata.keySet()) {
@@ -917,7 +968,15 @@ public class DatasetTest {
 
       Map<String, String> replaceConfig2 = new HashMap<>();
       replaceConfig2.put("key1", "value3");
-      dataset.replaceFieldMetadata(Collections.singletonMap(field.getId(), replaceConfig2));
+      Map<Integer, UpdateMap> fieldMetadataUpdates2 = new HashMap<>();
+      UpdateMap fieldUpdateMap2 = UpdateMap.builder().updates(replaceConfig2).replace(true).build();
+      fieldMetadataUpdates2.put(field.getId(), fieldUpdateMap2);
+      dataset =
+          dataset
+              .newTransactionBuilder()
+              .operation(UpdateConfig.builder().fieldMetadataUpdates(fieldMetadataUpdates2).build())
+              .build()
+              .commit();
       currentMetadata = dataset.getSchema().getFields().get(0).getMetadata();
       assertEquals(3, dataset.version());
       assertEquals(1, currentMetadata.size());
@@ -925,12 +984,30 @@ public class DatasetTest {
 
       assertThrows(
           IllegalArgumentException.class,
-          () ->
-              dataset.replaceFieldMetadata(
-                  Collections.singletonMap(Integer.MAX_VALUE, replaceConfig2)));
+          () -> {
+            Map<Integer, UpdateMap> badUpdates = new HashMap<>();
+            UpdateMap badUpdateMap =
+                UpdateMap.builder().updates(replaceConfig2).replace(true).build();
+            badUpdates.put(Integer.MAX_VALUE, badUpdateMap);
+            dataset
+                .newTransactionBuilder()
+                .operation(UpdateConfig.builder().fieldMetadataUpdates(badUpdates).build())
+                .build()
+                .commit();
+          });
       assertThrows(
           IllegalArgumentException.class,
-          () -> dataset.replaceFieldMetadata(Collections.singletonMap(-1, replaceConfig2)));
+          () -> {
+            Map<Integer, UpdateMap> badUpdates2 = new HashMap<>();
+            UpdateMap badUpdateMap2 =
+                UpdateMap.builder().updates(replaceConfig2).replace(true).build();
+            badUpdates2.put(-1, badUpdateMap2);
+            dataset
+                .newTransactionBuilder()
+                .operation(UpdateConfig.builder().fieldMetadataUpdates(badUpdates2).build())
+                .build()
+                .commit();
+          });
     }
   }
 
