@@ -4,8 +4,10 @@
 use std::sync::Arc;
 
 use arrow::array::Float32Array;
-use jni::objects::{JMap, JObject, JString, JValue};
+use jni::objects::{JMap, JObject, JString, JValue, JValueGen};
+use jni::sys::{jboolean, jfloat, jlong};
 use jni::JNIEnv;
+use lance::dataset::optimize::CompactionOptions;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -68,6 +70,50 @@ pub fn extract_write_params(
         ..Default::default()
     });
     Ok(write_params)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_compaction_options(
+    env: &mut JNIEnv,
+    target_rows_per_fragment: &JObject,        // Optional<Long>
+    max_rows_per_group: &JObject,              // Optional<Long>
+    max_bytes_per_file: &JObject,              // Optional<Long>
+    materialize_deletions: &JObject,           // Optional<Boolean>
+    materialize_deletions_threshold: &JObject, // Optional<Float>
+    num_threads: &JObject,                     // Optional<Long>
+    batch_size: &JObject,                      // Optional<Long>
+    defer_index_remap: &JObject,               // Optional<Boolean>
+) -> Result<CompactionOptions> {
+    let mut compaction_options = CompactionOptions::default();
+
+    if let Some(target_rows_per_fragment_val) = env.get_long_opt(target_rows_per_fragment)? {
+        compaction_options.target_rows_per_fragment = target_rows_per_fragment_val as usize;
+    }
+    if let Some(max_rows_per_group_val) = env.get_long_opt(max_rows_per_group)? {
+        compaction_options.max_rows_per_group = max_rows_per_group_val as usize;
+    }
+    if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
+        compaction_options.max_bytes_per_file = Some(max_bytes_per_file_val as usize);
+    }
+    if let Some(materialize_deletions_val) = env.get_boolean_opt(materialize_deletions)? {
+        compaction_options.materialize_deletions = materialize_deletions_val;
+    }
+    if let Some(materialize_deletions_threshold_val) =
+        env.get_f32_opt(materialize_deletions_threshold)?
+    {
+        compaction_options.materialize_deletions_threshold = materialize_deletions_threshold_val;
+    }
+    if let Some(num_threads_val) = env.get_long_opt(num_threads)? {
+        compaction_options.num_threads = Some(num_threads_val as usize);
+    }
+    if let Some(batch_size_val) = env.get_long_opt(batch_size)? {
+        compaction_options.batch_size = Some(batch_size_val as usize);
+    }
+    if let Some(defer_index_remap_val) = env.get_boolean_opt(defer_index_remap)? {
+        compaction_options.defer_index_remap = defer_index_remap_val;
+    }
+
+    Ok(compaction_options)
 }
 
 // Convert from Java Optional<Query> to Rust Option<Query>
@@ -368,4 +414,60 @@ pub fn to_java_list<'local>(
         )?;
     }
     Ok(java_list)
+}
+
+pub fn to_java_optional<'local>(
+    env: &mut JNIEnv<'local>,
+    value: JObject,
+) -> Result<JObject<'local>> {
+    Ok(env
+        .call_static_method(
+            "java/util/Optional",
+            "ofNullable",
+            "(Ljava/lang/Object;)Ljava/util/Optional;",
+            &[JValueGen::Object(&value)],
+        )?
+        .l()?)
+}
+
+pub fn to_java_long_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<i64>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Long",
+            "(J)V",
+            &[JValue::Long(base_index as jlong)],
+        )?),
+        None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_boolean_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<bool>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Boolean",
+            "(Z)V",
+            &[JValue::Bool(base_index as jboolean)],
+        )?),
+        None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_float_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<f32>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Float",
+            "(F)V",
+            &[JValue::Float(base_index as jfloat)],
+        )?),
+        None => Ok(JObject::null()),
+    }
 }
