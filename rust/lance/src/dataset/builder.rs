@@ -309,7 +309,7 @@ impl DatasetBuilder {
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         let (branch, version_number) = match cloned_ref {
-            Some(Ref::Version(version_number)) => (None, Some(version_number)),
+            Some(Ref::Version(branch, version_number)) => (branch, Some(version_number)),
             Some(Ref::Tag(tag_name)) => {
                 let refs = Refs::new(
                     object_store.clone(),
@@ -318,9 +318,6 @@ impl DatasetBuilder {
                 );
                 let tag_content = refs.tags().get(&tag_name).await?;
                 (tag_content.branch.clone(), Some(tag_content.version))
-            }
-            Some(Ref::Branch(branch_name, version_number)) => {
-                (Some(branch_name), Some(version_number))
             }
             None => (None, None),
         };

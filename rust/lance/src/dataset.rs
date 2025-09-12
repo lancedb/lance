@@ -380,14 +380,12 @@ impl Dataset {
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
         let ref_: refs::Ref = version.into();
         match ref_ {
-            refs::Ref::Version(version_number) => self.checkout_by_ref(version_number, None).await,
+            refs::Ref::Version(branch, version_number) => {
+                self.checkout_by_ref(version_number, branch).await
+            }
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags.get(tag_name.as_str()).await?;
                 self.checkout_by_ref(tag_contents.version, tag_contents.branch)
-                    .await
-            }
-            refs::Ref::Branch(branch_name, version_number) => {
-                self.checkout_by_ref(version_number, Some(branch_name))
                     .await
             }
         }
@@ -423,12 +421,11 @@ impl Dataset {
     ) -> Result<Self> {
         let _ref: refs::Ref = version.into();
         let (version_number, source_branch) = match _ref.clone() {
-            refs::Ref::Version(version_number) => (version_number, None),
+            refs::Ref::Version(branch, version_number) => (version_number, branch),
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags.get(tag_name.as_str()).await?;
                 (tag_contents.version, tag_contents.branch)
             }
-            refs::Ref::Branch(branch_name, version_number) => (version_number, Some(branch_name)),
         };
         self.branches
             .create(branch, version_number, source_branch.as_deref())
@@ -1835,9 +1832,8 @@ impl Dataset {
     ) -> Result<Self> {
         let ref_: refs::Ref = version.into();
         let (version_number, ref_name) = match ref_ {
-            refs::Ref::Version(version) => (version, None),
+            refs::Ref::Version(branch, version) => (version, branch),
             refs::Ref::Tag(tag) => (self.tags.get(tag.as_str()).await?.version, Some(tag)),
-            refs::Ref::Branch(branch, version) => (version, Some(branch)),
         };
         let clone_op = Operation::Clone {
             is_shallow: true,

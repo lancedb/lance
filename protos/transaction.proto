@@ -172,14 +172,13 @@ message Transaction {
     //          integrity guarantees provided by the storage backend.
     bool is_shallow = 1;
     // the reference name in the source dataset
-    // for branch scenario, this is the branch name in the source dataset
-    // for non branch scenario(normal cloning), this is an optional tag name in the source dataset
+    // most cases it should be the the branch or tag name in the source dataset
     optional string ref_name = 2;
     // the version of the source dataset for cloning
     uint64 ref_version = 3;
     // the absolute base path of the source dataset for cloning
     string ref_path = 4;
-    // if the cloned dataset is a branch, this is the branch name of the cloned dataset
+    // if the target dataset is a branch, this is the branch name of the target dataset
     optional string branch_name = 5;
   }
   

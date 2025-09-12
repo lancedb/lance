@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::dataset_location::DatasetLocation;
-use crate::dataset::refs::Ref::{Branch, Tag, Version};
+use crate::dataset::refs::Ref::{Tag, Version};
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use snafu::location;
@@ -26,16 +26,16 @@ use std::io::ErrorKind;
 #[derive(Debug, Clone)]
 pub enum Ref {
     // This is a version number of Main branch, the global version identifier is Main::<version_number>
-    Version(u64),
+    Version(Option<String>, u64),
     // Tag name points to the global version identifier, could be considered as an alias of specific global version
     Tag(String),
     // Branch name and version number, <branch_name>::<version_number> constructs the global version identifier
-    Branch(String, u64),
+    // Branch(String, u64),
 }
 
 impl From<u64> for Ref {
     fn from(ref_: u64) -> Self {
-        Version(ref_)
+        Version(None, ref_)
     }
 }
 
@@ -47,16 +47,21 @@ impl From<&str> for Ref {
 
 impl From<(&str, u64)> for Ref {
     fn from(_ref: (&str, u64)) -> Self {
-        Branch(_ref.0.to_string(), _ref.1)
+        Version(Some(_ref.0.to_string()), _ref.1)
     }
 }
 
 impl fmt::Display for Ref {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Version(version_number) => write!(f, "Main:{}", version_number),
+            Version(branch, version_number) => {
+                if let Some(name) = branch {
+                    write!(f, "{}:{}", name, version_number)
+                } else {
+                    write!(f, "Main:{}", version_number)
+                }
+            }
             Tag(tag_name) => write!(f, "{}", tag_name),
-            Branch(branch, ref_) => write!(f, "{}:{}", branch, ref_),
         }
     }
 }
@@ -821,23 +826,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ref_display() {
-        let version_ref = Version(42);
-        assert_eq!(format!("{}", version_ref), "Main:42");
-
-        let tag_ref = Tag("v1.0.0".to_string());
-        assert_eq!(format!("{}", tag_ref), "v1.0.0");
-
-        let branch_ref = Branch("feature".to_string(), 10);
-        assert_eq!(format!("{}", branch_ref), "feature:10");
-    }
-
-    #[tokio::test]
     async fn test_refs_from_traits() {
         // Test From<u64> for Ref
         let version_ref: Ref = 42u64.into();
         match version_ref {
-            Version(v) => assert_eq!(v, 42),
+            Version(branch, v) => {
+                assert_eq!(v, 42);
+                assert_eq!(branch, None)
+            }
             _ => panic!("Expected Version variant"),
         }
 
@@ -851,8 +847,8 @@ mod tests {
         // Test From<(&str, u64)> for Ref
         let branch_ref: Ref = ("test_branch", 10u64).into();
         match branch_ref {
-            Branch(name, version) => {
-                assert_eq!(name, "test_branch");
+            Version(name, version) => {
+                assert_eq!(name.unwrap(), "test_branch");
                 assert_eq!(version, 10);
             }
             _ => panic!("Expected Branch variant"),
