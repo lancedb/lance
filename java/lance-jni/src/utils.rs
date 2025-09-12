@@ -72,6 +72,7 @@ pub fn extract_write_params(
     Ok(write_params)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_compaction_options(
     env: &mut JNIEnv,
     target_rows_per_fragment: &JObject,        // Optional<Long>
