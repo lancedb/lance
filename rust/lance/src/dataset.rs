@@ -539,6 +539,11 @@ impl Dataset {
             populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
         }
 
+        // Check sdk version compatibility and log warning if needed
+        if let Some(ref writer_version) = manifest.writer_version {
+            writer_version.check_sdk_compatibility();
+        }
+
         Ok(manifest)
     }
 
