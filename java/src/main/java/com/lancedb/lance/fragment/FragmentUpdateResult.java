@@ -19,8 +19,8 @@ import com.google.common.base.MoreObjects;
 import org.apache.arrow.c.ArrowArrayStream;
 
 /**
- * Result of {@link com.lancedb.lance.Fragment#mergeColumns(ArrowArrayStream, String, String)
- * Fragment.mergeColumns()}.
+ * Result of {@link com.lancedb.lance.Fragment#updateColumns(ArrowArrayStream, String, String)
+ * Fragment.updateColumns()}.
  */
 public class FragmentUpdateResult {
   private final FragmentMetadata fragmentMetadata;
