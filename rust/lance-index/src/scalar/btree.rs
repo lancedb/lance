@@ -1629,8 +1629,8 @@ async fn merge_metadata_files(
     Ok(())
 }
 
-/// Merge pages using DataFusion's SortPreservingMerge
-/// with fixed-size output streams which implementation is the K-way merge algorithm
+/// Merge pages using Datafusion's SortPreservingMergeExec
+/// which implements a K-way merge algorithm with fixed-size output batches
 async fn merge_pages(
     part_lookup_files: &[String],
     page_files_map: &HashMap<u64, &String>,
@@ -1643,14 +1643,16 @@ async fn merge_pages(
     let mut lookup_entries = Vec::new();
     let mut page_idx = 0u32;
 
-    let start_time = std::time::Instant::now();
     debug!(
-        "Starting DataFusion SortPreservingMerge with {} partitions",
+        "Starting SortPreservingMerge with {} partitions",
         part_lookup_files.len()
     );
 
-    // Create input streams for each partition
-    let mut input_streams = Vec::new();
+    let mut streams: Vec<SendableRecordBatchStream> = Vec::new();
+
+    let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
+    let stream_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
 
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
@@ -1665,39 +1667,30 @@ async fn merge_pages(
 
         let reader = store.open_index_file(&page_file_name).await?;
 
-        let stream = reader
-            .read_stream(batch_size as u32, batch_readhead.unwrap_or(1) as u32, None)
-            .await?;
+        let reader_stream = IndexReaderStream::new(reader, batch_size).await;
 
-        input_streams.push(stream);
+        let stream = reader_stream
+            .map(|fut| fut.map_err(DataFusionError::from))
+            .buffered(batch_readhead.unwrap_or(1))
+            .boxed();
+
+        let sendable_stream =
+            Box::pin(RecordBatchStreamAdapter::new(stream_schema.clone(), stream));
+        streams.push(sendable_stream);
     }
 
-    if input_streams.is_empty() {
-        return Ok(lookup_entries);
+    // Create execution plans for each stream
+    let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+    for stream in streams {
+        let plan = Arc::new(OneShotExec::new(stream));
+        inputs.push(plan);
     }
 
-    // Convert streams into execution plans
-    let mut input_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-    let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
-    let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+    // Create Union execution plan to combine all partitions
+    let union_inputs = Arc::new(UnionExec::new(inputs));
 
-    for stream in input_streams {
-        // Convert Lance RecordBatchStream to DataFusion SendableRecordBatchStream
-        let df_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            new_schema.clone(),
-            stream.map(|result| result.map_err(|e| DataFusionError::ArrowError(e.into(), None))),
-        ));
-
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::new(df_stream));
-        input_plans.push(plan);
-    }
-
-    // Create UnionExec to combine all inputs
-    let union_exec = Arc::new(UnionExec::new(input_plans));
-
-    // Create sort expression for the first column (value column)
-    let value_column_index = new_schema.index_of(VALUE_COLUMN_NAME)?;
+    // Create SortPreservingMerge execution plan
+    let value_column_index = stream_schema.index_of(VALUE_COLUMN_NAME)?;
     let sort_expr = PhysicalSortExpr {
         expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
         options: SortOptions {
@@ -1706,128 +1699,40 @@ async fn merge_pages(
         },
     };
 
-    // Create SortPreservingMergeExec
     let merge_exec = Arc::new(SortPreservingMergeExec::new(
-        LexOrdering::new(vec![sort_expr]),
-        union_exec,
+        [sort_expr].into(),
+        union_inputs,
     ));
 
-    // Execute the plan
-    let merged_stream = execute_plan(
+    let unchunked = execute_plan(
         merge_exec,
         LanceExecutionOptions {
-            use_spilling: true,
+            use_spilling: false,
             ..Default::default()
         },
     )?;
 
-    // Use chunk_concat_stream to ensure fixed-size output batches
-    let chunked_stream = chunk_concat_stream(merged_stream, batch_size as usize);
-    let mut chunked_stream = Box::pin(chunked_stream);
-    let mut total_merged = 0usize;
+    // Use chunk_concat_stream to ensure fixed batch sizes
+    let mut chunked_stream = chunk_concat_stream(unchunked, batch_size as usize);
 
-    // Process the chunked stream - each batch will have exactly batch_size rows
-    // (except possibly the last one)
-    while let Some(batch_result) = chunked_stream.next().await {
-        let batch = batch_result?;
+    // Process chunked stream
+    while let Some(batch) = chunked_stream.try_next().await? {
+        let writer_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![batch.column(0).clone(), batch.column(1).clone()],
+        )?;
 
-        // Convert the entire batch to lookup entries at once
-        let mut current_batch_rows = Vec::with_capacity(batch.num_rows());
-        for row_idx in 0..batch.num_rows() {
-            let value = ScalarValue::try_from_array(batch.column(0), row_idx)?;
-            let row_id = ScalarValue::try_from_array(batch.column(1), row_idx)?;
-            current_batch_rows.push((value, row_id));
-        }
+        page_file.write_record_batch(writer_batch).await?;
 
-        total_merged += current_batch_rows.len();
+        let min_val = ScalarValue::try_from_array(batch.column(0), 0)?;
+        let max_val = ScalarValue::try_from_array(batch.column(0), batch.num_rows() - 1)?;
+        let null_count = batch.column(0).null_count() as u32;
 
-        // Write the batch (it's already the right size due to chunk_concat_stream)
-        write_batch_and_lookup_entry(
-            &mut current_batch_rows,
-            page_file,
-            &arrow_schema,
-            &mut lookup_entries,
-            &mut page_idx,
-        )
-        .await?;
+        lookup_entries.push((min_val, max_val, null_count, page_idx));
+        page_idx += 1;
     }
-
-    let duration = start_time.elapsed();
-    debug!(
-        "DataFusion merge completed: merged {} records in {:?}, {} lookup entries",
-        total_merged,
-        duration,
-        lookup_entries.len()
-    );
 
     Ok(lookup_entries)
-}
-
-/// Helper function to prepare batch data with optimized memory usage
-async fn prepare_batch_data(
-    batch_rows: Vec<(ScalarValue, ScalarValue)>,
-    arrow_schema: Arc<Schema>,
-    page_idx: u32,
-) -> Result<(RecordBatch, (ScalarValue, ScalarValue, u32, u32))> {
-    if batch_rows.is_empty() {
-        return Err(Error::Internal {
-            message: "Cannot prepare empty batch".to_string(),
-            location: location!(),
-        });
-    }
-
-    let capacity = batch_rows.len();
-    let mut values = Vec::with_capacity(capacity);
-    let mut row_ids = Vec::with_capacity(capacity);
-
-    for (value, row_id) in batch_rows.into_iter() {
-        values.push(value);
-        row_ids.push(row_id);
-    }
-
-    let (values_array, row_ids_array) = rayon::join(
-        || ScalarValue::iter_to_array(values.into_iter()),
-        || ScalarValue::iter_to_array(row_ids.into_iter()),
-    );
-
-    let values_array = values_array?;
-    let row_ids_array = row_ids_array?;
-
-    let batch = RecordBatch::try_new(arrow_schema, vec![values_array, row_ids_array])?;
-
-    // Calculate min/max/null_count for lookup entry
-    let min_val = ScalarValue::try_from_array(batch.column(0), 0)?;
-    let max_val = ScalarValue::try_from_array(batch.column(0), batch.num_rows() - 1)?;
-    let null_count = batch.column(0).null_count() as u32;
-
-    let lookup_entry = (min_val, max_val, null_count, page_idx);
-
-    Ok((batch, lookup_entry))
-}
-
-/// Helper function to write a batch and create lookup entry
-async fn write_batch_and_lookup_entry(
-    batch_rows: &mut Vec<(ScalarValue, ScalarValue)>,
-    page_file: &mut Box<dyn IndexWriter>,
-    arrow_schema: &Arc<Schema>,
-    lookup_entries: &mut Vec<(ScalarValue, ScalarValue, u32, u32)>,
-    page_idx: &mut u32,
-) -> Result<()> {
-    if batch_rows.is_empty() {
-        return Ok(());
-    }
-
-    let batch_data = std::mem::take(batch_rows);
-    let current_page_idx = *page_idx;
-
-    let (batch, lookup_entry) =
-        prepare_batch_data(batch_data, arrow_schema.clone(), current_page_idx).await?;
-
-    lookup_entries.push(lookup_entry);
-    page_file.write_record_batch(batch).await?;
-    *page_idx += 1;
-
-    Ok(())
 }
 
 /// Extract partition ID from partition file name
@@ -2413,11 +2318,11 @@ mod tests {
         .unwrap();
 
         // Load both indexes
-        let full_index = BTreeIndex::load(full_store.clone(), None, LanceCache::no_cache())
+        let full_index = BTreeIndex::load(full_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
-        let merged_index = BTreeIndex::load(fragment_store.clone(), None, LanceCache::no_cache())
+        let merged_index = BTreeIndex::load(fragment_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -2624,11 +2529,11 @@ mod tests {
         .unwrap();
 
         // Load both indexes
-        let full_index = BTreeIndex::load(full_store.clone(), None, LanceCache::no_cache())
+        let full_index = BTreeIndex::load(full_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
-        let merged_index = BTreeIndex::load(fragment_store.clone(), None, LanceCache::no_cache())
+        let merged_index = BTreeIndex::load(fragment_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
