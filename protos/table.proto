@@ -37,6 +37,9 @@ message Manifest {
   // All fields of the dataset, including the nested fields.
   repeated lance.file.Field fields = 1;
 
+  // Schema metadata.
+  map<string, bytes> schema_metadata = 5;
+
   // Fragments of the dataset.
   repeated DataFragment fragments = 2;
 
@@ -47,9 +50,6 @@ message Manifest {
   //  * It is not inheritable between versions.
   //  * It is not loaded by default during query.
   uint64 version_aux_data = 4;
-
-  // Schema metadata.
-  map<string, bytes> metadata = 5;
 
   message WriterVersion {
     // The name of the library that created this file.
@@ -144,6 +144,18 @@ message Manifest {
   // libraries may wish to similarly prefix their configuration keys
   // appropriately.
   map<string, string> config = 16;
+
+  // Metadata associated with the table.
+  //
+  // This is a key-value map that can be used to store arbitrary metadata
+  // associated with the table.
+  //
+  // This is different than configuration, which is used to tell libraries how
+  // to read, write, or manage the table.
+  //
+  // This is different than schema metadata, which is used to describe the
+  // data itself and is attached to the output schema of scans.
+  map<string, string> table_metadata = 19;
 
   // The version of the blob dataset associated with this table.  Changes to
   // blob fields will modify the blob dataset and update this version in the parent

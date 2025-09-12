@@ -90,6 +90,13 @@ pub struct Manifest {
     /// Table configuration.
     pub config: HashMap<String, String>,
 
+    /// Table metadata.
+    ///
+    /// This is a key-value map that can be used to store arbitrary metadata
+    /// associated with the table. This is different than configuration, which
+    /// is used to tell libraries how to read, write, or manage the table.
+    pub table_metadata: HashMap<String, String>,
+
     /// Blob dataset version
     pub blob_dataset_version: Option<u64>,
 
@@ -146,6 +153,7 @@ impl Manifest {
             next_row_id: 0,
             data_storage_format,
             config: HashMap::new(),
+            table_metadata: HashMap::new(),
             blob_dataset_version,
             base_paths,
         }
@@ -180,6 +188,7 @@ impl Manifest {
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
+            table_metadata: previous.table_metadata.clone(),
             blob_dataset_version,
             base_paths: previous.base_paths.clone(),
         }
@@ -246,6 +255,7 @@ impl Manifest {
                 base_paths.insert(ref_base_id, base_path);
                 base_paths
             },
+            table_metadata: self.table_metadata.clone(),
         }
     }
 
@@ -265,18 +275,45 @@ impl Manifest {
         self.timestamp_nanos = nanos;
     }
 
+    /// Get a mutable reference to the config
+    pub fn config_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.config
+    }
+
+    /// Get a mutable reference to the table metadata
+    pub fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.table_metadata
+    }
+
+    /// Get a mutable reference to the schema metadata
+    pub fn schema_metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.schema.metadata
+    }
+
+    /// Get a mutable reference to the field metadata for a specific field id
+    ///
+    /// Returns None if the field does not exist in the schema.
+    pub fn field_metadata_mut(&mut self, field_id: i32) -> Option<&mut HashMap<String, String>> {
+        self.schema
+            .field_by_id_mut(field_id)
+            .map(|field| &mut field.metadata)
+    }
+
     /// Set the `config` from an iterator
+    #[deprecated(note = "Use config_mut() for direct access to config HashMap")]
     pub fn update_config(&mut self, upsert_values: impl IntoIterator<Item = (String, String)>) {
         self.config.extend(upsert_values);
     }
 
     /// Delete `config` keys using a slice of keys
+    #[deprecated(note = "Use config_mut() for direct access to config HashMap")]
     pub fn delete_config_keys(&mut self, delete_keys: &[&str]) {
         self.config
             .retain(|key, _| !delete_keys.contains(&key.as_str()));
     }
 
     /// Replaces the schema metadata with the given key-value pairs.
+    #[deprecated(note = "Use schema_metadata_mut() for direct access to schema metadata HashMap")]
     pub fn replace_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
         self.schema.metadata = new_metadata;
     }
@@ -284,6 +321,9 @@ impl Manifest {
     /// Replaces the metadata of the field with the given id with the given key-value pairs.
     ///
     /// If the field does not exist in the schema, this is a no-op.
+    #[deprecated(
+        note = "Use field_metadata_mut(field_id) for direct access to field metadata HashMap"
+    )]
     pub fn replace_field_metadata(
         &mut self,
         field_id: i32,
@@ -599,7 +639,7 @@ impl TryFrom<pb::Manifest> for Manifest {
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
-            metadata: p.metadata,
+            metadata: p.schema_metadata,
         };
 
         if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
@@ -653,6 +693,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             next_row_id: p.next_row_id,
             data_storage_format,
             config: p.config,
+            table_metadata: p.table_metadata,
             blob_dataset_version: if p.blob_dataset_version == 0 {
                 None
             } else {
@@ -682,6 +723,12 @@ impl From<&Manifest> for pb::Manifest {
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
         Self {
             fields: fields_with_meta.fields.0,
+            schema_metadata: m
+                .schema
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+                .collect(),
             version: m.version,
             writer_version: m
                 .writer_version
@@ -691,7 +738,7 @@ impl From<&Manifest> for pb::Manifest {
                     version: wv.version.clone(),
                 }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            metadata: fields_with_meta.metadata,
+            table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,
@@ -936,11 +983,11 @@ mod tests {
         config.insert("lance.test".to_string(), "value".to_string());
         config.insert("other-key".to_string(), "other-value".to_string());
 
-        manifest.update_config(config.clone());
+        manifest.config_mut().extend(config.clone());
         assert_eq!(manifest.config, config.clone());
 
         config.remove("other-key");
-        manifest.delete_config_keys(&["other-key"]);
+        manifest.config_mut().remove("other-key");
         assert_eq!(manifest.config, config);
     }
 }
