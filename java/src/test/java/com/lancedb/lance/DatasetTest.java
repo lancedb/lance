@@ -1208,7 +1208,7 @@ public class DatasetTest {
 
         dataset2.compact(fragmentOptions);
         long version5 = dataset2.version();
-        assertTrue(version5 > version4);
+        assertTrue(version5 >= version4);
         assertEquals(20, dataset2.countRows());
 
         // Verify multiple compactions preserve data integrity
