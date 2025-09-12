@@ -1589,7 +1589,9 @@ impl FileFragment {
         // Hash join
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         while let Some(batch) = updater.next().await? {
-            let updated_batch = joiner.collect_with_fallback(batch, batch[left_on].clone()).await?;
+            let updated_batch = joiner
+                .collect_with_fallback(batch, batch[left_on].clone())
+                .await?;
             updater.update(updated_batch).await?;
         }
 
@@ -1605,10 +1607,11 @@ impl FileFragment {
             }
         }
         // Remove data files that have become entirely tombstoned.
-        updated_fragment.files.retain(|data_file| {
-            data_file.fields.iter().any(|&field| field != -2)
-        });
-        let updated_fields = updated_fields.iter()
+        updated_fragment
+            .files
+            .retain(|data_file| data_file.fields.iter().any(|&field| field != -2));
+        let updated_fields = updated_fields
+            .iter()
             .filter_map(|&i| u32::try_from(i).ok())
             .collect();
         // Note: updated field should be returned when committing, waiting to be done
@@ -2648,7 +2651,8 @@ mod tests {
                 NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
                 None,
                 None,
-            ).await;
+            )
+            .await;
         let mut fragment1 = dataset1.get_fragment(0).unwrap();
         let test_dir2 = tempdir().unwrap();
         let test_uri2 = test_dir2.path().to_str().unwrap();
@@ -2658,10 +2662,16 @@ mod tests {
                 NewColumnTransform::SqlExpressions(vec![("col1".into(), "2".into())]),
                 None,
                 None,
-            ).await;
+            )
+            .await;
         let fragment2 = dataset2.get_fragment(0).unwrap();
-        let fragment2 = fragment2.delete("_rowid=0 OR _rowid=3").await.unwrap().unwrap();
-        let batches = fragment2.scan()
+        let fragment2 = fragment2
+            .delete("_rowid=0 OR _rowid=3")
+            .await
+            .unwrap()
+            .unwrap();
+        let batches = fragment2
+            .scan()
             .with_row_id()
             .batch_size(10)
             .try_into_stream()
@@ -2671,21 +2681,32 @@ mod tests {
             .await
             .unwrap();
         let schema = batches[0].schema_ref().clone();
-        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(
-            RecordBatchIterator::new(batches.into_iter().map(Ok), schema)
-        );
-        let (updated_fragment, updated_field_ids) = fragment1.update_columns(right_stream, ROW_ID, ROW_ID).await.unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema,
+        ));
+        let (updated_fragment, updated_field_ids) = fragment1
+            .update_columns(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
         let op = Operation::Update {
             removed_fragment_ids: vec![],
             updated_fragments: vec![updated_fragment],
             new_fragments: vec![],
             fields_modified: updated_field_ids,
-            mem_wal_to_merge: None
+            mem_wal_to_merge: None,
         };
-        let new_dataset =
-            Dataset::commit(test_uri1, op, Some(dataset1.version().version), None, None, Default::default(), true)
-                .await
-                .unwrap();
+        let new_dataset = Dataset::commit(
+            test_uri1,
+            op,
+            Some(dataset1.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(new_dataset.get_fragments().len(), 5);
         let mut scanner = new_dataset.get_fragment(0).unwrap().scan();
         let batches = scanner
@@ -2704,7 +2725,7 @@ mod tests {
         expected_values[0] = -1;
         expected_values[3] = -1;
         assert_eq!(
-            actual_values, 
+            actual_values,
             &expected_values[..],
             "The vector content did not match the expected values."
         );
