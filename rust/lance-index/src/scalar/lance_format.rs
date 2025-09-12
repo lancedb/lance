@@ -18,14 +18,12 @@ use lance_file::{
     writer::{FileWriter, ManifestProvider},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use std::cmp::min;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
 /// An index store that serializes scalar indices using the lance format
@@ -127,15 +125,6 @@ impl IndexReader for FileReader {
         self.read_range(range, &projection).await
     }
 
-    async fn read_stream(
-        &self,
-        _batch_size: u32,
-        _batch_readahead: u32,
-        _projection: Option<&[&str]>,
-    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
-        unimplemented!("Unsupported operation in IndexReader for FileReader.");
-    }
-
     async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.num_batches() as u32
     }
@@ -192,33 +181,6 @@ impl IndexReader for v2::reader::FileReader {
             .await?;
         assert_eq!(batches.len(), 1);
         Ok(batches[0].clone())
-    }
-
-    async fn read_stream(
-        &self,
-        batch_size: u32,
-        batch_readahead: u32,
-        projection: Option<&[&str]>,
-    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
-        let projection = if let Some(projection) = projection {
-            v2::reader::ReaderProjection::from_column_names(
-                self.metadata().version(),
-                self.schema(),
-                projection,
-            )?
-        } else {
-            v2::reader::ReaderProjection::from_whole_schema(
-                self.schema(),
-                self.metadata().version(),
-            )
-        };
-        self.read_stream_projected(
-            ReadBatchParams::RangeFull,
-            batch_size,
-            batch_readahead,
-            projection,
-            FilterExpression::no_filter(),
-        )
     }
 
     // V2 format has removed the row group concept,

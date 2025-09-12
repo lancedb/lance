@@ -13,7 +13,6 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use datafusion_expr::expr::ScalarFunction;
@@ -44,7 +43,6 @@ pub mod zonemap;
 use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
 use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
-use lance_io::stream::RecordBatchStream;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
@@ -190,13 +188,6 @@ pub trait IndexReader: Send + Sync {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
-    /// Reads data from the file as a stream of record batches
-    async fn read_stream(
-        &self,
-        batch_size: u32,
-        batch_readahead: u32,
-        projection: Option<&[&str]>,
-    ) -> Result<Pin<Box<dyn RecordBatchStream>>>;
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file
