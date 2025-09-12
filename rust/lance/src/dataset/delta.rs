@@ -321,9 +321,9 @@ impl FragmentDiffAnalyzer {
         let row_ids = vec![row_id];
         let schema = dataset.schema().clone();
         let projection = super::ProjectionRequest::Schema(Arc::new(schema));
-        
+
         let batch = dataset.take_rows(&row_ids, projection).await?;
-        
+
         // Verify we got exactly one row
         if batch.num_rows() == 0 {
             return Err(Error::invalid_input(
@@ -332,11 +332,15 @@ impl FragmentDiffAnalyzer {
             ));
         } else if batch.num_rows() > 1 {
             return Err(Error::invalid_input(
-                format!("Expected 1 row for row ID {}, got {}", row_id, batch.num_rows()),
+                format!(
+                    "Expected 1 row for row ID {}, got {}",
+                    row_id,
+                    batch.num_rows()
+                ),
                 Default::default(),
             ));
         }
-        
+
         Ok(batch)
     }
 

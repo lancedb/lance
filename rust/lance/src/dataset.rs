@@ -86,7 +86,6 @@ use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::delta::DatasetDelta;
 use crate::dataset::delta::{DatasetDelta, DatasetDiffBuilder, DiffRecordStream};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
