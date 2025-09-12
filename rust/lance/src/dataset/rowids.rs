@@ -43,7 +43,7 @@ pub async fn load_row_id_sequence(
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move {
-                    let path = dataset_clone.base.child(file_slice.path.as_str());
+                    let path = dataset_clone.base().child(file_slice.path.as_str());
                     let range = file_slice.offset as usize
                         ..(file_slice.offset as usize + file_slice.size as usize);
                     let data = dataset_clone

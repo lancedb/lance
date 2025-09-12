@@ -61,6 +61,7 @@ use tracing::{info, instrument};
 mod blob;
 pub mod builder;
 pub mod cleanup;
+mod dataset_location;
 mod delta;
 pub mod fragment;
 mod hash_joiner;
@@ -83,12 +84,14 @@ mod write;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
-use self::refs::Tags;
+use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction, UpdateMapEntry};
 use self::write::write_fragments_internal;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
+use crate::dataset::dataset_location::DatasetLocation;
 use crate::dataset::delta::DatasetDelta;
+use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -139,13 +142,13 @@ pub struct Dataset {
     ///
     /// On cloud storage, we can not use [Dataset::base] to build the full uri because the
     /// `bucket` is swallowed in the inner [ObjectStore].
-    uri: String,
-    pub(crate) base: Path,
+    pub(crate) dataset_location: DatasetLocation,
     pub manifest: Arc<Manifest>,
     // Path for the manifest that is loaded. Used to get additional information,
     // such as the index metadata.
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
+    pub(crate) branches: Branches,
     pub tags: Tags,
 
     // Bitmap of fragment ids in this dataset.
@@ -159,11 +162,11 @@ pub struct Dataset {
     pub(crate) file_reader_options: Option<FileReaderOptions>,
 }
 
-impl std::fmt::Debug for Dataset {
+impl Debug for Dataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dataset")
-            .field("uri", &self.uri)
-            .field("base", &self.base)
+            .field("uri", &self.uri())
+            .field("base", &self.dataset_location)
             .field("version", &self.manifest.version)
             .field("cache_num_items", &self.session.approx_num_items())
             .finish()
@@ -380,8 +383,14 @@ impl Dataset {
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
         let ref_: refs::Ref = version.into();
         match ref_ {
-            refs::Ref::Version(version) => self.checkout_by_version_number(version).await,
-            refs::Ref::Tag(tag) => self.checkout_by_tag(tag.as_str()).await,
+            refs::Ref::Version(branch, version_number) => {
+                self.checkout_by_ref(version_number, branch).await
+            }
+            refs::Ref::Tag(tag_name) => {
+                let tag_contents = self.tags.get(tag_name.as_str()).await?;
+                self.checkout_by_ref(tag_contents.version, tag_contents.branch)
+                    .await
+            }
         }
     }
 
@@ -400,10 +409,69 @@ impl Dataset {
         Ok(())
     }
 
-    fn already_checked_out(&self, location: &ManifestLocation) -> bool {
+    /// Check out the latest version of the branch
+    pub async fn checkout_branch(&mut self, branch: &str) -> Result<Self> {
+        let version_number = self.latest_branch_version_id(branch).await?;
+        self.checkout_by_ref(version_number, Some(branch.to_string()))
+            .await
+    }
+
+    pub async fn create_branch(
+        &mut self,
+        branch: &str,
+        version: impl Into<refs::Ref>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let _ref: refs::Ref = version.into();
+        let (version_number, source_branch) = match _ref.clone() {
+            refs::Ref::Version(branch, version_number) => (version_number, branch),
+            refs::Ref::Tag(tag_name) => {
+                let tag_contents = self.tags.get(tag_name.as_str()).await?;
+                (tag_contents.version, tag_contents.branch)
+            }
+        };
+        self.branches
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+        let branch_location = self
+            .dataset_location
+            .switch_branch(Some(branch.to_string()))?;
+        let clone_op = Operation::Clone {
+            is_shallow: true,
+            ref_name: source_branch,
+            ref_version: version_number,
+            ref_path: String::from(self.uri()),
+            branch_name: Some(branch.to_string()),
+        };
+        let transaction = Transaction::new(version_number, clone_op, None, None);
+
+        let builder =
+            CommitBuilder::new(WriteDestination::Uri(branch_location.base_uri().as_str()))
+                .with_store_params(store_params.unwrap_or_default())
+                .with_object_store(Arc::new(self.object_store().clone()))
+                .with_commit_handler(self.commit_handler.clone())
+                .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+        builder.execute(transaction).await
+    }
+
+    pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
+        self.branches.delete(branch).await?;
+        Ok(())
+    }
+
+    pub async fn list_branches(&self) -> Result<HashMap<String, BranchContents>> {
+        self.branches.list().await
+    }
+
+    fn already_checked_out(
+        &self,
+        location: &ManifestLocation,
+        branch_name: Option<String>,
+    ) -> bool {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
-        self.manifest.version == location.version
+        self.dataset_location.branch == branch_name
+            && self.manifest.version == location.version
             && self.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
                 self.manifest_location
@@ -413,39 +481,38 @@ impl Dataset {
             })
     }
 
-    async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
-        let base_path = self.base.clone();
+    async fn checkout_by_ref(&self, version: u64, branch: Option<String>) -> Result<Self> {
+        let new_dataset_location = self.dataset_location.switch_branch(branch.clone())?;
+
         let manifest_location = self
             .commit_handler
-            .resolve_version_location(&base_path, version, &self.object_store.inner)
+            .resolve_version_location(
+                new_dataset_location.base_path(),
+                version,
+                &self.object_store.inner,
+            )
             .await?;
 
-        if self.already_checked_out(&manifest_location) {
+        if self.already_checked_out(&manifest_location, branch.clone()) {
             return Ok(self.clone());
         }
 
         let manifest = Self::load_manifest(
             self.object_store.as_ref(),
             &manifest_location,
-            &self.uri,
+            new_dataset_location.base_uri(),
             self.session.as_ref(),
         )
         .await?;
         Self::checkout_manifest(
             self.object_store.clone(),
-            base_path,
-            self.uri.clone(),
+            new_dataset_location,
             Arc::new(manifest),
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
         )
-    }
-
-    async fn checkout_by_tag(&self, tag: &str) -> Result<Self> {
-        let version = self.tags.get_version(tag).await?;
-        self.checkout_by_version_number(version).await
     }
 
     pub(crate) async fn load_manifest(
@@ -548,31 +615,35 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     fn checkout_manifest(
         object_store: Arc<ObjectStore>,
-        base_path: Path,
-        uri: String,
+        dataset_location: DatasetLocation,
         manifest: Arc<Manifest>,
         manifest_location: ManifestLocation,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
     ) -> Result<Self> {
-        let tags = Tags::new(
+        let refs = Refs::new(
             object_store.clone(),
             commit_handler.clone(),
-            base_path.clone(),
+            dataset_location.clone(),
         );
-        let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
-        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
+
+        let metadata_cache = Arc::new(
+            session
+                .metadata_cache
+                .for_dataset(dataset_location.base_uri()),
+        );
+        let index_cache = Arc::new(session.index_cache.for_dataset(dataset_location.base_uri()));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         Ok(Self {
             object_store,
-            base: base_path,
-            uri,
+            dataset_location,
             manifest,
             manifest_location,
             commit_handler,
             session,
-            tags,
+            tags: refs.tags(),
+            branches: refs.branches(),
             fragment_bitmap,
             metadata_cache,
             index_cache,
@@ -624,8 +695,18 @@ impl Dataset {
     }
 
     /// Get the fully qualified URI of this dataset.
-    pub fn uri(&self) -> &str {
-        &self.uri
+    pub fn uri(&self) -> &String {
+        self.dataset_location.base_uri()
+    }
+
+    /// Get the optional branch
+    pub fn branch(&self) -> Option<String> {
+        self.dataset_location.branch.clone()
+    }
+
+    /// Get the fully qualified URI of this dataset.
+    pub fn base(&self) -> &Path {
+        self.dataset_location.base_path()
     }
 
     /// Get the full manifest of the dataset version.
@@ -682,10 +763,14 @@ impl Dataset {
     // TODO: Cache this
     pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
         if let Some(blobs_version) = self.manifest.blob_dataset_version {
-            let blobs_path = self.base.child(BLOB_DIR);
+            let blobs_location = self.dataset_location.blobs_location()?;
             let blob_manifest_location = self
                 .commit_handler
-                .resolve_version_location(&blobs_path, blobs_version, &self.object_store.inner)
+                .resolve_version_location(
+                    &blobs_location.base.path,
+                    blobs_version,
+                    &self.object_store.inner,
+                )
                 .await?;
             let manifest = read_manifest(
                 &self.object_store,
@@ -695,8 +780,7 @@ impl Dataset {
             .await?;
             let blobs_dataset = Self::checkout_manifest(
                 self.object_store.clone(),
-                blobs_path,
-                format!("{}/{}", self.uri, BLOB_DIR),
+                blobs_location,
                 Arc::new(manifest),
                 blob_manifest_location,
                 self.session.clone(),
@@ -720,20 +804,29 @@ impl Dataset {
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
         let location = self
             .commit_handler
-            .resolve_latest_location(&self.base, &self.object_store)
+            .resolve_latest_location(self.dataset_location.base_path(), &self.object_store)
             .await?;
 
+        let branch = self.dataset_location.branch.clone();
+        let metadata_cache = if branch.is_none() {
+            &self.metadata_cache
+        } else {
+            &self
+                .session
+                .metadata_cache
+                .for_dataset(self.dataset_location.base_uri())
+        };
         // Check if manifest is in cache before reading from storage
         let manifest_key = ManifestKey {
             version: location.version,
             e_tag: location.e_tag.as_deref(),
         };
-        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
+        let cached_manifest = metadata_cache.get_with_key(&manifest_key).await;
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }
 
-        if self.already_checked_out(&location) {
+        if self.already_checked_out(&location, branch) {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
@@ -756,7 +849,7 @@ impl Dataset {
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
         let path = match &self.manifest.transaction_file {
-            Some(path) => self.base.child("_transactions").child(path.as_str()),
+            Some(path) => self.base().child("_transactions").child(path.as_str()),
             None => return Ok(None),
         };
         let data = self.object_store.inner.get(&path).await?.bytes().await?;
@@ -894,7 +987,7 @@ impl Dataset {
         &self,
         policy: CleanupPolicy,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=self.uri());
         cleanup::cleanup_old_versions(self, policy).boxed()
     }
 
@@ -1200,7 +1293,7 @@ impl Dataset {
 
     /// Delete rows based on a predicate.
     pub async fn delete(&mut self, predicate: &str) -> Result<()> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri(), predicate=predicate);
         write::delete::delete(self, predicate).await
     }
 
@@ -1217,11 +1310,11 @@ impl Dataset {
     }
 
     pub fn data_dir(&self) -> Path {
-        self.base.child(DATA_DIR)
+        self.base().child(DATA_DIR)
     }
 
     pub fn indices_dir(&self) -> Path {
-        self.base.child(INDICES_DIR)
+        self.base().child(INDICES_DIR)
     }
 
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
@@ -1245,7 +1338,7 @@ impl Dataset {
                     Ok(path)
                 }
             }
-            None => Ok(self.base.child(DATA_DIR)),
+            None => Ok(self.base().child(DATA_DIR)),
         }
     }
 
@@ -1274,7 +1367,7 @@ impl Dataset {
                 }
                 Ok(Path::parse(base_path.path.as_str())?)
             }
-            None => Ok(self.base.clone()),
+            None => Ok(self.base().clone()),
         }
     }
 
@@ -1300,7 +1393,7 @@ impl Dataset {
                     Ok(path)
                 }
             }
-            None => Ok(self.base.child(INDICES_DIR)),
+            None => Ok(self.base().child(INDICES_DIR)),
         }
     }
 
@@ -1331,7 +1424,7 @@ impl Dataset {
     pub async fn versions(&self) -> Result<Vec<Version>> {
         let mut versions: Vec<Version> = self
             .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
+            .list_manifest_locations(self.base(), &self.object_store, false)
             .try_filter_map(|location| async move {
                 match read_manifest(&self.object_store, &location.path, location.size).await {
                     Ok(manifest) => Ok(Some(Version::from(&manifest))),
@@ -1353,7 +1446,21 @@ impl Dataset {
     pub async fn latest_version_id(&self) -> Result<u64> {
         Ok(self
             .commit_handler
-            .resolve_latest_location(&self.base, &self.object_store)
+            .resolve_latest_location(self.base(), &self.object_store)
+            .await?
+            .version)
+    }
+
+    /// Get the latest version of the dataset
+    /// This is meant to be a fast path for checking if a dataset has changed. This is why
+    /// we don't return the full version struct.
+    pub async fn latest_branch_version_id(&self, branch: &str) -> Result<u64> {
+        let branch_location = self
+            .dataset_location
+            .switch_branch(Some(branch.to_string()))?;
+        Ok(self
+            .commit_handler
+            .resolve_latest_location(branch_location.base_path(), &self.object_store)
             .await?
             .version)
     }
@@ -1594,10 +1701,10 @@ impl Dataset {
         for (id, count) in id_counts {
             if count > 1 {
                 return Err(Error::corrupt_file(
-                    self.base.clone(),
+                    self.base().clone(),
                     format!(
                         "Duplicate fragment id {} found in dataset {:?}",
-                        id, self.base
+                        id, self.dataset_location
                     ),
                     location!(),
                 ));
@@ -1612,10 +1719,10 @@ impl Dataset {
             .try_fold(0, |prev, id| {
                 if id < prev {
                     Err(Error::corrupt_file(
-                        self.base.clone(),
+                        self.base().clone(),
                         format!(
                             "Fragment ids are not sorted in increasing fragment-id order. Found {} after {} in dataset {:?}",
-                            id, prev, self.base
+                            id, prev, self.dataset_location
                         ),
                         location!(),
                     ))
@@ -1647,7 +1754,7 @@ impl Dataset {
                     self.manifest_location.path.clone(),
                     format!(
                         "Duplicate index id {} found in dataset {:?}",
-                        &index.uuid, self.base
+                        &index.uuid, self.dataset_location
                     ),
                     location!(),
                 ));
@@ -1703,7 +1810,7 @@ impl Dataset {
     /// # tokio::runtime::Runtime::new().unwrap().block_on(fut);
     /// ```
     pub async fn migrate_manifest_paths_v2(&mut self) -> Result<()> {
-        migrate_scheme_to_v2(self.object_store(), &self.base).await?;
+        migrate_scheme_to_v2(self.object_store(), self.base()).await?;
         // We need to re-open.
         let latest_version = self.latest_version_id().await?;
         *self = self.checkout_version(latest_version).await?;
@@ -1718,23 +1825,24 @@ impl Dataset {
         &mut self,
         target_path: &str,
         version: impl Into<refs::Ref>,
-        store_params: ObjectStoreParams,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let ref_: refs::Ref = version.into();
         let (version_number, ref_name) = match ref_ {
-            refs::Ref::Version(version) => (version, None),
-            refs::Ref::Tag(tag) => (self.tags.get_version(tag.as_str()).await?, Some(tag)),
+            refs::Ref::Version(branch, version) => (version, branch),
+            refs::Ref::Tag(tag) => (self.tags.get(tag.as_str()).await?.version, Some(tag)),
         };
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: String::from(self.base.clone()),
+            ref_path: String::from(self.base().clone()),
+            branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params)
+            .with_store_params(store_params.unwrap_or_default())
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
@@ -1761,7 +1869,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     let latest_version = dataset.manifest.version;
     let locations = dataset
         .commit_handler
-        .list_manifest_locations(&dataset.base, dataset.object_store(), true)
+        .list_manifest_locations(dataset.base(), dataset.object_store(), true)
         .try_take_while(move |location| {
             futures::future::ready(Ok(location.version > latest_version))
         });
@@ -1787,7 +1895,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         Dataset::load_manifest(
                             dataset.object_store(),
                             &location,
-                            &dataset.uri,
+                            dataset.uri(),
                             dataset.session.as_ref(),
                         )
                         .await?,
@@ -1820,8 +1928,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 } else {
                     let dataset_version = Dataset::checkout_manifest(
                         dataset.object_store.clone(),
-                        dataset.base.clone(),
-                        dataset.uri.clone(),
+                        dataset.dataset_location.clone(),
                         manifest_copy.clone(),
                         location,
                         dataset.session(),
@@ -1841,7 +1948,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                             location: location!(),
                         })?;
                     let loaded =
-                        Arc::new(read_transaction_file(object_store, &dataset.base, path).await?);
+                        Arc::new(read_transaction_file(object_store, dataset.base(), path).await?);
                     dataset
                         .metadata_cache
                         .insert_with_key(&tx_key, loaded.clone())
@@ -1857,8 +1964,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             // If we got the latest manifest, we can checkout the dataset.
             Dataset::checkout_manifest(
                 dataset.object_store.clone(),
-                dataset.base.clone(),
-                dataset.uri.clone(),
+                dataset.dataset_location.clone(),
                 latest_manifest,
                 location,
                 dataset.session(),
@@ -1927,7 +2033,7 @@ impl Dataset {
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
+        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri(), columns = columns.join(","));
         schema_evolution::drop_columns(self, columns).await
     }
 
@@ -2778,7 +2884,7 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_location(&dataset.base, dataset.object_store())
+                .resolve_latest_location(dataset.base(), dataset.object_store())
                 .await
                 .unwrap()
                 .path,
@@ -2802,7 +2908,7 @@ mod tests {
             dataset.object_store(),
             &dataset
                 .commit_handler
-                .resolve_latest_location(&dataset.base, dataset.object_store())
+                .resolve_latest_location(dataset.base(), dataset.object_store())
                 .await
                 .unwrap()
                 .path,
@@ -2826,7 +2932,7 @@ mod tests {
         write_manifest_file(
             dataset.object_store(),
             dataset.commit_handler.as_ref(),
-            &dataset.base,
+            dataset.base(),
             &mut manifest,
             None,
             &ManifestWriteConfig {
@@ -3019,7 +3125,7 @@ mod tests {
             .await
             .unwrap();
         let cloned_dataset = dataset
-            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .shallow_clone(cloned_uri, "test_tag", None)
             .await
             .unwrap();
 
@@ -3140,7 +3246,7 @@ mod tests {
                 .unwrap();
 
             current_dataset = current_dataset
-                .shallow_clone(clone_path, "v1", ObjectStoreParams::default())
+                .shallow_clone(clone_path, "v1", None)
                 .await
                 .unwrap();
             current_dataset = write_dataset(
@@ -4481,7 +4587,7 @@ mod tests {
         let bad_tag_creation = dataset.tags.create("tag1", 3).await;
         assert_eq!(
             bad_tag_creation.err().unwrap().to_string(),
-            "Version not found error: version 3 does not exist"
+            "Version not found error: version Main::3 does not exist"
         );
 
         let bad_tag_deletion = dataset.tags.delete("tag1").await;
@@ -7860,5 +7966,201 @@ mod tests {
             results.column(0).as_any().downcast_ref::<T>().unwrap(),
             values
         )
+    }
+
+    #[tokio::test]
+    async fn test_branch() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let data_storage_version = LanceFileVersion::Stable;
+
+        // Generate consistent test data batches
+        let generate_data = |prefix: &str, start_id: i32, row_count: u64| {
+            gen_batch()
+                .col("id", array::step_custom::<Int32Type>(start_id, 1))
+                .col("value", array::fill_utf8(format!("{prefix}_data")))
+                .into_reader_rows(RowCount::from(row_count), BatchCount::from(1))
+        };
+
+        // Reusable dataset writer with configurable mode
+        async fn write_dataset(
+            uri: &str,
+            data_reader: impl RecordBatchReader + Send + 'static,
+            mode: WriteMode,
+            version: LanceFileVersion,
+        ) -> Dataset {
+            let params = WriteParams {
+                max_rows_per_file: 100,
+                max_rows_per_group: 20,
+                data_storage_version: Some(version),
+                mode,
+                ..Default::default()
+            };
+            Dataset::write(data_reader, uri, Some(params))
+                .await
+                .unwrap()
+        }
+
+        // Unified dataset scanning and row counting
+        async fn collect_rows(dataset: &Dataset) -> (usize, Vec<RecordBatch>) {
+            let batches = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            (batches.iter().map(|b| b.num_rows()).sum(), batches)
+        }
+
+        // Phase 1: Create empty dataset, write data batch 1, create branch1 based on version_number, write data batch 2
+        let mut dataset = write_dataset(
+            test_uri,
+            generate_data("batch1", 0, 50),
+            WriteMode::Create,
+            data_storage_version,
+        )
+        .await;
+
+        let original_version = dataset.version().version;
+        assert_eq!(original_version, 1);
+
+        // Create branch1 on the latest version and write data batch 2
+        let mut branch1_dataset = dataset
+            .create_branch("branch1", original_version, None)
+            .await
+            .unwrap();
+
+        branch1_dataset = write_dataset(
+            branch1_dataset.uri(),
+            generate_data("batch2", 50, 30),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Phase 2: Create branch2 based on branch1's latest version_number, write data batch 3
+        let mut branch2_dataset = branch1_dataset
+            .create_branch(
+                "dev/branch2",
+                ("branch1", branch1_dataset.version().version),
+                None,
+            )
+            .await
+            .unwrap();
+
+        branch2_dataset = write_dataset(
+            branch2_dataset.uri(),
+            generate_data("batch3", 80, 20),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Phase 3: Create a tag on branch2, the actual tag content is under root dataset
+        // create branch3 based on that tag, write data batch 4
+        branch2_dataset
+            .tags
+            .create_on_branch(
+                "tag1",
+                branch2_dataset.version().version,
+                Some("dev/branch2"),
+            )
+            .await
+            .unwrap();
+
+        let mut branch3_dataset = branch2_dataset
+            .create_branch("feature/nathan/branch3", "tag1", None)
+            .await
+            .unwrap();
+
+        branch3_dataset = write_dataset(
+            branch3_dataset.uri(),
+            generate_data("batch4", 100, 25),
+            WriteMode::Append,
+            data_storage_version,
+        )
+        .await;
+
+        // Verify data correctness and independence of each branch
+        // Main branch only has data 1 (50 rows)
+        let main_dataset = Dataset::open(test_uri).await.unwrap();
+        let (main_rows, _) = collect_rows(&main_dataset).await;
+        assert_eq!(main_rows, 50); // only batch1
+        assert_eq!(main_dataset.version().version, 1);
+
+        // branch1 has data 1 + 2 (80 rows)
+        let updated_branch1 = Dataset::open(branch1_dataset.uri()).await.unwrap();
+        let (branch1_rows, _) = collect_rows(&updated_branch1).await;
+        assert_eq!(branch1_rows, 80); // batch1+batch2
+        assert_eq!(updated_branch1.version().version, 2);
+
+        // branch2 has data 1 + 2 + 3 (100 rows)
+        let updated_branch2 = Dataset::open(branch2_dataset.uri()).await.unwrap();
+        let (branch2_rows, _) = collect_rows(&updated_branch2).await;
+        assert_eq!(branch2_rows, 100); // batch1+batch2+batch3
+        assert_eq!(updated_branch2.version().version, 3);
+
+        // branch3 has data 1 + 2 + 3 + 4 (125 rows)
+        let updated_branch3 = Dataset::open(branch3_dataset.uri()).await.unwrap();
+        let (branch3_rows, _) = collect_rows(&updated_branch3).await;
+        assert_eq!(branch3_rows, 125); // batch1+batch2+batch3+batch4
+        assert_eq!(updated_branch3.version().version, 4);
+
+        // Use list_branches to get branch list and verify each field of branch_content
+        let branches = dataset.list_branches().await.unwrap();
+        assert_eq!(branches.len(), 3);
+        assert!(branches.contains_key("branch1"));
+        assert!(branches.contains_key("dev/branch2"));
+        assert!(branches.contains_key("feature/nathan/branch3"));
+
+        // Verify branch1 content
+        let branch1_content = branches.get("branch1").unwrap();
+        assert_eq!(branch1_content.parent_branch, None); // Created based on main branch
+        assert_eq!(branch1_content.parent_version, 1);
+        assert!(branch1_content.create_at > 0);
+        assert!(branch1_content.manifest_size > 0);
+
+        // Verify branch2 content
+        let branch2_content = branches.get("dev/branch2").unwrap();
+        assert_eq!(branch2_content.parent_branch.as_deref().unwrap(), "branch1");
+        assert_eq!(branch2_content.parent_version, 2);
+        assert!(branch2_content.create_at > 0);
+        assert!(branch2_content.manifest_size > 0);
+        assert!(branch2_content.create_at >= branch1_content.create_at);
+
+        // Verify branch3 content
+        let branch3_content = branches.get("feature/nathan/branch3").unwrap();
+        // Created based on tag pointed to branch2
+        assert_eq!(
+            branch3_content.parent_branch.as_deref().unwrap(),
+            "dev/branch2"
+        );
+        assert_eq!(branch3_content.parent_version, 3);
+        assert!(branch3_content.create_at > 0);
+        assert!(branch3_content.manifest_size > 0);
+        assert!(branch3_content.create_at >= branch2_content.create_at);
+
+        let mut dataset = main_dataset;
+        // Finally delete all branches
+        dataset.delete_branch("branch1").await.unwrap();
+        dataset.delete_branch("dev/branch2").await.unwrap();
+        dataset
+            .delete_branch("feature/nathan/branch3")
+            .await
+            .unwrap();
+
+        // Verify list_branches is empty
+        let branches_after_delete = dataset.list_branches().await.unwrap();
+        assert!(branches_after_delete.is_empty());
+
+        // Verify branch directories are all deleted cleanly
+        let branches = dataset
+            .object_store
+            .read_dir(Path::parse(test_dir.path().join("tree").to_str().unwrap()).unwrap())
+            .await
+            .unwrap();
+        assert!(branches.is_empty());
     }
 }

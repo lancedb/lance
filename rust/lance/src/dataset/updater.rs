@@ -146,7 +146,7 @@ impl Updater {
         open_writer(
             &self.fragment.dataset().object_store,
             &schema,
-            &self.fragment.dataset().base,
+            self.fragment.dataset().base(),
             data_storage_version,
         )
         .await

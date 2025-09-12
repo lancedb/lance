@@ -1287,7 +1287,7 @@ impl<'a> TransactionRebase<'a> {
                     }
 
                     let new_deletion_file = write_deletion_file(
-                        &dataset.base,
+                        dataset.base(),
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
@@ -1704,7 +1704,7 @@ mod tests {
                 fragment.id,
                 deletion_file,
                 // Reference deletion file should never enter this apply_deletion. So base path is fine.
-                &dataset.base,
+                dataset.base(),
                 dataset.object_store(),
             )
             .await
@@ -1716,7 +1716,7 @@ mod tests {
         current_deletions.extend(delete_rows.iter().copied());
 
         fragment.deletion_file = write_deletion_file(
-            &dataset.base,
+            dataset.base(),
             fragment.id,
             dataset.manifest.version,
             &current_deletions,
@@ -1829,7 +1829,7 @@ mod tests {
                 //     }
                 // };
                 // let old_path = deletion_file_path(
-                //     &dataset.base,
+                //     dataset.base(),
                 //     original_fragment.id,
                 //     original_fragment.deletion_file.as_ref().unwrap(),
                 // );
@@ -1847,7 +1847,7 @@ mod tests {
                     }
                 };
                 let new_path = deletion_file_path(
-                    &dataset.base,
+                    dataset.base(),
                     final_fragment.id,
                     final_fragment.deletion_file.as_ref().unwrap(),
                 );

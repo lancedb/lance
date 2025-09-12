@@ -1237,7 +1237,7 @@ impl FileFragment {
                 if num_deletions != deletion_vector.len() {
                     return Err(Error::corrupt_file(
                         deletion_file_path(
-                            &self.dataset.base,
+                            self.dataset.base(),
                             self.metadata.id,
                             self.metadata.deletion_file.as_ref().unwrap(),
                         ),
@@ -1255,7 +1255,7 @@ impl FileFragment {
                     let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
                     return Err(Error::corrupt_file(
                         deletion_file_path(
-                            &self.dataset.base,
+                            self.dataset.base(),
                             self.metadata.id,
                             deletion_file_meta,
                         ),
@@ -1669,7 +1669,7 @@ impl FileFragment {
         }
 
         self.metadata.deletion_file = write_deletion_file(
-            &self.dataset.base,
+            self.dataset.base(),
             self.metadata.id,
             self.dataset.version().version,
             &deletion_vector,
@@ -1838,8 +1838,8 @@ impl FragmentReader {
                 if let Some(other_legacy) = reader.as_legacy_opt() {
                     if other_legacy.num_batches() != num_batches {
                         return Err(Error::io(
-                                "Cannot create FragmentReader from data files with different number of batches"
-                                    .to_string(),
+                            "Cannot create FragmentReader from data files with different number of batches"
+                                .to_string(),
                             location!(),
                         ));
                     }
@@ -3459,7 +3459,7 @@ mod tests {
             fragments: vec![frag],
         };
         let dataset = Dataset::commit(
-            &dataset.uri,
+            dataset.uri().as_str(),
             op,
             Some(dataset.version().version),
             None,

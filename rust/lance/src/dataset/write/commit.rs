@@ -17,7 +17,7 @@ use crate::{
     dataset::{
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
-        refs::Tags,
+        refs::Refs,
         transaction::{Operation, Transaction},
         ManifestWriteConfig, ReadParams,
     },
@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
+use crate::dataset::dataset_location::DatasetLocation;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
@@ -189,7 +190,7 @@ impl<'a> CommitBuilder<'a> {
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
-                dataset.base.clone(),
+                dataset.base().clone(),
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
@@ -210,6 +211,7 @@ impl<'a> CommitBuilder<'a> {
                 if let Some(passed_store) = self.object_store {
                     object_store = passed_store;
                 }
+
                 (object_store, base_path, commit_handler)
             }
         };
@@ -370,12 +372,6 @@ impl<'a> CommitBuilder<'a> {
             operation=&transaction.operation.name()
         );
 
-        let tags = Tags::new(
-            object_store.clone(),
-            commit_handler.clone(),
-            base_path.clone(),
-        );
-
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
@@ -386,20 +382,32 @@ impl<'a> CommitBuilder<'a> {
                 fragment_bitmap,
                 ..dataset.as_ref().clone()
             }),
-            WriteDestination::Uri(uri) => Ok(Dataset {
-                object_store,
-                base: base_path,
-                uri: uri.to_string(),
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                commit_handler,
-                tags,
-                index_cache,
-                fragment_bitmap,
-                metadata_cache,
-                file_reader_options: None,
-            }),
+            WriteDestination::Uri(uri) => {
+                let dataset_location = DatasetLocation::new(
+                    uri.to_string(),
+                    base_path.clone(),
+                    manifest.branch.clone(),
+                )?;
+                let refs = Refs::new(
+                    object_store.clone(),
+                    commit_handler.clone(),
+                    dataset_location.clone(),
+                );
+                Ok(Dataset {
+                    object_store,
+                    dataset_location,
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    commit_handler,
+                    tags: refs.tags(),
+                    branches: refs.branches(),
+                    index_cache,
+                    fragment_bitmap,
+                    metadata_cache,
+                    file_reader_options: None,
+                })
+            }
         }
     }
 
