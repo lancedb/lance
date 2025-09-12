@@ -1379,7 +1379,7 @@ impl Dataset {
     /// Returns the properly formatted path from root to the field.
     /// Field names containing dots are quoted (e.g., struct."field.with.dot")
     pub fn field_path(&self, field_id: i32) -> Result<String> {
-        use lance_core::datatypes::field_path;
+        use lance_core::datatypes::format_field_path;
 
         self.schema()
             .field_ancestry_by_id(field_id)
@@ -1389,7 +1389,7 @@ impl Dataset {
             })
             .map(|ancestry| {
                 let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
-                field_path::format_field_path(&field_refs)
+                format_field_path(&field_refs)
             })
     }
 

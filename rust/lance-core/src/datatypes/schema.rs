@@ -175,7 +175,7 @@ impl Schema {
         }
 
         // Otherwise, parse as a potentially nested field path
-        let mut split = field_path::split_field_path(column_str)?;
+        let mut split = split_field_path(column_str)?;
         let mut fields = Vec::with_capacity(split.len());
         let first = split.pop_front().unwrap();
 
@@ -241,7 +241,7 @@ impl Schema {
         for field in self.fields.iter() {
             let ancestry = self.field_ancestry_by_id(field.id).unwrap();
             let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
-            let column_path = field_path::format_field_path(&field_refs);
+            let column_path = format_field_path(&field_refs);
             if !seen_names.insert(column_path.clone()) {
                 return Err(Error::Schema {
                     message: format!(
@@ -398,7 +398,7 @@ impl Schema {
         }
 
         // Otherwise, parse as a potentially nested field path
-        let split = field_path::parse_field_path(name)?;
+        let split = parse_field_path(name)?;
         self.fields
             .iter()
             .find(|f| f.name == split[0])
@@ -1202,106 +1202,101 @@ impl Projection {
     }
 }
 
-/// Utilities for parsing and formatting field paths with proper quoting support
-pub mod field_path {
-    use std::collections::VecDeque;
+/// Parse a field path that may contain quoted field names.
+///
+/// Field names containing dots must be quoted with double quotes.
+/// For example: `parent."child.with.dot"` parses to ["parent", "child.with.dot"]
+///
+/// Returns None if the path is malformed (unclosed quotes, etc.)
+pub fn parse_field_path(path: &str) -> Option<Vec<String>> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+    let mut chars = path.chars().peekable();
 
-    /// Parse a field path that may contain quoted field names.
-    ///
-    /// Field names containing dots must be quoted with double quotes.
-    /// For example: `parent."child.with.dot"` parses to ["parent", "child.with.dot"]
-    ///
-    /// Returns None if the path is malformed (unclosed quotes, etc.)
-    pub fn parse_field_path(path: &str) -> Option<Vec<String>> {
-        let mut result = Vec::new();
-        let mut current = String::new();
-        let mut in_quotes = false;
-        let mut escape_next = false;
-        let mut chars = path.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escape_next {
+            current.push(ch);
+            escape_next = false;
+            continue;
+        }
 
-        while let Some(ch) = chars.next() {
-            if escape_next {
-                current.push(ch);
-                escape_next = false;
-                continue;
+        match ch {
+            '\\' if in_quotes => {
+                escape_next = true;
             }
-
-            match ch {
-                '\\' if in_quotes => {
-                    escape_next = true;
-                }
-                '"' => {
-                    if in_quotes {
-                        // End of quoted field
-                        in_quotes = false;
-                        // After closing quote, we should either see a dot or end of string
-                        if let Some(&next_ch) = chars.peek() {
-                            if next_ch != '.' {
-                                return None; // Invalid format
-                            }
+            '"' => {
+                if in_quotes {
+                    // End of quoted field
+                    in_quotes = false;
+                    // After closing quote, we should either see a dot or end of string
+                    if let Some(&next_ch) = chars.peek() {
+                        if next_ch != '.' {
+                            return None; // Invalid format
                         }
-                    } else if current.is_empty() {
-                        // Start of quoted field
-                        in_quotes = true;
-                    } else {
-                        // Quote in the middle of unquoted field name
-                        return None;
                     }
-                }
-                '.' if !in_quotes => {
-                    if current.is_empty() {
-                        return None; // Empty field name
-                    }
-                    result.push(current);
-                    current = String::new();
-                }
-                _ => {
-                    current.push(ch);
+                } else if current.is_empty() {
+                    // Start of quoted field
+                    in_quotes = true;
+                } else {
+                    // Quote in the middle of unquoted field name
+                    return None;
                 }
             }
-        }
-
-        if in_quotes {
-            return None; // Unclosed quote
-        }
-
-        if !current.is_empty() {
-            result.push(current);
-        } else if !result.is_empty() {
-            return None; // Trailing dot
-        }
-
-        if result.is_empty() {
-            return None;
-        }
-
-        Some(result)
-    }
-
-    /// Format a field path, quoting field names that contain dots.
-    ///
-    /// For example: ["parent", "child.with.dot"] formats to `parent."child.with.dot"`
-    pub fn format_field_path(fields: &[&str]) -> String {
-        fields
-            .iter()
-            .map(|field| {
-                if field.contains('.') || field.contains('"') {
-                    // Need to quote this field
-                    let escaped = field.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!("\"{}\"", escaped)
-                } else {
-                    field.to_string()
+            '.' if !in_quotes => {
+                if current.is_empty() {
+                    return None; // Empty field name
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(".")
+                result.push(current);
+                current = String::new();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
     }
 
-    /// Split a field path into segments for resolution.
-    /// This is a compatibility wrapper that converts the parsed path into a VecDeque.
-    pub fn split_field_path(path: &str) -> Option<VecDeque<String>> {
-        parse_field_path(path).map(|v| v.into_iter().collect())
+    if in_quotes {
+        return None; // Unclosed quote
     }
+
+    if !current.is_empty() {
+        result.push(current);
+    } else if !result.is_empty() {
+        return None; // Trailing dot
+    }
+
+    if result.is_empty() {
+        return None;
+    }
+
+    Some(result)
+}
+
+/// Format a field path, quoting field names that contain dots.
+///
+/// For example: ["parent", "child.with.dot"] formats to `parent."child.with.dot"`
+pub fn format_field_path(fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            if field.contains('.') || field.contains('"') {
+                // Need to quote this field
+                let escaped = field.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{}\"", escaped)
+            } else {
+                field.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Split a field path into segments for resolution.
+/// This is a compatibility wrapper that converts the parsed path into a VecDeque.
+pub fn split_field_path(path: &str) -> Option<std::collections::VecDeque<String>> {
+    parse_field_path(path).map(|v| v.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -1312,8 +1307,6 @@ mod tests {
 
     #[test]
     fn test_field_path_parsing() {
-        use super::field_path::{format_field_path, parse_field_path};
-
         // Simple paths without quotes
         assert_eq!(
             parse_field_path("a.b.c"),

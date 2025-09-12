@@ -433,14 +433,14 @@ pub struct Scanner {
 }
 
 pub(crate) fn escape_column_name(name: &str, schema: Option<&Schema>) -> String {
-    use lance_core::datatypes::field_path;
+    use lance_core::datatypes::parse_field_path;
 
     // If we have a schema, first check if this is a valid field path as-is
     if let Some(schema) = schema {
         // Check if this column exists in the schema (handles both simple and nested fields)
         if let Some(_field) = schema.field(name) {
             // Parse the field path to get segments
-            if let Some(segments) = field_path::parse_field_path(name) {
+            if let Some(segments) = parse_field_path(name) {
                 if segments.len() == 1 {
                     // Simple field name - just escape it
                     return format!("`{}`", segments[0]);
@@ -479,7 +479,7 @@ pub(crate) fn escape_column_name(name: &str, schema: Option<&Schema>) -> String 
     }
 
     // Fallback: Try to parse as a field path with proper quote handling
-    if let Some(segments) = field_path::parse_field_path(name) {
+    if let Some(segments) = parse_field_path(name) {
         // Escape each segment with backticks for DataFusion
         segments
             .iter()
