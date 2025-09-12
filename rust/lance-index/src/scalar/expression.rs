@@ -18,8 +18,8 @@ use datafusion_expr::{
 };
 
 use super::{
-    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
-    TextQuery, TokenQuery,
+    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
+    SearchResult, TextQuery, TokenQuery,
 };
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Error, Result};
@@ -316,6 +316,95 @@ impl ScalarQueryParser for SargableQueryParser {
         _: &ScalarUDF,
         _: &[Expr],
     ) -> Option<IndexedExpression> {
+        None
+    }
+}
+
+/// A parser for bloom filter indices that only support equals, is_null, and is_in operations
+#[derive(Debug)]
+pub struct BloomFilterQueryParser {
+    index_name: String,
+    needs_recheck: bool,
+}
+
+impl BloomFilterQueryParser {
+    pub fn new(index_name: String, needs_recheck: bool) -> Self {
+        Self {
+            index_name,
+            needs_recheck,
+        }
+    }
+}
+
+impl ScalarQueryParser for BloomFilterQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        // Bloom filters don't support range queries
+        None
+    }
+
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        let query = BloomFilterQuery::IsIn(in_list.to_vec());
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(BloomFilterQuery::Equals(ScalarValue::Boolean(Some(value)))),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(BloomFilterQuery::IsNull()),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        let query = match op {
+            // Bloom filters only support equality comparisons
+            Operator::Eq => BloomFilterQuery::Equals(value.clone()),
+            // This will be negated by the caller
+            Operator::NotEq => BloomFilterQuery::Equals(value.clone()),
+            // Bloom filters don't support range operations
+            _ => return None,
+        };
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_scalar_function(
+        &self,
+        _: &str,
+        _: &DataType,
+        _: &ScalarUDF,
+        _: &[Expr],
+    ) -> Option<IndexedExpression> {
+        // Bloom filters don't support scalar functions
         None
     }
 }

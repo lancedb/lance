@@ -4,7 +4,7 @@
 use core::slice;
 
 use crate::error::Result;
-use crate::utils::{get_index_params, get_query};
+use crate::utils::{get_query, get_vector_index_params};
 use crate::Error;
 use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
@@ -422,5 +422,5 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIndexParam
     _obj: JObject,
     index_params_obj: JObject, // IndexParams
 ) {
-    ok_or_throw_without_return!(env, get_index_params(&mut env, index_params_obj));
+    ok_or_throw_without_return!(env, get_vector_index_params(&mut env, index_params_obj));
 }

@@ -212,3 +212,4 @@ message JsonIndexDetails {
   string path = 1;
   google.protobuf.Any target_details = 2;
 }
+message BloomFilterIndexDetails {}

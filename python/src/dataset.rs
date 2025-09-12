@@ -213,6 +213,11 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.use_index(use_index);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -1489,6 +1494,7 @@ impl Dataset {
             "BITMAP" => IndexType::Bitmap,
             "NGRAM" => IndexType::NGram,
             "ZONEMAP" => IndexType::ZoneMap,
+            "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
@@ -1522,6 +1528,10 @@ impl Dataset {
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 index_type: "label_list".to_string(),
+                params: None,
+            }),
+            "BLOOMFILTER" => Box::new(ScalarIndexParams {
+                index_type: "bloomfilter".to_string(),
                 params: None,
             }),
             "SCALAR" => {
