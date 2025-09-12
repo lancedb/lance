@@ -46,6 +46,7 @@ pub mod ffi;
 mod file_reader;
 mod file_writer;
 mod fragment;
+mod optimize;
 mod schema;
 mod sql;
 pub mod traits;

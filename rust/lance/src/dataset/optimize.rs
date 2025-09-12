@@ -288,9 +288,9 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
 /// See [plan_compaction()] for more details.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactionPlan {
-    tasks: Vec<TaskData>,
-    read_version: u64,
-    options: CompactionOptions,
+    pub tasks: Vec<TaskData>,
+    pub read_version: u64,
+    pub options: CompactionOptions,
 }
 
 impl CompactionPlan {
@@ -336,7 +336,7 @@ pub struct TaskData {
 pub struct CompactionTask {
     pub task: TaskData,
     pub read_version: u64,
-    options: CompactionOptions,
+    pub options: CompactionOptions,
 }
 
 impl CompactionTask {
