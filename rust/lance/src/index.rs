@@ -3999,7 +3999,7 @@ mod tests {
                     Field::new("id", DataType::Int32, false),
                     Field::new("label", DataType::Utf8, false),
                 ]
-                    .into(),
+                .into(),
             ),
             false,
         );
@@ -4045,7 +4045,7 @@ mod tests {
             schema.clone(),
             vec![Arc::new(ids), Arc::new(struct_array), Arc::new(categories)],
         )
-            .unwrap();
+        .unwrap();
 
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
 
@@ -4142,7 +4142,7 @@ mod tests {
                 Arc::new(new_categories),
             ],
         )
-            .unwrap();
+        .unwrap();
 
         dataset
             .append(
@@ -4185,5 +4185,160 @@ mod tests {
             .unwrap();
 
         assert_eq!(post_optimize_results.num_rows(), 10);
+    }
+    
+    #[tokio::test]
+    #[ignore = "Index creation on fields with dots in names requires additional DataFusion integration work"]
+    async fn test_index_on_nested_field_with_dots() {
+        let dimensions = 16;
+        let num_rows = 256;
+        
+        // Create schema with nested field containing dots in the name
+        let struct_field = Field::new(
+            "embedding_data",
+            DataType::Struct(
+                vec![
+                    Field::new(
+                        "vector.v1",  // Field name with dot
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, true)),
+                            dimensions,
+                        ),
+                        false,
+                    ),
+                    Field::new("vector.v2",  // Another field name with dot
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, true)),
+                            dimensions,
+                        ),
+                        false,
+                    ),
+                    Field::new("metadata", DataType::Utf8, false),
+                ]
+                    .into(),
+            ),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            struct_field,
+        ]));
+
+        // Generate test data
+        let float_arr_v1 = generate_random_array(num_rows * dimensions as usize);
+        let vectors_v1 = FixedSizeListArray::try_new_from_values(float_arr_v1, dimensions).unwrap();
+        
+        let float_arr_v2 = generate_random_array(num_rows * dimensions as usize);
+        let vectors_v2 = FixedSizeListArray::try_new_from_values(float_arr_v2, dimensions).unwrap();
+        
+        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let metadata = StringArray::from_iter_values((0..num_rows).map(|i| format!("meta_{}", i)));
+
+        let struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "vector.v1",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dimensions,
+                    ),
+                    false,
+                )),
+                Arc::new(vectors_v1) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new(
+                    "vector.v2",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        dimensions,
+                    ),
+                    false,
+                )),
+                Arc::new(vectors_v2) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("metadata", DataType::Utf8, false)),
+                Arc::new(metadata) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(struct_array)],
+        )
+            .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test creating index on nested field with dots using quoted syntax
+        let nested_column_path_v1 = "embedding_data.\"vector.v1\"";
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 10);
+
+        dataset
+            .create_index(
+                &[nested_column_path_v1],
+                IndexType::Vector,
+                Some("vec_v1_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "vec_v1_idx");
+        
+        // Verify the correct field was indexed
+        let field_id = indices[0].fields[0];
+        let field_path = dataset.field_path(field_id).unwrap();
+        assert_eq!(field_path, "embedding_data.\"vector.v1\"");
+
+        // Test creating index on the second vector field with dots
+        let nested_column_path_v2 = "embedding_data.\"vector.v2\"";
+        dataset
+            .create_index(
+                &[nested_column_path_v2],
+                IndexType::Vector,
+                Some("vec_v2_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify both indices exist
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+        
+        // Verify we can query using the indexed fields
+        let query_vector = generate_random_array(dimensions as usize);
+
+        let search_results_v1 = dataset
+            .scan()
+            .nearest(nested_column_path_v1, &query_vector, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(search_results_v1.num_rows(), 5);
+        
+        let search_results_v2 = dataset
+            .scan()
+            .nearest(nested_column_path_v2, &query_vector, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(search_results_v2.num_rows(), 5);
     }
 }

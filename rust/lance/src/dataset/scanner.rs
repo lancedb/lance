@@ -433,10 +433,20 @@ pub struct Scanner {
 }
 
 fn escape_column_name(name: &str) -> String {
-    name.split('.')
-        .map(|s| format!("`{}`", s))
-        .collect::<Vec<_>>()
-        .join(".")
+    use lance_core::datatypes::field_path;
+    
+    // Try to parse as a field path with proper quote handling
+    if let Some(segments) = field_path::parse_field_path(name) {
+        // Escape each segment with backticks for DataFusion
+        segments
+            .iter()
+            .map(|s| format!("`{}`", s))
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        // Fallback: treat as a single field name
+        format!("`{}`", name)
+    }
 }
 
 /// Represents a user-requested take operation

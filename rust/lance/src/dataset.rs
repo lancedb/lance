@@ -1376,8 +1376,11 @@ impl Dataset {
 
     /// Get the full field path for a field ID, handling nested fields
     ///
-    /// Returns the dot-separated path from root to the field (e.g., "struct_field.nested_field")
+    /// Returns the properly formatted path from root to the field.
+    /// Field names containing dots are quoted (e.g., struct."field.with.dot")
     pub fn field_path(&self, field_id: i32) -> Result<String> {
+        use lance_core::datatypes::field_path;
+
         self.schema()
             .field_ancestry_by_id(field_id)
             .ok_or_else(|| Error::Index {
@@ -1385,11 +1388,8 @@ impl Dataset {
                 location: location!(),
             })
             .map(|ancestry| {
-                ancestry
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".")
+                let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
+                field_path::format_field_path(&field_refs)
             })
     }
 
@@ -3805,12 +3805,27 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_bad_field_name(
+    async fn test_field_name_with_dots(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        // don't allow `.` in the field name
-        assert!(create_bad_file(data_storage_version).await.is_err());
+        // Field names with dots should now be allowed
+        let dataset = create_bad_file(data_storage_version)
+            .await
+            .expect("Field names with dots should be allowed");
+
+        // Test that we can access the field using quotes
+        let field = dataset.schema().field("\"a.b.c\"");
+        assert!(
+            field.is_some(),
+            "Should be able to access field with dots using quotes"
+        );
+
+        // Test that field_path properly quotes the field name
+        if let Some(field) = field {
+            let field_path = dataset.field_path(field.id).unwrap();
+            assert_eq!(field_path, "\"a.b.c\"");
+        }
     }
 
     #[rstest]
@@ -3847,8 +3862,8 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
 
-        // Nested fields should also not allow dots in their names
-        let result = Dataset::write(
+        // Field names with dots should now be allowed
+        let dataset = Dataset::write(
             reader,
             test_uri,
             Some(WriteParams {
@@ -3856,20 +3871,28 @@ mod tests {
                 ..Default::default()
             }),
         )
-        .await;
+        .await
+        .expect("Should allow field names with dots");
 
+        // Test that we can access the field with dot using quoted syntax
+        let field = dataset.schema().field("parent.\"child.with.dot\"");
         assert!(
-            result.is_err(),
-            "Should not allow nested field names with dots"
+            field.is_some(),
+            "Should be able to access field with dots using quotes"
         );
-        if let Err(e) = result {
-            let err_msg = e.to_string();
-            assert!(
-                err_msg.contains("cannot contain `.`") || err_msg.contains("Dots are reserved"),
-                "Error should mention dots are not allowed, got: {}",
-                err_msg
-            );
+
+        // Test that field_path properly quotes the field name
+        if let Some(field) = field {
+            let field_path = dataset.field_path(field.id).unwrap();
+            assert_eq!(field_path, "parent.\"child.with.dot\"");
         }
+
+        // Test accessing the normal field
+        let normal_field = dataset.schema().field("parent.normal_child");
+        assert!(
+            normal_field.is_some(),
+            "Should be able to access normal nested field"
+        );
     }
 
     #[tokio::test]
