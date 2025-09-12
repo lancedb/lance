@@ -487,14 +487,13 @@ impl Dataset {
             builder = builder.with_session(session.inner.clone());
         }
 
-        let dataset = RT.runtime.block_on(builder.load());
+        let dataset = RT.block_on(Some(py), builder.load())?;
 
         match dataset {
             Ok(ds) => Ok(Self {
                 uri,
                 ds: Arc::new(ds),
             }),
-            // TODO: return an appropriate error type, such as IOError or NotFound.
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }

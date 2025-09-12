@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use pyo3::{pyclass, pymethods};
 
+use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
 
 use crate::RT;
@@ -33,8 +34,8 @@ impl Session {
         metadata_cache_size_bytes: Option<usize>,
     ) -> Self {
         let session = LanceSession::new(
-            index_cache_size_bytes,
-            metadata_cache_size_bytes,
+            index_cache_size_bytes.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
+            metadata_cache_size_bytes.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             Default::default(),
         );
         Session {
@@ -43,12 +44,14 @@ impl Session {
     }
 
     fn __repr__(&self) -> String {
-        let (index_cache_size, meta_cache_size) = RT.block_on(None, async move {
-            (
-                self.inner.index_cache_stats().await.size_bytes,
-                self.inner.metadata_cache_stats().await.size_bytes,
-            )
-        });
+        let (index_cache_size, meta_cache_size) = RT
+            .block_on(None, async move {
+                (
+                    self.inner.index_cache_stats().await.size_bytes,
+                    self.inner.metadata_cache_stats().await.size_bytes,
+                )
+            })
+            .unwrap_or((0, 0));
         format!(
             "Session(index_cache_size_bytes={}, metadata_cache_size_bytes={})",
             index_cache_size, meta_cache_size
