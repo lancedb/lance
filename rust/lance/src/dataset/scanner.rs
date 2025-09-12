@@ -432,10 +432,53 @@ pub struct Scanner {
     autoproject_scoring_columns: bool,
 }
 
-fn escape_column_name(name: &str) -> String {
+pub(crate) fn escape_column_name(name: &str, schema: Option<&Schema>) -> String {
     use lance_core::datatypes::field_path;
-    
-    // Try to parse as a field path with proper quote handling
+
+    // If we have a schema, first check if this is a valid field path as-is
+    if let Some(schema) = schema {
+        // Check if this column exists in the schema (handles both simple and nested fields)
+        if let Some(_field) = schema.field(name) {
+            // Parse the field path to get segments
+            if let Some(segments) = field_path::parse_field_path(name) {
+                if segments.len() == 1 {
+                    // Simple field name - just escape it
+                    return format!("`{}`", segments[0]);
+                } else if segments.len() == 2 {
+                    // For nested fields, we need special handling
+                    // Check if the parent is a struct field
+                    if let Some(parent_field) = schema.field(&segments[0]) {
+                        // Check if this is a struct with a child that has dots in its name
+                        if parent_field
+                            .children
+                            .iter()
+                            .any(|child| child.name == segments[1])
+                        {
+                            // This is a nested field where the child name contains dots
+                            // Try using struct field access with escaped child name
+                            // DataFusion expects: struct_col["field_name"] for fields with special chars
+                            return format!("`{}`[\"{}\"]", segments[0], segments[1]);
+                        }
+                    }
+                    // Normal nested field access
+                    return segments
+                        .iter()
+                        .map(|s| format!("`{}`", s))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                } else {
+                    // Multi-level nesting
+                    return segments
+                        .iter()
+                        .map(|s| format!("`{}`", s))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                }
+            }
+        }
+    }
+
+    // Fallback: Try to parse as a field path with proper quote handling
     if let Some(segments) = field_path::parse_field_path(name) {
         // Escape each segment with backticks for DataFusion
         segments
@@ -447,6 +490,11 @@ fn escape_column_name(name: &str) -> String {
         // Fallback: treat as a single field name
         format!("`{}`", name)
     }
+}
+
+/// Helper function to escape column name with schema context
+pub(crate) fn escape_column_name_with_schema(name: &str, schema: &Schema) -> String {
+    escape_column_name(name, Some(schema))
 }
 
 /// Represents a user-requested take operation
@@ -699,9 +747,10 @@ impl Scanner {
     ///
     /// Only select the specified columns. If not specified, all columns will be scanned.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
+        let schema = self.dataset.schema();
         let transformed_columns: Vec<(&str, String)> = columns
             .iter()
-            .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
+            .map(|c| (c.as_ref(), escape_column_name(c.as_ref(), Some(schema))))
             .collect();
 
         self.project_with_transform(&transformed_columns)
