@@ -115,7 +115,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             DataType::LargeList(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
             _ => return Err(Error::InvalidInput {
                 source: format!(
-                    "An inverted index can only be created on a Utf8 or LargeUtf8 field. Column has type {:?}",
+                    "A inverted index can only be created on a Utf8 or LargeUtf8 field/list. Column has type {:?}",
                     field.data_type()
                 )
                     .into(),
