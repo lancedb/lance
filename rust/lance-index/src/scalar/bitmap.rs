@@ -18,7 +18,8 @@ use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{
-    cache::LanceCache, error::LanceOptionExt, utils::mask::RowIdTreeMap, Error, Result, ROW_ID,
+    cache::LanceCache, error::LanceOptionExt, utils::mask::RowIdTreeMap, utils::tokio::spawn_cpu,
+    Error, Result, ROW_ID,
 };
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -261,30 +262,43 @@ impl ScalarIndex for BitmapIndex {
                     Bound::Unbounded => Bound::Unbounded,
                 };
 
-                let maps = self
+                let maps: Vec<RowIdTreeMap> = self
                     .index_map
                     .range((range_start, range_end))
-                    .map(|(_, v)| v)
-                    .collect::<Vec<_>>();
+                    .map(|(_, v)| v.clone())
+                    .collect();
 
                 metrics.record_comparisons(maps.len());
-                RowIdTreeMap::union_all(&maps)
+                spawn_cpu(move || {
+                    let map_refs: Vec<&RowIdTreeMap> = maps.iter().collect();
+                    Ok(RowIdTreeMap::union_all(&map_refs))
+                })
+                .await?
             }
             SargableQuery::IsIn(values) => {
-                let mut union_bitmap = RowIdTreeMap::default();
                 metrics.record_comparisons(values.len());
+
+                // Pre-extract only the bitmaps we need instead of cloning the entire index_map
+                let null_map_arc = Arc::new(self.null_map.clone());
+                let mut needed_bitmaps: Vec<Arc<RowIdTreeMap>> = Vec::with_capacity(values.len());
+
                 for val in values {
                     if val.is_null() {
-                        union_bitmap |= self.null_map.clone();
+                        needed_bitmaps.push(null_map_arc.clone());
                     } else {
                         let key = OrderableScalarValue(val.clone());
                         if let Some(bitmap) = self.index_map.get(&key) {
-                            union_bitmap |= bitmap.clone();
+                            needed_bitmaps.push(Arc::new(bitmap.clone()));
                         }
                     }
                 }
 
-                union_bitmap
+                spawn_cpu(move || {
+                    let bitmap_refs: Vec<&RowIdTreeMap> =
+                        needed_bitmaps.iter().map(|arc| arc.as_ref()).collect();
+                    Ok(RowIdTreeMap::union_all(&bitmap_refs))
+                })
+                .await?
             }
             SargableQuery::IsNull() => {
                 metrics.record_comparisons(1);
