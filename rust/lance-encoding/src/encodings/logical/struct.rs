@@ -626,7 +626,6 @@ mod tests {
             vec![Arc::new(list_array)],
             Some(NullBuffer::new(struct_validity)),
         );
-        println!("struct_array: {:#?}", struct_array);
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
             &TestCases::default().with_file_version(LanceFileVersion::V2_1),
@@ -658,7 +657,6 @@ mod tests {
             vec![Arc::new(list_array)],
             Some(NullBuffer::new(struct_validity)),
         );
-        println!("struct_array: {:#?}", struct_array);
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
             &TestCases::default().with_file_version(LanceFileVersion::V2_1),
