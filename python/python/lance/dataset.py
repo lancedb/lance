@@ -208,6 +208,27 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def use_index(self, use_index: bool) -> "MergeInsertBuilder":
+        """
+        Controls whether to use indices for the merge operation.
+
+        When set to False, forces a full table scan even if an index exists on
+        the join key. This can be useful for benchmarking or when the optimizer
+        chooses a suboptimal path.
+
+        Parameters
+        ----------
+        use_index : bool
+            If True (default), uses an index if available. If False, forces a
+            full table scan.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).use_index(use_index)
+
     def explain_plan(
         self, schema: Optional[pa.Schema] = None, verbose: bool = False
     ) -> str:
