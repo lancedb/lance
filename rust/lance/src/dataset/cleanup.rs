@@ -60,7 +60,7 @@ use std::{
 };
 use tracing::{info, instrument, Span};
 
-use super::refs::{RefOperations, TagContents};
+use super::refs::{TagContents};
 use crate::{utils::temporal::utc_now, Dataset};
 
 #[derive(Clone, Debug, Default)]
@@ -1031,10 +1031,10 @@ mod tests {
 
         let mut dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1, None).await.unwrap();
+        dataset.tags.create("old-tag", 1).await.unwrap();
         dataset
             .tags
-            .create("another-old-tag", 2, None)
+            .create("another-old-tag", 2)
             .await
             .unwrap();
 
@@ -1086,13 +1086,13 @@ mod tests {
 
         let mut dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1, None).await.unwrap();
+        dataset.tags.create("old-tag", 1).await.unwrap();
         dataset
             .tags
-            .create("another-old-tag", 2, None)
+            .create("another-old-tag", 2)
             .await
             .unwrap();
-        dataset.tags.create("tag-latest", 3, None).await.unwrap();
+        dataset.tags.create("tag-latest", 3).await.unwrap();
 
         fixture
             .clock

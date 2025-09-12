@@ -127,31 +127,143 @@ impl Branches {
     }
 }
 
-#[async_trait::async_trait]
-pub trait RefOperations<T> {
-    /// Fetch all tags or branches
-    async fn fetch(&self) -> Result<Vec<(String, T)>>;
-
-    /// List all tags or branches as a name to contents map
-    async fn list(&self) -> Result<HashMap<String, T>>;
-
-    /// Get the contents of a tag or branch
-    async fn get(&self, name: &str) -> Result<T>;
-
-    /// Create a new tag or branch
-    async fn create(&mut self, name: &str, version_number: u64, branch: Option<&str>)
-        -> Result<()>;
-
-    /// Delete a tag or branch
-    async fn delete(&mut self, name: &str) -> Result<()>;
-
-    /// List all tags or branches in name order
-    async fn list_ordered(&self, order: Option<Ordering>) -> Result<Vec<(String, T)>>;
-}
-
 impl Tags {
+    pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
+        let base_path = base_tags_path(self.refs.root());
+        let tag_files = self.object_store().read_dir(base_path).await?;
+
+        let tag_names: Vec<String> = tag_files
+            .iter()
+            .filter_map(|name| name.strip_suffix(".json"))
+            .map(|name| name.to_string())
+            .collect_vec();
+
+        futures::stream::iter(tag_names)
+            .map(|tag_name| async move {
+                let contents = TagContents::from_path(
+                    &tag_path(self.refs.root(), &tag_name),
+                    self.object_store(),
+                )
+                .await?;
+                Ok((tag_name, contents))
+            })
+            .buffer_unordered(10)
+            .try_collect()
+            .await
+    }
+
+    pub async fn list(&self) -> Result<HashMap<String, TagContents>> {
+        self.fetch_tags().await.map(|tags| tags.into_iter().collect())
+    }
+
+    pub async fn list_tags_ordered(&self, order: Option<Ordering>) -> Result<Vec<(String, TagContents)>> {
+        let mut tags = self.fetch_tags().await?;
+        tags.sort_by(|a, b| {
+            let desired_ordering = order.unwrap_or(Ordering::Greater);
+            let version_ordering = a.1.version.cmp(&b.1.version);
+            let version_result = match desired_ordering {
+                Ordering::Less => version_ordering,
+                _ => version_ordering.reverse(),
+            };
+            version_result.then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(tags)
+    }
+
+    pub async fn get_version(&self, tag: &str) -> Result<u64> {
+        self.get(tag).await.map(|tag| tag.version)
+    }
+
+    pub async fn get(&self, tag: &str) -> Result<TagContents> {
+        check_valid_tag(tag)?;
+
+        let tag_file = tag_path(self.refs.root(), tag);
+
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+
+        Ok(tag_contents)
+    }
+
+    pub async fn create(&mut self, tag: &str, version: u64) -> Result<()> {
+        self.create_on_branch(tag, version, None).await
+    }
+
+    pub async fn create_on_branch(&mut self, tag: &str, version_number: u64, branch: Option<&str>) -> Result<()> {
+        check_valid_tag(tag)?;
+
+        let branch = branch.map(String::from);
+        let tag_file = tag_path(self.refs.root(), tag);
+
+        if self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("tag {} already exists", tag),
+            });
+        }
+
+        let base_path = dataset_base_path(&self.refs.dataset_location, branch.clone())?;
+        let manifest_file = self
+            .refs
+            .commit_handler
+            .resolve_version_location(&base_path, version_number, &self.refs.object_store.inner)
+            .await?;
+
+        if !self.object_store().exists(&manifest_file.path).await? {
+            return Err(Error::VersionNotFound {
+                message: format!(
+                    "version {}::{} does not exist",
+                    branch.unwrap_or("Main".to_string()),
+                    version_number
+                ),
+            });
+        }
+
+        let manifest_size = if let Some(size) = manifest_file.size {
+            size as usize
+        } else {
+            self.object_store().size(&manifest_file.path).await? as usize
+        };
+
+        let tag_contents = TagContents {
+            branch,
+            version: version_number,
+            manifest_size,
+        };
+
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn delete(&mut self, tag: &str) -> Result<()> {
+        check_valid_tag(tag)?;
+
+        let tag_file = tag_path(self.refs.root(), tag);
+
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        self.object_store().delete(&tag_file).await
+    }
+
+    pub async fn update(&mut self, tag: &str, version: u64) -> Result<()> {
+        self.update_on_branch(tag, version, None).await
+    }
+
     /// Update a tag to a branch::version
-    pub async fn update(
+    pub async fn update_on_branch(
         &mut self,
         tag: &str,
         version_number: u64,
@@ -203,146 +315,20 @@ impl Tags {
     }
 }
 
-#[async_trait::async_trait]
-impl RefOperations<TagContents> for Tags {
-    async fn fetch(&self) -> Result<Vec<(String, TagContents)>> {
-        let base_path = base_tags_path(self.refs.root());
-        let tag_files = self.object_store().read_dir(base_path).await?;
-
-        let tag_names: Vec<String> = tag_files
-            .iter()
-            .filter_map(|name| name.strip_suffix(".json"))
-            .map(|name| name.to_string())
-            .collect_vec();
-
-        futures::stream::iter(tag_names)
-            .map(|tag_name| async move {
-                let contents = TagContents::from_path(
-                    &tag_path(self.refs.root(), &tag_name),
-                    self.object_store(),
-                )
-                .await?;
-                Ok((tag_name, contents))
-            })
-            .buffer_unordered(10)
-            .try_collect()
-            .await
-    }
-
-    async fn list(&self) -> Result<HashMap<String, TagContents>> {
-        self.fetch().await.map(|tags| tags.into_iter().collect())
-    }
-
-    async fn get(&self, tag: &str) -> Result<TagContents> {
-        check_valid_tag(tag)?;
-
-        let tag_file = tag_path(self.refs.root(), tag);
-
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-
-        Ok(tag_contents)
-    }
-
-    async fn create(&mut self, tag: &str, version_number: u64, branch: Option<&str>) -> Result<()> {
-        check_valid_tag(tag)?;
-
-        let branch = branch.map(String::from);
-        let tag_file = tag_path(self.refs.root(), tag);
-
-        if self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefConflict {
-                message: format!("tag {} already exists", tag),
-            });
-        }
-
-        let base_path = dataset_base_path(&self.refs.dataset_location, branch.clone())?;
-        let manifest_file = self
-            .refs
-            .commit_handler
-            .resolve_version_location(&base_path, version_number, &self.refs.object_store.inner)
-            .await?;
-
-        if !self.object_store().exists(&manifest_file.path).await? {
-            return Err(Error::VersionNotFound {
-                message: format!(
-                    "version {}::{} does not exist",
-                    branch.unwrap_or("Main".to_string()),
-                    version_number
-                ),
-            });
-        }
-
-        let manifest_size = if let Some(size) = manifest_file.size {
-            size as usize
-        } else {
-            self.object_store().size(&manifest_file.path).await? as usize
-        };
-
-        let tag_contents = TagContents {
-            branch,
-            version: version_number,
-            manifest_size,
-        };
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
-    }
-
-    async fn delete(&mut self, tag: &str) -> Result<()> {
-        check_valid_tag(tag)?;
-
-        let tag_file = tag_path(self.refs.root(), tag);
-
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        self.object_store().delete(&tag_file).await
-    }
-
-    async fn list_ordered(&self, order: Option<Ordering>) -> Result<Vec<(String, TagContents)>> {
-        let mut tags = self.fetch().await?;
-        tags.sort_by(|a, b| {
-            let desired_ordering = order.unwrap_or(Ordering::Greater);
-            let version_ordering = a.1.version.cmp(&b.1.version);
-            let version_result = match desired_ordering {
-                Ordering::Less => version_ordering,
-                _ => version_ordering.reverse(),
-            };
-            version_result.then_with(|| a.0.cmp(&b.0))
-        });
-        Ok(tags)
-    }
-}
-
-#[async_trait::async_trait]
-impl RefOperations<BranchContents> for Branches {
-    async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
+impl Branches {
+    pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let base_path = base_branches_contents_path(self.refs.root());
         let branch_files = self.object_store().read_dir(base_path).await?;
 
         let branch_names: Vec<String> = branch_files
             .iter()
             .filter_map(|name| name.strip_suffix(".json"))
-            .map(|s| {
-                Path::from_url_path(s)
+            .map(|str| {
+                Path::from_url_path(str)
                     .map_err(|e| Error::InvalidRef {
                         message: format!(
                             "Failed to decode branch name: {} due to exception {}",
-                            s, e
+                            str, e
                         ),
                     })
                     .map(|path| path.to_string())
@@ -363,13 +349,13 @@ impl RefOperations<BranchContents> for Branches {
             .await
     }
 
-    async fn list(&self) -> Result<HashMap<String, BranchContents>> {
+    pub async fn list(&self) -> Result<HashMap<String, BranchContents>> {
         self.fetch()
             .await
             .map(|branches| branches.into_iter().collect())
     }
 
-    async fn get(&self, branch: &str) -> Result<BranchContents> {
+    pub async fn get(&self, branch: &str) -> Result<BranchContents> {
         check_valid_branch(branch)?;
 
         let branch_file = branch_contents_path(self.refs.root(), branch);
@@ -385,7 +371,7 @@ impl RefOperations<BranchContents> for Branches {
         Ok(branch_contents)
     }
 
-    async fn create(
+    pub async fn create(
         &mut self,
         branch_name: &str,
         version_number: u64,
@@ -435,7 +421,7 @@ impl RefOperations<BranchContents> for Branches {
             .map(|_| ())
     }
 
-    async fn delete(&mut self, branch: &str) -> Result<()> {
+    pub async fn delete(&mut self, branch: &str) -> Result<()> {
         check_valid_branch(branch)?;
 
         let branch_file = branch_contents_path(self.refs.root(), branch);
@@ -450,7 +436,7 @@ impl RefOperations<BranchContents> for Branches {
         self.cleanup_branch_directories(branch).await
     }
 
-    async fn list_ordered(&self, order: Option<Ordering>) -> Result<Vec<(String, BranchContents)>> {
+    pub async fn list_ordered(&self, order: Option<Ordering>) -> Result<Vec<(String, BranchContents)>> {
         let mut branches = self.fetch().await?;
         branches.sort_by(|a, b| {
             let desired_ordering = order.unwrap_or(Ordering::Greater);
@@ -463,9 +449,7 @@ impl RefOperations<BranchContents> for Branches {
         });
         Ok(branches)
     }
-}
 
-impl Branches {
     /// Clean up empty parent directories using 4-step algorithm
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;

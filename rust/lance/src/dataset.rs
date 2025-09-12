@@ -88,7 +88,7 @@ use self::write::write_fragments_internal;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::dataset_location::DatasetLocation;
 use crate::dataset::delta::DatasetDelta;
-use crate::dataset::refs::{BranchContents, Branches, RefOperations, Tags};
+use crate::dataset::refs::{BranchContents, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::error::box_error;
@@ -2983,7 +2983,7 @@ mod tests {
         // Create tag and shallow clone
         dataset
             .tags
-            .create("test_tag", original_version, None)
+            .create("test_tag", original_version)
             .await
             .unwrap();
         let cloned_dataset = dataset
@@ -3106,7 +3106,6 @@ mod tests {
                 .create(
                     "v1",
                     current_dataset.latest_version_id().await.unwrap(),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -4553,7 +4552,7 @@ mod tests {
 
         assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
 
-        let bad_tag_creation = dataset.tags.create("tag1", 3, None).await;
+        let bad_tag_creation = dataset.tags.create("tag1", 3).await;
         assert_eq!(
             bad_tag_creation.err().unwrap().to_string(),
             "Version not found error: version Main::3 does not exist"
@@ -4565,11 +4564,11 @@ mod tests {
             "Ref not found error: tag tag1 does not exist"
         );
 
-        dataset.tags.create("tag1", 1, None).await.unwrap();
+        dataset.tags.create("tag1", 1).await.unwrap();
 
         assert_eq!(dataset.tags.list().await.unwrap().len(), 1);
 
-        let another_bad_tag_creation = dataset.tags.create("tag1", 1, None).await;
+        let another_bad_tag_creation = dataset.tags.create("tag1", 1).await;
         assert_eq!(
             another_bad_tag_creation.err().unwrap().to_string(),
             "Ref conflict error: tag tag1 already exists"
@@ -4579,11 +4578,11 @@ mod tests {
 
         assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
 
-        dataset.tags.create("tag1", 1, None).await.unwrap();
-        dataset.tags.create("tag2", 1, None).await.unwrap();
-        dataset.tags.create("v1.0.0-rc1", 2, None).await.unwrap();
+        dataset.tags.create("tag1", 1).await.unwrap();
+        dataset.tags.create("tag2", 1).await.unwrap();
+        dataset.tags.create("v1.0.0-rc1", 2).await.unwrap();
 
-        let default_order = dataset.tags.list_ordered(None).await.unwrap();
+        let default_order = dataset.tags.list_tags_ordered(None).await.unwrap();
         let default_names: Vec<_> = default_order.iter().map(|t| &t.0).collect();
         assert_eq!(
             default_names,
@@ -4593,7 +4592,7 @@ mod tests {
 
         let asc_order = dataset
             .tags
-            .list_ordered(Some(Ordering::Less))
+            .list_tags_ordered(Some(Ordering::Less))
             .await
             .unwrap();
         let asc_names: Vec<_> = asc_order.iter().map(|t| &t.0).collect();
@@ -4605,7 +4604,7 @@ mod tests {
 
         let desc_order = dataset
             .tags
-            .list_ordered(Some(Ordering::Greater))
+            .list_tags_ordered(Some(Ordering::Greater))
             .await
             .unwrap();
         let desc_names: Vec<_> = desc_order.iter().map(|t| &t.0).collect();
@@ -4634,23 +4633,23 @@ mod tests {
         assert_eq!(first_ver.version().version, 1);
 
         // test update tag
-        let bad_tag_update = dataset.tags.update("tag3", 1, None).await;
+        let bad_tag_update = dataset.tags.update("tag3", 1).await;
         assert_eq!(
             bad_tag_update.err().unwrap().to_string(),
             "Ref not found error: tag tag3 does not exist"
         );
 
-        let another_bad_tag_update = dataset.tags.update("tag1", 3, None).await;
+        let another_bad_tag_update = dataset.tags.update("tag1", 3).await;
         assert_eq!(
             another_bad_tag_update.err().unwrap().to_string(),
             "Version not found error: version 3 does not exist"
         );
 
-        dataset.tags.update("tag1", 2, None).await.unwrap();
+        dataset.tags.update("tag1", 2).await.unwrap();
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
-        dataset.tags.update("tag1", 1, None).await.unwrap();
+        dataset.tags.update("tag1", 1).await.unwrap();
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
     }
@@ -8034,7 +8033,6 @@ mod tests {
             .create(
                 "tag1",
                 branch2_dataset.version().version,
-                Some("dev/branch2"),
             )
             .await
             .unwrap();

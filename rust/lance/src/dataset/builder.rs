@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use super::refs::{Ref, RefOperations, Refs};
+use super::refs::{Ref, Refs};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::dataset::dataset_location::DatasetLocation;
 use crate::{
