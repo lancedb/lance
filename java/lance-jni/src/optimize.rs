@@ -62,6 +62,7 @@ pub extern "system" fn Java_com_lancedb_lance_compaction_Compaction_nativePlanCo
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_plan_compaction<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,                    // Dataset
@@ -132,6 +133,7 @@ pub extern "system" fn Java_com_lancedb_lance_compaction_Compaction_nativeCommit
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_commit_compaction<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,                    // Dataset
@@ -215,6 +217,7 @@ pub extern "system" fn Java_com_lancedb_lance_compaction_CompactionTask_nativeEx
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_execute_task<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,                    // Dataset

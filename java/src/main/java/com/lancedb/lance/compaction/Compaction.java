@@ -21,7 +21,7 @@ import com.google.common.base.Preconditions;
 import java.util.List;
 import java.util.Optional;
 
-/** The entrypoint of compaction-related methods. */
+/** The entrypoint of distributed compaction-related methods. */
 public class Compaction {
   static {
     JniLoader.ensureLoaded();
