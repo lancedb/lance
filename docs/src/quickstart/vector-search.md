@@ -238,7 +238,7 @@ You can add metadata columns to your vector dataset and query both vectors and f
 
 In real-life situations, users have other feature or metadata columns that need to be stored and fetched together. If you're managing data and the index separately, you have to do a bunch of annoying plumbing to put stuff together. 
 
-With Lance, you can add columns directly to the dataset using `add_columns()`. For basic usecases, you can use SQL:
+With Lance, you can add columns directly to the dataset using `add_columns()`. For basic use cases, you can use SQL:
 
 ```python
 sift1m.add_columns(
