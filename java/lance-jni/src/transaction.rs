@@ -13,7 +13,7 @@ use crate::JNIEnvExt;
 use arrow::datatypes::Schema;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
-use jni::objects::{JByteArray, JMap, JObject, JString, JValue};
+use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue};
 use jni::sys::jbyte;
 use jni::JNIEnv;
 use lance::dataset::transaction::{
@@ -881,11 +881,18 @@ fn convert_to_rust_operation(
                     fragment.extract_object(env)
                 })?;
 
+            let updated_field_ids_obj = env.call_method(java_operation, "updatedFieldIds", "()[J", &[])?.l()?;
+            let updated_field_ids_array: JLongArray = updated_field_ids_obj.into();
+            let len = env.get_array_length(&updated_field_ids_array)?;
+            let mut buffer: Vec<i64> = vec![0; len as usize];
+            env.get_long_array_region(&updated_field_ids_array, 0, &mut buffer)?;
+            let updated_field_ids_unsafe: Vec<u32> = buffer.into_iter().map(|val| val as u32).collect();
+
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified: vec![],
+                fields_modified: updated_field_ids_unsafe,
                 mem_wal_to_merge: None,
             }
         }

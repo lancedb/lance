@@ -25,14 +25,17 @@ public class Update implements Operation {
   private final List<Long> removedFragmentIds;
   private final List<FragmentMetadata> updatedFragments;
   private final List<FragmentMetadata> newFragments;
+  private final long[] updatedFieldIds;
 
   private Update(
       List<Long> removedFragmentIds,
       List<FragmentMetadata> updatedFragments,
-      List<FragmentMetadata> newFragments) {
+      List<FragmentMetadata> newFragments,
+      long[] updatedFieldIds) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
     this.newFragments = newFragments;
+    this.updatedFieldIds = updatedFieldIds;
   }
 
   public static Builder builder() {
@@ -51,6 +54,10 @@ public class Update implements Operation {
     return newFragments;
   }
 
+  public long[] updatedFieldIds() {
+    return updatedFieldIds;
+  }
+
   @Override
   public String name() {
     return "Update";
@@ -61,6 +68,7 @@ public class Update implements Operation {
         .add("removedFragmentIds", removedFragmentIds)
         .add("updatedFragments", updatedFragments)
         .add("newFragments", newFragments)
+        .add("updatedFieldIds", updatedFieldIds)
         .toString();
   }
 
@@ -71,13 +79,15 @@ public class Update implements Operation {
     Update that = (Update) o;
     return Objects.equals(removedFragmentIds, that.removedFragmentIds)
         && Objects.equals(updatedFragments, that.updatedFragments)
-        && Objects.equals(newFragments, that.newFragments);
+        && Objects.equals(newFragments, that.newFragments)
+        && Objects.equals(updatedFieldIds, that.updatedFieldIds);
   }
 
   public static class Builder {
     private List<Long> removedFragmentIds = Collections.emptyList();
     private List<FragmentMetadata> updatedFragments = Collections.emptyList();
     private List<FragmentMetadata> newFragments = Collections.emptyList();
+    private long[] updatedFieldIds = new long[0];
 
     private Builder() {}
 
@@ -96,8 +106,13 @@ public class Update implements Operation {
       return this;
     }
 
+    public Builder updatedFieldIds(long[] updatedFieldIds) {
+      this.updatedFieldIds = updatedFieldIds;
+      return this;
+    }
+
     public Update build() {
-      return new Update(removedFragmentIds, updatedFragments, newFragments);
+      return new Update(removedFragmentIds, updatedFragments, newFragments, updatedFieldIds);
     }
   }
 }
