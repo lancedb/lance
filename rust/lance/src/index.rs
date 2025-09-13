@@ -244,7 +244,7 @@ pub(crate) async fn remap_index(
         .fields
         .first()
         .expect("An index existed with no fields");
-    let field_path = dataset.field_path(*field_id)?;
+    let field_path = dataset.schema().field_path(*field_id)?;
 
     let new_id = Uuid::new_v4();
 
@@ -727,7 +727,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let field_id = metadatas[0].fields[0];
-        let field_path = self.field_path(field_id)?;
+        let field_path = self.schema().field_path(field_id)?;
 
         // Open all delta indices
         let indices = stream::iter(metadatas.iter())
@@ -4302,7 +4302,7 @@ mod tests {
 
         // Verify the correct field was indexed
         let field_id = indices[0].fields[0];
-        let field_path = dataset.field_path(field_id).unwrap();
+        let field_path = dataset.schema().field_path(field_id).unwrap();
         assert_eq!(field_path, "embedding_data.\"vector.v1\"");
 
         // Test creating index on the second vector field with dots

@@ -141,10 +141,9 @@ pub(crate) async fn scan_training_data(
         scan.with_row_address();
     }
 
-    // Properly escape the column name for DataFusion
-    use crate::dataset::scanner::escape_column_name_with_schema;
-    let escaped_column = escape_column_name_with_schema(column, dataset.schema());
-    scan.project_with_transform(&[(VALUE_COLUMN_NAME, escaped_column.as_str())])?;
+    // For scalar index, we just need to project the column by name
+    // The ProjectionPlan will handle it correctly even if it has dots
+    scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])?;
 
     if let Some(fragments) = fragments {
         scan.with_fragments(fragments);

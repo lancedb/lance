@@ -1202,6 +1202,22 @@ impl Projection {
     }
 }
 
+impl Schema {
+    /// Returns the properly formatted path from root to the field.
+    /// Field names containing dots are quoted (e.g., struct."field.with.dot")
+    pub fn field_path(&self, field_id: i32) -> Result<String> {
+        self.field_ancestry_by_id(field_id)
+            .map(|ancestry| {
+                let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
+                format_field_path(&field_refs)
+            })
+            .ok_or_else(|| Error::Index {
+                message: format!("Could not find field ancestry for id {}", field_id),
+                location: location!(),
+            })
+    }
+}
+
 /// Parse a field path that may contain quoted field names.
 ///
 /// Field names containing dots must be quoted with double quotes.

@@ -83,7 +83,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         })?;
 
     // Get the full field path for nested fields
-    let column_path = dataset.field_path(old_indices[0].fields[0])?;
+    let column_path = dataset.schema().field_path(old_indices[0].fields[0])?;
 
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {

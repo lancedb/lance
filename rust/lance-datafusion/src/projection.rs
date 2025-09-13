@@ -79,7 +79,16 @@ impl ProjectionPlan {
                 ));
             }
 
-            let expr = planner.parse_expr(raw_expr.as_ref())?;
+            // Check if this is a simple column reference (when output_name == raw_expr)
+            // If so, create a direct column reference to avoid SQL parsing issues with dots
+            let expr = if output_name.as_ref() == raw_expr.as_ref() {
+                // This is a simple column projection, not a computed expression
+                // Create a direct column reference
+                Expr::Column(Column::from_name(raw_expr.as_ref()))
+            } else {
+                // This is a computed expression, parse it as SQL
+                planner.parse_expr(raw_expr.as_ref())?
+            };
 
             // If the expression is a bare column reference to a system column, mark that we need it
             if let Expr::Column(Column {
