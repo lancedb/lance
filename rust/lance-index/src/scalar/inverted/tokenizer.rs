@@ -10,6 +10,7 @@ use snafu::location;
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
 
+pub mod json;
 #[cfg(feature = "tokenizer-lindera")]
 mod lindera;
 
@@ -20,6 +21,7 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
+use crate::scalar::inverted::tokenizer::json::TripletTokenizer;
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -272,6 +274,7 @@ impl InvertedIndexParams {
                 .map_err(|e| Error::invalid_input(e.to_string(), location!()))?,
             )
             .dynamic()),
+            "json" => Ok(tantivy::tokenizer::TextAnalyzer::builder(TripletTokenizer).dynamic()),
             #[cfg(feature = "tokenizer-lindera")]
             s if s.starts_with("lindera/") => {
                 let Some(home) = language_model_home() else {
