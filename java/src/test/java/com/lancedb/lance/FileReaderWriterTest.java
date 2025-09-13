@@ -20,6 +20,7 @@ import com.lancedb.lance.util.Range;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -32,10 +33,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -194,6 +192,54 @@ public class FileReaderWriterTest {
       assertFalse(batches.loadNextBatch());
     }
 
+    reader.close();
+  }
+
+  @Test
+  void testTake(@TempDir Path tempDir) throws Exception {
+    BufferAllocator allocator = new RootAllocator();
+    String filePath = tempDir.resolve("basic_read.lance").toString();
+    createSimpleFile(filePath);
+    LanceFileReader reader = LanceFileReader.open(filePath, allocator);
+
+    Schema expectedSchema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("x", new ArrowType.Int(64, true)),
+                Field.nullable("y", new ArrowType.Utf8())),
+            null);
+
+    assertEquals(100, reader.numRows());
+    assertEquals(expectedSchema, reader.schema());
+
+    List<Integer> indices = Arrays.asList(0, 11, 23, 35, 47, 59, 62, 74, 86, 98);
+
+    try (ArrowReader batches = reader.take(null, indices, 100)) {
+      assertTrue(batches.loadNextBatch());
+      VectorSchemaRoot batch = batches.getVectorSchemaRoot();
+      assertEquals(10, batch.getRowCount());
+      assertEquals(2, batch.getSchema().getFields().size());
+      BigIntVector vectorX = (BigIntVector) batch.getVector("x");
+      VarCharVector vectorY = (VarCharVector) batch.getVector("y");
+      for (int i = 0; i < indices.size(); i++) {
+        assertEquals((long) indices.get(i), vectorX.getObject(i));
+        assertEquals("s-" + indices.get(i), vectorY.getObject(i).toString());
+      }
+      assertFalse(batches.loadNextBatch());
+    }
+
+    reader.close();
+    try {
+      reader.numRows();
+      fail("Expected LanceException to be thrown");
+    } catch (IOException e) {
+      assertEquals("FileReader has already been closed", e.getMessage());
+    }
+
+    // Ok to call schema after close
+    assertEquals(expectedSchema, reader.schema());
+
+    // close should be idempotent
     reader.close();
   }
 
