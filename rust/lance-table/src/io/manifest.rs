@@ -107,7 +107,14 @@ pub async fn read_manifest(
     }
 
     let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    let manifest = Manifest::try_from(proto)?;
+
+    // Check sdk version compatibility and log warning if needed
+    if let Some(ref writer_version) = manifest.writer_version {
+        writer_version.check_sdk_compatibility();
+    }
+
+    Ok(manifest)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]

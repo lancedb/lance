@@ -537,6 +537,46 @@ impl WriterVersion {
             version: new_version,
         }
     }
+
+    /// Check if the current SDK version is older than the writer version
+    /// and log a warning if so. This helps users identify potential compatibility issues.
+    pub fn check_sdk_compatibility(&self) {
+        let current_sdk_version = env!("CARGO_PKG_VERSION");
+        let current_version = Self {
+            library: "lance".to_string(),
+            version: current_sdk_version.to_string(),
+        };
+
+        // Only check compatibility for lance library
+        if self.library == "lance" {
+            if let (Some(writer_parts), Some(current_parts)) =
+                (self.semver(), current_version.semver())
+            {
+                // Compare versions: if current SDK version < writer version, warn
+                if (current_parts.0, current_parts.1, current_parts.2)
+                    < (writer_parts.0, writer_parts.1, writer_parts.2)
+                {
+                    log::warn!(
+                        "Dataset was written with Lance SDK version {} but current SDK version is {}. \
+                         Some features may not be available or data may not be readable correctly. \
+                         Consider upgrading your Lance SDK to version {} or later.",
+                        self.version,
+                        current_sdk_version,
+                        self.version
+                    );
+                }
+            } else {
+                // If we can't parse versions, still log a warning for awareness
+                log::warn!(
+                    "Dataset was written with Lance SDK version {} but current SDK version is {}. \
+                     Unable to parse version numbers for compatibility check. \
+                     Please ensure you are using a compatible Lance SDK version.",
+                    self.version,
+                    current_sdk_version
+                );
+            }
+        }
+    }
 }
 
 impl Default for WriterVersion {
@@ -768,6 +808,12 @@ impl SelfDescribingFileReader for FileReader {
         if manifest.should_use_legacy_format() {
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
+
+        // Check sdk version compatibility and log warning if needed
+        if let Some(ref writer_version) = manifest.writer_version {
+            writer_version.check_sdk_compatibility();
+        }
+
         let schema = manifest.schema;
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(
@@ -793,6 +839,33 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
 
+    use crate::format::manifest::{VersionPart, WriterVersion};
+    use std::sync::Arc;
+
+    // Helper function to determine if a warning should be logged for compatibility
+    fn should_warn_for_compatibility(writer_version: &WriterVersion) -> bool {
+        let current_sdk_version = env!("CARGO_PKG_VERSION");
+        let current_version = WriterVersion {
+            library: "lance".to_string(),
+            version: current_sdk_version.to_string(),
+        };
+
+        // Only check compatibility for lance library
+        if writer_version.library == "lance" {
+            if let (Some(writer_parts), Some(current_parts)) =
+                (writer_version.semver(), current_version.semver())
+            {
+                // Compare versions: if current SDK version < writer version, should warn
+                (current_parts.0, current_parts.1, current_parts.2)
+                    < (writer_parts.0, writer_parts.1, writer_parts.2)
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
+
     #[test]
     fn test_writer_version() {
         let wv = WriterVersion::default();
@@ -816,6 +889,73 @@ mod tests {
             let bumped = wv.bump(*part, false);
             let bumped_parts = bumped.semver_or_panic();
             assert!(wv.older_than(bumped_parts.0, bumped_parts.1, bumped_parts.2));
+        }
+    }
+
+    #[test]
+    fn test_compatibility_warning_conditions() {
+        let current_sdk_version = env!("CARGO_PKG_VERSION");
+
+        let test_cases = vec![
+            // (writer_version, library, expected_warn, description)
+            (
+                "99.99.99",
+                "lance",
+                true,
+                "newer writer version should warn",
+            ),
+            (
+                "0.1.0",
+                "lance",
+                false,
+                "older writer version should not warn",
+            ),
+            (
+                current_sdk_version,
+                "lance",
+                false,
+                "same version should not warn",
+            ),
+            (
+                "invalid.version",
+                "lance",
+                true,
+                "invalid version format should warn",
+            ),
+            (
+                "99.99.99",
+                "other",
+                false,
+                "non-lance library should not warn",
+            ),
+            (
+                "1.0.0",
+                "other",
+                false,
+                "non-lance library with valid version should not warn",
+            ),
+            ("", "lance", true, "empty version should warn"),
+            (
+                "10000.0.0",
+                "lance",
+                true,
+                "extremely high version should warn",
+            ),
+        ];
+
+        for (writer_ver, library, expected_warn, desc) in test_cases {
+            let writer = WriterVersion {
+                library: library.to_string(),
+                version: writer_ver.to_string(),
+            };
+
+            let actual_warn = should_warn_for_compatibility(&writer);
+
+            assert_eq!(
+                actual_warn, expected_warn,
+                "Failed for case: {} (writer: {}, library: {})",
+                desc, writer_ver, library
+            );
         }
     }
 
