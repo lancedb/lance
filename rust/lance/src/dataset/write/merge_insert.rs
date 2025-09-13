@@ -882,7 +882,7 @@ impl MergeInsertJob {
                     let mut writer = open_writer(
                         dataset.object_store(),
                         &write_schema,
-                        &dataset.base,
+                        dataset.base(),
                         data_storage_version,
                     )
                     .await?;
@@ -1046,7 +1046,7 @@ impl MergeInsertJob {
                 let fragments = write_fragments_internal(
                     Some(dataset.as_ref()),
                     dataset.object_store.clone(),
-                    &dataset.base,
+                    dataset.base(),
                     write_schema,
                     stream,
                     Default::default(), // TODO: support write params.
@@ -1428,7 +1428,7 @@ impl MergeInsertJob {
             let written = write_fragments_internal(
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
-                &self.dataset.base,
+                self.dataset.base(),
                 self.dataset.schema().clone(),
                 Box::pin(stream),
                 WriteParams::default(),
