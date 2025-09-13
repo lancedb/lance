@@ -432,12 +432,6 @@ pub struct Scanner {
     autoproject_scoring_columns: bool,
 }
 
-fn escape_column_name(name: &str) -> String {
-    name.split('.')
-        .map(|s| format!("`{}`", s))
-        .collect::<Vec<_>>()
-        .join(".")
-}
 
 /// Represents a user-requested take operation
 #[derive(Debug, Clone)]
@@ -689,12 +683,14 @@ impl Scanner {
     ///
     /// Only select the specified columns. If not specified, all columns will be scanned.
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
-        let transformed_columns: Vec<(&str, String)> = columns
+        // Pass column names directly without transformation
+        // The projection plan will handle them as simple column references
+        let column_pairs: Vec<(&str, &str)> = columns
             .iter()
-            .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
+            .map(|c| (c.as_ref(), c.as_ref()))
             .collect();
 
-        self.project_with_transform(&transformed_columns)
+        self.project_with_transform(&column_pairs)
     }
 
     /// Projection with transform
@@ -1806,8 +1802,15 @@ impl Scanner {
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
+                    // Strip quotes from column name for DataFusion lookup
+                    // Fields with dots are quoted like "field.with.dots"
+                    let column_name = if col.column_name.starts_with('"') && col.column_name.ends_with('"') && col.column_name.len() > 2 {
+                        &col.column_name[1..col.column_name.len() - 1]
+                    } else {
+                        &col.column_name
+                    };
                     Ok(PhysicalSortExpr {
-                        expr: expressions::col(&col.column_name, plan.schema().as_ref())?,
+                        expr: expressions::col(column_name, plan.schema().as_ref())?,
                         options: SortOptions {
                             descending: !col.ascending,
                             nulls_first: col.nulls_first,

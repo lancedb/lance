@@ -141,6 +141,8 @@ pub(crate) async fn scan_training_data(
         scan.with_row_address();
     }
 
+    // For scalar index, we just need to project the column by name
+    // The ProjectionPlan will handle it correctly even if it has dots
     scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])?;
 
     if let Some(fragments) = fragments {

@@ -8,6 +8,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
+use futures::TryStreamExt;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
 #[derive(Clone, Debug)]
@@ -88,20 +89,18 @@ impl SqlQuery {
         Self { dataframe }
     }
 
-    pub async fn into_stream(self) -> SendableRecordBatchStream {
-        self.dataframe.execute_stream().await.unwrap()
+    pub async fn into_stream(self) -> lance_core::Result<SendableRecordBatchStream> {
+        self.dataframe
+            .execute_stream()
+            .await
+            .map_err(|e| e.into())
     }
 
     pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {
-        use futures::TryStreamExt;
-
-        Ok(self
-            .dataframe
-            .execute_stream()
-            .await
-            .unwrap()
+        self.into_stream().await?
             .try_collect::<Vec<_>>()
-            .await?)
+            .await
+            .map_err(|e| e.into())
     }
 
     pub fn into_dataframe(self) -> DataFrame {
