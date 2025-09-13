@@ -171,7 +171,7 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let nodes = &self.nodes();
         for level in (0..self.max_level()).rev() {
@@ -256,7 +256,7 @@ impl HNSW {
         let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
         let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
 
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
         for i in 0..node_ids.len() {
             if let Some(ahead) = self.inner.params.prefetch_distance {
@@ -479,6 +479,7 @@ impl HnswBuilder {
                 ef: self.params.ef_construction,
                 lower_bound: None,
                 upper_bound: None,
+                dist_q_c: 0.0,
             },
             dist_calc,
             None,
@@ -556,6 +557,7 @@ pub struct HnswQueryParams {
     pub ef: usize,
     pub lower_bound: Option<f32>,
     pub upper_bound: Option<f32>,
+    pub dist_q_c: f32,
 }
 
 impl From<&Query> for HnswQueryParams {
@@ -565,6 +567,7 @@ impl From<&Query> for HnswQueryParams {
             ef: query.ef.unwrap_or(k + k / 2),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
+            dist_q_c: query.dist_q_c,
         }
     }
 }
@@ -900,6 +903,7 @@ mod tests {
             ef: 50,
             lower_bound: None,
             upper_bound: None,
+            dist_q_c: 0.0,
         };
         let builder_results = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())

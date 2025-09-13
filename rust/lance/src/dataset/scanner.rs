@@ -1055,6 +1055,7 @@ impl Scanner {
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
+            dist_q_c: 0.0,
         });
         Ok(self)
     }
@@ -3421,15 +3422,15 @@ impl Scanner {
     #[instrument(level = "info", skip(self))]
     pub async fn analyze_plan(&self) -> Result<String> {
         let plan = self.create_plan().await?;
-
-        analyze_plan(
+        let res = analyze_plan(
             plan,
             LanceExecutionOptions {
                 batch_size: self.batch_size,
                 ..Default::default()
             },
         )
-        .await
+        .await;
+        res
     }
 
     #[instrument(level = "info", skip(self))]

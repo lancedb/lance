@@ -21,6 +21,8 @@ use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
@@ -67,6 +69,7 @@ pub enum StageParams {
     Hnsw(HnswBuildParams),
     PQ(PQBuildParams),
     SQ(SQBuildParams),
+    RQ(RQBuildParams),
 }
 
 // The version of the index file.
@@ -161,6 +164,17 @@ impl VectorIndexParams {
         }
     }
 
+    pub fn ivf_rq(num_partitions: usize, num_bits: u8, distance_type: DistanceType) -> Self {
+        let ivf = IvfBuildParams::new(num_partitions);
+        let rq = RQBuildParams { num_bits };
+        let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
+        Self {
+            stages,
+            metric_type: distance_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
     /// Create index parameters with `IVF` and `PQ` parameters, respectively.
     pub fn with_ivf_pq_params(
         metric_type: MetricType,
@@ -181,6 +195,19 @@ impl VectorIndexParams {
         sq: SQBuildParams,
     ) -> Self {
         let stages = vec![StageParams::Ivf(ivf), StageParams::SQ(sq)];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+        }
+    }
+
+    pub fn with_ivf_rq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        rq: RQBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::RQ(rq)];
         Self {
             stages,
             metric_type,
@@ -248,6 +275,7 @@ impl VectorIndexParams {
             (1, _, Some(StageParams::Ivf(_))) => IndexType::IvfFlat,
             (2, _, Some(StageParams::PQ(_))) => IndexType::IvfPq,
             (2, _, Some(StageParams::SQ(_))) => IndexType::IvfSq,
+            (2, _, Some(StageParams::RQ(_))) => IndexType::IvfRq,
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
@@ -413,6 +441,28 @@ pub(crate) async fn build_vector_index(
                 Box::new(shuffler),
                 Some(ivf_params),
                 Some(sq_params.clone()),
+                (),
+                frag_reuse_index,
+            )?
+            .build()
+            .await?;
+        }
+        IndexType::IvfRq => {
+            let StageParams::RQ(rq_params) = &stages[1] else {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid stages: {:?}", stages),
+                    location: location!(),
+                });
+            };
+
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().child(uuid),
+                params.metric_type,
+                Box::new(shuffler),
+                Some(ivf_params),
+                Some(rq_params.clone()),
                 (),
                 frag_reuse_index,
             )?

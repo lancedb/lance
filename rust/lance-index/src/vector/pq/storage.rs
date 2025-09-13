@@ -630,7 +630,7 @@ impl VectorStore for ProductQuantizationStorage {
         self.row_ids.values().iter()
     }
 
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+    fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codebook = self.metadata.codebook.as_ref().unwrap();
         match codebook.value_type() {
             DataType::Float16 => PQDistCalculator::new(
@@ -1107,7 +1107,6 @@ mod tests {
 
         StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
             .unwrap()
-            .assert_num_columns(false)
             .build(vec![batch])
             .unwrap()
     }
@@ -1129,7 +1128,7 @@ mod tests {
     async fn test_distance_all() {
         let storage = create_pq_storage().await;
         let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
-        let dist_calc = storage.dist_calculator(query);
+        let dist_calc = storage.dist_calculator(query, 0.0);
         let expected = (0..storage.len())
             .map(|id| dist_calc.distance(id as u32))
             .collect::<Vec<_>>();
