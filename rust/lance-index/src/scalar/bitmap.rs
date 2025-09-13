@@ -729,6 +729,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
+        _fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         Self::train_bitmap_index(data, index_store).await?;
         Ok(CreatedIndex {
