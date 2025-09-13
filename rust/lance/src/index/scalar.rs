@@ -284,12 +284,11 @@ pub(super) async fn build_scalar_index(
         training_request.criteria(),
         None,
         train,
-        fragment_ids,
+        fragment_ids.clone(),
     )
     .await?;
-
     plugin
-        .train_index(training_data, &index_store, training_request)
+        .train_index(training_data, &index_store, training_request, fragment_ids)
         .await
 }
 

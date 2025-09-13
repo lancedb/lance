@@ -777,8 +777,54 @@ pub(crate) fn part_metadata_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, METADATA_FILE)
 }
 
+pub async fn merge_index_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    store: Arc<dyn IndexStore>,
+) -> Result<()> {
+    // List all partition metadata files in the index directory
+    let part_metadata_files = list_metadata_files(object_store, index_dir).await?;
+
+    // Call merge_metadata_files function for inverted index
+    merge_metadata_files(store, &part_metadata_files).await
+}
+
+/// List and filter metadata files from the index directory
+/// Returns partition metadata files
+async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Result<Vec<String>> {
+    // List all partition metadata files in the index directory
+    let mut part_metadata_files = Vec::new();
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                let file_name = meta.location.filename().unwrap_or_default();
+                // Filter files matching the pattern part_*_metadata.lance
+                if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance") {
+                    part_metadata_files.push(file_name.to_string());
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if part_metadata_files.is_empty() {
+        return Err(Error::InvalidInput {
+            source: format!(
+                "No partition metadata files found in index directory: {}",
+                index_dir
+            )
+            .into(),
+            location: location!(),
+        });
+    }
+
+    Ok(part_metadata_files)
+}
+
 /// Merge partition metadata files with partition ID remapping to sequential IDs starting from 0
-pub async fn merge_metadata_files(
+async fn merge_metadata_files(
     store: Arc<dyn IndexStore>,
     part_metadata_files: &[String],
 ) -> Result<()> {

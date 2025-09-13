@@ -119,6 +119,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex>;
 
     /// Returns true if the index returns an exact answer (e.g. not AtMost)

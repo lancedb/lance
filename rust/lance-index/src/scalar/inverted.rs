@@ -163,6 +163,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<InvertedIndexTrainingRequest>()
@@ -170,7 +171,8 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                 source: "must provide training request created by new_training_request".into(),
                 location: location!(),
             })?;
-        Self::train_inverted_index(data, index_store, request.parameters.clone(), None).await
+        Self::train_inverted_index(data, index_store, request.parameters.clone(), fragment_ids)
+            .await
     }
 
     /// Load an index from storage
