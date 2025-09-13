@@ -238,6 +238,7 @@ impl IndexDetails {
     pub fn supports_fts(&self) -> bool {
         // In the future this may need to change if we want FTS indices to be pluggable
         self.0.type_url.ends_with("InvertedIndexDetails")
+            || self.0.type_url.ends_with("JsonIndexDetails")
     }
 
     /// Returns the plugin for the index
@@ -251,6 +252,34 @@ impl IndexDetails {
             Ok(VECTOR_INDEX_VERSION)
         } else {
             self.get_plugin().map(|p| p.version())
+        }
+    }
+
+    pub fn index_type(&self) -> IndexType {
+        if self.0.type_url.ends_with("BTreeIndexDetails") {
+            IndexType::BTree
+        } else if self.0.type_url.ends_with("BitmapIndexDetails") {
+            IndexType::Bitmap
+        } else if self.0.type_url.ends_with("LabelListIndexDetails") {
+            IndexType::LabelList
+        } else if self.0.type_url.ends_with("InvertedIndexDetails") {
+            IndexType::Inverted
+        } else if self.0.type_url.ends_with("NGramIndexDetails") {
+            IndexType::NGram
+        } else if self.0.type_url.ends_with("FragmentReuseIndexDetails") {
+            IndexType::FragmentReuse
+        } else if self.0.type_url.ends_with("MemWalIndexDetails") {
+            IndexType::MemWal
+        } else if self.0.type_url.ends_with("ZoneMapIndexDetails") {
+            IndexType::ZoneMap
+        } else if self.0.type_url.ends_with("BloomFilterIndexDetails") {
+            IndexType::BloomFilter
+        } else if self.0.type_url.ends_with("JsonIndexDetails") {
+            IndexType::Json
+        } else if self.0.type_url.ends_with("VectorIndexDetails") {
+            IndexType::Vector
+        } else {
+            panic!("Unrecognized index detail {}", self.0.type_url)
         }
     }
 }
