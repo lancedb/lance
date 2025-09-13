@@ -1802,8 +1802,15 @@ impl Scanner {
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
+                    // Strip quotes from column name for DataFusion lookup
+                    // Fields with dots are quoted like "field.with.dots"
+                    let column_name = if col.column_name.starts_with('"') && col.column_name.ends_with('"') && col.column_name.len() > 2 {
+                        &col.column_name[1..col.column_name.len() - 1]
+                    } else {
+                        &col.column_name
+                    };
                     Ok(PhysicalSortExpr {
-                        expr: expressions::col(&col.column_name, plan.schema().as_ref())?,
+                        expr: expressions::col(column_name, plan.schema().as_ref())?,
                         options: SortOptions {
                             descending: !col.ascending,
                             nulls_first: col.nulls_first,

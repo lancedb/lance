@@ -169,17 +169,36 @@ impl Schema {
     pub fn resolve(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
         let column_str = column.as_ref();
 
-        // First, try to find an exact match for a top-level field (for fields with dots in their names)
+        // First check for exact field name match for backward compatibility
+        // This allows "field.with.dots" to match a field literally named "field.with.dots"
         if let Some(field) = self.fields.iter().find(|f| f.name == column_str) {
             return Some(vec![field]);
         }
 
-        // Otherwise, parse as a potentially nested field path
+        // Parse the field path to handle quoted segments
+        // For example: "simple.name.with.dot" -> ["simple.name.with.dot"]
+        //              parent."child.with.dot" -> ["parent", "child.with.dot"]
         let mut split = split_field_path(column_str)?;
+        
+        if split.is_empty() {
+            return None;
+        }
+
+        // If it's a single segment (possibly with dots if it was quoted),
+        // look for an exact match in top-level fields
+        if split.len() == 1 {
+            let field_name = &split[0];
+            if let Some(field) = self.fields.iter().find(|f| &f.name == field_name) {
+                return Some(vec![field]);
+            }
+            return None;
+        }
+
+        // Multiple segments - resolve as a nested field path
         let mut fields = Vec::with_capacity(split.len());
         let first = split.pop_front().unwrap();
 
-        // Find the first field - it could be a field with dots in its name
+        // Find the first field
         let field = self.fields.iter().find(|f| f.name == first)?;
 
         let mut split_refs: VecDeque<&str> = split.iter().map(|s| s.as_str()).collect();
@@ -193,11 +212,22 @@ impl Schema {
     fn do_project<T: AsRef<str>>(&self, columns: &[T], err_on_missing: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
-            let split = col.as_ref().split('.').collect::<Vec<_>>();
-            let first = split[0];
+            // Use parse_field_path to handle quoted field names properly
+            let split = parse_field_path(col.as_ref())
+                .ok_or_else(|| Error::Schema {
+                    message: format!("Invalid field path: {}", col.as_ref()),
+                    location: location!(),
+                })?;
+            
+            if split.is_empty() {
+                continue;
+            }
+            
+            let first = &split[0];
             if let Some(field) = self.field(first) {
-                let projected_field = field.project(&split[1..])?;
-                if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == first) {
+                let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+                let projected_field = field.project(&split_refs)?;
+                if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == *first) {
                     candidate_field.merge(&projected_field)?;
                 } else {
                     candidates.push(projected_field)
@@ -392,20 +422,19 @@ impl Schema {
     /// Get a field by name. Return `None` if the field does not exist.
     /// Field names containing dots must be quoted: parent."child.with.dot"
     pub fn field(&self, name: &str) -> Option<&Field> {
-        // First try to find an exact match for the field name (for single fields with dots)
+        // First check if there's an exact match for the field name
+        // This handles the case where we're passing the actual field name (not a user query)
+        // For example, when project_by_schema calls field(&field.name) with "simple.field"
         if let Some(field) = self.fields.iter().find(|f| f.name == name) {
             return Some(field);
         }
-
-        // Otherwise, parse as a potentially nested field path
-        let split = parse_field_path(name)?;
-        self.fields
-            .iter()
-            .find(|f| f.name == split[0])
-            .and_then(|c| {
-                let refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
-                c.sub_field(&refs)
-            })
+        
+        // Otherwise, use resolve to handle quoted field paths
+        // This handles user queries like "simple.field" or parent."child.with.dot"
+        self.resolve(name).map(|fields| {
+            // resolve returns a path of fields, we want the last one
+            fields.last().copied()
+        })?
     }
 
     // TODO: This is not a public API, change to pub(crate) after refactor is done.
@@ -1224,7 +1253,7 @@ impl Schema {
 /// For example: `parent."child.with.dot"` parses to ["parent", "child.with.dot"]
 ///
 /// Returns None if the path is malformed (unclosed quotes, etc.)
-pub fn parse_field_path(path: &str) -> Option<Vec<String>> {
+fn parse_field_path(path: &str) -> Option<Vec<String>> {
     let mut result = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -1293,7 +1322,7 @@ pub fn parse_field_path(path: &str) -> Option<Vec<String>> {
 /// Format a field path, quoting field names that contain dots.
 ///
 /// For example: ["parent", "child.with.dot"] formats to `parent."child.with.dot"`
-pub fn format_field_path(fields: &[&str]) -> String {
+fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
         .map(|field| {
@@ -1311,7 +1340,7 @@ pub fn format_field_path(fields: &[&str]) -> String {
 
 /// Split a field path into segments for resolution.
 /// This is a compatibility wrapper that converts the parsed path into a VecDeque.
-pub fn split_field_path(path: &str) -> Option<std::collections::VecDeque<String>> {
+fn split_field_path(path: &str) -> Option<VecDeque<String>> {
     parse_field_path(path).map(|v| v.into_iter().collect())
 }
 
@@ -1322,11 +1351,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_resolve_with_quoted_fields() {
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields};
+        
+        // Create a schema with fields containing dots
+        let field_with_dots = Field::try_from(&ArrowField::new("simple.name.with.dot", ArrowDataType::Int32, false)).unwrap();
+        let normal_field = Field::try_from(&ArrowField::new("normal", ArrowDataType::Int32, false)).unwrap();
+        let nested_field = Field::try_from(&ArrowField::new(
+            "parent",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("child.with.dot", ArrowDataType::Int32, false),
+                ArrowField::new("normal_child", ArrowDataType::Int32, false),
+            ])),
+            false,
+        )).unwrap();
+        
+        let schema = Schema {
+            fields: vec![field_with_dots, normal_field, nested_field],
+            metadata: HashMap::new(),
+        };
+        
+        // Test 1: Resolving a field with dots using quotes
+        let resolved = schema.resolve("\"simple.name.with.dot\"");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "simple.name.with.dot");
+        
+        // Test 2: Resolving a normal field
+        let resolved = schema.resolve("normal");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "normal");
+        
+        // Test 3: Resolving a nested field with dots
+        let resolved = schema.resolve("parent.\"child.with.dot\"");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "parent");
+        assert_eq!(fields[1].name, "child.with.dot");
+        
+        // Test 4: Resolving a normal nested field
+        let resolved = schema.resolve("parent.normal_child");
+        assert!(resolved.is_some());
+        let fields = resolved.unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "parent");
+        assert_eq!(fields[1].name, "normal_child");
+        
+        // Test 5: Non-existent field should return None
+        let resolved = schema.resolve("\"non.existent\"");
+        assert!(resolved.is_none());
+        
+        // Test 6: Schema::field should work the same way
+        let field = schema.field("\"simple.name.with.dot\"");
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name, "simple.name.with.dot");
+        
+        let field = schema.field("parent.\"child.with.dot\"");
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name, "child.with.dot");
+        
+        let field = schema.field("parent.normal_child");
+        assert!(field.is_some());
+        assert_eq!(field.unwrap().name, "normal_child");
+    }
+
+    #[test]
     fn test_field_path_parsing() {
         // Simple paths without quotes
         assert_eq!(
             parse_field_path("a.b.c"),
             Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+
+        // Single quoted field with dots
+        assert_eq!(
+            parse_field_path("\"simple.name.with.dot\""),
+            Some(vec!["simple.name.with.dot".to_string()])
         );
 
         // Path with quoted field containing dots
@@ -1385,8 +1489,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_with_quoted_fields() {
-        // Test schema with fields containing dots
+    fn test_resolve_backward_compat() {
+        // Test backward compatibility - fields with dots without quotes
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new("field.with.dots", DataType::Int32, false),
             ArrowField::new(

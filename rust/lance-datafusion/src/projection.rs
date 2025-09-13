@@ -4,6 +4,7 @@
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
+use datafusion::functions::expr_fn::get_field;
 use datafusion_common::{Column, DFSchema};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::TryStreamExt;
@@ -83,8 +84,65 @@ impl ProjectionPlan {
             // If so, create a direct column reference to avoid SQL parsing issues with dots
             let expr = if output_name.as_ref() == raw_expr.as_ref() {
                 // This is a simple column projection, not a computed expression
-                // Create a direct column reference
-                Expr::Column(Column::from_name(raw_expr.as_ref()))
+                // Parse the field path to handle quoted segments
+                let field_path = raw_expr.as_ref();
+                
+                // Parse field path to handle quoted segments and nested fields
+                // Check if entire field is quoted (e.g., "simple.field")
+                if field_path.starts_with('"') && field_path.ends_with('"') && field_path.len() > 2 {
+                    // Entire field is quoted - it's a single field with dots in the name
+                    let field_name = &field_path[1..field_path.len() - 1];
+                    Expr::Column(Column::from_name(field_name))
+                } else if field_path.contains(".\"" ) || field_path.contains("\".") {
+                    // Has quoted segments within a path (e.g., parent."child.with.dot")
+                    let mut segments = Vec::new();
+                    let mut current = String::new();
+                    let mut in_quotes = false;
+                    let mut chars = field_path.chars().peekable();
+                    
+                    while let Some(ch) = chars.next() {
+                        match ch {
+                            '"' => {
+                                in_quotes = !in_quotes;
+                            }
+                            '.' if !in_quotes => {
+                                if !current.is_empty() {
+                                    segments.push(current.clone());
+                                    current.clear();
+                                }
+                            }
+                            _ => {
+                                current.push(ch);
+                            }
+                        }
+                    }
+                    if !current.is_empty() {
+                        segments.push(current);
+                    }
+                    
+                    if segments.len() <= 1 {
+                        // Should have multiple segments
+                        Expr::Column(Column::from_name(field_path))
+                    } else {
+                        // Build nested field reference with get_field
+                        let mut expr = Expr::Column(Column::from_name(&segments[0]));
+                        for segment in &segments[1..] {
+                            expr = get_field(expr, segment.as_str());
+                        }
+                        expr
+                    }
+                } else if field_path.contains('.') {
+                    // Simple nested field without quotes (e.g., parent.normal_child)
+                    let segments: Vec<&str> = field_path.split('.').collect();
+                    let mut expr = Expr::Column(Column::from_name(segments[0]));
+                    for segment in &segments[1..] {
+                        expr = get_field(expr, *segment);
+                    }
+                    expr
+                } else {
+                    // Simple column name
+                    Expr::Column(Column::from_name(field_path))
+                }
             } else {
                 // This is a computed expression, parse it as SQL
                 planner.parse_expr(raw_expr.as_ref())?
@@ -106,12 +164,22 @@ impl ProjectionPlan {
                 }
             }
 
-            for col in Planner::column_names_in_expr(&expr) {
-                if physical_cols_set.contains(&col) {
-                    continue;
+            // For simple column references, use the raw expression directly
+            // This preserves quotes around field names with dots
+            if output_name.as_ref() == raw_expr.as_ref() {
+                if !physical_cols_set.contains(raw_expr.as_ref()) {
+                    physical_cols.push(raw_expr.as_ref().to_string());
+                    physical_cols_set.insert(raw_expr.as_ref().to_string());
                 }
-                physical_cols.push(col.clone());
-                physical_cols_set.insert(col);
+            } else {
+                // For computed expressions, extract column names normally
+                for col in Planner::column_names_in_expr(&expr) {
+                    if physical_cols_set.contains(&col) {
+                        continue;
+                    }
+                    physical_cols.push(col.clone());
+                    physical_cols_set.insert(col);
+                }
             }
             output.insert(output_name.as_ref().to_string(), expr);
         }
