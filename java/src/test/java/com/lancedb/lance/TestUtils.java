@@ -505,26 +505,26 @@ public class TestUtils {
       return fragmentMetas;
     }
     /**
-     * Test method to merge columns. Note that for simplicity, the merged column rowid is fixed with
+     * Test method to update columns. Note that for simplicity, the updated column rowid is fixed with
      * [0, mergeNum). Please only use this method to test the first fragment.
      *
      * @param fragment fragment to merge.
-     * @param mergeNum number of new rows.
-     * @return merge result
+     * @param updateNum number of new rows.
+     * @return update result
      */
-    public FragmentUpdateResult updateColumn(Fragment fragment, int mergeNum) {
+    public FragmentUpdateResult updateColumn(Fragment fragment, int updateNum) {
       try (VectorSchemaRoot root = VectorSchemaRoot.create(updateSchema, allocator)) {
         root.allocateNew();
         UInt8Vector rowidVec = (UInt8Vector) root.getVector("_rowid");
         IntVector idVector = (IntVector) root.getVector("id");
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
-        for (int i = 0; i < mergeNum; i++) {
+        for (int i = 0; i < updateNum; i++) {
           rowidVec.setSafe(i, i);
           idVector.setSafe(i, 2 * i);
           String name = "Update " + i;
           nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
         }
-        root.setRowCount(mergeNum);
+        root.setRowCount(updateNum);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
           writer.start();
