@@ -80,7 +80,6 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     column: String,
     index_dir: Path,
     distance_type: DistanceType,
-    retrain: bool,
     // build params, only needed for building new IVF, quantizer
     dataset: Option<Dataset>,
     shuffler: Option<Arc<dyn Shuffler>>,
@@ -124,7 +123,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             column,
             index_dir,
             distance_type,
-            retrain: false,
             dataset: Some(dataset),
             shuffler: Some(shuffler.into()),
             ivf_params,
@@ -185,7 +183,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             column,
             index_dir,
             distance_type: ivf_index.metric_type(),
-            retrain: false,
             dataset: None,
             shuffler: None,
             ivf_params: None,
@@ -203,11 +200,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     // build the index with the all data in the dataset,
     pub async fn build(&mut self) -> Result<()> {
-        if self.retrain {
-            self.shuffle_reader = None;
-            self.existing_indices = Vec::new();
-        }
-
         // step 1. train IVF & quantizer
         self.with_ivf(self.load_or_build_ivf().await?);
 
@@ -287,11 +279,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
-    pub fn retrain(&mut self, retrain: bool) -> &mut Self {
-        self.retrain = retrain;
-        self
-    }
-
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]
     async fn load_or_build_ivf(&self) -> Result<IvfModel> {
         let Some(dataset) = self.dataset.as_ref() else {
@@ -303,24 +290,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
         match &self.ivf {
-            Some(ivf) => {
-                if self.retrain {
-                    // retrain the IVF model with the existing indices
-                    let mut ivf_params = IvfBuildParams::new(ivf.num_partitions());
-                    ivf_params.retrain = true;
-
-                    super::build_ivf_model(
-                        dataset,
-                        &self.column,
-                        dim,
-                        self.distance_type,
-                        &ivf_params,
-                    )
-                    .await
-                } else {
-                    Ok(ivf.clone())
-                }
-            }
+            Some(ivf) => Ok(ivf.clone()),
             None => {
                 let ivf_params = self.ivf_params.as_ref().ok_or(Error::invalid_input(
                     "IVF build params not set",
@@ -334,7 +304,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "load_or_build_quantizer", level = "debug", skip_all)]
     async fn load_or_build_quantizer(&self) -> Result<Q> {
-        if self.quantizer.is_some() && !self.retrain {
+        if self.quantizer.is_some() {
             return Ok(self.quantizer.clone().unwrap());
         }
 
@@ -389,13 +359,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
         let quantizer = match &self.quantizer {
-            Some(q) => {
-                let mut q = q.clone();
-                if self.retrain {
-                    q.retrain(&training_data)?;
-                }
-                q
-            }
+            Some(q) => q.clone(),
             None => {
                 let quantizer_params = self.quantizer_params.as_ref().ok_or(
                     Error::invalid_input("quantizer build params not set", location!()),

@@ -48,6 +48,7 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::utils::is_finite;
@@ -78,7 +79,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
-use log::{info, warn};
+use log::info;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -285,12 +286,6 @@ pub(crate) async fn optimize_vector_indices(
         .await;
     }
 
-    if options.retrain {
-        warn!(
-            "optimizing vector index: retrain is only supported for v3 vector indices, falling back to normal optimization. please re-create the index with lance>=0.25.0 to enable retrain."
-        );
-    }
-
     let new_uuid = Uuid::new_v4();
     let object_store = dataset.object_store();
     let index_file = dataset
@@ -382,11 +377,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
-    let num_indices_to_merge = if options.retrain {
-        existing_indices.len()
-    } else {
-        options.num_indices_to_merge
-    };
+    let num_indices_to_merge = options.num_indices_to_merge;
     let temp_dir = tempfile::tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
@@ -415,7 +406,6 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(indices_to_merge)
-                .retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -433,7 +423,6 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(indices_to_merge)
-                .retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -454,7 +443,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -474,7 +462,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -497,7 +484,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -520,7 +506,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -543,7 +528,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -1765,14 +1749,13 @@ where
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     const REDOS: usize = 1;
+    let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
+        .with_balance_factor(1.0);
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
-        centroids,
         data,
+        kmeans_params,
         dimension,
-        params.num_partitions.unwrap(),
-        params.max_iters as u32,
-        REDOS,
-        metric_type,
+        params.num_partitions.unwrap_or(32),
         params.sample_rate,
     )?;
     Ok(IvfModel::new(

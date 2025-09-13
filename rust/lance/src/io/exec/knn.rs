@@ -1551,11 +1551,7 @@ mod tests {
                         .unwrap();
                 } else {
                     dataset
-                        .optimize_indices(&OptimizeOptions {
-                            num_indices_to_merge: 0,
-                            index_names: None,
-                            retrain: false,
-                        })
+                        .optimize_indices(&OptimizeOptions::append())
                         .await
                         .unwrap();
                 }
