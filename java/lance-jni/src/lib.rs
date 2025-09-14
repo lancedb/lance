@@ -59,7 +59,6 @@ pub use ffi::JNIEnvExt;
 use env_logger::{Builder, Env};
 use std::env;
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -101,7 +100,7 @@ fn set_timestamp_precision(builder: &mut env_logger::Builder) {
 fn set_log_file_target(builder: &mut env_logger::Builder) {
     if let Ok(log_file_path) = env::var("LANCE_LOG_FILE") {
         let path = Path::new(&log_file_path);
-        
+
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             if std::fs::create_dir_all(parent).is_err() {
@@ -109,21 +108,16 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
                 return;
             }
         }
-        
+
         // Try to open/create the log file
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
+        match OpenOptions::new().create(true).append(true).open(path) {
             Ok(file) => {
-                builder.target(env_logger::Target::Writer(Box::new(file)));
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
             }
             Err(e) => {
                 println!(
                     "Failed to open log file '{}': {}, using stderr",
-                    log_file_path,
-                    e
+                    log_file_path, e
                 );
             }
         }
