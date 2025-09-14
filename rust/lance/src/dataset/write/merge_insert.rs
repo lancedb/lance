@@ -284,6 +284,9 @@ struct MergeInsertParams {
     // if the writer does not have delete permissions and the clean up would
     // just try and log a failure anyway.
     skip_auto_cleanup: bool,
+    // Controls whether to use indices for the merge operation. Default is true.
+    // Setting to false forces a full table scan even if an index exists.
+    use_index: bool,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -367,6 +370,7 @@ impl MergeInsertBuilder {
                 retry_timeout: Duration::from_secs(30),
                 mem_wal_to_merge: None,
                 skip_auto_cleanup: false,
+                use_index: true,
             },
         })
     }
@@ -424,6 +428,17 @@ impl MergeInsertBuilder {
 
     pub fn skip_auto_cleanup(&mut self, skip: bool) -> &mut Self {
         self.params.skip_auto_cleanup = skip;
+        self
+    }
+
+    /// Controls whether to use indices for the merge operation.
+    ///
+    /// When set to false, forces a full table scan even if an index exists on the join key.
+    /// This can be useful for benchmarking or when the optimizer chooses a suboptimal path.
+    ///
+    /// Default is true (use index if available).
+    pub fn use_index(&mut self, use_index: bool) -> &mut Self {
+        self.params.use_index = use_index;
         self
     }
 
@@ -791,7 +806,8 @@ impl MergeInsertJob {
         let can_use_scalar_index = matches!(
             self.params.delete_not_matched_by_source, // this value marks behavior for rows in target that are not matched by the source. Value assigned earlier.
             WhenNotMatchedBySource::Keep
-        );
+        ) && self.params.use_index;
+
         if can_use_scalar_index {
             // keeping unmatched rows, no deletion
             if let Some(index) = self.join_key_as_scalar_index().await? {
@@ -1314,7 +1330,7 @@ impl MergeInsertJob {
     ///
     /// The fast path is only available for specific conditions:
     /// - when_matched is UpdateAll or UpdateIf
-    /// - No scalar index on join key
+    /// - Either use_index is false OR there's no scalar index on join key
     /// - Source schema matches dataset schema exactly
     /// - when_not_matched_by_source is Keep
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
@@ -1334,7 +1350,7 @@ impl MergeInsertJob {
         Ok(matches!(
             self.params.when_matched,
             WhenMatched::UpdateAll | WhenMatched::UpdateIf(_)
-        ) && !has_scalar_index
+        ) && (!self.params.use_index || !has_scalar_index)
             && is_full_schema
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -4418,5 +4434,90 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             "Expected error message to mention ambiguous merge insert and multiple source rows, got: {}",
             error_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_use_index() {
+        let data = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("value", array::step::<UInt32Type>());
+        let data = data.into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let schema = data.schema();
+        let mut ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Create a scalar index on id column
+        let index_params = ScalarIndexParams::default();
+        ds.create_index(&["id"], IndexType::Scalar, None, &index_params, false)
+            .await
+            .unwrap();
+
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 101])), // Two matches, one new
+                Arc::new(UInt32Array::from(vec![999, 999, 999])),
+            ],
+        )
+        .unwrap();
+
+        // Test 1: use_index=false should allow explain_plan to succeed
+        let merge_job_no_index =
+            MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .use_index(false) // Force not using index
+                .try_build()
+                .unwrap();
+
+        // With use_index=false, explain_plan should succeed even with an index present
+        let plan = merge_job_no_index.explain_plan(None, false).await;
+        assert!(
+            plan.is_ok(),
+            "explain_plan should succeed with use_index=false"
+        );
+        let plan_str = plan.unwrap();
+        assert!(plan_str.contains("MergeInsert"));
+        assert!(plan_str.contains("HashJoinExec")); // Should use hash join, not index scan
+
+        // Test 2: use_index=true (default) should fail explain_plan with index present
+        let merge_job_with_index =
+            MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .use_index(true) // Explicitly set to use index (though it's the default)
+                .try_build()
+                .unwrap();
+
+        // With use_index=true and an index present, explain_plan should fail
+        let plan_result = merge_job_with_index.explain_plan(None, false).await;
+        assert!(
+            plan_result.is_err(),
+            "explain_plan should fail with use_index=true when index exists"
+        );
+
+        match plan_result {
+            Err(Error::NotSupported { source, .. }) => {
+                assert!(source.to_string().contains("does not support explain_plan"));
+            }
+            _ => panic!("Expected NotSupported error"),
+        }
+
+        // Test 3: Verify actual execution works without index
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(source_batch.clone())],
+            schema.clone(),
+        ));
+        let (result_ds, stats) = merge_job_no_index.execute_reader(source).await.unwrap();
+        assert_eq!(stats.num_updated_rows, 2);
+        assert_eq!(stats.num_inserted_rows, 1);
+
+        // Verify the data was updated correctly
+        let updated_count = result_ds
+            .count_rows(Some("value = 999".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(updated_count, 3);
     }
 }
