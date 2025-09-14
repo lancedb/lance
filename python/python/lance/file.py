@@ -275,8 +275,8 @@ class LanceFileSession:
             keep_original_array,
             max_page_bytes,
         )
-        return LanceFileWriter(  # pyright: ignore[reportArgumentType]
-            None,
+        return LanceFileWriter(
+            None,  # pyright: ignore[reportArgumentType]
             _inner_writer=inner,
         )
 
