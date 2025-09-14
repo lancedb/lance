@@ -8,7 +8,7 @@ use std::time::Duration;
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::transaction::UpdateMode::VerticalPartialSchema;
+use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{io::exec::Planner, Dataset};
@@ -275,7 +275,7 @@ impl UpdateJob {
             retry_timeout: self.retry_timeout,
         };
 
-        execute_with_retry(self, dataset, config).await
+        Box::pin(execute_with_retry(self, dataset, config)).await
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {
@@ -392,10 +392,10 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
-        let mut value_updated_fields = Vec::new();
+        let mut fields_for_preserving_frag_bitmap = Vec::new();
         for column_name in self.updates.keys() {
             if let Ok(field_id) = dataset.schema().field_id(column_name) {
-                value_updated_fields.push(field_id as u32);
+                fields_for_preserving_frag_bitmap.push(field_id as u32);
             }
         }
 
@@ -404,11 +404,13 @@ impl UpdateJob {
             removed_fragment_ids: update_data.removed_fragment_ids,
             updated_fragments: update_data.old_fragments,
             new_fragments: update_data.new_fragments,
-            // This job only deletes rows, it does not modify any field values.
+            // In "rewrite rows" mode, the rows that are updated in the fragment
+            // are moved(deleted and appended).
+            // so we do not need to handle the frag bitmap of the index about it.
             fields_modified: vec![],
             mem_wal_to_merge: None,
-            value_updated_fields,
-            update_mode: Some(VerticalPartialSchema),
+            fields_for_preserving_frag_bitmap,
+            update_mode: Some(RewriteRows),
         };
 
         let transaction = Transaction::new(
@@ -519,6 +521,7 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::{WriteDestination, WriteMode};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::{array::AsArray, datatypes::UInt32Type};
@@ -528,7 +531,7 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use futures::{future::try_join_all, TryStreamExt};
     use lance_core::ROW_ID;
-    use lance_datagen::Dimension;
+    use lance_datagen::{Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::ScalarIndexParams;
     use lance_index::DatasetIndexExt;
@@ -1164,5 +1167,175 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_mixed_indexed_unindexed_fragments() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "str",
+                lance_datagen::array::cycle_utf8_literals(&["a", "b", "c", "d", "e", "f"]),
+            )
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(4)),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["str"],
+                IndexType::Scalar,
+                Some("str_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let initial_indices = dataset.load_indices().await.unwrap();
+        let str_index = initial_indices
+            .iter()
+            .find(|idx| idx.name == "str_idx")
+            .unwrap();
+        let vec_index = initial_indices
+            .iter()
+            .find(|idx| idx.name == "vec_idx")
+            .unwrap();
+
+        assert_eq!(str_index.fragment_bitmap.as_ref().unwrap().len(), 2);
+        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
+
+        // insert data to create the third frag
+        let new_batch = lance_datagen::gen_batch()
+            .col(
+                "str",
+                lance_datagen::array::cycle_utf8_literals(&["g", "h", "i"]),
+            )
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(4)),
+            )
+            .into_batch_rows(RowCount::from(3))
+            .unwrap();
+
+        dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset)))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            })
+            .execute(vec![new_batch])
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let indices_after_insert = dataset.load_indices().await.unwrap();
+        let str_index_after_insert = indices_after_insert
+            .iter()
+            .find(|idx| idx.name == "str_idx")
+            .unwrap();
+        let vec_index_after_insert = indices_after_insert
+            .iter()
+            .find(|idx| idx.name == "vec_idx")
+            .unwrap();
+
+        assert_eq!(
+            str_index_after_insert
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!str_index_after_insert
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .contains(2));
+        assert_eq!(
+            vec_index_after_insert
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!vec_index_after_insert
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .contains(2));
+
+        let updated_dataset = UpdateBuilder::new(Arc::new(dataset))
+            // 'a' in fragment 0，'g' in fragment 2, and frag 2 not in frag bitmap
+            .update_where("str = 'a' OR str = 'g'")
+            .unwrap()
+            .set("vec", "array[99.0, 99.0, 99.0, 99.0]")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // reload indices
+        let updated_indices = updated_dataset.load_indices().await.unwrap();
+        let updated_str_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "str_idx")
+            .unwrap();
+        let updated_vec_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "vec_idx")
+            .unwrap();
+
+        let str_bitmap = updated_str_index.fragment_bitmap.as_ref().unwrap();
+        let vec_bitmap = updated_vec_index.fragment_bitmap.as_ref().unwrap();
+
+        assert!(updated_dataset.get_fragments().len() > 3);
+        assert_eq!(str_bitmap.len(), 2);
+        assert_eq!(vec_bitmap.len(), 2);
+
+        // frag 3 not in the index's frag bitmap
+        for &fragment_id in str_bitmap.iter().collect::<Vec<_>>().iter() {
+            assert!(fragment_id < 2,
+                    "str index bitmap should not contain fragments with unindexed data, found fragment {}",
+                    fragment_id);
+        }
+
+        // frag 3 not in the index's frag bitmap
+        for &fragment_id in vec_bitmap.iter().collect::<Vec<_>>().iter() {
+            assert!(fragment_id < 2,
+                    "vec index bitmap should not contain fragments with unindexed data, found fragment {}",
+                    fragment_id);
+        }
     }
 }

@@ -978,18 +978,16 @@ mod tests {
             .await
             .unwrap();
         // update the other half rows
-        let update_result = Box::pin(
-            UpdateBuilder::new(Arc::new(dataset))
-                .update_where(&format!("id >= {} and id<{}", half_rows, half_rows + 50))
-                .unwrap()
-                .set("id", &format!("{}+id", NUM_ROWS))
-                .unwrap()
-                .build()
-                .unwrap()
-                .execute(),
-        )
-        .await
-        .unwrap();
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where(&format!("id >= {} and id<{}", half_rows, half_rows + 50))
+            .unwrap()
+            .set("id", &format!("{}+id", NUM_ROWS))
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
         let mut dataset = Dataset::open(update_result.new_dataset.uri())
             .await
             .unwrap();

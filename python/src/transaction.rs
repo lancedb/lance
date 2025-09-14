@@ -147,11 +147,10 @@ impl FromPyObject<'_> for PyUpdateMode {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let mode_str: String = ob.extract()?;
         match mode_str.as_str() {
-            "vertical_partial_schema" => Ok(Self(UpdateMode::VerticalPartialSchema)),
-            "vertical_full_schema" => Ok(Self(UpdateMode::VerticalFullSchema)),
-            "horizontal" => Ok(Self(UpdateMode::Horizontal)),
+            "rewrite_rows" => Ok(Self(UpdateMode::RewriteRows)),
+            "rewrite_columns" => Ok(Self(UpdateMode::RewriteColumns)),
             _ => Err(PyValueError::new_err(format!(
-                "Invalid UpdateMode: {}. Valid options are: vertical_partial_schema, vertical_full_schema, horizontal",
+                "Invalid UpdateMode: {}. Valid options are: rewrite_rows, rewrite_columns",
                 mode_str
             ))),
         }
@@ -199,8 +198,8 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let fields_modified = ob.getattr("fields_modified")?.extract()?;
 
-                let value_updated_fields = ob
-                    .getattr("value_updated_fields")?
+                let fields_for_preserving_frag_bitmap = ob
+                    .getattr("fields_for_preserving_frag_bitmap")?
                     .extract()
                     .unwrap_or_default();
 
@@ -216,7 +215,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     new_fragments,
                     fields_modified,
                     mem_wal_to_merge: None,
-                    value_updated_fields,
+                    fields_for_preserving_frag_bitmap,
                     update_mode,
                 };
                 Ok(Self(op))
@@ -320,7 +319,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                value_updated_fields,
+                fields_for_preserving_frag_bitmap,
                 update_mode,
                 ..
             } => {
@@ -328,18 +327,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let fields_modified = fields_modified.into_pyobject(py)?;
-                let value_updated_fields = value_updated_fields.into_pyobject(py)?;
+                let fields_for_preserving_frag_bitmap =
+                    fields_for_preserving_frag_bitmap.into_pyobject(py)?;
                 let update_mode = match update_mode {
                     Some(mode) => match mode {
-                        lance::dataset::transaction::UpdateMode::VerticalPartialSchema => {
-                            "vertical_partial_schema"
+                        lance::dataset::transaction::UpdateMode::RewriteRows => "rewrite_rows",
+                        lance::dataset::transaction::UpdateMode::RewriteColumns => {
+                            "rewrite_columns"
                         }
-                        lance::dataset::transaction::UpdateMode::VerticalFullSchema => {
-                            "vertical_full_schema"
-                        }
-                        lance::dataset::transaction::UpdateMode::Horizontal => "horizontal",
                     },
-                    None => "horizontal", // Default to horizontal if not set
+                    None => "rewrite_rows",
                 };
                 let cls = namespace
                     .getattr("Update")
@@ -349,7 +346,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    value_updated_fields,
+                    fields_for_preserving_frag_bitmap,
                     update_mode,
                 ))
             }

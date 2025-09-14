@@ -194,26 +194,25 @@ message Transaction {
     repeated uint32 fields_modified = 4;
     /// The MemWAL (pre-image) that should be marked as merged after this transaction
     MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
-    /// The field ids that their values have been updated
-    repeated uint32 value_updated_fields = 6;
+    /// The fields that used to judge whether to preserve the new frag's id into
+    /// the frag bitmap of the specified indices.
+    repeated uint32 fields_for_preserving_frag_bitmap = 6;
     // The mode of update
     UpdateMode update_mode = 7;
   }
 
   // The mode of update operation
   enum UpdateMode {
-    // Vertical update with partial schema: adds new rows with only some fields
-    // The update contains a subset of the schema fields
-    // This is used by the dataset updater and merge insert(non-full schema) when doing partial updates
-    VERTICAL_PARTIAL_SCHEMA = 0;
 
-    // Vertical update with full schema: adds new rows with all schema fields
-    // The update contains all fields from the current schema
-    // This is used when merge_insert matches the full schema
-    VERTICAL_FULL_SCHEMA = 1;
+    /// rows are deleted in current fragments and rewritten in new fragments.
+    /// This is most optimal when the majority of columns are being rewritten
+    /// or only a few rows are being updated.
+    REWRITE_ROWS = 0;
 
-    // Horizontal update: adds/modify/delete columns
-    HORIZONTAL = 2;
+    /// within each fragment, columns are fully rewritten and inserted as new data files.
+    /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
+    /// but a small subset of columns are affected.
+    REWRITE_COLUMNS = 1;
   }
   
   // An operation that updates the table config.

@@ -1589,7 +1589,7 @@ mod tests {
             new_fragments: vec![],
             fields_modified: vec![],
             mem_wal_to_merge: None,
-            value_updated_fields: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
@@ -1600,7 +1600,7 @@ mod tests {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
-                value_updated_fields: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
             },
             Operation::Delete {
@@ -1614,7 +1614,7 @@ mod tests {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
-                value_updated_fields: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
             },
         ];
@@ -1715,7 +1715,7 @@ mod tests {
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
-                value_updated_fields: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
             },
             Operation::Delete {
@@ -1729,7 +1729,7 @@ mod tests {
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
-                value_updated_fields: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
             },
         ];
@@ -1850,7 +1850,7 @@ mod tests {
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
                     mem_wal_to_merge: None,
-                    value_updated_fields: vec![],
+                    fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                 },
             ),
@@ -1862,7 +1862,7 @@ mod tests {
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
                     mem_wal_to_merge: None,
-                    value_updated_fields: vec![],
+                    fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                 },
             ),
@@ -2019,7 +2019,7 @@ mod tests {
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
                 mem_wal_to_merge: None,
-                value_updated_fields: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
             },
             Operation::UpdateConfig {
@@ -2213,7 +2213,7 @@ mod tests {
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
                     mem_wal_to_merge: None,
-                    value_updated_fields: vec![],
+                    fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                 },
                 [

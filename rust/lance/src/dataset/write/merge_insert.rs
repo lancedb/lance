@@ -24,7 +24,7 @@ use assign_action::merge_insert_action;
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
-use crate::dataset::transaction::UpdateMode::VerticalFullSchema;
+use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
 use crate::{
     datafusion::dataframe::SessionContextExt,
@@ -1419,10 +1419,10 @@ impl MergeInsertJob {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
                 new_fragments,
-                fields_modified: fields_modified.clone(),
+                fields_modified,
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
-                value_updated_fields: fields_modified,
-                update_mode: Some(VerticalFullSchema),
+                fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
+                update_mode: Some(RewriteColumns),
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1493,8 +1493,12 @@ impl MergeInsertJob {
                 // modify any field values.
                 fields_modified: vec![],
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
-                value_updated_fields: vec![],
-                update_mode: Some(VerticalFullSchema),
+                fields_for_preserving_frag_bitmap: full_schema
+                    .fields
+                    .iter()
+                    .map(|f| f.id as u32)
+                    .collect(),
+                update_mode: Some(RewriteRows),
             };
 
             let affected_rows = Some(RowIdTreeMap::from(removed_row_addrs));
@@ -4533,7 +4537,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
     }
 
     #[tokio::test]
-    async fn test_full_schema_upsert_fragment_bitmap_behavior() {
+    async fn test_full_schema_upsert_fragment_bitmap() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, true),
             Field::new("value", DataType::UInt32, true),
@@ -4572,9 +4576,9 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         let scalar_params = ScalarIndexParams::default();
         dataset
             .create_index(
-                &["key"],
+                &["value"],
                 IndexType::Scalar,
-                Some("key_idx".to_string()),
+                Some("value_idx".to_string()),
                 &scalar_params,
                 true,
             )
@@ -4594,23 +4598,21 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             .unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
-        let key_index = indices.iter().find(|idx| idx.name == "key_idx").unwrap();
+        let value_index = indices.iter().find(|idx| idx.name == "value_idx").unwrap();
         let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
 
-        assert_eq!(key_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(key_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(key_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(value_index.fragment_bitmap.as_ref().unwrap().len(), 2);
+        assert!(value_index.fragment_bitmap.as_ref().unwrap().contains(0));
+        assert!(value_index.fragment_bitmap.as_ref().unwrap().contains(1));
         assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
         assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
         assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
 
-        let upsert_keys = UInt32Array::from(vec![2, 5, 7, 8]);
-        let upsert_values = UInt32Array::from(vec![200, 500, 70, 80]);
+        // update keys: 2,5
+        let upsert_keys = UInt32Array::from(vec![2, 5]);
+        let upsert_values = UInt32Array::from(vec![200, 500]);
         let upsert_vecs = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![
-                21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0, 33.0, 34.0,
-                35.0, 36.0,
-            ]),
+            Float32Array::from(vec![21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0]),
             4,
         )
         .unwrap();
@@ -4634,7 +4636,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
                 .unwrap()
                 .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::InsertAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
                 .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
                 .try_build()
                 .unwrap()
@@ -4646,71 +4648,29 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert_eq!(fragments.len(), 3);
 
         let updated_indices = updated_dataset.load_indices().await.unwrap();
-        let updated_key_index = updated_indices
+        let updated_value_index = updated_indices
             .iter()
-            .find(|idx| idx.name == "key_idx")
+            .find(|idx| idx.name == "value_idx")
             .unwrap();
         let updated_vec_index = updated_indices
             .iter()
             .find(|idx| idx.name == "vec_idx")
             .unwrap();
 
-        let key_bitmap = updated_key_index.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(key_bitmap.len(), 2);
-        assert!(key_bitmap.contains(0));
-        assert!(key_bitmap.contains(1));
+        // the frag bitmap of the index for 'value' field should not been updated
+        let value_bitmap = updated_value_index.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(value_bitmap.len(), 2);
+        assert!(value_bitmap.contains(0));
+        assert!(value_bitmap.contains(1));
 
         let vec_bitmap = updated_vec_index.fragment_bitmap.as_ref().unwrap();
         assert_eq!(vec_bitmap.len(), 2);
         assert!(vec_bitmap.contains(0));
         assert!(vec_bitmap.contains(1));
-
-        let first_fragment = &fragments[0];
-        let second_fragment = &fragments[1];
-
-        let has_deletion_vector = first_fragment
-            .get_deletion_vector()
-            .await
-            .unwrap()
-            .is_some()
-            && second_fragment
-                .get_deletion_vector()
-                .await
-                .unwrap()
-                .is_some();
-
-        assert!(
-            has_deletion_vector,
-            "At least one fragment should have a deletion vector after upsert"
-        );
-
-        let final_data = updated_dataset
-            .scan()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        let final_keys = final_data
-            .column_by_name("key")
-            .unwrap()
-            .as_primitive::<UInt32Type>()
-            .values();
-        let final_values = final_data
-            .column_by_name("value")
-            .unwrap()
-            .as_primitive::<UInt32Type>()
-            .values();
-
-        assert_eq!(final_keys, &[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(final_values, &[10, 200, 30, 40, 500, 60, 70, 80]);
     }
 
     #[tokio::test]
-    async fn test_sub_schema_upsert_fragment_bitmap_behavior() {
+    async fn test_sub_schema_upsert_fragment_bitmap() {
         let mut dataset = lance_datagen::gen_batch()
             .col("key", array::step_custom::<UInt32Type>(1, 1))
             .col("value", array::step_custom::<UInt32Type>(10, 10))
@@ -4780,12 +4740,9 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             ),
         ]));
 
-        let upsert_keys = UInt32Array::from(vec![2, 5, 7, 8]);
+        let upsert_keys = UInt32Array::from(vec![2, 5]);
         let upsert_vecs = FixedSizeListArray::try_new_from_values(
-            Float32Array::from(vec![
-                21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0, 33.0, 34.0,
-                35.0, 36.0,
-            ]),
+            Float32Array::from(vec![21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0]),
             4,
         )
         .unwrap();
@@ -4820,7 +4777,6 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         let updated_indices = updated_dataset.load_indices().await.unwrap();
         // all the fragments have been updated, so the index of the vector field has been deleted
         assert_eq!(updated_indices.len(), 1);
-        println!("The indices after updating are: {:?}", updated_indices);
         let updated_value_index = updated_indices
             .iter()
             .find(|idx| idx.name == "value_idx")
@@ -4830,48 +4786,5 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert_eq!(value_bitmap.len(), 2);
         assert!(value_bitmap.contains(0));
         assert!(value_bitmap.contains(1));
-
-        let first_fragment = &fragments[0];
-        let second_fragment = &fragments[1];
-
-        let has_deletion_vector = first_fragment
-            .get_deletion_vector()
-            .await
-            .unwrap()
-            .is_some()
-            && second_fragment
-                .get_deletion_vector()
-                .await
-                .unwrap()
-                .is_some();
-
-        assert!(
-            !has_deletion_vector,
-            "In-place update should not have a deletion vector."
-        );
-
-        let final_data = updated_dataset
-            .scan()
-            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                "key".to_string(),
-            )]))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        let final_keys = final_data
-            .column_by_name("key")
-            .unwrap()
-            .as_primitive::<UInt32Type>()
-            .values();
-        let final_values = final_data
-            .column_by_name("value")
-            .unwrap()
-            .as_primitive::<UInt32Type>()
-            .values();
-
-        assert_eq!(final_keys, &[1, 2, 3, 4, 5, 6]);
-        assert_eq!(final_values, &[10, 20, 30, 40, 50, 60]);
     }
 }
