@@ -204,6 +204,8 @@ fn try_bitpack_for_block(
     let bit_widths = data.expect_stat(Stat::BitWidth);
     let widths = bit_widths.as_primitive::<UInt64Type>();
     let has_all_zeros = widths.values().contains(&0);
+    let max_bit_width = *widths.values().iter().max().unwrap();
+
     let too_small =
         widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
 
@@ -216,9 +218,11 @@ fn try_bitpack_for_block(
         let encoding = ProtobufUtils21::inline_bitpacking(bits, None);
         Some((compressor, encoding))
     } else {
-        let compressor = Box::new(OutOfLineBitpacking::new(bits as usize));
-        let encoding =
-            ProtobufUtils21::out_of_line_bitpacking(bits, ProtobufUtils21::flat(bits, None));
+        let compressor = Box::new(OutOfLineBitpacking::new(max_bit_width, bits));
+        let encoding = ProtobufUtils21::out_of_line_bitpacking(
+            bits,
+            ProtobufUtils21::flat(max_bit_width, None),
+        );
         Some((compressor, encoding))
     }
 }
@@ -716,7 +720,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     .as_ref()
                     .unwrap()
                 {
-                    Compression::Flat(flat) => flat.bits_per_value as usize,
+                    Compression::Flat(flat) => flat.bits_per_value,
                     _ => {
                         return Err(Error::InvalidInput {
                             location: location!(),
@@ -724,7 +728,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                         })
                     }
                 };
-                Ok(Box::new(OutOfLineBitpacking::new(compressed_bit_width)))
+                Ok(Box::new(OutOfLineBitpacking::new(
+                    compressed_bit_width,
+                    out_of_line.uncompressed_bits_per_value,
+                )))
             }
             _ => todo!(),
         }
