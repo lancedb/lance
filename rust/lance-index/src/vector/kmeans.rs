@@ -10,6 +10,8 @@
 //!
 
 use core::f32;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::vec;
@@ -78,6 +80,9 @@ pub struct KMeansParams {
     /// Setting this value to 0 means no balance factor,
     /// which is the same as normal kmeans clustering.
     pub balance_factor: f32,
+
+    /// Whether to use hierarchical clustering.
+    pub hierarchical_k: usize,
 }
 
 impl Default for KMeansParams {
@@ -89,6 +94,7 @@ impl Default for KMeansParams {
             init: KMeanInit::Random,
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
+            hierarchical_k: 16,
         }
     }
 }
@@ -115,6 +121,11 @@ impl KMeansParams {
 
     pub fn with_balance_factor(mut self, balance_factor: f32) -> Self {
         self.balance_factor = balance_factor;
+        self
+    }
+
+    pub fn with_hierarchical_k(mut self, hierarchical_k: usize) -> Self {
+        self.hierarchical_k = hierarchical_k;
         self
     }
 }
@@ -679,6 +690,239 @@ impl KMeans {
         Ok(best_kmeans)
     }
 
+    /// Helper function to create a FixedSizeListArray from indices
+    fn create_array_from_indices<T: ArrowNumericType>(
+        indices: &[usize],
+        data_values: &[T::Native],
+        dimension: usize,
+    ) -> arrow::error::Result<FixedSizeListArray>
+    where
+        T::Native: Clone,
+    {
+        let mut subset_data = Vec::with_capacity(indices.len() * dimension);
+        for &idx in indices {
+            let start = idx * dimension;
+            let end = start + dimension;
+            subset_data.extend_from_slice(&data_values[start..end]);
+        }
+        let array = PrimitiveArray::<T>::from_iter_values(subset_data.into_iter());
+        FixedSizeListArray::try_new_from_values(array, dimension as i32)
+    }
+
+    /// Train a hierarchical KMeans model when k > 256
+    ///
+    /// This function implements a hierarchical clustering approach:
+    /// 1. Start with k'=256 initial clusters
+    /// 2. Iteratively split the largest cluster until we have k clusters
+    fn train_hierarchical_kmeans<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        data: &FixedSizeListArray,
+        target_k: usize,
+        params: &KMeansParams,
+    ) -> arrow::error::Result<Self>
+    where
+        T::Native: Num,
+    {
+        // Cluster structure for the heap
+        #[derive(Clone, Debug)]
+        struct Cluster<N> {
+            id: usize,
+            indices: Vec<usize>,
+            centroid: Vec<N>,
+        }
+
+        impl<N> Eq for Cluster<N> {}
+
+        impl<N> PartialEq for Cluster<N> {
+            fn eq(&self, other: &Self) -> bool {
+                self.indices.len() == other.indices.len()
+            }
+        }
+
+        impl<N> Ord for Cluster<N> {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // Max heap: larger clusters first
+                self.indices.len().cmp(&other.indices.len())
+            }
+        }
+
+        impl<N> PartialOrd for Cluster<N> {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let n = data.len();
+        let dimension = data.value_length() as usize;
+
+        let data_values = data
+            .values()
+            .as_primitive_opt::<T>()
+            .ok_or(ArrowError::InvalidArgumentError(format!(
+                "KMeans: data must be {}, got: {}",
+                T::DATA_TYPE,
+                data.value_type()
+            )))?
+            .values();
+
+        // Initial clustering with k'=256
+        let initial_k = params.hierarchical_k.min(target_k).min(n);
+        info!(
+            "Hierarchical clustering: initial k={}, target k={}",
+            initial_k, target_k
+        );
+
+        let initial_kmeans = Self::train_kmeans::<T, Algo>(data, initial_k, params)?;
+
+        // Get membership for all data points
+        let (membership, _, _) = Algo::compute_membership_and_loss(
+            initial_kmeans.centroids.as_primitive::<T>().values(),
+            data_values,
+            dimension,
+            params.distance_type,
+            0.0, // No balance factor for membership computation
+            None,
+            None,
+        );
+
+        // Build initial clusters and add to heap
+        let mut heap: BinaryHeap<Cluster<T::Native>> = BinaryHeap::new();
+        let mut next_cluster_id = 0;
+        let initial_centroids = initial_kmeans.centroids.as_primitive::<T>().values();
+
+        for i in 0..initial_k {
+            let mut cluster_indices = Vec::new();
+            for (idx, &cluster_id) in membership.iter().enumerate() {
+                if let Some(cid) = cluster_id {
+                    if cid as usize == i {
+                        cluster_indices.push(idx);
+                    }
+                }
+            }
+
+            if !cluster_indices.is_empty() {
+                let centroid_start = i * dimension;
+                let centroid_end = centroid_start + dimension;
+                let centroid = initial_centroids[centroid_start..centroid_end].to_vec();
+
+                heap.push(Cluster {
+                    id: next_cluster_id,
+                    indices: cluster_indices,
+                    centroid,
+                });
+                next_cluster_id += 1;
+            }
+        }
+
+        // Iteratively split largest clusters until we have target_k clusters
+        while heap.len() < target_k {
+            // Get the largest cluster
+            let largest_cluster = heap.pop().ok_or(ArrowError::InvalidArgumentError(
+                "No cluster can be further split".to_string(),
+            ))?;
+
+            // Skip if cluster has only 1 point
+            if largest_cluster.indices.len() <= 1 {
+                heap.push(largest_cluster);
+                if heap.iter().all(|c| c.indices.len() <= 1) {
+                    break; // No more splits possible
+                }
+                continue;
+            }
+
+            let cluster_size = largest_cluster.indices.len();
+            info!(
+                "Splitting cluster {} with {} points (current total clusters: {})",
+                largest_cluster.id,
+                cluster_size,
+                heap.len() + 1 // +1 for the cluster we just popped
+            );
+
+            // Determine k' for this cluster based on its size
+            let remaining_k = target_k - heap.len() + 1; // Spaces left to fill
+            let cluster_k = if cluster_size <= params.hierarchical_k {
+                2.min(remaining_k).min(cluster_size)
+            } else {
+                // For larger clusters, split more aggressively
+                let suggested_k = cluster_size / params.hierarchical_k;
+                suggested_k
+                    .min(remaining_k)
+                    .min(params.hierarchical_k)
+                    .max(2)
+            };
+
+            // Create sub-dataset for this cluster using indices
+            let cluster_fsl = Self::create_array_from_indices::<T>(
+                &largest_cluster.indices,
+                data_values,
+                dimension,
+            )?;
+
+            // Run kmeans on this cluster
+            let sub_kmeans = Self::train_kmeans::<T, Algo>(&cluster_fsl, cluster_k, params)?;
+
+            // Get membership for points in the sub-cluster
+            let sub_data = cluster_fsl.values().as_primitive::<T>().values();
+            let (sub_membership, _, _) = Algo::compute_membership_and_loss(
+                sub_kmeans.centroids.as_primitive::<T>().values(),
+                sub_data,
+                dimension,
+                params.distance_type,
+                0.0,
+                None,
+                None,
+            );
+
+            // Create new sub-clusters and add to heap
+            let sub_centroids = sub_kmeans.centroids.as_primitive::<T>().values();
+            for i in 0..cluster_k {
+                let mut new_cluster_indices = Vec::new();
+                for (local_idx, &sub_cluster_id) in sub_membership.iter().enumerate() {
+                    if let Some(sid) = sub_cluster_id {
+                        if sid as usize == i {
+                            let global_idx = largest_cluster.indices[local_idx];
+                            new_cluster_indices.push(global_idx);
+                        }
+                    }
+                }
+
+                if !new_cluster_indices.is_empty() {
+                    let centroid_start = i * dimension;
+                    let centroid_end = centroid_start + dimension;
+                    let centroid = sub_centroids[centroid_start..centroid_end].to_vec();
+
+                    heap.push(Cluster {
+                        id: next_cluster_id,
+                        indices: new_cluster_indices,
+                        centroid,
+                    });
+                    next_cluster_id += 1;
+                }
+            }
+
+            info!(
+                "Split complete: now have {} clusters (target: {})",
+                heap.len(),
+                target_k
+            );
+        }
+
+        // Construct final KMeans model with all centroids
+        let mut all_clusters: Vec<Cluster<T::Native>> = heap.into_vec();
+        // Sort by ID to ensure consistent ordering
+        all_clusters.sort_by_key(|c| c.id);
+
+        let flat_centroids: Vec<T::Native> =
+            all_clusters.into_iter().flat_map(|c| c.centroid).collect();
+        let centroids_array = PrimitiveArray::<T>::from_iter_values(flat_centroids.into_iter());
+
+        Ok(KMeans {
+            centroids: Arc::new(centroids_array),
+            dimension,
+            distance_type: params.distance_type,
+            loss: 0.0, // Loss is not meaningful for hierarchical clustering
+        })
+    }
+
     /// Train a [`KMeans`] model with full parameters.
     ///
     /// If the DistanceType is `Cosine`, the input vectors will be normalized with each iteration.
@@ -695,6 +939,36 @@ impl KMeans {
                     n, k
                 )
             ));
+        }
+
+        // use hierarchical clustering if k > 256 and hierarchical_k > 1
+        // we set 256 as the threshold because:
+        // 1. PQ would run kmeans with k=256, in that case we don't want to use hierarchical clustering for accuracy
+        // 2. kmeans with k=256 is small enough that we don't need to use hierarchical clustering for efficiency
+        if k > 256 && params.hierarchical_k > 1 {
+            log::debug!("Using hierarchical clustering for k={}", k);
+            return match (data.value_type(), params.distance_type) {
+                (DataType::Float16, _) => Self::train_hierarchical_kmeans::<
+                    Float16Type,
+                    KMeansAlgoFloat<Float16Type>,
+                >(data, k, params),
+                (DataType::Float32, _) => Self::train_hierarchical_kmeans::<
+                    Float32Type,
+                    KMeansAlgoFloat<Float32Type>,
+                >(data, k, params),
+                (DataType::Float64, _) => Self::train_hierarchical_kmeans::<
+                    Float64Type,
+                    KMeansAlgoFloat<Float64Type>,
+                >(data, k, params),
+                (DataType::UInt8, DistanceType::Hamming) => {
+                    Self::train_hierarchical_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
+                }
+                _ => Err(ArrowError::InvalidArgumentError(format!(
+                    "KMeans: can not train data type {} with distance type: {}",
+                    data.value_type(),
+                    params.distance_type
+                ))),
+            };
         }
 
         match (data.value_type(), params.distance_type) {
@@ -963,7 +1237,7 @@ where
 
     // Only sample sample_rate * num_clusters. See Faiss
     let data = if num_rows > sample_rate * k {
-        info!(
+        log::info!(
             "Sample {} out of {} to train kmeans of {} dim, {} clusters",
             sample_rate * k,
             array.len() / dimension,
@@ -1139,5 +1413,95 @@ mod tests {
         assert_eq!(kmeans.centroids.len(), K * DIM);
         assert_eq!(kmeans.dimension, DIM);
         assert_eq!(kmeans.centroids.data_type(), &DataType::UInt8);
+    }
+
+    #[tokio::test]
+    async fn test_hierarchical_kmeans() {
+        const DIM: usize = 64;
+        const K: usize = 512; // Greater than 256 to trigger hierarchical clustering
+        const NUM_VALUES: usize = 1024 * K;
+
+        let values = generate_random_array(NUM_VALUES * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 10,
+            hierarchical_k: 256,
+            ..Default::default()
+        };
+
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+
+        // Verify that we have the correct number of clusters
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+        assert_eq!(kmeans.centroids.data_type(), &DataType::Float32);
+
+        // Verify that all centroids are valid (not NaN)
+        let centroids = kmeans.centroids.as_primitive::<Float32Type>().values();
+        for val in centroids {
+            assert!(!val.is_nan(), "Centroid should not contain NaN values");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hierarchical_kmeans_small() {
+        const DIM: usize = 32;
+        const K: usize = 300; // Just above 256 to trigger hierarchical clustering
+        const NUM_VALUES: usize = 512 * K;
+
+        let values = generate_random_array(NUM_VALUES * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 5,
+            hierarchical_k: 16,
+            ..Default::default()
+        };
+
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+
+        // Verify that we have the correct number of clusters
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+
+        // Test boundary case: k = 256 should use regular kmeans
+        let k_boundary = 256;
+        let kmeans_boundary = KMeans::new_with_params(&fsl, k_boundary, &params).unwrap();
+        assert_eq!(kmeans_boundary.centroids.len(), k_boundary * DIM);
+    }
+
+    #[tokio::test]
+    async fn test_hierarchical_kmeans_efficiency() {
+        // Test with a smaller dataset to verify the optimization
+        const DIM: usize = 16;
+        const K: usize = 400;
+        const NUM_VALUES: usize = 256 * K; // Smaller dataset
+
+        let values = generate_random_array(NUM_VALUES * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 3,
+            hierarchical_k: 16,
+            ..Default::default()
+        };
+
+        // Should complete quickly with the optimized version
+        let start = std::time::Instant::now();
+        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
+        let duration = start.elapsed();
+
+        println!("Hierarchical clustering for k={} took {:?}", K, duration);
+
+        // Verify correctness
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+
+        // Verify all centroids are valid
+        let centroids = kmeans.centroids.as_primitive::<Float32Type>().values();
+        for val in centroids {
+            assert!(!val.is_nan(), "Centroid should not contain NaN values");
+        }
     }
 }
