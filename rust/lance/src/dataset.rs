@@ -813,13 +813,20 @@ impl Dataset {
             .resolve_latest_location(dataset_location.base_path(), &self.object_store)
             .await?;
 
+        let metadata_cache = if branch.is_none() {
+            &self.metadata_cache
+        } else {
+            &self
+                .session
+                .metadata_cache
+                .for_dataset(dataset_location.base_uri())
+        };
         // Check if manifest is in cache before reading from storage
         let manifest_key = ManifestKey {
-            branch: branch.as_deref(),
             version: location.version,
             e_tag: location.e_tag.as_deref(),
         };
-        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
+        let cached_manifest = metadata_cache.get_with_key(&manifest_key).await;
         if let Some(cached_manifest) = cached_manifest {
             return Ok((cached_manifest, location));
         }
@@ -1886,7 +1893,6 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             let latest_tx = latest_tx.take();
             async move {
                 let manifest_key = ManifestKey {
-                    branch: dataset.dataset_location.branch.as_deref(),
                     version: location.version,
                     e_tag: location.e_tag.as_deref(),
                 };

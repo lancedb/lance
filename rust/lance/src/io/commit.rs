@@ -206,7 +206,6 @@ async fn do_commit_new_dataset(
                 .await;
 
             let manifest_key = crate::session::caches::ManifestKey {
-                branch: manifest.branch.as_deref(),
                 version: manifest_location.version,
                 e_tag: manifest_location.e_tag.as_deref(),
             };
@@ -919,7 +918,6 @@ pub(crate) async fn commit_transaction(
                     .await;
 
                 let manifest_key = crate::session::caches::ManifestKey {
-                    branch: dataset.dataset_location.branch.as_deref(),
                     version: manifest_location.version,
                     e_tag: manifest_location.e_tag.as_deref(),
                 };
