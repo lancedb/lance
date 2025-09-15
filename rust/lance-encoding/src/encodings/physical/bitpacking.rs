@@ -453,7 +453,7 @@ impl BlockDecompressor for OutOfLineBitpacking {
         let data = FixedWidthDataBlock {
             data,
             bits_per_value: self.uncompressed_bit_width,
-            num_values: num_compressed_words as u64,
+            num_values: num_compressed_words,
             block_info: BlockInfo::new(),
         };
 
