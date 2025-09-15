@@ -16,7 +16,137 @@ A `Lance Dataset` is organized in a directory.
 A `Manifest` file includes the metadata to describe a version of the dataset.
 
 ```protobuf
-%%% proto.message.Manifest %%%
+// Manifest is a global section shared between all the files.
+message Manifest {
+  // All fields of the dataset, including the nested fields.
+  repeated lance.file.Field fields = 1;
+
+  // Fragments of the dataset.
+  repeated DataFragment fragments = 2;
+
+  // Snapshot version number.
+  uint64 version = 3;
+
+  // The file position of the version auxiliary data.
+  //  * It is not inheritable between versions.
+  //  * It is not loaded by default during query.
+  uint64 version_aux_data = 4;
+
+  // Schema metadata.
+  map<string, bytes> metadata = 5;
+
+  message WriterVersion {
+    // The name of the library that created this file.
+    string library = 1;
+    // The version of the library that created this file. Because we cannot assume
+    // that the library is semantically versioned, this is a string. However, if it
+    // is semantically versioned, it should be a valid semver string without any 'v'
+    // prefix. For example: `2.0.0`, `2.0.0-rc.1`.
+    string version = 2;
+  }
+
+  // The version of the writer that created this file.
+  //
+  // This information may be used to detect whether the file may have known bugs
+  // associated with that writer.
+  WriterVersion writer_version = 13;
+
+  // If present, the file position of the index metadata.
+  optional uint64 index_section = 6;
+
+  // Version creation Timestamp, UTC timezone
+  google.protobuf.Timestamp timestamp = 7;
+
+  // Optional version tag
+  string tag = 8;
+
+  // Feature flags for readers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // read the table. If a reader does not recognize a flag that is set, it
+  // should not attempt to read the dataset.
+  //
+  // Known flags:
+  // * 1: deletion files are present
+  // * 2: row ids are stable and stored as part of the fragment metadata.
+  // * 4: use v2 format (deprecated)
+  // * 8: table config is present
+  uint64 reader_feature_flags = 9;
+
+  // Feature flags for writers.
+  //
+  // A bitmap of flags that indicate which features must be used when writing to the
+  // dataset. If a writer does not recognize a flag that is set, it should not attempt to
+  // write to the dataset.
+  //
+  // The flag identities are the same as for reader_feature_flags, but the values of
+  // reader_feature_flags and writer_feature_flags are not required to be identical.
+  uint64 writer_feature_flags = 10;
+
+  // The highest fragment ID that has been used so far.
+  //
+  // This ID is not guaranteed to be present in the current version, but it may
+  // have been used in previous versions.
+  //
+  // For a single fragment, will be zero. For no fragments, will be absent.
+  optional uint32 max_fragment_id = 11;
+
+  // Path to the transaction file, relative to `{root}/_transactions`. The file at that
+  // location contains a wire-format serialized Transaction message representing the
+  // transaction that created this version.
+  //
+  // This string field "transaction_file" may be empty if no transaction file was written.
+  //
+  // The path format is "{read_version}-{uuid}.txn" where {read_version} is the version of
+  // the table the transaction read from (serialized to decimal with no padding digits),
+  // and {uuid} is a hyphen-separated UUID.
+  string transaction_file = 12;
+
+  // The next unused row id. If zero, then the table does not have any rows.
+  //
+  // This is only used if the "stable_row_ids" feature flag is set.
+  uint64 next_row_id = 14;
+
+  message DataStorageFormat {
+    // The format of the data files (e.g. "lance")
+    string file_format = 1;
+    // The max format version of the data files. The format of the version can vary by
+    // file_format and is not required to follow semver.
+    //
+    // Every file in this version of the dataset has the same file_format version.
+    string version = 2;
+  }
+
+  // The data storage format
+  //
+  // This specifies what format is used to store the data files.
+  DataStorageFormat data_format = 15;
+
+  // Table config.
+  //
+  // Keys with the prefix "lance." are reserved for the Lance library. Other
+  // libraries may wish to similarly prefix their configuration keys
+  // appropriately.
+  map<string, string> config = 16;
+
+  // The version of the blob dataset associated with this table.  Changes to
+  // blob fields will modify the blob dataset and update this version in the parent
+  // table.
+  //
+  // If this value is 0 then there are no blob fields.
+  uint64 blob_dataset_version = 17;
+
+  // The base paths of data files.
+  //
+  // This is used to determine the base path of a data file. In common cases data file paths are under current dataset base path.
+  // But for shallow cloning, importing file and other multi-tier storage cases, the actual data files could be outside of the current dataset.
+  // This field is used with the `base_id` in `lance.file.File` and `lance.file.DeletionFile`.
+  //
+  // For example, if we have a dataset with base path `s3://bucket/dataset`, we have a DataFile with base_id 0, we get the actual data file path by:
+  // base_paths[id = 0] + /data/ + file.path
+  // the key(a.k.a index) starts from 0, increased by 1 for each new base path.
+  repeated BasePath base_paths = 18;
+} // Manifest
 ```
 
 ### Fragments
@@ -26,7 +156,36 @@ where each `DataFile` can contain several columns in the chunk of data.
 It also may include a `DeletionFile`, which is explained in a later section.
 
 ```protobuf
-%%% proto.message.DataFragment %%%
+// A DataFragment is a set of files which represent the different columns of the same
+// rows. If column exists in the schema of a dataset, but the file for that column does
+// not exist within a DataFragment of that dataset, that column consists entirely of
+// nulls.
+message DataFragment {
+  // The ID of a DataFragment is unique within a dataset.
+  uint64 id = 1;
+
+  repeated DataFile files = 2;
+
+  // File that indicates which rows, if any, should be considered deleted.
+  DeletionFile deletion_file = 3;
+
+  // A serialized RowIdSequence message (see rowids.proto).
+  //
+  // These are the row ids for the fragment, in order of the rows as they appear.
+  // That is, if a fragment has 3 rows, and the row ids are [1, 42, 3], then the
+  // first row is row 1, the second row is row 42, and the third row is row 3.
+  oneof row_id_sequence {
+    // If small (< 200KB), the row ids are stored inline.
+    bytes inline_row_ids = 5;
+    // Otherwise, stored as part of a file.
+    ExternalFile external_row_ids = 6;
+  } // row_id_sequence
+
+  // Number of original rows in the fragment, this includes rows that are now marked with
+  // deletion tombstones. To compute the current number of rows, subtract
+  // `deletion_file.num_deleted_rows` from this value.
+  uint64 physical_rows = 4;
+}
 ```
 
 The overall structure of a fragment is shown below. One or more data files store the columns of a fragment.
@@ -133,7 +292,37 @@ _deletions/{fragment_id}-{read_version}-{random_id}.{arrow|bin}
 Where `fragment_id` is the fragment the file corresponds to, `read_version` is the version of the dataset that it was created off of (usually one less than the version it was committed to), and `random_id` is a random i64 used to avoid collisions. The suffix is determined by the file type (`.arrow` for Arrow file, `.bin` for roaring bitmap).
 
 ```protobuf
-%%% proto.message.DeletionFile %%%
+// Deletion File
+//
+// The path of the deletion file is constructed as:
+//   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
+// where {extension} is `.arrow` or `.bin` depending on the type of deletion.
+message DeletionFile {
+  // Type of deletion file, which varies depending on what is the most efficient
+  // way to store the deleted row offsets. If none, then will be unspecified. If there are
+  // sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there are
+  // densely deleted rows, then BIT_MAP is the most efficient.
+  enum DeletionFileType {
+    // Deletion file is a single Int32Array of deleted row offsets. This is stored as
+    // an Arrow IPC file with one batch and one column. Has a .arrow extension.
+    ARROW_ARRAY = 0;
+    // Deletion file is a Roaring Bitmap of deleted row offsets. Has a .bin extension.
+    BITMAP = 1;
+  }
+
+  // Type of deletion file. If it is unspecified, then the remaining fields will be missing.
+  DeletionFileType file_type = 1;
+  // The version of the dataset this deletion file was built from.
+  uint64 read_version = 2;
+  // An opaque id used to differentiate this file from others written by concurrent
+  // writers.
+  uint64 id = 3;
+  // The number of rows that are marked as deleted.
+  uint64 num_deleted_rows = 4;
+  // The base path index of the data file. Used when the file is imported or referred from another dataset.
+  // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
+  optional uint32 base_id = 7;
+} // DeletionFile
 ```
 
 Deletes can be materialized by re-writing data files with the deleted rows removed.
