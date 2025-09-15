@@ -705,7 +705,7 @@ impl KMeans {
             let end = start + dimension;
             subset_data.extend_from_slice(&data_values[start..end]);
         }
-        let array = PrimitiveArray::<T>::from_iter_values(subset_data.into_iter());
+        let array = PrimitiveArray::<T>::from_iter_values(subset_data);
         FixedSizeListArray::try_new_from_values(array, dimension as i32)
     }
 
@@ -914,9 +914,9 @@ impl KMeans {
 
         let flat_centroids: Vec<T::Native> =
             all_clusters.into_iter().flat_map(|c| c.centroid).collect();
-        let centroids_array = PrimitiveArray::<T>::from_iter_values(flat_centroids.into_iter());
+        let centroids_array = PrimitiveArray::<T>::from_iter_values(flat_centroids);
 
-        Ok(KMeans {
+        Ok(Self {
             centroids: Arc::new(centroids_array),
             dimension,
             distance_type: params.distance_type,
