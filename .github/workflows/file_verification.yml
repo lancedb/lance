@@ -1,4 +1,6 @@
 name: Lance File Write Read Round Trip Verification
+permissions:
+  contents: read
 
 on:
   workflow_dispatch:
