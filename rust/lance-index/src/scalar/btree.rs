@@ -1655,12 +1655,12 @@ async fn merge_pages(
         part_lookup_files.len()
     );
 
-    let mut streams: Vec<SendableRecordBatchStream> = Vec::new();
-
     let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
     let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
     let stream_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
 
+    // Create execution plans for each stream
+    let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
         let page_file_name =
@@ -1683,14 +1683,7 @@ async fn merge_pages(
 
         let sendable_stream =
             Box::pin(RecordBatchStreamAdapter::new(stream_schema.clone(), stream));
-        streams.push(sendable_stream);
-    }
-
-    // Create execution plans for each stream
-    let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-    for stream in streams {
-        let plan = Arc::new(OneShotExec::new(stream));
-        inputs.push(plan);
+        inputs.push(Arc::new(OneShotExec::new(sendable_stream)));
     }
 
     // Create Union execution plan to combine all partitions

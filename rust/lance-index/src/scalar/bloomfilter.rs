@@ -1208,6 +1208,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        _fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()
