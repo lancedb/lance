@@ -182,12 +182,9 @@ mod tests {
         );
 
         let data = struct_array.to_data();
-        println!("data: {:#?}", data);
         let sliced = data.into_builder().offset(1).len(2).build().unwrap();
-        println!("sliced: {:#?}", sliced);
         let sliced = make_array(sliced);
         let normalized = sliced.as_struct().clone().normalize_slicing().unwrap();
-        println!("normalized: {:#?}", normalized.to_data());
 
         assert_eq!(normalized, struct_array.slice(1, 2));
     }
