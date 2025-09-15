@@ -247,6 +247,27 @@ impl LanceFileWriter {
     ) -> PyResult<Self> {
         let (object_store, path) =
             object_store_from_uri_or_path(uri_or_path, storage_options).await?;
+        Self::open_with_store(
+            object_store,
+            path,
+            schema,
+            data_cache_bytes,
+            version,
+            keep_original_array,
+            max_page_bytes,
+        )
+        .await
+    }
+
+    async fn open_with_store(
+        object_store: Arc<ObjectStore>,
+        path: Path,
+        schema: Option<PyArrowType<ArrowSchema>>,
+        data_cache_bytes: Option<u64>,
+        version: Option<String>,
+        keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
+    ) -> PyResult<Self> {
         let object_writer = object_store.create(&path).await.infer_error()?;
         let options = FileWriterOptions {
             data_cache_bytes,
@@ -439,6 +460,38 @@ impl LanceFileSession {
         RT.block_on(
             None,
             LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+        )?
+    }
+
+    #[pyo3(signature=(
+        path,
+        schema=None,
+        data_cache_bytes=None,
+        version=None,
+        keep_original_array=None,
+        max_page_bytes=None
+    ))]
+    pub fn open_writer(
+        &self,
+        path: String,
+        schema: Option<PyArrowType<ArrowSchema>>,
+        data_cache_bytes: Option<u64>,
+        version: Option<String>,
+        keep_original_array: Option<bool>,
+        max_page_bytes: Option<u64>,
+    ) -> PyResult<LanceFileWriter> {
+        let path = self.base_path.child(path);
+        RT.block_on(
+            None,
+            LanceFileWriter::open_with_store(
+                self.object_store.clone(),
+                path,
+                schema,
+                data_cache_bytes,
+                version,
+                keep_original_array,
+                max_page_bytes,
+            ),
         )?
     }
 }

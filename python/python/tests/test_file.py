@@ -290,14 +290,14 @@ def test_round_trip_parquet(tmp_path):
     assert round_tripped == table
 
 
-def test_read_with_session(tmp_path):
-    path = tmp_path / "foo.lance"
-    with LanceFileWriter(path) as writer:
+def test_write_read_with_session(tmp_path):
+    session = LanceFileSession(tmp_path)
+    with session.open_writer("foo.lance") as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
-    with LanceFileWriter(tmp_path / "bar.lance") as writer:
+
+    with session.open_writer("bar.lance") as writer:
         writer.write_batch(pa.table({"a": [4, 5, 6]}))
 
-    session = LanceFileSession(tmp_path)
     reader = session.open_reader("foo.lance")
     assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
 
