@@ -18,6 +18,7 @@ from .dataset import (
     LanceOperation,
     LanceScanner,
     MergeInsertBuilder,
+    Session,
     Transaction,
     __version__,
     batch_udf,
@@ -82,6 +83,7 @@ def dataset(
     metadata_cache_size_bytes: Optional[int] = None,
     index_cache_size_bytes: Optional[int] = None,
     read_params: Optional[Dict[str, any]] = None,
+    session: Optional[Session] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -136,6 +138,9 @@ def dataset(
         - cache_repetition_index (bool): Whether to cache repetition indices for
           large string/binary columns
         - validate_on_decode (bool): Whether to validate data during decoding
+    session : optional, lance.Session
+        A session to use for this dataset. This contains the caches used by the
+        across multiple datasets.
     """
     ds = LanceDataset(
         uri,
@@ -148,6 +153,7 @@ def dataset(
         metadata_cache_size_bytes=metadata_cache_size_bytes,
         index_cache_size_bytes=index_cache_size_bytes,
         read_params=read_params,
+        session=session,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
@@ -170,6 +176,7 @@ def dataset(
                 metadata_cache_size_bytes=metadata_cache_size_bytes,
                 index_cache_size_bytes=index_cache_size_bytes,
                 read_params=read_params,
+                session=session,
             )
     else:
         return ds
