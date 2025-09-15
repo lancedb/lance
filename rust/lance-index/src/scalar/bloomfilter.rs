@@ -1208,8 +1208,15 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        _fragment_ids: Option<Vec<u32>>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "BloomFilter index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()
             .map_err(|_| Error::InvalidInput {

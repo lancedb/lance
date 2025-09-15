@@ -404,6 +404,13 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "LabelList index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         let schema = data.schema();
         let field = schema
             .column_with_name(VALUE_COLUMN_NAME)

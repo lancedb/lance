@@ -1534,8 +1534,15 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        _fragment_ids: Option<Vec<u32>>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "BTree index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         let request = request
             .as_any()
             .downcast_ref::<BTreeTrainingRequest>()
