@@ -472,7 +472,7 @@ impl IoTask {
     }
 
     async fn run(self) {
-        let file_path = self.reader.path().to_string();
+        let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
         let bytes = if self.to_read.start == self.to_read.end {
             Ok(Bytes::new())

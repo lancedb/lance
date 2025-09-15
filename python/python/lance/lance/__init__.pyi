@@ -113,6 +113,15 @@ class LanceFileSession:
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
     ) -> LanceFileReader: ...
+    def open_writer(
+        self,
+        path: str,
+        schema: Optional[pa.Schema] = None,
+        data_cache_bytes: Optional[int] = None,
+        version: Optional[str] = None,
+        keep_original_array: Optional[bool] = None,
+        max_page_bytes: Optional[int] = None,
+    ) -> LanceFileWriter: ...
 
 class LanceFileReader:
     def __init__(
