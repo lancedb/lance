@@ -830,7 +830,7 @@ impl KMeans {
             }
 
             let cluster_size = largest_cluster.indices.len();
-            info!(
+            log::debug!(
                 "Splitting cluster {} with {} points (current total clusters: {})",
                 largest_cluster.id,
                 cluster_size,
@@ -838,7 +838,7 @@ impl KMeans {
             );
 
             // Determine k' for this cluster based on its size
-            let remaining_k = target_k - heap.len() + 1; // Spaces left to fill
+            let remaining_k = target_k - heap.len(); // Spaces left to fill
             let cluster_k = if cluster_size <= params.hierarchical_k {
                 2.min(remaining_k).min(cluster_size)
             } else {
@@ -899,12 +899,13 @@ impl KMeans {
                 }
             }
 
-            info!(
+            log::debug!(
                 "Split complete: now have {} clusters (target: {})",
                 heap.len(),
                 target_k
             );
         }
+        debug_assert_eq!(heap.len(), target_k);
 
         // Construct final KMeans model with all centroids
         let mut all_clusters: Vec<Cluster<T::Native>> = heap.into_vec();
