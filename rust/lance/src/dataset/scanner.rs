@@ -1467,8 +1467,55 @@ impl Scanner {
     ///
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
     /// especially if there is no filter.
+    ///
+    /// This method automatically handles column selection scenarios by converting to
+    /// an optimized scanner with with_row_id=true and empty columns when needed.
     #[instrument(skip_all)]
     pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
+        // Future intentionally boxed here to avoid large futures on the stack
+        async move {
+            // Check if we have column selection that would cause the original method to fail
+            if !self.projection_plan.physical_projection.is_metadata_only()
+                && self.projection_plan.physical_projection.has_non_meta_cols() {
+                log::debug!(
+                    "count_rows: Column selection detected, converting to optimized count scanner. Selected columns: {:?}",
+                    self.projection_plan.physical_projection.to_schema().fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+                );
+                // Direct conversion as requested: self.scanner(with_row_id=True, columns=[], filter=filter).count_rows()
+                let mut count_scanner = Scanner::new(self.dataset.clone());
+                let empty_projection_with_row_id = self.dataset.empty_projection().with_row_id();
+                count_scanner.projection_plan = ProjectionPlan::from_schema(
+                    self.dataset.clone(),
+                    &empty_projection_with_row_id.to_schema(),
+                )?;
+                if let Some(filter) = &self.filter {
+                    count_scanner.filter = Some(filter.clone());
+                }
+                let result = count_scanner.count_rows().await;
+                match &result {
+                    Ok(count) => {
+                        log::debug!("count_rows: Successfully counted {} rows with optimized scanner", count);
+                    },
+                    Err(err) => {
+                        log::warn!("count_rows: Count operation failed with optimized scanner: {}", err);
+                    }
+                }
+                result
+            } else {
+                // No column selection, use the original logic
+                log::debug!("count_rows: No column selection detected, using direct count_rows");
+                self.count_rows_direct().await
+            }
+        }
+        .boxed()
+    }
+
+    /// Direct count_rows implementation (for internal use)
+    ///
+    /// This is the direct count_rows method that requires metadata-only projections.
+    /// It's used internally by the enhanced count_rows method.
+    #[instrument(skip_all)]
+    fn count_rows_direct(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let count_plan = self.create_count_plan().await?;

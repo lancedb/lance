@@ -885,17 +885,16 @@ def test_count_rows(tmp_path: Path):
 def test_count_rows_via_scanner(tmp_path: Path):
     ds = lance.write_dataset(pa.table({"a": range(100), "b": range(100)}), tmp_path)
 
+    # Test basic count_rows with empty columns and with_row_id=True
+    # (should work as before)
     assert ds.scanner(filter="a < 50", columns=[], with_row_id=True).count_rows() == 50
 
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows()
+    # Test count_rows with column selection - should now work (previously would fail)
+    assert (
+        ds.scanner(filter="a < 50", columns=["a"], with_row_id=True).count_rows() == 50
+    )
 
-    with pytest.raises(
-        ValueError, match="should not be called on a plan selecting columns"
-    ):
-        ds.scanner(with_row_id=True).count_rows()
+    assert ds.scanner(columns=["a"], with_row_id=True).count_rows() == 100
 
     with pytest.raises(ValueError, match="with_row_id is false"):
         ds.scanner(columns=[]).count_rows()
