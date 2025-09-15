@@ -799,27 +799,19 @@ impl Dataset {
     }
 
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
-        self.latest_branch_manifest(self.dataset_location.branch.clone())
-            .await
-    }
-
-    pub async fn latest_branch_manifest(
-        &self,
-        branch: Option<String>,
-    ) -> Result<(Arc<Manifest>, ManifestLocation)> {
-        let dataset_location = self.dataset_location.switch_branch(branch.clone())?;
         let location = self
             .commit_handler
-            .resolve_latest_location(dataset_location.base_path(), &self.object_store)
+            .resolve_latest_location(self.dataset_location.base_path(), &self.object_store)
             .await?;
 
+        let branch = self.dataset_location.branch.clone();
         let metadata_cache = if branch.is_none() {
             &self.metadata_cache
         } else {
             &self
                 .session
                 .metadata_cache
-                .for_dataset(dataset_location.base_uri())
+                .for_dataset(self.dataset_location.base_uri())
         };
         // Check if manifest is in cache before reading from storage
         let manifest_key = ManifestKey {
@@ -831,7 +823,7 @@ impl Dataset {
             return Ok((cached_manifest, location));
         }
 
-        if self.already_checked_out(&location, branch.clone()) {
+        if self.already_checked_out(&location, branch) {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
