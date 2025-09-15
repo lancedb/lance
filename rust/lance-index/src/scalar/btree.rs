@@ -11,8 +11,8 @@ use std::{
 };
 
 use super::{
-    flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    SargableQuery, ScalarIndex, SearchResult,
+    flat::FlatIndexMetadata, AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter,
+    MetricsCollector, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -1251,6 +1251,13 @@ impl ScalarIndex for BTreeIndex {
     fn update_criteria(&self) -> UpdateCriteria {
         UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
     }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let params = serde_json::to_value(BTreeParameters {
+            zone_size: Some(self.batch_size),
+        })?;
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(params))
+    }
 }
 
 struct BatchStats {
@@ -1940,7 +1947,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        BTREE_INDEX_VERSION
     }
 
     fn new_query_parser(

@@ -203,6 +203,10 @@ public class VectorIndexParams {
     return distanceType;
   }
 
+  public String getDistanceTypeString() {
+    return distanceType.toString();
+  }
+
   public IvfBuildParams getIvfParams() {
     return ivfParams;
   }

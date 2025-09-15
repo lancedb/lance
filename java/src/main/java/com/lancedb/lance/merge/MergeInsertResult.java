@@ -11,34 +11,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.lancedb.lance.index;
+package com.lancedb.lance.merge;
 
-public enum IndexType {
-  SCALAR(0),
-  BTREE(1),
-  BITMAP(2),
-  LABEL_LIST(3),
-  INVERTED(4),
-  NGRAM(5),
-  FRAGMENT_REUSE(6),
-  MEM_WAL(7),
-  ZONEMAP(8),
-  BLOOM_FILTER(9),
-  VECTOR(100),
-  IVF_FLAT(101),
-  IVF_SQ(102),
-  IVF_PQ(103),
-  IVF_HNSW_SQ(104),
-  IVF_HNSW_PQ(105),
-  IVF_HNSW_FLAT(106);
+import com.lancedb.lance.Dataset;
 
-  private final int value;
+public class MergeInsertResult {
+  private final Dataset dataset;
+  private final MergeInsertStats stats;
 
-  IndexType(int value) {
-    this.value = value;
+  public MergeInsertResult(Dataset dataset, MergeInsertStats stats) {
+    this.dataset = dataset;
+    this.stats = stats;
   }
 
-  public int getValue() {
-    return value;
+  public Dataset dataset() {
+    return dataset;
+  }
+
+  public MergeInsertStats stats() {
+    return stats;
   }
 }

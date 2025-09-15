@@ -472,6 +472,8 @@ impl IoTask {
     }
 
     async fn run(self) {
+        let file_path = self.reader.path().as_ref();
+        let num_bytes = self.num_bytes();
         let bytes = if self.to_read.start == self.to_read.end {
             Ok(Bytes::new())
         } else {
@@ -487,6 +489,15 @@ impl IoTask {
                 .await
                 .map_err(Error::from)
         };
+        // Emit per-file I/O trace event only when tracing is enabled
+        tracing::trace!(
+            file = file_path,
+            bytes_read = num_bytes,
+            requests = 1,
+            range_start = self.to_read.start,
+            range_end = self.to_read.end,
+            "File I/O completed"
+        );
         IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }

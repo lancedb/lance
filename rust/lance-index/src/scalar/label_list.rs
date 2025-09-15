@@ -18,8 +18,8 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
-use super::SargableQuery;
 use super::{bitmap::BitmapIndex, AnyQuery, IndexStore, LabelListQuery, ScalarIndex};
+use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::bitmap::BitmapIndexPlugin;
@@ -220,6 +220,10 @@ impl ScalarIndex for LabelListIndex {
     fn update_criteria(&self) -> UpdateCriteria {
         UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
     }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList))
+    }
 }
 
 fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
@@ -378,7 +382,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        LABEL_LIST_INDEX_VERSION
     }
 
     fn new_query_parser(

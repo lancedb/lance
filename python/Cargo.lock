@@ -1128,7 +1128,7 @@ dependencies = [
  "bitflags 2.9.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -2783,6 +2783,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
+name = "fastbloom"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18c1ddb9231d8554c2d6bdf4cfaabf0c59251658c68b6c95cd52dd0c513a912a"
+dependencies = [
+ "getrandom 0.3.3",
+ "libm",
+ "rand 0.9.1",
+ "siphasher",
+]
+
+[[package]]
 name = "fastdivide"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2878,7 +2890,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3825,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3890,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3908,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3917,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3952,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3982,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3999,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4035,7 +4047,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4069,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4090,6 +4102,7 @@ dependencies = [
  "datafusion-sql",
  "deepsize",
  "dirs",
+ "fastbloom",
  "fst",
  "futures",
  "half",
@@ -4123,12 +4136,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "twox-hash",
  "uuid",
 ]
 
 [[package]]
 name = "lance-io"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4168,7 +4182,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4191,7 +4205,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5614,8 +5628,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.5.0",
- "itertools 0.11.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -5634,8 +5648,8 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -5668,7 +5682,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -5681,7 +5695,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -5725,7 +5739,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6813,7 +6827,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1961e2ef424c1424204d3a5d6975f934f56b6d50ff5732382d84ebf460e147f7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -7576,6 +7590,9 @@ name = "twox-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b907da542cbced5261bd3256de1b3a1bf340a3d37f93425a07362a1d687de56"
+dependencies = [
+ "rand 0.9.1",
+]
 
 [[package]]
 name = "typed-arena"
