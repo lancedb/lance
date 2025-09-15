@@ -18,7 +18,6 @@ import com.lancedb.lance.compaction.CompactionMetrics;
 import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.compaction.CompactionPlan;
 import com.lancedb.lance.compaction.CompactionTask;
-import com.lancedb.lance.compaction.IndexRemapperType;
 import com.lancedb.lance.compaction.RewriteResult;
 
 import org.apache.arrow.memory.RootAllocator;
@@ -63,10 +62,7 @@ public class CompactionTest {
         // Step-3: commit the RewriteResults
         CompactionMetrics ignored =
             Compaction.commitCompaction(
-                dataset,
-                Collections.singletonList(result),
-                compactionPlan.getCompactionOptions(),
-                IndexRemapperType.Ignore);
+                dataset, Collections.singletonList(result), compactionPlan.getCompactionOptions());
 
         // checkout to the latest snapshot and verify row num and fragment num.
         dataset.checkoutLatest();
@@ -111,10 +107,7 @@ public class CompactionTest {
 
         CompactionMetrics ignored =
             Compaction.commitCompaction(
-                dataset,
-                Collections.singletonList(result),
-                compactionPlan.getCompactionOptions(),
-                IndexRemapperType.Ignore);
+                dataset, Collections.singletonList(result), compactionPlan.getCompactionOptions());
 
         // checkout to the latest snapshot and verify row num and fragment num.
         dataset.checkoutLatest();

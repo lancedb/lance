@@ -45,10 +45,7 @@ public class Compaction {
   }
 
   public static CompactionMetrics commitCompaction(
-      Dataset dataset,
-      List<RewriteResult> rewriteResults,
-      CompactionOptions compactionOptions,
-      IndexRemapperType indexRemapperType) {
+      Dataset dataset, List<RewriteResult> rewriteResults, CompactionOptions compactionOptions) {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(rewriteResults);
     Preconditions.checkNotNull(compactionOptions);
@@ -62,8 +59,7 @@ public class Compaction {
         compactionOptions.getMaterializeDeletionsThreshold(),
         compactionOptions.getNumThreads(),
         compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap(),
-        indexRemapperType);
+        compactionOptions.getDeferIndexRemap());
   }
 
   public static native CompactionMetrics nativeCommitCompaction(
@@ -76,8 +72,7 @@ public class Compaction {
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
       Optional<Long> batchSize,
-      Optional<Boolean> deferIndexRemap,
-      IndexRemapperType indexRemapperType);
+      Optional<Boolean> deferIndexRemap);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,

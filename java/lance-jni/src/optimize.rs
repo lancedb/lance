@@ -12,7 +12,7 @@ use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
         commit_compaction, plan_compaction, CompactionMetrics, CompactionOptions, CompactionPlan,
-        CompactionTask, IgnoreRemap, IndexRemapperOptions, RewriteResult, TaskData,
+        CompactionTask, IndexRemapperOptions, RewriteResult, TaskData,
     },
 };
 
@@ -25,7 +25,7 @@ use crate::{
         build_compaction_options, to_java_boolean_obj, to_java_float_obj, to_java_long_obj,
         to_java_optional,
     },
-    JNIEnvExt, RT,
+    RT,
 };
 
 use crate::error::Result;
@@ -111,7 +111,6 @@ pub extern "system" fn Java_com_lancedb_lance_compaction_Compaction_nativeCommit
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    index_remapper_type: JObject,             // IndexRemapperType
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -127,7 +126,6 @@ pub extern "system" fn Java_com_lancedb_lance_compaction_Compaction_nativeCommit
             num_threads,
             batch_size,
             defer_index_remap,
-            index_remapper_type
         ),
         JObject::null()
     )
@@ -146,7 +144,6 @@ fn inner_commit_compaction<'local>(
     num_threads: JObject,                     // Optional<Long>
     batch_size: JObject,                      // Optional<Long>
     defer_index_remap: JObject,               // Optional<Boolean>
-    index_remapper_type: JObject,             // IndexRemapperType
 ) -> Result<JObject<'local>> {
     let compaction_options = build_compaction_options(
         env,
@@ -162,12 +159,7 @@ fn inner_commit_compaction<'local>(
     let completed_tasks = import_vec_to_rust(env, &rewrite_results, |env, rewrite_result| {
         rewrite_result.extract_object(env)
     })?;
-    let remapper_name = env.get_string_from_method(&index_remapper_type, "name")?;
-    let remap_options: Arc<dyn IndexRemapperOptions> = match remapper_name.as_str() {
-        "DatasetIndexRemapper" => Arc::new(DatasetIndexRemapperOptions {}),
-        "Ignore" => Arc::new(IgnoreRemap {}),
-        _ => unimplemented!(),
-    };
+    let remap_options: Arc<dyn IndexRemapperOptions> = Arc::new(DatasetIndexRemapperOptions {});
     let committed_metrics = {
         let mut dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;

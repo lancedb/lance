@@ -20,7 +20,9 @@ import java.util.Optional;
 
 /**
  * Compaction options. All fields are optional in Java side. We do not set default value for them to
- * avoid conflicting with those default value in Rust side.
+ * avoid conflicting with those default values in Rust side. Please check the <a
+ * href="https://docs.rs/lance/latest/src/lance/dataset/optimize.rs.html#118">rust code</a> for all
+ * default values.
  */
 public class CompactionOptions implements Serializable {
   private final Optional<Long> targetRowsPerFragment;
