@@ -548,7 +548,7 @@ impl ScalarIndex for BloomFilterIndex {
             number_of_items: self.number_of_items,
             probability: self.probability,
         })?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(params))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(&params))
     }
 }
 
@@ -1208,7 +1208,15 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "BloomFilter index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()
             .map_err(|_| Error::InvalidInput {
