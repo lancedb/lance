@@ -47,6 +47,7 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
     affected_rows: Option<RowIdTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    write_transaction_file: bool,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -64,6 +65,7 @@ impl<'a> CommitBuilder<'a> {
             commit_config: Default::default(),
             affected_rows: None,
             transaction_properties: None,
+            write_transaction_file: true,
         }
     }
 
@@ -177,6 +179,13 @@ impl<'a> CommitBuilder<'a> {
         transaction_properties: HashMap<String, String>,
     ) -> Self {
         self.transaction_properties = Some(Arc::new(transaction_properties));
+        self
+    }
+
+    /// Control whether to also write an external transaction file.
+    /// Default is true for backward compatibility. Set to false to write inline only.
+    pub fn with_write_transaction_file(mut self, write_transaction_file: bool) -> Self {
+        self.write_transaction_file = write_transaction_file;
         self
     }
 
@@ -308,6 +317,7 @@ impl<'a> CommitBuilder<'a> {
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
+            write_transaction_file: self.write_transaction_file,
             ..Default::default()
         };
 

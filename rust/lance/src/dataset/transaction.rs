@@ -322,6 +322,15 @@ impl std::fmt::Display for Operation {
     }
 }
 
+impl From<&Transaction> for lance_table::format::Transaction {
+    fn from(value: &Transaction) -> Self {
+        let pb_transaction: pb::Transaction = value.into();
+        Self {
+            inner: pb_transaction,
+        }
+    }
+}
+
 impl PartialEq for Operation {
     fn eq(&self, other: &Self) -> bool {
         // Many of the operations contain `Vec<T>` where the order of the
@@ -1954,7 +1963,11 @@ impl Transaction {
             manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file = if transaction_file_path.is_empty() {
+            None
+        } else {
+            Some(transaction_file_path.to_string())
+        };
 
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
