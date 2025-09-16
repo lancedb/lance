@@ -81,7 +81,11 @@ pub struct KMeansParams {
     /// which is the same as normal kmeans clustering.
     pub balance_factor: f32,
 
-    /// Whether to use hierarchical clustering.
+    /// The number of clusters to train in each hierarchical level.
+    ///
+    /// Default is 16, which performs the best performance in our experiments.
+    /// Higher would split the clusters more aggressively, which would be more accurate but slower.
+    /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
     pub hierarchical_k: usize,
 }
 
@@ -119,11 +123,20 @@ impl KMeansParams {
         }
     }
 
+    /// Set the balance factor for the kmeans clustering.
+    ///
+    /// Higher value means more balanced clustering.
+    /// Setting this value to 0 means no balance factor,
+    /// which is the same as normal kmeans clustering.
     pub fn with_balance_factor(mut self, balance_factor: f32) -> Self {
         self.balance_factor = balance_factor;
         self
     }
 
+    /// Set the number of clusters to train in each hierarchical level.
+    ///
+    /// Higher would split the clusters more aggressively, which would be more accurate but slower.
+    /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
     pub fn with_hierarchical_k(mut self, hierarchical_k: usize) -> Self {
         self.hierarchical_k = hierarchical_k;
         self
@@ -698,6 +711,7 @@ impl KMeans {
     ) -> arrow::error::Result<FixedSizeListArray>
     where
         T::Native: Clone,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         let mut subset_data = Vec::with_capacity(indices.len() * dimension);
         for &idx in indices {
@@ -705,7 +719,7 @@ impl KMeans {
             let end = start + dimension;
             subset_data.extend_from_slice(&data_values[start..end]);
         }
-        let array = PrimitiveArray::<T>::from_iter_values(subset_data);
+        let array = PrimitiveArray::<T>::from(subset_data);
         FixedSizeListArray::try_new_from_values(array, dimension as i32)
     }
 
@@ -721,6 +735,7 @@ impl KMeans {
     ) -> arrow::error::Result<Self>
     where
         T::Native: Num,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         // Cluster structure for the heap
         #[derive(Clone, Debug)]
@@ -914,7 +929,7 @@ impl KMeans {
 
         let flat_centroids: Vec<T::Native> =
             all_clusters.into_iter().flat_map(|c| c.centroid).collect();
-        let centroids_array = PrimitiveArray::<T>::from_iter_values(flat_centroids);
+        let centroids_array = PrimitiveArray::<T>::from(flat_centroids);
 
         Ok(Self {
             centroids: Arc::new(centroids_array),
