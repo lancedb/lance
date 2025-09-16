@@ -458,6 +458,37 @@ mod tests {
 
     #[rstest]
     #[test_log::test(tokio::test)]
+    async fn test_simple_string_list_no_null(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let items_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_value([Some("a"), Some("bc"), Some("def")]);
+        list_builder.append_value([Some("gh"), Some("zxy")]);
+        list_builder.append_value([Some("gh"), Some("z")]);
+        list_builder.append_value([Some("ijk"), Some("lmnop"), Some("qrs")]);
+        let list_array = list_builder.finish();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![1, 3])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
     async fn test_simple_sliced_list(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
@@ -795,6 +826,20 @@ mod tests {
         let test_cases = test_cases.with_batch_size(1);
         check_round_trip_encoding_of_data(vec![struct_array], &test_cases, field_metadata.clone())
             .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_empty_list_list() {
+        let items_builder = Int32Builder::new();
+        let list_builder = ListBuilder::new(items_builder);
+        let mut outer_list_builder = ListBuilder::new(list_builder);
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        let list_array = Arc::new(outer_list_builder.finish());
+
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
     #[rstest]

@@ -912,7 +912,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         // in the items array.  We need to account for that here to figure out how many values
         // should be in the items array.
         let num_values = if let Some(def) = &def {
-            def.iter().filter(|&d| *d < self.max_visible_level).count() as u64
+            def.iter().filter(|&d| *d <= self.max_visible_level).count() as u64
         } else {
             num_values
         };
@@ -2585,10 +2585,17 @@ impl DecodePageTask for VariableFullZipDecodeTask {
             block_info: BlockInfo::new(),
         };
         let decomopressed = self.decompressor.decompress(block)?;
-        let rep = self.rep.to_vec();
-        let def = self.def.to_vec();
-        let unraveler =
-            RepDefUnraveler::new(Some(rep), Some(def), self.details.def_meaning.clone());
+        let rep = if self.rep.is_empty() {
+            None
+        } else {
+            Some(self.rep.to_vec())
+        };
+        let def = if self.def.is_empty() {
+            None
+        } else {
+            Some(self.def.to_vec())
+        };
+        let unraveler = RepDefUnraveler::new(rep, def, self.details.def_meaning.clone());
         Ok(DecodedPage {
             data: decomopressed,
             repdef: unraveler,
@@ -3293,8 +3300,8 @@ impl PrimitiveStructuralEncoder {
     // P - Padding inserted to ensure each buffer is 8-byte aligned and the buffer size is a multiple
     //     of 8 bytes (so that the next chunk is 8-byte aligned).
     //
-    // Each block has a u16 word of metadata.  The upper 12 bits contain 1/6 the
-    // # of bytes in the block (if the block does not have an even number of bytes
+    // Each block has a u16 word of metadata.  The upper 12 bits contain the
+    // # of 8-byte words in the block (if the block does not fill the final word
     // then up to 7 bytes of padding are added).  The lower 4 bits describe the log_2
     // number of values (e.g. if there are 1024 then the lower 4 bits will be
     // 0xA)  All blocks except the last must have power-of-two number of values.
@@ -3417,7 +3424,7 @@ impl PrimitiveStructuralEncoder {
             }
 
             let chunk_bytes = data_buffer.len() - start_pos;
-            assert!(chunk_bytes <= 16 * 1024);
+            assert!(chunk_bytes <= 32 * 1024);
             assert!(chunk_bytes > 0);
             assert_eq!(chunk_bytes % 8, 0);
             // We subtract 1 here from chunk_bytes because we want to be able to express
@@ -3460,12 +3467,17 @@ impl PrimitiveStructuralEncoder {
         // Make the levels into a FixedWidth data block
         let num_levels = levels.num_levels() as u64;
         let levels_buf = levels.all_levels().clone();
-        let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+
+        let mut fixed_width_block = FixedWidthDataBlock {
             data: levels_buf,
             bits_per_value: 16,
             num_values: num_levels,
             block_info: BlockInfo::new(),
-        });
+        };
+        // Compute statistics to enable optimal compression for rep/def levels
+        fixed_width_block.compute_stat();
+
+        let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
         // Pick a block compressor
         let (compressor, compressor_desc) =
@@ -3530,12 +3542,14 @@ impl PrimitiveStructuralEncoder {
                 rep_index.push(num_rows as u64);
                 rep_index.push(num_leftovers as u64);
             }
-            let chunk_levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            let mut chunk_fixed_width = FixedWidthDataBlock {
                 data: chunk_levels,
                 bits_per_value: 16,
                 num_values: num_chunk_levels,
                 block_info: BlockInfo::new(),
-            });
+            };
+            chunk_fixed_width.compute_stat();
+            let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
             let compressed_levels = compressor.compress(chunk_levels_block)?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
@@ -4226,6 +4240,7 @@ impl PrimitiveStructuralEncoder {
                 // We should not encode empty arrays.  So if we get here that should mean that we
                 // either have all empty lists or all null lists (or a mix).  We still need to encode
                 // the rep/def information but we can skip the data encoding.
+                log::debug!("Encoding column {} with {} items ({} rows) using complex-null layout", column_idx, num_values, num_rows);
                 return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows);
             }
             let num_nulls = arrays
@@ -4236,13 +4251,20 @@ impl PrimitiveStructuralEncoder {
             if num_values == num_nulls {
                 return if repdefs.iter().all(|rd| rd.is_simple_validity()) {
                     log::debug!(
-                        "Encoding column {} with {} items using simple-null layout",
+                        "Encoding column {} with {} items ({} rows) using simple-null layout",
                         column_idx,
-                        num_values
+                        num_values,
+                        num_rows
                     );
                     // Simple case, no rep/def and all nulls, we don't need to encode any data
                     Self::encode_simple_all_null(column_idx, num_values, row_number)
                 } else {
+                    log::debug!(
+                        "Encoding column {} with {} items ({} rows) using complex-null layout",
+                        column_idx,
+                        num_values,
+                        num_rows
+                    );
                     // If we get here then we have definition levels and we need to store those
                     Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
                 };

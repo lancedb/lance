@@ -208,6 +208,27 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def use_index(self, use_index: bool) -> "MergeInsertBuilder":
+        """
+        Controls whether to use indices for the merge operation.
+
+        When set to False, forces a full table scan even if an index exists on
+        the join key. This can be useful for benchmarking or when the optimizer
+        chooses a suboptimal path.
+
+        Parameters
+        ----------
+        use_index : bool
+            If True (default), uses an index if available. If False, forces a
+            full table scan.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).use_index(use_index)
+
     def explain_plan(
         self, schema: Optional[pa.Schema] = None, verbose: bool = False
     ) -> str:
@@ -383,6 +404,7 @@ class LanceDataset(pa.dataset.Dataset):
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
+        session: Optional[Session] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -412,6 +434,7 @@ class LanceDataset(pa.dataset.Dataset):
             metadata_cache_size_bytes=metadata_cache_size_bytes,
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
+            session=session,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -1885,6 +1908,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
+            Literal["BLOOMFILTER"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -1953,6 +1977,9 @@ class LanceDataset(pa.dataset.Dataset):
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
+        * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
+             but can only handle filters with equals and not equals and may require
+             more I/O than a btree or bitmap index```
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1967,7 +1994,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"`` or ``"INVERTED"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"``,
+            ``"INVERTED"`` or ``"BLOOMFILTER"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2077,11 +2105,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "ZONEMAP",
                 "LABEL_LIST",
                 "INVERTED",
+                "BLOOMFILTER",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        'or "INVERTED" are supported for '
+                        'or "INVERTED" or "BLOOMFILTER" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )

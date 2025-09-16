@@ -9,8 +9,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::lance_format::LanceIndexStore;
 use super::{
-    AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector, ScalarIndex, SearchResult,
-    TextQuery,
+    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
 use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
@@ -537,6 +537,10 @@ impl ScalarIndex for NGramIndex {
 
     fn update_criteria(&self) -> UpdateCriteria {
         UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::NGram))
     }
 }
 
@@ -1269,7 +1273,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        NGRAM_INDEX_VERSION
     }
 
     fn new_query_parser(
@@ -1285,7 +1289,15 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "NGram index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
