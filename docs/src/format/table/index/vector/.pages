@@ -1,0 +1,8 @@
+title: Vector Indices
+nav:
+  - Overview: index.md
+  - IVF: ivf.md
+  - HNSW: hnsw.md
+  - Flat: flat.md
+  - Product Quantization: pq.md
+  - Scalar Quantization: sq.md
