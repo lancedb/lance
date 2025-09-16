@@ -260,8 +260,7 @@ impl FtsQueryUDTFBuilder {
 
 #[cfg(test)]
 pub mod tests {
-    use crate::datafusion::LanceTableProvider;
-    use crate::dataset::udtf::{FtsQueryUDTF, FtsQueryUDTFBuilder};
+    use crate::dataset::udtf::FtsQueryUDTFBuilder;
     use crate::Dataset;
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
