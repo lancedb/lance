@@ -12,6 +12,9 @@ pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9
 pub const BATCH_SIZE: usize = 32;
 
 // This function is used to sum the distance table for 4-bit codes.
+// the distance table is a 2D array, that dist_table[i][j] is the distance between the i-th subvector and the code j,
+// the distance table is stored as a flat array for better cache locality and SIMD instruction usage.
+//
 // The codes are organized in the order of PERM0:
 // +----------+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+----+
 // | address  |  0 |  1 |  2 |  3 |  4 |  5 |  6 |  7 |  8 |  9 | 10 | 11 | 12 | 13 | 14 | 15 |
@@ -156,6 +159,8 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dis
     _mm256_storeu_si256(dists.as_mut_ptr().add(16) as *mut __m256i, dis1);
 }
 
+// We implement the AVX512 version in C because AVX512 is not stable yet in Rust,
+// implement it in Rust once we upgrade rust to 1.89.0.
 extern "C" {
     #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
     pub fn sum_4bit_dist_table_32bytes_batch_avx512(

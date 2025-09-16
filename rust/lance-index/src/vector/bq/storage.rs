@@ -40,6 +40,9 @@ pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RabitQuantizationMetadata {
+    // this rotate matrix is large, and lance index would store all metadata in schema metadata,
+    // which is in JSON format, so we skip it in serialization and deserialization, and store it
+    // in the global buffer, which is a binary format (protobuf for now) for efficiency.
     #[serde(skip)]
     pub rotate_mat: Option<FixedSizeListArray>,
     pub rotate_mat_position: u32,
@@ -235,6 +238,7 @@ where
     dist_table
 }
 
+// Quantize the distance table to u8, map distance `d` to `(d-qmin) * 255 / (qmax-qmin)`
 #[inline]
 fn quantize_dist_table(dist_table: &[f32]) -> (f32, f32, Vec<u8>) {
     let (qmin, qmax) = dist_table
@@ -265,7 +269,7 @@ fn compute_rq_distance_flat(
     dists: &mut [f32],
 ) {
     let d = dist_table.len() / 4;
-    let code_len = d / 8;
+    let code_len = d / u8::BITS as usize;
     let codes = &codes[offset * code_len..(offset + length) * code_len];
     let dists = &mut dists[offset..offset + length];
 
@@ -287,7 +291,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
     #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
         let id = id as usize;
-        let code_len = self.dim * (self.num_bits as usize) / 8;
+        let code_len = self.dim * (self.num_bits as usize) / u8::BITS as usize;
         let num_vectors = self.codes.len() / code_len;
         let code = get_rq_code(self.codes, id, num_vectors, code_len);
         let dist = code
@@ -308,7 +312,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
 
     #[inline(always)]
     fn distance_all(&self, _: usize) -> Vec<f32> {
-        let code_len = self.dim * (self.num_bits as usize) / 8;
+        let code_len = self.dim * (self.num_bits as usize) / u8::BITS as usize;
         let n = self.codes.len() / code_len;
         if n == 0 {
             return Vec::new();

@@ -57,15 +57,7 @@ impl RabitQuantizer {
         let (rotate_mat, _) = rotate_mat.into_raw_vec_and_offset();
 
         let rotate_mat = match T::FLOAT_TYPE {
-            FloatType::Float16 => {
-                let rotate_mat = T::ArrayType::from(rotate_mat);
-                FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
-            }
-            FloatType::Float32 => {
-                let rotate_mat = T::ArrayType::from(rotate_mat);
-                FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
-            }
-            FloatType::Float64 => {
+            FloatType::Float16 | FloatType::Float32 | FloatType::Float64 => {
                 let rotate_mat = T::ArrayType::from(rotate_mat);
                 FixedSizeListArray::try_new_from_values(rotate_mat, code_dim).unwrap()
             }
@@ -177,10 +169,10 @@ impl RabitQuantizer {
         let bv: BitVec<u8, Lsb0> = BitVec::from_iter(quantized_vectors);
 
         let codes = UInt8Array::from(bv.into_vec());
-        debug_assert_eq!(codes.len(), n * self.code_dim() / 8);
+        debug_assert_eq!(codes.len(), n * self.code_dim() / u8::BITS as usize);
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             codes,
-            self.code_dim() as i32 / 8, // num_bits -> num_bytes
+            self.code_dim() as i32 / u8::BITS as i32, // num_bits -> num_bytes
         )?))
     }
 }
