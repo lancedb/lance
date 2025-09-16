@@ -61,6 +61,7 @@ use tracing::{info, instrument};
 mod blob;
 pub mod builder;
 pub mod cleanup;
+pub mod conflict_detection;
 mod delta;
 pub mod fragment;
 mod hash_joiner;
