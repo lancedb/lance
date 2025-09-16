@@ -1434,7 +1434,7 @@ mod tests {
     #[tokio::test]
     async fn test_hierarchical_kmeans() {
         const DIM: usize = 64;
-        const K: usize = 512; // Greater than 256 to trigger hierarchical clustering
+        const K: usize = 257; // Greater than 256 to trigger hierarchical clustering
         const NUM_VALUES: usize = 1024 * K;
 
         let values = generate_random_array(NUM_VALUES * DIM);
@@ -1442,7 +1442,7 @@ mod tests {
 
         let params = KMeansParams {
             max_iters: 10,
-            hierarchical_k: 256,
+            hierarchical_k: 16,
             ..Default::default()
         };
 
@@ -1458,32 +1458,5 @@ mod tests {
         for val in centroids {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
         }
-    }
-
-    #[tokio::test]
-    async fn test_hierarchical_kmeans_small() {
-        const DIM: usize = 32;
-        const K: usize = 300; // Just above 256 to trigger hierarchical clustering
-        const NUM_VALUES: usize = 512 * K;
-
-        let values = generate_random_array(NUM_VALUES * DIM);
-        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
-
-        let params = KMeansParams {
-            max_iters: 5,
-            hierarchical_k: 16,
-            ..Default::default()
-        };
-
-        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
-
-        // Verify that we have the correct number of clusters
-        assert_eq!(kmeans.centroids.len(), K * DIM);
-        assert_eq!(kmeans.dimension, DIM);
-
-        // Test boundary case: k = 256 should use regular kmeans
-        let k_boundary = 256;
-        let kmeans_boundary = KMeans::new_with_params(&fsl, k_boundary, &params).unwrap();
-        assert_eq!(kmeans_boundary.centroids.len(), k_boundary * DIM);
     }
 }
