@@ -3305,6 +3305,7 @@ impl From<&Transaction> for pb::Transaction {
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            primary_key_filter: None,
         }
     }
 }

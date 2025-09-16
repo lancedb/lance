@@ -5,6 +5,7 @@ syntax = "proto3";
 
 import "file.proto";
 import "table.proto";
+import "primary_key_filter.proto";
 import "google/protobuf/any.proto";
 
 package lance.table;
@@ -33,6 +34,8 @@ message Transaction {
   // __lance_commit_message is a reserved key
   map<string, string> transaction_properties = 4;
 
+  // Primary key filter using typed protobuf message. This is the sole carrier.
+  optional PrimaryKeyFilter primary_key_filter = 6;
   // Add new rows to the dataset.
   message Append {
     // The new fragments to append.
@@ -299,6 +302,7 @@ message Transaction {
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
+  reserved 5; // Prevent reuse of legacy primary_key_bloom_filter
   reserved 200, 202;
   reserved "blob_append", "blob_overwrite";
 }

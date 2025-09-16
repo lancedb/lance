@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.table;
+
+// Primary key value representation (reserved for future use)
+// Currently filters operate on hashed values for compactness.
+message PrimaryKeyValue {
+  oneof value {
+    string string_value = 1;
+    int64 int64_value = 2;
+    uint64 uint64_value = 3;
+    bytes binary_value = 4;
+    CompositeKey composite = 5;
+  }
+}
+
+message CompositeKey {
+  repeated PrimaryKeyValue parts = 1;
+}
+
+// Exact set of primary keys, represented by their 64-bit hashes.
+message ExactSet {
+  repeated uint64 key_hashes = 1;
+}
+
+// Bloom filter data for primary key set membership tests.
+message BloomFilterData {
+  // Bitset backing the bloom filter.
+  bytes bitmap = 1;
+  // Number of hash functions used.
+  uint32 num_hashes = 2;
+  // Total number of bits in the bitmap.
+  uint32 bitmap_bits = 3;
+  // Reserved for future fields to avoid reuse.
+  reserved 4, 5;
+  reserved "hash_seed", "hash_algo";
+}
+
+// Primary key filter attached to a Transaction for conflict detection.
+message PrimaryKeyFilter {
+  // Names of columns participating in the primary key.
+  repeated string columns = 1;
+  oneof filter {
+    ExactSet exact_set = 2;
+    BloomFilterData bloom = 3;
+  }
+  // Reserved to allow schema evolution.
+  reserved 4, 5;
+}
