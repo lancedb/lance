@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 
+use crate::aimd::{self, AimdController};
 use crate::object_store::ObjectStore as LanceObjectStore;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -81,6 +82,7 @@ pub struct ObjectWriter {
     buffer: Vec<u8>,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
+    aimd_controller: Option<AimdController>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,6 +159,12 @@ impl UploadState {
 
 impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
+        let aimd_controller = if aimd::is_aimd_enabled() {
+            Some(AimdController::new())
+        } else {
+            None
+        };
+
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
@@ -164,6 +172,7 @@ impl ObjectWriter {
             connection_resets: 0,
             buffer: Vec::with_capacity(initial_upload_size()),
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
+            aimd_controller,
         })
     }
 
@@ -239,25 +248,28 @@ impl ObjectWriter {
                 } => {
                     while let Poll::Ready(Some(res)) = futures.poll_join_next(cx) {
                         match res {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => {
+                                // Report success to AIMD controller
+                                if let Some(ref controller) = mut_self.aimd_controller {
+                                    controller.report_success();
+                                }
+                            }
                             Err(err) => return Err(std::io::Error::other(err)),
                             Ok(Err(UploadPutError {
-                                source: OSError::Generic { source, .. },
+                                source,
                                 part_idx,
                                 buffer,
-                            })) if source
-                                .to_string()
-                                .to_lowercase()
-                                .contains("connection reset by peer") =>
-                            {
-                                if mut_self.connection_resets < max_conn_reset_retries() {
-                                    // Retry, but only up to max_conn_reset_retries of them.
-                                    mut_self.connection_resets += 1;
+                            })) => {
+                                // Check if this is a throttling error
+                                if aimd::is_throttling_error(&source) {
+                                    // Report throttle to AIMD controller
+                                    if let Some(ref controller) = mut_self.aimd_controller {
+                                        controller.report_throttle();
+                                    }
 
-                                    // Resubmit with random jitter
-                                    let sleep_time_ms = rand::rng().random_range(2_000..8_000);
-                                    let sleep_time =
-                                        std::time::Duration::from_millis(sleep_time_ms);
+                                    // Retry with exponential backoff
+                                    let sleep_time_ms = rand::rng().random_range(5_000..20_000);
+                                    let sleep_time = std::time::Duration::from_millis(sleep_time_ms);
 
                                     futures.spawn(Self::put_part(
                                         upload.as_mut(),
@@ -265,20 +277,49 @@ impl ObjectWriter {
                                         part_idx,
                                         Some(sleep_time),
                                     ));
+                                } else if let OSError::Generic { source, .. } = &source {
+                                    if source
+                                        .to_string()
+                                        .to_lowercase()
+                                        .contains("connection reset by peer")
+                                    {
+                                        if mut_self.connection_resets < max_conn_reset_retries() {
+                                            // Retry, but only up to max_conn_reset_retries of them.
+                                            mut_self.connection_resets += 1;
+
+                                            // Resubmit with random jitter
+                                            let sleep_time_ms = rand::rng().random_range(2_000..8_000);
+                                            let sleep_time =
+                                                std::time::Duration::from_millis(sleep_time_ms);
+
+                                            futures.spawn(Self::put_part(
+                                                upload.as_mut(),
+                                                buffer,
+                                                part_idx,
+                                                Some(sleep_time),
+                                            ));
+                                        } else {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::ConnectionReset,
+                                                Box::new(ConnectionResetError {
+                                                    message: format!(
+                                                        "Hit max retries ({}) for connection reset",
+                                                        max_conn_reset_retries()
+                                                    ),
+                                                    source: Box::new(std::io::Error::new(
+                                                        std::io::ErrorKind::Other,
+                                                        source.to_string(),
+                                                    )),
+                                                }),
+                                            ));
+                                        }
+                                    } else {
+                                        return Err(std::io::Error::other(format!("Upload failed: {}", source)));
+                                    }
                                 } else {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::ConnectionReset,
-                                        Box::new(ConnectionResetError {
-                                            message: format!(
-                                                "Hit max retries ({}) for connection reset",
-                                                max_conn_reset_retries()
-                                            ),
-                                            source,
-                                        }),
-                                    ));
+                                    return Err(std::io::Error::other(format!("Upload failed: {}", source)));
                                 }
                             }
-                            Ok(Err(err)) => return Err(err.source.into()),
                         }
                     }
                     break;
@@ -395,8 +436,15 @@ impl AsyncWrite for ObjectWriter {
                     futures,
                     ..
                 } => {
-                    // TODO: Make max concurrency configurable from storage options.
-                    if futures.len() < max_upload_parallelism() {
+                    // Use AIMD controller to determine max parallelism if available
+                    let max_parallelism = if let Some(ref controller) = mut_self.aimd_controller {
+                        controller.capacity()
+                    } else {
+                        max_upload_parallelism()
+                    };
+
+                    // Only spawn new upload if within capacity
+                    if futures.len() < max_parallelism {
                         let data = Self::next_part_buffer(
                             &mut mut_self.buffer,
                             *part_idx,
@@ -468,8 +516,15 @@ impl AsyncWrite for ObjectWriter {
                     futures,
                     part_idx,
                 } => {
+                    // Use AIMD controller to determine max parallelism if available
+                    let max_parallelism = if let Some(ref controller) = mut_self.aimd_controller {
+                        controller.capacity()
+                    } else {
+                        max_upload_parallelism()
+                    };
+
                     // Flush final batch
-                    if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
+                    if !mut_self.buffer.is_empty() && futures.len() < max_parallelism {
                         // We can just use `take` since we don't need the buffer anymore.
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
                         futures.spawn(
