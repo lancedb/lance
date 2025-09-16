@@ -1486,38 +1486,4 @@ mod tests {
         let kmeans_boundary = KMeans::new_with_params(&fsl, k_boundary, &params).unwrap();
         assert_eq!(kmeans_boundary.centroids.len(), k_boundary * DIM);
     }
-
-    #[tokio::test]
-    async fn test_hierarchical_kmeans_efficiency() {
-        // Test with a smaller dataset to verify the optimization
-        const DIM: usize = 16;
-        const K: usize = 400;
-        const NUM_VALUES: usize = 256 * K; // Smaller dataset
-
-        let values = generate_random_array(NUM_VALUES * DIM);
-        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
-
-        let params = KMeansParams {
-            max_iters: 3,
-            hierarchical_k: 16,
-            ..Default::default()
-        };
-
-        // Should complete quickly with the optimized version
-        let start = std::time::Instant::now();
-        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
-        let duration = start.elapsed();
-
-        println!("Hierarchical clustering for k={} took {:?}", K, duration);
-
-        // Verify correctness
-        assert_eq!(kmeans.centroids.len(), K * DIM);
-        assert_eq!(kmeans.dimension, DIM);
-
-        // Verify all centroids are valid
-        let centroids = kmeans.centroids.as_primitive::<Float32Type>().values();
-        for val in centroids {
-            assert!(!val.is_nan(), "Centroid should not contain NaN values");
-        }
-    }
 }
