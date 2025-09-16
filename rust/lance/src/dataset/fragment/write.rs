@@ -41,39 +41,26 @@ use crate::Result;
 /// The binary prefix ensures files are distributed evenly across S3 prefixes,
 /// minimizing throttling and maximizing throughput, while maintaining uniqueness.
 pub(crate) fn generate_random_filename() -> String {
-    // Generate a UUID (16 bytes)
     let uuid = Uuid::new_v4();
-    let uuid_bytes = uuid.as_bytes();
+    let bytes = uuid.as_bytes();
 
-    // Use first 3 bytes (24 bits) for binary prefix
-    let binary_prefix = to_binary_string(&uuid_bytes[0..3]);
+    let mut out = String::with_capacity(50);
 
-    // Convert remaining 13 bytes to hex string
-    let hex_suffix: String = uuid_bytes[3..]
-        .iter()
-        .map(|byte| format!("{:02x}", byte))
-        .collect();
-
-    // Combine binary prefix with hex suffix
-    format!("{}{}", binary_prefix, hex_suffix)
-}
-
-/// Converts bytes to binary string representation (0s and 1s)
-/// This provides optimal distribution for S3 prefix sharding
-fn to_binary_string(bytes: &[u8]) -> String {
-    let mut result = String::with_capacity(bytes.len() * 8);
-
-    for &byte in bytes {
+    // Convert first 3 bytes to binary string (24 bits)
+    for &b in &bytes[..3] {
         for i in (0..8).rev() {
-            if (byte >> i) & 1 == 1 {
-                result.push('1');
-            } else {
-                result.push('0');
-            }
+            out.push(if (b >> i) & 1 == 1 { '1' } else { '0' });
         }
     }
 
-    result
+    // Convert remaining 13 bytes to hex string (26 chars)
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in &bytes[3..] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+
+    out
 }
 
 /// Builder for writing a new fragment.
@@ -605,21 +592,5 @@ mod tests {
             // Should be unique
             assert!(filenames.insert(filename.clone()));
         }
-    }
-
-    #[test]
-    fn test_binary_string_conversion() {
-        // Test with known values
-        let bytes = [0b10101010, 0b11110000, 0b00001111];
-        let binary = to_binary_string(&bytes);
-        assert_eq!(binary, "101010101111000000001111");
-
-        // Test empty
-        let empty: &[u8] = &[];
-        assert_eq!(to_binary_string(empty), "");
-
-        // Test single byte
-        let single = [0b11001100];
-        assert_eq!(to_binary_string(&single), "11001100");
     }
 }
