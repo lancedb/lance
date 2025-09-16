@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -55,9 +56,14 @@ impl CloudObjectReader {
         block_size: usize,
         known_size: Option<usize>,
         download_retry_count: usize,
+        storage_options: Option<&HashMap<String, String>>,
     ) -> Result<Self> {
-        let aimd_controller = if aimd::is_aimd_enabled() {
-            Some(AimdController::new_for_operation(OperationType::Read))
+        let aimd_controller = if aimd::is_aimd_enabled(storage_options) {
+            let config = aimd::AimdConfig::from_storage_options(
+                OperationType::Read,
+                storage_options,
+            );
+            Some(AimdController::with_config(config))
         } else {
             None
         };
@@ -259,12 +265,14 @@ impl SmallReader {
         path: Path,
         download_retry_count: usize,
         size: usize,
+        storage_options: Option<&HashMap<String, String>>,
     ) -> Self {
         let path_ref = path.clone();
+        let storage_options_clone = storage_options.cloned();
         let state = SmallReaderState::Loading(
             Box::pin(async move {
                 let object_reader =
-                    CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
+                    CloudObjectReader::new(store, path_ref, 0, None, download_retry_count, storage_options_clone.as_ref())
                         .map_err(CloneableError)?;
                 object_reader
                     .get_all()

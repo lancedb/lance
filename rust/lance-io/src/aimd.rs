@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 /// AIMD (Additive Increase Multiplicative Decrease) controller for managing
 /// upload concurrency in response to S3 throttling.
@@ -66,8 +66,11 @@ pub enum OperationType {
 }
 
 impl AimdConfig {
-    /// Create default configuration for a specific operation type
-    pub fn default_for_operation(op_type: OperationType) -> Self {
+    /// Create configuration from storage options
+    pub fn from_storage_options(
+        op_type: OperationType,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Self {
         // EMRFS uses different initial rates for GET and PUT
         // GET: 5500, PUT: 3500 (3500/5500 ratio)
         let initial_rate_default = match op_type {
@@ -75,44 +78,75 @@ impl AimdConfig {
             OperationType::Write => 3500.0,
         };
 
-        // Allow separate environment variables for read and write rates
-        let initial_rate_env = match op_type {
-            OperationType::Read => "LANCE_AIMD_READ_INITIAL_RATE",
-            OperationType::Write => "LANCE_AIMD_WRITE_INITIAL_RATE",
+        let mut config = Self {
+            initial_rate: initial_rate_default,
+            min_rate: 0.1,  // EMRFS default
+            max_rate: 10000.0,  // Practical upper bound
+            increase_increment: 0.1,  // EMRFS default
+            reduction_factor: 2.0,  // EMRFS default
+            adjust_window: 2,  // EMRFS default
         };
 
-        Self {
-            initial_rate: std::env::var(initial_rate_env)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| {
-                    // Fall back to generic initial rate if specific one not set
-                    std::env::var("LANCE_AIMD_INITIAL_RATE")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                })
-                .unwrap_or(initial_rate_default),
-            min_rate: std::env::var("LANCE_AIMD_MIN_RATE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.1),  // EMRFS default
-            max_rate: std::env::var("LANCE_AIMD_MAX_RATE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10000.0),  // Practical upper bound
-            increase_increment: std::env::var("LANCE_AIMD_INCREASE_INCREMENT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.1),  // EMRFS default
-            reduction_factor: std::env::var("LANCE_AIMD_REDUCTION_FACTOR")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2.0),  // EMRFS default
-            adjust_window: std::env::var("LANCE_AIMD_ADJUST_WINDOW")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2),  // EMRFS default
+        if let Some(options) = storage_options {
+            // Parse AIMD configuration from storage options
+            // Keys use dots instead of underscores for consistency with other storage options
+            if let Some(enabled) = options.get("lance.aimd.enabled") {
+                if enabled.parse::<bool>().unwrap_or(true) == false {
+                    // If AIMD is disabled, return default config (caller should check is_enabled)
+                    return config;
+                }
+            }
+
+            // Operation-specific initial rate
+            let initial_rate_key = match op_type {
+                OperationType::Read => "lance.aimd.read.initial_rate",
+                OperationType::Write => "lance.aimd.write.initial_rate",
+            };
+            if let Some(val) = options.get(initial_rate_key) {
+                if let Ok(rate) = val.parse::<f64>() {
+                    config.initial_rate = rate;
+                }
+            } else if let Some(val) = options.get("lance.aimd.initial_rate") {
+                // Fall back to generic initial rate
+                if let Ok(rate) = val.parse::<f64>() {
+                    config.initial_rate = rate;
+                }
+            }
+
+            // Common parameters
+            if let Some(val) = options.get("lance.aimd.min_rate") {
+                if let Ok(rate) = val.parse::<f64>() {
+                    config.min_rate = rate;
+                }
+            }
+            if let Some(val) = options.get("lance.aimd.max_rate") {
+                if let Ok(rate) = val.parse::<f64>() {
+                    config.max_rate = rate;
+                }
+            }
+            if let Some(val) = options.get("lance.aimd.increase_increment") {
+                if let Ok(inc) = val.parse::<f64>() {
+                    config.increase_increment = inc;
+                }
+            }
+            if let Some(val) = options.get("lance.aimd.reduction_factor") {
+                if let Ok(factor) = val.parse::<f64>() {
+                    config.reduction_factor = factor;
+                }
+            }
+            if let Some(val) = options.get("lance.aimd.adjust_window") {
+                if let Ok(window) = val.parse::<usize>() {
+                    config.adjust_window = window;
+                }
+            }
         }
+
+        config
+    }
+
+    /// Create default configuration for a specific operation type
+    pub fn default_for_operation(op_type: OperationType) -> Self {
+        Self::from_storage_options(op_type, None)
     }
 }
 
@@ -274,18 +308,26 @@ pub fn is_throttling_error(error: &object_store::Error) -> bool {
     }
 }
 
-/// Check if AIMD is enabled via environment variable
-pub fn is_aimd_enabled() -> bool {
-    std::env::var("LANCE_AIMD_ENABLED")
-        .ok()
-        .and_then(|s| s.parse::<bool>().ok())
-        .unwrap_or(true)
+/// Check if AIMD is enabled via storage options
+pub fn is_aimd_enabled(storage_options: Option<&HashMap<String, String>>) -> bool {
+    if let Some(options) = storage_options {
+        // Check if explicitly disabled
+        if let Some(enabled) = options.get("lance.aimd.enabled") {
+            return enabled.parse::<bool>().unwrap_or(true);
+        }
+        // If any AIMD config is present, consider it enabled
+        options.keys().any(|k| k.starts_with("lance.aimd."))
+    } else {
+        // Default to disabled if no storage options provided
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
     use object_store::path::Path;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use object_store::ObjectStore;
@@ -492,30 +534,73 @@ mod tests {
     }
 
     #[test]
-    fn test_aimd_config_env_vars() {
-        // Test separate read/write initial rates
-        std::env::set_var("LANCE_AIMD_READ_INITIAL_RATE", "6000");
-        std::env::set_var("LANCE_AIMD_WRITE_INITIAL_RATE", "4000");
+    fn test_aimd_disabled_by_default() {
+        // Test that AIMD is disabled when no storage options are provided
+        assert!(!is_aimd_enabled(None));
 
-        let read_config = AimdConfig::default_for_operation(OperationType::Read);
-        assert_eq!(read_config.initial_rate, 6000.0);
+        // Test that AIMD is disabled with empty storage options
+        let empty_options = HashMap::new();
+        assert!(!is_aimd_enabled(Some(&empty_options)));
 
-        let write_config = AimdConfig::default_for_operation(OperationType::Write);
-        assert_eq!(write_config.initial_rate, 4000.0);
+        // Test that AIMD is disabled with unrelated storage options
+        let mut unrelated_options = HashMap::new();
+        unrelated_options.insert("some.other.option".to_string(), "value".to_string());
+        assert!(!is_aimd_enabled(Some(&unrelated_options)));
+    }
 
-        // Test fallback to generic initial rate
-        std::env::remove_var("LANCE_AIMD_READ_INITIAL_RATE");
-        std::env::remove_var("LANCE_AIMD_WRITE_INITIAL_RATE");
-        std::env::set_var("LANCE_AIMD_INITIAL_RATE", "2000");
+    #[test]
+    fn test_aimd_config_storage_options() {
+        // Create storage options with AIMD configuration
+        let mut storage_options = HashMap::new();
+        storage_options.insert("lance.aimd.enabled".to_string(), "true".to_string());
+        storage_options.insert("lance.aimd.read.initial_rate".to_string(), "7000".to_string());
+        storage_options.insert("lance.aimd.write.initial_rate".to_string(), "4500".to_string());
+        storage_options.insert("lance.aimd.increase_increment".to_string(), "0.2".to_string());
+        storage_options.insert("lance.aimd.reduction_factor".to_string(), "3.0".to_string());
+        storage_options.insert("lance.aimd.min_rate".to_string(), "50".to_string());
+        storage_options.insert("lance.aimd.adjust_window".to_string(), "5".to_string());
 
-        let read_config2 = AimdConfig::default_for_operation(OperationType::Read);
-        assert_eq!(read_config2.initial_rate, 2000.0);
+        // Test that storage options are parsed correctly for read operations
+        let read_config = AimdConfig::from_storage_options(
+            OperationType::Read,
+            Some(&storage_options)
+        );
+        assert_eq!(read_config.initial_rate, 7000.0);
+        assert_eq!(read_config.increase_increment, 0.2);
+        assert_eq!(read_config.reduction_factor, 3.0);
+        assert_eq!(read_config.min_rate, 50.0);
+        assert_eq!(read_config.adjust_window, 5);
 
-        let write_config2 = AimdConfig::default_for_operation(OperationType::Write);
-        assert_eq!(write_config2.initial_rate, 2000.0);
+        // Test that storage options are parsed correctly for write operations
+        let write_config = AimdConfig::from_storage_options(
+            OperationType::Write,
+            Some(&storage_options)
+        );
+        assert_eq!(write_config.initial_rate, 4500.0);
+        assert_eq!(write_config.increase_increment, 0.2);
+        assert_eq!(write_config.reduction_factor, 3.0);
+        assert_eq!(write_config.min_rate, 50.0);
+        assert_eq!(write_config.adjust_window, 5);
 
-        // Clean up
-        std::env::remove_var("LANCE_AIMD_INITIAL_RATE");
+        // Test generic initial rate fallback
+        let mut generic_options = HashMap::new();
+        generic_options.insert("lance.aimd.initial_rate".to_string(), "1500".to_string());
+
+        let generic_config = AimdConfig::from_storage_options(
+            OperationType::Read,
+            Some(&generic_options)
+        );
+        assert_eq!(generic_config.initial_rate, 1500.0);
+
+        // Test that AIMD can be disabled via storage options
+        let mut disabled_options = HashMap::new();
+        disabled_options.insert("lance.aimd.enabled".to_string(), "false".to_string());
+        assert!(!is_aimd_enabled(Some(&disabled_options)));
+
+        // Test that AIMD is enabled by default when options are set
+        let mut enabled_options = HashMap::new();
+        enabled_options.insert("lance.aimd.initial_rate".to_string(), "2000".to_string());
+        assert!(is_aimd_enabled(Some(&enabled_options)));
     }
 
     /// Create a throttled store that simulates S3 throttling
@@ -532,14 +617,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_aimd_with_throttling() {
-        // Set up environment for AIMD
-        std::env::set_var("LANCE_AIMD_ENABLED", "true");
-        std::env::set_var("LANCE_AIMD_WRITE_INITIAL_RATE", "3500");
-        std::env::set_var("LANCE_AIMD_MIN_RATE", "0.1");
-        std::env::set_var("LANCE_AIMD_MAX_RATE", "10000");
-        std::env::set_var("LANCE_AIMD_INCREASE_INCREMENT", "0.1");
-        std::env::set_var("LANCE_AIMD_REDUCTION_FACTOR", "2");
-        std::env::set_var("LANCE_AIMD_ADJUST_WINDOW", "2");
+        // Create storage options with AIMD configuration
+        let mut storage_options = HashMap::new();
+        storage_options.insert("lance.aimd.enabled".to_string(), "true".to_string());
+        storage_options.insert("lance.aimd.write.initial_rate".to_string(), "3500".to_string());
+        storage_options.insert("lance.aimd.min_rate".to_string(), "0.1".to_string());
+        storage_options.insert("lance.aimd.max_rate".to_string(), "10000".to_string());
+        storage_options.insert("lance.aimd.increase_increment".to_string(), "0.1".to_string());
+        storage_options.insert("lance.aimd.reduction_factor".to_string(), "2".to_string());
+        storage_options.insert("lance.aimd.adjust_window".to_string(), "2".to_string());
 
         // Create a memory store wrapped with throttling
         let memory_store = object_store::memory::InMemory::new();
@@ -553,7 +639,7 @@ mod tests {
             true,
             16,
             3,
-            None,
+            Some(&storage_options),
         );
 
         // Create object writer with AIMD enabled
@@ -572,14 +658,5 @@ mod tests {
         // Complete the write
         let result = writer.shutdown().await.unwrap();
         assert_eq!(result.size, chunk_size * 5);
-
-        // Clean up
-        std::env::remove_var("LANCE_AIMD_ENABLED");
-        std::env::remove_var("LANCE_AIMD_WRITE_INITIAL_RATE");
-        std::env::remove_var("LANCE_AIMD_MIN_RATE");
-        std::env::remove_var("LANCE_AIMD_MAX_RATE");
-        std::env::remove_var("LANCE_AIMD_INCREASE_INCREMENT");
-        std::env::remove_var("LANCE_AIMD_REDUCTION_FACTOR");
-        std::env::remove_var("LANCE_AIMD_ADJUST_WINDOW");
     }
 }

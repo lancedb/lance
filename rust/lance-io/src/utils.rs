@@ -308,7 +308,7 @@ mod tests {
         object_writer.shutdown().await.unwrap();
 
         let object_reader =
-            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT, None)
                 .unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);

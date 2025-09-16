@@ -159,8 +159,14 @@ impl UploadState {
 
 impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
-        let aimd_controller = if aimd::is_aimd_enabled() {
-            Some(AimdController::new_for_operation(aimd::OperationType::Write))
+        // Check if AIMD is enabled via storage options
+        let storage_options = Some(&object_store.storage_options);
+        let aimd_controller = if aimd::is_aimd_enabled(storage_options) {
+            let config = aimd::AimdConfig::from_storage_options(
+                aimd::OperationType::Write,
+                storage_options,
+            );
+            Some(AimdController::with_config(config))
         } else {
             None
         };
