@@ -672,6 +672,7 @@ fn inner_create_index(
         | IndexType::IvfFlat
         | IndexType::IvfSq
         | IndexType::IvfPq
+        | IndexType::IvfRq
         | IndexType::IvfHnswSq
         | IndexType::IvfHnswPq
         | IndexType::IvfHnswFlat => {
