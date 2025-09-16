@@ -15,11 +15,13 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.operation.Operation;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -31,11 +33,11 @@ public class Transaction {
   private final long readVersion;
   private final String uuid;
   private final Map<String, String> writeParams;
-  private final Map<String, String> transactionProperties;
+  private final Optional<Map<String, String>> transactionProperties;
   // Mainly for JNI usage
   private final Dataset dataset;
   private final Operation operation;
-  private final Operation blobOp;
+  private final Optional<Operation> blobOp;
 
   private Transaction(
       Dataset dataset,
@@ -49,10 +51,9 @@ public class Transaction {
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
-    this.blobOp = blobOp;
+    this.blobOp = Optional.ofNullable(blobOp);
     this.writeParams = writeParams != null ? writeParams : new HashMap<>();
-    this.transactionProperties =
-        transactionProperties != null ? transactionProperties : new HashMap<>();
+    this.transactionProperties = Optional.ofNullable(transactionProperties);
   }
 
   public long readVersion() {
@@ -67,7 +68,7 @@ public class Transaction {
     return operation;
   }
 
-  public Operation blobsOperation() {
+  public Optional<Operation> blobsOperation() {
     return blobOp;
   }
 
@@ -75,7 +76,7 @@ public class Transaction {
     return writeParams;
   }
 
-  public Map<String, String> transactionProperties() {
+  public Optional<Map<String, String>> transactionProperties() {
     return transactionProperties;
   }
 
@@ -88,16 +89,19 @@ public class Transaction {
 
   public void release() {
     operation.release();
-    if (blobOp != null) {
-      blobOp.release();
-    }
+    blobOp.ifPresent(Operation::release);
   }
 
   @Override
   public String toString() {
-    return String.format(
-        "Transaction{readVersion=%d, uuid='%s', operation=%s, blobOp=%s}",
-        readVersion, uuid, operation, blobOp);
+    return MoreObjects.toStringHelper(this)
+        .add("readVersion", readVersion)
+        .add("uuid", uuid)
+        .add("operation", operation)
+        .add("writeParams", writeParams)
+        .add("blobOp", blobOp)
+        .add("transactionProperties", transactionProperties)
+        .toString();
   }
 
   @Override
@@ -149,6 +153,11 @@ public class Transaction {
     public Builder operation(Operation operation) {
       validateState();
       this.operation = operation;
+      return this;
+    }
+
+    public Builder blobsOperation(Operation blobOp) {
+      this.blobOp = blobOp;
       return this;
     }
 

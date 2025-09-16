@@ -11,7 +11,7 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::{DFSchema, SchemaExt};
+use datafusion::common::{exec_datafusion_err, DFSchema, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{col, lit, Expr};
@@ -1815,7 +1815,11 @@ impl Scanner {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            plan = Arc::new(SortExec::new(LexOrdering::new(col_exprs), plan));
+            plan = Arc::new(SortExec::new(
+                LexOrdering::new(col_exprs)
+                    .ok_or(exec_datafusion_err!("Unexpected empty sort expressions"))?,
+                plan,
+            ));
         }
 
         // Stage 4: limit / offset
@@ -2433,7 +2437,7 @@ impl Scanner {
                 };
 
                 Arc::new(
-                    SortExec::new(LexOrdering::new(vec![sort_expr]), fts_node)
+                    SortExec::new([sort_expr].into(), fts_node)
                         .with_fetch(self.limit.map(|l| l as usize)),
                 )
             }
@@ -2490,7 +2494,7 @@ impl Scanner {
                             &datafusion_expr::JoinType::Inner,
                             None,
                             datafusion_physical_plan::joins::PartitionMode::CollectLeft,
-                            false,
+                            NullEquality::NullEqualsNothing,
                         )?) as _);
                     } else {
                         must = Some(plan);
@@ -2621,10 +2625,8 @@ impl Scanner {
                     nulls_first: false,
                 },
             };
-            match_plan = Arc::new(
-                SortExec::new(LexOrdering::new(vec![sort_expr]), match_plan)
-                    .with_fetch(params.limit),
-            );
+            match_plan =
+                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit));
         }
         Ok(match_plan)
     }
@@ -3153,7 +3155,7 @@ impl Scanner {
 
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
-            LexOrdering::new(vec![
+            [
                 PhysicalSortExpr {
                     expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
                     options: SortOptions {
@@ -3168,7 +3170,8 @@ impl Scanner {
                         nulls_first: false,
                     },
                 },
-            ]),
+            ]
+            .into(),
             knn_plan,
         )
         .with_fetch(Some(q.k));
@@ -3230,11 +3233,8 @@ impl Scanner {
             },
         };
         Ok(Arc::new(
-            SortExec::new(
-                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                inner_fanout_search,
-            )
-            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new([sort_expr, sort_expr_row_id].into(), inner_fanout_search)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
     }
 
@@ -3292,11 +3292,8 @@ impl Scanner {
                 },
             };
             let ann_node = Arc::new(
-                SortExec::new(
-                    LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                    ann_node,
-                )
-                .with_fetch(Some(q.k * over_fetch_factor as usize)),
+                SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
+                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
             );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
@@ -3318,11 +3315,8 @@ impl Scanner {
             },
         };
         let ann_node = Arc::new(
-            SortExec::new(
-                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                ann_node,
-            )
-            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         );
 
         Ok(ann_node)

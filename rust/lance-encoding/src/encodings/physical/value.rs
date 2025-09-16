@@ -813,6 +813,21 @@ pub(crate) mod tests {
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
 
+    #[test_log::test(tokio::test)]
+    async fn test_simple_range() {
+        let items = Arc::new(Int32Array::from_iter((0..5000).map(|i| {
+            if i % 2 == 0 {
+                Some(i)
+            } else {
+                None
+            }
+        })));
+
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
+    }
+
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_value_primitive(

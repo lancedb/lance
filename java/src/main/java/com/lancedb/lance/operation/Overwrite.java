@@ -15,11 +15,13 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Overwrite the dataset with new fragments. This operation will overwrite the existing dataset.
@@ -27,22 +29,21 @@ import java.util.Objects;
  * 2. If we want to create a new Dataset, use {@link com.lancedb.lance.Dataset}.create instead.
  */
 public class Overwrite extends SchemaOperation {
-
   private final List<FragmentMetadata> fragments;
-  private final Map<String, String> configUpsertValues;
+  private final Optional<Map<String, String>> configUpsertValues;
 
   protected Overwrite(
       List<FragmentMetadata> fragments, Schema schema, Map<String, String> configUpsertValues) {
     super(schema);
     this.fragments = fragments;
-    this.configUpsertValues = configUpsertValues;
+    this.configUpsertValues = Optional.ofNullable(configUpsertValues);
   }
 
   public List<FragmentMetadata> fragments() {
     return fragments;
   }
 
-  public Map<String, String> configUpsertValues() {
+  public Optional<Map<String, String>> configUpsertValues() {
     return configUpsertValues;
   }
 
@@ -57,14 +58,11 @@ public class Overwrite extends SchemaOperation {
 
   @Override
   public String toString() {
-    return "Overwrite{"
-        + "fragments="
-        + fragments
-        + ", schema="
-        + schema()
-        + ", configUpsertValues="
-        + configUpsertValues
-        + '}';
+    return MoreObjects.toStringHelper(this)
+        .add("fragments", fragments)
+        .add("schema", schema())
+        .add("configUpsertValues", configUpsertValues)
+        .toString();
   }
 
   @Override

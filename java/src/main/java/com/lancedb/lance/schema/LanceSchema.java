@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance.schema;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.Collections;
@@ -21,7 +22,6 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 public class LanceSchema {
-
   private final List<LanceField> fields;
   private final Map<String, String> metadata;
 
@@ -41,6 +41,14 @@ public class LanceSchema {
   public Schema asArrowSchema() {
     return new Schema(
         fields.stream().map(LanceField::asArrowField).collect(Collectors.toList()), metadata);
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("fields", fields)
+        .add("metadata", metadata)
+        .toString();
   }
 
   // Builder class for LanceSchema

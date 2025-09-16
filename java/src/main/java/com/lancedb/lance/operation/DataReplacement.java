@@ -15,6 +15,8 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.fragment.DataFile;
 
+import com.google.common.base.MoreObjects;
+
 import java.util.List;
 import java.util.Objects;
 
@@ -30,7 +32,6 @@ import java.util.Objects;
  * columns all have the same datafile layout across the fragments being replaced.
  */
 public class DataReplacement implements Operation {
-
   private final List<DataReplacementGroup> replacements;
 
   private DataReplacement(List<DataReplacementGroup> replacements) {
@@ -53,7 +54,7 @@ public class DataReplacement implements Operation {
 
   @Override
   public String toString() {
-    return "DataReplacement{" + "replacements=" + replacements + '}';
+    return MoreObjects.toStringHelper(this).add("replacements", replacements).toString();
   }
 
   @Override
@@ -149,12 +150,10 @@ public class DataReplacement implements Operation {
 
     @Override
     public String toString() {
-      return "DataReplacementGroup{"
-          + "fragmentId="
-          + fragmentId
-          + ", replacedFile="
-          + replacedFile
-          + '}';
+      return MoreObjects.toStringHelper(this)
+          .add("fragmentId", fragmentId)
+          .add("replacedFile", replacedFile)
+          .toString();
     }
   }
 }

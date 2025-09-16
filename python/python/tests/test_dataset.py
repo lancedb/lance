@@ -2222,6 +2222,54 @@ def test_merge_insert_explain_analyze_plan():
     assert "num_files_written" in analysis
 
 
+def test_merge_insert_use_index():
+    """Test that use_index parameter controls whether indices are used."""
+    data = pa.table({"id": range(100), "value": [i * 10 for i in range(100)]})
+    dataset = lance.write_dataset(data, "memory://test-merge-use-index")
+    dataset.create_scalar_index("id", "BTREE")
+
+    source_data = pa.table({"id": [1, 2, 101], "value": [999, 999, 999]})
+
+    # Test 1: use_index=False should allow explain_plan to succeed
+    builder_no_index = (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .use_index(False)  # Force not using index
+    )
+
+    # With use_index=False, explain_plan should succeed even with an index present
+    plan = builder_no_index.explain_plan()
+    assert isinstance(plan, str)
+    assert "MergeInsert" in plan
+    # Should use hash join, not index scan
+    assert "HashJoinExec" in plan or "Join" in plan
+
+    # Test 2: use_index=True (default) should fail explain_plan with index present
+    builder_with_index = (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .use_index(True)  # Explicitly set to use index (though it's the default)
+    )
+
+    # With use_index=True and an index present, explain_plan should fail
+    with pytest.raises(Exception) as exc_info:
+        builder_with_index.explain_plan()
+    assert "does not support explain_plan" in str(exc_info.value)
+
+    # Test 3: Verify actual execution works with no index
+    result = builder_no_index.execute(source_data)
+    assert result["num_updated_rows"] == 2
+    assert result["num_inserted_rows"] == 1
+
+    # Verify the data was updated correctly
+    updated_table = dataset.to_table()
+    values = updated_table.column("value").to_pylist()
+    updated_count = sum(1 for v in values if v == 999)
+    assert updated_count == 3
+
+
 def test_add_null_columns(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)

@@ -46,6 +46,7 @@ pub mod ffi;
 mod file_reader;
 mod file_writer;
 mod fragment;
+mod merge_insert;
 mod schema;
 mod sql;
 pub mod traits;
@@ -57,6 +58,7 @@ pub use error::Result;
 pub use ffi::JNIEnvExt;
 
 use env_logger::{Builder, Env};
+use std::env;
 use std::sync::Arc;
 
 use std::sync::LazyLock;
@@ -68,12 +70,39 @@ pub static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("Failed to create tokio runtime")
 });
 
+fn set_timestamp_precision(builder: &mut env_logger::Builder) {
+    if let Ok(timestamp_precision) = env::var("LANCE_LOG_TS_PRECISION") {
+        match timestamp_precision.as_str() {
+            "ns" => {
+                builder.format_timestamp_nanos();
+            }
+            "us" => {
+                builder.format_timestamp_micros();
+            }
+            "ms" => {
+                builder.format_timestamp_millis();
+            }
+            "s" => {
+                builder.format_timestamp_secs();
+            }
+            _ => {
+                // Can't log here because logging is not initialized yet
+                println!(
+                    "Invalid timestamp precision (valid values: ns, us, ms, s): {}, using default",
+                    timestamp_precision
+                );
+            }
+        };
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_JniLoader_initLanceLogger() {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
     let mut log_builder = Builder::from_env(env);
+    set_timestamp_precision(&mut log_builder);
     let logger = Arc::new(log_builder.build());
     let max_level = logger.filter();
     log::set_boxed_logger(Box::new(logger.clone())).unwrap();

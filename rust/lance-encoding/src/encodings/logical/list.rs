@@ -3,7 +3,7 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, LargeListArray, ListArray};
+use arrow_array::{cast::AsArray, make_array, Array, ArrayRef, LargeListArray, ListArray};
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use lance_arrow::deepcopy::deep_copy_nulls;
@@ -202,7 +202,13 @@ impl StructuralDecodeArrayTask for StructuralListDecodeTask {
         match &self.data_type {
             DataType::List(child_field) => {
                 let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
+                let array = if !child_field.is_nullable() && array.null_count() == array.len() {
+                    make_array(array.into_data().into_builder().nulls(None).build()?)
+                } else {
+                    array
+                };
                 let list_array = ListArray::try_new(child_field.clone(), offsets, array, validity)?;
+
                 Ok(DecodedArray {
                     array: Arc::new(list_array),
                     repdef,
@@ -452,6 +458,37 @@ mod tests {
 
     #[rstest]
     #[test_log::test(tokio::test)]
+    async fn test_simple_string_list_no_null(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let items_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_value([Some("a"), Some("bc"), Some("def")]);
+        list_builder.append_value([Some("gh"), Some("zxy")]);
+        list_builder.append_value([Some("gh"), Some("z")]);
+        list_builder.append_value([Some("ijk"), Some("lmnop"), Some("qrs")]);
+        let list_array = list_builder.finish();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![1, 3])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
     async fn test_simple_sliced_list(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
@@ -503,6 +540,35 @@ mod tests {
             .with_indices(vec![2]);
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array)],
+            &test_cases,
+            HashMap::default(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_list_all_null() {
+        let items = UInt64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 5, 8, 10]);
+        let offsets = OffsetBuffer::new(offsets);
+        let list_validity = NullBuffer::new(BooleanBuffer::from(vec![false, false, false]));
+
+        // The list array is nullable but the items are not.  Then, all lists are null.
+        let list_arr = ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt64, false)),
+            offsets,
+            Arc::new(items),
+            Some(list_validity),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(1..2)
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_arr)],
             &test_cases,
             HashMap::default(),
         )
@@ -760,6 +826,20 @@ mod tests {
         let test_cases = test_cases.with_batch_size(1);
         check_round_trip_encoding_of_data(vec![struct_array], &test_cases, field_metadata.clone())
             .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_empty_list_list() {
+        let items_builder = Int32Builder::new();
+        let list_builder = ListBuilder::new(items_builder);
+        let mut outer_list_builder = ListBuilder::new(list_builder);
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        outer_list_builder.append_null();
+        let list_array = Arc::new(outer_list_builder.finish());
+
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
     #[rstest]

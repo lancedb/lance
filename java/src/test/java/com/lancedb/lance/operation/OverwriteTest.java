@@ -78,7 +78,8 @@ public class OverwriteTest extends OperationTestBase {
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
               .build();
-      assertEquals("value", transaction.transactionProperties().get("key"));
+      assertEquals(
+          "value", transaction.transactionProperties().map(m -> m.get("key")).orElse(null));
       try (Dataset dataset = transaction.commit()) {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());

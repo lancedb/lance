@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.time.ZonedDateTime;
 import java.util.Objects;
@@ -45,10 +45,10 @@ public class Version {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("id", id)
-        .append("dataTime", dataTime)
-        .append("metadata", metadata)
+    return MoreObjects.toStringHelper(this)
+        .add("id", id)
+        .add("dataTime", dataTime)
+        .add("metadata", metadata)
         .toString();
   }
 

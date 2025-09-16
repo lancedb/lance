@@ -21,7 +21,7 @@ pub use deepsize::{Context, DeepSizeOf};
 type ArcAny = Arc<dyn Any + Send + Sync>;
 
 #[derive(Clone)]
-struct SizedRecord {
+pub struct SizedRecord {
     record: ArcAny,
     size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
 }
@@ -31,6 +31,12 @@ impl std::fmt::Debug for SizedRecord {
         f.debug_struct("SizedRecord")
             .field("record", &self.record)
             .finish()
+    }
+}
+
+impl DeepSizeOf for SizedRecord {
+    fn deep_size_of_children(&self, _: &mut Context) -> usize {
+        (self.size_accessor)(&self.record)
     }
 }
 
@@ -321,6 +327,231 @@ impl LanceCache {
         self.get_unsized::<K::ValueType>(&cache_key.key())
             .boxed()
             .await
+    }
+}
+
+/// A weak reference to a LanceCache, used by indices to avoid circular references.
+/// When the original cache is dropped, operations on this will gracefully no-op.
+#[derive(Clone, Debug)]
+pub struct WeakLanceCache {
+    inner: std::sync::Weak<Cache<(String, TypeId), SizedRecord>>,
+    prefix: String,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
+}
+
+impl WeakLanceCache {
+    /// Create a weak reference from a strong LanceCache
+    pub fn from(cache: &LanceCache) -> Self {
+        Self {
+            inner: Arc::downgrade(&cache.cache),
+            prefix: cache.prefix.clone(),
+            hits: cache.hits.clone(),
+            misses: cache.misses.clone(),
+        }
+    }
+
+    /// Appends a prefix to the cache key
+    pub fn with_key_prefix(&self, prefix: &str) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            prefix: format!("{}{}/", self.prefix, prefix),
+            hits: self.hits.clone(),
+            misses: self.misses.clone(),
+        }
+    }
+
+    fn get_key(&self, key: &str) -> String {
+        if self.prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}/{}", self.prefix, key)
+        }
+    }
+
+    /// Get an item from cache if the cache is still alive
+    pub async fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
+        let cache = self.inner.upgrade()?;
+        let key = self.get_key(key);
+        if let Some(metadata) = cache.get(&(key, TypeId::of::<T>())).await {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(metadata.record.clone().downcast::<T>().unwrap())
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Insert an item if the cache is still alive
+    /// Returns true if the item was inserted, false if the cache is no longer available
+    pub async fn insert<T: DeepSizeOf + Send + Sync + 'static>(
+        &self,
+        key: &str,
+        value: Arc<T>,
+    ) -> bool {
+        if let Some(cache) = self.inner.upgrade() {
+            let key = self.get_key(key);
+            let record = SizedRecord::new(value);
+            cache.insert((key, TypeId::of::<T>()), record).await;
+            true
+        } else {
+            log::warn!("WeakLanceCache: cache no longer available, unable to insert item");
+            false
+        }
+    }
+
+    /// Get or insert an item, computing it if necessary
+    pub async fn get_or_insert<T, F, Fut>(&self, key: &str, f: F) -> Result<Arc<T>>
+    where
+        T: DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T>> + Send,
+    {
+        if let Some(cache) = self.inner.upgrade() {
+            let full_key = self.get_key(key);
+            let cache_key = (full_key.clone(), TypeId::of::<T>());
+
+            // Use optionally_get_with to handle concurrent requests properly
+            let hits = self.hits.clone();
+            let misses = self.misses.clone();
+
+            // Track whether init was run (for metrics)
+            let (init_run_tx, mut init_run_rx) = tokio::sync::oneshot::channel();
+            let (error_tx, error_rx) = tokio::sync::oneshot::channel();
+
+            let init = Box::pin(async move {
+                let _ = init_run_tx.send(());
+                misses.fetch_add(1, Ordering::Relaxed);
+                match f().await {
+                    Ok(value) => Some(SizedRecord::new(Arc::new(value))),
+                    Err(e) => {
+                        let _ = error_tx.send(e);
+                        None
+                    }
+                }
+            });
+
+            match cache.optionally_get_with(cache_key, init).await {
+                Some(record) => {
+                    // Check if init was run or if this was a cache hit
+                    match init_run_rx.try_recv() {
+                        Ok(()) => {
+                            // Init was run, miss was already recorded
+                        }
+                        Err(_) => {
+                            // Init was not run, this was a cache hit
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(record.record.clone().downcast::<T>().unwrap())
+                }
+                None => {
+                    // Init returned None, which means there was an error
+                    match error_rx.await {
+                        Ok(e) => Err(e),
+                        Err(_) => Err(crate::Error::Internal {
+                            message: "Failed to receive error from cache init function".to_string(),
+                            location: location!(),
+                        }),
+                    }
+                }
+            }
+        } else {
+            log::warn!("WeakLanceCache: cache no longer available, computing without caching");
+            f().await.map(Arc::new)
+        }
+    }
+
+    /// Get or insert an item with a cache key type
+    pub async fn get_or_insert_with_key<K, F, Fut>(
+        &self,
+        cache_key: K,
+        loader: F,
+    ) -> Result<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<K::ValueType>> + Send,
+    {
+        let key_str = cache_key.key().into_owned();
+        self.get_or_insert(&key_str, loader).await
+    }
+
+    /// Insert with a cache key type
+    /// Returns true if the item was inserted, false if the cache is no longer available
+    pub async fn insert_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>) -> bool
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key_str = cache_key.key().into_owned();
+        self.insert(&key_str, value).await
+    }
+
+    /// Get with a cache key type
+    pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key_str = cache_key.key().into_owned();
+        self.get(&key_str).await
+    }
+
+    /// Get unsized item from cache
+    pub async fn get_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
+        &self,
+        key: &str,
+    ) -> Option<Arc<T>> {
+        // For unsized types, we store Arc<T> directly
+        let cache = self.inner.upgrade()?;
+        let key = self.get_key(key);
+        if let Some(metadata) = cache.get(&(key, TypeId::of::<Arc<T>>())).await {
+            metadata
+                .record
+                .clone()
+                .downcast::<Arc<T>>()
+                .ok()
+                .map(|arc| arc.as_ref().clone())
+        } else {
+            None
+        }
+    }
+
+    /// Insert unsized item into cache
+    pub async fn insert_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
+        &self,
+        key: &str,
+        value: Arc<T>,
+    ) {
+        if let Some(cache) = self.inner.upgrade() {
+            let key = self.get_key(key);
+            let record = SizedRecord::new(Arc::new(value));
+            cache.insert((key, TypeId::of::<Arc<T>>()), record).await;
+        } else {
+            log::warn!("WeakLanceCache: cache no longer available, unable to insert unsized item");
+        }
+    }
+
+    /// Get unsized with a cache key type
+    pub async fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
+    where
+        K: UnsizedCacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key_str = cache_key.key();
+        self.get_unsized(&key_str).await
+    }
+
+    /// Insert unsized with a cache key type
+    pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>)
+    where
+        K: UnsizedCacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    {
+        let key_str = cache_key.key();
+        self.insert_unsized(&key_str, value).await
     }
 }
 

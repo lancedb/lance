@@ -15,13 +15,13 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
 import java.util.List;
 import java.util.Objects;
 
 public class Append implements Operation {
-
   private final List<FragmentMetadata> fragments;
 
   private Append(List<FragmentMetadata> fragments) {
@@ -49,7 +49,7 @@ public class Append implements Operation {
 
   @Override
   public String toString() {
-    return "Append{" + "fragments=" + fragments + '}';
+    return MoreObjects.toStringHelper(this).add("fragments", fragments).toString();
   }
 
   public static Builder builder() {

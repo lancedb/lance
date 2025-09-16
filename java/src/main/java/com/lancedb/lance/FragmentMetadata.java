@@ -17,7 +17,7 @@ import com.lancedb.lance.fragment.DataFile;
 import com.lancedb.lance.fragment.DeletionFile;
 import com.lancedb.lance.fragment.RowIdMeta;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
 import java.util.List;
@@ -98,12 +98,12 @@ public class FragmentMetadata implements Serializable {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("id", id)
-        .append("physicalRows", physicalRows)
-        .append("files", files)
-        .append("deletionFile", deletionFile)
-        .append("rowIdMeta", rowIdMeta)
+    return MoreObjects.toStringHelper(this)
+        .add("id", id)
+        .add("physicalRows", physicalRows)
+        .add("files", files)
+        .add("deletionFile", deletionFile)
+        .add("rowIdMeta", rowIdMeta)
         .toString();
   }
 }

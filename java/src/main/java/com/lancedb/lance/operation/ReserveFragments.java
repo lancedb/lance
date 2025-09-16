@@ -13,8 +13,11 @@
  */
 package com.lancedb.lance.operation;
 
+import com.google.common.base.MoreObjects;
+
 /** ReserveFragments operation to reserve fragment IDs for future use. */
 public class ReserveFragments implements Operation {
+
   private final int numFragments;
 
   private ReserveFragments(int numFragments) {
@@ -37,7 +40,7 @@ public class ReserveFragments implements Operation {
 
   @Override
   public String toString() {
-    return "ReserveFragments{" + "numFragments=" + numFragments + '}';
+    return MoreObjects.toStringHelper(this).add("numFragments", numFragments).toString();
   }
 
   @Override

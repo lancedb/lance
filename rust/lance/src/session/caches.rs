@@ -12,6 +12,7 @@
 
 use std::{borrow::Cow, ops::Deref};
 
+use deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, LanceCache},
     utils::{deletion::DeletionVector, mask::RowIdMask},
@@ -44,6 +45,12 @@ impl GlobalMetadataCache {
 impl Clone for GlobalMetadataCache {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+impl DeepSizeOf for GlobalMetadataCache {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.0.deep_size_of_children(context)
     }
 }
 

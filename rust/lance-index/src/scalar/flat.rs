@@ -334,6 +334,11 @@ impl ScalarIndex for FlatIndex {
     fn update_criteria(&self) -> UpdateCriteria {
         unimplemented!()
     }
+
+    fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
+        // FlatIndex is used internally and doesn't have user-configurable parameters
+        unimplemented!("FlatIndex is an internal index type and cannot be recreated")
+    }
 }
 
 #[cfg(test)]

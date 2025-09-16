@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance.operation;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
@@ -21,7 +22,6 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * positions, not ids(a.k.a. field id)
  */
 public class Project extends SchemaOperation {
-
   private Project(Schema schema) {
     super(schema);
   }
@@ -33,7 +33,7 @@ public class Project extends SchemaOperation {
 
   @Override
   public String toString() {
-    return "Project{" + "schema=" + +'}';
+    return MoreObjects.toStringHelper(this).add("schema", schema()).toString();
   }
 
   public static Builder builder() {

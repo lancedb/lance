@@ -213,6 +213,11 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.use_index(use_index);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -386,7 +391,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None))]
     fn new(
         py: Python,
         uri: String,
@@ -400,6 +405,7 @@ impl Dataset {
         metadata_cache_size_bytes: Option<usize>,
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -482,6 +488,10 @@ impl Dataset {
             builder = builder.with_serialized_manifest(manifest).infer_error()?;
         }
 
+        if let Some(session) = session {
+            builder = builder.with_session(session.inner.clone());
+        }
+
         let dataset = RT.block_on(Some(py), builder.load())?;
 
         match dataset {
@@ -489,7 +499,6 @@ impl Dataset {
                 uri,
                 ds: Arc::new(ds),
             }),
-            // TODO: return an appropriate error type, such as IOError or NotFound.
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }
@@ -1486,6 +1495,7 @@ impl Dataset {
             "BITMAP" => IndexType::Bitmap,
             "NGRAM" => IndexType::NGram,
             "ZONEMAP" => IndexType::ZoneMap,
+            "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
@@ -1519,6 +1529,10 @@ impl Dataset {
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 index_type: "label_list".to_string(),
+                params: None,
+            }),
+            "BLOOMFILTER" => Box::new(ScalarIndexParams {
+                index_type: "bloomfilter".to_string(),
                 params: None,
             }),
             "SCALAR" => {

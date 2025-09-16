@@ -204,7 +204,7 @@ fn bench_warm_indexed(c: &mut Criterion) {
             fixture.index_store.clone(),
             &details,
             None,
-            LanceCache::no_cache(),
+            &LanceCache::no_cache(),
         ))
         .unwrap();
 

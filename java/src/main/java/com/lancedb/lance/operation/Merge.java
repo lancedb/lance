@@ -15,9 +15,9 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
+import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.Schema;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -26,12 +26,11 @@ import java.util.Objects;
  * schema evolution and column modifications.
  */
 public class Merge extends SchemaOperation {
-
   private final List<FragmentMetadata> fragments;
 
   protected Merge(List<FragmentMetadata> fragments, Schema schema) {
     super(schema);
-    this.fragments = fragments != null ? fragments : new ArrayList<>();
+    this.fragments = fragments;
   }
 
   public List<FragmentMetadata> fragments() {
@@ -45,7 +44,10 @@ public class Merge extends SchemaOperation {
 
   @Override
   public String toString() {
-    return "Merge{" + "fragments=" + fragments + ", schema=" + schema() + '}';
+    return MoreObjects.toStringHelper(this)
+        .add("fragments", fragments)
+        .add("schema", schema())
+        .toString();
   }
 
   @Override

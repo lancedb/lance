@@ -23,7 +23,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
@@ -119,7 +119,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     distance_type: DistanceType,
 
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -226,7 +226,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
-            index_cache,
+            index_cache: WeakLanceCache::from(&index_cache),
             _marker: PhantomData,
         })
     }

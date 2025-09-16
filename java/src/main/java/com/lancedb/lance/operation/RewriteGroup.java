@@ -15,7 +15,7 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.util.List;
 import java.util.Objects;
@@ -25,6 +25,7 @@ import java.util.Objects;
  * lance/rust/lance/src/dataset/transaction.rs.
  */
 public class RewriteGroup {
+
   private final List<FragmentMetadata> oldFragments;
   private final List<FragmentMetadata> newFragments;
 
@@ -33,11 +34,11 @@ public class RewriteGroup {
     this.newFragments = newFragments;
   }
 
-  public List<FragmentMetadata> getOldFragments() {
+  public List<FragmentMetadata> oldFragments() {
     return oldFragments;
   }
 
-  public List<FragmentMetadata> getNewFragments() {
+  public List<FragmentMetadata> newFragments() {
     return newFragments;
   }
 
@@ -57,9 +58,9 @@ public class RewriteGroup {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("oldFragments", oldFragments)
-        .append("newFragments", newFragments)
+    return MoreObjects.toStringHelper(this)
+        .add("oldFragments", oldFragments)
+        .add("newFragments", newFragments)
         .toString();
   }
 

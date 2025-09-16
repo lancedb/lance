@@ -9,7 +9,8 @@ use crate::{
     format::pb21::{compressive_encoding::Compression, BufferCompression, CompressiveEncoding},
 };
 
-use arrow_array::{Array, StructArray, UInt64Array};
+use arrow_array::{make_array, Array, StructArray, UInt64Array};
+use arrow_data::transform::{Capacities, MutableArrayData};
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
@@ -18,7 +19,7 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{cache::LanceCache, utils::bit::pad_bytes, Result};
+use lance_core::{utils::bit::pad_bytes, Result};
 use lance_datagen::{array, gen_batch, ArrayGenerator, RowCount, Seed};
 
 use crate::{
@@ -168,7 +169,9 @@ async fn test_decode(
     ) -> BoxFuture<'static, ()>,
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
-    let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
+    let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+        128 * 1024 * 1024,
+    ));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
@@ -335,10 +338,9 @@ pub async fn check_round_trip_encoding_generated(
     }
 }
 
-fn supports_nulls(data_type: &DataType) -> bool {
-    // We don't yet have nullability support for all types.  Don't test nullability for the
-    // types we don't support.
-    !matches!(data_type, DataType::Struct(_))
+fn supports_nulls(data_type: &DataType, version: LanceFileVersion) -> bool {
+    // 2.0 doesn't support nullability for structs
+    !(matches!(data_type, DataType::Struct(_)) && version == LanceFileVersion::V2_0)
 }
 
 type EncodingVerificationFn = dyn Fn(&[EncodedColumn]);
@@ -788,6 +790,19 @@ async fn check_round_trip_encoding_inner(
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
     let concat_data = if test_cases.skip_validation {
         None
+    } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
+        // TODO(tsaucer) When arrow upgrades to 56, remove this if statement
+        // This is due to a check for concat_struct in arrow-rs. See https://github.com/lancedb/lance/pull/4598
+        let capacities = Capacities::Array(num_rows as usize);
+        let array_data: Vec<_> = data.iter().map(|a| a.to_data()).collect::<Vec<_>>();
+        let array_data = array_data.iter().collect();
+        let mut mutable = MutableArrayData::with_capacities(array_data, false, capacities);
+
+        for (i, a) in data.iter().enumerate() {
+            mutable.extend(i, 0, a.len())
+        }
+
+        Some(make_array(mutable.freeze()))
     } else {
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
@@ -924,7 +939,7 @@ async fn check_round_trip_field_encoding_random(
             }
 
             let field = if null_rate.is_some() {
-                if !supports_nulls(field.data_type()) {
+                if !supports_nulls(field.data_type(), version) {
                     continue;
                 }
                 field.clone().with_nullable(true)

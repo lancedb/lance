@@ -141,7 +141,7 @@ public class TestVectorDataset implements AutoCloseable {
 
   public void createIndex(Dataset dataset) {
     IndexParams params =
-        new IndexParams.Builder()
+        IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2))
             .build();
     dataset.createIndex(

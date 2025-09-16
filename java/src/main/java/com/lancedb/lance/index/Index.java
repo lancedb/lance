@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance.index;
 
-import org.apache.commons.lang3.builder.ToStringBuilder;
+import com.google.common.base.MoreObjects;
 
 import java.time.Instant;
 import java.util.Arrays;
@@ -145,14 +145,14 @@ public class Index {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-        .append("uuid", uuid)
-        .append("fields", fields)
-        .append("name", name)
-        .append("datasetVersion", datasetVersion)
-        .append("indexVersion", indexVersion)
-        .append("createdAt", createdAt)
-        .append("baseId", baseId)
+    return MoreObjects.toStringHelper(this)
+        .add("uuid", uuid)
+        .add("fields", fields)
+        .add("name", name)
+        .add("datasetVersion", datasetVersion)
+        .add("indexVersion", indexVersion)
+        .add("createdAt", createdAt)
+        .add("baseId", baseId)
         .toString();
   }
 

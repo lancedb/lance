@@ -38,7 +38,7 @@ use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::{
     mask::RowIdMask,
@@ -72,8 +72,8 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
-    AnyQuery, CreatedIndex, IndexReader, IndexStore, MetricsCollector, ScalarIndex, SearchResult,
-    TokenQuery, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
+    ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
 use crate::{pb, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -240,7 +240,7 @@ impl InvertedIndex {
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
         let tokens_fut = tokio::spawn({
@@ -260,10 +260,11 @@ impl InvertedIndex {
         });
         let invert_list_fut = tokio::spawn({
             let store = store.clone();
+            let index_cache_clone = index_cache.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
                 let invert_list =
-                    PostingListReader::try_new(invert_list_reader, index_cache).await?;
+                    PostingListReader::try_new(invert_list_reader, &index_cache_clone).await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -304,7 +305,7 @@ impl InvertedIndex {
     pub async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -334,11 +335,17 @@ impl InvertedIndex {
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
                     let frag_reuse_index_clone = frag_reuse_index.clone();
-                    let index_cache = index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                    let index_cache_for_part =
+                        index_cache.with_key_prefix(format!("part-{}", id).as_str());
                     async move {
                         Result::Ok(Arc::new(
-                            InvertedPartition::load(store, id, frag_reuse_index_clone, index_cache)
-                                .await?,
+                            InvertedPartition::load(
+                                store,
+                                id,
+                                frag_reuse_index_clone,
+                                &index_cache_for_part,
+                            )
+                            .await?,
                         ))
                     }
                 });
@@ -508,6 +515,20 @@ impl ScalarIndex for InvertedIndex {
             UpdateCriteria::only_new_data(criteria)
         }
     }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let mut params = self.params.clone();
+        if params.base_tokenizer.is_empty() {
+            params.base_tokenizer = "simple".to_string();
+        }
+
+        let params_json = serde_json::to_string(&params)?;
+
+        Ok(ScalarIndexParams {
+            index_type: BuiltinIndexType::Inverted.as_str().to_string(),
+            params: Some(params_json),
+        })
+    }
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
@@ -552,7 +573,7 @@ impl InvertedPartition {
         store: Arc<dyn IndexStore>,
         id: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
@@ -923,7 +944,7 @@ pub struct PostingListReader {
 
     has_position: bool,
 
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl std::fmt::Debug for PostingListReader {
@@ -946,7 +967,7 @@ impl DeepSizeOf for PostingListReader {
 impl PostingListReader {
     pub(crate) async fn try_new(
         reader: Arc<dyn IndexReader>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Self> {
         let has_position = reader.schema().field(POSITION_COL).is_some();
         let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
@@ -973,7 +994,7 @@ impl PostingListReader {
             max_scores,
             lengths,
             has_position,
-            index_cache,
+            index_cache: WeakLanceCache::from(index_cache),
         })
     }
 
@@ -1082,9 +1103,10 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
+        let cache_key = PostingListKey { token_id };
         let mut posting = self
             .index_cache
-            .get_or_insert_with_key(PostingListKey { token_id }, || async move {
+            .get_or_insert_with_key(cache_key, || async move {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
@@ -1130,7 +1152,8 @@ impl PostingListReader {
             // This ensures each cached entry has its own memory, not shared references
             let batch = batch.shrink_to_fit()?;
             let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
-            self.index_cache
+            let inserted = self
+                .index_cache
                 .insert_with_key(
                     &PostingListKey {
                         token_id: token_id as u32,
@@ -1138,6 +1161,13 @@ impl PostingListReader {
                     Arc::new(posting_list),
                 )
                 .await;
+
+            if !inserted {
+                return Err(Error::Internal {
+                    message: "Failed to prewarm index: cache is no longer available".to_string(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())
@@ -2291,7 +2321,7 @@ mod tests {
         builder.docs.append(2, 1);
         builder.write(store.as_ref()).await.unwrap();
 
-        let index = InvertedPartition::load(store.clone(), 0, None, LanceCache::no_cache())
+        let index = InvertedPartition::load(store.clone(), 0, None, &LanceCache::no_cache())
             .await
             .unwrap();
         let mut builder = index.into_builder().await.unwrap();
@@ -2370,7 +2400,8 @@ mod tests {
         writer.finish_with_metadata(metadata).await.unwrap();
 
         // Load the inverted index
-        let index = InvertedIndex::load(store.clone(), None, LanceCache::with_capacity(4096))
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
             .await
             .unwrap();
 

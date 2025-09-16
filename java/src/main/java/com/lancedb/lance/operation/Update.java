@@ -15,14 +15,16 @@ package com.lancedb.lance.operation;
 
 import com.lancedb.lance.FragmentMetadata;
 
+import com.google.common.base.MoreObjects;
+
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
 public class Update implements Operation {
-  private List<Long> removedFragmentIds;
-  private List<FragmentMetadata> updatedFragments;
-  private List<FragmentMetadata> newFragments;
+  private final List<Long> removedFragmentIds;
+  private final List<FragmentMetadata> updatedFragments;
+  private final List<FragmentMetadata> newFragments;
 
   private Update(
       List<Long> removedFragmentIds,
@@ -55,9 +57,11 @@ public class Update implements Operation {
   }
 
   public String toString() {
-    return String.format(
-        "Update{removedFragmentIds=%s, updatedFragments=%s, newFragments=%s}",
-        removedFragmentIds, updatedFragments, newFragments);
+    return MoreObjects.toStringHelper(this)
+        .add("removedFragmentIds", removedFragmentIds)
+        .add("updatedFragments", updatedFragments)
+        .add("newFragments", newFragments)
+        .toString();
   }
 
   @Override
