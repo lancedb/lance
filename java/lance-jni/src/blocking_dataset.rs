@@ -4,7 +4,10 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
-use crate::utils::{extract_storage_options, extract_write_params, get_index_params, to_rust_map};
+use crate::utils::{
+    extract_storage_options, extract_write_params, get_scalar_index_params,
+    get_vector_index_params, to_rust_map,
+};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -20,6 +23,7 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::optimize::{compact_files, CompactionOptions as RustCompactionOptions};
 use lance::dataset::refs::TagContents;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
@@ -256,6 +260,11 @@ impl BlockingDataset {
         metadata_map: HashMap<u32, HashMap<String, String>>,
     ) -> Result<()> {
         RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
+        Ok(())
+    }
+
+    pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
+        RT.block_on(compact_files(&mut self.inner, options, None))?;
         Ok(())
     }
 
@@ -631,12 +640,51 @@ fn inner_create_index(
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let name = env.get_string_opt(&name_jobj)?;
-    let params = get_index_params(env, params_jobj)?;
     let replace = replace_jobj != 0;
     let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
+
+    // Handle scalar vs vector indices differently and get params before borrowing dataset
+    let params_result: Result<Box<dyn IndexParams>> = match index_type {
+        IndexType::Scalar
+        | IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::LabelList
+        | IndexType::Inverted
+        | IndexType::NGram
+        | IndexType::ZoneMap
+        | IndexType::BloomFilter => {
+            // For scalar indices, create a scalar IndexParams
+            let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
+            let scalar_params = lance_index::scalar::ScalarIndexParams {
+                index_type: index_type_str,
+                params: params_opt,
+            };
+            Ok(Box::new(scalar_params))
+        }
+        IndexType::FragmentReuse | IndexType::MemWal => {
+            // System indices - not user-creatable
+            Err(Error::input_error(format!(
+                "Cannot create system index type: {:?}. System indices are managed internally.",
+                index_type
+            )))
+        }
+        IndexType::Vector
+        | IndexType::IvfFlat
+        | IndexType::IvfSq
+        | IndexType::IvfPq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswFlat => {
+            // For vector indices, use the existing parameter handling
+            get_vector_index_params(env, params_jobj)
+        }
+    };
+
+    let params = params_result?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.create_index(&columns_slice, index_type, name, params.as_ref(), replace)?;
+
     Ok(())
 }
 
@@ -1675,4 +1723,97 @@ fn inner_replace_field_metadata(
     let mut dataset_guard =
         { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
     dataset_guard.replace_field_metadata(field_metadata_map)
+}
+
+//////////////////////////////
+// Compaction Methods       //
+//////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCompact(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    compaction_options: JObject, // CompactionOptions
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_compact(&mut env, java_dataset, compaction_options)
+    )
+}
+
+fn inner_compact(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    compaction_options: JObject, // CompactionOptions
+) -> Result<()> {
+    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.compact(rust_options)?;
+    Ok(())
+}
+
+fn convert_java_compaction_options_to_rust(
+    env: &mut JNIEnv,
+    java_options: JObject,
+) -> Result<RustCompactionOptions> {
+    // Extract all field values directly from Java object fields to minimize JNI calls
+    let target_rows_per_fragment = env
+        .get_field(&java_options, "targetRowsPerFragment", "I")?
+        .i()? as usize;
+
+    let max_rows_per_group = env.get_field(&java_options, "maxRowsPerGroup", "I")?.i()? as usize;
+
+    let materialize_deletions = env
+        .get_field(&java_options, "materializeDeletions", "Z")?
+        .z()?;
+
+    let materialize_deletions_threshold = env
+        .get_field(&java_options, "materializeDeletionsThreshold", "F")?
+        .f()?;
+
+    let defer_index_remap = env.get_field(&java_options, "deferIndexRemap", "Z")?.z()?;
+
+    // Extract Optional<Integer> fields efficiently
+    let max_bytes_per_file =
+        extract_optional_integer(env, &java_options, "maxBytesPerFile")?.map(|i| i as usize);
+
+    let num_threads =
+        extract_optional_integer(env, &java_options, "numThreads")?.map(|i| i as usize);
+
+    let batch_size = extract_optional_integer(env, &java_options, "batchSize")?.map(|i| i as usize);
+
+    Ok(RustCompactionOptions {
+        target_rows_per_fragment,
+        max_rows_per_group,
+        max_bytes_per_file,
+        materialize_deletions,
+        materialize_deletions_threshold,
+        num_threads,
+        batch_size,
+        defer_index_remap,
+    })
+}
+
+// Helper function to efficiently extract Optional<Integer> fields
+fn extract_optional_integer(
+    env: &mut JNIEnv,
+    java_obj: &JObject,
+    field_name: &str,
+) -> Result<Option<i32>> {
+    let optional_field = env
+        .get_field(java_obj, field_name, "Ljava/util/Optional;")?
+        .l()?;
+
+    if env
+        .call_method(&optional_field, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let integer_obj = env
+            .call_method(optional_field, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let value = env.call_method(integer_obj, "intValue", "()I", &[])?.i()?;
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
 }

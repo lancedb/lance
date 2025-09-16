@@ -73,6 +73,10 @@ impl RabitQuantizer {
         Self { metadata }
     }
 
+    pub fn num_bits(&self) -> u8 {
+        self.metadata.num_bits
+    }
+
     #[inline]
     fn rotate_mat_flat<T: ArrowFloatType>(&self) -> &[T::Native] {
         let rotate_mat = self.metadata.rotate_mat.as_ref().unwrap();

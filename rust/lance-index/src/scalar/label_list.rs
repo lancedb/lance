@@ -18,8 +18,8 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
-use super::SargableQuery;
 use super::{bitmap::BitmapIndex, AnyQuery, IndexStore, LabelListQuery, ScalarIndex};
+use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::bitmap::BitmapIndexPlugin;
@@ -220,6 +220,10 @@ impl ScalarIndex for LabelListIndex {
     fn update_criteria(&self) -> UpdateCriteria {
         UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
     }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::LabelList))
+    }
 }
 
 fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
@@ -378,7 +382,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        LABEL_LIST_INDEX_VERSION
     }
 
     fn new_query_parser(
@@ -398,7 +402,15 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "LabelList index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         let schema = data.schema();
         let field = schema
             .column_with_name(VALUE_COLUMN_NAME)
@@ -427,7 +439,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         let data = unnest_chunks(data)?;
         let bitmap_plugin = BitmapIndexPlugin;
         bitmap_plugin
-            .train_index(data, index_store, request)
+            .train_index(data, index_store, request, fragment_ids)
             .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
