@@ -199,13 +199,29 @@ impl ProjectionPlan {
     }
 
     pub fn full(base: Arc<dyn Projectable>) -> Result<Self> {
-        let projection = base
+        let physical_cols: Vec<&str> = base
             .schema()
             .fields
             .iter()
-            .map(|f| (f.name.as_str(), format!("`{}`", f.name.as_str())))
+            .map(|f| f.name.as_ref())
             .collect::<Vec<_>>();
-        Self::from_expressions(base.clone(), &projection)
+
+        let physical_projection =
+            Projection::empty(base.clone()).union_columns(&physical_cols, OnMissing::Ignore)?;
+
+        let requested_output_expr = physical_cols
+            .into_iter()
+            .map(|col_name| OutputColumn {
+                expr: datafusion::prelude::col(col_name),
+                name: col_name.to_string(),
+            })
+            .collect();
+
+        Ok(Self {
+            physical_projection,
+            must_add_row_offset: false,
+            requested_output_expr,
+        })
     }
 
     /// Convert the projection to a list of physical expressions
