@@ -33,6 +33,11 @@ use crate::Result;
 /// Format: `<24-bit-binary><remaining-hex>`
 /// Example: "101100101101010011010110a1b2c3d4e5f6g7h8i9j0"
 ///
+/// We use binary instead of hex for the prefix because it helps S3 scale up on the
+/// prefix faster with fewer throttling and retries. Binary provides maximum entropy per character
+/// (1 bit) compared to hex (4 bits), allowing S3's internal partitioning to more
+/// quickly recognize the access pattern and scale appropriately.
+///
 /// The binary prefix ensures files are distributed evenly across S3 prefixes,
 /// minimizing throttling and maximizing throughput, while maintaining uniqueness.
 pub(crate) fn generate_random_filename() -> String {
