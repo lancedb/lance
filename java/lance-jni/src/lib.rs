@@ -103,8 +103,11 @@ fn set_log_file_target(builder: &mut env_logger::Builder) {
 
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                // just fallback to stderr
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                println!(
+                    "Failed to create parent directories for log file '{}': {}, using stderr",
+                    log_file_path, e
+                );
                 return;
             }
         }
