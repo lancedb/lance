@@ -56,17 +56,42 @@ pub struct AimdConfig {
     pub adjust_window: usize,
 }
 
-impl Default for AimdConfig {
-    fn default() -> Self {
-        // Default values from EMRFS, scaled for PUT operations
-        // EMRFS uses 3500/5500 ratio for PUT vs GET requests
-        let put_scale_factor = 3500.0 / 5500.0;
+/// Operation type for AIMD controller
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationType {
+    /// Read/GET operations
+    Read,
+    /// Write/PUT operations
+    Write,
+}
+
+impl AimdConfig {
+    /// Create default configuration for a specific operation type
+    pub fn default_for_operation(op_type: OperationType) -> Self {
+        // EMRFS uses different initial rates for GET and PUT
+        // GET: 5500, PUT: 3500 (3500/5500 ratio)
+        let initial_rate_default = match op_type {
+            OperationType::Read => 5500.0,
+            OperationType::Write => 3500.0,
+        };
+
+        // Allow separate environment variables for read and write rates
+        let initial_rate_env = match op_type {
+            OperationType::Read => "LANCE_AIMD_READ_INITIAL_RATE",
+            OperationType::Write => "LANCE_AIMD_WRITE_INITIAL_RATE",
+        };
 
         Self {
-            initial_rate: std::env::var("LANCE_AIMD_INITIAL_RATE")
+            initial_rate: std::env::var(initial_rate_env)
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(5500.0 * put_scale_factor),  // ~3500 for PUT operations
+                .or_else(|| {
+                    // Fall back to generic initial rate if specific one not set
+                    std::env::var("LANCE_AIMD_INITIAL_RATE")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                })
+                .unwrap_or(initial_rate_default),
             min_rate: std::env::var("LANCE_AIMD_MIN_RATE")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -91,10 +116,22 @@ impl Default for AimdConfig {
     }
 }
 
+impl Default for AimdConfig {
+    fn default() -> Self {
+        // Default to write configuration for backward compatibility
+        Self::default_for_operation(OperationType::Write)
+    }
+}
+
 impl AimdController {
     /// Create a new AIMD controller with default configuration
     pub fn new() -> Self {
         Self::with_config(AimdConfig::default())
+    }
+
+    /// Create a new AIMD controller for a specific operation type
+    pub fn new_for_operation(op_type: OperationType) -> Self {
+        Self::with_config(AimdConfig::default_for_operation(op_type))
     }
 
     /// Create a new AIMD controller with custom configuration
@@ -259,14 +296,27 @@ mod tests {
 
     #[test]
     fn test_aimd_config_defaults() {
+        // Clean up any env vars from other tests
+        std::env::remove_var("LANCE_AIMD_READ_INITIAL_RATE");
+        std::env::remove_var("LANCE_AIMD_WRITE_INITIAL_RATE");
+        std::env::remove_var("LANCE_AIMD_INITIAL_RATE");
+
+        // Test write configuration (default)
         let config = AimdConfig::default();
-        let put_scale_factor = 3500.0 / 5500.0;
-        assert!((config.initial_rate - 5500.0 * put_scale_factor).abs() < 0.01);
+        assert_eq!(config.initial_rate, 3500.0);
         assert_eq!(config.min_rate, 0.1);
         assert_eq!(config.max_rate, 10000.0);
         assert_eq!(config.increase_increment, 0.1);
         assert_eq!(config.reduction_factor, 2.0);
         assert_eq!(config.adjust_window, 2);
+
+        // Test read configuration
+        let read_config = AimdConfig::default_for_operation(OperationType::Read);
+        assert_eq!(read_config.initial_rate, 5500.0);
+
+        // Test write configuration explicitly
+        let write_config = AimdConfig::default_for_operation(OperationType::Write);
+        assert_eq!(write_config.initial_rate, 3500.0);
     }
 
     #[test]
@@ -441,6 +491,33 @@ mod tests {
         assert!(after_success >= after_throttle);
     }
 
+    #[test]
+    fn test_aimd_config_env_vars() {
+        // Test separate read/write initial rates
+        std::env::set_var("LANCE_AIMD_READ_INITIAL_RATE", "6000");
+        std::env::set_var("LANCE_AIMD_WRITE_INITIAL_RATE", "4000");
+
+        let read_config = AimdConfig::default_for_operation(OperationType::Read);
+        assert_eq!(read_config.initial_rate, 6000.0);
+
+        let write_config = AimdConfig::default_for_operation(OperationType::Write);
+        assert_eq!(write_config.initial_rate, 4000.0);
+
+        // Test fallback to generic initial rate
+        std::env::remove_var("LANCE_AIMD_READ_INITIAL_RATE");
+        std::env::remove_var("LANCE_AIMD_WRITE_INITIAL_RATE");
+        std::env::set_var("LANCE_AIMD_INITIAL_RATE", "2000");
+
+        let read_config2 = AimdConfig::default_for_operation(OperationType::Read);
+        assert_eq!(read_config2.initial_rate, 2000.0);
+
+        let write_config2 = AimdConfig::default_for_operation(OperationType::Write);
+        assert_eq!(write_config2.initial_rate, 2000.0);
+
+        // Clean up
+        std::env::remove_var("LANCE_AIMD_INITIAL_RATE");
+    }
+
     /// Create a throttled store that simulates S3 throttling
     fn create_throttled_store(base_store: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         let config = ThrottleConfig {
@@ -457,7 +534,7 @@ mod tests {
     async fn test_aimd_with_throttling() {
         // Set up environment for AIMD
         std::env::set_var("LANCE_AIMD_ENABLED", "true");
-        std::env::set_var("LANCE_AIMD_INITIAL_RATE", "3500");
+        std::env::set_var("LANCE_AIMD_WRITE_INITIAL_RATE", "3500");
         std::env::set_var("LANCE_AIMD_MIN_RATE", "0.1");
         std::env::set_var("LANCE_AIMD_MAX_RATE", "10000");
         std::env::set_var("LANCE_AIMD_INCREASE_INCREMENT", "0.1");
@@ -498,7 +575,7 @@ mod tests {
 
         // Clean up
         std::env::remove_var("LANCE_AIMD_ENABLED");
-        std::env::remove_var("LANCE_AIMD_INITIAL_RATE");
+        std::env::remove_var("LANCE_AIMD_WRITE_INITIAL_RATE");
         std::env::remove_var("LANCE_AIMD_MIN_RATE");
         std::env::remove_var("LANCE_AIMD_MAX_RATE");
         std::env::remove_var("LANCE_AIMD_INCREASE_INCREMENT");

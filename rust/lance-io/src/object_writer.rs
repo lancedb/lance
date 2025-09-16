@@ -160,7 +160,7 @@ impl UploadState {
 impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
         let aimd_controller = if aimd::is_aimd_enabled() {
-            Some(AimdController::new())
+            Some(AimdController::new_for_operation(aimd::OperationType::Write))
         } else {
             None
         };

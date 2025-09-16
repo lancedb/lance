@@ -13,10 +13,15 @@ use futures::{
 };
 use lance_core::{error::CloneableError, Error, Result};
 use object_store::{path::Path, GetOptions, GetResult, ObjectStore, Result as OSResult};
+use rand::Rng;
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
-use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::Reader};
+use crate::{
+    aimd::{self, AimdController, OperationType},
+    object_store::DEFAULT_CLOUD_IO_PARALLELISM,
+    traits::Reader,
+};
 
 /// Object Reader
 ///
@@ -32,6 +37,7 @@ pub struct CloudObjectReader {
 
     block_size: usize,
     download_retry_count: usize,
+    aimd_controller: Option<AimdController>,
 }
 
 impl DeepSizeOf for CloudObjectReader {
@@ -50,12 +56,19 @@ impl CloudObjectReader {
         known_size: Option<usize>,
         download_retry_count: usize,
     ) -> Result<Self> {
+        let aimd_controller = if aimd::is_aimd_enabled() {
+            Some(AimdController::new_for_operation(OperationType::Read))
+        } else {
+            None
+        };
+
         Ok(Self {
             object_store,
             path,
             size: OnceCell::new_with(known_size),
             block_size,
             download_retry_count,
+            aimd_controller,
         })
     }
 
@@ -69,8 +82,24 @@ impl CloudObjectReader {
         let mut retries = 3;
         loop {
             match f().await {
-                Ok(val) => return Ok(val),
+                Ok(val) => {
+                    // Report success to AIMD controller
+                    if let Some(ref controller) = self.aimd_controller {
+                        controller.report_success();
+                    }
+                    return Ok(val);
+                }
                 Err(err) => {
+                    // Check if this is a throttling error
+                    if let Some(ref controller) = self.aimd_controller {
+                        if aimd::is_throttling_error(&err) {
+                            controller.report_throttle();
+                            // Add exponential backoff for throttling
+                            let sleep_ms = rand::rng().random_range(1000..5000);
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        }
+                    }
+
                     if retries == 0 {
                         return Err(err);
                     }
@@ -97,6 +126,16 @@ impl CloudObjectReader {
             match get_result.bytes().await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => {
+                    // Check if this is a throttling error
+                    if let Some(ref controller) = self.aimd_controller {
+                        if aimd::is_throttling_error(&err) {
+                            controller.report_throttle();
+                            // Add exponential backoff for throttling
+                            let sleep_ms = rand::rng().random_range(1000..5000);
+                            tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        }
+                    }
+
                     if retries == 0 {
                         log::warn!("Failed to download {} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}", desc(), self.path, self.download_retry_count, err);
                         return Err(err);
@@ -126,7 +165,12 @@ impl Reader for CloudObjectReader {
     }
 
     fn io_parallelism(&self) -> usize {
-        DEFAULT_CLOUD_IO_PARALLELISM
+        // Use AIMD controller to determine parallelism if available
+        if let Some(ref controller) = self.aimd_controller {
+            controller.capacity().min(DEFAULT_CLOUD_IO_PARALLELISM)
+        } else {
+            DEFAULT_CLOUD_IO_PARALLELISM
+        }
     }
 
     /// Object/File Size.
