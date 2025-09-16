@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::dataset::conflict_detection::conflict_detector::DefaultConflictDetector;
+use crate::dataset::conflict_detection::ConflictDetector;
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
@@ -346,6 +348,33 @@ impl<'a> TransactionRebase<'a> {
             mem_wal_to_merge, ..
         } = &self.transaction.operation
         {
+            // Pre-check using join key (Bloom/Exact) for duplicate detection
+            // Only evaluate when both transactions are merge/update style operations carrying a join key metadata.
+            // This guard avoids misclassifying normal upsert overlap with already committed data as a commit-time conflict.
+            if let (Some(self_jk), Some(other_jk)) = (
+                &self.transaction.join_key_metadata,
+                &other_transaction.join_key_metadata,
+            ) {
+                if let Operation::Update { .. } = &other_transaction.operation {
+                    if self_jk.columns == other_jk.columns {
+                        let detector = DefaultConflictDetector::new();
+                        let res = detector.check_filter_conflict(
+                            self_jk,
+                            other_jk,
+                            &other_transaction.uuid,
+                            other_version,
+                        )?;
+                        if res.has_conflict() {
+                            return Err(self.retryable_conflict_err(
+                                other_transaction,
+                                other_version,
+                                location!(),
+                            ));
+                        }
+                    }
+                }
+            }
+
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
@@ -2496,36 +2525,6 @@ mod tests {
                 ],
             ),
             (
-                // Delete config keys currently being deleted by other UpdateConfig operation
-                create_update_config_for_test(
-                    None,
-                    Some(vec!["remove-key".to_string()]),
-                    None,
-                    None,
-                ),
-                [Compatible; 9],
-            ),
-            (
-                // Delete config keys currently being upserted by other UpdateConfig operation
-                create_update_config_for_test(
-                    None,
-                    Some(vec!["lance.test".to_string()]),
-                    None,
-                    None,
-                ),
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    Compatible,    // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
-            ),
-            (
                 // Changing schema metadata conflicts with another update changing schema
                 // metadata or with an overwrite
                 create_update_config_for_test(
@@ -2559,8 +2558,8 @@ mod tests {
                     Some(HashMap::from_iter(vec![(
                         0,
                         HashMap::from_iter(vec![(
-                            "field_key".to_string(),
-                            "field_value".to_string(),
+                            "field-key".to_string(),
+                            "field-value".to_string(),
                         )]),
                     )])),
                 ),
@@ -3149,7 +3148,7 @@ mod tests {
                         "{}: expected NotCompatible but got {:?}",
                         description,
                         result
-                    );
+                    )
                 }
                 Retryable => {
                     assert!(

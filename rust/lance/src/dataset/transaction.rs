@@ -46,6 +46,7 @@
 //!
 
 use super::{blob::BLOB_VERSION_CONFIG_KEY, ManifestWriteConfig};
+use crate::dataset::conflict_detection::JoinKeyMetadata;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
@@ -90,6 +91,8 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Optional join key metadata for conflict detection
+    pub join_key_metadata: Option<JoinKeyMetadata>,
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -1428,6 +1431,7 @@ pub struct TransactionBuilder {
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    join_key_metadata: Option<JoinKeyMetadata>,
 }
 
 impl TransactionBuilder {
@@ -1438,6 +1442,7 @@ impl TransactionBuilder {
             operation,
             tag: None,
             transaction_properties: None,
+            join_key_metadata: None,
         }
     }
 
@@ -1459,6 +1464,11 @@ impl TransactionBuilder {
         self
     }
 
+    pub fn join_key_metadata(mut self, filter: Option<JoinKeyMetadata>) -> Self {
+        self.join_key_metadata = filter;
+        self
+    }
+
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
@@ -1469,6 +1479,7 @@ impl TransactionBuilder {
             operation: self.operation,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            join_key_metadata: self.join_key_metadata,
         }
     }
 }
@@ -3043,6 +3054,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            join_key_metadata: message
+                .join_key_metadata
+                .as_ref()
+                .map(JoinKeyMetadata::from_pb)
+                .transpose()?,
         })
     }
 }
@@ -3312,6 +3328,7 @@ impl From<&Transaction> for pb::Transaction {
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            join_key_metadata: value.join_key_metadata.as_ref().map(|m| m.to_pb()),
         }
     }
 }

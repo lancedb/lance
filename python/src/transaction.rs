@@ -551,6 +551,7 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             operation,
             tag: None,
             transaction_properties,
+            join_key_metadata: None,
         }))
     }
 }
