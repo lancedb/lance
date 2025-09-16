@@ -314,16 +314,9 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
         return LanceBuffer::reinterpret_vec(output);
     }
 
-    // If we get here then the last chunk needs to be padded with zeros
-    let remaining_items = data_buffer.len() % ELEMS_PER_CHUNK as usize;
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
-
-    let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
-    last_chunk[..remaining_items].clone_from_slice(&data_buffer[last_chunk_start..]);
-    let output_start = num_whole_chunks * words_per_chunk;
-    unsafe {
-        BitPacking::unchecked_pack(bit_width, &last_chunk, &mut output[output_start..]);
-    }
+    output.truncate(num_whole_chunks * words_per_chunk);
+    output.extend_from_slice(&data_buffer[last_chunk_start..]);
 
     LanceBuffer::reinterpret_vec(output)
 }
@@ -338,12 +331,11 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
         (ELEMS_PER_CHUNK as usize * bits_per_value).div_ceil(data.bits_per_value as usize);
     let compressed_words = data.data.borrow_to_typed_slice::<T>();
 
-    let num_chunks = data.num_values as usize / words_per_chunk;
-    debug_assert_eq!(data.num_values as usize % words_per_chunk, 0);
+    let num_chunks = compressed_words.len() / words_per_chunk;
+    let tail_words = compressed_words.len() % words_per_chunk;
 
-    // This is slightly larger than num_values because the last chunk has some padding, we will truncate at the end
     #[allow(clippy::uninit_vec)]
-    let mut decompressed = Vec::with_capacity(num_chunks * ELEMS_PER_CHUNK as usize);
+    let mut decompressed = Vec::with_capacity((num_chunks + 1) * ELEMS_PER_CHUNK as usize);
     #[allow(clippy::uninit_vec)]
     unsafe {
         decompressed.set_len(num_chunks * ELEMS_PER_CHUNK as usize);
@@ -361,6 +353,12 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
                 &mut decompressed[output_start..output_end],
             );
         }
+    }
+
+    if tail_words != 0 {
+        let tail_start = num_chunks * words_per_chunk;
+        decompressed.truncate(num_chunks * ELEMS_PER_CHUNK as usize);
+        decompressed.extend_from_slice(&compressed_words[tail_start..]);
     }
 
     decompressed.truncate(num_values);
@@ -463,6 +461,8 @@ mod test {
     use arrow_array::Array;
 
     use crate::{
+        buffer::LanceBuffer,
+        data::{BlockInfo, FixedWidthDataBlock},
         testing::{check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
@@ -524,5 +524,30 @@ mod test {
         metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
 
         check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+    }
+
+    #[test]
+    fn test_out_of_line_bitpack_raw_tail_roundtrip() {
+        let bit_width = 8usize;
+        let word_bits = std::mem::size_of::<u32>() as u64 * 8;
+        let values: Vec<u32> = (0..1025).map(|i| (i % 200) as u32).collect();
+        let input = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            bits_per_value: word_bits,
+            num_values: values.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+
+        let compressed = super::bitpack_out_of_line::<u32>(input, bit_width);
+        let compressed_block = FixedWidthDataBlock {
+            data: compressed,
+            bits_per_value: word_bits,
+            num_values: values.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+
+        let decoded = super::unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
+        let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
+        assert_eq!(decoded_values.as_ref(), values.as_slice());
     }
 }
