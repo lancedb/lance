@@ -105,7 +105,6 @@ tempfile.workspace = true
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
-paste = "1.0"
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
