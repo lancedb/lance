@@ -22,8 +22,8 @@ use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projectable, Proje
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT,
-    DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS, TRACE_FILE_AUDIT,
+    DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
+    TRACE_DATASET_EVENTS,
 };
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_datafusion::projection::ProjectionPlan;
@@ -32,18 +32,15 @@ use lance_file::v2::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_io::object_writer::{ObjectWriter, WriteResult};
-use lance_io::traits::WriteExt;
-use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
+use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, MAGIC,
-    MAJOR_VERSION, MINOR_VERSION,
+    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
 };
 use lance_table::io::commit::{
-    migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
-    ManifestNamingScheme,
+    migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
+    CommitLock, ManifestLocation, ManifestNamingScheme,
 };
-use lance_table::io::manifest::{read_manifest, write_manifest};
+use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -678,7 +675,7 @@ impl Dataset {
             });
         }
 
-        // If indices were also the last block, we can take the opportunity to
+        // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section {
             if manifest_size - index_offset <= last_block.len() {
@@ -701,6 +698,29 @@ impl Dataset {
                 };
                 ds_index_cache
                     .insert_with_key(&metadata_key, Arc::new(indices))
+                    .await;
+            }
+        }
+
+        // If transaction is also in the last block, we can take the opportunity to
+        // decode them now and cache them.
+        if let Some(transaction_offset) = manifest.transaction_section {
+            if manifest_size - transaction_offset <= last_block.len() {
+                let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
+                let message_len =
+                    LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4])
+                        as usize;
+                let message_data =
+                    &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
+                let transaction: Transaction =
+                    lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
+
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
                     .await;
             }
         }
@@ -914,7 +934,11 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok((Arc::new(manifest), location))
+        let manifest_arc = Arc::new(manifest);
+        self.metadata_cache
+            .insert_with_key(&manifest_key, manifest_arc.clone())
+            .await;
+        Ok((manifest_arc, location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -922,13 +946,36 @@ impl Dataset {
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
-        let path = match &self.manifest.transaction_file {
-            Some(path) => self.base.child("_transactions").child(path.as_str()),
-            None => return Ok(None),
+        let transaction_key = TransactionKey {
+            version: self.manifest.version,
         };
-        let data = self.object_store.inner.get(&path).await?.bytes().await?;
-        let transaction = lance_table::format::pb::Transaction::decode(data)?;
-        Transaction::try_from(transaction).map(Some)
+        if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
+            return Ok(Some((*transaction).clone()));
+        }
+        // Prefer inline transaction from manifest when available
+        if let Some(pos) = self.manifest.transaction_section {
+            let reader = if let Some(size) = self.manifest_location.size {
+                self.object_store
+                    .open_with_size(&self.manifest_location.path, size as usize)
+                    .await?
+            } else {
+                self.object_store.open(&self.manifest_location.path).await?
+            };
+
+            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
+            return Transaction::try_from(tx).map(Some);
+            // If any of the checks above fail, we will fall through to external file
+        }
+
+        // Fallback: read external transaction file if present
+        if let Some(path) = &self.manifest.transaction_file {
+            let path = self.base.child("_transactions").child(path.as_str());
+            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let transaction = lance_table::format::pb::Transaction::decode(data)?;
+            return Transaction::try_from(transaction).map(Some);
+        }
+
+        Ok(None)
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -2532,6 +2579,7 @@ pub(crate) struct ManifestWriteConfig {
     use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
+    disable_transaction_file: bool,            // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -2540,13 +2588,21 @@ impl Default for ManifestWriteConfig {
             auto_set_feature_flags: true,
             timestamp: None,
             use_stable_row_ids: false,
+            disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
         }
     }
 }
 
+impl ManifestWriteConfig {
+    pub fn disable_transaction_file(&self) -> bool {
+        self.disable_transaction_file
+    }
+}
+
 /// Commit a manifest file and create a copy at the latest manifest path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
@@ -2555,9 +2611,14 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
+    mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
-        apply_feature_flags(manifest, config.use_stable_row_ids)?;
+        apply_feature_flags(
+            manifest,
+            config.use_stable_row_ids,
+            config.disable_transaction_file,
+        )?;
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
@@ -2572,26 +2633,9 @@ pub(crate) async fn write_manifest_file(
             object_store,
             write_manifest_file_to_path,
             naming_scheme,
+            transaction.take().map(|tx| tx.into()),
         )
         .await
-}
-
-fn write_manifest_file_to_path<'a>(
-    object_store: &'a ObjectStore,
-    manifest: &'a mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
-    path: &'a Path,
-) -> BoxFuture<'a, Result<WriteResult>> {
-    Box::pin(async {
-        let mut object_writer = ObjectWriter::new(object_store, path).await?;
-        let pos = write_manifest(&mut object_writer, manifest, indices).await?;
-        object_writer
-            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
-            .await?;
-        let res = object_writer.shutdown().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
-        Ok(res)
-    })
 }
 
 impl Projectable for Dataset {
@@ -3104,8 +3148,10 @@ mod tests {
                 use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
+                disable_transaction_file: false,
             },
             dataset.manifest_location.naming_scheme,
+            None,
         )
         .await
         .unwrap();
@@ -8682,6 +8728,132 @@ mod tests {
             results.column(0).as_any().downcast_ref::<T>().unwrap(),
             values
         )
+    }
+
+    // Test coverage:
+    // Case 1: delete external transaction file → read_transaction should prioritize inline and succeed.
+    // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+    // Case 3: manifest does not contain inline → read_transaction should fall back to external transaction file and succeed.
+    #[tokio::test]
+    async fn test_inline_transaction() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        async fn create_dataset(rows: i32) -> Arc<Dataset> {
+            let dir = TempDir::default();
+            let uri = dir.path_str();
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "i",
+                DataType::Int32,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..rows))],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                uri.as_str(),
+                None,
+            )
+            .await
+            .unwrap();
+            Arc::new(ds)
+        }
+
+        fn make_tx(read_version: u64) -> Transaction {
+            Transaction::new(
+                read_version,
+                Operation::Append { fragments: vec![] },
+                None,
+                None,
+            )
+        }
+
+        async fn delete_external_tx_file(ds: &Dataset) {
+            if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
+                let tx_path = ds.base.child("_transactions").child(tx_file.as_str());
+                let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
+            }
+        }
+
+        let session = Arc::new(Session::default());
+        let io_tracker = Arc::new(IOTracker::default());
+
+        // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
+        let ds = create_dataset(5).await;
+        let read_version = ds.manifest().version;
+        let tx = make_tx(read_version);
+        let ds2 = CommitBuilder::new(ds.clone())
+            .execute(tx.clone())
+            .await
+            .unwrap();
+        delete_external_tx_file(&ds2).await;
+        let read_tx = ds2.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx, tx.clone());
+
+        // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+        let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+            .with_session(session.clone())
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(io_tracker.clone()),
+                    ..Default::default()
+                }),
+                session: Some(session.clone()),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        let stats = io_tracker.incremental_stats(); // Reset
+        assert!(stats.read_bytes < 64 * 1024);
+        // Because the manifest is so small, we should have opportunistically
+        // cached the transaction in memory already.
+        let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
+        let stats = io_tracker.incremental_stats();
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+        assert_eq!(inline_tx, tx);
+
+        // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
+        let ds = create_dataset(2).await;
+        let tx = make_tx(ds.manifest().version);
+        let tx_file = crate::io::commit::write_transaction_file(ds.object_store(), &ds.base, &tx)
+            .await
+            .unwrap();
+        let (mut manifest, indices) = tx
+            .build_manifest(
+                Some(ds.manifest.as_ref()),
+                ds.load_indices().await.unwrap().as_ref().clone(),
+                &tx_file,
+                &ManifestWriteConfig::default(),
+                None,
+            )
+            .unwrap();
+        let location = write_manifest_file(
+            ds.object_store(),
+            ds.commit_handler.as_ref(),
+            &ds.base,
+            &mut manifest,
+            if indices.is_empty() {
+                None
+            } else {
+                Some(indices.clone())
+            },
+            &ManifestWriteConfig::default(),
+            ds.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+        let ds_new = ds.checkout_version(location.version).await.unwrap();
+        assert!(ds_new.manifest.transaction_section.is_none());
+        assert!(ds_new.manifest.transaction_file.is_some());
+        let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx, tx);
     }
 
     #[tokio::test]
