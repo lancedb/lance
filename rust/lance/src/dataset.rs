@@ -57,8 +57,6 @@ use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 mod blob;
-#[cfg(test)]
-mod broad_test;
 pub mod builder;
 pub mod cleanup;
 mod delta;
