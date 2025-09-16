@@ -320,6 +320,8 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
 
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
     output.truncate(num_whole_chunks * words_per_chunk);
+    let remaining_items = data_buffer.len() - last_chunk_start;
+    output.reserve(remaining_items);
     output.extend_from_slice(&data_buffer[last_chunk_start..]);
 
     LanceBuffer::reinterpret_vec(output)
@@ -338,34 +340,44 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
         .div_ceil(data.bits_per_value as usize);
     let compressed_words = data.data.borrow_to_typed_slice::<T>();
 
-    let num_chunks = compressed_words.len() / words_per_chunk;
-    let tail_words = compressed_words.len() % words_per_chunk;
+    let num_whole_chunks = num_values / ELEMS_PER_CHUNK as usize;
+    let tail_values = num_values % ELEMS_PER_CHUNK as usize;
+    let expected_full_words = num_whole_chunks * words_per_chunk;
+    let expected_new_len = expected_full_words + tail_values;
+    let tail_is_raw = tail_values > 0 && compressed_words.len() == expected_new_len;
 
     #[allow(clippy::uninit_vec)]
-    let mut decompressed = Vec::with_capacity((num_chunks + 1) * ELEMS_PER_CHUNK as usize);
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        decompressed.set_len(num_chunks * ELEMS_PER_CHUNK as usize);
-    }
+    let mut decompressed = Vec::with_capacity(num_values);
+    let mut chunk_buf = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
 
-    for chunk_idx in 0..num_chunks {
+    for chunk_idx in 0..num_whole_chunks {
         let input_start = chunk_idx * words_per_chunk;
         let input_end = input_start + words_per_chunk;
-        let output_start = chunk_idx * ELEMS_PER_CHUNK as usize;
-        let output_end = output_start + ELEMS_PER_CHUNK as usize;
         unsafe {
             BitPacking::unchecked_unpack(
                 compressed_bits_per_value,
                 &compressed_words[input_start..input_end],
-                &mut decompressed[output_start..output_end],
+                &mut chunk_buf,
             );
         }
+        decompressed.extend_from_slice(&chunk_buf);
     }
 
-    if tail_words != 0 {
-        let tail_start = num_chunks * words_per_chunk;
-        decompressed.truncate(num_chunks * ELEMS_PER_CHUNK as usize);
-        decompressed.extend_from_slice(&compressed_words[tail_start..]);
+    if tail_values > 0 {
+        if tail_is_raw {
+            let tail_start = expected_full_words;
+            decompressed.extend_from_slice(&compressed_words[tail_start..tail_start + tail_values]);
+        } else {
+            let tail_start = expected_full_words;
+            unsafe {
+                BitPacking::unchecked_unpack(
+                    compressed_bits_per_value,
+                    &compressed_words[tail_start..tail_start + words_per_chunk],
+                    &mut chunk_buf,
+                );
+            }
+            decompressed.extend_from_slice(&chunk_buf[..tail_values]);
+        }
     }
 
     decompressed.truncate(num_values);
@@ -434,45 +446,44 @@ impl BlockCompressor for OutOfLineBitpacking {
 
 impl BlockDecompressor for OutOfLineBitpacking {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        let num_chunks = num_values.div_ceil(ELEMS_PER_CHUNK);
-        let words_per_chunk =
-            (ELEMS_PER_CHUNK * self.compressed_bit_width).div_ceil(self.uncompressed_bit_width);
-        let num_compressed_words = num_chunks * words_per_chunk;
-
-        debug_assert_eq!(
-            data.len() as u64,
-            (num_compressed_words * self.uncompressed_bit_width) / 8
-        );
-
-        let data = FixedWidthDataBlock {
+        let word_size = match self.uncompressed_bit_width {
+            8 => std::mem::size_of::<u8>(),
+            16 => std::mem::size_of::<u16>(),
+            32 => std::mem::size_of::<u32>(),
+            64 => std::mem::size_of::<u64>(),
+            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+        };
+        debug_assert_eq!(data.len() % word_size, 0);
+        let total_words = (data.len() / word_size) as u64;
+        let block = FixedWidthDataBlock {
             data,
             bits_per_value: self.uncompressed_bit_width,
-            num_values: num_compressed_words,
+            num_values: total_words,
             block_info: BlockInfo::new(),
         };
 
         let unpacked = match self.uncompressed_bit_width {
             8 => unpack_out_of_line::<u8>(
-                data,
+                block,
                 num_values as usize,
                 self.compressed_bit_width as usize,
             ),
             16 => unpack_out_of_line::<u16>(
-                data,
+                block,
                 num_values as usize,
                 self.compressed_bit_width as usize,
             ),
             32 => unpack_out_of_line::<u32>(
-                data,
+                block,
                 num_values as usize,
                 self.compressed_bit_width as usize,
             ),
             64 => unpack_out_of_line::<u64>(
-                data,
+                block,
                 num_values as usize,
                 self.compressed_bit_width as usize,
             ),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            _ => unreachable!(),
         };
         Ok(DataBlock::FixedWidth(unpacked))
     }
@@ -482,12 +493,10 @@ impl BlockDecompressor for OutOfLineBitpacking {
 mod test {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Int64Array, Int8Array};
-
+    use arrow_array::{Array, Int64Array, Int8Array};
     use arrow_schema::DataType;
 
-    use arrow_array::Array;
-
+    use super::{bitpack_out_of_line, unpack_out_of_line, ELEMS_PER_CHUNK};
     use crate::{
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
@@ -591,15 +600,22 @@ mod test {
             block_info: BlockInfo::new(),
         };
 
-        let compressed = super::bitpack_out_of_line::<u32>(input, bit_width);
+        let compressed = bitpack_out_of_line::<u32>(input, bit_width);
+        let compressed_words = compressed.borrow_to_typed_slice::<u32>().to_vec();
+        let words_per_chunk = (ELEMS_PER_CHUNK as usize * bit_width).div_ceil(word_bits as usize);
+        assert_eq!(
+            compressed_words.len(),
+            words_per_chunk + (values.len() - ELEMS_PER_CHUNK as usize),
+        );
+
         let compressed_block = FixedWidthDataBlock {
-            data: compressed,
+            data: LanceBuffer::reinterpret_vec(compressed_words.clone()),
             bits_per_value: word_bits,
-            num_values: values.len() as u64,
+            num_values: compressed_words.len() as u64,
             block_info: BlockInfo::new(),
         };
 
-        let decoded = super::unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
+        let decoded = unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
         let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
         assert_eq!(decoded_values.as_ref(), values.as_slice());
     }
