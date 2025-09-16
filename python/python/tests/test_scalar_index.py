@@ -896,6 +896,11 @@ def test_fts_on_list(tmp_path):
     results = ds.to_table(full_text_query=PhraseQuery("lance database", "text"))
     assert results.num_rows == 2
 
+    # Append new data without fts index, then query.
+    ds.insert(data)
+    results = ds.to_table(full_text_query="lance")
+    assert results.num_rows == 6
+
 
 def test_fts_fuzzy_query(tmp_path):
     data = pa.table(
