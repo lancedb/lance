@@ -82,6 +82,7 @@ humantime = { workspace = true }
 async_cell = "0.2.2"
 semver.workspace = true
 tokio-stream = { workspace = true }
+bincode = "1.3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true

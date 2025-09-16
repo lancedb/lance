@@ -4,7 +4,12 @@
 use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
-    dataset::transaction::{Operation, Transaction},
+    dataset::{
+        conflict_detection::{
+            conflict_detector::DefaultConflictDetector, ConflictDetector, PrimaryKeyBloomFilter,
+        },
+        transaction::{Operation, Transaction},
+    },
     Dataset,
 };
 use futures::{StreamExt, TryStreamExt};
@@ -273,6 +278,69 @@ impl<'a> TransactionRebase<'a> {
                     deleted_fragment_ids: removed_fragment_ids,
                     ..
                 } => {
+                    // First check for primary key conflicts if both transactions have Bloom Filters
+                    // This handles merge insert operations that use Operation::Update
+                    if let (Some(current_filter_data), Some(other_filter_data)) = (
+                        &self.transaction.primary_key_bloom_filter,
+                        &other_transaction.primary_key_bloom_filter,
+                    ) {
+                        // Deserialize the Bloom Filters
+                        let current_filter = PrimaryKeyBloomFilter::from_bytes(current_filter_data)
+                            .map_err(|e| Error::InvalidInput {
+                                source: format!(
+                                    "Failed to deserialize current transaction's Bloom Filter: {}",
+                                    e
+                                )
+                                .into(),
+                                location: location!(),
+                            })?;
+
+                        let other_filter = PrimaryKeyBloomFilter::from_bytes(other_filter_data)
+                            .map_err(|e| Error::InvalidInput {
+                                source: format!(
+                                    "Failed to deserialize other transaction's Bloom Filter: {}",
+                                    e
+                                )
+                                .into(),
+                                location: location!(),
+                            })?;
+
+                        // Use the default conflict detector
+                        let detector = DefaultConflictDetector::new();
+
+                        // Check for conflicts between the two filters
+                        let conflict_result = detector.check_filter_conflict(
+                            &current_filter,
+                            &other_filter,
+                            &other_transaction.uuid,
+                            other_version,
+                        )?;
+
+                        // If there's a conflict, return a retryable error
+                        if conflict_result.has_conflict() {
+                            let error_message = if conflict_result.might_be_false_positive() {
+                                format!(
+                                    "Primary key conflict detected between merge insert operations (transaction {} and {}). \
+                                     This might be a false positive due to Bloom Filter limitations. Please retry.",
+                                    self.transaction.uuid, other_transaction.uuid
+                                )
+                            } else {
+                                format!(
+                                    "Primary key conflict detected between merge insert operations (transaction {} and {}). \
+                                     Operations are modifying the same primary keys.",
+                                    self.transaction.uuid, other_transaction.uuid
+                                )
+                            };
+
+                            return Err(Error::RetryableCommitConflict {
+                                version: other_version,
+                                source: error_message.into(),
+                                location: location!(),
+                            });
+                        }
+                    }
+
+                    // Continue with existing fragment-level conflict detection
                     if !updated_fragments
                         .iter()
                         .map(|f| f.id)
@@ -394,6 +462,69 @@ impl<'a> TransactionRebase<'a> {
                     deleted_fragment_ids: removed_fragment_ids,
                     ..
                 } => {
+                    // First check for primary key conflicts if both transactions have Bloom Filters
+                    // This handles merge insert operations that use Operation::Update
+                    if let (Some(current_filter_data), Some(other_filter_data)) = (
+                        &self.transaction.primary_key_bloom_filter,
+                        &other_transaction.primary_key_bloom_filter,
+                    ) {
+                        // Deserialize the Bloom Filters
+                        let current_filter = PrimaryKeyBloomFilter::from_bytes(current_filter_data)
+                            .map_err(|e| Error::InvalidInput {
+                                source: format!(
+                                    "Failed to deserialize current transaction's Bloom Filter: {}",
+                                    e
+                                )
+                                .into(),
+                                location: location!(),
+                            })?;
+
+                        let other_filter = PrimaryKeyBloomFilter::from_bytes(other_filter_data)
+                            .map_err(|e| Error::InvalidInput {
+                                source: format!(
+                                    "Failed to deserialize other transaction's Bloom Filter: {}",
+                                    e
+                                )
+                                .into(),
+                                location: location!(),
+                            })?;
+
+                        // Use the default conflict detector
+                        let detector = DefaultConflictDetector::new();
+
+                        // Check for conflicts between the two filters
+                        let conflict_result = detector.check_filter_conflict(
+                            &current_filter,
+                            &other_filter,
+                            &other_transaction.uuid,
+                            other_version,
+                        )?;
+
+                        // If there's a conflict, return a retryable error
+                        if conflict_result.has_conflict() {
+                            let error_message = if conflict_result.might_be_false_positive() {
+                                format!(
+                                    "Primary key conflict detected between merge insert operations (transaction {} and {}). \
+                                     This might be a false positive due to Bloom Filter limitations. Please retry.",
+                                    self.transaction.uuid, other_transaction.uuid
+                                )
+                            } else {
+                                format!(
+                                    "Primary key conflict detected between merge insert operations (transaction {} and {}). \
+                                     Operations are modifying the same primary keys.",
+                                    self.transaction.uuid, other_transaction.uuid
+                                )
+                            };
+
+                            return Err(Error::RetryableCommitConflict {
+                                version: other_version,
+                                source: error_message.into(),
+                                location: location!(),
+                            });
+                        }
+                    }
+
+                    // Continue with existing fragment-level conflict detection
                     if !updated_fragments
                         .iter()
                         .map(|f| f.id)
@@ -925,11 +1056,17 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
 
+            Operation::Merge { .. } => {
+                // Merge operations conflict with other merge operations by default
+                // Note: Merge Insert operations actually use Operation::Update, not Operation::Merge
+                // Primary key conflict detection for Merge Insert is handled in check_update_txn
+                Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
+            }
+
             Operation::Update { .. }
             | Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::Rewrite { .. }
-            | Operation::Merge { .. }
             | Operation::DataReplacement { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version, location!()))
             }

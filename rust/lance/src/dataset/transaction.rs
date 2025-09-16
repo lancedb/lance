@@ -95,6 +95,9 @@ pub struct Transaction {
     pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Primary key Bloom Filter data for conflict detection
+    /// This is used to detect conflicts between concurrent merge insert operations
+    pub primary_key_bloom_filter: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1433,6 +1436,8 @@ pub struct TransactionBuilder {
     blobs_op: Option<Operation>,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Primary key Bloom Filter data for conflict detection
+    primary_key_bloom_filter: Option<Vec<u8>>,
 }
 
 impl TransactionBuilder {
@@ -1444,6 +1449,7 @@ impl TransactionBuilder {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
+            primary_key_bloom_filter: None,
         }
     }
 
@@ -1470,6 +1476,11 @@ impl TransactionBuilder {
         self
     }
 
+    pub fn primary_key_bloom_filter(mut self, bloom_filter: Option<Vec<u8>>) -> Self {
+        self.primary_key_bloom_filter = bloom_filter;
+        self
+    }
+
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
@@ -1481,6 +1492,7 @@ impl TransactionBuilder {
             blobs_op: self.blobs_op,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            primary_key_bloom_filter: self.primary_key_bloom_filter,
         }
     }
 }
@@ -3101,6 +3113,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            primary_key_bloom_filter: message.primary_key_bloom_filter,
         })
     }
 }
@@ -3405,6 +3418,7 @@ impl From<&Transaction> for pb::Transaction {
             blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            primary_key_bloom_filter: value.primary_key_bloom_filter.clone(),
         }
     }
 }
