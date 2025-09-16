@@ -212,7 +212,7 @@ impl ProjectionPlan {
         let requested_output_expr = physical_cols
             .into_iter()
             .map(|col_name| OutputColumn {
-                expr: datafusion::prelude::col(col_name),
+                expr: Expr::Column(Column::from_name(col_name)),
                 name: col_name.to_string(),
             })
             .collect();
