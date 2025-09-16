@@ -16,7 +16,15 @@ pub enum SimdSupport {
 
 /// Support for FP16 SIMD operations
 pub static FP16_SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", any(target_os = "ios", target_os = "tvos")))]
+    {
+        // AArch64 iOS/tvOS has NEON; fp16 arithmetic is available on modern targets.
+        SimdSupport::Neon
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(target_os = "ios", target_os = "tvos"))
+    ))]
     {
         if aarch64::has_neon_f16_support() {
             SimdSupport::Neon

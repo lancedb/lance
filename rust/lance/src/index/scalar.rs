@@ -21,17 +21,16 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
-use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-use lance_index::scalar::inverted::{InvertedIndexPlugin, METADATA_FILE};
+use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
     VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::CreatedIndex;
 use lance_index::scalar::{
     bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams,
 };
+use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
 use lance_table::format::{Fragment, Index};
 use log::info;
@@ -287,32 +286,9 @@ pub(super) async fn build_scalar_index(
         fragment_ids.clone(),
     )
     .await?;
+
     plugin
         .train_index(training_data, &index_store, training_request, fragment_ids)
-        .await
-}
-
-/// Build a Scalar Index
-#[instrument(level = "debug", skip_all)]
-pub(super) async fn build_inverted_index(
-    dataset: &Dataset,
-    column: &str,
-    uuid: &str,
-    params: &InvertedIndexParams,
-    train: bool,
-    fragment_ids: Option<Vec<u32>>,
-) -> Result<CreatedIndex> {
-    let data = load_training_data(
-        dataset,
-        column,
-        &TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-        None,
-        train,
-        fragment_ids.clone(),
-    )
-    .await?;
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, uuid)?;
-    InvertedIndexPlugin::train_inverted_index(data, &index_store, params.clone(), fragment_ids)
         .await
 }
 
@@ -764,7 +740,7 @@ mod tests {
         let params_json = serde_json::to_value(&btree_params).unwrap();
         let index_params =
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree)
-                .with_params(params_json);
+                .with_params(&params_json);
 
         source_dataset
             .create_index(
@@ -1088,7 +1064,7 @@ mod tests {
         let params_json = serde_json::to_value(&zonemap_params).unwrap();
         let index_params =
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
-                .with_params(params_json);
+                .with_params(&params_json);
 
         source_dataset
             .create_index(

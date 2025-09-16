@@ -137,8 +137,8 @@ impl ScalarIndexParams {
     }
 
     /// Set the parameters for the index
-    pub fn with_params<ParamsType: Serialize>(mut self, params: ParamsType) -> Self {
-        self.params = Some(serde_json::to_string(&params).unwrap());
+    pub fn with_params<ParamsType: Serialize>(mut self, params: &ParamsType) -> Self {
+        self.params = Some(serde_json::to_string(params).unwrap());
         self
     }
 }

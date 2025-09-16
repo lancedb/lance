@@ -1256,7 +1256,7 @@ impl ScalarIndex for BTreeIndex {
         let params = serde_json::to_value(BTreeParameters {
             zone_size: Some(self.batch_size),
         })?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(params))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
 }
 
