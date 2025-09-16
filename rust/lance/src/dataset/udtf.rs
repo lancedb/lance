@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::datafusion::LanceTableProvider;
-use crate::dataset::utils::{get_all_tables, normalize_datafusion_table_name};
 use crate::Dataset;
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, ScalarValue, TableReference};
-use datafusion::prelude::SessionContext;
+use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion_expr::{Expr, TableType};
 use datafusion_physical_plan::ExecutionPlan;
 use lance_arrow::SchemaExt;
@@ -46,11 +43,11 @@ impl FtsTableProvider {
         let mut row_addr_idx = None;
         if with_row_id {
             full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
-            row_id_idx = Some(full_schema.fields.len() - 1);
+            row_id_idx = Some(full_schema.fields().len() - 1);
         }
         if with_row_addr {
             full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
-            row_addr_idx = Some(full_schema.fields.len() - 1);
+            row_addr_idx = Some(full_schema.fields().len() - 1);
         }
         Self {
             dataset,
@@ -140,17 +137,14 @@ impl TableProvider for FtsTableProvider {
 /// ```ignore
 /// use crate::datafusion::LanceTableProvider;
 /// use crate::dataset::udtf::FtsQueryUDTF;
+/// use crate::dataset::udtf::FtsQueryUDTFBuilder;
 /// use datafusion::prelude::SessionContext;
 ///
 /// let ctx = SessionContext::new();
-/// ctx.register_table(
-///   "HarryPotter_Chapter1",
-///   Arc::new(LanceTableProvider::new(data1.clone(), false, false)),
-/// ).unwrap();
-/// ctx.register_table(
-///   "HarryPotter_Chapter2",
-///   Arc::new(LanceTableProvider::new(data2.clone(), false, false)),
-/// ).unwrap();
+/// let fts_query_udtf = FtsQueryUDTFBuilder::builder()
+///   .register_table("HarryPotter_Chapter1", data1.clone())
+///   .register_table("HarryPotter_Chapter2", data2.clone())
+///   .build();
 /// ctx.register_udtf("fts", Arc::new(fts_query_udtf));
 ///
 /// let fts_query = r#"
@@ -178,25 +172,6 @@ struct FtsQueryUDTF {
     datasets: HashMap<String, Arc<Dataset>>,
 }
 
-impl FtsQueryUDTF {
-    /// Build a FtsQueryUDTF from session context. Tables already registered in session context are
-    /// allowed in FtsQueryUDTF. The tables registered after this function can't be recognized.
-    #[allow(dead_code)]
-    pub async fn new(ctx: &SessionContext) -> Result<Self, Error> {
-        let mut dataset = HashMap::new();
-        let tables = get_all_tables(ctx);
-        for name in tables {
-            let table = ctx.table_provider(TableReference::from(&name)).await?;
-            let table = table.as_any().downcast_ref::<LanceTableProvider>().ok_or(
-                DataFusionError::Execution(format!("Table {} not found", &name)),
-            )?;
-            dataset.insert(name.clone(), table.dataset());
-        }
-
-        Ok(Self { datasets: dataset })
-    }
-}
-
 impl TableFunctionImpl for FtsQueryUDTF {
     fn call(&self, expr: &[Expr]) -> datafusion::common::Result<Arc<dyn TableProvider>> {
         // Parse params: table_name, fts_query, options
@@ -211,7 +186,6 @@ impl TableFunctionImpl for FtsQueryUDTF {
                 "FtsQueryUDTF first argument should be table name in string".to_string(),
             ));
         };
-        let table_name = normalize_datafusion_table_name(table_name)?;
 
         let Some(Expr::Literal(ScalarValue::Utf8(Some(fts_query)), _)) = expr.get(1) else {
             return Err(DataFusionError::Execution(
@@ -227,9 +201,10 @@ impl TableFunctionImpl for FtsQueryUDTF {
             };
 
         // Fts query
-        let dataset = self.datasets.get(&table_name).ok_or_else(|| {
-            DataFusionError::Execution(format!("Table {} not found", &table_name))
-        })?;
+        let dataset = self
+            .datasets
+            .get(table_name)
+            .ok_or_else(|| DataFusionError::Execution(format!("Table {} not found", table_name)))?;
 
         let provider = FtsTableProvider::new(
             dataset.clone(),
@@ -257,10 +232,36 @@ fn parse_query_options(options: &str) -> datafusion::common::Result<(bool, bool,
     Ok((with_row_id, with_row_addr, ordered))
 }
 
+/// Builder of `FtsQueryUDTF`
+#[allow(dead_code)]
+struct FtsQueryUDTFBuilder {
+    datasets: HashMap<String, Arc<Dataset>>,
+}
+
+#[allow(dead_code)]
+impl FtsQueryUDTFBuilder {
+    pub fn builder() -> Self {
+        Self {
+            datasets: HashMap::new(),
+        }
+    }
+
+    pub fn register_table(mut self, table_name: &str, dataset: Arc<Dataset>) -> Self {
+        self.datasets.insert(table_name.to_string(), dataset);
+        self
+    }
+
+    pub fn build(self) -> FtsQueryUDTF {
+        FtsQueryUDTF {
+            datasets: self.datasets,
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use crate::datafusion::LanceTableProvider;
-    use crate::dataset::udtf::FtsQueryUDTF;
+    use crate::dataset::udtf::{FtsQueryUDTF, FtsQueryUDTFBuilder};
     use crate::Dataset;
     use arrow_array::{
         Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
@@ -310,13 +311,9 @@ pub mod tests {
 
         // Prepare datafusion
         let ctx = Arc::new(SessionContext::new());
-        ctx.register_table(
-            "foo",
-            Arc::new(LanceTableProvider::new(data.clone(), false, false)),
-        )
-        .unwrap();
-
-        let fts_query_udtf = FtsQueryUDTF::new(&ctx).await.unwrap();
+        let fts_query_udtf = FtsQueryUDTFBuilder::builder()
+            .register_table("foo", data.clone())
+            .build();
         ctx.register_udtf("fts", Arc::new(fts_query_udtf));
 
         // Full text search

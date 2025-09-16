@@ -7,16 +7,14 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
     is_arrow_json_field, is_json_field,
 };
-use lance_core::{Error, ROW_ID};
+use lance_core::ROW_ID;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
-use snafu::location;
 use std::borrow::Cow;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -247,34 +245,4 @@ pub fn wrap_json_stream_for_reading(
         converted_schema,
         converted_stream,
     ))
-}
-
-pub fn get_all_tables(ctx: &SessionContext) -> Vec<String> {
-    let mut tables = Vec::new();
-    for catalog_name in ctx.catalog_names() {
-        if let Some(catalog) = ctx.catalog(&catalog_name) {
-            for schema_name in catalog.schema_names() {
-                if let Some(schema) = catalog.schema(&schema_name) {
-                    tables.extend(schema.table_names().into_iter().map(|table_name| {
-                        format!("{}.{}.{}", catalog_name, schema_name, table_name)
-                    }))
-                }
-            }
-        }
-    }
-    tables
-}
-
-pub fn normalize_datafusion_table_name(table_name: &str) -> Result<String> {
-    let parts: Vec<&str> = table_name.split('.').collect();
-
-    match parts.len() {
-        3 => Ok(table_name.to_string()),
-        2 => Ok(format!("datafusion.{}", table_name)),
-        1 => Ok(format!("datafusion.public.{}", table_name)),
-        _ => Err(Error::InvalidInput {
-            source: "Invalid table name format".into(),
-            location: location!(),
-        }),
-    }
 }
