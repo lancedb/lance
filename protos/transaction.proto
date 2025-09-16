@@ -33,6 +33,10 @@ message Transaction {
   // __lance_commit_message is a reserved key
   map<string, string> transaction_properties = 4;
 
+  // Primary key Bloom Filter data for conflict detection
+  // This is used to detect conflicts between concurrent merge insert operations
+  optional bytes primary_key_bloom_filter = 5;
+
   // Add new rows to the dataset.
   message Append {
     // The new fragments to append.
