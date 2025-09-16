@@ -1116,7 +1116,8 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         target_partition_size: None,
         max_iters: 50, // Default
         centroids: ivf_model.centroids.clone().map(Arc::new),
-        retrain: false,   // Don't retrain since we have centroids
+        #[allow(deprecated)]
+        retrain: false, // Don't retrain since we have centroids
         sample_rate: 256, // Default
         precomputed_partitions_file: None,
         precomputed_shuffle_buffers: None,
