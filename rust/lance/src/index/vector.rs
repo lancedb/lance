@@ -1757,11 +1757,7 @@ mod tests {
         // Run optimize_indices to index the newly added data and merge indices
         // We set num_indices_to_merge to a high value to force merging all indices into one
         use lance_index::optimize::OptimizeOptions;
-        let optimize_options = OptimizeOptions {
-            num_indices_to_merge: 10, // High value to ensure all indices are merged
-            index_names: None,
-            retrain: false, // Don't retrain, just merge with existing centroids
-        };
+        let optimize_options = OptimizeOptions::new().num_indices_to_merge(10);
         target_dataset
             .optimize_indices(&optimize_options)
             .await
