@@ -322,15 +322,18 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     output.truncate(num_whole_chunks * words_per_chunk);
     let remaining_items = data_buffer.len() - last_chunk_start;
     output.reserve(remaining_items);
+    // Append the raw tail so that we avoid padding zeros and keep decoding fast.
     output.extend_from_slice(&data_buffer[last_chunk_start..]);
 
     LanceBuffer::reinterpret_vec(output)
 }
 
-/// Unpacks a FixedWidthDataBlock that has been bitpacked with a constant bit width
+/// Unpacks a FixedWidthDataBlock that has been bitpacked with a constant bit width.
 ///
-/// The compressed_bits_per_value is provided
-/// The uncompressed_bits_per_value is based on T's size
+/// The compressed bit width is provided while the uncompressed width comes from `T`.
+/// Buffers written by older versions always packed a padded 1024-value tail. New buffers
+/// append the raw remainder instead. We detect the format from the buffer length so both
+/// layouts remain compatible.
 fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     data: FixedWidthDataBlock,
     num_values: usize,
@@ -364,6 +367,9 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     }
 
     if tail_values > 0 {
+        // Older buffers always padded the tail to 1024 items and then packed it.
+        // New buffers append the raw tail values directly to the compressed blocks.
+        // We infer the layout from the buffer length so we can decode both versions.
         if tail_is_raw {
             let tail_start = expected_full_words;
             decompressed.extend_from_slice(&compressed_words[tail_start..tail_start + tail_values]);
