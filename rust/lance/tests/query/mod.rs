@@ -77,19 +77,11 @@ async fn test_filter(original: &RecordBatch, ds: &Dataset, predicate: &str) {
         .unwrap();
     let scanned = scanner.try_into_batch().await.unwrap();
 
-    // Use DataFusion to apply same filter using SQL
-    // Convert Lance filter syntax to SQL syntax
-    let sql_predicate = if predicate.starts_with('!') {
-        format!("NOT {}", &predicate[1..])
-    } else {
-        predicate.to_string()
-    };
-
     let ctx = SessionContext::new();
     let table = MemTable::try_new(original.schema(), vec![vec![original.clone()]]).unwrap();
     ctx.register_table("t", Arc::new(table)).unwrap();
 
-    let sql = format!("SELECT * FROM t WHERE {} ORDER BY id", sql_predicate);
+    let sql = format!("SELECT * FROM t WHERE {} ORDER BY id", predicate);
     let df = ctx.sql(&sql).await.unwrap();
     let expected_batches = df.collect().await.unwrap();
     let expected = concat_batches(&original.schema(), &expected_batches).unwrap();
