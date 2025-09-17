@@ -1153,8 +1153,8 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 // simple column reference (e.g. x = 7).  Second, a more complex way,
 // is some kind of projection into a column (e.g. json_extract(json, '$.name')).
 // Third way is nested field access (e.g. get_field(metadata, "status.code"))
-fn maybe_indexed_column<'a, 'b>(
-    expr: &'a Expr,
+fn maybe_indexed_column<'b>(
+    expr: &Expr,
     index_info: &'b dyn IndexInformationProvider,
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions

@@ -4201,8 +4201,8 @@ mod tests {
 
         // Generate test data
         let num_rows = 1000;
-        let ids = Int32Array::from_iter_values(0..num_rows as i32);
-        let values_v1 = Int32Array::from_iter_values((0..num_rows).map(|i| (i % 100) as i32));
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        let values_v1 = Int32Array::from_iter_values((0..num_rows).map(|i| i % 100));
         let values_v2 = Float32Array::from_iter_values((0..num_rows).map(|i| (i as f32) * 0.1));
         let texts = StringArray::from_iter_values((0..num_rows).map(|i| format!("text_{}", i)));
 
@@ -4311,9 +4311,9 @@ mod tests {
 
         // Generate test data with low cardinality (good for bitmap index)
         let num_rows = 1000;
-        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let ids = Int32Array::from_iter_values(0..num_rows);
         // Only 10 unique status codes
-        let status_codes = Int32Array::from_iter_values((0..num_rows).map(|i| (i % 10) as i32));
+        let status_codes = Int32Array::from_iter_values((0..num_rows).map(|i| i % 10));
         // Only 5 unique categories
         let categories =
             StringArray::from_iter_values((0..num_rows).map(|i| format!("category_{}", i % 5)));
