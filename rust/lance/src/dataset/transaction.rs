@@ -58,10 +58,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
-    format::{
-        pb::{self, IndexMetadata},
-        DataFile, DataStorageFormat, Fragment, Index, Manifest, RowIdMeta,
-    },
+    format::{pb, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta},
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
@@ -133,9 +130,9 @@ pub enum Operation {
     /// A new index has been created.
     CreateIndex {
         /// The new secondary indices that are being added
-        new_indices: Vec<Index>,
+        new_indices: Vec<IndexMetadata>,
         /// The indices that have been modified.
-        removed_indices: Vec<Index>,
+        removed_indices: Vec<IndexMetadata>,
     },
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
@@ -150,7 +147,7 @@ pub enum Operation {
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
-        frag_reuse_index: Option<Index>,
+        frag_reuse_index: Option<IndexMetadata>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
@@ -1290,7 +1287,7 @@ impl Transaction {
         version: u64,
         config: &ManifestWriteConfig,
         tx_path: &str,
-    ) -> Result<(Manifest, Vec<Index>)> {
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let location = commit_handler
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
@@ -1307,11 +1304,11 @@ impl Transaction {
     pub(crate) fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
-        current_indices: Vec<Index>,
+        current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
         new_blob_version: Option<u64>,
-    ) -> Result<(Manifest, Vec<Index>)> {
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
@@ -1847,7 +1844,7 @@ impl Transaction {
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
     fn prune_updated_fields_from_indices(
-        indices: &mut [Index],
+        indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
     ) {
@@ -1873,7 +1870,7 @@ impl Transaction {
         }
     }
 
-    fn is_vector_index(index: &Index) -> bool {
+    fn is_vector_index(index: &IndexMetadata) -> bool {
         if let Some(details) = &index.index_details {
             details.type_url.ends_with("VectorIndexDetails")
         } else {
@@ -1892,7 +1889,11 @@ impl Transaction {
         }
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, _fragments: &[Fragment]) {
+    fn retain_relevant_indices(
+        indices: &mut Vec<IndexMetadata>,
+        schema: &Schema,
+        _fragments: &[Fragment],
+    ) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
@@ -1913,7 +1914,7 @@ impl Transaction {
 
         // Apply retention logic for indices with empty bitmaps per index name
         // (except for fragment reuse indices which are always kept)
-        let mut indices_by_name: std::collections::HashMap<String, Vec<&Index>> =
+        let mut indices_by_name: std::collections::HashMap<String, Vec<&IndexMetadata>> =
             std::collections::HashMap::new();
 
         // Group indices by name
@@ -1945,7 +1946,7 @@ impl Transaction {
                     // All indices are empty - for scalar indices, keep only the first (oldest) one
                     // For vector indices, remove all of them
                     let mut sorted_indices = empty_indices;
-                    sorted_indices.sort_by_key(|index: &&Index| index.dataset_version); // Sort by ascending dataset_version
+                    sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version); // Sort by ascending dataset_version
 
                     // Keep only the first (oldest) if it's not a vector index
                     if let Some(oldest) = sorted_indices.first() {
@@ -2015,7 +2016,7 @@ impl Transaction {
     }
 
     fn handle_rewrite_indices(
-        indices: &mut [Index],
+        indices: &mut [IndexMetadata],
         rewritten_indices: &[RewrittenIndex],
         groups: &[RewriteGroup],
     ) -> Result<()> {
@@ -2334,11 +2335,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .into_iter()
-                    .map(Index::try_from)
+                    .map(IndexMetadata::try_from)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .into_iter()
-                    .map(Index::try_from)
+                    .map(IndexMetadata::try_from)
                     .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -2639,8 +2640,11 @@ impl From<&Transaction> for pb::Transaction {
                 new_indices,
                 removed_indices,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
-                removed_indices: removed_indices.iter().map(IndexMetadata::from).collect(),
+                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+                removed_indices: removed_indices
+                    .iter()
+                    .map(pb::IndexMetadata::from)
+                    .collect(),
             }),
             Operation::Merge { fragments, schema } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {

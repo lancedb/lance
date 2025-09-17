@@ -10,7 +10,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
 use lance_index::VECTOR_INDEX_VERSION;
-use lance_table::format::{Fragment, Index as IndexMetadata};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
