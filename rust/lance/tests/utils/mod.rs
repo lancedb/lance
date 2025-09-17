@@ -116,7 +116,7 @@ async fn build_dataset(
     let max_rows_per_file = if let Fragmentation::MultiFragment = fragmentation {
         3
     } else {
-        original.num_rows() + 1
+        1_000_000
     };
 
     let mut ds = InsertBuilder::new("memory://")
@@ -132,7 +132,13 @@ async fn build_dataset(
 
     assert_eq!(ds.count_rows(None).await.unwrap(), original.num_rows());
 
-    for (column, index_type) in indices {
+    let fragment_ids = ds
+        .manifest()
+        .fragments
+        .iter()
+        .map(|f| f.id as u32)
+        .collect::<Vec<_>>();
+    for (fragment_offset, (column, index_type)) in indices.iter().enumerate() {
         // TODO: when possible, make indices cover a portion of rows and not be
         // aligned between indices.
         let index_params: Box<dyn IndexParams> = match index_type {
@@ -180,8 +186,23 @@ async fn build_dataset(
             }
         };
 
+        // Index all but one fragment. Each new index we increase the offset.
+        // Start at the offset and then count (wrapping around if needed)
+        // fragments.length - 1.
+        // So for 3 fragments:
+        // Index 1: [0, 1]
+        // Index 2: [1, 2]
+        // Index 3: [2, 0]
+        let fragments_to_index = fragment_ids
+            .iter()
+            .cycle()
+            .skip(fragment_offset)
+            .take((fragment_ids.len() - 1).max(1))
+            .cloned()
+            .collect::<Vec<_>>();
+
         ds.create_index_builder(&[column], *index_type, index_params.as_ref())
-            //.fragments() <--- Uncomment this line when implementing fragments
+            .fragments(fragments_to_index)
             .await
             .unwrap();
     }
