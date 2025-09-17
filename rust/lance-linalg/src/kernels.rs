@@ -87,6 +87,28 @@ pub fn argmin_value_float<T: Float>(iter: impl Iterator<Item = T>) -> Option<(u3
     min_idx.map(|idx| (idx, min_value))
 }
 
+#[inline]
+pub fn argmin_value_float_with_bias<T: Float>(
+    iter: impl Iterator<Item = T>,
+    bias: Option<impl Iterator<Item = T>>,
+) -> Option<(u32, T)> {
+    let Some(bias) = bias else {
+        return argmin_value_float(iter);
+    };
+
+    let mut min_idx = None;
+    let mut min_value = T::infinity();
+    let mut min_original_value = T::infinity();
+    for (idx, (value, bias)) in iter.zip(bias).enumerate() {
+        if value + bias < min_value {
+            min_value = value + bias;
+            min_original_value = value;
+            min_idx = Some(idx as u32);
+        }
+    }
+    min_idx.map(|idx| (idx, min_original_value))
+}
+
 pub fn argmin_value_opt<T: Num + Bounded + PartialOrd>(
     iter: impl Iterator<Item = Option<T>>,
 ) -> Option<(u32, T)> {

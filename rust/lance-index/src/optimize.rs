@@ -32,6 +32,10 @@ pub struct OptimizeOptions {
     /// This would be faster than re-create the index from scratch.
     ///
     /// NOTE: this option is only supported for v3 vector indices.
+    #[deprecated(
+        since = "0.35.0",
+        note = "lance>=0.35.0 always incrementally updates the index, this option is ignored"
+    )]
     pub retrain: bool,
 }
 
@@ -40,6 +44,7 @@ impl Default for OptimizeOptions {
         Self {
             num_indices_to_merge: 1,
             index_names: None,
+            #[allow(deprecated)]
             retrain: false,
         }
     }
@@ -50,7 +55,7 @@ impl OptimizeOptions {
         Self {
             num_indices_to_merge: 1,
             index_names: None,
-            retrain: false,
+            ..Default::default()
         }
     }
 
@@ -58,15 +63,19 @@ impl OptimizeOptions {
         Self {
             num_indices_to_merge: 0,
             index_names: None,
-            retrain: false,
+            ..Default::default()
         }
     }
 
+    #[deprecated(
+        since = "0.35.0",
+        note = "lance>=0.35.0 always incrementally updates the index, this option is ignored"
+    )]
     pub fn retrain() -> Self {
         Self {
             num_indices_to_merge: 0,
             index_names: None,
-            retrain: true,
+            ..Default::default()
         }
     }
 
