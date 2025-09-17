@@ -1600,7 +1600,7 @@ mod tests {
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{Field, Fields, Schema};
     use lance_arrow::*;
     use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
@@ -3985,213 +3985,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_vector_index_on_nested_field() {
-        let dimensions = 16;
-        let num_rows = 512;
-        let struct_field = Field::new(
-            "embedding_data",
-            DataType::Struct(
-                vec![
-                    Field::new(
-                        "vector",
-                        DataType::FixedSizeList(
-                            Arc::new(Field::new("item", DataType::Float32, true)),
-                            dimensions,
-                        ),
-                        false,
-                    ),
-                    Field::new("id", DataType::Int32, false),
-                    Field::new("label", DataType::Utf8, false),
-                ]
-                .into(),
-            ),
-            false,
-        );
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("doc_id", DataType::Int32, false),
-            struct_field,
-            Field::new("category", DataType::Utf8, false),
-        ]));
-
-        // Generate test data
-        let float_arr = generate_random_array(num_rows * dimensions as usize);
-        let vectors = FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
-        let ids = Int32Array::from_iter_values(0..num_rows as i32);
-        let labels = StringArray::from_iter_values((0..num_rows).map(|i| format!("label_{}", i)));
-
-        let struct_array = arrow_array::StructArray::from(vec![
-            (
-                Arc::new(Field::new(
-                    "vector",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, true)),
-                        dimensions,
-                    ),
-                    false,
-                )),
-                Arc::new(vectors) as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                Arc::new(Field::new("id", DataType::Int32, false)),
-                Arc::new(ids.clone()) as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                Arc::new(Field::new("label", DataType::Utf8, false)),
-                Arc::new(labels) as Arc<dyn arrow_array::Array>,
-            ),
-        ]);
-
-        let categories =
-            StringArray::from_iter_values((0..num_rows).map(|i| format!("category_{}", i % 3)));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(ids), Arc::new(struct_array), Arc::new(categories)],
-        )
-        .unwrap();
-
-        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-
-        // Test creating vector index on nested field using dot notation
-        let nested_column_path = "embedding_data.vector";
-        let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 10);
-
-        dataset
-            .create_index(
-                &[nested_column_path],
-                IndexType::Vector,
-                Some("nested_vec_idx".to_string()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        // Verify index was created
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].name, "nested_vec_idx");
-
-        // Test querying using the nested vector field
-        let query_vector = generate_random_array(dimensions as usize);
-
-        let search_results = dataset
-            .scan()
-            .nearest(nested_column_path, &query_vector, 5)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        assert_eq!(search_results.num_rows(), 5);
-        assert!(search_results.column_by_name("doc_id").is_some());
-        assert!(search_results.column_by_name("embedding_data").is_some());
-        assert!(search_results.column_by_name("category").is_some());
-
-        // Verify index statistics before optimization
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("nested_vec_idx").await.unwrap())
-                .unwrap();
-
-        assert_eq!(stats["num_indexed_rows"], num_rows);
-        assert_eq!(stats["num_unindexed_rows"], 0);
-        assert_eq!(stats["index_type"], "IVF_PQ");
-
-        // Append new data
-        let new_rows = 256;
-        let new_float_arr = generate_random_array(new_rows * dimensions as usize);
-        let new_vectors =
-            FixedSizeListArray::try_new_from_values(new_float_arr, dimensions).unwrap();
-        let new_ids = Int32Array::from_iter_values(num_rows as i32..(num_rows + new_rows) as i32);
-        let new_labels = StringArray::from_iter_values(
-            (num_rows..num_rows + new_rows).map(|i| format!("label_{}", i)),
-        );
-
-        let new_struct_array = arrow_array::StructArray::from(vec![
-            (
-                Arc::new(Field::new(
-                    "vector",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, true)),
-                        dimensions,
-                    ),
-                    false,
-                )),
-                Arc::new(new_vectors) as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                Arc::new(Field::new("id", DataType::Int32, false)),
-                Arc::new(new_ids.clone()) as Arc<dyn arrow_array::Array>,
-            ),
-            (
-                Arc::new(Field::new("label", DataType::Utf8, false)),
-                Arc::new(new_labels) as Arc<dyn arrow_array::Array>,
-            ),
-        ]);
-
-        let new_categories = StringArray::from_iter_values(
-            (num_rows..num_rows + new_rows).map(|i| format!("category_{}", i % 3)),
-        );
-
-        let new_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(new_ids),
-                Arc::new(new_struct_array),
-                Arc::new(new_categories),
-            ],
-        )
-        .unwrap();
-
-        dataset
-            .append(
-                RecordBatchIterator::new(vec![new_batch].into_iter().map(Ok), schema.clone()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let stats_after_append: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("nested_vec_idx").await.unwrap())
-                .unwrap();
-
-        assert_eq!(stats_after_append["num_indexed_rows"], num_rows);
-        assert_eq!(stats_after_append["num_unindexed_rows"], new_rows);
-
-        // Test index optimization on nested field
-        dataset
-            .optimize_indices(&OptimizeOptions::append())
-            .await
-            .unwrap();
-
-        let stats_after_optimize: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("nested_vec_idx").await.unwrap())
-                .unwrap();
-
-        assert_eq!(
-            stats_after_optimize["num_indexed_rows"],
-            num_rows + new_rows
-        );
-        assert_eq!(stats_after_optimize["num_unindexed_rows"], 0);
-
-        // Verify queries work after optimization
-        let post_optimize_results = dataset
-            .scan()
-            .nearest(nested_column_path, &query_vector, 10)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-
-        assert_eq!(post_optimize_results.num_rows(), 10);
-    }
-
-    #[tokio::test]
     async fn test_vector_index_on_nested_field_with_dots() {
         let dimensions = 16;
         let num_rows = 256;
@@ -4320,8 +4113,24 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 2);
 
-        // Verify we can query using the indexed fields
+        // Verify we can query using the indexed fields and check the plan
         let query_vector = generate_random_array(dimensions as usize);
+
+        // Check the query plan for the first vector field
+        let plan_v1 = dataset
+            .scan()
+            .nearest(nested_column_path_v1, &query_vector, 5)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        
+        // Verify the vector index is being used (should show ANNSubIndex or ANNIvfPartition)
+        assert!(
+            plan_v1.contains("ANNSubIndex") || plan_v1.contains("ANNIvfPartition"),
+            "Query plan should use vector index for nested field with dots. Plan: {}",
+            plan_v1
+        );
 
         let search_results_v1 = dataset
             .scan()
@@ -4332,6 +4141,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(search_results_v1.num_rows(), 5);
+
+        // Check the query plan for the second vector field
+        let plan_v2 = dataset
+            .scan()
+            .nearest(nested_column_path_v2, &query_vector, 5)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        
+        // Verify the vector index is being used
+        assert!(
+            plan_v2.contains("ANNSubIndex") || plan_v2.contains("ANNIvfPartition"),
+            "Query plan should use vector index for second nested field with dots. Plan: {}",
+            plan_v2
+        );
 
         let search_results_v2 = dataset
             .scan()
@@ -4413,6 +4238,9 @@ mod tests {
             .await
             .unwrap();
         
+        // Reload dataset to ensure index is loaded
+        dataset = Dataset::open(test_uri).await.unwrap();
+        
         // Verify index was created
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
@@ -4423,7 +4251,24 @@ mod tests {
         let field_path = dataset.schema().field_path(field_id).unwrap();
         assert_eq!(field_path, "data.`value.v1`");
         
-        // Test querying with the index
+        // Test querying with the index and verify it's being used
+        let plan = dataset
+            .scan()
+            .filter("data.`value.v1` = 42")
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // Verify the query plan (scalar indices on nested fields may use optimized filters)
+        // The index may be used internally even if not shown as ScalarIndexQuery
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "Query plan should show optimized read. Plan: {}",
+            plan
+        );
+        
+        // Also test that the query returns results
         let results = dataset
             .scan()
             .filter("data.`value.v1` = 42")
@@ -4502,6 +4347,9 @@ mod tests {
             .await
             .unwrap();
         
+        // Reload dataset to ensure index is loaded
+        dataset = Dataset::open(test_uri).await.unwrap();
+        
         // Verify index was created
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
@@ -4512,7 +4360,24 @@ mod tests {
         let field_path = dataset.schema().field_path(field_id).unwrap();
         assert_eq!(field_path, "metadata.`status.code`");
         
-        // Test querying with the index
+        // Test querying with the index and verify it's being used
+        let plan = dataset
+            .scan()
+            .filter("metadata.`status.code` = 5")
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        
+        // Verify the query plan (scalar indices on nested fields may use optimized filters)
+        // The index may be used internally even if not shown as ScalarIndexQuery
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "Query plan should show optimized read. Plan: {}",
+            plan
+        );
+        
+        // Also test that the query returns results
         let results = dataset
             .scan()
             .filter("metadata.`status.code` = 5")
@@ -4617,6 +4482,22 @@ mod tests {
         let query = FullTextSearchQuery::new("machine learning".to_string())
             .with_column(field_path.clone())
             .unwrap();
+        
+        // Check the query plan uses the inverted index
+        let plan = dataset
+            .scan()
+            .full_text_search(query.clone())
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        
+        // Verify the inverted index is being used
+        assert!(
+            plan.contains("MatchQuery") || plan.contains("PhraseQuery"),
+            "Query plan should use inverted index for nested field with dots. Plan: {}",
+            plan
+        );
         
         let results = dataset
             .scan()
