@@ -1235,10 +1235,10 @@ impl Projection {
 /// Parse a field path that may contain quoted field names.
 ///
 /// Field names containing dots must be quoted with backticks.
-/// For example: `parent.`child.with.dot`` parses to ["parent", "child.with.dot"]
+/// For example: "parent.`child.with.dot`" parses to ["parent", "child.with.dot"]
 ///
-/// Backticks within quoted fields must be escaped by doubling them (PostgreSQL style).
-/// For example: ``field``with``backticks`` represents the field name `field`with`backticks`
+/// Backticks within quoted fields must be escaped by doubling them.
+/// For example: "`field``with``backticks`" represents the field name "field`with`backticks"
 ///
 /// Returns an error if:
 /// - The input path is empty
@@ -1341,9 +1341,9 @@ pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
 
 /// Format a field path, quoting field names that contain dots or backticks.
 ///
-/// For example: ["parent", "child.with.dot"] formats to `parent.`child.with.dot``
-/// Backticks in field names are escaped by doubling them (PostgreSQL style).
-/// For example: ["field`with`backticks"] formats to ``field``with``backticks``
+/// For example: ["parent", "child.with.dot"] formats to “parent.`child.with.dot`”
+/// Backticks in field names are escaped by doubling them.
+/// For example: ["field`with`backticks"] formats to “`field``with``backticks`”
 pub fn format_field_path(fields: &[&str]) -> String {
     fields
         .iter()
@@ -1364,26 +1364,18 @@ pub fn format_field_path(fields: &[&str]) -> String {
 /// Escape a field path for project
 ///
 /// Parses the field path and formats it for SQL usage.
-/// Only quotes segments that contain special characters.
+/// Always quotes all segments with backticks to prevent special characters.
 ///
 /// For example:
-/// - "parent.child" -> parent.child  
-/// - "parent.`child.with.dot`" -> parent.`child.with.dot`
+/// - "parent.child" -> “`parent`.`child`”
+/// - "parent.`child.with.dot`" -> “`parent`.`child.with.dot`”
 pub fn escape_field_path_for_project(name: &str) -> String {
-    // Parse the field path to handle quoted segments properly
     let segments = parse_field_path(name).unwrap_or_else(|_| vec![name.to_string()]);
-
-    // Quote only segments that need it (contain dots or backticks)
     segments
         .iter()
         .map(|s| {
-            if s.contains('.') || s.contains('`') {
-                // Escape backticks by doubling them
-                let escaped = s.replace('`', "``");
-                format!("`{}`", escaped)
-            } else {
-                s.to_string()
-            }
+            let escaped = s.replace('`', "``");
+            format!("`{}`", escaped)
         })
         .collect::<Vec<_>>()
         .join(".")
