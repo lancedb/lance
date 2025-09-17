@@ -186,7 +186,7 @@ impl From<&Manifest> for Version {
         Self {
             version: m.version,
             timestamp: m.timestamp(),
-            metadata: m.summary(),
+            metadata: m.summary().into(),
         }
     }
 }

@@ -118,12 +118,43 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
 }
 
 #[derive(Default)]
-struct ManifestStats {
-    total_data_files: usize,
-    total_records: usize,
-    total_file_sizes: u64,
-    total_deletion_files: usize,
-    total_deletions: usize,
+pub struct ManifestStats {
+    total_fragments: u64,
+    total_data_files: u64,
+    total_records: u64,
+    total_files_size: u64,
+    total_deletion_files: u64,
+    total_deletions: u64,
+}
+
+impl Into<BTreeMap<String, String>> for ManifestStats {
+    fn into(self) -> BTreeMap<String, String> {
+        let mut stats_map = BTreeMap::new();
+
+        stats_map.insert(
+            "total-fragments".to_string(),
+            self.total_fragments.to_string(),
+        );
+        stats_map.insert(
+            "total-data-files".to_string(),
+            self.total_data_files.to_string(),
+        );
+        stats_map.insert("total-records".to_string(), self.total_records.to_string());
+        stats_map.insert(
+            "total-files-size".to_string(),
+            self.total_files_size.to_string(),
+        );
+        stats_map.insert(
+            "total-deletion-files".to_string(),
+            self.total_deletion_files.to_string(),
+        );
+        stats_map.insert(
+            "total-deletions".to_string(),
+            self.total_deletions.to_string(),
+        );
+
+        stats_map
+    }
 }
 
 impl Manifest {
@@ -456,27 +487,22 @@ impl Manifest {
     /// - total-data-files: Total number of data files across all fragments
     /// - total-deletions: Total number of deleted records
     /// - total-deletion-files: Number of fragments with deletion files
-    pub fn summary(&self) -> BTreeMap<String, String> {
-        let mut metadata = BTreeMap::new();
-
+    pub fn summary(&self) -> ManifestStats {
         // Calculate total fragments
-        let total_fragments = self.fragments.len();
-        metadata.insert("total-fragments".to_string(), total_fragments.to_string());
-
-        let stats = self
+        let mut stats = self
             .fragments
             .iter()
             .fold(ManifestStats::default(), |mut stats, f| {
                 // Count data files in the current fragment
-                stats.total_data_files += f.files.len();
+                stats.total_data_files += f.files.len() as u64;
                 // Sum the number of rows for the current fragment (if available)
                 if let Some(num_rows) = f.num_rows() {
-                    stats.total_records += num_rows;
+                    stats.total_records += num_rows as u64;
                 }
                 // Sum file sizes for all data files in the current fragment (if available)
                 for data_file in &f.files {
                     if let Some(size_bytes) = data_file.file_size_bytes.get() {
-                        stats.total_file_sizes += size_bytes.get();
+                        stats.total_files_size += size_bytes.get();
                     }
                 }
                 // Check and count if the current fragment has a deletion file
@@ -486,32 +512,14 @@ impl Manifest {
                 // Sum the number of deleted rows from the deletion file (if available)
                 if let Some(deletion_file) = &f.deletion_file {
                     if let Some(num_deleted) = deletion_file.num_deleted_rows {
-                        stats.total_deletions += num_deleted;
+                        stats.total_deletions += num_deleted as u64;
                     }
                 }
                 stats
             });
+        stats.total_fragments = self.fragments.len() as u64;
 
-        // Insert all statistical results into metadata
-        metadata.insert(
-            "total-data-files".to_string(),
-            stats.total_data_files.to_string(),
-        );
-        metadata.insert("total-records".to_string(), stats.total_records.to_string());
-        metadata.insert(
-            "total-files-size".to_string(),
-            stats.total_file_sizes.to_string(),
-        );
-        metadata.insert(
-            "total-deletion-files".to_string(),
-            stats.total_deletion_files.to_string(),
-        );
-        metadata.insert(
-            "total-deletions".to_string(),
-            stats.total_deletions.to_string(),
-        );
-
-        metadata
+        stats
     }
 }
 
@@ -1040,13 +1048,12 @@ mod tests {
         );
 
         let empty_summary = empty_manifest.summary();
-        assert_eq!(empty_summary.get("total-records").unwrap(), "0");
-        assert_eq!(empty_summary.get("total-files-size").unwrap(), "0");
-        assert_eq!(empty_summary.get("total-fragments").unwrap(), "0");
-        assert_eq!(empty_summary.get("total-data-files").unwrap(), "0");
-        assert_eq!(empty_summary.get("total-deletions").unwrap(), "0");
-        assert_eq!(empty_summary.get("total-deletion-files").unwrap(), "0");
-        assert_eq!(empty_summary.len(), 6);
+        assert_eq!(empty_summary.total_records, 0);
+        assert_eq!(empty_summary.total_files_size, 0);
+        assert_eq!(empty_summary.total_fragments, 0);
+        assert_eq!(empty_summary.total_data_files, 0);
+        assert_eq!(empty_summary.total_deletions, 0);
+        assert_eq!(empty_summary.total_deletion_files, 0);
 
         // Step 2: write empty files and verify summary
         let empty_fragments = vec![
@@ -1063,16 +1070,12 @@ mod tests {
         );
 
         let empty_files_summary = empty_files_manifest.summary();
-        assert_eq!(empty_files_summary.get("total-records").unwrap(), "0");
-        assert_eq!(empty_files_summary.get("total-files-size").unwrap(), "0");
-        assert_eq!(empty_files_summary.get("total-fragments").unwrap(), "2");
-        assert_eq!(empty_files_summary.get("total-data-files").unwrap(), "2");
-        assert_eq!(empty_files_summary.get("total-deletions").unwrap(), "0");
-        assert_eq!(
-            empty_files_summary.get("total-deletion-files").unwrap(),
-            "0"
-        );
-        assert_eq!(empty_files_summary.len(), 6);
+        assert_eq!(empty_files_summary.total_records, 0);
+        assert_eq!(empty_files_summary.total_files_size, 0);
+        assert_eq!(empty_files_summary.total_fragments, 2);
+        assert_eq!(empty_files_summary.total_data_files, 2);
+        assert_eq!(empty_files_summary.total_deletions, 0);
+        assert_eq!(empty_files_summary.total_deletion_files, 0);
 
         // Step 3: write real data and verify summary
         let real_fragments = vec![
@@ -1090,13 +1093,12 @@ mod tests {
         );
 
         let real_data_summary = real_data_manifest.summary();
-        assert_eq!(real_data_summary.get("total-records").unwrap(), "425"); // 100 + 250 + 75
-        assert_eq!(real_data_summary.get("total-files-size").unwrap(), "0"); // Zero for unknown
-        assert_eq!(real_data_summary.get("total-fragments").unwrap(), "3");
-        assert_eq!(real_data_summary.get("total-data-files").unwrap(), "3");
-        assert_eq!(real_data_summary.get("total-deletions").unwrap(), "0");
-        assert_eq!(real_data_summary.get("total-deletion-files").unwrap(), "0");
-        assert_eq!(real_data_summary.len(), 6);
+        assert_eq!(real_data_summary.total_records, 425); // 100 + 250 + 75
+        assert_eq!(real_data_summary.total_files_size, 0); // Zero for unknown
+        assert_eq!(real_data_summary.total_fragments, 3);
+        assert_eq!(real_data_summary.total_data_files, 3);
+        assert_eq!(real_data_summary.total_deletions, 0);
+        assert_eq!(real_data_summary.total_deletion_files, 0);
 
         let file_version = LanceFileVersion::default();
         // Step 4: write deletion files and verify summary
@@ -1126,13 +1128,11 @@ mod tests {
         );
 
         let deletion_summary = manifest_with_deletion.summary();
-        assert_eq!(deletion_summary.get("total-records").unwrap(), "40"); // 50 - 10
-        assert_eq!(deletion_summary.get("total-files-size").unwrap(), "1000");
-        assert_eq!(deletion_summary.get("total-fragments").unwrap(), "1");
-        assert_eq!(deletion_summary.get("total-data-files").unwrap(), "1");
-        assert_eq!(deletion_summary.get("total-deletions").unwrap(), "10");
-        assert_eq!(deletion_summary.get("total-deletion-files").unwrap(), "1");
-
-        assert_eq!(deletion_summary.len(), 6);
+        assert_eq!(deletion_summary.total_records, 40); // 50 - 10
+        assert_eq!(deletion_summary.total_files_size, 1000);
+        assert_eq!(deletion_summary.total_fragments, 1);
+        assert_eq!(deletion_summary.total_data_files, 1);
+        assert_eq!(deletion_summary.total_deletions, 10);
+        assert_eq!(deletion_summary.total_deletion_files, 1);
     }
 }
