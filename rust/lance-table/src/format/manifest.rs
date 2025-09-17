@@ -442,14 +442,11 @@ impl Manifest {
     ///
     /// This function calculates various statistics about the manifest, including:
     /// - total-records: Total number of records in the dataset
-    /// - total-file-sizes: Total size of all data files in bytes
+    /// - total-files-size: Total size of all data files in bytes
     /// - total-fragments: Number of fragments in the dataset
     /// - total-data-files: Total number of data files across all fragments
     /// - total-deletions: Total number of deleted records
     /// - total-deletion-files: Number of fragments with deletion files
-    ///
-    /// # Returns
-    ///  A BTreeMap containing the calculated metadata
     pub fn summary(&self) -> BTreeMap<String, String> {
         let mut metadata = BTreeMap::new();
 
@@ -473,7 +470,7 @@ impl Manifest {
             .filter_map(|df| df.file_size_bytes.get())
             .map(|size| size.get())
             .sum();
-        metadata.insert("total-file-sizes".to_string(), total_file_sizes.to_string());
+        metadata.insert("total-files-size".to_string(), total_file_sizes.to_string());
 
         // Calculate total deletion files
         let total_deletion_files = self
@@ -1024,7 +1021,7 @@ mod tests {
 
         let empty_summary = empty_manifest.summary();
         assert_eq!(empty_summary.get("total-records").unwrap(), "0");
-        assert_eq!(empty_summary.get("total-file-sizes").unwrap(), "0");
+        assert_eq!(empty_summary.get("total-files-size").unwrap(), "0");
         assert_eq!(empty_summary.get("total-fragments").unwrap(), "0");
         assert_eq!(empty_summary.get("total-data-files").unwrap(), "0");
         assert_eq!(empty_summary.get("total-deletions").unwrap(), "0");
@@ -1047,7 +1044,7 @@ mod tests {
 
         let empty_files_summary = empty_files_manifest.summary();
         assert_eq!(empty_files_summary.get("total-records").unwrap(), "0");
-        assert_eq!(empty_files_summary.get("total-file-sizes").unwrap(), "0"); // 文件大小未知时为0
+        assert_eq!(empty_files_summary.get("total-files-size").unwrap(), "0"); // 文件大小未知时为0
         assert_eq!(empty_files_summary.get("total-fragments").unwrap(), "2");
         assert_eq!(empty_files_summary.get("total-data-files").unwrap(), "2");
         assert_eq!(empty_files_summary.get("total-deletions").unwrap(), "0");
@@ -1074,7 +1071,7 @@ mod tests {
 
         let real_data_summary = real_data_manifest.summary();
         assert_eq!(real_data_summary.get("total-records").unwrap(), "425"); // 100 + 250 + 75
-        assert_eq!(real_data_summary.get("total-file-sizes").unwrap(), "0"); // 文件大小未知时为0
+        assert_eq!(real_data_summary.get("total-files-size").unwrap(), "0"); // 文件大小未知时为0
         assert_eq!(real_data_summary.get("total-fragments").unwrap(), "3");
         assert_eq!(real_data_summary.get("total-data-files").unwrap(), "3");
         assert_eq!(real_data_summary.get("total-deletions").unwrap(), "0");
@@ -1102,7 +1099,7 @@ mod tests {
 
         let deletion_summary = manifest_with_deletion.summary();
         assert_eq!(deletion_summary.get("total-records").unwrap(), "40"); // 50 - 10 (删除的行数)
-        assert_eq!(deletion_summary.get("total-file-sizes").unwrap(), "0");
+        assert_eq!(deletion_summary.get("total-files-size").unwrap(), "0");
         assert_eq!(deletion_summary.get("total-fragments").unwrap(), "1");
         assert_eq!(deletion_summary.get("total-data-files").unwrap(), "1");
         assert_eq!(deletion_summary.get("total-deletions").unwrap(), "10");
