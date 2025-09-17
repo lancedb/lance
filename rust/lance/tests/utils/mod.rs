@@ -2,11 +2,18 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use futures::FutureExt;
-use lance::Dataset;
-use lance_index::IndexType;
+use lance::index::vector::VectorIndexParams;
+use lance::{
+    dataset::{InsertBuilder, WriteParams},
+    Dataset,
+};
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::{DatasetIndexExt, IndexParams, IndexType};
+use lance_linalg::distance::MetricType;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Fragmentation {
@@ -75,7 +82,8 @@ impl DatasetTestCases {
                 let index_combinations = self.generate_index_combinations();
                 for indices in index_combinations {
                     let ds =
-                        build_dataset(self.original.clone(), fragmentation, deletion, &indices);
+                        build_dataset(self.original.clone(), fragmentation, deletion, &indices)
+                            .await;
                     let context = format!(
                         "fragmentation: {:?}, deletion: {:?}, index: {:?}",
                         fragmentation, deletion, indices
@@ -95,11 +103,144 @@ impl DatasetTestCases {
 ///
 /// The data in dataset will exactly match the `original` batch. (Extra rows are
 /// created for the deleted rows created by `DeletionState`.)
-fn build_dataset(
+async fn build_dataset(
     original: RecordBatch,
     fragmentation: Fragmentation,
     deletion: DeletionState,
     indices: &[(&str, IndexType)],
 ) -> Dataset {
-    todo!()
+    let data_to_write = fill_deleted_rows(&original, deletion);
+
+    let max_rows_per_file = if let Fragmentation::MultiFragment = fragmentation {
+        3
+    } else {
+        original.num_rows() + 1
+    };
+
+    let mut ds = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file,
+            ..Default::default()
+        })
+        .execute(vec![data_to_write])
+        .await
+        .unwrap();
+
+    ds.delete("id = -1").await.unwrap();
+
+    assert_eq!(ds.count_rows(None).await.unwrap(), original.num_rows());
+
+    for (column, index_type) in indices {
+        // TODO: when possible, make indices cover a portion of rows and not be
+        // aligned between indices.
+        let index_params: Box<dyn IndexParams> = match index_type {
+            IndexType::BTree
+            | IndexType::Bitmap
+            | IndexType::LabelList
+            | IndexType::NGram
+            | IndexType::ZoneMap
+            | IndexType::Inverted
+            | IndexType::BloomFilter => Box::new(ScalarIndexParams::for_builtin(
+                (*index_type).try_into().unwrap(),
+            )),
+            IndexType::IvfFlat => {
+                // Use a small number of partitions for testing
+                Box::new(VectorIndexParams::ivf_flat(4, MetricType::L2))
+            }
+            IndexType::IvfPq => {
+                // Simple PQ params for testing
+                Box::new(VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 10))
+            }
+            _ => {
+                // For other index types, use default scalar params
+                Box::new(ScalarIndexParams::default())
+            }
+        };
+
+        ds.create_index_builder(&[column], *index_type, index_params.as_ref())
+            //.fragments() <--- Uncomment this line when implementing fragments
+            .await
+            .unwrap();
+    }
+
+    ds
+}
+
+/// Insert filler rows into a record batch such that applying deletions to the
+/// output will yield the input. For example, given the `deletions: DeletionState::DeleteOdd`
+/// and the table:
+///
+/// ```
+/// id | value
+///  1 |   "a"
+///  2 |   "b"
+/// ```
+///
+/// Produce:
+///
+/// ```
+/// id | value
+/// -1 |   "a" (filler row)
+///  1 |   "a"
+/// -1 |   "a"
+///  2 |   "b"
+/// ```
+///
+/// The filler row will have the same values as the original row, but with a special
+/// identifier (e.g., -1) to indicate that it is a filler row.
+fn fill_deleted_rows(batch: &RecordBatch, deletions: DeletionState) -> RecordBatch {
+    // Early return for no deletions
+    if let DeletionState::NoDeletions = deletions {
+        return batch.clone();
+    }
+
+    // Create a filler batch by taking the first row and replacing id with -1
+    let schema = batch.schema();
+    let mut filler_columns: Vec<ArrayRef> = Vec::new();
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        if field.name() == "id" {
+            // Create an array with a single -1 value
+            filler_columns.push(Arc::new(Int32Array::from(vec![-1])));
+        } else {
+            // Take the first value from the original column
+            let original_column = batch.column(i);
+            let sliced = original_column.slice(0, 1);
+            filler_columns.push(sliced);
+        }
+    }
+
+    let filler_batch = RecordBatch::try_new(schema.clone(), filler_columns).unwrap();
+
+    // Create an array of filler batches, one for each row that will be deleted
+    let num_rows = batch.num_rows();
+    let filler_batches = vec![filler_batch.clone(); num_rows];
+
+    // Concatenate all filler batches into one
+    let all_fillers = arrow_select::concat::concat_batches(&schema, &filler_batches).unwrap();
+
+    // Create indices for interleaving based on the deletion pattern
+    // Format: (batch_index, row_index) where batch_index 0 = original, 1 = fillers
+    let mut indices: Vec<(usize, usize)> = Vec::new();
+
+    match deletions {
+        DeletionState::DeleteOdd => {
+            // Pattern: filler, original[0], filler, original[1], ...
+            for i in 0..num_rows {
+                indices.push((1, i)); // filler batch, row i
+                indices.push((0, i)); // original batch, row i
+            }
+        }
+        DeletionState::DeleteEven => {
+            // Pattern: original[0], filler, original[1], filler, ...
+            for i in 0..num_rows {
+                indices.push((0, i)); // original batch, row i
+                indices.push((1, i)); // filler batch, row i
+            }
+        }
+        DeletionState::NoDeletions => unreachable!(),
+    }
+
+    // Use interleave to reorder according to our indices
+    arrow::compute::interleave_record_batch(&[batch, &all_fillers], &indices).unwrap()
 }
