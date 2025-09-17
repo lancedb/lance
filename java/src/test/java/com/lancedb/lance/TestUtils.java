@@ -528,7 +528,7 @@ public class TestUtils {
      * Test method to update columns. Note that for simplicity, the updated column rowid is fixed
      * with [0, updateNum). Please only use this method to test the first fragment.
      *
-     * @param fragment fragment to merge.
+     * @param fragment fragment to update.
      * @param updateNum number of new rows.
      * @return update result
      */
