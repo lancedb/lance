@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.google.common.base.MoreObjects;
 
+import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -26,6 +27,7 @@ public class ReadOptions {
   private final Optional<Integer> blockSize;
   private final long indexCacheSizeBytes;
   private final long metadataCacheSizeBytes;
+  private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
 
   private ReadOptions(Builder builder) {
@@ -34,6 +36,7 @@ public class ReadOptions {
     this.indexCacheSizeBytes = builder.indexCacheSizeBytes;
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
+    this.serializedManifest = builder.serializedManifest;
   }
 
   public Optional<Integer> getVersion() {
@@ -56,6 +59,10 @@ public class ReadOptions {
     return storageOptions;
   }
 
+  public Optional<ByteBuffer> getSerializedManifest() {
+    return serializedManifest;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -64,6 +71,9 @@ public class ReadOptions {
         .add("indexCacheSizeBytes", indexCacheSizeBytes)
         .add("metadataCacheSizeBytes", metadataCacheSizeBytes)
         .add("storageOptions", storageOptions)
+        .add(
+            "serializedManifest",
+            serializedManifest.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
         .toString();
   }
 
@@ -74,6 +84,7 @@ public class ReadOptions {
     private long indexCacheSizeBytes = 6 * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
     private long metadataCacheSizeBytes = 1024 * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
+    private Optional<ByteBuffer> serializedManifest = Optional.empty();
 
     /**
      * Set the version of the dataset to read. If not set, read from latest version.
@@ -164,6 +175,18 @@ public class ReadOptions {
      */
     public Builder setStorageOptions(Map<String, String> storageOptions) {
       this.storageOptions = storageOptions;
+      return this;
+    }
+
+    /**
+     * Use a serialized manifest instead of loading it from the object store. This is common when
+     * transferring a dataset across IPC boundaries.
+     *
+     * @param serializedManifest the serialized manifest as a ByteBuffer
+     * @return this builder
+     */
+    public Builder setSerializedManifest(ByteBuffer serializedManifest) {
+      this.serializedManifest = Optional.of(serializedManifest);
       return this;
     }
 
