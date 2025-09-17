@@ -877,7 +877,6 @@ mod tests {
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_writer_version() {
