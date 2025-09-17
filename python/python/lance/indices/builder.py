@@ -2,16 +2,19 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import math
+import warnings
 from dataclasses import dataclass
-from typing import Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import pyarrow as pa
 
 from lance.indices.ivf import IvfModel
 from lance.indices.pq import PqModel
 
-
 if TYPE_CHECKING:
+    import torch
+
     from lance import LanceFragment
 
 # Some transforms hardcode their output column names
