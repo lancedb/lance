@@ -238,6 +238,15 @@ impl SargableQueryParser {
 }
 
 impl ScalarQueryParser for SargableQueryParser {
+    fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
+        match func {
+            Expr::Column(_) => Some(data_type.clone()),
+            // Also accept get_field expressions for nested field access
+            Expr::ScalarFunction(udf) if udf.name() == "get_field" => Some(data_type.clone()),
+            _ => None,
+        }
+    }
+
     fn visit_between(
         &self,
         column: &str,
@@ -1101,7 +1110,7 @@ fn maybe_column(expr: &Expr) -> Option<&str> {
 fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     let mut current_expr = expr;
     let mut parts = Vec::new();
-    
+
     // Walk up the get_field chain
     loop {
         match current_expr {
@@ -1124,13 +1133,15 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
                 parts.push(col.name.clone());
                 break;
             }
-            _ => return None,
+            _ => {
+                return None;
+            }
         }
     }
-    
+
     // Reverse to get the correct order (parent.child.grandchild)
     parts.reverse();
-    
+
     // Format the path correctly
     let field_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
     Some(lance_core::datatypes::format_field_path(&field_refs))
@@ -1154,7 +1165,7 @@ fn maybe_indexed_column<'a, 'b>(
             }
         }
     }
-    
+
     match expr {
         Expr::Column(col) => {
             let col = col.name.as_str();

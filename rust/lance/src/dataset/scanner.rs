@@ -42,7 +42,9 @@ use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
-use lance_core::datatypes::{escape_field_path_for_project, format_field_path, Field, OnMissing, Projection};
+use lance_core::datatypes::{
+    escape_field_path_for_project, format_field_path, Field, OnMissing, Projection,
+};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
@@ -2345,20 +2347,26 @@ impl Scanner {
                 let is_string_field = match field.data_type() {
                     DataType::Utf8 | DataType::LargeUtf8 => true,
                     DataType::List(inner_field) | DataType::LargeList(inner_field) => {
-                        matches!(inner_field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                        matches!(
+                            inner_field.data_type(),
+                            DataType::Utf8 | DataType::LargeUtf8
+                        )
                     }
                     _ => false,
                 };
-                
+
                 if is_string_field {
                     // Build the full field path for nested fields
-                    let column_path = if let Some(ancestors) = self.dataset.schema().field_ancestry_by_id(field.id) {
-                        let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+                    let column_path = if let Some(ancestors) =
+                        self.dataset.schema().field_ancestry_by_id(field.id)
+                    {
+                        let field_refs: Vec<&str> =
+                            ancestors.iter().map(|f| f.name.as_str()).collect();
                         format_field_path(&field_refs)
                     } else {
-                        continue;  // Skip if we can't find the field ancestry
+                        continue; // Skip if we can't find the field ancestry
                     };
-                    
+
                     // Check if this field has an inverted index
                     let has_fts_index = self
                         .dataset
@@ -2369,7 +2377,7 @@ impl Scanner {
                         )
                         .await?
                         .is_some();
-                        
+
                     if has_fts_index {
                         indexed_columns.push(column_path);
                     }

@@ -633,10 +633,12 @@ mod tests {
             fields: vec![field.clone()],
             metadata: Default::default(),
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         // test for_column
@@ -646,11 +648,13 @@ mod tests {
             for_column: Some("mycol"),
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.for_column = Some("mycol2");
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         // test has_name
@@ -660,15 +664,19 @@ mod tests {
             for_column: None,
             has_name: Some("btree_index"),
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.has_name = Some("btree_index2");
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         // test supports_exact_equality
@@ -678,15 +686,18 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result = index_matches_criteria(&inverted_index, &criteria, &field, false, &schema).unwrap();
+        let result =
+            index_matches_criteria(&inverted_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         criteria.must_support_fts = false;
-        let result = index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
+        let result =
+            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
 
         // test multiple indices
@@ -696,15 +707,18 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result = index_matches_criteria(&inverted_index, &criteria, &field, true, &schema).unwrap();
+        let result =
+            index_matches_criteria(&inverted_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = false;
-        let result = index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
+        let result =
+            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
     }
 
