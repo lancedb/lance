@@ -12,8 +12,12 @@ use lance::{
     Dataset,
 };
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::{DatasetIndexExt, IndexParams, IndexType};
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::{DistanceType, MetricType};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Fragmentation {
@@ -59,10 +63,8 @@ impl DatasetTestCases {
     fn generate_index_combinations(&self) -> Vec<Vec<(&str, IndexType)>> {
         let mut combinations = Vec::new();
         for (column, index_types) in &self.index_options {
-            for index_type in index_types {
-                if let Some(index_type) = index_type {
-                    combinations.push(vec![(column.as_str(), index_type.clone())]);
-                }
+            for index_type in index_types.iter().flatten() {
+                combinations.push(vec![(column.as_str(), *index_type)]);
             }
         }
         combinations
@@ -145,12 +147,33 @@ async fn build_dataset(
             )),
             IndexType::IvfFlat => {
                 // Use a small number of partitions for testing
-                Box::new(VectorIndexParams::ivf_flat(4, MetricType::L2))
+                Box::new(VectorIndexParams::ivf_flat(2, MetricType::L2))
             }
             IndexType::IvfPq => {
                 // Simple PQ params for testing
-                Box::new(VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 10))
+                Box::new(VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 10))
             }
+            IndexType::IvfSq => Box::new(VectorIndexParams::with_ivf_sq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(2),
+                SQBuildParams::default(),
+            )),
+            IndexType::IvfHnswFlat => Box::new(VectorIndexParams::with_ivf_flat_params(
+                DistanceType::L2,
+                IvfBuildParams::new(2),
+            )),
+            IndexType::IvfHnswPq => Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                PQBuildParams::new(2, 8),
+            )),
+            IndexType::IvfHnswSq => Box::new(VectorIndexParams::with_ivf_hnsw_sq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default(),
+            )),
             _ => {
                 // For other index types, use default scalar params
                 Box::new(ScalarIndexParams::default())
@@ -214,7 +237,7 @@ fn fill_deleted_rows(batch: &RecordBatch, deletions: DeletionState) -> RecordBat
 
     // Create an array of filler batches, one for each row that will be deleted
     let num_rows = batch.num_rows();
-    let filler_batches = vec![filler_batch.clone(); num_rows];
+    let filler_batches = vec![filler_batch; num_rows];
 
     // Concatenate all filler batches into one
     let all_fillers = arrow_select::concat::concat_batches(&schema, &filler_batches).unwrap();
