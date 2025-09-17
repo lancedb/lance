@@ -5,6 +5,7 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{prelude::*, Duration};
 use deepsize::DeepSizeOf;
@@ -1748,6 +1749,30 @@ impl Dataset {
     /// Please refer to the DataFusion documentation for supported SQL syntax.
     pub fn sql(&mut self, sql: &str) -> SqlQueryBuilder {
         SqlQueryBuilder::new(self.clone(), sql)
+    }
+
+    /// Returns true if Lance supports writing this datatype with nulls.
+    pub fn lance_supports_nulls(&self, datatype: &DataType) -> bool {
+        match self
+            .manifest()
+            .data_storage_format
+            .lance_file_version()
+            .unwrap()
+        {
+            LanceFileVersion::Legacy => matches!(
+                datatype,
+                DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Binary
+                    | DataType::List(_)
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::FixedSizeList(_, _)
+            ),
+            LanceFileVersion::V2_0 | LanceFileVersion::Stable => {
+                !matches!(datatype, DataType::Struct(..))
+            }
+            _ => true,
+        }
     }
 }
 

@@ -1572,7 +1572,7 @@ impl FileFragment {
             }
         }
         let write_schema = right_schema.as_ref().without_column(right_on);
-        // lance schema, field id keep consistent
+
         let write_schema = self.schema().project_by_schema(
             &write_schema,
             OnMissing::Error,
@@ -1590,7 +1590,7 @@ impl FileFragment {
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         while let Some(batch) = updater.next().await? {
             let updated_batch = joiner
-                .collect_with_fallback(batch, batch[left_on].clone())
+                .collect_with_fallback(batch, batch[left_on].clone(), self.dataset(), &write_schema)
                 .await?;
             updater.update(updated_batch).await?;
         }

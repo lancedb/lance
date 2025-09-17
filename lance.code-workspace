@@ -1,0 +1,13 @@
+{
+    "folders": [
+        {
+            "path": "."
+        },
+        {
+            "path": "java/lance-jni"
+        }
+    ],
+    "settings": {
+        "workbench.editor.wrapTabs": true
+    }
+}

@@ -12,12 +12,13 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
 use dashmap::{DashMap, ReadOnlyView};
 use futures::{StreamExt, TryStreamExt};
+use lance_core::datatypes::Schema;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use snafu::location;
 use tokio::task;
 
 use crate::datatypes::lance_supports_nulls;
-use crate::{Error, Result};
+use crate::{Dataset, Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
 pub struct HashJoiner {
@@ -215,6 +216,8 @@ impl HashJoiner {
         &self,
         left_batch: &RecordBatch,
         index_column: ArrayRef,
+        dataset: &Dataset,
+        write_schema: &Schema,
     ) -> Result<RecordBatch> {
         if index_column.data_type() != &self.index_type {
             return Err(Error::invalid_input(
@@ -266,12 +269,33 @@ impl HashJoiner {
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            if array.null_count() > 0 && !lance_supports_nulls(array.data_type()) {
-                                return Err(Error::invalid_input(format!(
-                                    "Found rows on LHS that do not match any rows on RHS. Lance would need to write \
-                                    nulls on the RHS, but Lance does not yet support nulls for type {:?}.",
-                                    array.data_type()
-                                ), location!()));
+                            if array.null_count() > 0 {
+                                let field = write_schema.fields.get(column_i).unwrap().clone();
+                                if !field.nullable {
+                                    return Err(Error::invalid_input(
+                                        format!(
+                                            "Join produced null values for column '{}', but the schema does not allow \
+                                            nulls for this field. This can be caused by an explicit null in the new \
+                                            data.",
+                                            field.name
+                                        ),
+                                        location!(),
+                                    ));
+                                }
+                                if !dataset.lance_supports_nulls(array.data_type()) {
+                                    return Err(Error::invalid_input(
+                                        format!(
+                                            "Join produced null values for column '{}' (type: {:?}). Storing nulls \
+                                            for this data type is not supported by the dataset's current Lance file \
+                                            format version: {:?}. This can be caused by an explicit null in the new \
+                                            data.",
+                                            field.name,
+                                            array.data_type(),
+                                            dataset.manifest().data_storage_format.lance_file_version().unwrap()
+                                        ),
+                                        location!(),
+                                    ));
+                                }
                             }
                             Ok(array)
                         },

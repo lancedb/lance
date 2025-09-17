@@ -18,7 +18,6 @@ import com.lancedb.lance.Fragment;
 import com.lancedb.lance.FragmentMetadata;
 import com.lancedb.lance.TestUtils;
 import com.lancedb.lance.Transaction;
-import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.fragment.FragmentUpdateResult;
 import com.lancedb.lance.ipc.LanceScanner;
 
@@ -33,11 +32,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
-import java.util.stream.LongStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -110,33 +107,17 @@ public class UpdateTest extends OperationTestBase {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.UpdateColumnTestDataset testDataset =
           new TestUtils.UpdateColumnTestDataset(allocator, datasetPath);
-      WriteParams writeParams = new WriteParams.Builder().withEnableStableRowIds(true).build();
-      dataset = testDataset.createDatasetWithWriteParams(writeParams);
-      int rowCount = 20;
+      dataset = testDataset.createEmptyDataset();
       /* dataset content
        * _rowid |   id   |     name     | timeStamp |
-       * ------------------------------------------------
        *   0:   |    0   |  "Person 0"  |     0     |
-       *   1:   |    1   |  "Person 1"  |     1     |
-       *   2:   |    2   |  "Person 2"  |     2     |
-       *   3:   |    3   |  "Person 3"  |     3     |
+       *   1:   |    1   |  "Person 1"  |    null   |
+       *   2:   |  null  |     null     |     2     |
+       *   3:   |  null  |     null     |    null   |
        *   4:   |    4   |  "Person 4"  |     4     |
-       *   5:   |    5   |  "Person 5"  |     5     |
-       *   6:   |    6   |  "Person 6"  |     6     |
-       *   7:   |    7   |  "Person 7"  |     7     |
-       *   8:   |    8   |  "Person 8"  |     8     |
-       *   9:   |    9   |  "Person 9"  |     9     |
-       *  10:   |   10   |      null    |    null   |
-       *  11:   |   11   |      null    |    null   |
-       *  12:   |   12   |      null    |    null   |
-       *  13:   |   13   |      null    |    null   |
-       *  14:   |   14   |      null    |    null   |
-       *  15:   |   15   |      null    |    null   |
-       *  16:   |   16   |      null    |    null   |
-       *  17:   |   17   |      null    |    null   |
-       *  18:   |   18   |      null    |    null   |
-       *  19:   |   19   |      null    |    null   |
+       *   5:   |  null  |     null     |    null   |
        */
+      int rowCount = 6;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
       Transaction appendTransaction =
           dataset
@@ -152,20 +133,13 @@ public class UpdateTest extends OperationTestBase {
 
       dataset = Dataset.open(datasetPath, allocator);
       Fragment targetFragment = dataset.getFragments().get(0);
-      int updateRowCount = 10;
-      /* sourceFragment content
+      int updateRowCount = 4;
+      /* source fragment content
        * _rowid |   id   |     name     |
-       * --------------------------------
-       *   0:   |    0   |  "Update 0"  |
-       *   1:   |    2   |  "Update 1"  |
-       *   2:   |    4   |  "Update 2"  |
-       *   3:   |    6   |  "Update 3"  |
-       *   4:   |    8   |  "Update 4"  |
-       *   5:   |   10   |  "Update 5"  |
-       *   6:   |   12   |  "Update 6"  |
-       *   7:   |   14   |  "Update 7"  |
-       *   8:   |   16   |  "Update 8"  |
-       *   9:   |   18   |  "Update 9"  |
+       *   0:   |   100  |  "Update 0"  |
+       *   1:   |  null  |     null     |
+       *   2:   |    2   |  "Update 2"  |
+       *   3:   |  null  |     null     |
        */
       FragmentUpdateResult updateResult = testDataset.updateColumn(targetFragment, updateRowCount);
       Transaction updateTransaction =
@@ -182,41 +156,42 @@ public class UpdateTest extends OperationTestBase {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         Fragment fragment = dataset.getFragments().get(0);
-        try (LanceScanner scanner = fragment.newScan(20)) {
-          List<Integer> actualIds = new ArrayList<>(20);
-          List<String> actualNames = new ArrayList<>(20);
-          List<Long> actualTimeStamps = new ArrayList<>(20);
+        try (LanceScanner scanner = fragment.newScan(rowCount)) {
+          List<Integer> actualIds = new ArrayList<>(rowCount);
+          List<String> actualNames = new ArrayList<>(rowCount);
+          List<Long> actualTimeStamps = new ArrayList<>(rowCount);
           try (ArrowReader reader = scanner.scanBatches()) {
             while (reader.loadNextBatch()) {
               VectorSchemaRoot root = reader.getVectorSchemaRoot();
-              IntVector intVector = (IntVector) root.getVector("id");
-              for (int i = 0; i < intVector.getValueCount(); i++) {
-                actualIds.add(intVector.isNull(i) ? null : intVector.getObject(i));
+              IntVector idVector = (IntVector) root.getVector("id");
+              for (int i = 0; i < idVector.getValueCount(); i++) {
+                actualIds.add(idVector.isNull(i) ? null : idVector.getObject(i));
               }
-              VarCharVector stringVector = (VarCharVector) root.getVector("name");
-              for (int i = 0; i < stringVector.getValueCount(); i++) {
-                actualNames.add(
-                    stringVector.isNull(i) ? null : stringVector.getObject(i).toString());
+              VarCharVector nameVector = (VarCharVector) root.getVector("name");
+              for (int i = 0; i < nameVector.getValueCount(); i++) {
+                actualNames.add(nameVector.isNull(i) ? null : nameVector.getObject(i).toString());
               }
               TimeStampSecTZVector timeStampVector =
                   (TimeStampSecTZVector) root.getVector("timeStamp");
               for (int i = 0; i < timeStampVector.getValueCount(); i++) {
-                actualTimeStamps.add(stringVector.isNull(i) ? null : timeStampVector.getObject(i));
+                actualTimeStamps.add(
+                    timeStampVector.isNull(i) ? null : timeStampVector.getObject(i));
               }
             }
           }
-          List<Integer> expectIds =
-              IntStream.range(0, 20)
-                  .mapToObj(i -> (i < 10 ? 2 * i : i))
-                  .collect(Collectors.toList());
+          /* result dataset content
+           * _rowid |   id   |     name     | timeStamp |
+           *   0:   |   100  |  "Update 0"  |     0     |
+           *   1:   |  null  |     null     |    null   |
+           *   2:   |    2   |  "Update 2"  |     2     |
+           *   3:   |  null  |     null     |    null   |
+           *   4:   |    4   |  "Person 4"  |     4     |
+           *   5:   |  null  |     null     |    null   |
+           */
+          List<Integer> expectIds = Arrays.asList(100, null, 2, null, 4, null);
           List<String> expectNames =
-              IntStream.range(0, 20)
-                  .mapToObj(i -> (i < 10 ? "Update " + i : null))
-                  .collect(Collectors.toList());
-          List<Long> expectTimeStamps =
-              LongStream.range(0, 20)
-                  .mapToObj(i -> (i < 10 ? i : null))
-                  .collect(Collectors.toList());
+              Arrays.asList("Update 0", null, "Update 2", null, "Person 4", null);
+          List<Long> expectTimeStamps = Arrays.asList(0L, null, 2L, null, 4L, null);
           assertEquals(expectIds, actualIds);
           assertEquals(expectNames, actualNames);
           assertEquals(expectTimeStamps, actualTimeStamps);

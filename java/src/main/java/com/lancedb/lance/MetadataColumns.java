@@ -13,7 +13,7 @@
  */
 package com.lancedb.lance;
 
-public class Constants {
+public class MetadataColumns {
   // Column name for the meta row ID.
   public static final String ROWID = "_rowid";
   // Column name for the meta row address.

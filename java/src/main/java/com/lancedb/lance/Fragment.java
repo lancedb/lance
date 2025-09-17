@@ -187,7 +187,7 @@ public class Fragment {
   }
 
   public FragmentUpdateResult updateColumns(ArrowArrayStream stream) {
-    return updateColumns(stream, Constants.ROWID, Constants.ROWID);
+    return updateColumns(stream, MetadataColumns.ROWID, MetadataColumns.ROWID);
   }
 
   private native FragmentUpdateResult nativeUpdateColumns(

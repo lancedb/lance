@@ -453,6 +453,9 @@ public class TestUtils {
                 Field.nullable("name", new ArrowType.Utf8())),
             null);
 
+    private static final int actualRowCount = 6;
+    private static final int actualUpdateRowCount = 4;
+
     public UpdateColumnTestDataset(BufferAllocator allocator, String datasetPath) {
       super(allocator, datasetPath);
     }
@@ -464,6 +467,7 @@ public class TestUtils {
 
     @Override
     public FragmentMetadata createNewFragment(int rowCount) {
+      assertEquals(actualRowCount, rowCount);
       List<FragmentMetadata> fragmentMetas = createNewFragment(rowCount, Integer.MAX_VALUE);
       assertEquals(1, fragmentMetas.size());
       FragmentMetadata fragmentMeta = fragmentMetas.get(0);
@@ -473,6 +477,7 @@ public class TestUtils {
 
     @Override
     public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      assertEquals(actualRowCount, rowCount);
       List<FragmentMetadata> fragmentMetas;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(getSchema(), allocator)) {
         root.allocateNew();
@@ -480,51 +485,82 @@ public class TestUtils {
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
         TimeStampSecTZVector timeStampSecVector =
             (TimeStampSecTZVector) root.getVector("timeStamp");
-        for (int i = 0; i < rowCount / 2; i++) {
-          idVector.setSafe(i, i);
-          String name = "Person " + i;
-          nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
-          timeStampSecVector.setSafe(i, i);
-        }
-        for (int i = rowCount / 2; i < rowCount; i++) {
-          idVector.setSafe(i, i);
-          nameVector.setNull(i);
-          timeStampSecVector.setSafe(i, 0, i);
-        }
-        root.setRowCount(rowCount);
+        /* dataset content
+         * _rowid |   id   |     name     | timeStamp |
+         *   0:   |    0   |  "Person 0"  |     0     |
+         *   1:   |    1   |  "Person 1"  |    null   |
+         *   2:   |  null  |     null     |     2     |
+         *   3:   |  null  |     null     |    null   |
+         *   4:   |    4   |  "Person 4"  |     4     |
+         *   5:   |  null  |     null     |    null   |
+         */
+        idVector.setSafe(0, 0);
+        idVector.set(1, 1);
+        idVector.setNull(2);
+        idVector.setNull(3);
+        idVector.set(4, 4);
+        idVector.setNull(5);
+
+        nameVector.setSafe(0, "Person 0".getBytes(StandardCharsets.UTF_8));
+        nameVector.setSafe(1, "Person 1".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(2);
+        nameVector.setNull(3);
+        nameVector.setSafe(4, "Person 4".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(5);
+
+        timeStampSecVector.setSafe(0, 0);
+        timeStampSecVector.setNull(1);
+        timeStampSecVector.setSafe(2, 2);
+        timeStampSecVector.setNull(3);
+        timeStampSecVector.setSafe(4, 4);
+        timeStampSecVector.setNull(5);
+        root.setRowCount(actualRowCount);
         fragmentMetas =
             Fragment.create(
                 datasetPath,
                 allocator,
                 root,
-                new WriteParams.Builder()
-                    .withEnableStableRowIds(true)
-                    .withMaxRowsPerFile(maxRowsPerFile)
-                    .build());
+                new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
       }
       return fragmentMetas;
     }
     /**
-     * Test method to update columns. Note that for simplicity, the updated column rowid is fixed with
-     * [0, mergeNum). Please only use this method to test the first fragment.
+     * Test method to update columns. Note that for simplicity, the updated column rowid is fixed
+     * with [0, updateNum). Please only use this method to test the first fragment.
      *
      * @param fragment fragment to merge.
      * @param updateNum number of new rows.
      * @return update result
      */
     public FragmentUpdateResult updateColumn(Fragment fragment, int updateNum) {
+      assertEquals(actualUpdateRowCount, updateNum);
       try (VectorSchemaRoot root = VectorSchemaRoot.create(updateSchema, allocator)) {
         root.allocateNew();
         UInt8Vector rowidVec = (UInt8Vector) root.getVector("_rowid");
         IntVector idVector = (IntVector) root.getVector("id");
         VarCharVector nameVector = (VarCharVector) root.getVector("name");
-        for (int i = 0; i < updateNum; i++) {
-          rowidVec.setSafe(i, i);
-          idVector.setSafe(i, 2 * i);
-          String name = "Update " + i;
-          nameVector.setSafe(i, name.getBytes(StandardCharsets.UTF_8));
-        }
-        root.setRowCount(updateNum);
+        /* source fragment content
+         * _rowid |   id   |     name     |
+         *   0:   |   100  |  "Update 0"  |
+         *   1:   |  null  |     null     |
+         *   2:   |    2   |  "Update 2"  |
+         *   3:   |  null  |     null     |
+         */
+        rowidVec.set(0, 0);
+        rowidVec.set(1, 1);
+        rowidVec.set(2, 2);
+        rowidVec.set(3, 3);
+
+        idVector.set(0, 100);
+        idVector.setNull(1);
+        idVector.set(2, 2);
+        idVector.setNull(3);
+
+        nameVector.setSafe(0, "Update 0".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(1);
+        nameVector.setSafe(2, "Update 2".getBytes(StandardCharsets.UTF_8));
+        nameVector.setNull(3);
+        root.setRowCount(actualUpdateRowCount);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
           writer.start();
