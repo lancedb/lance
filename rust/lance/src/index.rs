@@ -1394,12 +1394,21 @@ impl DatasetIndexInternalExt for Dataset {
                 ),
                 location: location!(),
             })?;
+            
+            // Build the full field path for nested fields
+            let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+                let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+                lance_core::datatypes::format_field_path(&field_refs)
+            } else {
+                field.name.clone()
+            };
+            
             let index_details = IndexDetails(fetch_index_details(self, &field.name, index).await?);
             let plugin = index_details.get_plugin()?;
             let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
             if let Some(query_parser) = query_parser {
-                indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+                indexed_fields.push((field_path, (field.data_type(), query_parser)));
             }
         }
         let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
@@ -4256,6 +4265,7 @@ mod tests {
             .scan()
             .filter("data.`value.v1` = 42")
             .unwrap()
+            .prefilter(true)
             .explain_plan(false)
             .await
             .unwrap();
@@ -4273,6 +4283,7 @@ mod tests {
             .scan()
             .filter("data.`value.v1` = 42")
             .unwrap()
+            .prefilter(true)
             .try_into_batch()
             .await
             .unwrap();
