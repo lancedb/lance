@@ -117,6 +117,15 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
+#[derive(Default)]
+struct ManifestStats {
+    total_data_files: usize,
+    total_records: usize,
+    total_file_sizes: u64,
+    total_deletion_files: usize,
+    total_deletions: usize,
+}
+
 impl Manifest {
     pub fn new(
         schema: Schema,
@@ -454,43 +463,53 @@ impl Manifest {
         let total_fragments = self.fragments.len();
         metadata.insert("total-fragments".to_string(), total_fragments.to_string());
 
-        // Calculate total data files
-        let total_data_files: usize = self.fragments.iter().map(|f| f.files.len()).sum();
-        metadata.insert("total-data-files".to_string(), total_data_files.to_string());
-
-        // Calculate total records
-        let total_records: usize = self.fragments.iter().filter_map(|f| f.num_rows()).sum();
-        metadata.insert("total-records".to_string(), total_records.to_string());
-
-        // Calculate total file sizes
-        let total_file_sizes: u64 = self
+        let stats = self
             .fragments
             .iter()
-            .flat_map(|f| &f.files)
-            .filter_map(|df| df.file_size_bytes.get())
-            .map(|size| size.get())
-            .sum();
-        metadata.insert("total-files-size".to_string(), total_file_sizes.to_string());
+            .fold(ManifestStats::default(), |mut stats, f| {
+                // Count data files in the current fragment
+                stats.total_data_files += f.files.len();
+                // Sum the number of rows for the current fragment (if available)
+                if let Some(num_rows) = f.num_rows() {
+                    stats.total_records += num_rows;
+                }
+                // Sum file sizes for all data files in the current fragment (if available)
+                for data_file in &f.files {
+                    if let Some(size_bytes) = data_file.file_size_bytes.get() {
+                        stats.total_file_sizes += size_bytes.get();
+                    }
+                }
+                // Check and count if the current fragment has a deletion file
+                if f.deletion_file.is_some() {
+                    stats.total_deletion_files += 1;
+                }
+                // Sum the number of deleted rows from the deletion file (if available)
+                if let Some(deletion_file) = &f.deletion_file {
+                    if let Some(num_deleted) = deletion_file.num_deleted_rows {
+                        stats.total_deletions += num_deleted;
+                    }
+                }
+                stats
+            });
 
-        // Calculate total deletion files
-        let total_deletion_files = self
-            .fragments
-            .iter()
-            .filter(|f| f.deletion_file.is_some())
-            .count();
+        // Insert all statistical results into metadata
+        metadata.insert(
+            "total-data-files".to_string(),
+            stats.total_data_files.to_string(),
+        );
+        metadata.insert("total-records".to_string(), stats.total_records.to_string());
+        metadata.insert(
+            "total-files-size".to_string(),
+            stats.total_file_sizes.to_string(),
+        );
         metadata.insert(
             "total-deletion-files".to_string(),
-            total_deletion_files.to_string(),
+            stats.total_deletion_files.to_string(),
         );
-
-        // Calculate total deletions
-        let total_deletions: usize = self
-            .fragments
-            .iter()
-            .filter_map(|f| f.deletion_file.as_ref())
-            .filter_map(|df| df.num_deleted_rows)
-            .sum();
-        metadata.insert("total-deletions".to_string(), total_deletions.to_string());
+        metadata.insert(
+            "total-deletions".to_string(),
+            stats.total_deletions.to_string(),
+        );
 
         metadata
     }
@@ -844,6 +863,7 @@ impl SelfDescribingFileReader for FileReader {
 #[cfg(test)]
 mod tests {
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use std::num::NonZero;
 
     use super::*;
 
@@ -1044,7 +1064,7 @@ mod tests {
 
         let empty_files_summary = empty_files_manifest.summary();
         assert_eq!(empty_files_summary.get("total-records").unwrap(), "0");
-        assert_eq!(empty_files_summary.get("total-files-size").unwrap(), "0"); // 文件大小未知时为0
+        assert_eq!(empty_files_summary.get("total-files-size").unwrap(), "0");
         assert_eq!(empty_files_summary.get("total-fragments").unwrap(), "2");
         assert_eq!(empty_files_summary.get("total-data-files").unwrap(), "2");
         assert_eq!(empty_files_summary.get("total-deletions").unwrap(), "0");
@@ -1071,16 +1091,24 @@ mod tests {
 
         let real_data_summary = real_data_manifest.summary();
         assert_eq!(real_data_summary.get("total-records").unwrap(), "425"); // 100 + 250 + 75
-        assert_eq!(real_data_summary.get("total-files-size").unwrap(), "0"); // 文件大小未知时为0
+        assert_eq!(real_data_summary.get("total-files-size").unwrap(), "0"); // Zero for unknown
         assert_eq!(real_data_summary.get("total-fragments").unwrap(), "3");
         assert_eq!(real_data_summary.get("total-data-files").unwrap(), "3");
         assert_eq!(real_data_summary.get("total-deletions").unwrap(), "0");
         assert_eq!(real_data_summary.get("total-deletion-files").unwrap(), "0");
         assert_eq!(real_data_summary.len(), 6);
 
+        let file_version = LanceFileVersion::default();
         // Step 4: write deletion files and verify summary
-        let mut fragment_with_deletion =
-            Fragment::with_file_legacy(0, "data_with_deletion.lance", &schema, Some(50));
+        let mut fragment_with_deletion = Fragment::new(0)
+            .with_file(
+                "data_with_deletion.lance",
+                vec![0, 1],
+                vec![0, 1],
+                &file_version,
+                NonZero::new(1000),
+            )
+            .with_physical_rows(50);
         fragment_with_deletion.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
@@ -1098,14 +1126,13 @@ mod tests {
         );
 
         let deletion_summary = manifest_with_deletion.summary();
-        assert_eq!(deletion_summary.get("total-records").unwrap(), "40"); // 50 - 10 (删除的行数)
-        assert_eq!(deletion_summary.get("total-files-size").unwrap(), "0");
+        assert_eq!(deletion_summary.get("total-records").unwrap(), "40"); // 50 - 10
+        assert_eq!(deletion_summary.get("total-files-size").unwrap(), "1000");
         assert_eq!(deletion_summary.get("total-fragments").unwrap(), "1");
         assert_eq!(deletion_summary.get("total-data-files").unwrap(), "1");
         assert_eq!(deletion_summary.get("total-deletions").unwrap(), "10");
         assert_eq!(deletion_summary.get("total-deletion-files").unwrap(), "1");
 
-        // 验证 BTreeMap 只包含这6个字段
         assert_eq!(deletion_summary.len(), 6);
     }
 }
