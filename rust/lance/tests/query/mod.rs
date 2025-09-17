@@ -21,6 +21,7 @@ fn create_datafusion_context() -> SessionContext {
 mod primitives;
 mod vectors;
 
+/// Scanning an ordering by id should give same result as original.
 async fn test_scan(original: &RecordBatch, ds: &Dataset) {
     let mut scanner = ds.scan();
     scanner
@@ -33,6 +34,7 @@ async fn test_scan(original: &RecordBatch, ds: &Dataset) {
     assert_eq!(original, &scanned);
 }
 
+/// Taking specific rows should give the same result as taking from the original.
 async fn test_take(original: &RecordBatch, ds: &Dataset) {
     let num_rows = original.num_rows();
     let cases: Vec<Vec<usize>> = vec![
@@ -73,6 +75,8 @@ async fn test_take(original: &RecordBatch, ds: &Dataset) {
     }
 }
 
+/// Querying with filter should give same result as filtering original
+/// record batch in DataFusion.
 async fn test_filter(original: &RecordBatch, ds: &Dataset, predicate: &str) {
     // Scan with filter and order
     let mut scanner = ds.scan();
@@ -137,6 +141,7 @@ async fn test_ann(original: &RecordBatch, ds: &Dataset, column: &str, predicate:
         .collect::<Vec<_>>()
         .join(", ");
 
+    // DataFusion's built-in `array_distance` function uses L2 distance.
     let sql = format!(
         "SELECT * FROM t {} ORDER BY array_distance(t.{}, [{}]) LIMIT 10",
         if let Some(pred) = predicate {
