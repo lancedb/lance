@@ -57,7 +57,9 @@ fn inner_into_batch_records(
         with_row_addr,
     )?;
 
-    let stream = RT.block_on(async move { builder.build().await.unwrap().into_stream().await });
+    let stream = RT.block_on(async move { 
+        builder.build().await?.into_stream().await 
+    })?;
 
     let ffi_stream =
         to_ffi_arrow_array_stream(DatasetRecordBatchStream::new(stream), RT.handle().clone())?;

@@ -82,10 +82,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             location: location!(),
         })?;
 
+    let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
         let index = dataset
-            .open_generic_index(&column.name, &idx.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
             .await?;
         indices.push(index);
     }
@@ -116,7 +117,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             let index = dataset
                 .open_scalar_index(
-                    &column.name,
+                    &field_path,
                     &old_indices[0].uuid.to_string(),
                     &NoOpMetricsCollector,
                 )
@@ -131,7 +132,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             };
             let new_data_stream = load_training_data(
                 dataset.as_ref(),
-                &column.name,
+                &field_path,
                 &update_criteria.data_criteria,
                 fragments,
                 true,
@@ -163,9 +164,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 scanner
                     .with_fragments(unindexed.to_vec())
                     .with_row_id()
-                    .project(&[&column.name])?;
+                    .project(&[&field_path])?;
                 if column.nullable {
-                    scanner.filter_expr(datafusion_expr::col(&column.name).is_not_null());
+                    scanner.filter_expr(datafusion_expr::col(&field_path).is_not_null());
                 }
                 Some(scanner.try_into_stream().await?)
             };
@@ -173,7 +174,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let (new_uuid, indices_merged) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
-                &column.name,
+                &field_path,
                 &indices,
                 options,
             )
