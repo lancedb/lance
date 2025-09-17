@@ -1597,12 +1597,16 @@ mod tests {
 
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+    };
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
     use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
-    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+    use lance_index::scalar::{
+        FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+    };
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -4338,5 +4342,274 @@ mod tests {
             .unwrap();
 
         assert_eq!(search_results_v2.num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_btree_index_on_nested_field_with_dots() {
+        // Test creating BTree index on nested field with dots in the name
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        
+        // Create schema with nested field containing dots
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "data",
+                DataType::Struct(
+                    vec![
+                        Field::new("value.v1", DataType::Int32, false),
+                        Field::new("value.v2", DataType::Float32, false),
+                        Field::new("text", DataType::Utf8, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ]));
+        
+        // Generate test data
+        let num_rows = 1000;
+        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let values_v1 = Int32Array::from_iter_values((0..num_rows).map(|i| (i % 100) as i32));
+        let values_v2 = Float32Array::from_iter_values((0..num_rows).map(|i| (i as f32) * 0.1));
+        let texts = StringArray::from_iter_values((0..num_rows).map(|i| format!("text_{}", i)));
+        
+        let struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("value.v1", DataType::Int32, false)),
+                Arc::new(values_v1) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("value.v2", DataType::Float32, false)),
+                Arc::new(values_v2) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("text", DataType::Utf8, false)),
+                Arc::new(texts) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+        
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(struct_array)],
+        )
+        .unwrap();
+        
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        
+        // Create BTree index on nested field with dots
+        let nested_column_path = "data.`value.v1`";
+        let params = ScalarIndexParams::default();
+        
+        dataset
+            .create_index(
+                &[nested_column_path],
+                IndexType::BTree,
+                Some("btree_v1_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "btree_v1_idx");
+        
+        // Verify the correct field was indexed
+        let field_id = indices[0].fields[0];
+        let field_path = dataset.schema().field_path(field_id).unwrap();
+        assert_eq!(field_path, "data.`value.v1`");
+        
+        // Test querying with the index
+        let results = dataset
+            .scan()
+            .filter("data.`value.v1` = 42")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        
+        assert!(results.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_index_on_nested_field_with_dots() {
+        // Test creating Bitmap index on nested field with dots in the name
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        
+        // Create schema with nested field containing dots - using low cardinality for bitmap
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "metadata",
+                DataType::Struct(
+                    vec![
+                        Field::new("status.code", DataType::Int32, false),
+                        Field::new("category.name", DataType::Utf8, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ]));
+        
+        // Generate test data with low cardinality (good for bitmap index)
+        let num_rows = 1000;
+        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        // Only 10 unique status codes
+        let status_codes = Int32Array::from_iter_values((0..num_rows).map(|i| (i % 10) as i32));
+        // Only 5 unique categories
+        let categories = StringArray::from_iter_values(
+            (0..num_rows).map(|i| format!("category_{}", i % 5))
+        );
+        
+        let struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("status.code", DataType::Int32, false)),
+                Arc::new(status_codes) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("category.name", DataType::Utf8, false)),
+                Arc::new(categories) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+        
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(struct_array)],
+        )
+        .unwrap();
+        
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        
+        // Create Bitmap index on nested field with dots
+        let nested_column_path = "metadata.`status.code`";
+        let params = ScalarIndexParams::default();
+        
+        dataset
+            .create_index(
+                &[nested_column_path],
+                IndexType::Bitmap,
+                Some("bitmap_status_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "bitmap_status_idx");
+        
+        // Verify the correct field was indexed
+        let field_id = indices[0].fields[0];
+        let field_path = dataset.schema().field_path(field_id).unwrap();
+        assert_eq!(field_path, "metadata.`status.code`");
+        
+        // Test querying with the index
+        let results = dataset
+            .scan()
+            .filter("metadata.`status.code` = 5")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        
+        // Should have ~100 rows with status code 5
+        assert!(results.num_rows() > 0);
+        assert_eq!(results.num_rows(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_inverted_index_on_nested_field_with_dots() {
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+        
+        // Test creating Inverted index on nested text field with dots in the name
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        
+        // Create schema with nested text field containing dots
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "document",
+                DataType::Struct(
+                    vec![
+                        Field::new("content.text", DataType::Utf8, false),
+                        Field::new("content.summary", DataType::Utf8, false),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ]));
+        
+        // Generate test data with text content
+        let num_rows = 100;
+        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let content_texts = StringArray::from_iter_values((0..num_rows).map(|i| {
+            match i % 3 {
+                0 => format!("The quick brown fox jumps over the lazy dog {}", i),
+                1 => format!("Machine learning and artificial intelligence document {}", i),
+                _ => format!("Data science and analytics content piece {}", i),
+            }
+        }));
+        let summaries = StringArray::from_iter_values(
+            (0..num_rows).map(|i| format!("Summary of document {}", i))
+        );
+        
+        let struct_array = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(Field::new("content.text", DataType::Utf8, false)),
+                Arc::new(content_texts) as Arc<dyn arrow_array::Array>,
+            ),
+            (
+                Arc::new(Field::new("content.summary", DataType::Utf8, false)),
+                Arc::new(summaries) as Arc<dyn arrow_array::Array>,
+            ),
+        ]);
+        
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(struct_array)],
+        )
+        .unwrap();
+        
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        
+        // Create Inverted index on nested text field with dots
+        let nested_column_path = "document.`content.text`";
+        let params = InvertedIndexParams::default();
+        
+        dataset
+            .create_index(
+                &[nested_column_path],
+                IndexType::Inverted,
+                Some("inverted_content_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "inverted_content_idx");
+        
+        // Verify the correct field was indexed
+        let field_id = indices[0].fields[0];
+        let field_path = dataset.schema().field_path(field_id).unwrap();
+        assert_eq!(field_path, "document.`content.text`");
+        
+        // Note: Full text search on nested fields with dots may not be fully supported yet
+        // For now, we just verify the index was created successfully on the nested field
     }
 }
