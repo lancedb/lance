@@ -42,7 +42,7 @@ use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
-use lance_core::datatypes::{escape_field_path_for_project, Field, OnMissing, Projection};
+use lance_core::datatypes::{escape_field_path_for_project, format_field_path, Field, OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
@@ -2338,37 +2338,41 @@ impl Scanner {
         }
         let query = if columns.is_empty() {
             // the field is not specified,
-            // try to search over all indexed fields
-            let string_columns =
-                self.dataset
-                    .schema()
-                    .fields
-                    .iter()
-                    .filter_map(|f| match f.data_type() {
-                        DataType::Utf8 | DataType::LargeUtf8 => Some(&f.name),
-                        DataType::List(field) | DataType::LargeList(field) => {
-                            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-                                Some(&f.name)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    });
-
+            // try to search over all indexed fields including nested ones
             let mut indexed_columns = Vec::new();
-            for column in string_columns {
-                let has_fts_index = self
-                    .dataset
-                    .load_scalar_index(
-                        ScalarIndexCriteria::default()
-                            .for_column(column)
-                            .supports_fts(),
-                    )
-                    .await?
-                    .is_some();
-                if has_fts_index {
-                    indexed_columns.push(column.clone());
+            for field in self.dataset.schema().fields_pre_order() {
+                // Check if this field is a string type that could have an inverted index
+                let is_string_field = match field.data_type() {
+                    DataType::Utf8 | DataType::LargeUtf8 => true,
+                    DataType::List(inner_field) | DataType::LargeList(inner_field) => {
+                        matches!(inner_field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+                    }
+                    _ => false,
+                };
+                
+                if is_string_field {
+                    // Build the full field path for nested fields
+                    let column_path = if let Some(ancestors) = self.dataset.schema().field_ancestry_by_id(field.id) {
+                        let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+                        format_field_path(&field_refs)
+                    } else {
+                        continue;  // Skip if we can't find the field ancestry
+                    };
+                    
+                    // Check if this field has an inverted index
+                    let has_fts_index = self
+                        .dataset
+                        .load_scalar_index(
+                            ScalarIndexCriteria::default()
+                                .for_column(&column_path)
+                                .supports_fts(),
+                        )
+                        .await?
+                        .is_some();
+                        
+                    if has_fts_index {
+                        indexed_columns.push(column_path);
+                    }
                 }
             }
 

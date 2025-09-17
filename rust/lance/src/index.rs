@@ -601,7 +601,7 @@ impl DatasetIndexExt for Dataset {
             for idx in indices {
                 let field = self.schema().field_by_id(field_id);
                 if let Some(field) = field {
-                    if index_matches_criteria(idx, &criteria, field, has_multiple)? {
+                    if index_matches_criteria(idx, &criteria, field, has_multiple, self.schema())? {
                         let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                             bitmap.intersection_len(self.fragment_bitmap.as_ref()) > 0
                         });
@@ -4599,6 +4599,9 @@ mod tests {
             .await
             .unwrap();
         
+        // Reload the dataset to ensure the index is loaded
+        dataset = Dataset::open(test_uri).await.unwrap();
+        
         // Verify index was created
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
@@ -4609,7 +4612,33 @@ mod tests {
         let field_path = dataset.schema().field_path(field_id).unwrap();
         assert_eq!(field_path, "document.`content.text`");
         
-        // Note: Full text search on nested fields with dots may not be fully supported yet
-        // For now, we just verify the index was created successfully on the nested field
+        // Test full-text search on the nested field with dots
+        // Use the field_path that the index reports
+        let query = FullTextSearchQuery::new("machine learning".to_string())
+            .with_column(field_path.clone())
+            .unwrap();
+        
+        let results = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        
+        // Verify we get results from the full-text search
+        assert!(!results.is_empty(), "Full-text search should return results");
+        
+        // Check that we found documents containing "machine learning"
+        let mut found_count = 0;
+        for batch in results {
+            found_count += batch.num_rows();
+        }
+        // We expect to find approximately 1/3 of documents (those with i % 3 == 1)
+        assert!(found_count > 0, "Should find at least some documents with 'machine learning'");
+        assert!(found_count < num_rows, "Should not match all documents");
     }
 }
