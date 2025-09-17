@@ -3,12 +3,20 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{cast::AsArray, RecordBatch, UInt32Array};
 use arrow_select::concat::concat_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::Dataset;
+use lance_datafusion::udf::register_functions;
+
+/// Creates a fresh SessionContext with Lance UDFs registered
+fn create_datafusion_context() -> SessionContext {
+    let ctx = SessionContext::new();
+    register_functions(&ctx);
+    ctx
+}
 
 mod primitives;
 mod vectors;
@@ -77,7 +85,7 @@ async fn test_filter(original: &RecordBatch, ds: &Dataset, predicate: &str) {
         .unwrap();
     let scanned = scanner.try_into_batch().await.unwrap();
 
-    let ctx = SessionContext::new();
+    let ctx = create_datafusion_context();
     let table = MemTable::try_new(original.schema(), vec![vec![original.clone()]]).unwrap();
     ctx.register_table("t", Arc::new(table)).unwrap();
 
@@ -89,6 +97,78 @@ async fn test_filter(original: &RecordBatch, ds: &Dataset, predicate: &str) {
     assert_eq!(&expected, &scanned);
 }
 
-async fn test_ann(_original: &RecordBatch, _ds: &Dataset, _predicate: Option<&str>) {
-    todo!("Scan ds with the ANN predicate");
+/// Test that an exhaustive ANN query gives the same results as brute force
+/// KNN against the original batch.
+///
+/// By exhaustive ANN, I mean we search all the partitions so we get perfect recall.
+async fn test_ann(original: &RecordBatch, ds: &Dataset, column: &str, predicate: Option<&str>) {
+    // Extract first vector from the column as query vector
+    let vector_column = original.column_by_name(column).unwrap();
+    let fixed_size_list = vector_column.as_fixed_size_list();
+
+    // Extract the first vector's values as a new array
+    let vector_values = fixed_size_list
+        .values()
+        .slice(0, fixed_size_list.value_length() as usize);
+    let query_vector = vector_values;
+
+    let mut scanner = ds.scan();
+    scanner
+        .nearest(column, query_vector.as_ref(), 10)
+        .unwrap()
+        .prefilter(true)
+        .refine(2);
+    if let Some(pred) = predicate {
+        scanner.filter(pred).unwrap();
+    }
+    let result = scanner.try_into_batch().await.unwrap();
+
+    // Use DataFusion to apply same vector search using SQL
+    let ctx = create_datafusion_context();
+    let table = MemTable::try_new(original.schema(), vec![vec![original.clone()]]).unwrap();
+    ctx.register_table("t", Arc::new(table)).unwrap();
+
+    // Convert query vector to SQL array literal
+    let float_array = query_vector.as_primitive::<arrow::datatypes::Float32Type>();
+    let vector_values_str = float_array
+        .values()
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT * FROM t {} ORDER BY array_distance(t.{}, [{}]) LIMIT 10",
+        if let Some(pred) = predicate {
+            format!("WHERE {}", pred)
+        } else {
+            String::new()
+        },
+        column,
+        vector_values_str
+    );
+
+    let df = ctx.sql(&sql).await.unwrap();
+    let expected_batches = df.collect().await.unwrap();
+    let expected = concat_batches(&original.schema(), &expected_batches).unwrap();
+
+    // Compare only the main data (excluding _distance column which Lance adds)
+    // We validate that both return the same number of rows and same row ordering
+    assert_eq!(
+        expected.num_rows(),
+        result.num_rows(),
+        "Different number of results"
+    );
+
+    // Compare the first few columns (excluding _distance)
+    for (col_idx, field) in original.schema().fields().iter().enumerate() {
+        let expected_col = expected.column(col_idx);
+        let result_col = result.column(col_idx);
+        assert_eq!(
+            expected_col,
+            result_col,
+            "Column '{}' differs between DataFusion and Lance results",
+            field.name()
+        );
+    }
 }
