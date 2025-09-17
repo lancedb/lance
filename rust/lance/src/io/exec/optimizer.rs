@@ -143,10 +143,10 @@ impl PhysicalOptimizerRule for SimplifyProjection {
                         return Ok(Transformed::no(plan));
                     }
 
-                    if proj.expr().iter().enumerate().all(|(index, (expr, name))| {
-                        if let Some(expr) = expr.as_any().downcast_ref::<Column>() {
+                    if proj.expr().iter().enumerate().all(|(index, proj_expr)| {
+                        if let Some(expr) = proj_expr.expr.as_any().downcast_ref::<Column>() {
                             // no renaming, no reordering
-                            expr.index() == index && expr.name() == name
+                            expr.index() == index && expr.name() == proj_expr.alias
                         } else {
                             false
                         }
