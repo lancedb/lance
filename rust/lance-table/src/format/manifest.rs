@@ -127,32 +127,30 @@ pub struct ManifestStats {
     total_deletions: u64,
 }
 
-impl Into<BTreeMap<String, String>> for ManifestStats {
-    fn into(self) -> BTreeMap<String, String> {
-        let mut stats_map = BTreeMap::new();
-
+impl From<ManifestStats> for BTreeMap<String, String> {
+    fn from(val: ManifestStats) -> Self {
+        let mut stats_map = Self::new();
         stats_map.insert(
             "total-fragments".to_string(),
-            self.total_fragments.to_string(),
+            val.total_fragments.to_string(),
         );
         stats_map.insert(
             "total-data-files".to_string(),
-            self.total_data_files.to_string(),
+            val.total_data_files.to_string(),
         );
-        stats_map.insert("total-records".to_string(), self.total_records.to_string());
+        stats_map.insert("total-records".to_string(), val.total_records.to_string());
         stats_map.insert(
             "total-files-size".to_string(),
-            self.total_files_size.to_string(),
+            val.total_files_size.to_string(),
         );
         stats_map.insert(
             "total-deletion-files".to_string(),
-            self.total_deletion_files.to_string(),
+            val.total_deletion_files.to_string(),
         );
         stats_map.insert(
             "total-deletions".to_string(),
-            self.total_deletions.to_string(),
+            val.total_deletions.to_string(),
         );
-
         stats_map
     }
 }
@@ -1133,5 +1131,9 @@ mod tests {
         assert_eq!(deletion_summary.total_data_files, 1);
         assert_eq!(deletion_summary.total_deletions, 10);
         assert_eq!(deletion_summary.total_deletion_files, 1);
+
+        //Just verify the transformation is OK
+        let stats_map: BTreeMap<String, String> = deletion_summary.into();
+        assert_eq!(stats_map.len(), 6)
     }
 }
