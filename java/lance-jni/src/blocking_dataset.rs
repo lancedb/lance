@@ -84,6 +84,7 @@ impl BlockingDataset {
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
+        serialized_manifest: Option<&[u8]>,
     ) -> Result<Self> {
         let params = ReadParams {
             index_cache_size_bytes: index_cache_size_bytes as usize,
@@ -101,6 +102,10 @@ impl BlockingDataset {
             builder = builder.with_version(ver as u64);
         }
         builder = builder.with_storage_options(storage_options);
+
+        if let Some(serialized_manifest) = serialized_manifest {
+            builder = builder.with_serialized_manifest(serialized_manifest)?;
+        }
 
         let inner = RT.block_on(builder.load())?;
         Ok(Self { inner })
@@ -701,6 +706,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
+    serialized_manifest: JObject, // Optional<ByteBuffer>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -711,11 +717,13 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
-            storage_options_obj
+            storage_options_obj,
+            serialized_manifest
         )
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
@@ -724,12 +732,14 @@ fn inner_open_native<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
+    serialized_manifest: JObject, // Optional<ByteBuffer>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+    let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
     let dataset = BlockingDataset::open(
         &path_str,
         version,
@@ -737,6 +747,7 @@ fn inner_open_native<'local>(
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
+        serialized_manifest,
     )?;
     dataset.into_java(env)
 }

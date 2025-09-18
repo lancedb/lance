@@ -42,7 +42,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.ZonedDateTime;
@@ -56,6 +58,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -347,6 +350,39 @@ public class DatasetTest {
           () -> {
             Dataset.open(datasetPath, allocator);
           });
+    }
+  }
+
+  @Test
+  void testOpenSerializedManifest(@TempDir Path tempDir) throws IOException, URISyntaxException {
+    Path datasetPath = tempDir.resolve("serialized_manifest");
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath.toString());
+
+      try (Dataset dataset1 = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset1.version());
+        Path manifestPath = datasetPath.resolve("_versions");
+        Stream<Path> fileStream = Files.list(manifestPath);
+        assertEquals(1, fileStream.count());
+        Path filePath = manifestPath.resolve("1.manifest");
+        byte[] manifestBytes = Files.readAllBytes(filePath);
+        // Need to trim the magic number at end and message length at beginning
+        // https://github.com/lancedb/lance/blob/main/rust/lance-table/src/io/manifest.rs#L95-L96
+        byte[] trimmedManifest = Arrays.copyOfRange(manifestBytes, 4, manifestBytes.length - 16);
+        ByteBuffer manifestBuffer = ByteBuffer.allocateDirect(trimmedManifest.length);
+        manifestBuffer.put(trimmedManifest);
+        manifestBuffer.flip();
+        try (Dataset dataset2 = testDataset.write(1, 5)) {
+          assertEquals(2, dataset2.version());
+          assertEquals(2, dataset2.latestVersion());
+          // When reading from the serialized manifest, it shouldn't know about the second dataset
+          ReadOptions readOptions =
+              new ReadOptions.Builder().setSerializedManifest(manifestBuffer).build();
+          Dataset dataset1Manifest = Dataset.open(allocator, datasetPath.toString(), readOptions);
+          assertEquals(1, dataset1Manifest.version());
+        }
+      }
     }
   }
 
