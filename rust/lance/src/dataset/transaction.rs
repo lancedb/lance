@@ -1803,7 +1803,7 @@ impl Transaction {
     }
 
     fn register_pure_rewrite_rows_update_frags_in_indices(
-        indices: &mut [Index],
+        indices: &mut [IndexMetadata],
         pure_update_frag_ids: &[u64],
         original_fragment_ids: &[u64],
         fields_for_preserving_frag_bitmap: &[u32],
