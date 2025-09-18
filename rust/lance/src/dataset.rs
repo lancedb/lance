@@ -56,7 +56,7 @@ use std::sync::Arc;
 use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
-mod blob;
+pub mod blob;
 pub mod builder;
 pub mod cleanup;
 mod delta;

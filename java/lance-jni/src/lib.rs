@@ -52,6 +52,7 @@ mod sql;
 pub mod traits;
 mod transaction;
 pub mod utils;
+mod blocking_blobfile;
 
 pub use error::Error;
 pub use error::Result;
