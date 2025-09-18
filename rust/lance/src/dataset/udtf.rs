@@ -168,7 +168,7 @@ impl TableProvider for FtsTableProvider {
 ///  .unwrap();
 /// ```
 #[derive(Debug)]
-struct FtsQueryUDTF {
+pub struct FtsQueryUDTF {
     datasets: HashMap<String, Arc<Dataset>>,
 }
 
@@ -233,12 +233,10 @@ fn parse_query_options(options: &str) -> datafusion::common::Result<(bool, bool,
 }
 
 /// Builder of `FtsQueryUDTF`
-#[allow(dead_code)]
-struct FtsQueryUDTFBuilder {
+pub struct FtsQueryUDTFBuilder {
     datasets: HashMap<String, Arc<Dataset>>,
 }
 
-#[allow(dead_code)]
 impl FtsQueryUDTFBuilder {
     pub fn builder() -> Self {
         Self {
@@ -330,6 +328,7 @@ pub mod tests {
                 "with_row_id": true
             }
             "#;
+
         let df = ctx
             .sql(&format!(
                 "SELECT * FROM fts('foo', '{}', '{}') WHERE number > 1",
