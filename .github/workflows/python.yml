@@ -36,8 +36,38 @@ env:
   CACHE_PREFIX: "2"
 
 jobs:
+  linux-build:
+    timeout-minutes: 30
+    runs-on: "ubuntu-24.04"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+          cache-targets: false
+          cache-workspace-crates: true
+      - uses: ./.github/workflows/build_linux_wheel
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-wheel
+          path: python/target/wheels/*.whl
+          retention-days: 1
+
   lint:
-    timeout-minutes: 45
+    timeout-minutes: 30
     runs-on: "ubuntu-24.04"
     defaults:
       run:
@@ -80,23 +110,13 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
           cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
-      - name: Build
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-          pip install maturin
-          maturin develop --locked --extras tests,ray
-      - name: Run doctest
-        run: |
-          source venv/bin/activate
-          pytest --doctest-modules python/lance
-  linux:
+  linux-test:
     timeout-minutes: 45
+    needs: linux-build
     strategy:
       matrix:
         python-minor-version: ["9", "12"]
-    name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
+    name: "Python Linux Test 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04"
     defaults:
       run:
@@ -111,13 +131,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: 3.${{ matrix.python-minor-version }}
-      - uses: Swatinem/rust-cache@v2
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
         with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
-      - uses: ./.github/workflows/build_linux_wheel
+          name: linux-wheel
+          path: python/target/wheels
       - uses: ./.github/workflows/run_tests
       - name: Generate forward compatibility files
         run: python python/tests/forward_compat/datagen.py
@@ -132,6 +150,35 @@ jobs:
           source venv/bin/activate
           pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
           pytest python/tests/forward_compat --run-forward
+
+  doctest:
+    timeout-minutes: 30
+    needs: linux-build
+    runs-on: "ubuntu-24.04"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-wheel
+          path: python/target/wheels
+      - name: Install dependencies
+        run: |
+          pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
+          pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
+      - name: Run doctest
+        run: pytest --doctest-modules python/lance
 
   linux-arm:
     timeout-minutes: 45
@@ -215,6 +262,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     timeout-minutes: 45
+    needs: linux-build
     runs-on: "ubuntu-latest"
     defaults:
       run:
@@ -229,13 +277,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11" # TODO: upgrade when ray supports 3.12
-      - uses: Swatinem/rust-cache@v2
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
         with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-          cache-targets: false
-          cache-workspace-crates: true
-      - uses: ./.github/workflows/build_linux_wheel
+          name: linux-wheel
+          path: python/target/wheels
       - name: Install dependencies
         run: |
           pip install ray[data]
