@@ -221,19 +221,6 @@ impl BlockingDataset {
         Ok(indexes)
     }
 
-    pub fn update_config(
-        &mut self,
-        upsert_values: impl Iterator<Item = (String, String)>,
-    ) -> Result<()> {
-        RT.block_on(self.inner.update_config(upsert_values))?;
-        Ok(())
-    }
-
-    pub fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
-        RT.block_on(self.inner.delete_config_keys(delete_keys))?;
-        Ok(())
-    }
-
     pub fn commit_transaction(
         &mut self,
         transaction: Transaction,
@@ -255,17 +242,8 @@ impl BlockingDataset {
         Ok(transaction)
     }
 
-    pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
-        RT.block_on(self.inner.replace_schema_metadata(metadata))?;
-        Ok(())
-    }
-
-    pub fn replace_field_metadata(
-        &mut self,
-        metadata_map: HashMap<u32, HashMap<String, String>>,
-    ) -> Result<()> {
-        RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
-        Ok(())
+    pub fn get_table_metadata(&self) -> Result<HashMap<String, String>> {
+        Ok(self.inner.metadata().clone())
     }
 
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
@@ -1131,7 +1109,7 @@ fn inner_get_config<'local>(
     let config = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.inner.config()?
+        dataset_guard.inner.config().clone()
     };
 
     let java_hashmap = env
@@ -1156,49 +1134,6 @@ fn inner_get_config<'local>(
     }
 
     Ok(java_hashmap)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateConfig(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    config_map: JObject,
-) {
-    ok_or_throw_without_return!(env, inner_update_config(&mut env, java_dataset, config_map))
-}
-
-fn inner_update_config(env: &mut JNIEnv, java_dataset: JObject, config_map: JObject) -> Result<()> {
-    let jmap = JMap::from_env(env, &config_map)?;
-    let config = to_rust_map(env, &jmap)?;
-    let mut dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.update_config(config.into_iter())?;
-    Ok(())
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDeleteConfigKeys(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    config_keys: JObject,
-) {
-    ok_or_throw_without_return!(
-        env,
-        inner_delete_config_keys(&mut env, java_dataset, config_keys)
-    )
-}
-
-fn inner_delete_config_keys(
-    env: &mut JNIEnv,
-    java_dataset: JObject,
-    config_keys: JObject,
-) -> Result<()> {
-    let keys: Vec<String> = env.get_strings(&config_keys)?;
-    let mut dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    let key_slice: &[&str] = &keys.iter().map(String::as_str).collect::<Vec<_>>();
-    dataset_guard.delete_config_keys(key_slice)?;
-    Ok(())
 }
 
 #[no_mangle]
@@ -1678,62 +1613,48 @@ fn inner_get_version_by_tag(
     dataset_guard.get_version(tag.as_str())
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceSchemaMetadata(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    jschema_metadata: JObject,
-) {
-    ok_or_throw_without_return!(
-        env,
-        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata)
-    )
-}
-
-fn inner_replace_schema_metadata(
-    env: &mut JNIEnv,
-    java_dataset: JObject,
-    jschema_metadata: JObject,
-) -> Result<()> {
-    let jmap = JMap::from_env(env, &jschema_metadata)?;
-    let schema_metadata = to_rust_map(env, &jmap)?;
-    let mut dataset_guard =
-        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.replace_schema_metadata(schema_metadata)
-}
+// Unified metadata API JNI methods
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata(
-    mut env: JNIEnv,
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetTableMetadata<'local>(
+    mut env: JNIEnv<'local>,
     java_dataset: JObject,
-    jfield_metadata_map: JObject,
-) {
-    ok_or_throw_without_return!(
-        env,
-        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map)
-    )
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_table_metadata(&mut env, java_dataset))
 }
 
-fn inner_replace_field_metadata(
-    env: &mut JNIEnv,
+fn inner_get_table_metadata<'local>(
+    env: &mut JNIEnv<'local>,
     java_dataset: JObject,
-    jfield_metadata_map: JObject,
-) -> Result<()> {
-    let jmap = JMap::from_env(env, &jfield_metadata_map)?;
-    let mut field_metadata_map = HashMap::new();
-    let mut iter = jmap.iter(env)?;
-    env.with_local_frame(16, |env| {
-        while let Some((key, value)) = iter.next(env)? {
-            let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
-            let inner_map = JMap::from_env(env, &value)?;
-            let value_map = to_rust_map(env, &inner_map)?;
-            field_metadata_map.insert(field_id, value_map);
-        }
-        Ok::<(), Error>(())
-    })?;
-    let mut dataset_guard =
-        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.replace_field_metadata(field_metadata_map)
+) -> Result<JObject<'local>> {
+    let table_metadata = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.get_table_metadata()?
+    };
+
+    let java_hashmap = env
+        .new_object("java/util/HashMap", "()V", &[])
+        .expect("Failed to create Java HashMap");
+
+    for (k, v) in table_metadata {
+        let java_key = env
+            .new_string(&k)
+            .expect("Failed to create Java String (key)");
+        let java_value = env
+            .new_string(&v)
+            .expect("Failed to create Java String (value)");
+
+        env.call_method(
+            &java_hashmap,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&java_key), JValue::Object(&java_value)],
+        )
+        .expect("Failed to call HashMap.put()");
+    }
+
+    Ok(java_hashmap)
 }
 
 //////////////////////////////

@@ -6,7 +6,8 @@ use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
-    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMode,
+    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMap,
+    UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
 use lance_table::format::{DataFile, Fragment, Index};
@@ -273,6 +274,40 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let op = Operation::Project { schema };
                 Ok(Self(op))
             }
+            "UpdateConfig" => {
+                let config_updates = extract_update_map(&ob.getattr("config_updates")?)?;
+                let table_metadata_updates =
+                    extract_update_map(&ob.getattr("table_metadata_updates")?)?;
+                let schema_metadata_updates =
+                    extract_update_map(&ob.getattr("schema_metadata_updates")?)?;
+
+                // Extract field_metadata_updates
+                let field_metadata_updates_py = ob.getattr("field_metadata_updates")?;
+                let mut field_metadata_updates = HashMap::new();
+
+                if !field_metadata_updates_py.is_none() {
+                    if let Ok(items) = field_metadata_updates_py.call_method0("items") {
+                        for item in items.try_iter()? {
+                            let item = item?;
+                            // Extract as a tuple and then get individual elements
+                            let tuple = item.downcast::<pyo3::types::PyTuple>()?;
+                            let field_id = tuple.get_item(0)?.extract::<i32>()?;
+                            let update_map = tuple.get_item(1)?;
+                            if let Some(map) = extract_update_map(&update_map)? {
+                                field_metadata_updates.insert(field_id, map);
+                            }
+                        }
+                    }
+                }
+
+                let op = Operation::UpdateConfig {
+                    config_updates,
+                    table_metadata_updates,
+                    schema_metadata_updates,
+                    field_metadata_updates,
+                };
+                Ok(Self(op))
+            }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
             ))),
@@ -426,13 +461,29 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 }
             }
             Operation::UpdateConfig {
-                ref upsert_values,
-                ref delete_keys,
-                ref schema_metadata,
-                ref field_metadata,
+                ref config_updates,
+                ref table_metadata_updates,
+                ref schema_metadata_updates,
+                ref field_metadata_updates,
             } => {
                 if let Ok(cls) = namespace.getattr("UpdateConfig") {
-                    cls.call1((upsert_values, delete_keys, schema_metadata, field_metadata))
+                    let config = export_update_map(py, config_updates)?;
+                    let table_meta = export_update_map(py, table_metadata_updates)?;
+                    let schema_meta = export_update_map(py, schema_metadata_updates)?;
+
+                    // Export field_metadata_updates
+                    let field_meta = if field_metadata_updates.is_empty() {
+                        py.None()
+                    } else {
+                        let dict = pyo3::types::PyDict::new(py);
+                        for (field_id, update_map) in field_metadata_updates {
+                            let map_obj = export_update_map(py, &Some(update_map.clone()))?;
+                            dict.set_item(field_id, map_obj)?;
+                        }
+                        dict.into()
+                    };
+
+                    cls.call1((config, table_meta, schema_meta, field_meta))
                 } else {
                     let base_op = namespace.getattr("BaseOperation")?;
                     base_op.call0()
@@ -579,6 +630,52 @@ impl<'py> IntoPyObject<'py> for PyLance<&RewrittenIndex> {
         let old_id = self.0.old_id.to_string();
         let new_id = self.0.new_id.to_string();
         cls.call1((old_id, new_id))
+    }
+}
+
+fn extract_update_map(ob: &Bound<'_, PyAny>) -> PyResult<Option<UpdateMap>> {
+    if ob.is_none() {
+        return Ok(None);
+    }
+
+    let updates_dict = ob.getattr("updates")?;
+    let replace = ob.getattr("replace")?.extract::<bool>()?;
+
+    let mut entries = Vec::new();
+    if let Ok(items) = updates_dict.call_method0("items") {
+        for item in items.try_iter()? {
+            let item = item?;
+            let tuple = item.extract::<(String, Option<String>)>()?;
+            entries.push(UpdateMapEntry {
+                key: tuple.0,
+                value: tuple.1,
+            });
+        }
+    }
+
+    Ok(Some(UpdateMap {
+        update_entries: entries,
+        replace,
+    }))
+}
+
+fn export_update_map(py: Python<'_>, update_map: &Option<UpdateMap>) -> PyResult<PyObject> {
+    match update_map {
+        None => Ok(py.None()),
+        Some(map) => {
+            let lance_module = py.import(intern!(py, "lance"))?;
+            let lance_op = lance_module.getattr(intern!(py, "LanceOperation"))?;
+            let update_map_cls = lance_op.getattr(intern!(py, "UpdateMap"))?;
+
+            let dict = pyo3::types::PyDict::new(py);
+            for entry in &map.update_entries {
+                dict.set_item(&entry.key, &entry.value)?;
+            }
+
+            update_map_cls
+                .call1((dict, map.replace))
+                .map(|obj| obj.into())
+        }
     }
 }
 

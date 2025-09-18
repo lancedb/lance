@@ -109,6 +109,51 @@ pub enum BlobsOperation {
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct DataReplacementGroup(pub u64, pub DataFile);
 
+/// An entry for a map update. If value is None, the key will be removed from the map.
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct UpdateMapEntry {
+    /// The key of the map entry to update.
+    pub key: String,
+    /// The value to set for the key.
+    pub value: Option<String>,
+}
+
+impl From<(String, Option<String>)> for UpdateMapEntry {
+    fn from((key, value): (String, Option<String>)) -> Self {
+        Self { key, value }
+    }
+}
+
+impl From<(String, String)> for UpdateMapEntry {
+    fn from((key, value): (String, String)) -> Self {
+        Self::from((key, Some(value)))
+    }
+}
+
+impl From<(&str, Option<&str>)> for UpdateMapEntry {
+    fn from((key, value): (&str, Option<&str>)) -> Self {
+        Self {
+            key: key.to_string(),
+            value: value.map(str::to_owned),
+        }
+    }
+}
+
+impl From<(&str, &str)> for UpdateMapEntry {
+    fn from((key, value): (&str, &str)) -> Self {
+        Self::from((key, Some(value)))
+    }
+}
+
+/// Represents updates to a map (either incremental or replacement)
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct UpdateMap {
+    pub update_entries: Vec<UpdateMapEntry>,
+    /// If true, the map will be replaced entirely with the new entries.
+    /// If false, the new entries will be merged with the existing map.
+    pub replace: bool,
+}
+
 /// An operation on a dataset.
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
@@ -225,10 +270,10 @@ pub enum Operation {
 
     /// Update the dataset configuration.
     UpdateConfig {
-        upsert_values: Option<HashMap<String, String>>,
-        delete_keys: Option<Vec<String>>,
-        schema_metadata: Option<HashMap<String, String>>,
-        field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
+        config_updates: Option<UpdateMap>,
+        table_metadata_updates: Option<UpdateMap>,
+        schema_metadata_updates: Option<UpdateMap>,
+        field_metadata_updates: HashMap<i32, UpdateMap>,
     },
     /// Update the state of MemWALs.
     UpdateMemWalState {
@@ -418,28 +463,20 @@ impl PartialEq for Operation {
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
                 Self::UpdateConfig {
-                    upsert_values: a_upsert,
-                    delete_keys: a_delete,
-                    schema_metadata: a_schema,
-                    field_metadata: a_field,
+                    config_updates: a_config,
+                    table_metadata_updates: a_table_metadata,
+                    schema_metadata_updates: a_schema,
+                    field_metadata_updates: a_field,
                 },
                 Self::UpdateConfig {
-                    upsert_values: b_upsert,
-                    delete_keys: b_delete,
-                    schema_metadata: b_schema,
-                    field_metadata: b_field,
+                    config_updates: b_config,
+                    table_metadata_updates: b_table_metadata,
+                    schema_metadata_updates: b_schema,
+                    field_metadata_updates: b_field,
                 },
             ) => {
-                a_upsert == b_upsert
-                    && a_delete.as_ref().map(|v| {
-                        let mut v = v.clone();
-                        v.sort();
-                        v
-                    }) == b_delete.as_ref().map(|v| {
-                        let mut v = v.clone();
-                        v.sort();
-                        v
-                    })
+                a_config == b_config
+                    && a_table_metadata == b_table_metadata
                     && a_schema == b_schema
                     && a_field == b_field
             }
@@ -1073,12 +1110,19 @@ impl Operation {
                 vec
             }
             Self::UpdateConfig {
-                upsert_values: Some(uv),
+                config_updates: Some(config_updates),
                 ..
-            } => {
-                let vec: Vec<String> = uv.keys().cloned().collect();
-                vec
-            }
+            } => config_updates
+                .update_entries
+                .iter()
+                .filter_map(|entry| {
+                    if entry.value.is_some() {
+                        Some(entry.key.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
             _ => Vec::<String>::new(),
         }
     }
@@ -1087,9 +1131,19 @@ impl Operation {
     fn get_delete_config_keys(&self) -> Vec<String> {
         match self {
             Self::UpdateConfig {
-                delete_keys: Some(dk),
+                config_updates: Some(config_updates),
                 ..
-            } => dk.clone(),
+            } => config_updates
+                .update_entries
+                .iter()
+                .filter_map(|entry| {
+                    if entry.value.is_none() {
+                        Some(entry.key.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
             _ => Vec::<String>::new(),
         }
     }
@@ -1098,25 +1152,23 @@ impl Operation {
         match (self, other) {
             (
                 Self::UpdateConfig {
-                    schema_metadata,
-                    field_metadata,
+                    schema_metadata_updates,
+                    field_metadata_updates,
                     ..
                 },
                 Self::UpdateConfig {
-                    schema_metadata: other_schema_metadata,
-                    field_metadata: other_field_metadata,
+                    schema_metadata_updates: other_schema_metadata,
+                    field_metadata_updates: other_field_metadata,
                     ..
                 },
             ) => {
-                if schema_metadata.is_some() && other_schema_metadata.is_some() {
+                if schema_metadata_updates.is_some() && other_schema_metadata.is_some() {
                     return true;
                 }
-                if let Some(field_metadata) = field_metadata {
-                    if let Some(other_field_metadata) = other_field_metadata {
-                        for field in field_metadata.keys() {
-                            if other_field_metadata.contains_key(field) {
-                                return true;
-                            }
+                if !field_metadata_updates.is_empty() && !other_field_metadata.is_empty() {
+                    for field in field_metadata_updates.keys() {
+                        if other_field_metadata.contains_key(field) {
+                            return true;
                         }
                     }
                 }
@@ -1158,6 +1210,110 @@ impl Operation {
             Self::DataReplacement { .. } => "DataReplacement",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
+        }
+    }
+}
+
+/// Helper function to apply UpdateMap changes to a HashMap<String, String>
+fn apply_update_map(
+    target: &mut std::collections::HashMap<String, String>,
+    update_map: &UpdateMap,
+) {
+    if update_map.replace {
+        // Full replacement - clear existing and replace with new entries that have values
+        target.clear();
+        for entry in &update_map.update_entries {
+            if let Some(value) = &entry.value {
+                target.insert(entry.key.clone(), value.clone());
+            }
+        }
+    } else {
+        // Incremental update - merge entries
+        for entry in &update_map.update_entries {
+            if let Some(value) = &entry.value {
+                target.insert(entry.key.clone(), value.clone());
+            } else {
+                target.remove(&entry.key);
+            }
+        }
+    }
+}
+
+/// Helper function to translate old-style config updates to new UpdateMap format
+pub fn translate_config_updates(
+    upsert_values: &std::collections::HashMap<String, String>,
+    delete_keys: &[String],
+) -> UpdateMap {
+    let mut update_entries = Vec::new();
+
+    // Add upsert entries (with values)
+    for (key, value) in upsert_values {
+        update_entries.push(UpdateMapEntry {
+            key: key.clone(),
+            value: Some(value.clone()),
+        });
+    }
+
+    // Add delete entries (without values)
+    for key in delete_keys {
+        update_entries.push(UpdateMapEntry {
+            key: key.clone(),
+            value: None,
+        });
+    }
+
+    UpdateMap {
+        update_entries,
+        replace: false, // Old style was always incremental
+    }
+}
+
+/// Helper function to translate old-style schema metadata to new UpdateMap format
+pub fn translate_schema_metadata_updates(
+    schema_metadata: &std::collections::HashMap<String, String>,
+) -> UpdateMap {
+    let update_entries = schema_metadata
+        .iter()
+        .map(|(key, value)| UpdateMapEntry {
+            key: key.clone(),
+            value: Some(value.clone()),
+        })
+        .collect();
+
+    UpdateMap {
+        update_entries,
+        replace: true, // Old style schema metadata was full replacement
+    }
+}
+
+impl From<&UpdateMap> for pb::transaction::UpdateMap {
+    fn from(update_map: &UpdateMap) -> Self {
+        Self {
+            update_entries: update_map
+                .update_entries
+                .iter()
+                .map(|entry| pb::transaction::UpdateMapEntry {
+                    key: entry.key.clone(),
+                    value: entry.value.clone(),
+                })
+                .collect(),
+            replace: update_map.replace,
+        }
+    }
+}
+
+impl From<&pb::transaction::UpdateMap> for UpdateMap {
+    fn from(pb_update_map: &pb::transaction::UpdateMap) -> Self {
+        Self {
+            update_entries: pb_update_map
+                .update_entries
+                .iter()
+                .map(|entry| UpdateMapEntry {
+                    key: entry.key.clone(),
+                    value: entry.value.clone(),
+                })
+                .collect(),
+            replace: pb_update_map.replace,
         }
     }
 }
@@ -1759,33 +1915,38 @@ impl Transaction {
             Operation::Overwrite {
                 config_upsert_values: Some(tm),
                 ..
-            } => manifest.update_config(tm.clone()),
-            Operation::UpdateConfig {
-                upsert_values,
-                delete_keys,
-                schema_metadata,
-                field_metadata,
             } => {
-                // Delete is handled first. If the same key is referenced by upsert and
-                // delete, then upserted key-value pair will remain.
-                if let Some(delete_keys) = delete_keys {
-                    manifest.delete_config_keys(
-                        delete_keys
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                    )
+                manifest.config_mut().extend(tm.clone());
+            }
+            Operation::UpdateConfig {
+                config_updates,
+                table_metadata_updates,
+                schema_metadata_updates,
+                field_metadata_updates,
+            } => {
+                if let Some(config_updates) = config_updates {
+                    let mut config = manifest.config.clone();
+                    apply_update_map(&mut config, config_updates);
+                    manifest.config = config;
                 }
-                if let Some(upsert_values) = upsert_values {
-                    manifest.update_config(upsert_values.clone());
+                if let Some(table_metadata_updates) = table_metadata_updates {
+                    let mut table_metadata = manifest.table_metadata.clone();
+                    apply_update_map(&mut table_metadata, table_metadata_updates);
+                    manifest.table_metadata = table_metadata;
                 }
-                if let Some(schema_metadata) = schema_metadata {
-                    manifest.replace_schema_metadata(schema_metadata.clone());
+                if let Some(schema_metadata_updates) = schema_metadata_updates {
+                    let mut schema_metadata = manifest.schema.metadata.clone();
+                    apply_update_map(&mut schema_metadata, schema_metadata_updates);
+                    manifest.schema.metadata = schema_metadata;
                 }
-                if let Some(field_metadata) = field_metadata {
-                    for (field_id, metadata) in field_metadata {
-                        manifest.replace_field_metadata(*field_id as i32, metadata.clone())?;
+                for (field_id, field_metadata_update) in field_metadata_updates {
+                    if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
+                        apply_update_map(&mut field.metadata, field_metadata_update);
+                    } else {
+                        return Err(Error::InvalidInput {
+                            source: format!("Field with id {} does not exist", field_id).into(),
+                            location: location!(),
+                        });
                     }
                 }
             }
@@ -2387,40 +2548,85 @@ impl TryFrom<pb::Transaction> for Transaction {
                     schema: Schema::from(&Fields(schema)),
                 }
             }
-            Some(pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                upsert_values,
-                delete_keys,
-                schema_metadata,
-                field_metadata,
-            })) => {
-                let upsert_values = match upsert_values.len() {
-                    0 => None,
-                    _ => Some(upsert_values),
-                };
-                let delete_keys = match delete_keys.len() {
-                    0 => None,
-                    _ => Some(delete_keys),
-                };
-                let schema_metadata = match schema_metadata.len() {
-                    0 => None,
-                    _ => Some(schema_metadata),
-                };
-                let field_metadata = match field_metadata.len() {
-                    0 => None,
-                    _ => Some(
-                        field_metadata
-                            .into_iter()
-                            .map(|(field_id, field_meta_update)| {
-                                (field_id, field_meta_update.metadata)
+            Some(pb::transaction::Operation::UpdateConfig(update_config)) => {
+                // Check if new-style fields are present
+                let has_new_fields = update_config.config_updates.is_some()
+                    || update_config.table_metadata_updates.is_some()
+                    || update_config.schema_metadata_updates.is_some()
+                    || !update_config.field_metadata_updates.is_empty();
+
+                // Check if old-style fields are present
+                let has_old_fields = !update_config.upsert_values.is_empty()
+                    || !update_config.delete_keys.is_empty()
+                    || !update_config.schema_metadata.is_empty()
+                    || !update_config.field_metadata.is_empty();
+
+                // Error if both are present
+                if has_new_fields && has_old_fields {
+                    return Err(Error::InvalidInput {
+                        source: "Cannot mix old and new style UpdateConfig fields".into(),
+                        location: location!(),
+                    });
+                }
+
+                if has_old_fields {
+                    // Translate old-style to new-style
+                    let config_updates = if !update_config.upsert_values.is_empty()
+                        || !update_config.delete_keys.is_empty()
+                    {
+                        Some(translate_config_updates(
+                            &update_config.upsert_values,
+                            &update_config.delete_keys,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let schema_metadata_updates = if !update_config.schema_metadata.is_empty() {
+                        Some(translate_schema_metadata_updates(
+                            &update_config.schema_metadata,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let field_metadata_updates = update_config
+                        .field_metadata
+                        .into_iter()
+                        .map(|(field_id, field_meta_update)| {
+                            (
+                                field_id as i32,
+                                translate_schema_metadata_updates(&field_meta_update.metadata),
+                            )
+                        })
+                        .collect();
+
+                    Operation::UpdateConfig {
+                        config_updates,
+                        table_metadata_updates: None,
+                        schema_metadata_updates,
+                        field_metadata_updates,
+                    }
+                } else {
+                    // Use new-style fields directly (convert from protobuf)
+                    Operation::UpdateConfig {
+                        config_updates: update_config.config_updates.as_ref().map(UpdateMap::from),
+                        table_metadata_updates: update_config
+                            .table_metadata_updates
+                            .as_ref()
+                            .map(UpdateMap::from),
+                        schema_metadata_updates: update_config
+                            .schema_metadata_updates
+                            .as_ref()
+                            .map(UpdateMap::from),
+                        field_metadata_updates: update_config
+                            .field_metadata_updates
+                            .iter()
+                            .map(|(field_id, pb_update_map)| {
+                                (*field_id, UpdateMap::from(pb_update_map))
                             })
                             .collect(),
-                    ),
-                };
-                Operation::UpdateConfig {
-                    upsert_values,
-                    delete_keys,
-                    schema_metadata,
-                    field_metadata,
+                    }
                 }
             }
             Some(pb::transaction::Operation::DataReplacement(
@@ -2684,30 +2890,31 @@ impl From<&Transaction> for pb::Transaction {
                 })
             }
             Operation::UpdateConfig {
-                upsert_values,
-                delete_keys,
-                schema_metadata,
-                field_metadata,
+                config_updates,
+                table_metadata_updates,
+                schema_metadata_updates,
+                field_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                upsert_values: upsert_values.clone().unwrap_or(Default::default()),
-                delete_keys: delete_keys.clone().unwrap_or(Default::default()),
-                schema_metadata: schema_metadata.clone().unwrap_or(Default::default()),
-                field_metadata: field_metadata
+                config_updates: config_updates
                     .as_ref()
-                    .map(|field_metadata| {
-                        field_metadata
-                            .iter()
-                            .map(|(field_id, metadata)| {
-                                (
-                                    *field_id,
-                                    pb::transaction::update_config::FieldMetadataUpdate {
-                                        metadata: metadata.clone(),
-                                    },
-                                )
-                            })
-                            .collect()
+                    .map(pb::transaction::UpdateMap::from),
+                table_metadata_updates: table_metadata_updates
+                    .as_ref()
+                    .map(pb::transaction::UpdateMap::from),
+                schema_metadata_updates: schema_metadata_updates
+                    .as_ref()
+                    .map(pb::transaction::UpdateMap::from),
+                field_metadata_updates: field_metadata_updates
+                    .iter()
+                    .map(|(field_id, update_map)| {
+                        (*field_id, pb::transaction::UpdateMap::from(update_map))
                     })
-                    .unwrap_or(Default::default()),
+                    .collect(),
+                // Leave old fields empty - we only write new-style fields
+                upsert_values: Default::default(),
+                delete_keys: Default::default(),
+                schema_metadata: Default::default(),
+                field_metadata: Default::default(),
             }),
             Operation::DataReplacement { replacements } => {
                 pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {

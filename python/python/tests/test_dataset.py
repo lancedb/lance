@@ -249,14 +249,15 @@ def test_schema_metadata(tmp_path: Path):
     assert ds.schema.field("a").metadata == {b"thisis": b"a"}
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
-    # Replace schema metadata
-    ds.replace_schema_metadata({"foo": "baz"})
+    # Replace schema metadata (using new unified API)
+    ds.update_schema_metadata({"foo": "baz"}, replace=True)
     assert ds.schema.metadata == {b"foo": b"baz"}
     assert ds.schema.field("a").metadata == {b"thisis": b"a"}
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
-    # Replace field metadata
-    ds.replace_field_metadata("a", {"thisis": "c"})
+    # Replace field metadata (using new unified API)
+    # Use field path instead of field ID
+    ds.update_field_metadata({"a": {"thisis": "c"}}, replace=True)
     assert ds.schema.field("a").metadata == {b"thisis": b"c"}
     assert ds.schema.field("b").metadata == {b"thisis": b"b"}
 
@@ -4170,3 +4171,401 @@ def test_diff_meta(tmp_path: Path):
     # Now try to diff with the cleaned up version 1 (should raise error)
     with pytest.raises(ValueError):
         dataset.diff_meta(1)
+
+
+def test_table_metadata_updates(tmp_path: Path):
+    """Test table metadata incremental updates and full replacement."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Test incremental updates
+    ds.update_metadata({"key1": "value1", "key2": "value2"})
+    metadata = ds.metadata
+    assert metadata["key1"] == "value1"
+    assert metadata["key2"] == "value2"
+
+    # Test updating existing key
+    ds.update_metadata({"key1": "updated_value1", "key3": "value3"})
+    metadata = ds.metadata
+    assert metadata["key1"] == "updated_value1"
+    assert metadata["key2"] == "value2"  # Should remain
+    assert metadata["key3"] == "value3"
+
+    # Test deletion with None values
+    ds.update_metadata({"key2": None, "key4": "value4"})
+    metadata = ds.metadata
+    assert metadata["key1"] == "updated_value1"
+    assert "key2" not in metadata  # Should be deleted
+    assert metadata["key3"] == "value3"
+    assert metadata["key4"] == "value4"
+
+    # Test full replacement
+    ds.update_metadata({"new_key": "new_value"}, replace=True)
+    metadata = ds.metadata
+    assert metadata == {"new_key": "new_value"}  # All previous keys gone
+
+
+def test_config_updates(tmp_path: Path):
+    """Test config incremental updates and full replacement."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    original_config = ds.config()
+
+    # Test incremental updates
+    ds.update_config({"custom_key1": "value1", "custom_key2": "value2"})
+    config = ds.config()
+    assert config["custom_key1"] == "value1"
+    assert config["custom_key2"] == "value2"
+    # Original config should still be there
+    for key, value in original_config.items():
+        assert config[key] == value
+
+    # Test updating existing custom key
+    ds.update_config({"custom_key1": "updated_value1", "custom_key3": "value3"})
+    config = ds.config()
+    assert config["custom_key1"] == "updated_value1"
+    assert config["custom_key2"] == "value2"
+    assert config["custom_key3"] == "value3"
+
+    # Test deletion with None values
+    ds.update_config({"custom_key2": None, "custom_key4": "value4"})
+    config = ds.config()
+    assert config["custom_key1"] == "updated_value1"
+    assert "custom_key2" not in config
+    assert config["custom_key3"] == "value3"
+    assert config["custom_key4"] == "value4"
+
+    # Test full replacement (should preserve original config plus new values)
+    ds.update_config({"only_custom": "only_value"}, replace=True)
+    config = ds.config()
+    assert config == {"only_custom": "only_value"}
+
+
+def test_schema_metadata_updates(tmp_path: Path):
+    """Test schema metadata incremental updates and full replacement."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Test incremental updates
+    ds.update_schema_metadata({"schema_key1": "value1", "schema_key2": "value2"})
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata["schema_key1"] == "value1"
+    assert schema_metadata["schema_key2"] == "value2"
+
+    # Test updating existing key
+    ds.update_schema_metadata(
+        {"schema_key1": "updated_value1", "schema_key3": "value3"}
+    )
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata["schema_key1"] == "updated_value1"
+    assert schema_metadata["schema_key2"] == "value2"
+    assert schema_metadata["schema_key3"] == "value3"
+
+    # Test deletion with None values
+    ds.update_schema_metadata({"schema_key2": None, "schema_key4": "value4"})
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata["schema_key1"] == "updated_value1"
+    assert "schema_key2" not in schema_metadata
+    assert schema_metadata["schema_key3"] == "value3"
+    assert schema_metadata["schema_key4"] == "value4"
+
+    # Test full replacement
+    ds.update_schema_metadata({"only_schema": "only_value"}, replace=True)
+    schema_metadata = ds.schema_metadata
+    assert schema_metadata == {"only_schema": "only_value"}
+
+
+def test_field_metadata_updates(tmp_path: Path):
+    """Test field metadata updates using field paths."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Test incremental updates using field path
+    ds.update_field_metadata({"a": {"field_key1": "value1", "field_key2": "value2"}})
+
+    # Get field metadata for verification
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata["field_key1"] == "value1"
+    assert field_metadata["field_key2"] == "value2"
+
+    # Test updating existing key
+    ds.update_field_metadata(
+        {"a": {"field_key1": "updated_value1", "field_key3": "value3"}}
+    )
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata["field_key1"] == "updated_value1"
+    assert field_metadata["field_key2"] == "value2"  # Should remain
+    assert field_metadata["field_key3"] == "value3"
+
+    # Test deletion with None values
+    ds.update_field_metadata({"a": {"field_key2": None, "field_key4": "value4"}})
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata["field_key1"] == "updated_value1"
+    assert "field_key2" not in field_metadata  # Should be deleted
+    assert field_metadata["field_key3"] == "value3"
+    assert field_metadata["field_key4"] == "value4"
+
+    # Test full replacement
+    ds.update_field_metadata({"a": {"only_field": "only_value"}}, replace=True)
+    field_a = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "a":
+            field_a = f
+            break
+    field_metadata = field_a.metadata
+    assert field_metadata == {"only_field": "only_value"}
+
+
+def test_field_metadata_multiple_fields(tmp_path: Path):
+    """Test field metadata updates on multiple fields at once."""
+    arr1 = pa.array([1, 2, 3])
+    arr2 = pa.array(["a", "b", "c"])
+    tbl = pa.table({"num": arr1, "str": arr2})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Update metadata for both fields
+    ds.update_field_metadata(
+        {
+            "num": {"type": "numeric", "unit": "count"},
+            "str": {"type": "string", "encoding": "utf8"},
+        }
+    )
+
+    # Verify both fields got updated
+    num_field = None
+    str_field = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "num":
+            num_field = f
+        elif f.name() == "str":
+            str_field = f
+
+    assert num_field.metadata["type"] == "numeric"
+    assert num_field.metadata["unit"] == "count"
+    assert str_field.metadata["type"] == "string"
+    assert str_field.metadata["encoding"] == "utf8"
+
+    # Update one field while leaving the other
+    ds.update_field_metadata({"num": {"unit": "items", "description": "Item count"}})
+
+    num_field = None
+    str_field = None
+    for f in ds.lance_schema.fields():
+        if f.name() == "num":
+            num_field = f
+        elif f.name() == "str":
+            str_field = f
+
+    # num field should be updated
+    assert num_field.metadata["type"] == "numeric"  # preserved
+    assert num_field.metadata["unit"] == "items"  # updated
+    assert num_field.metadata["description"] == "Item count"  # added
+
+    # str field should be unchanged
+    assert str_field.metadata["type"] == "string"
+    assert str_field.metadata["encoding"] == "utf8"
+
+
+def test_metadata_apis_return_post_image(tmp_path: Path):
+    """Test that metadata update methods return the post-update state."""
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr})
+    ds = lance.write_dataset(tbl, tmp_path)
+
+    # Test table metadata
+    result = ds.update_metadata({"key1": "value1", "key2": "value2"})
+    assert result["key1"] == "value1"
+    assert result["key2"] == "value2"
+
+    result = ds.update_metadata({"key1": "updated", "key3": "value3"})
+    assert result["key1"] == "updated"
+    assert result["key2"] == "value2"
+    assert result["key3"] == "value3"
+
+    # Test config
+    original_config = ds.config()
+    result = ds.update_config({"custom": "value"})
+    expected = {**original_config, "custom": "value"}
+    assert result == expected
+
+    # Test schema metadata
+    result = ds.update_schema_metadata({"schema_key": "schema_value"})
+    assert result["schema_key"] == "schema_value"
+
+
+def test_update_config_transaction(tmp_path: Path):
+    """Test UpdateConfig operation using transaction with new UpdateMap pattern."""
+    # Create initial dataset
+    arr = pa.array([1, 2, 3])
+    tbl = pa.table({"a": arr, "b": [10, 20, 30]})
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64(), metadata={b"field_a": b"original"}),
+            pa.field("b", pa.int64(), metadata={b"field_b": b"original"}),
+        ],
+        metadata={b"schema_key": b"original"},
+    )
+    tbl = tbl.replace_schema_metadata(schema.metadata)
+    ds = lance.write_dataset(tbl, tmp_path, schema=schema)
+
+    # Test 1: Update configuration using UpdateConfig transaction
+    config_update_map = lance.LanceOperation.UpdateMap(
+        updates={"key1": "value1", "key2": "value2"}, replace=False
+    )
+
+    update_config_op = lance.LanceOperation.UpdateConfig(
+        config_updates=config_update_map,
+        table_metadata_updates=None,
+        schema_metadata_updates=None,
+        field_metadata_updates=None,
+    )
+
+    transaction = lance.Transaction(
+        read_version=ds.version, operation=update_config_op, uuid=str(uuid.uuid4())
+    )
+
+    # Commit transaction
+    ds_v2 = lance.LanceDataset.commit(tmp_path, transaction)
+    assert ds_v2.version == 2
+    config = ds_v2.config()
+    assert config["key1"] == "value1"
+    assert config["key2"] == "value2"
+
+    # Test 2: Delete configuration key with null value
+    config_delete_map = lance.LanceOperation.UpdateMap(
+        updates={"key1": None},  # None means delete
+        replace=False,
+    )
+
+    update_config_op2 = lance.LanceOperation.UpdateConfig(
+        config_updates=config_delete_map,
+        table_metadata_updates=None,
+        schema_metadata_updates=None,
+        field_metadata_updates=None,
+    )
+
+    transaction2 = lance.Transaction(
+        read_version=ds_v2.version, operation=update_config_op2, uuid=str(uuid.uuid4())
+    )
+
+    ds_v3 = lance.LanceDataset.commit(tmp_path, transaction2)
+    assert ds_v3.version == 3
+    config = ds_v3.config()
+    assert "key1" not in config
+    assert config["key2"] == "value2"
+
+    # Test 3: Update schema metadata
+    schema_update_map = lance.LanceOperation.UpdateMap(
+        updates={"schema_new": "schema_value", "schema_key": "updated"}, replace=False
+    )
+
+    update_config_op3 = lance.LanceOperation.UpdateConfig(
+        config_updates=None,
+        table_metadata_updates=None,
+        schema_metadata_updates=schema_update_map,
+        field_metadata_updates=None,
+    )
+
+    transaction3 = lance.Transaction(
+        read_version=ds_v3.version, operation=update_config_op3, uuid=str(uuid.uuid4())
+    )
+
+    ds_v4 = lance.LanceDataset.commit(tmp_path, transaction3)
+    assert ds_v4.version == 4
+    schema_metadata = ds_v4.schema_metadata
+    assert schema_metadata["schema_new"] == "schema_value"
+    assert schema_metadata["schema_key"] == "updated"
+
+    # Test 4: Update field metadata for multiple fields
+    field_a_update_map = lance.LanceOperation.UpdateMap(
+        updates={"field_a": "updated_a", "new_key_a": "new_value_a"}, replace=False
+    )
+
+    field_b_update_map = lance.LanceOperation.UpdateMap(
+        updates={"field_b": "updated_b", "new_key_b": "new_value_b"}, replace=False
+    )
+
+    update_config_op4 = lance.LanceOperation.UpdateConfig(
+        config_updates=None,
+        table_metadata_updates=None,
+        schema_metadata_updates=None,
+        field_metadata_updates={
+            0: field_a_update_map,  # field "a"
+            1: field_b_update_map,  # field "b"
+        },
+    )
+
+    transaction4 = lance.Transaction(
+        read_version=ds_v4.version, operation=update_config_op4, uuid=str(uuid.uuid4())
+    )
+
+    ds_v5 = lance.LanceDataset.commit(tmp_path, transaction4)
+    assert ds_v5.version == 5
+
+    # Verify field metadata updates
+    field_a = None
+    field_b = None
+    for field in ds_v5.lance_schema.fields():
+        if field.name() == "a":
+            field_a = field
+        elif field.name() == "b":
+            field_b = field
+
+    assert field_a is not None
+    assert field_b is not None
+    assert field_a.metadata["field_a"] == "updated_a"
+    assert field_a.metadata["new_key_a"] == "new_value_a"
+    assert field_b.metadata["field_b"] == "updated_b"
+    assert field_b.metadata["new_key_b"] == "new_value_b"
+
+    # Test 5: Replace mode - completely replace metadata
+    table_replace_map = lance.LanceOperation.UpdateMap(
+        updates={"only_key": "only_value"},
+        replace=True,  # This will replace all existing table metadata
+    )
+
+    # First add some table metadata to replace
+    ds_v5.update_metadata(
+        {"existing_key": "existing_value", "another_key": "another_value"}
+    )
+    # Reload dataset to get the updated version
+    ds_v6 = lance.dataset(tmp_path)
+
+    update_config_op5 = lance.LanceOperation.UpdateConfig(
+        config_updates=None,
+        table_metadata_updates=table_replace_map,
+        schema_metadata_updates=None,
+        field_metadata_updates=None,
+    )
+
+    transaction5 = lance.Transaction(
+        read_version=ds_v6.version,  # Use the actual latest version
+        operation=update_config_op5,
+        uuid=str(uuid.uuid4()),
+    )
+
+    ds_v7 = lance.LanceDataset.commit(tmp_path, transaction5)
+    table_metadata = ds_v7.metadata
+    assert table_metadata == {
+        "only_key": "only_value"
+    }  # All previous metadata should be gone
