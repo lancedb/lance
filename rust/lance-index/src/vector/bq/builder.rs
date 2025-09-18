@@ -312,6 +312,7 @@ fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
     ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
 }
 
+// implement the householder qr decomposition referenced from https://en.wikipedia.org/wiki/Householder_transformation#QR_decomposition
 fn householder_qr(a: ndarray::Array2<f64>) -> (ndarray::Array2<f64>, ndarray::Array2<f64>) {
     let (m, n) = a.dim();
     let mut q = ndarray::Array2::eye(m);
