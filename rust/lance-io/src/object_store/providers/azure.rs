@@ -117,6 +117,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            storage_options: storage_options.0.clone(),
         })
     }
 }
