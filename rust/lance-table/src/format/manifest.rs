@@ -1004,13 +1004,12 @@ impl MultiBucketManager {
         Ok(selected_bucket)
     }
 
-    /// Hash a fragment ID using the default hasher
+    /// Hash a fragment ID using a simple but effective hash function
     fn hash_fragment_id(&self, fragment_id: u32) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        fragment_id.hash(&mut hasher);
-        hasher.finish()
+        // Use a simple multiplicative hash that works well for sequential IDs
+        // This provides better distribution than DefaultHasher for small sequential numbers
+        let hash = (fragment_id as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        hash
     }
 
     /// Check if multi-bucket layout is enabled (more than one bucket)
