@@ -539,6 +539,7 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
     use tokio::sync::Barrier;
@@ -1121,12 +1122,24 @@ mod tests {
         let str_index = indices.iter().find(|idx| idx.name == "str_idx").unwrap();
         let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
 
-        assert_eq!(str_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(1));
-        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(
+            str_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            vec_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         let updated_dataset = UpdateBuilder::new(Arc::new(dataset))
             .update_where("str = 'e'")
@@ -1224,12 +1237,24 @@ mod tests {
             .find(|idx| idx.name == "vec_idx")
             .unwrap();
 
-        assert_eq!(str_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(str_index.fragment_bitmap.as_ref().unwrap().contains(1));
-        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(
+            str_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            vec_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         // insert data to create the third frag
         let new_batch = lance_datagen::gen_batch()

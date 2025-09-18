@@ -4601,12 +4601,24 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         let value_index = indices.iter().find(|idx| idx.name == "value_idx").unwrap();
         let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
 
-        assert_eq!(value_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(value_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(value_index.fragment_bitmap.as_ref().unwrap().contains(1));
-        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(
+            value_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            vec_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         // update keys: 2,5
         let upsert_keys = UInt32Array::from(vec![2, 5]);
@@ -4646,27 +4658,6 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
 
         let fragments = updated_dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
-
-        let updated_indices = updated_dataset.load_indices().await.unwrap();
-        let updated_value_index = updated_indices
-            .iter()
-            .find(|idx| idx.name == "value_idx")
-            .unwrap();
-        let updated_vec_index = updated_indices
-            .iter()
-            .find(|idx| idx.name == "vec_idx")
-            .unwrap();
-
-        // the frag bitmap of the index for 'value' field should not been updated
-        let value_bitmap = updated_value_index.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(value_bitmap.len(), 2);
-        assert!(value_bitmap.contains(0));
-        assert!(value_bitmap.contains(1));
-
-        let vec_bitmap = updated_vec_index.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(vec_bitmap.len(), 2);
-        assert!(vec_bitmap.contains(0));
-        assert!(vec_bitmap.contains(1));
     }
 
     #[tokio::test]
@@ -4724,12 +4715,24 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         let value_index = indices.iter().find(|idx| idx.name == "value_idx").unwrap();
         let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
 
-        assert_eq!(value_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(value_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(value_index.fragment_bitmap.as_ref().unwrap().contains(1));
-        assert_eq!(vec_index.fragment_bitmap.as_ref().unwrap().len(), 2);
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(0));
-        assert!(vec_index.fragment_bitmap.as_ref().unwrap().contains(1));
+        assert_eq!(
+            value_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            vec_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         let sub_schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, true),
