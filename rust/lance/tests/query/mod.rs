@@ -121,7 +121,8 @@ async fn test_ann(original: &RecordBatch, ds: &Dataset, column: &str, predicate:
         .nearest(column, query_vector.as_ref(), 10)
         .unwrap()
         .prefilter(true)
-        .refine(2);
+        .refine(2)
+        .ef(400);
     if let Some(pred) = predicate {
         scanner.filter(pred).unwrap();
     }
