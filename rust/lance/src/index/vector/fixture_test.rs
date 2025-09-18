@@ -109,7 +109,7 @@ mod test {
             Ok(self.ret_val.clone())
         }
 
-        fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        fn find_partitions(&self, _: &Query) -> Result<(UInt32Array, Float32Array)> {
             unimplemented!("only for IVF")
         }
 

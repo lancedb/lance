@@ -16,7 +16,7 @@ use crate::index::{
 };
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -447,7 +447,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         unimplemented!("IVFIndex not currently used as sub-index and top-level indices do partition-aware search")
     }
 
-    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
         let dt = if self.distance_type == DistanceType::Cosine {
             DistanceType::L2
         } else {

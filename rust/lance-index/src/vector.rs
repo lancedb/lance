@@ -8,7 +8,7 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
@@ -166,7 +166,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// partitions to the query vector).
     ///
     /// The results should be in sorted order from closest to farthest.
-    fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)>;
 
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;

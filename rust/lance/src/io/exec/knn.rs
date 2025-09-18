@@ -491,7 +491,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
-                    let partitions = index.find_partitions(&query).map_err(|e| {
+                    let (partitions, _dists) = index.find_partitions(&query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
 

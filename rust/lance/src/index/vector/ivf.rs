@@ -19,6 +19,7 @@ use crate::{
 };
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
+use arrow_array::Float32Array;
 use arrow_array::{
     cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
@@ -923,7 +924,7 @@ impl VectorIndex for IVFIndex {
     /// Internal API with no stability guarantees.
     ///
     /// Assumes the query vector is normalized if the metric type is cosine.
-    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
         let mt = if self.metric_type == MetricType::Cosine {
             MetricType::L2
         } else {

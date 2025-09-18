@@ -6,7 +6,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
 
 pub use builder::IvfBuildParams;
 use lance_core::Result;
@@ -255,7 +255,11 @@ impl IvfTransformer {
         )
     }
 
-    pub fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
+    pub fn find_partitions(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+    ) -> Result<(UInt32Array, Float32Array)> {
         Ok(kmeans_find_partitions_arrow_array(
             &self.centroids,
             query,
