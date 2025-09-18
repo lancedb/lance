@@ -3381,7 +3381,6 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-table",
- "libm",
  "log",
  "num-traits",
  "object_store",
