@@ -746,7 +746,7 @@ fn inner_open_native<'local>(
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
-        serialized_manifest
+        serialized_manifest,
     )?;
     dataset.into_java(env)
 }
