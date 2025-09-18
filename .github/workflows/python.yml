@@ -178,7 +178,7 @@ jobs:
           pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
       - name: Run doctest
-        run: pytest --doctest-modules python/lance
+        run: pytest --doctest-modules --pyargs lance
 
   linux-arm:
     timeout-minutes: 45
