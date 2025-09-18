@@ -3149,7 +3149,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_delete_not_supported() {
-            let Fixtures { ds, new_data } = setup(false).await;
+            let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
 
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
@@ -3178,7 +3178,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_errors_on_bad_schema() {
-            let Fixtures { ds, new_data } = setup(false).await;
+            let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
 
             // Schema with different names, which should be rejected.
             let bad_schema = Arc::new(Schema::new(vec![
@@ -3215,7 +3215,7 @@ mod tests {
             #[values(false, true)] scalar_index: bool,
             #[values(false, true)] insert: bool,
         ) {
-            let Fixtures { ds, new_data } = setup(scalar_index).await;
+            let Fixtures { ds, new_data } = Box::pin(setup(scalar_index)).await;
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
                 new_data.schema(),
