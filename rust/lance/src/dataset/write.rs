@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
+use url::Url;
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
@@ -342,13 +343,20 @@ pub async fn do_write_fragments(
         for (i, uri) in data_bucket_uris.iter().enumerate() {
             let bucket_id = (i + 1) as u32; // Start from 1, 0 is reserved for primary
             println!("🪣 Registering bucket {} -> {}", bucket_id, uri);
+            // Extract just the path portion from the URI for storage
+            let path_portion = if let Ok(url) = Url::parse(uri) {
+                format!("{}/data", url.path().trim_start_matches('/'))
+            } else {
+                format!("{}/data", uri)
+            };
+            println!("🪣 Extracted path portion: {}", path_portion);
             base_paths.insert(
                 bucket_id,
                 lance_table::format::BasePath {
                     id: bucket_id,
                     name: Some(format!("data_bucket_{}", bucket_id)),
                     is_dataset_root: false, // Direct path to data directory
-                    path: format!("{}/data", uri), // Store the full path to where files will be
+                    path: path_portion, // Store just the path portion, not full URL
                 },
             );
         }
@@ -764,13 +772,17 @@ impl WriterGenerator {
                     )
                 })?;
                 
-                // The base_path already includes /data, but open_writer will add /data again
+                // The base_path now contains just the path portion, not the full URL
+                // and already includes /data, but open_writer will add /data again
                 // So we need to remove /data from the end to prevent double /data
                 let full_path = &base_path.path;
+                println!("📝 Processing bucket path: '{}'", full_path);
                 let bucket_path = if full_path.ends_with("/data") {
                     let parent_path = &full_path[..full_path.len() - 5]; // Remove "/data"
+                    println!("📝 After removing /data: '{}'", parent_path);
                     Path::parse(parent_path)?
                 } else {
+                    println!("📝 Path doesn't end with /data, using as-is");
                     Path::parse(full_path)?
                 };
                 println!("📝 Using additional bucket directory: {} (open_writer will add /data)", bucket_path);
