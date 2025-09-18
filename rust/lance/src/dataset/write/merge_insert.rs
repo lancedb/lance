@@ -24,6 +24,7 @@ use assign_action::merge_insert_action;
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 use crate::dataset::rowids::get_row_id_index;
+use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
 use crate::{
     datafusion::dataframe::SessionContextExt,
@@ -1420,6 +1421,8 @@ impl MergeInsertJob {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
+                fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
+                update_mode: Some(RewriteColumns),
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
@@ -1490,6 +1493,12 @@ impl MergeInsertJob {
                 // modify any field values.
                 fields_modified: vec![],
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
+                fields_for_preserving_frag_bitmap: full_schema
+                    .fields
+                    .iter()
+                    .map(|f| f.id as u32)
+                    .collect(),
+                update_mode: Some(RewriteRows),
             };
 
             let affected_rows = Some(RowIdTreeMap::from(removed_row_addrs));
@@ -2031,6 +2040,7 @@ impl Merger {
 mod tests {
     use super::*;
     use crate::dataset::scanner::ColumnOrdering;
+    use crate::index::vector::VectorIndexParams;
     use crate::{
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
@@ -2039,18 +2049,23 @@ mod tests {
             FragmentRowCount, ThrottledStoreWrapper,
         },
     };
+    use arrow_array::types::Float32Type;
     use arrow_array::{
         types::{Int32Type, UInt32Type},
-        Int32Array, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array,
+        FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatchIterator,
+        RecordBatchReader, StringArray, UInt32Array,
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{future::try_join_all, FutureExt, StreamExt, TryStreamExt};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_datafusion::{datagen::DatafusionDatagenExt, utils::reader_to_stream};
-    use lance_datagen::{array, BatchCount, RowCount, Seed};
-    use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_datagen::{array, BatchCount, Dimension, RowCount, Seed};
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::IndexType;
     use lance_io::object_store::ObjectStoreParams;
+    use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
@@ -4519,5 +4534,260 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
         assert_eq!(updated_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_full_schema_upsert_fragment_bitmap() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, true),
+            Field::new("value", DataType::UInt32, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(1, 1))
+            .col("value", array::step_custom::<UInt32Type>(10, 10))
+            .col(
+                "vec",
+                array::cycle_vec(
+                    array::cycle::<Float32Type>(vec![
+                        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+                        15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+                    ]),
+                    Dimension::from(4),
+                ),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::Scalar,
+                Some("value_idx".to_string()),
+                &scalar_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let value_index = indices.iter().find(|idx| idx.name == "value_idx").unwrap();
+        let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
+
+        assert_eq!(
+            value_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            vec_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        // update keys: 2,5
+        let upsert_keys = UInt32Array::from(vec![2, 5]);
+        let upsert_values = UInt32Array::from(vec![200, 500]);
+        let upsert_vecs = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0]),
+            4,
+        )
+        .unwrap();
+
+        let upsert_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(upsert_keys),
+                Arc::new(upsert_values),
+                Arc::new(upsert_vecs),
+            ],
+        )
+        .unwrap();
+
+        let upsert_stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::once(async { Ok(upsert_batch) }).boxed(),
+        );
+
+        let (updated_dataset, _stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+                .try_build()
+                .unwrap()
+                .execute(Box::pin(upsert_stream))
+                .await
+                .unwrap();
+
+        let fragments = updated_dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sub_schema_upsert_fragment_bitmap() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("key", array::step_custom::<UInt32Type>(1, 1))
+            .col("value", array::step_custom::<UInt32Type>(10, 10))
+            .col(
+                "vec",
+                array::cycle_vec(
+                    array::cycle::<Float32Type>(vec![
+                        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+                        15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0,
+                    ]),
+                    Dimension::from(4),
+                ),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let scalar_params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::Scalar,
+                Some("value_idx".to_string()),
+                &scalar_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let value_index = indices.iter().find(|idx| idx.name == "value_idx").unwrap();
+        let vec_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
+
+        assert_eq!(
+            value_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            vec_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt32, true),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+        ]));
+
+        let upsert_keys = UInt32Array::from(vec![2, 5]);
+        let upsert_vecs = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0]),
+            4,
+        )
+        .unwrap();
+
+        let upsert_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![Arc::new(upsert_keys), Arc::new(upsert_vecs)],
+        )
+        .unwrap();
+
+        let upsert_stream = RecordBatchStreamAdapter::new(
+            sub_schema.clone(),
+            futures::stream::once(async { Ok(upsert_batch) }).boxed(),
+        );
+
+        let (updated_dataset, _stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+                .try_build()
+                .unwrap()
+                .execute(Box::pin(upsert_stream))
+                .await
+                .unwrap();
+
+        let fragments = updated_dataset.get_fragments();
+        // in-place updates only, no new fragment should be added
+        assert_eq!(fragments.len(), 2);
+
+        let updated_indices = updated_dataset.load_indices().await.unwrap();
+        // all the fragments have been updated, so the index of the vector field has been deleted
+        assert_eq!(updated_indices.len(), 1);
+        let updated_value_index = updated_indices
+            .iter()
+            .find(|idx| idx.name == "value_idx")
+            .unwrap();
+
+        let value_bitmap = updated_value_index.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(value_bitmap.len(), 2);
+        assert!(value_bitmap.contains(0));
+        assert!(value_bitmap.contains(1));
     }
 }

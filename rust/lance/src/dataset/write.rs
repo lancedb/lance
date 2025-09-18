@@ -30,12 +30,12 @@ use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::location;
 use tracing::{info, instrument};
-use uuid::Uuid;
 
 use crate::session::Session;
 use crate::Dataset;
 
 use super::blob::BlobStreamExt;
+use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::wrap_json_stream_for_writing;
@@ -609,7 +609,7 @@ pub async fn open_writer(
     base_dir: &Path,
     storage_version: LanceFileVersion,
 ) -> Result<Box<dyn GenericWriter>> {
-    let filename = format!("{}.lance", Uuid::new_v4());
+    let filename = format!("{}.lance", generate_random_filename());
 
     let full_path = base_dir.child(DATA_DIR).child(filename.as_str());
 

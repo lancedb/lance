@@ -1377,6 +1377,7 @@ def test_optimize_indices(indexed_dataset):
     assert len(indices) == 2
 
 
+@pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")

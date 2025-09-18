@@ -127,6 +127,7 @@ hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
 jieba-rs = { version = "0.8.1", default-features = false }
 jsonb = { version = "0.5.3", default-features = false, features = ["databend"]}
+libm = "0.2.15"
 log = "0.4"
 mockall = { version = "0.13.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }

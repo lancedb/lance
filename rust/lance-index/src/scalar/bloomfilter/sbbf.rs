@@ -29,6 +29,7 @@
 //! https://github.com/apache/arrow-rs/issues/8277
 
 use crate::scalar::bloomfilter::as_bytes::AsBytes;
+use libm::lgamma;
 use std::error::Error;
 use std::fmt;
 use std::io::Write;
@@ -166,24 +167,68 @@ impl std::ops::IndexMut<usize> for Block {
     }
 }
 
-/// Minimum and maximum bitset lengths
-pub const BITSET_MIN_LENGTH: usize = 32;
-pub const BITSET_MAX_LENGTH: usize = 128 * 1024 * 1024;
-
+// This implements the false positive probability in Putze et al.'s "Cache-, hash-and
+// space-efficient bloom filters", equation 3.
 #[inline]
-fn optimal_num_of_bytes(num_bytes: usize) -> usize {
-    let num_bytes = num_bytes.min(BITSET_MAX_LENGTH);
-    let num_bytes = num_bytes.max(BITSET_MIN_LENGTH);
-    num_bytes.next_power_of_two()
+fn false_positive_probability(ndv: u64, log_space_bytes: u8) -> f64 {
+    const WORD_BITS: f64 = 32.0;
+    const BUCKET_WORDS: f64 = 8.0;
+    let bytes = (1u64 << log_space_bytes) as f64;
+    let ndv = ndv as f64;
+    if ndv == 0.0 {
+        return 0.0;
+    }
+    // This short-cuts a slowly-converging sum for very dense filters
+    if ndv / (bytes * u8::BITS as f64) > 2.0 {
+        return 1.0;
+    }
+    let mut result: f64 = 0.0;
+    // lam is the usual parameter to the Poisson's PMF. Following the notation in the paper,
+    // lam is B/c, where B is the number of bits in a bucket and c is the number of bits per
+    // distinct value
+    let lam = BUCKET_WORDS * WORD_BITS / ((bytes * u8::BITS as f64) / ndv);
+    // Some of the calculations are done in log-space to increase numerical stability
+    let loglam = lam.ln();
+
+    // 750 iterations are sufficient to cause the sum to converge in all of the tests. In
+    // other words, setting the iterations higher than 750 will give the same result as
+    // leaving it at 750.
+    const ITERS: i32 = 750;
+    // We start with the highest value of i, since the values we're adding to result are
+    // mostly smaller at high i, and this increases accuracy to sum from the smallest
+    // values up.
+    for i in (0..ITERS).rev() {
+        // The PMF of the Poisson distribution is lam^i * exp(-lam) / i!. In logspace, using
+        // lgamma for the log of the factorial function:
+        let logp = i as f64 * loglam - lam - lgamma((i + 1).into());
+        // The f_inner part of the equation in the paper is the probability of a single
+        // collision in the bucket. Since there are kBucketWords non-overlapping lanes in each
+        // bucket, the log of this probability is:
+        let logfinner = BUCKET_WORDS * (1.0 - (1.0 - 1.0 / WORD_BITS).powi(i)).ln();
+        // Here we are forced out of log-space calculations
+        result += (logp + logfinner).exp();
+    }
+    result.min(1.0)
 }
 
-/// Calculate number of bits needed for given NDV and FPP
-/// Formula: m = -k * n / ln(1 - fpp^(1/k))
-/// Where k=8 (number of hash functions), n=NDV, fpp=false positive probability
+/// Minimum and maximum filter sizes
+const BITSET_LOG2_MIN_BYTES: u8 = 5; // 32B (1 Block)
+const BITSET_LOG2_MAX_BYTES: u8 = 27; // 128MiB
+
 #[inline]
-fn num_of_bits_from_ndv_fpp(ndv: u64, fpp: f64) -> usize {
-    let num_bits = -8.0 * ndv as f64 / (1.0 - fpp.powf(1.0 / 8.0)).ln();
-    num_bits as usize
+fn min_log2_bytes(ndv: u64, fpp: f64) -> u8 {
+    let mut low = 0;
+    let mut high = 64;
+    while high > low + 1 {
+        let mid = (high + low) / 2;
+        let candidate = false_positive_probability(ndv, mid);
+        if candidate <= fpp {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    high
 }
 
 /// A Split Block Bloom Filter (SBBF) implementation
@@ -223,8 +268,9 @@ impl Sbbf {
 
     /// Create a new empty SBBF with the given number of bytes
     /// The actual size will be adjusted to the next power of two within bounds
-    pub fn with_num_bytes(num_bytes: usize) -> Self {
-        let num_bytes = optimal_num_of_bytes(num_bytes);
+    pub fn with_log2_num_bytes(log2_num_bytes: u8) -> Self {
+        let num_bytes =
+            1_usize << log2_num_bytes.clamp(BITSET_LOG2_MIN_BYTES, BITSET_LOG2_MAX_BYTES);
         let bitset = vec![0_u8; num_bytes];
         // unwrap is safe because we know the size is valid
         Self::new(&bitset).unwrap()
@@ -235,8 +281,8 @@ impl Sbbf {
         if !(0.0..1.0).contains(&fpp) {
             return Err(SbbfError::InvalidFpp { fpp });
         }
-        let num_bits = num_of_bits_from_ndv_fpp(ndv, fpp);
-        Ok(Self::with_num_bytes(num_bits / 8))
+        let log2_num_bytes = min_log2_bytes(ndv, fpp);
+        Ok(Self::with_log2_num_bytes(log2_num_bytes))
     }
 
     /// Get the hash-to-block-index for a given hash
@@ -320,7 +366,7 @@ fn hash_as_bytes<A: AsBytes + ?Sized>(value: &A) -> u64 {
 pub struct SbbfBuilder {
     ndv: Option<u64>,
     fpp: Option<f64>,
-    num_bytes: Option<usize>,
+    log2_num_bytes: Option<u8>,
 }
 
 impl SbbfBuilder {
@@ -329,7 +375,7 @@ impl SbbfBuilder {
         Self {
             ndv: None,
             fpp: None,
-            num_bytes: None,
+            log2_num_bytes: None,
         }
     }
 
@@ -347,20 +393,20 @@ impl SbbfBuilder {
 
     /// Set the number of bytes directly
     #[allow(dead_code)]
-    pub fn num_bytes(mut self, num_bytes: usize) -> Self {
-        self.num_bytes = Some(num_bytes);
+    pub fn log2_num_bytes(mut self, log2_num_bytes: u8) -> Self {
+        self.log2_num_bytes = Some(log2_num_bytes);
         self
     }
 
     /// Build the SBBF
     pub fn build(self) -> Result<Sbbf> {
-        if let Some(num_bytes) = self.num_bytes {
-            Ok(Sbbf::with_num_bytes(num_bytes))
+        if let Some(log2_num_bytes) = self.log2_num_bytes {
+            Ok(Sbbf::with_log2_num_bytes(log2_num_bytes))
         } else if let (Some(ndv), Some(fpp)) = (self.ndv, self.fpp) {
             Sbbf::with_ndv_fpp(ndv, fpp)
         } else {
             Err(SbbfError::InvalidData {
-                message: "Must specify either num_bytes or both ndv and fpp".to_string(),
+                message: "Must specify either log2_num_bytes or both ndv and fpp".to_string(),
             })
         }
     }
@@ -400,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_sbbf_insert_and_check() {
-        let mut sbbf = Sbbf::with_num_bytes(1024);
+        let mut sbbf = Sbbf::with_log2_num_bytes(10);
         for i in 0..1_000 {
             sbbf.insert(&i);
             assert!(sbbf.check(&i));
@@ -468,35 +514,19 @@ mod tests {
     }
 
     #[test]
-    fn test_optimal_num_of_bytes() {
-        for (input, expected) in &[
-            (0, 32),
-            (9, 32),
-            (31, 32),
-            (32, 32),
-            (33, 64),
-            (99, 128),
-            (1024, 1024),
-            (999_000_000, 128 * 1024 * 1024),
-        ] {
-            assert_eq!(*expected, optimal_num_of_bytes(*input));
-        }
-    }
-
-    #[test]
     fn test_num_of_bits_from_ndv_fpp() {
-        for (fpp, ndv, num_bits) in &[
-            (0.1, 10, 57),
-            (0.01, 10, 96),
-            (0.001, 10, 146),
-            (0.1, 100, 577),
-            (0.01, 100, 968),
-            (0.001, 100, 1460),
-            (0.1, 1000, 5772),
-            (0.01, 1000, 9681),
-            (0.001, 1000, 14607),
+        for (fpp, ndv, log2_num_bytes) in &[
+            (0.1, 10, 3),
+            (0.01, 10, 4),
+            (0.001, 10, 5),
+            (0.1, 100, 7),
+            (0.01, 100, 8),
+            (0.001, 100, 8),
+            (0.1, 1000, 10),
+            (0.01, 1000, 11),
+            (0.001, 1000, 12),
         ] {
-            assert_eq!(*num_bits, num_of_bits_from_ndv_fpp(*ndv, *fpp) as u64);
+            assert_eq!(*log2_num_bytes, min_log2_bytes(*ndv, *fpp));
         }
     }
 
