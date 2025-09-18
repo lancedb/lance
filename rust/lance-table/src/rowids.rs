@@ -579,29 +579,38 @@ pub fn rechunk_sequences(
     allow_incomplete: bool,
 ) -> Result<Vec<RowIdSequence>> {
     // TODO: return an iterator. (with a good size hint?)
-    let chunk_size_iter = chunk_sizes.into_iter();
-    let mut chunked_sequences = Vec::with_capacity(chunk_size_iter.size_hint().0);
+    let chunk_sizes_vec: Vec<u64> = chunk_sizes.into_iter().collect();
+    let total_chunks = chunk_sizes_vec.len();
+    let mut chunked_sequences = Vec::with_capacity(total_chunks);
     let mut segment_iter = sequences
         .into_iter()
         .flat_map(|sequence| sequence.0.into_iter())
         .peekable();
 
-    let too_few_segments_error = || {
+    let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
         Error::invalid_input(
-            "Got too few segments for the provided chunk lengths",
+            format!(
+                "Got too few segments for chunk {}. Expected chunk size: {}, remaining needed: {}",
+                chunk_index, expected_chunk_size, remaining
+            ),
             location!(),
         )
     };
 
-    let too_many_segments_error = || {
+    let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
         Error::invalid_input(
-            "Got too many segments for the provided chunk lengths",
+            format!(
+                "Got too many segments for the provided chunk lengths. Processed {} chunks out of {} expected",
+                processed_chunks, total_chunk_sizes
+            ),
             location!(),
         )
     };
 
     let mut segment_offset = 0_u64;
-    for chunk_size in chunk_size_iter {
+
+    for (chunk_index, chunk_size) in chunk_sizes_vec.iter().enumerate() {
+        let chunk_size = *chunk_size;
         let mut sequence = RowIdSequence(Vec::new());
         let mut remaining = chunk_size;
 
@@ -620,7 +629,7 @@ pub fn rechunk_sequences(
                     if allow_incomplete {
                         break;
                     } else {
-                        return Err(too_few_segments_error());
+                        return Err(too_few_segments_error(chunk_index, chunk_size, remaining));
                     }
                 }
             }
@@ -631,7 +640,7 @@ pub fn rechunk_sequences(
                     // Segment is larger than remaining space - slice it
                     let segment = segment_iter
                         .peek()
-                        .ok_or_else(too_few_segments_error)?
+                        .ok_or_else(|| too_few_segments_error(chunk_index, chunk_size, remaining))?
                         .slice(segment_offset as usize, remaining as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset += remaining;
@@ -643,7 +652,7 @@ pub fn rechunk_sequences(
                     // Less case: remaining -= remaining_in_segment (remaining becomes positive)
                     let segment = segment_iter
                         .next()
-                        .ok_or_else(too_few_segments_error)?
+                        .ok_or_else(|| too_few_segments_error(chunk_index, chunk_size, remaining))?
                         .slice(segment_offset as usize, remaining_in_segment as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset = 0;
@@ -656,7 +665,10 @@ pub fn rechunk_sequences(
     }
 
     if segment_iter.peek().is_some() {
-        return Err(too_many_segments_error());
+        return Err(too_many_segments_error(
+            chunked_sequences.len(),
+            total_chunks,
+        ));
     }
 
     Ok(chunked_sequences)
