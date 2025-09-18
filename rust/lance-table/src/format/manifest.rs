@@ -944,3 +944,134 @@ mod tests {
         assert_eq!(manifest.config, config);
     }
 }
+
+/// Manager for multi-bucket operations and distribution logic
+#[derive(Debug, Clone)]
+pub struct MultiBucketManager {
+    /// Base paths for all buckets
+    pub base_paths: std::collections::HashMap<u32, BasePath>,
+    /// Statistics for each bucket (optional, for monitoring)
+    pub bucket_stats: std::collections::HashMap<u32, BucketStats>,
+}
+
+/// Basic statistics for a bucket (for monitoring purposes)
+#[derive(Debug, Clone)]
+pub struct BucketStats {
+    /// Number of fragments stored in this bucket
+    pub fragment_count: u32,
+    /// Last time data was written to this bucket
+    pub last_write_time: Option<std::time::SystemTime>,
+}
+
+impl MultiBucketManager {
+    pub fn new(base_paths: std::collections::HashMap<u32, BasePath>) -> Self {
+        println!("🏗️  Creating MultiBucketManager with {} buckets", base_paths.len());
+        for (bucket_id, base_path) in &base_paths {
+            println!("🏗️  Bucket {}: {} (dataset_root: {})", 
+                     bucket_id, base_path.path, base_path.is_dataset_root);
+        }
+        
+        let bucket_stats = base_paths
+            .keys()
+            .map(|&bucket_id| (bucket_id, BucketStats::default()))
+            .collect();
+
+        Self {
+            base_paths,
+            bucket_stats,
+        }
+    }
+
+    /// Select a bucket for storing a new fragment using hash-based distribution
+    pub fn select_bucket_for_fragment(&self, fragment_id: u32) -> Result<u32> {
+        let bucket_ids: Vec<u32> = self.base_paths.keys().copied().collect();
+        if bucket_ids.is_empty() {
+            eprintln!("❌ No buckets configured for distribution");
+            return Err(Error::invalid_input(
+                "No buckets configured for distribution",
+                location!(),
+            ));
+        }
+
+        // Simple hash distribution using fragment ID
+        let hash = self.hash_fragment_id(fragment_id);
+        let bucket_index = (hash % bucket_ids.len() as u64) as usize;
+        let selected_bucket = bucket_ids[bucket_index];
+        
+        println!("🎯 Fragment {} hash={} -> bucket {} (index {} of {} buckets)", 
+                 fragment_id, hash, selected_bucket, bucket_index, bucket_ids.len());
+        
+        Ok(selected_bucket)
+    }
+
+    /// Hash a fragment ID using the default hasher
+    fn hash_fragment_id(&self, fragment_id: u32) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        fragment_id.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Check if multi-bucket layout is enabled (more than one bucket)
+    pub fn is_multi_bucket_enabled(&self) -> bool {
+        self.base_paths.len() > 1
+    }
+
+    /// Get all bucket IDs
+    pub fn get_bucket_ids(&self) -> Vec<u32> {
+        self.base_paths.keys().copied().collect()
+    }
+
+    /// Add a new bucket
+    pub fn add_bucket(&mut self, bucket_id: u32, base_path: BasePath) -> Result<()> {
+        if self.base_paths.contains_key(&bucket_id) {
+            return Err(Error::invalid_input(
+                format!("Bucket ID {} already exists", bucket_id),
+                location!(),
+            ));
+        }
+        self.base_paths.insert(bucket_id, base_path);
+        self.bucket_stats.insert(bucket_id, BucketStats::default());
+        Ok(())
+    }
+
+    /// Remove a bucket
+    pub fn remove_bucket(&mut self, bucket_id: u32) -> Result<BasePath> {
+        let base_path = self.base_paths.remove(&bucket_id).ok_or_else(|| {
+            Error::invalid_input(
+                format!("Bucket ID {} not found", bucket_id),
+                location!(),
+            )
+        })?;
+        self.bucket_stats.remove(&bucket_id);
+        Ok(base_path)
+    }
+
+    /// Record a fragment write to update statistics
+    pub fn record_fragment_write(&mut self, bucket_id: u32) {
+        if let Some(stats) = self.bucket_stats.get_mut(&bucket_id) {
+            stats.fragment_count += 1;
+            stats.last_write_time = Some(std::time::SystemTime::now());
+        }
+    }
+
+    /// Get bucket statistics
+    pub fn get_bucket_stats(&self, bucket_id: u32) -> Option<&BucketStats> {
+        self.bucket_stats.get(&bucket_id)
+    }
+
+    /// Get base path for a bucket
+    pub fn get_base_path(&self, bucket_id: u32) -> Option<&BasePath> {
+        self.base_paths.get(&bucket_id)
+    }
+}
+
+impl Default for BucketStats {
+    fn default() -> Self {
+        Self {
+            fragment_count: 0,
+            last_write_time: None,
+        }
+    }
+}

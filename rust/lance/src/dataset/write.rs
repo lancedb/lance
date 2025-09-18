@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 use crate::session::Session;
 use crate::Dataset;
+use lance_table::format::MultiBucketManager;
 
 use super::blob::BlobStreamExt;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
@@ -225,6 +226,11 @@ pub struct WriteParams {
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+
+    /// Additional bucket URIs for data file distribution.
+    /// When provided, data files will be distributed across the primary URI
+    /// and these additional bucket URIs using hash-based distribution.
+    pub data_bucket_uris: Option<Vec<String>>,
 }
 
 impl Default for WriteParams {
@@ -246,6 +252,7 @@ impl Default for WriteParams {
             auto_cleanup: Some(AutoCleanupParams::default()),
             skip_auto_cleanup: false,
             transaction_properties: None,
+            data_bucket_uris: None,
         }
     }
 }
@@ -324,7 +331,34 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
+    let mut writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
+    
+    // If multi-bucket URIs are provided, create a multi-bucket manager
+    if let Some(data_bucket_uris) = &params.data_bucket_uris {
+        println!("🪣 Multi-bucket mode enabled with {} additional buckets", data_bucket_uris.len());
+        let mut base_paths = std::collections::HashMap::new();
+        
+        // Add additional buckets (primary bucket ID 0 is handled automatically)
+        for (i, uri) in data_bucket_uris.iter().enumerate() {
+            let bucket_id = (i + 1) as u32; // Start from 1, 0 is reserved for primary
+            println!("🪣 Registering bucket {} -> {}", bucket_id, uri);
+            base_paths.insert(
+                bucket_id,
+                lance_table::format::BasePath {
+                    id: bucket_id,
+                    name: Some(format!("data_bucket_{}", bucket_id)),
+                    is_dataset_root: false, // Direct path to data directory
+                    path: format!("{}/data", uri), // Store the full path to where files will be
+                },
+            );
+        }
+        
+        let manager = MultiBucketManager::new(base_paths);
+        println!("🪣 Multi-bucket manager created with {} total buckets", manager.get_bucket_ids().len());
+        writer_generator = writer_generator.with_multi_bucket_manager(manager);
+    } else {
+        println!("🪣 Single-bucket mode (no additional buckets specified)");
+    }
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -643,12 +677,43 @@ pub async fn open_writer(
     Ok(writer)
 }
 
+/// Wrapper writer that sets the bucket_id on DataFile creation
+struct BucketAwareWriter {
+    inner: Box<dyn GenericWriter>,
+    bucket_id: u32,
+}
+
+#[async_trait::async_trait]
+impl GenericWriter for BucketAwareWriter {
+    async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        self.inner.write(batches).await
+    }
+
+    async fn tell(&mut self) -> Result<u64> {
+        self.inner.tell().await
+    }
+
+    async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        println!("🏁 Finishing BucketAwareWriter for bucket {}", self.bucket_id);
+        let (num_rows, mut data_file) = self.inner.finish().await?;
+        // Set the bucket_id on the DataFile
+        data_file.base_id = Some(self.bucket_id);
+        println!("🏁 DataFile created with base_id={} for bucket {} ({} rows)", 
+                 data_file.base_id.unwrap_or(0), self.bucket_id, num_rows);
+        Ok((num_rows, data_file))
+    }
+}
+
 /// Creates new file writers for a given dataset.
 struct WriterGenerator {
     object_store: Arc<ObjectStore>,
     base_dir: Path,
     schema: Schema,
     storage_version: LanceFileVersion,
+    /// Multi-bucket manager for fragment distribution (if enabled)
+    multi_bucket_manager: Option<lance_table::format::MultiBucketManager>,
+    /// Fragment counter for bucket selection
+    fragment_counter: std::sync::atomic::AtomicU32,
 }
 
 impl WriterGenerator {
@@ -663,21 +728,82 @@ impl WriterGenerator {
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             storage_version,
+            multi_bucket_manager: None,
+            fragment_counter: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
+    pub fn with_multi_bucket_manager(mut self, manager: lance_table::format::MultiBucketManager) -> Self {
+        self.multi_bucket_manager = Some(manager);
+        self
+    }
+
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
-        // Use temporary ID 0; will assign ID later.
+        // Get the next fragment ID for bucket selection
+        let fragment_id = self.fragment_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
+        // Use temporary ID 0; will assign actual ID later.
         let fragment = Fragment::new(0);
+
+        // Determine which bucket to write to
+        let (bucket_id, target_dir) = if let Some(ref manager) = self.multi_bucket_manager {
+            let bucket_id = manager.select_bucket_for_fragment(fragment_id)?;
+            println!("📝 Fragment {} assigned to bucket {}", fragment_id, bucket_id);
+            
+            let target_dir = if bucket_id == 0 {
+                // Primary bucket uses the base directory (open_writer will add /data)
+                println!("📝 Using primary bucket directory: {}", self.base_dir);
+                self.base_dir.clone()
+            } else {
+                // Additional buckets use their configured paths
+                let base_path = manager.get_base_path(bucket_id).ok_or_else(|| {
+                    eprintln!("❌ Bucket ID {} not found in manager", bucket_id);
+                    Error::invalid_input(
+                        format!("Bucket ID {} not found", bucket_id),
+                        location!(),
+                    )
+                })?;
+                
+                // The base_path already includes /data, but open_writer will add /data again
+                // So we need to remove /data from the end to prevent double /data
+                let full_path = &base_path.path;
+                let bucket_path = if full_path.ends_with("/data") {
+                    let parent_path = &full_path[..full_path.len() - 5]; // Remove "/data"
+                    Path::parse(parent_path)?
+                } else {
+                    Path::parse(full_path)?
+                };
+                println!("📝 Using additional bucket directory: {} (open_writer will add /data)", bucket_path);
+                bucket_path
+            };
+            (bucket_id, target_dir)
+        } else {
+            // Single bucket mode
+            println!("📝 Fragment {} using single-bucket mode", fragment_id);
+            (0, self.base_dir.clone())
+        };
 
         let writer = open_writer(
             &self.object_store,
             &self.schema,
-            &self.base_dir,
+            &target_dir,
             self.storage_version,
         )
         .await?;
 
+        // Wrap the writer to set bucket_id on DataFile creation
+        let writer: Box<dyn GenericWriter> = if bucket_id != 0 {
+            println!("📝 Wrapping writer with BucketAwareWriter for bucket {}", bucket_id);
+            Box::new(BucketAwareWriter {
+                inner: writer,
+                bucket_id,
+            })
+        } else {
+            println!("📝 Using standard writer (bucket 0)");
+            writer
+        };
+
+        println!("✅ Writer created for fragment {} in bucket {}", fragment_id, bucket_id);
         Ok((writer, fragment))
     }
 }

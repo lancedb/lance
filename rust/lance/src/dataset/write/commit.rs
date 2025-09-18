@@ -459,6 +459,8 @@ impl<'a> CommitBuilder<'a> {
             tag: None,
             //TODO: handle batch transaction merges in the future
             transaction_properties: None,
+            // For batch commits, we don't support multi-bucket configuration yet
+            data_bucket_uris: None,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
