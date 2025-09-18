@@ -482,7 +482,6 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
