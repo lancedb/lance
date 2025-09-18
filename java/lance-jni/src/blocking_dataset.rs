@@ -723,6 +723,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
