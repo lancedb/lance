@@ -15,7 +15,7 @@ use tracing::Span;
 /// 1. It shouldn't change during the lifetime of the program
 /// 2. It's a relatively expensive call (requires opening several files and examining them)
 static NUM_COMPUTE_INTENSIVE_CPUS: LazyLock<usize> =
-    LazyLock::new(|| calculate_num_compute_intensive_cpus());
+    LazyLock::new(calculate_num_compute_intensive_cpus);
 
 pub fn get_num_compute_intensive_cpus() -> usize {
     *NUM_COMPUTE_INTENSIVE_CPUS
