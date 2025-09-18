@@ -539,7 +539,6 @@ mod tests {
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
     use object_store::throttle::ThrottleConfig;
-    use roaring::RoaringBitmap;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
     use tokio::sync::Barrier;
