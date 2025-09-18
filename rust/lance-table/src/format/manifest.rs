@@ -119,13 +119,13 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
 
 #[derive(Default)]
 pub struct ManifestSummary {
-    total_fragments: u64,
-    total_data_files: u64,
-    total_files_size: u64,
-    total_deletion_files: u64,
-    total_data_file_rows: u64,
-    total_deletion_file_rows: u64,
-    total_rows: u64,
+    pub total_fragments: u64,
+    pub total_data_files: u64,
+    pub total_files_size: u64,
+    pub total_deletion_files: u64,
+    pub total_data_file_rows: u64,
+    pub total_deletion_file_rows: u64,
+    pub total_rows: u64,
 }
 
 impl From<ManifestSummary> for BTreeMap<String, String> {
