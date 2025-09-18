@@ -522,6 +522,7 @@ mod tests {
             read_version,
             blobs_op: None,
             tag: None,
+            data_bucket_uris: None,
             transaction_properties: None,
         }
     }
@@ -796,6 +797,7 @@ mod tests {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
+            data_bucket_uris: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])
