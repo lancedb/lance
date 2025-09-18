@@ -125,8 +125,10 @@ impl InlineBitpacking {
         }
 
         // Handle the last chunk
-        let last_chunk_elem_num = if data.num_values % ELEMS_PER_CHUNK == 0 {
-            1024
+        let last_chunk_elem_num = if data.num_values == 0 {
+            0
+        } else if data.num_values % ELEMS_PER_CHUNK == 0 {
+            ELEMS_PER_CHUNK
         } else {
             data.num_values % ELEMS_PER_CHUNK
         };
@@ -264,17 +266,11 @@ impl BlockDecompressor for InlineBitpacking {
     }
 }
 
-/// Bitpacks a FixedWidthDataBlock with a given bit width
+/// Bitpacks a FixedWidthDataBlock with a given bit width.
 ///
-/// This function is simpler as it does not do any chunking, but slightly less efficient.
-/// The compressed bits per value is constant across the entire buffer.
-///
-/// The uncompressed bits per value is based on T's size
-/// The compressed bits per value is provided
-///
-/// Note: even though we are not strictly "chunking" we are still operating on chunks of
-/// 1024 values because that's what the bitpacking primitives expect.  They just don't
-/// have a unique bit width for each chunk.
+/// Each chunk of 1024 values is packed with a constant bit width. For the tail we compare the
+/// cost of padding and packing against storing the raw values: if padding yields a smaller
+/// representation we pack; otherwise we append the raw tail.
 fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     data: FixedWidthDataBlock,
     compressed_bits_per_value: usize,
@@ -321,9 +317,34 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
     output.truncate(num_whole_chunks * words_per_chunk);
     let remaining_items = data_buffer.len() - last_chunk_start;
-    output.reserve(remaining_items);
-    // Append the raw tail so that we avoid padding zeros and keep decoding fast.
-    output.extend_from_slice(&data_buffer[last_chunk_start..]);
+
+    let uncompressed_bits = data.bits_per_value as usize;
+    let tail_bit_savings = uncompressed_bits.saturating_sub(compressed_bits_per_value);
+    let padding_cost = compressed_bits_per_value * (ELEMS_PER_CHUNK as usize - remaining_items);
+    let tail_pack_savings = tail_bit_savings.saturating_mul(remaining_items);
+    let pad_tail = remaining_items > 0 && tail_bit_savings > 0 && padding_cost < tail_pack_savings;
+
+    if pad_tail {
+        // Padding buys us more than it costs: pad to 1024 values and pack them as a normal chunk.
+        let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+        last_chunk[..remaining_items].copy_from_slice(&data_buffer[last_chunk_start..]);
+        let start = output.len();
+        output.extend(std::iter::repeat_n(
+            T::from_usize(0).unwrap(),
+            words_per_chunk,
+        ));
+        unsafe {
+            BitPacking::unchecked_pack(
+                compressed_bits_per_value,
+                &last_chunk,
+                &mut output[start..start + words_per_chunk],
+            );
+        }
+    } else {
+        output.reserve(remaining_items);
+        // Padding would waste space; append tail values as-is.
+        output.extend_from_slice(&data_buffer[last_chunk_start..]);
+    }
 
     LanceBuffer::reinterpret_vec(output)
 }
@@ -331,9 +352,8 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
 /// Unpacks a FixedWidthDataBlock that has been bitpacked with a constant bit width.
 ///
 /// The compressed bit width is provided while the uncompressed width comes from `T`.
-/// Buffers written by older versions always packed a padded 1024-value tail. New buffers
-/// append the raw remainder instead. We detect the format from the buffer length so both
-/// layouts remain compatible.
+/// Depending on the encoding decision the final chunk may be fully packed (with padding)
+/// or stored as raw tail values. We infer the layout from the buffer length.
 fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     data: FixedWidthDataBlock,
     num_values: usize,
