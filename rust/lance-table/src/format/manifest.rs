@@ -121,36 +121,41 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
 pub struct ManifestSummary {
     total_fragments: u64,
     total_data_files: u64,
-    total_records: u64,
     total_files_size: u64,
     total_deletion_files: u64,
-    total_deletions: u64,
+    total_data_file_rows: u64,
+    total_deletion_file_rows: u64,
+    total_rows: u64,
 }
 
 impl From<ManifestSummary> for BTreeMap<String, String> {
-    fn from(val: ManifestSummary) -> Self {
+    fn from(summary: ManifestSummary) -> Self {
         let mut stats_map = Self::new();
         stats_map.insert(
             "total_fragments".to_string(),
-            val.total_fragments.to_string(),
+            summary.total_fragments.to_string(),
         );
         stats_map.insert(
             "total_data_files".to_string(),
-            val.total_data_files.to_string(),
+            summary.total_data_files.to_string(),
         );
-        stats_map.insert("total_records".to_string(), val.total_records.to_string());
         stats_map.insert(
             "total_files_size".to_string(),
-            val.total_files_size.to_string(),
+            summary.total_files_size.to_string(),
         );
         stats_map.insert(
             "total_deletion_files".to_string(),
-            val.total_deletion_files.to_string(),
+            summary.total_deletion_files.to_string(),
         );
         stats_map.insert(
-            "total_deletions".to_string(),
-            val.total_deletions.to_string(),
+            "total_data_file_rows".to_string(),
+            summary.total_data_file_rows.to_string(),
         );
+        stats_map.insert(
+            "total_deletion_file_rows".to_string(),
+            summary.total_deletion_file_rows.to_string(),
+        );
+        stats_map.insert("total_rows".to_string(), summary.total_rows.to_string());
         stats_map
     }
 }
@@ -487,35 +492,36 @@ impl Manifest {
     /// - total-deletion-files: Number of fragments with deletion files
     pub fn summary(&self) -> ManifestSummary {
         // Calculate total fragments
-        let mut summary = self
-            .fragments
-            .iter()
-            .fold(ManifestSummary::default(), |mut summary, f| {
-                // Count data files in the current fragment
-                summary.total_data_files += f.files.len() as u64;
-                // Sum the number of rows for the current fragment (if available)
-                if let Some(num_rows) = f.num_rows() {
-                    summary.total_records += num_rows as u64;
-                }
-                // Sum file sizes for all data files in the current fragment (if available)
-                for data_file in &f.files {
-                    if let Some(size_bytes) = data_file.file_size_bytes.get() {
-                        summary.total_files_size += size_bytes.get();
+        let mut summary =
+            self.fragments
+                .iter()
+                .fold(ManifestSummary::default(), |mut summary, f| {
+                    // Count data files in the current fragment
+                    summary.total_data_files += f.files.len() as u64;
+                    // Sum the number of rows for the current fragment (if available)
+                    if let Some(num_rows) = f.num_rows() {
+                        summary.total_rows += num_rows as u64;
                     }
-                }
-                // Check and count if the current fragment has a deletion file
-                if f.deletion_file.is_some() {
-                    summary.total_deletion_files += 1;
-                }
-                // Sum the number of deleted rows from the deletion file (if available)
-                if let Some(deletion_file) = &f.deletion_file {
-                    if let Some(num_deleted) = deletion_file.num_deleted_rows {
-                        summary.total_deletions += num_deleted as u64;
+                    // Sum file sizes for all data files in the current fragment (if available)
+                    for data_file in &f.files {
+                        if let Some(size_bytes) = data_file.file_size_bytes.get() {
+                            summary.total_files_size += size_bytes.get();
+                        }
                     }
-                }
-                summary
-            });
+                    // Check and count if the current fragment has a deletion file
+                    if f.deletion_file.is_some() {
+                        summary.total_deletion_files += 1;
+                    }
+                    // Sum the number of deleted rows from the deletion file (if available)
+                    if let Some(deletion_file) = &f.deletion_file {
+                        if let Some(num_deleted) = deletion_file.num_deleted_rows {
+                            summary.total_deletion_file_rows += num_deleted as u64;
+                        }
+                    }
+                    summary
+                });
         summary.total_fragments = self.fragments.len() as u64;
+        summary.total_data_file_rows = summary.total_rows + summary.total_deletion_file_rows;
 
         summary
     }
@@ -1045,11 +1051,12 @@ mod tests {
         );
 
         let empty_summary = empty_manifest.summary();
-        assert_eq!(empty_summary.total_records, 0);
+        assert_eq!(empty_summary.total_rows, 0);
         assert_eq!(empty_summary.total_files_size, 0);
         assert_eq!(empty_summary.total_fragments, 0);
         assert_eq!(empty_summary.total_data_files, 0);
-        assert_eq!(empty_summary.total_deletions, 0);
+        assert_eq!(empty_summary.total_deletion_file_rows, 0);
+        assert_eq!(empty_summary.total_data_file_rows, 0);
         assert_eq!(empty_summary.total_deletion_files, 0);
 
         // Step 2: write empty files and verify summary
@@ -1067,11 +1074,12 @@ mod tests {
         );
 
         let empty_files_summary = empty_files_manifest.summary();
-        assert_eq!(empty_files_summary.total_records, 0);
+        assert_eq!(empty_files_summary.total_rows, 0);
         assert_eq!(empty_files_summary.total_files_size, 0);
         assert_eq!(empty_files_summary.total_fragments, 2);
         assert_eq!(empty_files_summary.total_data_files, 2);
-        assert_eq!(empty_files_summary.total_deletions, 0);
+        assert_eq!(empty_files_summary.total_deletion_file_rows, 0);
+        assert_eq!(empty_files_summary.total_data_file_rows, 0);
         assert_eq!(empty_files_summary.total_deletion_files, 0);
 
         // Step 3: write real data and verify summary
@@ -1090,11 +1098,12 @@ mod tests {
         );
 
         let real_data_summary = real_data_manifest.summary();
-        assert_eq!(real_data_summary.total_records, 425); // 100 + 250 + 75
+        assert_eq!(real_data_summary.total_rows, 425); // 100 + 250 + 75
         assert_eq!(real_data_summary.total_files_size, 0); // Zero for unknown
         assert_eq!(real_data_summary.total_fragments, 3);
         assert_eq!(real_data_summary.total_data_files, 3);
-        assert_eq!(real_data_summary.total_deletions, 0);
+        assert_eq!(real_data_summary.total_deletion_file_rows, 0);
+        assert_eq!(real_data_summary.total_data_file_rows, 425);
         assert_eq!(real_data_summary.total_deletion_files, 0);
 
         let file_version = LanceFileVersion::default();
@@ -1125,15 +1134,16 @@ mod tests {
         );
 
         let deletion_summary = manifest_with_deletion.summary();
-        assert_eq!(deletion_summary.total_records, 40); // 50 - 10
+        assert_eq!(deletion_summary.total_rows, 40); // 50 - 10
         assert_eq!(deletion_summary.total_files_size, 1000);
         assert_eq!(deletion_summary.total_fragments, 1);
         assert_eq!(deletion_summary.total_data_files, 1);
-        assert_eq!(deletion_summary.total_deletions, 10);
+        assert_eq!(deletion_summary.total_deletion_file_rows, 10);
+        assert_eq!(deletion_summary.total_data_file_rows, 50);
         assert_eq!(deletion_summary.total_deletion_files, 1);
 
         //Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();
-        assert_eq!(stats_map.len(), 6)
+        assert_eq!(stats_map.len(), 7)
     }
 }
