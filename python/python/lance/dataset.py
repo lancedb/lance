@@ -3662,12 +3662,17 @@ class LanceOperation:
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
             those fields.
+        fields_for_preserving_frag_bitmap: list[int]
+            The fields that used to judge whether to preserve the new frag's id into
+            the frag bitmap of the specified indices.
         """
 
         removed_fragment_ids: List[int]
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
         fields_modified: List[int]
+        fields_for_preserving_frag_bitmap: List[int]
+        update_mode: str
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -4547,7 +4552,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False
+        retrain: bool, default False, deprecated
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,

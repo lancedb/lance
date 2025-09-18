@@ -20,7 +20,7 @@ use snafu::location;
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;
-use crate::vector::kmeans::train_kmeans;
+use crate::vector::kmeans::{train_kmeans, KMeansParams};
 
 /// Parameters for building product quantizer.
 #[derive(Debug, Clone)]
@@ -110,7 +110,7 @@ impl PQBuildParams {
             .into_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
-                train_kmeans::<T>(
+                let params = KMeansParams::new(
                     self.codebook.as_ref().map(|cb| {
                         let sub_vec_centroids = FixedSizeListArray::try_new_from_values(
                             cb.as_fixed_size_list().values().as_primitive::<T>().slice(
@@ -122,12 +122,15 @@ impl PQBuildParams {
                         .unwrap();
                         Arc::new(sub_vec_centroids)
                     }),
-                    &sub_vec,
-                    sub_vector_dimension,
-                    num_centroids,
                     self.max_iters as u32,
                     self.kmeans_redos,
                     distance_type,
+                );
+                train_kmeans::<T>(
+                    &sub_vec,
+                    params,
+                    sub_vector_dimension,
+                    num_centroids,
                     self.sample_rate,
                 )
                 .map(|kmeans| kmeans.centroids)
