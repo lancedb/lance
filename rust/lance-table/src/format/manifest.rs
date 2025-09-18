@@ -131,24 +131,24 @@ impl From<ManifestStats> for BTreeMap<String, String> {
     fn from(val: ManifestStats) -> Self {
         let mut stats_map = Self::new();
         stats_map.insert(
-            "total-fragments".to_string(),
+            "total_fragments".to_string(),
             val.total_fragments.to_string(),
         );
         stats_map.insert(
-            "total-data-files".to_string(),
+            "total_data_files".to_string(),
             val.total_data_files.to_string(),
         );
-        stats_map.insert("total-records".to_string(), val.total_records.to_string());
+        stats_map.insert("total_records".to_string(), val.total_records.to_string());
         stats_map.insert(
-            "total-files-size".to_string(),
+            "total_files_size".to_string(),
             val.total_files_size.to_string(),
         );
         stats_map.insert(
-            "total-deletion-files".to_string(),
+            "total_deletion_files".to_string(),
             val.total_deletion_files.to_string(),
         );
         stats_map.insert(
-            "total-deletions".to_string(),
+            "total_deletions".to_string(),
             val.total_deletions.to_string(),
         );
         stats_map
