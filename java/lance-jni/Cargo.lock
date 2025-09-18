@@ -3382,6 +3382,7 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-table",
+ "libm",
  "log",
  "ndarray",
  "num-traits",

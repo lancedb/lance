@@ -99,9 +99,6 @@ pprof.workspace = true
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
 features = ["protoc"]
 
-[profile.release]
-debug = true
-
 [profile.bench]
 debug = true
 

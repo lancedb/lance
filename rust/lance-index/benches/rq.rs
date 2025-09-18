@@ -31,7 +31,7 @@ fn mock_rq_storage(num_bits: u8) -> RabitQuantizationStorage {
         .col(
             RABIT_CODE_COLUMN,
             rand_type(&fixed_size_list_type(
-                (DIM * num_bits as usize / 8) as i32,
+                (DIM * num_bits as usize / u8::BITS as usize) as i32,
                 DataType::UInt8,
             )),
         )

@@ -149,7 +149,7 @@ impl RabitQuantizer {
         T::Native: AsPrimitive<f32>,
     {
         // we don't need to normalize the residual vectors,
-        // because the signal of P^{-1} x v_r is the same as P^{-1} x v_r / ||v_r||
+        // because the signal of P^{-1} * v_r is the same as P^{-1} * v_r / ||v_r||
         let n = residual_vectors.len();
         let dim = self.dim();
         debug_assert_eq!(residual_vectors.values().len(), n * dim);
@@ -275,7 +275,7 @@ impl Quantization for RabitQuantizer {
             RABIT_CODE_COLUMN,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::UInt8, true)),
-                self.code_dim() as i32 / 8, // num_bits -> num_bytes
+                self.code_dim() as i32 / u8::BITS as i32, // num_bits -> num_bytes
             ),
             true,
         )
