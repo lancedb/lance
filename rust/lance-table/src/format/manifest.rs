@@ -118,7 +118,7 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
 }
 
 #[derive(Default)]
-pub struct ManifestStats {
+pub struct ManifestSummary {
     total_fragments: u64,
     total_data_files: u64,
     total_records: u64,
@@ -127,8 +127,8 @@ pub struct ManifestStats {
     total_deletions: u64,
 }
 
-impl From<ManifestStats> for BTreeMap<String, String> {
-    fn from(val: ManifestStats) -> Self {
+impl From<ManifestSummary> for BTreeMap<String, String> {
+    fn from(val: ManifestSummary) -> Self {
         let mut stats_map = Self::new();
         stats_map.insert(
             "total_fragments".to_string(),
@@ -485,39 +485,39 @@ impl Manifest {
     /// - total-data-files: Total number of data files across all fragments
     /// - total-deletions: Total number of deleted records
     /// - total-deletion-files: Number of fragments with deletion files
-    pub fn summary(&self) -> ManifestStats {
+    pub fn summary(&self) -> ManifestSummary {
         // Calculate total fragments
-        let mut stats = self
+        let mut summary = self
             .fragments
             .iter()
-            .fold(ManifestStats::default(), |mut stats, f| {
+            .fold(ManifestSummary::default(), |mut summary, f| {
                 // Count data files in the current fragment
-                stats.total_data_files += f.files.len() as u64;
+                summary.total_data_files += f.files.len() as u64;
                 // Sum the number of rows for the current fragment (if available)
                 if let Some(num_rows) = f.num_rows() {
-                    stats.total_records += num_rows as u64;
+                    summary.total_records += num_rows as u64;
                 }
                 // Sum file sizes for all data files in the current fragment (if available)
                 for data_file in &f.files {
                     if let Some(size_bytes) = data_file.file_size_bytes.get() {
-                        stats.total_files_size += size_bytes.get();
+                        summary.total_files_size += size_bytes.get();
                     }
                 }
                 // Check and count if the current fragment has a deletion file
                 if f.deletion_file.is_some() {
-                    stats.total_deletion_files += 1;
+                    summary.total_deletion_files += 1;
                 }
                 // Sum the number of deleted rows from the deletion file (if available)
                 if let Some(deletion_file) = &f.deletion_file {
                     if let Some(num_deleted) = deletion_file.num_deleted_rows {
-                        stats.total_deletions += num_deleted as u64;
+                        summary.total_deletions += num_deleted as u64;
                     }
                 }
-                stats
+                summary
             });
-        stats.total_fragments = self.fragments.len() as u64;
+        summary.total_fragments = self.fragments.len() as u64;
 
-        stats
+        summary
     }
 }
 
