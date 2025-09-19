@@ -1304,7 +1304,7 @@ mod tests {
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
 
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{ProjectionRequest, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::io::exec::testing::TestingExec;
 
@@ -1665,7 +1665,17 @@ mod tests {
     async fn test_no_prefilter_results(#[values(1, 20)] num_deltas: usize) {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
-        let q = fixture.get_centroid(0);
+        let q = fixture
+            .dataset
+            .take(
+                &[0],
+                ProjectionRequest::from_schema(fixture.dataset.schema().clone()),
+            )
+            .await
+            .unwrap()
+            .column_by_name("vector")
+            .unwrap()
+            .clone();
         let stats_holder = StatsHolder::default();
 
         let results = fixture
