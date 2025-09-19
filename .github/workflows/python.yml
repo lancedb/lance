@@ -37,6 +37,7 @@ env:
 
 jobs:
   linux-build:
+    name: Build - Linux x86_64
     timeout-minutes: 30
     runs-on: "ubuntu-24.04"
     defaults:
@@ -116,7 +117,7 @@ jobs:
     strategy:
       matrix:
         python-minor-version: ["9", "12"]
-    name: "Python Linux Test 3.${{ matrix.python-minor-version }} x86_64"
+    name: "Test - Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04"
     defaults:
       run:
@@ -152,6 +153,7 @@ jobs:
           pytest python/tests/forward_compat --run-forward
 
   doctest:
+    name: Doctest - Linux 3.11 x86_64
     timeout-minutes: 30
     needs: linux-build
     runs-on: "ubuntu-24.04"
@@ -178,12 +180,14 @@ jobs:
           pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
       - name: Run doctest
-        run: pytest --doctest-modules --pyargs lance
+        run: |
+          export LANCE_TEST_DATA_DIR=$(pwd)/python/python/tests
+          pytest --doctest-modules --pyargs lance
 
   linux-arm:
     timeout-minutes: 45
     runs-on: ubuntu-2404-4x-arm64
-    name: Python Linux 3.12 ARM
+    name: Build & Test - Linux 3.12 ARM
     defaults:
       run:
         shell: bash
@@ -214,7 +218,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   mac:
     timeout-minutes: 45
-    name: Python macOS 3.12 ARM
+    name: Build & Test - macOS 3.12 ARM
     runs-on: "macos-14"
     defaults:
       run:
@@ -241,6 +245,7 @@ jobs:
           skip-torch: "true"
 
   windows:
+    name: Build & Test - Windows x86_64
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
