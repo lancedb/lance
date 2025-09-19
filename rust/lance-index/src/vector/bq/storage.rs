@@ -217,25 +217,31 @@ where
     let mut dist_table = vec![0.0; qc.len() * 4];
     qc.chunks_exact(SEGMENT_LENGTH)
         .zip(dist_table.chunks_exact_mut(SEGMENT_NUM_CODES))
-        .for_each(|(sub_vec, dist_table)| {
-            // skip 0 because it's always 0
-            (1..SEGMENT_NUM_CODES).for_each(|j| {
-                // this is a little bit tricky,
-                // j represents a subset of 4 bits, that if the i-th bit of `j` is 1,
-                // then we need to add the distance of the i-th dim of the segment.
-                // but we don't need to check all bits of `j`,
-                // because `j` = `j - lowbit(j)` + `lowbit(j)`,
-                // where `j-lowbit(j)` is less than `j`,
-                // which means dist_table[j-lowbit(j)] is already computed,
-                // and we can use it to compute dist_table[j]
-                // for example, if j = 0b1010, then j - lowbit(j) = 0b1000,
-                // and dist_table[0b1000] is already computed,
-                // so dist_table[0b1010] = dist_table[0b1000] + sub_vec[LOWBIT_IDX[0b1010]];
-                // where lowbit(0b1010) = 0b10, LOWBIT_IDX[0b1010] = LOWBIT_IDX[0b10] = 1.
-                dist_table[j] = dist_table[j - lowbit(j)] + sub_vec[LOWBIT_IDX[j]].as_();
-            })
-        });
+        .for_each(|(sub_vec, dist_table)| build_dist_table_for_subvec::<T>(sub_vec, dist_table));
     dist_table
+}
+
+#[inline(always)]
+fn build_dist_table_for_subvec<T: ArrowFloatType>(sub_vec: &[T::Native], dist_table: &mut [f32])
+where
+    T::Native: AsPrimitive<f32>,
+{
+    // skip 0 because it's always 0
+    (1..SEGMENT_NUM_CODES).for_each(|j| {
+        // this is a little bit tricky,
+        // j represents a subset of 4 bits, that if the i-th bit of `j` is 1,
+        // then we need to add the distance of the i-th dim of the segment.
+        // but we don't need to check all bits of `j`,
+        // because `j` = `j - lowbit(j)` + `lowbit(j)`,
+        // where `j-lowbit(j)` is less than `j`,
+        // which means dist_table[j-lowbit(j)] is already computed,
+        // and we can use it to compute dist_table[j]
+        // for example, if j = 0b1010, then j - lowbit(j) = 0b1000,
+        // and dist_table[0b1000] is already computed,
+        // so dist_table[0b1010] = dist_table[0b1000] + sub_vec[LOWBIT_IDX[0b1010]];
+        // where lowbit(0b1010) = 0b10, LOWBIT_IDX[0b1010] = LOWBIT_IDX[0b10] = 1.
+        dist_table[j] = dist_table[j - lowbit(j)] + sub_vec[LOWBIT_IDX[j]].as_();
+    })
 }
 
 // Quantize the distance table to u8, map distance `d` to `(d-qmin) * 255 / (qmax-qmin)`
@@ -691,5 +697,35 @@ fn get_rq_code(
             .exact_size(num_code_bytes)
             .collect_vec()
             .into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_dist_table_not_optimized<T: ArrowFloatType>(
+        sub_vec: &[T::Native],
+        dist_table: &mut [f32],
+    ) where
+        T::Native: AsPrimitive<f32>,
+    {
+        for j in 0..SEGMENT_NUM_CODES {
+            for k in 0..SEGMENT_LENGTH {
+                if j & (1 << k) != 0 {
+                    dist_table[j] += sub_vec[k].as_();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_dist_table_not_optimized() {
+        let sub_vec = vec![1.0, 2.0, 3.0, 4.0];
+        let mut expected = vec![0.0; SEGMENT_NUM_CODES];
+        build_dist_table_not_optimized::<Float32Type>(&sub_vec, &mut expected);
+        let mut dist_table = vec![0.0; SEGMENT_NUM_CODES];
+        build_dist_table_for_subvec::<Float32Type>(&sub_vec, &mut dist_table);
+        assert_eq!(dist_table, expected);
     }
 }
