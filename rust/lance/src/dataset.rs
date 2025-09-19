@@ -33,8 +33,8 @@ use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION,
-    MINOR_VERSION,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, MAGIC,
+    MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
@@ -519,10 +519,10 @@ impl Dataset {
                 let message_data =
                     &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
                 let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-                let indices: Vec<Index> = section
+                let indices: Vec<IndexMetadata> = section
                     .indices
                     .into_iter()
-                    .map(Index::try_from)
+                    .map(IndexMetadata::try_from)
                     .collect::<Result<Vec<_>>>()?;
 
                 let ds_index_cache = session.index_cache.for_dataset(uri);
@@ -1281,7 +1281,7 @@ impl Dataset {
     }
 
     /// Get the indices directory for a specific index, considering its base_id
-    pub(crate) fn indice_files_dir(&self, index: &Index) -> Result<Path> {
+    pub(crate) fn indice_files_dir(&self, index: &IndexMetadata) -> Result<Path> {
         match index.base_id.as_ref() {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
@@ -1640,7 +1640,7 @@ impl Dataset {
         Ok(())
     }
 
-    fn validate_indices(&self, indices: &[Index]) -> Result<()> {
+    fn validate_indices(&self, indices: &[IndexMetadata]) -> Result<()> {
         // Make sure there are no duplicate ids
         let mut index_ids = HashSet::new();
         for index in indices.iter() {
@@ -2142,7 +2142,7 @@ pub(crate) async fn write_manifest_file(
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
 ) -> std::result::Result<ManifestLocation, CommitError> {
@@ -2169,7 +2169,7 @@ pub(crate) async fn write_manifest_file(
 fn write_manifest_file_to_path<'a>(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
 ) -> BoxFuture<'a, Result<WriteResult>> {
     Box::pin(async {
@@ -5145,7 +5145,7 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 2);
-        fn get_bitmap(meta: &Index) -> Vec<u32> {
+        fn get_bitmap(meta: &IndexMetadata) -> Vec<u32> {
             meta.fragment_bitmap.as_ref().unwrap().iter().collect()
         }
         assert_eq!(get_bitmap(&indices[0]), vec![0]);

@@ -9,7 +9,7 @@ use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{DataFile, Fragment, Index};
+use lance_table::format::{DataFile, Fragment, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 // Add Index bindings
-impl FromPyObject<'_> for PyLance<Index> {
+impl FromPyObject<'_> for PyLance<IndexMetadata> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let uuid = ob.getattr("uuid")?.to_string();
         let name = ob.getattr("name")?.extract()?;
@@ -42,7 +42,7 @@ impl FromPyObject<'_> for PyLance<Index> {
             .extract::<Option<i64>>()?
             .map(|id| id as u32);
 
-        Ok(Self(Index {
+        Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
@@ -56,7 +56,7 @@ impl FromPyObject<'_> for PyLance<Index> {
     }
 }
 
-impl<'py> IntoPyObject<'py> for PyLance<&Index> {
+impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
     type Target = PyAny;
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
@@ -100,7 +100,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
     }
 }
 
-impl<'py> IntoPyObject<'py> for PyLance<Index> {
+impl<'py> IntoPyObject<'py> for PyLance<IndexMetadata> {
     type Target = PyAny;
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;

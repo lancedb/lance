@@ -19,7 +19,7 @@ use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
-use lance::table::format::{Fragment, Index};
+use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
 use prost::Message;
 use prost_types::Any;
@@ -80,7 +80,7 @@ impl IntoJava for &DataReplacementGroup {
     }
 }
 
-impl IntoJava for &Index {
+impl IntoJava for &IndexMetadata {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let uuid = self.uuid.into_java(env)?;
 
@@ -151,7 +151,7 @@ impl IntoJava for &Index {
             JObject::null()
         };
 
-        // Create Index object
+        // Create IndexMetadata object
         Ok(env.new_object(
             "com/lancedb/lance/index/Index",
             "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;J[B[BILjava/time/Instant;Ljava/lang/Integer;)V",
@@ -219,8 +219,8 @@ impl FromJObjectWithEnv<RewrittenIndex> for JObject<'_> {
     }
 }
 
-impl FromJObjectWithEnv<Index> for JObject<'_> {
-    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Index> {
+impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<IndexMetadata> {
         let uuid = env
             .get_field(self, "uuid", "Ljava/util/UUID;")?
             .l()?
@@ -266,7 +266,7 @@ impl FromJObjectWithEnv<Index> for JObject<'_> {
             })?;
         let base_id = env.get_optional_u32_from_method(self, "baseId")?;
 
-        Ok(Index {
+        Ok(IndexMetadata {
             uuid,
             fields,
             name,
@@ -849,7 +849,7 @@ fn convert_to_rust_operation(
                     index.extract_object(env)
                 })?;
 
-            let frag_reuse_index: Option<Index> = env.get_optional_from_method(
+            let frag_reuse_index: Option<IndexMetadata> = env.get_optional_from_method(
                 java_operation,
                 "fragReuseIndex",
                 |env, frag_reuse_index| frag_reuse_index.extract_object(env),

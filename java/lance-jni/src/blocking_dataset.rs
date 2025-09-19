@@ -33,7 +33,7 @@ use lance::dataset::{
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
-use lance::table::format::Index;
+use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
@@ -216,7 +216,7 @@ impl BlockingDataset {
         Ok(stats)
     }
 
-    pub fn list_indexes(&self) -> Result<Arc<Vec<Index>>> {
+    pub fn list_indexes(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indexes = RT.block_on(self.inner.load_indices())?;
         Ok(indexes)
     }
