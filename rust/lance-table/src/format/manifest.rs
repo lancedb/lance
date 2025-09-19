@@ -484,12 +484,13 @@ impl Manifest {
     /// Get the summary information of a manifest.
     ///
     /// This function calculates various statistics about the manifest, including:
-    /// - total-records: Total number of records in the dataset
-    /// - total-files-size: Total size of all data files in bytes
-    /// - total-fragments: Number of fragments in the dataset
-    /// - total-data-files: Total number of data files across all fragments
-    /// - total-deletions: Total number of deleted records
-    /// - total-deletion-files: Number of fragments with deletion files
+    /// - total_files_size: Total size of all data files in bytes
+    /// - total_fragments: Total number of fragments in the dataset
+    /// - total_data_files: Total number of data files across all fragments
+    /// - total_deletion_files: Total number of deletion files
+    /// - total_data_file_rows: Total number of rows in data files
+    /// - total_deletion_file_rows: Total number of deleted rows in deletion files
+    /// - total_rows: Total number of rows in the dataset
     pub fn summary(&self) -> ManifestSummary {
         // Calculate total fragments
         let mut summary =
