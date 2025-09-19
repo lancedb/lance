@@ -247,7 +247,7 @@ class ImageURIArray(ImageArray):
         Examples
         --------
         >>> import os
-        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> uris = [os.path.join(os.environ["LANCE_TEST_DATA_DIR"], "images/1.png")]
         >>> uri_array = ImageURIArray.from_uris(uris)
         >>> uri_array.read_uris()
         <lance.arrow.EncodedImageArray object at 0x...>
@@ -353,7 +353,7 @@ class EncodedImageArray(ImageArray):
         Examples
         --------
         >>> import os
-        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> uris = [os.path.join(os.environ["LANCE_TEST_DATA_DIR"], "images/1.png")]
         >>> encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
         >>> encoded_image_array.to_tensor()
         <lance.arrow.FixedShapeImageTensorArray object at 0x...>
@@ -433,7 +433,7 @@ class FixedShapeImageTensorArray(ImageArray):
         --------
 
         >>> import os
-        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> uris = [os.path.join(os.environ["LANCE_TEST_DATA_DIR"], "images/1.png")]
         >>> tensor_image_array = ImageURIArray.from_uris(uris).read_uris().to_tensor()
         >>> tensor_image_array.to_numpy()
         array([[[[ 42,  42,  42, 255]]]], dtype=uint8)
