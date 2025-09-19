@@ -45,7 +45,7 @@ use lance_index::{
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::Index as IndexMetadata;
+use lance_table::format::IndexMetadata;
 use object_store::path::Path;
 use serde::Serialize;
 use snafu::location;
@@ -973,7 +973,7 @@ pub(crate) async fn open_vector_index_v2(
 pub async fn initialize_vector_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
-    source_index: &lance_table::format::Index,
+    source_index: &IndexMetadata,
     field_names: &[&str],
 ) -> Result<()> {
     if field_names.is_empty() || field_names.len() > 1 {

@@ -91,7 +91,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::{MemWal, MemWalId};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
-use lance_table::format::{Fragment, Index, RowIdMeta};
+use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
@@ -553,7 +553,7 @@ impl MergeInsertJob {
         }
     }
 
-    async fn join_key_as_scalar_index(&self) -> Result<Option<Index>> {
+    async fn join_key_as_scalar_index(&self) -> Result<Option<IndexMetadata>> {
         if self.params.on.len() != 1 {
             // joining on more than one column
             Ok(None)
@@ -573,7 +573,7 @@ impl MergeInsertJob {
     async fn create_indexed_scan_joined_stream(
         &self,
         source: SendableRecordBatchStream,
-        index: Index,
+        index: IndexMetadata,
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(

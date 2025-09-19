@@ -2259,7 +2259,7 @@ mod tests {
         // After building the index file, we need to register the index metadata
         // so that the dataset can find it when we try to open it
         let field = dataset.schema().field(WellKnownIvfPqData::COLUMN).unwrap();
-        let index_meta = lance_table::format::Index {
+        let index_meta = lance_table::format::IndexMetadata {
             uuid,
             dataset_version: dataset.version().version,
             fields: vec![field.id],
@@ -2304,7 +2304,7 @@ mod tests {
 
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
-        let index_meta = lance_table::format::Index {
+        let index_meta = lance_table::format::IndexMetadata {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),
@@ -2363,7 +2363,7 @@ mod tests {
             .schema()
             .field(WellKnownIvfPqData::COLUMN)
             .unwrap();
-        let new_index_meta = lance_table::format::Index {
+        let new_index_meta = lance_table::format::IndexMetadata {
             uuid: new_uuid,
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],

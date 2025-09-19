@@ -13,7 +13,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::Error;
 use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
 use lance_index::DatasetIndexExt;
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -273,7 +273,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
 
             let new_index_meta = match remap_result {
                 RemapResult::Drop => continue,
-                RemapResult::Keep(new_id) => Index {
+                RemapResult::Keep(new_id) => IndexMetadata {
                     uuid: new_id,
                     name: curr_index_meta.name.clone(),
                     fields: curr_index_meta.fields.clone(),
@@ -284,7 +284,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     created_at: curr_index_meta.created_at,
                     base_id: None,
                 },
-                RemapResult::Remapped(remapped_index) => Index {
+                RemapResult::Remapped(remapped_index) => IndexMetadata {
                     uuid: remapped_index.new_id,
                     name: curr_index_meta.name.clone(),
                     fields: curr_index_meta.fields.clone(),

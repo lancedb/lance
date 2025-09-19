@@ -14,7 +14,7 @@ use lance_core::{
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::MemWal;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
 use std::{
@@ -32,7 +32,7 @@ pub struct TransactionRebase<'a> {
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowIdTreeMap>,
-    conflicting_frag_reuse_indices: Vec<Index>,
+    conflicting_frag_reuse_indices: Vec<IndexMetadata>,
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -1537,7 +1537,7 @@ mod tests {
     use lance_core::Error;
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreParams;
-    use lance_table::format::Index;
+    use lance_table::format::IndexMetadata;
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
@@ -1964,7 +1964,7 @@ mod tests {
     fn test_conflicts() {
         use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
 
-        let index0 = Index {
+        let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
