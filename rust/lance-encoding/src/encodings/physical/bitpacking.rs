@@ -316,16 +316,20 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     }
 
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
-    output.truncate(num_whole_chunks * words_per_chunk);
+    // Safety: output ensures to have those values.
+    unsafe {
+        output.set_len(num_whole_chunks * words_per_chunk);
+    }
     let remaining_items = data_buffer.len() - last_chunk_start;
 
     let uncompressed_bits = data.bits_per_value as usize;
     let tail_bit_savings = uncompressed_bits.saturating_sub(compressed_bits_per_value);
     let padding_cost = compressed_bits_per_value * (ELEMS_PER_CHUNK as usize - remaining_items);
     let tail_pack_savings = tail_bit_savings.saturating_mul(remaining_items);
-    let pad_tail = remaining_items > 0 && tail_bit_savings > 0 && padding_cost < tail_pack_savings;
+    debug_assert!(remaining_items > 0, "remaining_items must be non-zero");
+    debug_assert!(tail_bit_savings > 0, "tail_bit_savings must be non-zero");
 
-    if pad_tail {
+    if padding_cost < tail_pack_savings {
         // Padding buys us more than it costs: pad to 1024 values and pack them as a normal chunk.
         let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
         last_chunk[..remaining_items].copy_from_slice(&data_buffer[last_chunk_start..]);
