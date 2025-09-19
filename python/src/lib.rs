@@ -62,6 +62,7 @@ use scanner::ScanStatistics;
 use session::Session;
 
 pub(crate) mod arrow;
+pub(crate) mod cli;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -86,6 +87,7 @@ use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
+pub use cli::lance_tools_cli;
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowIdMeta};
@@ -239,6 +241,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(lance_tools_cli))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;

@@ -38,6 +38,9 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
+[project.scripts]
+lance-tools="lance.cli:lance_tools_cli"
+
 [tool.maturin]
 python-source = "python"
 
