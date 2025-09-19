@@ -13,19 +13,20 @@ use lance_index::vector::utils::SimpleIndex;
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance_index::vector::kmeans::{
-    compute_partitions_arrow_array, KMeans, KMeansAlgo, KMeansAlgoFloat,
+    compute_partitions_arrow_array, KMeans, KMeansAlgo, KMeansAlgoFloat, KMeansParams,
 };
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array;
 
 fn bench_train(c: &mut Criterion) {
     let params = [
-        (64 * 1024, 8),     // training PQ
-        (64 * 1024, 128),   // training IVF with small vectors (1M rows)
-        (64 * 1024, 1024),  // training IVF with large vectors (1M rows)
-        (256 * 1024, 1024), // hit the threshold for using HNSW to speed up
-        (256 * 2048, 1024), // hit the threshold for using HNSW to speed up
-        (256 * 4096, 1024), // hit the threshold for using HNSW to speed up
+        // (64 * 1024, 8),      // training PQ
+        // (64 * 1024, 128),    // training IVF with small vectors (1M rows)
+        // (64 * 1024, 1024),   // training IVF with large vectors (1M rows)
+        // (256 * 1024, 1024),  // hit the threshold for using HNSW to speed up
+        // (256 * 2048, 1024),  // hit the threshold for using HNSW to speed up
+        // (256 * 4096, 1024),  // hit the threshold for using HNSW to speed up
+        (256 * 16384, 1024), // hit the threshold for using HNSW to speed up
     ];
     for (n, dimension) in params {
         let k = n / 256;
@@ -37,10 +38,26 @@ fn bench_train(c: &mut Criterion) {
         let centroids = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
 
         c.bench_function(&format!("train_{}d_{}k", dimension, k), |b| {
+            let params = KMeansParams::default().with_hierarchical_k(0);
             b.iter(|| {
-                KMeans::new(&data, k, 50).ok().unwrap();
+                KMeans::new_with_params(&data, k, &params).ok().unwrap();
             })
         });
+
+        if k > 256 {
+            for hierarchical_k in [4, 8, 16, 24, 32] {
+                let params = KMeansParams::default().with_hierarchical_k(hierarchical_k);
+                c.bench_function(
+                    &format!(
+                        "train_{}d_{}k_hierarchical_{}",
+                        dimension, k, hierarchical_k
+                    ),
+                    |b| {
+                        b.iter(|| KMeans::new_with_params(&data, k, &params).ok().unwrap());
+                    },
+                );
+            }
+        }
 
         let mut group = c.benchmark_group(format!("compute_membership_{}d_{}k", dimension, k));
 
@@ -59,6 +76,8 @@ fn bench_train(c: &mut Criterion) {
                         data.values().as_primitive::<Float32Type>().values(),
                         dimension as usize,
                         DistanceType::L2,
+                        0.0,
+                        None,
                         Some(&index),
                     )
                 })

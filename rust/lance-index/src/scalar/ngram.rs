@@ -1289,7 +1289,15 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "NGram index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),

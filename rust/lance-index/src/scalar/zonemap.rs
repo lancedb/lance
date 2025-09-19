@@ -619,7 +619,7 @@ impl ScalarIndex for ZoneMapIndex {
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(params))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
     }
 }
 
@@ -984,7 +984,15 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "ZoneMap index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
             .map_err(|_| Error::InvalidInput {

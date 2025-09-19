@@ -194,6 +194,25 @@ message Transaction {
     repeated uint32 fields_modified = 4;
     /// The MemWAL (pre-image) that should be marked as merged after this transaction
     MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
+    /// The fields that used to judge whether to preserve the new frag's id into
+    /// the frag bitmap of the specified indices.
+    repeated uint32 fields_for_preserving_frag_bitmap = 6;
+    // The mode of update
+    UpdateMode update_mode = 7;
+  }
+
+  // The mode of update operation
+  enum UpdateMode {
+
+    /// rows are deleted in current fragments and rewritten in new fragments.
+    /// This is most optimal when the majority of columns are being rewritten
+    /// or only a few rows are being updated.
+    REWRITE_ROWS = 0;
+
+    /// within each fragment, columns are fully rewritten and inserted as new data files.
+    /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
+    /// but a small subset of columns are affected.
+    REWRITE_COLUMNS = 1;
   }
   
   // An operation that updates the table config.

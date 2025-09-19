@@ -532,7 +532,7 @@ impl SerializerContext {
         // are reading.
 
         let mut new_len = 0;
-        assert!(self.rep_levels.len() >= offset_desc.num_values - 1 + self.current_num_specials);
+        assert!(self.rep_levels.len() >= (offset_desc.num_values + self.current_num_specials) - 1);
         if self.def_levels.is_empty() {
             let mut write_itr = self.spare_rep.iter_mut();
             let mut read_iter = self.rep_levels.iter().copied();
@@ -552,7 +552,7 @@ impl SerializerContext {
             std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
         } else {
             assert!(
-                self.def_levels.len() >= offset_desc.num_values - 1 + self.current_num_specials
+                self.def_levels.len() >= (offset_desc.num_values + self.current_num_specials) - 1
             );
             let mut def_write_itr = self.spare_def.iter_mut();
             let mut rep_write_itr = self.spare_rep.iter_mut();

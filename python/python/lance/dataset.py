@@ -404,6 +404,7 @@ class LanceDataset(pa.dataset.Dataset):
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
+        session: Optional[Session] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -433,6 +434,7 @@ class LanceDataset(pa.dataset.Dataset):
             metadata_cache_size_bytes=metadata_cache_size_bytes,
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
+            session=session,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -2760,8 +2762,38 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.prewarm_index(name)
 
-    def merge_index_metadata(self, index_uuid: str):
-        return self._ds.merge_index_metadata(index_uuid)
+    def merge_index_metadata(
+        self,
+        index_uuid: str,
+        index_type: str,
+        batch_readhead: Optional[int] = None,
+    ):
+        """
+        Merge an index which is not commit at present.
+
+        Parameters
+        ----------
+        index_uuid: str
+            The uuid of the index which want to merge.
+        index_type: str
+            The type of the index.
+            Only "BTREE" and "INVERTED" are supported now.
+        batch_readhead: int, optional
+            The number of prefetch batches of sub-page files for merging.
+            Default 1.
+        """
+        index_type = index_type.upper()
+        if index_type not in [
+            "BTREE",
+            "INVERTED",
+        ]:
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" or "INVERTED" are supported for '
+                    f"merge index metadata.  Received {index_type}",
+                )
+            )
+        return self._ds.merge_index_metadata(index_uuid, index_type, batch_readhead)
 
     def session(self) -> Session:
         """
@@ -3630,12 +3662,17 @@ class LanceOperation:
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
             those fields.
+        fields_for_preserving_frag_bitmap: list[int]
+            The fields that used to judge whether to preserve the new frag's id into
+            the frag bitmap of the specified indices.
         """
 
         removed_fragment_ids: List[int]
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
         fields_modified: List[int]
+        fields_for_preserving_frag_bitmap: List[int]
+        update_mode: str
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -4515,7 +4552,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False
+        retrain: bool, default False, deprecated
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
