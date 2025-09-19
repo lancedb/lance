@@ -3,10 +3,7 @@
 
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
-use crate::traits::{
-    export_vec, import_vec, import_vec_from_method, FromJObjectWithEnv, FromJString, IntoJava,
-    JLance,
-};
+use crate::traits::{export_vec, import_vec_from_method, FromJObjectWithEnv, IntoJava, JLance};
 use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use crate::JNIEnvExt;
@@ -18,6 +15,7 @@ use jni::sys::jbyte;
 use jni::JNIEnv;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    UpdateMap, UpdateMapEntry,
 };
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -517,50 +515,40 @@ fn convert_to_java_operation_inner<'local>(
             )?)
         }
         Operation::UpdateConfig {
-            upsert_values,
-            delete_keys,
-            schema_metadata,
-            field_metadata,
+            config_updates,
+            table_metadata_updates,
+            schema_metadata_updates,
+            field_metadata_updates,
         } => {
-            let upsert_values = match upsert_values {
-                Some(config_values) => to_java_map(env, &config_values)?,
-                _ => JObject::null(),
-            };
-            let delete_keys = match delete_keys {
-                Some(keys) => export_vec(env, &keys)?,
-                _ => JObject::null(),
-            };
-            let schema_metadata = match schema_metadata {
-                Some(schema_metadata) => to_java_map(env, &schema_metadata)?,
-                _ => JObject::null(),
-            };
-            let field_metadata = match field_metadata {
-                Some(field_metadata) => {
-                    let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
-                    let map = JMap::from_env(env, &java_map)?;
+            let config_updates_obj = export_update_map(env, &config_updates)?;
+            let table_metadata_updates_obj = export_update_map(env, &table_metadata_updates)?;
+            let schema_metadata_updates_obj = export_update_map(env, &schema_metadata_updates)?;
 
-                    for (field_id, field_meta) in field_metadata {
-                        let java_field_id = env.new_object(
-                            "java/lang/Integer",
-                            "(I)V",
-                            &[JValue::Int(field_id as i32)],
-                        )?;
+            // Handle field_metadata_updates
+            let field_metadata_updates_obj = if field_metadata_updates.is_empty() {
+                JObject::null()
+            } else {
+                let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+                let map = JMap::from_env(env, &java_map)?;
 
-                        let java_field_metadata = to_java_map(env, &field_meta)?;
-                        map.put(env, &java_field_id, &java_field_metadata)?;
-                    }
-                    java_map
+                for (field_id, update_map) in field_metadata_updates {
+                    let java_field_id =
+                        env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(field_id)])?;
+
+                    let update_map_obj = export_update_map(env, &Some(update_map.clone()))?;
+                    map.put(env, &java_field_id, &update_map_obj)?;
                 }
-                _ => JObject::null(),
+                java_map
             };
+
             let java_operation = env.new_object(
                 "com/lancedb/lance/operation/UpdateConfig",
-                "(Ljava/util/Map;Ljava/util/List;Ljava/util/Map;Ljava/util/Map;)V",
+                "(Lcom/lancedb/lance/operation/UpdateMap;Lcom/lancedb/lance/operation/UpdateMap;Lcom/lancedb/lance/operation/UpdateMap;Ljava/util/Map;)V",
                 &[
-                    JValue::Object(&upsert_values),
-                    JValue::Object(&delete_keys),
-                    JValue::Object(&schema_metadata),
-                    JValue::Object(&field_metadata),
+                    JValue::Object(&config_updates_obj),
+                    JValue::Object(&table_metadata_updates_obj),
+                    JValue::Object(&schema_metadata_updates_obj),
+                    JValue::Object(&field_metadata_updates_obj),
                 ],
             )?;
             Ok(java_operation)
@@ -728,61 +716,76 @@ fn convert_to_rust_operation(
             schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
         },
         "UpdateConfig" => {
-            let upsert_values = env.get_optional_from_method(
-                java_operation,
-                "upsertValues",
-                |env, upsert_values| {
-                    let upsert_values = JMap::from_env(env, &upsert_values)?;
-                    to_rust_map(env, &upsert_values)
-                },
-            )?;
+            let config_updates_obj = env
+                .call_method(
+                    java_operation,
+                    "configUpdates",
+                    "()Lcom/lancedb/lance/operation/UpdateMap;",
+                    &[],
+                )?
+                .l()?;
+            let config_updates = if config_updates_obj.is_null() {
+                None
+            } else {
+                extract_update_map(env, &config_updates_obj)?
+            };
 
-            let delete_keys =
-                env.get_optional_from_method(java_operation, "deleteKeys", |env, delete_keys| {
-                    let keys = import_vec(env, &delete_keys)?;
-                    let keys = keys
-                        .into_iter()
-                        .map(JString::from)
-                        .map(|key| key.extract(env))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(keys)
-                })?;
+            let table_metadata_updates_obj = env
+                .call_method(
+                    java_operation,
+                    "tableMetadataUpdates",
+                    "()Lcom/lancedb/lance/operation/UpdateMap;",
+                    &[],
+                )?
+                .l()?;
+            let table_metadata_updates = if table_metadata_updates_obj.is_null() {
+                None
+            } else {
+                extract_update_map(env, &table_metadata_updates_obj)?
+            };
 
-            let schema_metadata = env.get_optional_from_method(
-                java_operation,
-                "schemaMetadata",
-                |env, schema_metadata| {
-                    let schema_metadata = JMap::from_env(env, &schema_metadata)?;
-                    to_rust_map(env, &schema_metadata)
-                },
-            )?;
+            let schema_metadata_updates_obj = env
+                .call_method(
+                    java_operation,
+                    "schemaMetadataUpdates",
+                    "()Lcom/lancedb/lance/operation/UpdateMap;",
+                    &[],
+                )?
+                .l()?;
+            let schema_metadata_updates = if schema_metadata_updates_obj.is_null() {
+                None
+            } else {
+                extract_update_map(env, &schema_metadata_updates_obj)?
+            };
 
-            let field_metadata = env.get_optional_from_method(
-                java_operation,
-                "fieldMetadata",
-                |env, field_metadata| {
-                    let field_metadata = JMap::from_env(env, &field_metadata)?;
-                    let mut field_metadata_map = HashMap::new();
-                    let mut iter = field_metadata.iter(env)?;
-                    env.with_local_frame(16, |env| {
-                        while let Some((key, value)) = iter.next(env)? {
-                            let field_id =
-                                env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
-                            let inner_map = JMap::from_env(env, &value)?;
-                            let value_map = to_rust_map(env, &inner_map)?;
-                            field_metadata_map.insert(field_id, value_map);
+            let field_metadata_updates_obj = env
+                .call_method(
+                    java_operation,
+                    "fieldMetadataUpdates",
+                    "()Ljava/util/Map;",
+                    &[],
+                )?
+                .l()?;
+            let mut field_metadata_updates = HashMap::new();
+            if !field_metadata_updates_obj.is_null() {
+                let field_metadata_map = JMap::from_env(env, &field_metadata_updates_obj)?;
+                let mut iter = field_metadata_map.iter(env)?;
+                env.with_local_frame(16, |env| {
+                    while let Some((key, value)) = iter.next(env)? {
+                        let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()?;
+                        if let Some(update_map) = extract_update_map(env, &value)? {
+                            field_metadata_updates.insert(field_id, update_map);
                         }
-                        Ok::<(), Error>(())
-                    })?;
-                    Ok(field_metadata_map)
-                },
-            )?;
+                    }
+                    Ok::<(), Error>(())
+                })?;
+            }
 
             Operation::UpdateConfig {
-                upsert_values,
-                delete_keys,
-                schema_metadata,
-                field_metadata,
+                config_updates,
+                table_metadata_updates,
+                schema_metadata_updates,
+                field_metadata_updates,
             }
         }
         "Append" => {
@@ -925,4 +928,85 @@ fn convert_to_rust_operation(
         _ => unimplemented!(),
     };
     Ok(op)
+}
+
+fn extract_update_map(env: &mut JNIEnv, update_map_obj: &JObject) -> Result<Option<UpdateMap>> {
+    if update_map_obj.is_null() {
+        return Ok(None);
+    }
+
+    let updates_obj = env
+        .call_method(update_map_obj, "updates", "()Ljava/util/Map;", &[])?
+        .l()?;
+    let replace = env
+        .call_method(update_map_obj, "replace", "()Z", &[])?
+        .z()?;
+
+    if updates_obj.is_null() {
+        return Ok(None);
+    }
+
+    let updates_map = JMap::from_env(env, &updates_obj)?;
+    let mut entries = Vec::new();
+    let mut iter = updates_map.iter(env)?;
+
+    env.with_local_frame(16, |env| {
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+
+            let value_string = if value.is_null() {
+                None
+            } else {
+                let value_jstring = JString::from(value);
+                let value_str = env.get_string(&value_jstring)?.into();
+                Some(value_str)
+            };
+
+            entries.push(UpdateMapEntry {
+                key: key_string,
+                value: value_string,
+            });
+        }
+        Ok::<(), Error>(())
+    })?;
+
+    Ok(Some(UpdateMap {
+        update_entries: entries,
+        replace,
+    }))
+}
+
+fn export_update_map<'a>(
+    env: &mut JNIEnv<'a>,
+    update_map: &Option<UpdateMap>,
+) -> Result<JObject<'a>> {
+    match update_map {
+        None => Ok(JObject::null()),
+        Some(map) => {
+            // Create a Java HashMap for the updates
+            let updates_map = env.new_object("java/util/HashMap", "()V", &[])?;
+            let jmap = JMap::from_env(env, &updates_map)?;
+
+            for entry in &map.update_entries {
+                let key = env.new_string(&entry.key)?;
+                let value = match &entry.value {
+                    Some(val) => JObject::from(env.new_string(val)?),
+                    None => JObject::null(),
+                };
+                jmap.put(env, &key, &value)?;
+            }
+
+            // Create UpdateMap object
+            let update_map_obj = env.new_object(
+                "com/lancedb/lance/operation/UpdateMap",
+                "(Ljava/util/Map;Z)V",
+                &[
+                    JValue::Object(&updates_map),
+                    JValue::Bool(map.replace as u8),
+                ],
+            )?;
+            Ok(update_map_obj)
+        }
+    }
 }
