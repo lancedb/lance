@@ -334,11 +334,9 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
         let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
         last_chunk[..remaining_items].copy_from_slice(&data_buffer[last_chunk_start..]);
         let start = output.len();
-        output.extend(std::iter::repeat_n(
-            T::from_usize(0).unwrap(),
-            words_per_chunk,
-        ));
         unsafe {
+            // Capacity reserves a full chunk for each block; extend the visible length and fill it immediately.
+            output.set_len(start + words_per_chunk);
             BitPacking::unchecked_pack(
                 compressed_bits_per_value,
                 &last_chunk,
