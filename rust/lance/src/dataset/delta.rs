@@ -142,14 +142,8 @@ impl FragmentDiffAnalyzer {
                 .await?;
             diff_records.extend(updated_inserted);
         } else {
-            // Fragment without version metadata
-            // let new_fragment_records = self.handle_new_fragment(fragment).await?;
-            // diff_records.extend(new_fragment_records);
             panic!("In stable row id mode, fragment must have the row latest update version meta!")
         }
-
-        // Note: Deleted records are not handled at the fragment level
-        // since new fragments created by updates don't contain information about deletions
 
         Ok(diff_records)
     }
@@ -444,9 +438,105 @@ mod tests {
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use chrono::Duration;
     use futures::TryStreamExt;
+    use lance_core::utils::testing::MockClock;
     use lance_datagen::{array, BatchCount, RowCount};
     use std::sync::Arc;
+    use crate::dataset::transaction::Operation;
+
+    async fn create_test_dataset() -> Dataset {
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .col("value", array::fill_utf8("value".to_string()))
+            .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
+
+        let write_params = WriteParams {
+            ..Default::default()
+        };
+        Dataset::write(data, "memory://", Some(write_params.clone()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_diff_meta_no_transaction() {
+        let ds = create_test_dataset().await;
+        let result = ds.diff_meta(1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_diff_meta_single_transaction() {
+        let mut ds = create_test_dataset().await;
+        ds.delete("key = 5").await.unwrap();
+
+        let delta_struct = crate::dataset::delta::DatasetDelta {
+            begin_version: 1,
+            end_version: ds.version().version,
+            base_dataset: ds.clone(),
+        };
+        let txs = delta_struct.list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 1);
+        assert!(matches!(txs[0].operation, Operation::Delete { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_diff_meta_multiple_transactions() {
+        let mut ds = create_test_dataset().await;
+        ds.delete("key = 5").await.unwrap();
+        ds.delete("key = 6").await.unwrap();
+
+        let delta_struct = crate::dataset::delta::DatasetDelta {
+            begin_version: 1,
+            end_version: ds.version().version,
+            base_dataset: ds.clone(),
+        };
+        let txs = delta_struct.list_transactions().await.unwrap();
+        assert_eq!(txs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_diff_meta_contains_deleted_transaction() {
+        let clock = MockClock::new();
+
+        clock.set_system_time(Duration::seconds(1));
+
+        let mut ds = create_test_dataset().await;
+
+        clock.set_system_time(Duration::seconds(2));
+
+        ds.delete("key = 5").await.unwrap();
+        ds.delete("key = 6").await.unwrap();
+        ds.delete("key = 7").await.unwrap();
+
+        clock.set_system_time(Duration::seconds(3));
+
+        let end_version = ds.version().version;
+        let base_dataset = ds.clone();
+
+        clock.set_system_time(Duration::seconds(4));
+
+        ds.cleanup_old_versions(Duration::seconds(1), Some(true), None)
+            .await
+            .expect("Cleanup old versions failed");
+
+        clock.set_system_time(Duration::seconds(5));
+
+        let delta_struct = crate::dataset::delta::DatasetDelta {
+            begin_version: 1,
+            end_version,
+            base_dataset,
+        };
+
+        let result = delta_struct.list_transactions().await;
+        match result {
+            Err(lance_core::Error::VersionNotFound { message }) => {
+                assert!(message.contains("Can not find version"));
+            }
+            _ => panic!("Expected VersionNotFound error."),
+        }
+    }
 
     /// Helper function to create a test dataset with stable row IDs enabled
     async fn create_test_dataset_with_stable_row_ids() -> Dataset {
@@ -465,6 +555,40 @@ mod tests {
         Dataset::write(data, "memory://test_diff_dataset", Some(write_params))
             .await
             .unwrap()
+    }
+
+    async fn append_data_to_dataset(mut dataset: Dataset, start_id: i32, count: usize) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let ids: Vec<i32> = (start_id..start_id + count as i32).collect();
+        let names: Vec<String> = (0..count).map(|i| format!("new_{}", i)).collect();
+        let values: Vec<i32> = (start_id..start_id + count as i32)
+            .map(|x| x * 10)
+            .collect();
+
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap();
+
+        let batches = arrow_array::RecordBatchIterator::new([Ok(batch)], schema);
+
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        dataset.append(batches, Some(write_params)).await.unwrap();
+        dataset
     }
 
     #[tokio::test]
@@ -635,40 +759,6 @@ mod tests {
             "Should have updated exactly IDs 10-14, got {:?}",
             updated_ids
         );
-    }
-
-    async fn append_data_to_dataset(mut dataset: Dataset, start_id: i32, count: usize) -> Dataset {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, false),
-        ]));
-
-        let ids: Vec<i32> = (start_id..start_id + count as i32).collect();
-        let names: Vec<String> = (0..count).map(|i| format!("new_{}", i)).collect();
-        let values: Vec<i32> = (start_id..start_id + count as i32)
-            .map(|x| x * 10)
-            .collect();
-
-        let batch = arrow_array::RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(ids)),
-                Arc::new(StringArray::from(names)),
-                Arc::new(Int32Array::from(values)),
-            ],
-        )
-        .unwrap();
-
-        let batches = arrow_array::RecordBatchIterator::new([Ok(batch)], schema);
-
-        let write_params = WriteParams {
-            mode: WriteMode::Append,
-            ..Default::default()
-        };
-
-        dataset.append(batches, Some(write_params)).await.unwrap();
-        dataset
     }
 
     #[tokio::test]

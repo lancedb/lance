@@ -517,7 +517,6 @@ pub async fn write_fragments_internal(
         let (fragments_res, blobs_res) = futures::join!(fragments_fut, blob_fut);
         let fragments = fragments_res?;
         let blobs = blobs_res?;
-
         ((fragments, frag_schema), Some((blobs, blob_schema)))
     } else {
         let fragments = fragments_fut.await?;

@@ -132,28 +132,6 @@ impl RowVersionSegment {
         }
     }
 
-    /// Get the minimum version in this segment
-    pub fn min_version(&self) -> Option<u64> {
-        match self {
-            Self::UniformRange { version, .. } => Some(*version),
-            Self::IncrementalRange { start_version, .. } => Some(*start_version),
-            Self::Sparse(pairs) => pairs.iter().map(|(_, v)| *v).min(),
-        }
-    }
-
-    /// Get the maximum version in this segment
-    pub fn max_version(&self) -> Option<u64> {
-        match self {
-            Self::UniformRange { version, .. } => Some(*version),
-            Self::IncrementalRange {
-                start_row,
-                end_row,
-                start_version,
-            } => Some(start_version + (end_row - start_row - 1)),
-            Self::Sparse(pairs) => pairs.iter().map(|(_, v)| *v).max(),
-        }
-    }
-
     /// Create an optimal segment from a list of (row_id, version) pairs
     pub fn from_pairs(mut pairs: Vec<(u64, u64)>) -> Self {
         if pairs.is_empty() {
@@ -267,16 +245,6 @@ impl RowLatestUpdateVersionSequence {
             .flat_map(|segment| segment.iter_with_versions())
     }
 
-    // /// Get the minimum version in the sequence
-    // pub fn min_version(&self) -> Option<u64> {
-    //     self.0.iter().filter_map(|s| s.min_version()).min()
-    // }
-    //
-    // /// Get the maximum version in the sequence
-    // pub fn max_version(&self) -> Option<u64> {
-    //     self.0.iter().filter_map(|s| s.max_version()).max()
-    // }
-
     /// Add a new (row_id, version) pair to the sequence
     pub fn insert(&mut self, row_id: u64, version: u64) {
         // For simplicity, add as a sparse segment
@@ -326,8 +294,6 @@ impl RowLatestUpdateVersionMeta {
         match self {
             Self::Inline(data) => read_row_latest_update_versions(data),
             Self::External(_file) => {
-                // TODO: Implement external file loading
-                // This would involve reading from the object store at the specified path/offset/size
                 todo!("External file loading not yet implemented")
             }
         }
@@ -512,11 +478,6 @@ pub fn set_version_metadata_for_fragments(fragments: &mut [Fragment], current_ve
                         RowLatestUpdateVersionSequence::from_pairs(pairs)
                     };
 
-                // Calculate min and max versions from the sequence
-                // let min_version = version_sequence.min_version();
-                // let max_version = version_sequence.max_version();
-                // println!("min version is {:?} and max version is {:?}", min_version, max_version);
-
                 // Create inline metadata from the sequence
                 fragment.row_latest_update_version_meta =
                     Some(RowLatestUpdateVersionMeta::from_sequence(&version_sequence).unwrap());
@@ -563,8 +524,6 @@ mod tests {
         assert_eq!(segment.get_version(15), Some(5));
         assert_eq!(segment.get_version(5), None);
         assert_eq!(segment.get_version(25), None);
-        assert_eq!(segment.min_version(), Some(5));
-        assert_eq!(segment.max_version(), Some(5));
     }
 
     #[test]
@@ -580,8 +539,6 @@ mod tests {
         assert_eq!(segment.get_version(12), Some(102));
         assert_eq!(segment.get_version(14), Some(104));
         assert_eq!(segment.get_version(15), None);
-        assert_eq!(segment.min_version(), Some(100));
-        assert_eq!(segment.max_version(), Some(104));
     }
 
     #[test]
@@ -594,8 +551,6 @@ mod tests {
         assert_eq!(segment.get_version(5), Some(20));
         assert_eq!(segment.get_version(10), Some(30));
         assert_eq!(segment.get_version(3), None);
-        assert_eq!(segment.min_version(), Some(10));
-        assert_eq!(segment.max_version(), Some(30));
     }
 
     #[test]
@@ -659,8 +614,6 @@ mod tests {
         assert_eq!(sequence.get_version(10), Some(20));
         assert_eq!(sequence.get_version(15), Some(25));
         assert_eq!(sequence.get_version(5), None);
-        // assert_eq!(sequence.min_version(), Some(10));
-        // assert_eq!(sequence.max_version(), Some(25));
 
         let rows_gt_15 = sequence.rows_with_version_greater_than(15);
         assert_eq!(rows_gt_15, vec![10, 15]);
