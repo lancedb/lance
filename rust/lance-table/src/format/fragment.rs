@@ -286,20 +286,6 @@ pub struct Fragment {
     /// Row latest update version's metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub row_latest_update_version_meta: Option<RowLatestUpdateVersionMeta>,
-
-    /// Optimization field: minimum latest update version in this fragment
-    ///
-    /// This allows for fragment-level filtering during diff operations.
-    /// If all rows in the fragment have versions <= compared_version,
-    /// the fragment can be skipped entirely.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_latest_update_version: Option<u64>,
-
-    /// Optimization field: maximum latest update version in this fragment
-    ///
-    /// This allows for fragment-level filtering during diff operations.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_latest_update_version: Option<u64>,
 }
 
 impl Fragment {
@@ -311,8 +297,6 @@ impl Fragment {
             row_id_meta: None,
             physical_rows: None,
             row_latest_update_version_meta: None,
-            min_latest_update_version: None,
-            max_latest_update_version: None,
         }
     }
 
@@ -351,8 +335,6 @@ impl Fragment {
             physical_rows,
             row_id_meta: None,
             row_latest_update_version_meta: None,
-            min_latest_update_version: None,
-            max_latest_update_version: None,
         }
     }
 
@@ -475,8 +457,6 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .row_latest_updated_version_sequence
                 .map(RowLatestUpdateVersionMeta::try_from)
                 .transpose()?,
-            min_latest_update_version: p.min_latest_update_version,
-            max_latest_update_version: p.max_latest_update_version,
         })
     }
 }
@@ -516,8 +496,6 @@ impl From<&Fragment> for pb::DataFragment {
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             row_latest_updated_version_sequence,
-            min_latest_update_version: f.min_latest_update_version,
-            max_latest_update_version: f.max_latest_update_version,
         }
     }
 }

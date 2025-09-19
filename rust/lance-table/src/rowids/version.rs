@@ -520,8 +520,6 @@ pub fn set_version_metadata_for_fragments(fragments: &mut [Fragment], current_ve
                 // Create inline metadata from the sequence
                 fragment.row_latest_update_version_meta =
                     Some(RowLatestUpdateVersionMeta::from_sequence(&version_sequence).unwrap());
-                // fragment.min_latest_update_version = min_version;
-                // fragment.max_latest_update_version = max_version;
             }
         }
     }

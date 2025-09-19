@@ -136,25 +136,6 @@ impl FragmentDiffAnalyzer {
             return Ok(false);
         }
 
-        // // Use min/max version optimization if available
-        // if let (Some(min_ver), Some(max_ver)) = (
-        //     fragment.min_latest_update_version,
-        //     fragment.max_latest_update_version,
-        // ) {
-        //     // FIXED: Only skip if max_ver is strictly less than compared_version
-        //     // This prevents skipping fragments when max_ver equals compared_version,
-        //     // which could happen when fragment metadata is stale after merge operations
-        //     if max_ver < self.compared_version {
-        //         return Ok(true);
-        //     }
-        //
-        //     // If all records have versions > compared_version, we need to analyze
-        //     // (they could be inserts or updates)
-        //     if min_ver > self.compared_version {
-        //         return Ok(false);
-        //     }
-        // }
-
         // Fragment spans the compared version or has equal max version, need to analyze
         Ok(false)
     }

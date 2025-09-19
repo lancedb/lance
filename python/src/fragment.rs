@@ -727,10 +727,6 @@ impl FromPyObject<'_> for PyLance<Fragment> {
         let row_latest_update_version_meta: Option<PyRef<PyRowLatestUpdateVersionMeta>> =
             ob.getattr("row_latest_update_version_meta")?.extract()?;
         let row_latest_update_version_meta = row_latest_update_version_meta.map(|r| r.0.clone());
-        let min_latest_update_version: Option<u64> =
-            ob.getattr("min_latest_update_version")?.extract()?;
-        let max_latest_update_version: Option<u64> =
-            ob.getattr("max_latest_update_version")?.extract()?;
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
@@ -739,8 +735,6 @@ impl FromPyObject<'_> for PyLance<Fragment> {
             physical_rows: ob.getattr("physical_rows")?.extract()?,
             row_id_meta,
             row_latest_update_version_meta,
-            min_latest_update_version,
-            max_latest_update_version,
         }))
     }
 }
@@ -776,8 +770,6 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             deletion_file,
             row_id_meta,
             row_latest_update_version_meta,
-            self.0.min_latest_update_version,
-            self.0.max_latest_update_version,
         ))
     }
 }

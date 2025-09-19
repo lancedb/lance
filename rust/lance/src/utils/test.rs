@@ -256,8 +256,6 @@ impl TestDatasetGenerator {
             row_id_meta: None,
             physical_rows: Some(batch.num_rows()),
             row_latest_update_version_meta: None,
-            min_latest_update_version: None,
-            max_latest_update_version: None,
         }
     }
 }

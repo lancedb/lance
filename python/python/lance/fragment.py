@@ -72,11 +72,6 @@ class FragmentMetadata:
         The row id metadata, if any.
     row_latest_update_version_meta : Optional[RowLatestUpdateVersionMeta]
         The row latest update version metadata, if any.
-    min_latest_update_version : Optional[int]
-        The minimum latest update version, if any.
-    max_latest_update_version : Optional[int]
-        The maximum latest update version, if any.
-
     """
 
     id: int
@@ -85,8 +80,6 @@ class FragmentMetadata:
     deletion_file: Optional[DeletionFile] = None
     row_id_meta: Optional[RowIdMeta] = None
     row_latest_update_version_meta: Optional[RowLatestUpdateVersionMeta] = None
-    min_latest_update_version: Optional[int] = None
-    max_latest_update_version: Optional[int] = None
 
     @property
     def num_deletions(self) -> int:
@@ -128,8 +121,6 @@ class FragmentMetadata:
                 if self.row_latest_update_version_meta is not None
                 else None
             ),
-            min_latest_update_version=self.min_latest_update_version,
-            max_latest_update_version=self.max_latest_update_version,
         )
 
     @staticmethod
@@ -157,8 +148,6 @@ class FragmentMetadata:
             deletion_file=deletion_file,
             row_id_meta=row_id_meta,
             row_latest_update_version_meta=row_latest_update_version_meta,
-            min_latest_update_version=json_data.get("min_latest_update_version"),
-            max_latest_update_version=json_data.get("max_latest_update_version"),
         )
 
 

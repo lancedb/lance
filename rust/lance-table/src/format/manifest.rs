@@ -888,8 +888,6 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 row_latest_update_version_meta: None,
-                min_latest_update_version: None,
-                max_latest_update_version: None,
             },
             Fragment {
                 id: 1,
@@ -901,8 +899,6 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 row_latest_update_version_meta: None,
-                min_latest_update_version: None,
-                max_latest_update_version: None,
             },
         ];
 
