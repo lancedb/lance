@@ -217,7 +217,6 @@ impl HashJoiner {
         left_batch: &RecordBatch,
         index_column: ArrayRef,
         dataset: &Dataset,
-        write_schema: &Schema,
     ) -> Result<RecordBatch> {
         if index_column.data_type() != &self.index_type {
             return Err(Error::invalid_input(
@@ -269,33 +268,24 @@ impl HashJoiner {
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            if array.null_count() > 0 {
-                                let field = write_schema.fields.get(column_i).unwrap().clone();
-                                if !field.nullable {
-                                    return Err(Error::invalid_input(
-                                        format!(
-                                            "Join produced null values for column '{}', but the schema does not allow \
-                                            nulls for this field. This can be caused by an explicit null in the new \
-                                            data.",
-                                            field.name
-                                        ),
-                                        location!(),
-                                    ));
-                                }
-                                if !dataset.lance_supports_nulls(array.data_type()) {
-                                    return Err(Error::invalid_input(
-                                        format!(
-                                            "Join produced null values for column '{}' (type: {:?}). Storing nulls \
-                                            for this data type is not supported by the dataset's current Lance file \
-                                            format version: {:?}. This can be caused by an explicit null in the new \
-                                            data.",
-                                            field.name,
-                                            array.data_type(),
-                                            dataset.manifest().data_storage_format.lance_file_version().unwrap()
-                                        ),
-                                        location!(),
-                                    ));
-                                }
+                            if array.null_count() > 0
+                                && !dataset.lance_supports_nulls(array.data_type())
+                            {
+                                return Err(Error::invalid_input(
+                                    format!(
+                                        "Join produced null values for type: {:?}, but storing \
+                                        nulls for this data type is not supported by the \
+                                        dataset's current Lance file format version: {:?}. This \
+                                        can be caused by an explicit null in the new data.",
+                                        array.data_type(),
+                                        dataset
+                                            .manifest()
+                                            .data_storage_format
+                                            .lance_file_version()
+                                            .unwrap()
+                                    ),
+                                    location!(),
+                                ));
                             }
                             Ok(array)
                         },

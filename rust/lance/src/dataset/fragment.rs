@@ -1590,7 +1590,7 @@ impl FileFragment {
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         while let Some(batch) = updater.next().await? {
             let updated_batch = joiner
-                .collect_with_fallback(batch, batch[left_on].clone(), self.dataset(), &write_schema)
+                .collect_with_fallback(batch, batch[left_on].clone(), self.dataset())
                 .await?;
             updater.update(updated_batch).await?;
         }
