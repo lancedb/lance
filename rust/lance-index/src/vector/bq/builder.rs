@@ -149,7 +149,7 @@ impl RabitQuantizer {
         T::Native: AsPrimitive<f32>,
     {
         // we don't need to normalize the residual vectors,
-        // because the signal of P^{-1} * v_r is the same as P^{-1} * v_r / ||v_r||
+        // because the sign of P^{-1} * v_r is the same as P^{-1} * v_r / ||v_r||
         let n = residual_vectors.len();
         let dim = self.dim();
         debug_assert_eq!(residual_vectors.values().len(), n * dim);
