@@ -66,6 +66,7 @@ impl ValueEncoder {
         debug_assert_eq!(vals_per_chunk % values_per_word, 0);
         let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
         let bytes_per_chunk = u16::try_from(bytes_per_chunk).unwrap();
+        debug_assert!(bytes_per_chunk > 0);
 
         let data_buffer = data.data;
 
@@ -75,13 +76,14 @@ impl ValueEncoder {
         let mut bytes_counter = 0;
         loop {
             if row_offset + vals_per_chunk <= data.num_values {
+                // We can make a full chunk
                 chunks.push(MiniBlockChunk {
                     log_num_values: log_vals_per_chunk as u8,
                     buffer_sizes: vec![bytes_per_chunk],
                 });
                 row_offset += vals_per_chunk;
                 bytes_counter += bytes_per_chunk as u64;
-            } else {
+            } else if row_offset < data.num_values {
                 // Final chunk, special values
                 let num_bytes = data_buffer.len() as u64 - bytes_counter;
                 let num_bytes = u16::try_from(num_bytes).unwrap();
@@ -90,8 +92,13 @@ impl ValueEncoder {
                     buffer_sizes: vec![num_bytes],
                 });
                 break;
+            } else {
+                // If we get here then all chunks were full chunks and we have no remainder chunk
+                break;
             }
         }
+
+        debug_assert_eq!(chunks.len(), num_chunks);
 
         MiniBlockCompressed {
             chunks,
@@ -161,6 +168,7 @@ impl ValueEncoder {
         let bits_in_chunk = data.bits_per_value * num_values as u64;
         let bytes_in_chunk = bits_in_chunk.div_ceil(8);
         let bytes_in_chunk = u16::try_from(bytes_in_chunk).unwrap();
+        debug_assert!(bytes_in_chunk > 0);
         buffer_sizes.push(bytes_in_chunk);
 
         buffer_sizes
