@@ -149,11 +149,27 @@ pub fn import_vec<'local>(env: &mut JNIEnv<'local>, obj: &JObject) -> Result<Vec
     Ok(ret)
 }
 
+pub fn import_vec_to_rust<T, F>(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    mut extractor: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&mut JNIEnv<'_>, JObject<'_>) -> Result<T>,
+{
+    let java_items = import_vec(env, obj)?;
+    let mut result = Vec::with_capacity(java_items.len());
+    for item in java_items {
+        result.push(extractor(env, item)?);
+    }
+    Ok(result)
+}
+
 pub fn import_vec_from_method<T, F>(
     env: &mut JNIEnv<'_>,
     java_obj: &JObject<'_>,
     method_name: &str,
-    mut extractor: F,
+    extractor: F,
 ) -> Result<Vec<T>>
 where
     F: FnMut(&mut JNIEnv<'_>, JObject<'_>) -> Result<T>,
@@ -162,12 +178,7 @@ where
         .call_method(java_obj, method_name, "()Ljava/util/List;", &[])?
         .l()?;
 
-    let java_items = import_vec(env, &list_obj)?;
-    let mut result = Vec::with_capacity(java_items.len());
-    for item in java_items {
-        result.push(extractor(env, item)?);
-    }
-    Ok(result)
+    import_vec_to_rust(env, &list_obj, extractor)
 }
 
 pub struct JLance<T>(pub T);

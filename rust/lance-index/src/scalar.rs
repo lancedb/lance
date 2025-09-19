@@ -331,13 +331,9 @@ impl FullTextSearchQuery {
     }
 
     pub fn params(&self) -> FtsSearchParams {
-        let params = FtsSearchParams::new()
+        FtsSearchParams::new()
             .with_limit(self.limit.map(|limit| limit as usize))
-            .with_wand_factor(self.wand_factor.unwrap_or(1.0));
-        match self.query {
-            FtsQuery::Phrase(ref query) => params.with_phrase_slop(Some(query.slop)),
-            _ => params,
-        }
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0))
     }
 }
 

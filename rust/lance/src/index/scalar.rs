@@ -32,7 +32,7 @@ use lance_index::scalar::{
 };
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use snafu::location;
 use tracing::instrument;
@@ -301,7 +301,7 @@ pub(super) async fn build_scalar_index(
 pub async fn fetch_index_details(
     dataset: &Dataset,
     column: &str,
-    index: &Index,
+    index: &IndexMetadata,
 ) -> Result<Arc<prost_types::Any>> {
     let index_details = match index.index_details.as_ref() {
         Some(details) => details.clone(),
@@ -314,7 +314,7 @@ pub async fn fetch_index_details(
 pub async fn open_scalar_index(
     dataset: &Dataset,
     column: &str,
-    index: &Index,
+    index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let uuid_str = index.uuid.to_string();
@@ -337,7 +337,7 @@ pub async fn open_scalar_index(
 pub(crate) async fn infer_scalar_index_details(
     dataset: &Dataset,
     column: &str,
-    index: &Index,
+    index: &IndexMetadata,
 ) -> Result<Arc<prost_types::Any>> {
     let uuid = index.uuid.to_string();
     let type_key = crate::session::index_caches::ScalarIndexDetailsKey { uuid: &uuid };
@@ -383,7 +383,7 @@ pub(crate) async fn infer_scalar_index_details(
 }
 
 pub fn index_matches_criteria(
-    index: &Index,
+    index: &IndexMetadata,
     criteria: &ScalarIndexCriteria,
     field: &Field,
     has_multiple_indices: bool,
@@ -444,7 +444,7 @@ pub fn index_matches_criteria(
 pub async fn initialize_scalar_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
-    source_index: &Index,
+    source_index: &IndexMetadata,
     field_names: &[&str],
 ) -> Result<()> {
     if field_names.is_empty() || field_names.len() > 1 {

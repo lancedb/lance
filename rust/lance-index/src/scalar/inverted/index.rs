@@ -14,6 +14,7 @@ use std::{
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
+use crate::scalar::inverted::builder::flatten_string_list;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::{
     array::LargeBinaryBuilder,
@@ -2211,6 +2212,18 @@ pub fn flat_bm25_search_stream(
     }
     let stream = input.map(move |batch| {
         let batch = batch?;
+
+        // Flat if doc_col is a list
+        let batch = match batch[&doc_col].data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => batch,
+            DataType::List(_) => flatten_string_list::<i32>(&batch, &batch[&doc_col])?,
+            DataType::LargeList(_) => flatten_string_list::<i64>(&batch, &batch[&doc_col])?,
+            _ => panic!(
+                "Expecting Utf8, LargeUtf8, List(Utf8) or LargeList(Utf8), found {:?}",
+                batch[&doc_col].data_type()
+            ),
+        };
+
         let batch = flat_bm25_search(
             batch,
             &doc_col,

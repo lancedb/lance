@@ -74,6 +74,7 @@ impl InlineBitpacking {
     fn bitpack_chunked<T: ArrowNativeType + BitPacking>(
         data: FixedWidthDataBlock,
     ) -> MiniBlockCompressed {
+        debug_assert!(data.num_values > 0);
         let data_buffer = data.data.borrow_to_typed_slice::<T>();
         let data_buffer = data_buffer.as_ref();
 

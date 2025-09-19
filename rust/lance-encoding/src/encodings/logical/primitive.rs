@@ -3487,6 +3487,7 @@ impl PrimitiveStructuralEncoder {
         let mut values_counter = 0;
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let chunk_num_values = chunk.num_values(values_counter, num_elements);
+            debug_assert!(chunk_num_values > 0);
             values_counter += chunk_num_values;
             let chunk_levels = if chunk_idx < chunks.len() - 1 {
                 levels.slice_next(chunk_num_values as usize)
