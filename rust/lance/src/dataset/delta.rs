@@ -127,27 +127,9 @@ impl FragmentDiffAnalyzer {
         }
     }
 
-    /// Check if a fragment should be skipped during diff analysis
-    ///
-    /// This uses the min/max_latest_update_version optimization fields
-    /// to skip fragments that don't contain any changes.
-    pub fn should_skip_fragment(&self, fragment: &Fragment) -> Result<bool> {
-        if fragment.row_latest_update_version_meta.is_none() {
-            return Ok(false);
-        }
-
-        // Fragment spans the compared version or has equal max version, need to analyze
-        Ok(false)
-    }
-
     /// Analyze a single fragment for differences
     #[instrument(level = "debug", skip_all)]
     pub async fn analyze_fragment(&self, fragment: &Fragment) -> Result<Vec<DiffRecord>> {
-        // Check if we can skip this fragment using version optimization
-        if self.should_skip_fragment(fragment)? {
-            return Ok(vec![]);
-        }
-
         let mut diff_records = Vec::new();
 
         // Load the row version sequence for this fragment
