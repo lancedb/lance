@@ -126,9 +126,7 @@ impl InlineBitpacking {
         }
 
         // Handle the last chunk
-        let last_chunk_elem_num = if data.num_values == 0 {
-            0
-        } else if data.num_values % ELEMS_PER_CHUNK == 0 {
+        let last_chunk_elem_num = if data.num_values % ELEMS_PER_CHUNK == 0 {
             ELEMS_PER_CHUNK
         } else {
             data.num_values % ELEMS_PER_CHUNK
