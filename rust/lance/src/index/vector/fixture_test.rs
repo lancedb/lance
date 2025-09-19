@@ -263,7 +263,7 @@ mod test {
                 use_index: true,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
-            let partition_ids = idx.find_partitions(&q).unwrap();
+            let (partition_ids, _) = idx.find_partitions(&q).unwrap();
             assert_eq!(partition_ids.len(), 4);
             let nearest_partition_id = partition_ids.value(0);
             idx.search_in_partition(

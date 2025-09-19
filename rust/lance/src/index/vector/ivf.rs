@@ -2071,7 +2071,7 @@ mod tests {
                     metric_type: MetricType::L2,
                     use_index: true,
                 };
-                let partitions = index.find_partitions(&query).unwrap();
+                let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;
                 let search_result = index
                     .search_in_partition(
