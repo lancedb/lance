@@ -1500,7 +1500,7 @@ impl Dataset {
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RABIT" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
+            "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -2688,7 +2688,7 @@ fn prepare_vector_index_params(
             m_type, ivf_params, sq_params,
         ))),
 
-        "IVF_RABIT" => Ok(Box::new(VectorIndexParams::with_ivf_rq_params(
+        "IVF_RQ" => Ok(Box::new(VectorIndexParams::with_ivf_rq_params(
             m_type, ivf_params, rq_params,
         ))),
 

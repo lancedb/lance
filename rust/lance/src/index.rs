@@ -1224,7 +1224,7 @@ impl DatasetIndexInternalExt for Dataset {
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
                     }
 
-                    "IVF_RABIT" => {
+                    "IVF_RQ" => {
                         let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
                             self.object_store.clone(),
                             self.indices_dir(),

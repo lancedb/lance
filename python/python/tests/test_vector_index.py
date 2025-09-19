@@ -647,7 +647,7 @@ def test_create_ivf_rq_index():
     ds = lance.write_dataset(create_table(), "memory://")
     ds = ds.create_index(
         "vector",
-        index_type="IVF_RABIT",
+        index_type="IVF_RQ",
         num_partitions=4,
         num_bits=1,
     )
@@ -660,7 +660,7 @@ def test_create_ivf_rq_index():
         ds.delete("id>=0")
         ds = ds.create_index(
             "vector",
-            index_type="IVF_RABIT",
+            index_type="IVF_RQ",
             num_partitions=4,
             num_bits=1,
             replace=True,
@@ -673,7 +673,7 @@ def test_create_ivf_rq_index():
     ds = lance.write_dataset(tbl, "memory://", mode="overwrite")
     ds = ds.create_index(
         "vector",
-        index_type="IVF_RABIT",
+        index_type="IVF_RQ",
         num_partitions=4,
         num_bits=1,
     )
