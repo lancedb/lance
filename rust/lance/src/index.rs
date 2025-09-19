@@ -1127,7 +1127,7 @@ impl DatasetIndexInternalExt for Dataset {
                 .await
             }
 
-            (0, 3) => {
+            (0, 3) | (2, _) => {
                 let scheduler = ScanScheduler::new(
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),

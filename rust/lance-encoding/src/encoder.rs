@@ -275,9 +275,9 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
 pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEncodingStrategy> {
     match version.resolve() {
         LanceFileVersion::Legacy => panic!(),
-        LanceFileVersion::V2_0 => {
-            Box::new(crate::previous::encoder::CoreFieldEncodingStrategy::default())
-        }
+        LanceFileVersion::V2_0 => Box::new(
+            crate::previous::encoder::CoreFieldEncodingStrategy::new(version),
+        ),
         _ => Box::new(StructuralEncodingStrategy::default()),
     }
 }

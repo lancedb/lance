@@ -401,7 +401,7 @@ pub struct ColumnInfoIter<'a> {
 
 impl<'a> ColumnInfoIter<'a> {
     pub fn new(column_infos: Vec<Arc<ColumnInfo>>, column_indices: &'a [u32]) -> Self {
-        let initial_pos = column_indices[0] as usize;
+        let initial_pos = column_indices.first().copied().unwrap_or(0) as usize;
         Self {
             column_infos,
             column_indices,
@@ -960,7 +960,7 @@ impl DecodeBatchScheduler {
             .metadata
             .insert("__lance_decoder_root".to_string(), "true".to_string());
 
-        if column_infos[0].is_structural() {
+        if column_infos.is_empty() || column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
             let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);

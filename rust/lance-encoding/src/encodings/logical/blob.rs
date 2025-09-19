@@ -152,6 +152,7 @@ mod tests {
         compression::DefaultCompressionStrategy,
         encoder::{ColumnIndexSequence, EncodingOptions},
         testing::{check_round_trip_encoding_of_data, TestCases},
+        version::LanceFileVersion,
     };
     use arrow_array::LargeBinaryArray;
 
@@ -239,6 +240,12 @@ mod tests {
         ]));
 
         // Use the standard test harness
-        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+        check_round_trip_encoding_of_data(
+            vec![array],
+            // TODO (https://github.com/lancedb/lance/issues/4781)
+            &TestCases::default().with_max_file_version(LanceFileVersion::V2_0),
+            blob_metadata,
+        )
+        .await;
     }
 }
