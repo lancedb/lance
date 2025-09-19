@@ -57,7 +57,7 @@ fn main() -> Result<(), String> {
         };
         if let Err(err) = build_dist_table_with_flags("avx512", &["-march=native"]) {
             println!(
-                "cargo:warning=Skipping build of AVX-512 dist_table.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {}",
+                "cargo:warning=Skipping build of AVX-512 dist_table.  Clang/GCC too old or compiler does not support AVX512.  Error: {}",
                 err
             );
         } else {
