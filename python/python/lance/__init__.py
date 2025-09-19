@@ -29,6 +29,7 @@ from .lance import (
     FFILanceTableProvider,
     ScanStatistics,
     bytes_read_counter,
+    graph,
     iops_counter,
 )
 from .schema import json_to_schema, schema_to_json
@@ -60,6 +61,7 @@ __all__ = [
     "Transaction",
     "__version__",
     "bytes_read_counter",
+    "graph",
     "iops_counter",
     "write_dataset",
     "schema_to_json",
