@@ -14,6 +14,7 @@ The Python/Java logger can be configured with several environment variables:
 - `LANCE_LOG`: Controls log filtering based on log level and target. See the [env_logger](https://docs.rs/env_logger/latest/env_logger/) docs for more details. The `LANCE_LOG` environment variable replaces the `RUST_LOG` environment variable.
 - `LANCE_LOG_STYLE`: Controls whether colors are used in the log messages. Valid values are `auto`, `always`, `never`.
 - `LANCE_LOG_TS_PRECISION`: The precision of the timestamp in the log messages. Valid values are `ns`, `us`, `ms`, `s`.
+- `LANCE_LOG_FILE`: Redirects Rust log messages to the specified file path instead of stderr. When set, Lance will create the file and any necessary parent directories. If the file cannot be created (e.g., due to permission issues), Lance will fall back to logging to stderr.
 
 ## Trace Events
 
@@ -91,15 +92,15 @@ a lot of memory.
 ### Index Cache
 
 Lance uses an index cache to speed up queries. This caches vector and scalar indices in memory. The
-max size of this cache can be configured when creating a `LanceDataset` using the `index_cache_size`
-parameter. This cache is an LRU cached that is sized by "number of entries". The size of each entry
-and the number of entries needed depends on the index in question. For example, an IVF/PQ vector index
-contains 1 header entry and 1 entry for each partition. The size of each entry is determined by the
-number of vectors and the PQ parameters (e.g. number of subvectors). You can view the size of this cache
-by inspecting the result of `dataset.session().size_bytes()`.
+max size of this cache can be configured when creating a `LanceDataset` using the `index_cache_size_bytes`
+parameter. This cache is an LRU cached that is sized by bytes. The default size is 6 GiB.
+You can view the size of this cache by inspecting the result of `dataset.session().size_bytes()`.
 
 The index cache is not shared between tables. For best performance you should create a single table and
 share it across your application.
+
+**Note**: `index_cache_size` (specified in entries) was deprecated since version 0.30.0. Use
+`index_cache_size_bytes` (specified in bytes) for new code.
 
 ### Scanning Data
 

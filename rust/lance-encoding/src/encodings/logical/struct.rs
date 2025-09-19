@@ -21,8 +21,8 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
-use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::FieldExt;
+use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
 use lance_core::Result;
 use log::trace;
 
@@ -361,12 +361,14 @@ impl FieldEncoder for StructStructuralEncoder {
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_array = array.as_struct();
+        let mut struct_array = struct_array.normalize_slicing()?;
         if let Some(validity) = struct_array.nulls() {
             if self.keep_original_array {
                 repdef.add_validity_bitmap(validity.clone())
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap())
             }
+            struct_array = struct_array.pushdown_nulls()?;
         } else {
             repdef.add_no_null(struct_array.len());
         }
@@ -528,10 +530,11 @@ mod tests {
 
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
-        Array, ArrayRef, Int32Array, StructArray,
+        Array, ArrayRef, Int32Array, ListArray, StructArray,
     };
-    use arrow_buffer::NullBuffer;
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
+    use rstest::rstest;
 
     use crate::{
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
@@ -601,7 +604,72 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_struct_list() {
+    async fn test_simple_masked_nonempty_list() {
+        // [[1, 2], [NULL], [4], [], NULL, NULL-STRUCT]
+        //
+        let items = Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5), Some(6)]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 3, 4, 4, 4, 5]));
+        let list_validity = BooleanBuffer::from(vec![true, true, true, true, false, true]);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(items),
+            Some(NullBuffer::new(list_validity)),
+        );
+        let struct_validity = BooleanBuffer::from(vec![true, true, true, true, true, false]);
+        let struct_array = StructArray::new(
+            Fields::from(vec![Field::new(
+                "inner_list",
+                list_array.data_type().clone(),
+                true,
+            )]),
+            vec![Arc::new(list_array)],
+            Some(NullBuffer::new(struct_validity)),
+        );
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(struct_array)],
+            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_struct_list() {
+        // [[1, 2], [NULL], [4], [], NULL, NULL-STRUCT]
+        //
+        let items = Int32Array::from(vec![Some(1), Some(2), None, Some(4)]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 3, 4, 4, 4, 4]));
+        let list_validity = BooleanBuffer::from(vec![true, true, true, true, false, true]);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(items),
+            Some(NullBuffer::new(list_validity)),
+        );
+        let struct_validity = BooleanBuffer::from(vec![true, true, true, true, true, false]);
+        let struct_array = StructArray::new(
+            Fields::from(vec![Field::new(
+                "inner_list",
+                list_array.data_type().clone(),
+                true,
+            )]),
+            vec![Arc::new(list_array)],
+            Some(NullBuffer::new(struct_validity)),
+        );
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(struct_array)],
+            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_struct_list(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new(
                 "inner_list",
@@ -611,7 +679,7 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test_log::test(tokio::test)]

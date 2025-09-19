@@ -44,7 +44,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_table::{
-    format::{Index, Manifest},
+    format::{IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -210,7 +210,7 @@ impl<'a> CleanupTask<'a> {
     fn process_manifest(
         &self,
         manifest: &Manifest,
-        indexes: &Vec<Index>,
+        indexes: &Vec<IndexMetadata>,
         in_working_set: bool,
         inspection: &mut MutexGuard<CleanupInspection>,
     ) -> Result<()> {

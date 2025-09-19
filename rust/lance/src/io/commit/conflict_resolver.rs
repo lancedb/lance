@@ -14,7 +14,7 @@ use lance_core::{
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::MemWal;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
 use std::{
@@ -32,7 +32,7 @@ pub struct TransactionRebase<'a> {
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowIdTreeMap>,
-    conflicting_frag_reuse_indices: Vec<Index>,
+    conflicting_frag_reuse_indices: Vec<IndexMetadata>,
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -1537,7 +1537,7 @@ mod tests {
     use lance_core::Error;
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreParams;
-    use lance_table::format::Index;
+    use lance_table::format::IndexMetadata;
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
@@ -1589,6 +1589,8 @@ mod tests {
             new_fragments: vec![],
             fields_modified: vec![],
             mem_wal_to_merge: None,
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1598,6 +1600,8 @@ mod tests {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1610,6 +1614,8 @@ mod tests {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1709,6 +1715,8 @@ mod tests {
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1721,6 +1729,8 @@ mod tests {
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
                 mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
         ];
         let transactions =
@@ -1840,6 +1850,8 @@ mod tests {
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
                     mem_wal_to_merge: None,
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
                 },
             ),
             (
@@ -1850,6 +1862,8 @@ mod tests {
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
                     mem_wal_to_merge: None,
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
                 },
             ),
             (
@@ -1950,7 +1964,7 @@ mod tests {
     fn test_conflicts() {
         use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
 
-        let index0 = Index {
+        let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
@@ -2005,6 +2019,8 @@ mod tests {
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
                 mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
             Operation::UpdateConfig {
                 upsert_values: Some(HashMap::from_iter(vec![(
@@ -2197,6 +2213,8 @@ mod tests {
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
                     mem_wal_to_merge: None,
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
                 },
                 [
                     Compatible,    // append

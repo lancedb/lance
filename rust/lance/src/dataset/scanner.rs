@@ -65,7 +65,7 @@ use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
@@ -2734,7 +2734,7 @@ impl Scanner {
     async fn knn_combined(
         &self,
         q: &Query,
-        index: &Index,
+        index: &IndexMetadata,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -3190,7 +3190,7 @@ impl Scanner {
         }
     }
 
-    fn get_indexed_frags(&self, index: &[Index]) -> RoaringBitmap {
+    fn get_indexed_frags(&self, index: &[IndexMetadata]) -> RoaringBitmap {
         let all_fragments = self.get_fragments_as_bitmap();
 
         let mut all_indexed_frags = RoaringBitmap::new();
@@ -3211,7 +3211,7 @@ impl Scanner {
     async fn ann(
         &self,
         q: &Query,
-        index: &[Index],
+        index: &[IndexMetadata],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self
@@ -3242,7 +3242,7 @@ impl Scanner {
     async fn multivec_ann(
         &self,
         q: &Query,
-        index: &[Index],
+        index: &[IndexMetadata],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // we split the query procedure into two steps:

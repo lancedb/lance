@@ -289,11 +289,13 @@ pub struct IndexMetadata {
     pub distance_type: String,
 }
 
-pub fn is_system_index(index_meta: &lance_table::format::Index) -> bool {
+pub fn is_system_index(index_meta: &lance_table::format::IndexMetadata) -> bool {
     index_meta.name == FRAG_REUSE_INDEX_NAME || index_meta.name == MEM_WAL_INDEX_NAME
 }
 
-pub fn infer_system_index_type(index_meta: &lance_table::format::Index) -> Option<IndexType> {
+pub fn infer_system_index_type(
+    index_meta: &lance_table::format::IndexMetadata,
+) -> Option<IndexType> {
     if index_meta.name == FRAG_REUSE_INDEX_NAME {
         Some(IndexType::FragmentReuse)
     } else if index_meta.name == MEM_WAL_INDEX_NAME {

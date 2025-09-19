@@ -48,7 +48,7 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use snafu::location;
 use tokio::sync::Notify;
 
@@ -301,7 +301,7 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 pub fn new_knn_exec(
     dataset: Arc<Dataset>,
-    indices: &[Index],
+    indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -558,7 +558,7 @@ pub struct ANNIvfSubIndexExec {
 
     dataset: Arc<Dataset>,
 
-    indices: Vec<Index>,
+    indices: Vec<IndexMetadata>,
 
     /// Vector Query.
     query: Query,
@@ -576,7 +576,7 @@ impl ANNIvfSubIndexExec {
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
-        indices: Vec<Index>,
+        indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
@@ -1551,11 +1551,7 @@ mod tests {
                         .unwrap();
                 } else {
                     dataset
-                        .optimize_indices(&OptimizeOptions {
-                            num_indices_to_merge: 0,
-                            index_names: None,
-                            retrain: false,
-                        })
+                        .optimize_indices(&OptimizeOptions::append())
                         .await
                         .unwrap();
                 }

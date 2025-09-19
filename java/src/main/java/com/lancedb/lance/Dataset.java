@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.DataStatistics;
@@ -38,6 +39,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.io.ByteArrayInputStream;
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
 import java.util.ArrayList;
@@ -212,7 +214,8 @@ public class Dataset implements Closeable {
             options.getBlockSize(),
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
-            options.getStorageOptions());
+            options.getStorageOptions(),
+            options.getSerializedManifest());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -224,7 +227,8 @@ public class Dataset implements Closeable {
       Optional<Integer> blockSize,
       long indexCacheSize,
       long metadataCacheSizeBytes,
-      Map<String, String> storageOptions);
+      Map<String, String> storageOptions,
+      Optional<ByteBuffer> serializedManifest);
 
   /**
    * Create a new version of dataset. Use {@link Transaction} instead

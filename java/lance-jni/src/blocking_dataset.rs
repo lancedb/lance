@@ -5,8 +5,8 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
-    extract_storage_options, extract_write_params, get_scalar_index_params,
-    get_vector_index_params, to_rust_map,
+    build_compaction_options, extract_storage_options, extract_write_params,
+    get_scalar_index_params, get_vector_index_params, to_rust_map,
 };
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
@@ -33,7 +33,7 @@ use lance::dataset::{
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
-use lance::table::format::Index;
+use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
@@ -84,6 +84,7 @@ impl BlockingDataset {
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
+        serialized_manifest: Option<&[u8]>,
     ) -> Result<Self> {
         let params = ReadParams {
             index_cache_size_bytes: index_cache_size_bytes as usize,
@@ -101,6 +102,10 @@ impl BlockingDataset {
             builder = builder.with_version(ver as u64);
         }
         builder = builder.with_storage_options(storage_options);
+
+        if let Some(serialized_manifest) = serialized_manifest {
+            builder = builder.with_serialized_manifest(serialized_manifest)?;
+        }
 
         let inner = RT.block_on(builder.load())?;
         Ok(Self { inner })
@@ -211,7 +216,7 @@ impl BlockingDataset {
         Ok(stats)
     }
 
-    pub fn list_indexes(&self) -> Result<Arc<Vec<Index>>> {
+    pub fn list_indexes(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indexes = RT.block_on(self.inner.load_indices())?;
         Ok(indexes)
     }
@@ -701,6 +706,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
+    serialized_manifest: JObject, // Optional<ByteBuffer>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -711,11 +717,13 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
-            storage_options_obj
+            storage_options_obj,
+            serialized_manifest
         )
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
@@ -724,12 +732,14 @@ fn inner_open_native<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
+    serialized_manifest: JObject, // Optional<ByteBuffer>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+    let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
     let dataset = BlockingDataset::open(
         &path_str,
         version,
@@ -737,6 +747,7 @@ fn inner_open_native<'local>(
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
+        serialized_manifest,
     )?;
     dataset.into_java(env)
 }
@@ -1756,64 +1767,75 @@ fn convert_java_compaction_options_to_rust(
     env: &mut JNIEnv,
     java_options: JObject,
 ) -> Result<RustCompactionOptions> {
-    // Extract all field values directly from Java object fields to minimize JNI calls
     let target_rows_per_fragment = env
-        .get_field(&java_options, "targetRowsPerFragment", "I")?
-        .i()? as usize;
-
-    let max_rows_per_group = env.get_field(&java_options, "maxRowsPerGroup", "I")?.i()? as usize;
-
+        .call_method(
+            &java_options,
+            "getTargetRowsPerFragment",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_rows_per_group = env
+        .call_method(
+            &java_options,
+            "getMaxRowsPerGroup",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_bytes_per_file = env
+        .call_method(
+            &java_options,
+            "getMaxBytesPerFile",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
     let materialize_deletions = env
-        .get_field(&java_options, "materializeDeletions", "Z")?
-        .z()?;
-
+        .call_method(
+            &java_options,
+            "getMaterializeDeletions",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
     let materialize_deletions_threshold = env
-        .get_field(&java_options, "materializeDeletionsThreshold", "F")?
-        .f()?;
-
-    let defer_index_remap = env.get_field(&java_options, "deferIndexRemap", "Z")?.z()?;
-
-    // Extract Optional<Integer> fields efficiently
-    let max_bytes_per_file =
-        extract_optional_integer(env, &java_options, "maxBytesPerFile")?.map(|i| i as usize);
-
-    let num_threads =
-        extract_optional_integer(env, &java_options, "numThreads")?.map(|i| i as usize);
-
-    let batch_size = extract_optional_integer(env, &java_options, "batchSize")?.map(|i| i as usize);
-
-    Ok(RustCompactionOptions {
-        target_rows_per_fragment,
-        max_rows_per_group,
-        max_bytes_per_file,
-        materialize_deletions,
-        materialize_deletions_threshold,
-        num_threads,
-        batch_size,
-        defer_index_remap,
-    })
-}
-
-// Helper function to efficiently extract Optional<Integer> fields
-fn extract_optional_integer(
-    env: &mut JNIEnv,
-    java_obj: &JObject,
-    field_name: &str,
-) -> Result<Option<i32>> {
-    let optional_field = env
-        .get_field(java_obj, field_name, "Ljava/util/Optional;")?
+        .call_method(
+            &java_options,
+            "getMaterializeDeletionsThreshold",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let num_threads = env
+        .call_method(
+            &java_options,
+            "getNumThreads",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let batch_size = env
+        .call_method(&java_options, "getBatchSize", "()Ljava/util/Optional;", &[])?
+        .l()?;
+    let defer_index_remap = env
+        .call_method(
+            &java_options,
+            "getDeferIndexRemap",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
         .l()?;
 
-    if env
-        .call_method(&optional_field, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let integer_obj = env
-            .call_method(optional_field, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let value = env.call_method(integer_obj, "intValue", "()I", &[])?.i()?;
-        Ok(Some(value))
-    } else {
-        Ok(None)
-    }
+    build_compaction_options(
+        env,
+        &target_rows_per_fragment,
+        &max_rows_per_group,
+        &max_bytes_per_file,
+        &materialize_deletions,
+        &materialize_deletions_threshold,
+        &num_threads,
+        &batch_size,
+        &defer_index_remap,
+    )
 }

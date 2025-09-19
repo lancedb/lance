@@ -9,7 +9,6 @@ import platform
 import random
 import re
 import time
-import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List
@@ -1530,10 +1529,17 @@ def test_data_files(tmp_path: Path):
 
     data_files = fragment.files
     assert len(data_files) == 1
-    # it is a valid uuid
+    # Filename should be in format: 24-bit binary prefix + 26 hex chars
     with pytest.warns(DeprecationWarning):
         path = data_files[0].path()
-    uuid.UUID(os.path.splitext(path)[0])
+    filename_without_ext = os.path.splitext(path)[0]
+
+    # Should be 50 characters: 24 binary + 26 hex
+    assert len(filename_without_ext) == 50
+    # First 24 should be binary (0s and 1s)
+    assert all(c in "01" for c in filename_without_ext[:24])
+    # Last 26 should be hex
+    assert all(c in "0123456789abcdef" for c in filename_without_ext[24:])
 
     assert fragment.deletion_file is None
 

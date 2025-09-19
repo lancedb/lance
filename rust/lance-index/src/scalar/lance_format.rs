@@ -3,14 +3,10 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use std::cmp::min;
-use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
-
+use super::{IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
@@ -26,8 +22,9 @@ use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
-
-use super::{IndexReader, IndexStore, IndexWriter};
+use std::cmp::min;
+use std::collections::HashMap;
+use std::{any::Any, sync::Arc};
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -370,7 +367,7 @@ pub mod tests {
             )
             .unwrap();
         btree_plugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
@@ -868,6 +865,7 @@ pub mod tests {
             &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
         )
         .await
         .unwrap();
@@ -913,7 +911,7 @@ pub mod tests {
             .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
             .unwrap();
         BitmapIndexPlugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
@@ -1401,7 +1399,7 @@ pub mod tests {
             )
             .unwrap();
         LabelListIndexPlugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }

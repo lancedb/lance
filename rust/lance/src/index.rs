@@ -52,7 +52,7 @@ use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
     CachedFileSize,
 };
-use lance_table::format::Index as IndexMetadata;
+use lance_table::format::IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;

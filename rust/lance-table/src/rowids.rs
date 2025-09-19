@@ -579,56 +579,80 @@ pub fn rechunk_sequences(
     allow_incomplete: bool,
 ) -> Result<Vec<RowIdSequence>> {
     // TODO: return an iterator. (with a good size hint?)
-    let chunk_size_iter = chunk_sizes.into_iter();
-    let mut chunked_sequences = Vec::with_capacity(chunk_size_iter.size_hint().0);
+    let chunk_sizes_vec: Vec<u64> = chunk_sizes.into_iter().collect();
+    let total_chunks = chunk_sizes_vec.len();
+    let mut chunked_sequences = Vec::with_capacity(total_chunks);
     let mut segment_iter = sequences
         .into_iter()
         .flat_map(|sequence| sequence.0.into_iter())
         .peekable();
 
+    let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
+        Error::invalid_input(
+            format!(
+                "Got too few segments for chunk {}. Expected chunk size: {}, remaining needed: {}",
+                chunk_index, expected_chunk_size, remaining
+            ),
+            location!(),
+        )
+    };
+
+    let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
+        Error::invalid_input(
+            format!(
+                "Got too many segments for the provided chunk lengths. Processed {} chunks out of {} expected",
+                processed_chunks, total_chunk_sizes
+            ),
+            location!(),
+        )
+    };
+
     let mut segment_offset = 0_u64;
-    for chunk_size in chunk_size_iter {
+
+    for (chunk_index, chunk_size) in chunk_sizes_vec.iter().enumerate() {
+        let chunk_size = *chunk_size;
         let mut sequence = RowIdSequence(Vec::new());
         let mut remaining = chunk_size;
-
-        let too_many_segments_error = || {
-            Error::invalid_input(
-                "Got too many segments for the provided chunk lengths",
-                location!(),
-            )
-        };
 
         while remaining > 0 {
             let remaining_in_segment = segment_iter
                 .peek()
                 .map_or(0, |segment| segment.len() as u64 - segment_offset);
-            match (remaining_in_segment.cmp(&remaining), remaining_in_segment) {
-                (std::cmp::Ordering::Greater, _) => {
-                    // Can only push part of the segment, we are done with this chunk.
+
+            // Step 1: Handle segment remaining to be empty(also empty seg) - skip and continue
+            if remaining_in_segment == 0 {
+                if segment_iter.next().is_some() {
+                    segment_offset = 0;
+                    continue;
+                } else {
+                    // No more segments available
+                    if allow_incomplete {
+                        break;
+                    } else {
+                        return Err(too_few_segments_error(chunk_index, chunk_size, remaining));
+                    }
+                }
+            }
+
+            // Step 2: Handle still remaining segment based on size comparison
+            match remaining_in_segment.cmp(&remaining) {
+                std::cmp::Ordering::Greater => {
+                    // Segment is larger than remaining space - slice it
                     let segment = segment_iter
                         .peek()
-                        .ok_or_else(too_many_segments_error)?
+                        .ok_or_else(|| too_few_segments_error(chunk_index, chunk_size, remaining))?
                         .slice(segment_offset as usize, remaining as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset += remaining;
                     remaining = 0;
                 }
-                (_, 0) => {
-                    // Can push the entire segment.
-                    if let Some(segment) = segment_iter.next() {
-                        sequence.extend(RowIdSequence(vec![segment]));
-                        remaining = 0;
-                    } else if allow_incomplete {
-                        remaining = 0;
-                    } else {
-                        return Err(too_many_segments_error());
-                    }
-                }
-                (_, _) => {
-                    // Push remaining segment
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+                    // UNIFIED HANDLING: Both equal and less cases subtract from remaining
+                    // Equal case: remaining -= remaining_in_segment (remaining becomes 0)
+                    // Less case: remaining -= remaining_in_segment (remaining becomes positive)
                     let segment = segment_iter
                         .next()
-                        .ok_or_else(too_many_segments_error)?
+                        .ok_or_else(|| too_few_segments_error(chunk_index, chunk_size, remaining))?
                         .slice(segment_offset as usize, remaining_in_segment as usize);
                     sequence.extend(RowIdSequence(vec![segment]));
                     segment_offset = 0;
@@ -641,9 +665,9 @@ pub fn rechunk_sequences(
     }
 
     if segment_iter.peek().is_some() {
-        return Err(Error::invalid_input(
-            "Got too few segments for the provided chunk lengths",
-            location!(),
+        return Err(too_many_segments_error(
+            chunked_sequences.len(),
+            total_chunks,
         ));
     }
 
@@ -1191,5 +1215,106 @@ mod test {
         let mask = RowIdMask::allow_nothing();
         let ranges = sequence.mask_to_offset_ranges(&mask);
         assert_eq!(ranges, vec![]);
+    }
+
+    #[test]
+    fn test_row_id_sequence_rechunk_with_empty_segments() {
+        // equal case (segment exactly fills remaining space)
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(20..23), // [20, 21, 22] - 3 elements
+        ];
+        let chunk_sizes = vec![2, 3]; // First chunk wants 2, second wants 3
+
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 2);
+        assert_eq!(result[1].len(), 3);
+
+        let first_chunk: Vec<u64> = result[0].iter().collect();
+        let second_chunk: Vec<u64> = result[1].iter().collect();
+        assert_eq!(first_chunk, vec![0, 1]);
+        assert_eq!(second_chunk, vec![20, 21, 22]);
+
+        // less case (segment smaller than remaining space)
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements (less than remaining)
+            RowIdSequence::from(20..21), // [20] - 1 element (less than remaining)
+            RowIdSequence::from(30..32), // [30, 31] - 2 elements (exactly fills remaining)
+        ];
+        let chunk_sizes = vec![5]; // Request 5 elements, have exactly 5
+
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 5);
+
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 1, 20, 30, 31]);
+
+        // empty segment in the middle
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(10..10), // [] - 0 elements (empty)
+            RowIdSequence::from(20..22), // [20, 21] - 2 elements
+        ];
+        let chunk_sizes = vec![3, 1];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(result[1].len(), 1);
+
+        let first_chunk_elements: Vec<u64> = result[0].iter().collect();
+        let second_chunk_elements: Vec<u64> = result[1].iter().collect();
+        assert_eq!(first_chunk_elements, vec![0, 1, 20]);
+        assert_eq!(second_chunk_elements, vec![21]);
+
+        // multiple empty segments
+        let input_sequences = vec![
+            RowIdSequence::from(0..1),   // [0] - 1 element
+            RowIdSequence::from(10..10), // [] - 0 elements (empty)
+            RowIdSequence::from(20..20), // [] - 0 elements (empty)
+            RowIdSequence::from(30..32), // [30, 31] - 2 elements
+        ];
+        let chunk_sizes = vec![3];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 3);
+
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 30, 31]);
+
+        // empty segment at chunk boundary
+        let input_sequences = vec![
+            RowIdSequence::from(0..3), // [0, 1, 2] - 3 elements (exactly fills first chunk)
+            RowIdSequence::from(10..10), // [] - 0 elements (empty, at boundary)
+            RowIdSequence::from(20..22), // [20, 21] - 2 elements (for second chunk)
+        ];
+        let chunk_sizes = vec![3, 2];
+        let result = rechunk_sequences(input_sequences, chunk_sizes, false).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].len(), 3);
+        assert_eq!(result[1].len(), 2);
+
+        let first_chunk_elements: Vec<u64> = result[0].iter().collect();
+        let second_chunk_elements: Vec<u64> = result[1].iter().collect();
+        assert_eq!(first_chunk_elements, vec![0, 1, 2]);
+        assert_eq!(second_chunk_elements, vec![20, 21]);
+
+        // empty segments with allow_incomplete = true
+        let input_sequences = vec![
+            RowIdSequence::from(0..2),   // [0, 1] - 2 elements
+            RowIdSequence::from(10..10), // [] - 0 elements (empty)
+        ];
+        let chunk_sizes = vec![5]; // Request more than available
+        let result = rechunk_sequences(input_sequences, chunk_sizes, true).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 2);
+
+        let elements: Vec<u64> = result[0].iter().collect();
+        assert_eq!(elements, vec![0, 1]);
     }
 }

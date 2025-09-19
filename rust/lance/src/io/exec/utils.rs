@@ -1,12 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
     IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
-use lance_table::format::Index;
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
+use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
@@ -49,7 +50,7 @@ pub(crate) fn build_prefilter(
     partition: usize,
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
-    index_meta: &[Index],
+    index_meta: &[IndexMetadata],
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {

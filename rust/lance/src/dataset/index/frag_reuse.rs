@@ -7,7 +7,7 @@ use crate::Dataset;
 use lance_core::Error;
 use lance_index::frag_reuse::{FragReuseIndexDetails, FragReuseVersion, FRAG_REUSE_INDEX_NAME};
 use lance_index::is_system_index;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
 use roaring::RoaringBitmap;
@@ -101,7 +101,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
 
 fn is_index_remap_caught_up(
     frag_reuse_version: &FragReuseVersion,
-    index_meta: &Index,
+    index_meta: &IndexMetadata,
 ) -> lance_core::Result<bool> {
     if is_system_index(index_meta) {
         return Ok(true);

@@ -1602,14 +1602,10 @@ mod tests {
                     .unwrap();
 
             dataset
-                .optimize_indices(&OptimizeOptions {
-                    num_indices_to_merge: 1,
-                    index_names: Some(vec![
-                        "fully_indexed_idx".to_string(),
-                        "recheck_idx_idx".to_string(),
-                    ]),
-                    retrain: false,
-                })
+                .optimize_indices(&OptimizeOptions::new().index_names(vec![
+                    "fully_indexed_idx".to_string(),
+                    "recheck_idx_idx".to_string(),
+                ]))
                 .await
                 .unwrap();
 

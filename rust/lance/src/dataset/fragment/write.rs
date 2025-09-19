@@ -23,6 +23,46 @@ use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
 use crate::Result;
 
+/// Generates a filename optimized for S3 throughput using a UUID-based approach.
+///
+/// This approach follows Apache Iceberg's ObjectStoreLocationProvider pattern:
+/// - Takes a UUID (16 bytes total)
+/// - Uses first 3 bytes (24 bits) as binary string prefix for S3 distribution
+/// - Uses remaining 13 bytes as hex string for uniqueness
+///
+/// Format: `<24-bit-binary><remaining-hex>`
+/// Example: "101100101101010011010110a1b2c3d4e5f6g7h8i9j0"
+///
+/// We use binary instead of hex for the prefix because it helps S3 scale up on the
+/// prefix faster with fewer throttling and retries. Binary provides maximum entropy per character
+/// (1 bit) compared to hex (4 bits), allowing S3's internal partitioning to more
+/// quickly recognize the access pattern and scale appropriately.
+///
+/// The binary prefix ensures files are distributed evenly across S3 prefixes,
+/// minimizing throttling and maximizing throughput, while maintaining uniqueness.
+pub(crate) fn generate_random_filename() -> String {
+    let uuid = Uuid::new_v4();
+    let bytes = uuid.as_bytes();
+
+    let mut out = String::with_capacity(50);
+
+    // Convert first 3 bytes to binary string (24 bits)
+    for &b in &bytes[..3] {
+        for i in (0..8).rev() {
+            out.push(if (b >> i) & 1 == 1 { '1' } else { '0' });
+        }
+    }
+
+    // Convert remaining 13 bytes to hex string (26 chars)
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in &bytes[3..] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+
+    out
+}
+
 /// Builder for writing a new fragment.
 ///
 /// This builder can be re-used to write multiple fragments.
@@ -94,7 +134,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
-        let filename = format!("{}.lance", Uuid::new_v4());
+        let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
@@ -199,7 +239,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
-        let filename = format!("{}.lance", Uuid::new_v4());
+        let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let mut writer = FileWriter::<ManifestDescribing>::try_new(
@@ -518,5 +558,39 @@ mod tests {
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
+    }
+
+    #[test]
+    fn test_binary_filename_generation() {
+        use std::collections::HashSet;
+
+        // Test format and uniqueness
+        let mut filenames = HashSet::new();
+        for _ in 0..100 {
+            let filename = generate_random_filename();
+
+            // Should be 50 characters: 24 binary + 26 hex
+            assert_eq!(filename.len(), 50, "Filename should be 50 characters");
+
+            // First 24 should be binary
+            let binary_part = &filename[0..24];
+            assert!(
+                binary_part.chars().all(|c| c == '0' || c == '1'),
+                "First 24 chars should be binary: {}",
+                binary_part
+            );
+
+            // Last 26 should be hex
+            let hex_part = &filename[24..];
+            assert_eq!(hex_part.len(), 26, "Hex part should be 26 characters");
+            assert!(
+                hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+                "Last 26 chars should be hex: {}",
+                hex_part
+            );
+
+            // Should be unique
+            assert!(filenames.insert(filename.clone()));
+        }
     }
 }

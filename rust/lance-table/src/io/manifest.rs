@@ -22,7 +22,7 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
+use crate::format::{pb, DataStorageFormat, IndexMetadata, Manifest, MAGIC};
 
 use super::commit::ManifestLocation;
 
@@ -115,7 +115,7 @@ pub async fn read_manifest_indexes(
     object_store: &ObjectStore,
     location: &ManifestLocation,
     manifest: &Manifest,
-) -> Result<Vec<Index>> {
+) -> Result<Vec<IndexMetadata>> {
     if let Some(pos) = manifest.index_section.as_ref() {
         let reader = if let Some(size) = location.size {
             object_store
@@ -129,7 +129,7 @@ pub async fn read_manifest_indexes(
         let indices = section
             .indices
             .into_iter()
-            .map(Index::try_from)
+            .map(IndexMetadata::try_from)
             .collect::<Result<Vec<_>>>()?;
         Ok(indices)
     } else {
@@ -140,7 +140,7 @@ pub async fn read_manifest_indexes(
 async fn do_write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
 ) -> Result<usize> {
     // Write indices if presented.
     if let Some(indices) = indices.as_ref() {
@@ -158,7 +158,7 @@ async fn do_write_manifest(
 pub async fn write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);

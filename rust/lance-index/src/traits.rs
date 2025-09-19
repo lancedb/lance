@@ -9,7 +9,7 @@ use lance_core::{Error, Result};
 use snafu::location;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query
@@ -124,13 +124,13 @@ pub trait DatasetIndexExt {
     ///
     /// The indices are lazy loaded and cached in memory within the [`Dataset`] instance.
     /// The cache is invalidated when the dataset version (Manifest) is changed.
-    async fn load_indices(&self) -> Result<Arc<Vec<Index>>>;
+    async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>>;
 
     /// Loads all the indies of a given UUID.
     ///
     /// Note that it is possible to have multiple indices with the same UUID,
     /// as they are the deltas of the same index.
-    async fn load_index(&self, uuid: &str) -> Result<Option<Index>> {
+    async fn load_index(&self, uuid: &str) -> Result<Option<IndexMetadata>> {
         self.load_indices().await.map(|indices| {
             indices
                 .iter()
@@ -147,7 +147,7 @@ pub trait DatasetIndexExt {
     /// - `Ok(vec![])`: if the index does not exist.
     /// - `Err(e)`: if there is an error loading indices.
     ///
-    async fn load_indices_by_name(&self, name: &str) -> Result<Vec<Index>> {
+    async fn load_indices_by_name(&self, name: &str) -> Result<Vec<IndexMetadata>> {
         self.load_indices().await.map(|indices| {
             indices
                 .iter()
@@ -167,7 +167,7 @@ pub trait DatasetIndexExt {
     /// - `Ok(None)`: if the index does not exist.
     /// - `Err(e)`: Index error if there are multiple indexes sharing the same name.
     ///
-    async fn load_index_by_name(&self, name: &str) -> Result<Option<Index>> {
+    async fn load_index_by_name(&self, name: &str) -> Result<Option<IndexMetadata>> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             Ok(None)
@@ -186,7 +186,7 @@ pub trait DatasetIndexExt {
     async fn load_scalar_index<'a, 'b>(
         &'a self,
         criteria: ScalarIndexCriteria<'b>,
-    ) -> Result<Option<Index>>;
+    ) -> Result<Option<IndexMetadata>>;
 
     /// Optimize indices.
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()>;

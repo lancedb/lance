@@ -490,7 +490,7 @@ impl PhraseQueryExec {
     pub fn new(
         dataset: Arc<Dataset>,
         query: PhraseQuery,
-        params: FtsSearchParams,
+        mut params: FtsSearchParams,
         prefilter_source: PreFilterSource,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -499,7 +499,7 @@ impl PhraseQueryExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
-        assert_eq!(params.phrase_slop, Some(query.slop));
+        params = params.with_phrase_slop(Some(query.slop));
 
         Self {
             dataset,

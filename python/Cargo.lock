@@ -4118,6 +4118,7 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-table",
+ "libm",
  "lindera",
  "lindera-tantivy",
  "log",

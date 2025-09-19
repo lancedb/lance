@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::schema::LanceSchema;
+use crate::utils::{class_name, export_vec, extract_vec, PyLance};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
-    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{DataFile, Fragment, Index};
+use lance_table::format::{DataFile, Fragment, IndexMetadata};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
@@ -17,11 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::schema::LanceSchema;
-use crate::utils::{class_name, export_vec, extract_vec, PyLance};
-
 // Add Index bindings
-impl FromPyObject<'_> for PyLance<Index> {
+impl FromPyObject<'_> for PyLance<IndexMetadata> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         let uuid = ob.getattr("uuid")?.to_string();
         let name = ob.getattr("name")?.extract()?;
@@ -43,7 +42,7 @@ impl FromPyObject<'_> for PyLance<Index> {
             .extract::<Option<i64>>()?
             .map(|id| id as u32);
 
-        Ok(Self(Index {
+        Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
@@ -57,7 +56,7 @@ impl FromPyObject<'_> for PyLance<Index> {
     }
 }
 
-impl<'py> IntoPyObject<'py> for PyLance<&Index> {
+impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
     type Target = PyAny;
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
@@ -101,7 +100,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Index> {
     }
 }
 
-impl<'py> IntoPyObject<'py> for PyLance<Index> {
+impl<'py> IntoPyObject<'py> for PyLance<IndexMetadata> {
     type Target = PyAny;
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
@@ -138,6 +137,23 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
             .getattr("DataReplacementGroup")
             .expect("Failed to get DataReplacementGroup class");
         cls.call1((fragment_id, new_file))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PyUpdateMode(pub UpdateMode);
+
+impl FromPyObject<'_> for PyUpdateMode {
+    fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mode_str: String = ob.extract()?;
+        match mode_str.as_str() {
+            "rewrite_rows" => Ok(Self(UpdateMode::RewriteRows)),
+            "rewrite_columns" => Ok(Self(UpdateMode::RewriteColumns)),
+            _ => Err(PyValueError::new_err(format!(
+                "Invalid UpdateMode: {}. Valid options are: rewrite_rows, rewrite_columns",
+                mode_str
+            ))),
+        }
     }
 }
 
@@ -182,12 +198,25 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let fields_modified = ob.getattr("fields_modified")?.extract()?;
 
+                let fields_for_preserving_frag_bitmap = ob
+                    .getattr("fields_for_preserving_frag_bitmap")?
+                    .extract()
+                    .unwrap_or_default();
+
+                let update_mode = ob
+                    .getattr("update_mode")?
+                    .extract::<PyUpdateMode>()
+                    .ok()
+                    .map(|py_mode| py_mode.0);
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
                     mem_wal_to_merge: None,
+                    fields_for_preserving_frag_bitmap,
+                    update_mode,
                 };
                 Ok(Self(op))
             }
@@ -290,12 +319,25 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                fields_for_preserving_frag_bitmap,
+                update_mode,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let fields_modified = fields_modified.into_pyobject(py)?;
+                let fields_for_preserving_frag_bitmap =
+                    fields_for_preserving_frag_bitmap.into_pyobject(py)?;
+                let update_mode = match update_mode {
+                    Some(mode) => match mode {
+                        lance::dataset::transaction::UpdateMode::RewriteRows => "rewrite_rows",
+                        lance::dataset::transaction::UpdateMode::RewriteColumns => {
+                            "rewrite_columns"
+                        }
+                    },
+                    None => "rewrite_rows",
+                };
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -304,6 +346,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
+                    fields_for_preserving_frag_bitmap,
+                    update_mode,
                 ))
             }
             Operation::DataReplacement { replacements } => {

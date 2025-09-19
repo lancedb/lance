@@ -23,6 +23,8 @@
 #![allow(clippy::useless_conversion)]
 
 use std::env;
+use std::fs::OpenOptions;
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use std::ffi::CString;
@@ -151,6 +153,36 @@ fn set_timestamp_precision(builder: &mut env_logger::Builder) {
     }
 }
 
+fn set_log_file_target(builder: &mut env_logger::Builder) {
+    if let Ok(log_file_path) = env::var("LANCE_LOG_FILE") {
+        let path = Path::new(&log_file_path);
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                println!(
+                    "Failed to create parent directories for log file '{}': {}, using stderr",
+                    log_file_path, e
+                );
+                return;
+            }
+        }
+
+        // Try to open/create the log file
+        match OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                println!(
+                    "Failed to open log file '{}': {}, using stderr",
+                    log_file_path, e
+                );
+            }
+        }
+    }
+}
+
 #[pymodule]
 fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
@@ -158,6 +190,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .write_style("LANCE_LOG_STYLE");
     let mut log_builder = env_logger::Builder::from_env(env);
     set_timestamp_precision(&mut log_builder);
+    set_log_file_target(&mut log_builder);
     init_logging(log_builder);
 
     m.add_class::<FFILanceTableProvider>()?;

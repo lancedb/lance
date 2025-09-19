@@ -46,6 +46,7 @@
 //!
 
 use super::ManifestWriteConfig;
+use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
@@ -57,10 +58,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
-    format::{
-        pb::{self, IndexMetadata},
-        DataFile, DataStorageFormat, Fragment, Index, Manifest, RowIdMeta,
-    },
+    format::{pb, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta},
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
@@ -132,9 +130,9 @@ pub enum Operation {
     /// A new index has been created.
     CreateIndex {
         /// The new secondary indices that are being added
-        new_indices: Vec<Index>,
+        new_indices: Vec<IndexMetadata>,
         /// The indices that have been modified.
-        removed_indices: Vec<Index>,
+        removed_indices: Vec<IndexMetadata>,
     },
     /// Data is rewritten but *not* modified. This is used for things like
     /// compaction or re-ordering. Contains the old fragments and the new
@@ -149,7 +147,7 @@ pub enum Operation {
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
-        frag_reuse_index: Option<Index>,
+        frag_reuse_index: Option<IndexMetadata>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
@@ -212,6 +210,11 @@ pub enum Operation {
         fields_modified: Vec<u32>,
         /// The MemWAL (pre-image) that should be marked as merged after this transaction
         mem_wal_to_merge: Option<MemWal>,
+        /// The fields that used to judge whether to preserve the new frag's id into
+        /// the frag bitmap of the specified indices.
+        fields_for_preserving_frag_bitmap: Vec<u32>,
+        /// The mode of update
+        update_mode: Option<UpdateMode>,
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
@@ -238,6 +241,19 @@ pub enum Operation {
         ref_version: u64,
         ref_path: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub enum UpdateMode {
+    /// rows are deleted in current fragments and rewritten in new fragments.
+    /// This is most optimal when the majority of columns are being rewritten
+    /// or only a few rows are being updated.
+    RewriteRows,
+
+    /// within each fragment, columns are fully rewritten and inserted as new data files.
+    /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
+    /// but a small subset of columns are affected.
+    RewriteColumns,
 }
 
 impl std::fmt::Display for Operation {
@@ -372,6 +388,8 @@ impl PartialEq for Operation {
                     new_fragments: a_new,
                     fields_modified: a_fields,
                     mem_wal_to_merge: a_mem_wal_to_merge,
+                    fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
+                    update_mode: a_update_mode,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
@@ -379,6 +397,8 @@ impl PartialEq for Operation {
                     new_fragments: b_new,
                     fields_modified: b_fields,
                     mem_wal_to_merge: b_mem_wal_to_merge,
+                    fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
+                    update_mode: b_update_mode,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
@@ -386,6 +406,11 @@ impl PartialEq for Operation {
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
                     && a_mem_wal_to_merge == b_mem_wal_to_merge
+                    && compare_vec(
+                        a_fields_for_preserving_frag_bitmap,
+                        b_fields_for_preserving_frag_bitmap,
+                    )
+                    && a_update_mode == b_update_mode
             }
             (Self::Project { schema: a }, Self::Project { schema: b }) => a == b,
             (
@@ -1262,7 +1287,7 @@ impl Transaction {
         version: u64,
         config: &ManifestWriteConfig,
         tx_path: &str,
-    ) -> Result<(Manifest, Vec<Index>)> {
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let location = commit_handler
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
@@ -1279,11 +1304,11 @@ impl Transaction {
     pub(crate) fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
-        current_indices: Vec<Index>,
+        current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
         new_blob_version: Option<u64>,
-    ) -> Result<(Manifest, Vec<Index>)> {
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
@@ -1395,6 +1420,8 @@ impl Transaction {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_merge,
+                fields_for_preserving_frag_bitmap,
+                update_mode,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
                     if removed_fragment_ids.contains(&f.id) {
@@ -1417,6 +1444,29 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+
+                if config.use_stable_row_ids
+                    && update_mode.is_some()
+                    && *update_mode == Some(RewriteRows)
+                {
+                    let pure_updated_frag_ids =
+                        Self::collect_pure_rewrite_row_update_frags_ids(&new_fragments)?;
+
+                    // collect all the original frag ids that contains the updated rows
+                    let original_fragment_ids: Vec<u64> = removed_fragment_ids
+                        .iter()
+                        .chain(updated_fragments.iter().map(|f| &f.id))
+                        .copied()
+                        .collect();
+
+                    Self::register_pure_rewrite_rows_update_frags_in_indices(
+                        &mut final_indices,
+                        &pure_updated_frag_ids,
+                        &original_fragment_ids,
+                        fields_for_preserving_frag_bitmap,
+                    );
+                }
+
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
@@ -1752,10 +1802,49 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
+    fn register_pure_rewrite_rows_update_frags_in_indices(
+        indices: &mut [IndexMetadata],
+        pure_update_frag_ids: &[u64],
+        original_fragment_ids: &[u64],
+        fields_for_preserving_frag_bitmap: &[u32],
+    ) {
+        if pure_update_frag_ids.is_empty() {
+            return;
+        }
+
+        let value_updated_field_set = fields_for_preserving_frag_bitmap
+            .iter()
+            .collect::<HashSet<_>>();
+
+        for index in indices.iter_mut() {
+            let index_covers_modified_field = index.fields.iter().any(|field_id| {
+                value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
+            });
+
+            if !index_covers_modified_field {
+                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                    // check if all the original fragments contains the updating rows are covered
+                    // by the index(index fragment bitmap contains these frag ids).
+                    // if not, that means not all the updating rows are indexed, so we could not
+                    // index them.
+                    let index_covers_all_original_fragments = original_fragment_ids
+                        .iter()
+                        .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
+
+                    if index_covers_all_original_fragments {
+                        for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
+                            fragment_bitmap.insert(fragment_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
     fn prune_updated_fields_from_indices(
-        indices: &mut [Index],
+        indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
     ) {
@@ -1781,7 +1870,7 @@ impl Transaction {
         }
     }
 
-    fn is_vector_index(index: &Index) -> bool {
+    fn is_vector_index(index: &IndexMetadata) -> bool {
         if let Some(details) = &index.index_details {
             details.type_url.ends_with("VectorIndexDetails")
         } else {
@@ -1800,7 +1889,11 @@ impl Transaction {
         }
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, _fragments: &[Fragment]) {
+    fn retain_relevant_indices(
+        indices: &mut Vec<IndexMetadata>,
+        schema: &Schema,
+        _fragments: &[Fragment],
+    ) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
@@ -1821,7 +1914,7 @@ impl Transaction {
 
         // Apply retention logic for indices with empty bitmaps per index name
         // (except for fragment reuse indices which are always kept)
-        let mut indices_by_name: std::collections::HashMap<String, Vec<&Index>> =
+        let mut indices_by_name: std::collections::HashMap<String, Vec<&IndexMetadata>> =
             std::collections::HashMap::new();
 
         // Group indices by name
@@ -1853,7 +1946,7 @@ impl Transaction {
                     // All indices are empty - for scalar indices, keep only the first (oldest) one
                     // For vector indices, remove all of them
                     let mut sorted_indices = empty_indices;
-                    sorted_indices.sort_by_key(|index: &&Index| index.dataset_version); // Sort by ascending dataset_version
+                    sorted_indices.sort_by_key(|index: &&IndexMetadata| index.dataset_version); // Sort by ascending dataset_version
 
                     // Keep only the first (oldest) if it's not a vector index
                     if let Some(oldest) = sorted_indices.first() {
@@ -1923,7 +2016,7 @@ impl Transaction {
     }
 
     fn handle_rewrite_indices(
-        indices: &mut [Index],
+        indices: &mut [IndexMetadata],
         rewritten_indices: &[RewrittenIndex],
         groups: &[RewriteGroup],
     ) -> Result<()> {
@@ -2003,6 +2096,36 @@ impl Transaction {
             }
         }
         Ok(())
+    }
+
+    /// collect the pure(the num of row IDs are equal to the physical rows) "rewrite rows" updated fragment ids
+    fn collect_pure_rewrite_row_update_frags_ids(fragments: &[Fragment]) -> Result<Vec<u64>> {
+        let mut pure_update_frag_ids = Vec::new();
+
+        for fragment in fragments {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
+                message: "Fragment does not have physical rows".into(),
+                location: location!(),
+            })? as u64;
+
+            if let Some(row_id_meta) = &fragment.row_id_meta {
+                let existing_row_count = match row_id_meta {
+                    RowIdMeta::Inline(data) => {
+                        let sequence = read_row_ids(data)?;
+                        sequence.len() as u64
+                    }
+                    _ => 0,
+                };
+
+                // only filter the fragments that match: all the rows have row id,
+                // which means it does not contain inserted rows in this fragment
+                if existing_row_count == physical_rows {
+                    pure_update_frag_ids.push(fragment.id);
+                }
+            }
+        }
+
+        Ok(pure_update_frag_ids)
     }
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
@@ -2212,11 +2335,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .into_iter()
-                    .map(Index::try_from)
+                    .map(IndexMetadata::try_from)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .into_iter()
-                    .map(Index::try_from)
+                    .map(IndexMetadata::try_from)
                     .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -2239,6 +2362,8 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_merge,
+                fields_for_preserving_frag_bitmap,
+                update_mode,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -2251,6 +2376,12 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
                 mem_wal_to_merge: mem_wal_to_merge.map(|m| MemWal::try_from(m).unwrap()),
+                fields_for_preserving_frag_bitmap,
+                update_mode: match update_mode {
+                    0 => Some(UpdateMode::RewriteRows),
+                    1 => Some(UpdateMode::RewriteColumns),
+                    _ => Some(UpdateMode::RewriteRows),
+                },
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
@@ -2509,8 +2640,11 @@ impl From<&Transaction> for pb::Transaction {
                 new_indices,
                 removed_indices,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(IndexMetadata::from).collect(),
-                removed_indices: removed_indices.iter().map(IndexMetadata::from).collect(),
+                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+                removed_indices: removed_indices
+                    .iter()
+                    .map(pb::IndexMetadata::from)
+                    .collect(),
             }),
             Operation::Merge { fragments, schema } => {
                 pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -2528,6 +2662,8 @@ impl From<&Transaction> for pb::Transaction {
                 new_fragments,
                 fields_modified,
                 mem_wal_to_merge,
+                fields_for_preserving_frag_bitmap,
+                update_mode,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
                 updated_fragments: updated_fragments
@@ -2536,9 +2672,15 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 fields_modified: fields_modified.clone(),
-                mem_wal_to_merge: mem_wal_to_merge
+                mem_wal_to_merge: mem_wal_to_merge.as_ref().map(|m| m.into()),
+                fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
+                update_mode: update_mode
                     .as_ref()
-                    .map(pb::mem_wal_index_details::MemWal::from),
+                    .map(|mode| match mode {
+                        UpdateMode::RewriteRows => 0,
+                        UpdateMode::RewriteColumns => 1,
+                    })
+                    .unwrap_or(0),
             }),
             Operation::Project { schema } => {
                 pb::transaction::Operation::Project(pb::transaction::Project {

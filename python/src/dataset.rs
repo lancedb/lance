@@ -1464,9 +1464,6 @@ impl Dataset {
                         .map_err(|err| PyValueError::new_err(err.to_string()))?,
                 );
             }
-            if let Some(retrain) = kwargs.get_item("retrain")? {
-                options.retrain = retrain.extract()?;
-            }
         }
         RT.block_on(
             None,
@@ -1684,47 +1681,41 @@ impl Dataset {
             .infer_error()
     }
 
-    #[pyo3(signature = (index_uuid))]
-    fn merge_index_metadata(&self, index_uuid: &str) -> PyResult<()> {
+    #[pyo3(signature = (index_uuid, index_type, batch_readhead))]
+    fn merge_index_metadata(
+        &self,
+        index_uuid: &str,
+        index_type: &str,
+        batch_readhead: Option<usize>,
+    ) -> PyResult<()> {
         RT.block_on(None, async {
             let store = LanceIndexStore::from_dataset_for_new(self.ds.as_ref(), index_uuid)?;
             let index_dir = self.ds.indices_dir().child(index_uuid);
-
-            // List all partition metadata files in the index directory
-            let mut part_metadata_files = Vec::new();
-            let mut list_stream = self.ds.object_store().list(Some(index_dir.clone()));
-
-            while let Some(item) = list_stream.next().await {
-                match item {
-                    Ok(meta) => {
-                        let file_name = meta.location.filename().unwrap_or_default();
-                        // Filter files matching the pattern part_*_metadata.lance
-                        if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance")
-                        {
-                            part_metadata_files.push(file_name.to_string());
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-
-            if part_metadata_files.is_empty() {
-                return Err(Error::InvalidInput {
-                    source: format!(
-                        "No partition metadata files found in index directory: {}",
-                        index_dir
+            match index_type.to_uppercase().as_str() {
+                "INVERTED" => {
+                    // Call merge_index_files function for inverted index
+                    lance_index::scalar::inverted::builder::merge_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
+                        Arc::new(store),
                     )
-                    .into(),
+                    .await
+                }
+                "BTREE" => {
+                    // Call merge_index_files function for btree index
+                    lance_index::scalar::btree::merge_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
+                        Arc::new(store),
+                        batch_readhead,
+                    )
+                    .await
+                }
+                _ => Err(Error::InvalidInput {
+                    source: format!("Index type {} is not supported.", index_type).into(),
                     location: location!(),
-                });
+                }),
             }
-
-            // Call merge_metadata_files function for inverted index
-            lance_index::scalar::inverted::builder::merge_metadata_files(
-                Arc::new(store),
-                &part_metadata_files,
-            )
-            .await
         })?
         .map_err(|err| PyValueError::new_err(err.to_string()))
     }

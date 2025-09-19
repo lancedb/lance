@@ -13,6 +13,7 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.compaction.CompactionOptions;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.operation.Append;
@@ -41,7 +42,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.ZonedDateTime;
@@ -55,6 +58,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -346,6 +350,39 @@ public class DatasetTest {
           () -> {
             Dataset.open(datasetPath, allocator);
           });
+    }
+  }
+
+  @Test
+  void testOpenSerializedManifest(@TempDir Path tempDir) throws IOException, URISyntaxException {
+    Path datasetPath = tempDir.resolve("serialized_manifest");
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath.toString());
+
+      try (Dataset dataset1 = testDataset.createEmptyDataset()) {
+        assertEquals(1, dataset1.version());
+        Path manifestPath = datasetPath.resolve("_versions");
+        Stream<Path> fileStream = Files.list(manifestPath);
+        assertEquals(1, fileStream.count());
+        Path filePath = manifestPath.resolve("1.manifest");
+        byte[] manifestBytes = Files.readAllBytes(filePath);
+        // Need to trim the magic number at end and message length at beginning
+        // https://github.com/lancedb/lance/blob/main/rust/lance-table/src/io/manifest.rs#L95-L96
+        byte[] trimmedManifest = Arrays.copyOfRange(manifestBytes, 4, manifestBytes.length - 16);
+        ByteBuffer manifestBuffer = ByteBuffer.allocateDirect(trimmedManifest.length);
+        manifestBuffer.put(trimmedManifest);
+        manifestBuffer.flip();
+        try (Dataset dataset2 = testDataset.write(1, 5)) {
+          assertEquals(2, dataset2.version());
+          assertEquals(2, dataset2.latestVersion());
+          // When reading from the serialized manifest, it shouldn't know about the second dataset
+          ReadOptions readOptions =
+              new ReadOptions.Builder().setSerializedManifest(manifestBuffer).build();
+          Dataset dataset1Manifest = Dataset.open(allocator, datasetPath.toString(), readOptions);
+          assertEquals(1, dataset1Manifest.version());
+        }
+      }
     }
   }
 
@@ -1048,10 +1085,10 @@ public class DatasetTest {
         // Test compact with custom options
         CompactionOptions customOptions =
             CompactionOptions.builder()
-                .setTargetRowsPerFragment(20)
-                .setMaxRowsPerGroup(1024)
-                .setMaterializeDeletions(true)
-                .setMaterializeDeletionsThreshold(0.1f)
+                .withTargetRowsPerFragment(20)
+                .withMaxRowsPerGroup(1024)
+                .withMaterializeDeletions(true)
+                .withMaterializeDeletionsThreshold(0.1f)
                 .build();
 
         long preCustomCompactVersion = dataset2.version();
@@ -1061,14 +1098,10 @@ public class DatasetTest {
         assertEquals(10, dataset2.countRows());
 
         // Test that CompactionOptions getters work correctly
-        assertEquals(20, customOptions.getTargetRowsPerFragment());
-        assertEquals(1024, customOptions.getMaxRowsPerGroup());
-        assertTrue(customOptions.isMaterializeDeletions());
-        assertEquals(0.1f, customOptions.getMaterializeDeletionsThreshold(), 0.001f);
+        assertEquals(20, customOptions.getTargetRowsPerFragment().get());
+        assertEquals(1024, customOptions.getMaxRowsPerGroup().get());
+        assertEquals(0.1f, customOptions.getMaterializeDeletionsThreshold().get(), 0.001f);
         assertFalse(customOptions.getMaxBytesPerFile().isPresent());
-        assertFalse(customOptions.getNumThreads().isPresent());
-        assertFalse(customOptions.getBatchSize().isPresent());
-        assertFalse(customOptions.isDeferIndexRemap());
       }
     }
   }
@@ -1095,8 +1128,8 @@ public class DatasetTest {
         // Compact with deletion materialization
         CompactionOptions options =
             CompactionOptions.builder()
-                .setMaterializeDeletions(true)
-                .setMaterializeDeletionsThreshold(0.2f) // 20% threshold
+                .withMaterializeDeletions(true)
+                .withMaterializeDeletionsThreshold(0.2f) // 20% threshold
                 .build();
 
         dataset2.compact(options);
@@ -1131,12 +1164,12 @@ public class DatasetTest {
         // Test compact with maxBytesPerFile and batchSize options
         CompactionOptions options =
             CompactionOptions.builder()
-                .setTargetRowsPerFragment(100)
-                .setMaxBytesPerFile(1024 * 1024) // 1MB limit
-                .setBatchSize(10) // Process 10 rows at a time
-                .setNumThreads(2) // Use 2 threads
-                .setMaterializeDeletions(false)
-                .setDeferIndexRemap(true)
+                .withTargetRowsPerFragment(100)
+                .withMaxBytesPerFile(1024 * 1024) // 1MB limit
+                .withBatchSize(10) // Process 10 rows at a time
+                .withNumThreads(2) // Use 2 threads
+                .withMaterializeDeletions(false)
+                .withDeferIndexRemap(true)
                 .build();
 
         dataset2.compact(options);
@@ -1148,15 +1181,15 @@ public class DatasetTest {
         assertEquals(50, dataset2.countRows());
 
         // Test that all options are set correctly
-        assertEquals(100, options.getTargetRowsPerFragment());
+        assertEquals(100, options.getTargetRowsPerFragment().get());
         assertTrue(options.getMaxBytesPerFile().isPresent());
         assertEquals(1024 * 1024, options.getMaxBytesPerFile().get().intValue());
         assertTrue(options.getBatchSize().isPresent());
         assertEquals(10, options.getBatchSize().get().intValue());
         assertTrue(options.getNumThreads().isPresent());
         assertEquals(2, options.getNumThreads().get().intValue());
-        assertFalse(options.isMaterializeDeletions());
-        assertTrue(options.isDeferIndexRemap());
+        assertFalse(options.getMaterializeDeletions().get());
+        assertTrue(options.getDeferIndexRemap().get());
       }
     }
   }
@@ -1190,8 +1223,8 @@ public class DatasetTest {
         // Second compaction with deletion materialization
         CompactionOptions deletionOptions =
             CompactionOptions.builder()
-                .setMaterializeDeletions(true)
-                .setMaterializeDeletionsThreshold(0.3f)
+                .withMaterializeDeletions(true)
+                .withMaterializeDeletionsThreshold(0.3f)
                 .build();
 
         dataset2.compact(deletionOptions);
@@ -1204,7 +1237,10 @@ public class DatasetTest {
 
         // Third compaction with different target fragment size
         CompactionOptions fragmentOptions =
-            CompactionOptions.builder().setTargetRowsPerFragment(5).setMaxRowsPerGroup(512).build();
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(5)
+                .withMaxRowsPerGroup(512)
+                .build();
 
         dataset2.compact(fragmentOptions);
         long version5 = dataset2.version();
@@ -1244,14 +1280,14 @@ public class DatasetTest {
         // Test compaction with all options set
         CompactionOptions allOptions =
             CompactionOptions.builder()
-                .setTargetRowsPerFragment(15)
-                .setMaxRowsPerGroup(256)
-                .setMaxBytesPerFile(512 * 1024) // 512KB
-                .setMaterializeDeletions(true)
-                .setMaterializeDeletionsThreshold(0.15f) // 15% threshold
-                .setNumThreads(1)
-                .setBatchSize(5)
-                .setDeferIndexRemap(false)
+                .withTargetRowsPerFragment(15)
+                .withMaxRowsPerGroup(256)
+                .withMaxBytesPerFile(512 * 1024) // 512KB
+                .withMaterializeDeletions(true)
+                .withMaterializeDeletionsThreshold(0.15f) // 15% threshold
+                .withNumThreads(1)
+                .withBatchSize(5)
+                .withDeferIndexRemap(false)
                 .build();
 
         dataset2.compact(allOptions);
@@ -1265,17 +1301,17 @@ public class DatasetTest {
         assertEquals(20, dataset2.countRows("id % 5 != 0"));
 
         // Verify all CompactionOptions settings are preserved
-        assertEquals(15, allOptions.getTargetRowsPerFragment());
-        assertEquals(256, allOptions.getMaxRowsPerGroup());
+        assertEquals(15, allOptions.getTargetRowsPerFragment().get());
+        assertEquals(256, allOptions.getMaxRowsPerGroup().get());
         assertTrue(allOptions.getMaxBytesPerFile().isPresent());
         assertEquals(512 * 1024, allOptions.getMaxBytesPerFile().get().intValue());
-        assertTrue(allOptions.isMaterializeDeletions());
-        assertEquals(0.15f, allOptions.getMaterializeDeletionsThreshold(), 0.001f);
+        assertTrue(allOptions.getMaterializeDeletions().get());
+        assertEquals(0.15f, allOptions.getMaterializeDeletionsThreshold().get(), 0.001f);
         assertTrue(allOptions.getNumThreads().isPresent());
         assertEquals(1, allOptions.getNumThreads().get().intValue());
         assertTrue(allOptions.getBatchSize().isPresent());
         assertEquals(5, allOptions.getBatchSize().get().intValue());
-        assertFalse(allOptions.isDeferIndexRemap());
+        assertFalse(allOptions.getDeferIndexRemap().get());
       }
     }
   }
