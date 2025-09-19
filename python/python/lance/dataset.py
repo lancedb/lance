@@ -70,8 +70,6 @@ from .udf import batch_udf as batch_udf
 from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
-    from pyarrow._compute import Expression
-
     from .commit import CommitLock
     from .progress import FragmentWriteProgress
     from .types import ReaderLike
@@ -1023,17 +1021,81 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.replace_field_metadata(field_name, new_metadata)
 
-    def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
+    def get_fragments(
+        self, filter: Optional[Union[str, pa.compute.Expression]] = None
+    ) -> List[LanceFragment]:
         """Get all fragments from the dataset.
 
-        Note: filter is not supported yet.
+        Parameters
+        ----------
+        filter : str or pa.compute.Expression, optional
+            Filter expression to apply to fragments. Only fragments containing
+            rows that match the filter will be returned. Can be either a string
+            SQL expression or a PyArrow compute Expression.
+
+        Returns
+        -------
+        List[LanceFragment]
+            List of fragments that contain matching data. If no filter is provided,
+            returns all fragments (backward compatible behavior).
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>>
+        >>> # Create a dataset
+        >>> data = pa.table({
+        ...   "age": [20, 25, 30, 35],
+        ...   "name": ["Alice", "Bob", "Charlie", "David"]},
+        ...   schema=pa.schema([
+        ...       pa.field("age", pa.int32()),
+        ...       pa.field("name", pa.string())
+        ...   ]))
+        >>> dataset = lance.write_dataset(data, "my_dataset")
+        >>>
+        >>> # Get all fragments (backward compatible)
+        >>> all_fragments = dataset.get_fragments()
+        >>>
+        >>> # Get fragments with string filter
+        >>> filtered_fragments = dataset.get_fragments(filter="age > 25")
+        >>>
+        >>> # Get fragments with PyArrow Expression filter
+        >>> expr = pa.compute.greater(pa.compute.field("age"), pa.scalar(25))
+        >>> filtered_fragments = dataset.get_fragments(filter=expr)
+
+        Notes
+        -----
+        This method uses the fragment's count_rows method to determine if a
+        fragment contains any rows matching the filter. Fragments with zero
+        matching rows are excluded from the result.
+
+        The filtering is performed at the fragment level, which means:
+        - Only fragments containing at least one matching row are returned
+        - The actual filtering of rows within fragments is not performed here
+        - Use fragment.scanner(filter=filter) to get filtered data from
+        - individual fragments
         """
-        if filter is not None:
-            raise ValueError("get_fragments() does not support filter yet")
-        return [
+        # Get all fragments first (same as original implementation)
+        all_fragments = [
             LanceFragment(self, fragment_id=None, fragment=f)
             for f in self._ds.get_fragments()
         ]
+
+        if filter is None:
+            return all_fragments
+
+        # Filter fragments that contain matching rows
+        try:
+            filtered_fragments = [
+                fragment
+                for fragment in all_fragments
+                if fragment.count_rows(filter) > 0
+            ]
+        except Exception as e:
+            raise ValueError("Error counting rows in fragments while filtering.") from e
+
+        return filtered_fragments
 
     def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""
@@ -1322,7 +1384,6 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         alterations : Iterable[Dict[str, Any]]
             A sequence of dictionaries, each with the following keys:
-
             - "path": str
                 The column path to alter. For a top-level column, this is the name.
                 For a nested column, this is the dot-separated path, e.g. "a.b.c".

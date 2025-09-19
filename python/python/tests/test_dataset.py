@@ -4170,3 +4170,70 @@ def test_diff_meta(tmp_path: Path):
     # Now try to diff with the cleaned up version 1 (should raise error)
     with pytest.raises(ValueError):
         dataset.diff_meta(1)
+
+
+def test_get_fragments_filter_fragment_reduction(tmp_path: Path):
+    # Create a dataset with multiple fragments
+    # where some fragments won't match the filter
+    data = {
+        "age": list(range(1, 101)),  # Ages 1-100
+        "department": ["Engineering"] * 30 + ["Sales"] * 30 + ["Market"] * 40,
+        "salary": [50000 + i * 500 for i in range(100)],
+    }
+    table = pa.table(data)
+    # Force multiple fragments with small max_rows_per_file
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=15)
+
+    all_fragments = dataset.get_fragments()
+    assert len(all_fragments) > 3, (
+        "Should have multiple fragments for effective testing"
+    )
+
+    # Apply a selective filter that should exclude some fragments
+    # This filter should only match data in some fragments, not all
+    selective_filter = "department = 'Engineering' AND age <= 20"
+    filtered_fragments = dataset.get_fragments(filter=selective_filter)
+
+    # CORE ASSERTION: Filter should reduce fragment count
+    assert len(filtered_fragments) < len(all_fragments), (
+        f"Filter should reduce fragments: "
+        f"{len(filtered_fragments)} < {len(all_fragments)}"
+    )
+
+    # Verify the filtered fragments contain only relevant data
+    total_matching_rows = sum(
+        fragment.count_rows(selective_filter) for fragment in filtered_fragments
+    )
+    expected_rows = dataset.count_rows(selective_filter)
+    assert total_matching_rows == expected_rows
+    assert expected_rows > 0, "Filter should match some data"
+
+
+def test_get_fragments_filter_functionality(tmp_path: Path):
+    data = {
+        "age": list(range(20, 60, 5)),  # [20, 25, 30, 35, 40, 45, 50, 55]
+        "department": ["Engineering", "Sales"] * 4,
+    }
+    table = pa.table(data)
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=3)
+
+    all_fragments = dataset.get_fragments()
+
+    # Test backward compatibility: filter=None should return all fragments
+    all_fragments_none = dataset.get_fragments(filter=None)
+    assert len(all_fragments_none) == len(all_fragments)
+
+    # Test string filter
+    string_filtered = dataset.get_fragments(filter="age > 35")
+    assert len(string_filtered) <= len(all_fragments)
+    string_count = sum(fragment.count_rows("age > 35") for fragment in string_filtered)
+
+    # Test PyArrow expression filter (same condition)
+    expr = pc.greater(pc.field("age"), pa.scalar(35))
+    expr_filtered = dataset.get_fragments(filter=expr)
+    assert len(expr_filtered) <= len(all_fragments)
+    expr_count = sum(fragment.count_rows(expr) for fragment in expr_filtered)
+
+    # Both should return the same number of matching rows
+    assert string_count == expr_count
+    assert string_count > 0  # Should match some data
