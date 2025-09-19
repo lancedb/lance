@@ -710,10 +710,10 @@ mod tests {
     ) where
         T::Native: AsPrimitive<f32>,
     {
-        for j in 0..SEGMENT_NUM_CODES {
-            for k in 0..SEGMENT_LENGTH {
+        for (j, dist) in dist_table.iter_mut().enumerate().take(SEGMENT_NUM_CODES) {
+            for (k, v) in sub_vec.iter().enumerate().take(SEGMENT_LENGTH) {
                 if j & (1 << k) != 0 {
-                    dist_table[j] += sub_vec[k].as_();
+                    *dist += v.as_();
                 }
             }
         }
