@@ -371,21 +371,27 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let expected_new_len = expected_full_words + tail_values;
     let tail_is_raw = tail_values > 0 && compressed_words.len() == expected_new_len;
 
+    let extra_tail_capacity = ELEMS_PER_CHUNK as usize;
     #[allow(clippy::uninit_vec)]
-    let mut decompressed = Vec::with_capacity(num_values);
-    let mut chunk_buf = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+    let mut decompressed: Vec<T> =
+        Vec::with_capacity(num_values.saturating_add(extra_tail_capacity));
+    let chunk_value_len = num_whole_chunks * ELEMS_PER_CHUNK as usize;
+    unsafe {
+        decompressed.set_len(chunk_value_len);
+    }
 
     for chunk_idx in 0..num_whole_chunks {
         let input_start = chunk_idx * words_per_chunk;
         let input_end = input_start + words_per_chunk;
+        let output_start = chunk_idx * ELEMS_PER_CHUNK as usize;
+        let output_end = output_start + ELEMS_PER_CHUNK as usize;
         unsafe {
             BitPacking::unchecked_unpack(
                 compressed_bits_per_value,
                 &compressed_words[input_start..input_end],
-                &mut chunk_buf,
+                &mut decompressed[output_start..output_end],
             );
         }
-        decompressed.extend_from_slice(&chunk_buf);
     }
 
     if tail_values > 0 {
@@ -396,18 +402,22 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
             decompressed.extend_from_slice(&compressed_words[tail_start..tail_start + tail_values]);
         } else {
             let tail_start = expected_full_words;
+            let output_start = decompressed.len();
+            unsafe {
+                decompressed.set_len(output_start + ELEMS_PER_CHUNK as usize);
+            }
             unsafe {
                 BitPacking::unchecked_unpack(
                     compressed_bits_per_value,
                     &compressed_words[tail_start..tail_start + words_per_chunk],
-                    &mut chunk_buf,
+                    &mut decompressed[output_start..output_start + ELEMS_PER_CHUNK as usize],
                 );
             }
-            decompressed.extend_from_slice(&chunk_buf[..tail_values]);
+            decompressed.truncate(output_start + tail_values);
         }
     }
 
-    decompressed.truncate(num_values);
+    debug_assert_eq!(decompressed.len(), num_values);
 
     FixedWidthDataBlock {
         data: LanceBuffer::reinterpret_vec(decompressed),
