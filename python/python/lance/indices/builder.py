@@ -1,149 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+
 import math
 import warnings
 from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import pyarrow as pa
 
-from lance.file import LanceFileReader, LanceFileWriter
-from lance.fragment import LanceFragment
-
-from .lance import indices
+from lance.indices.ivf import IvfModel
+from lance.indices.pq import PqModel
 
 if TYPE_CHECKING:
-    from .dependencies import torch
+    import torch
 
-
-class IndexFileVersion(str, Enum):
-    LEGACY = "Legacy"
-    V3 = "V3"
-
-
-class PqModel:
-    """
-    A class that represents a trained PQ model
-
-    Can be saved / loaded to checkpoint progress.
-    """
-
-    def __init__(self, num_subvectors: int, codebook: pa.FixedSizeListArray):
-        self.num_subvectors = num_subvectors
-        """The number of subvectors to divide source vectors into"""
-        self.codebook = codebook
-        """The centroids of the PQ clusters"""
-
-    @property
-    def dimension(self):
-        """The dimension of the vectors this model was trained on"""
-        return self.codebook.type.list_size
-
-    def save(self, uri: str):
-        """
-        Save the PQ model to a lance file.
-
-        Parameters
-        ----------
-
-        uri: str
-            The URI to save the model to.  The URI can be a local file path or a
-            cloud storage path.
-        """
-        with LanceFileWriter(
-            uri,
-            pa.schema(
-                [pa.field("codebook", self.codebook.type)],
-                metadata={b"num_subvectors": str(self.num_subvectors).encode()},
-            ),
-        ) as writer:
-            batch = pa.table([self.codebook], names=["codebook"])
-            writer.write_batch(batch)
-
-    @classmethod
-    def load(cls, uri: str):
-        """
-        Load a PQ model from a lance file.
-
-        Parameters
-        ----------
-
-        uri: str
-            The URI to load the model from.  The URI can be a local file path or a
-            cloud storage path.
-        """
-        reader = LanceFileReader(uri)
-        num_rows = reader.metadata().num_rows
-        metadata = reader.metadata().schema.metadata
-        num_subvectors = int(metadata[b"num_subvectors"].decode())
-        codebook = (
-            reader.read_all(batch_size=num_rows).to_table().column("codebook").chunk(0)
-        )
-        return cls(num_subvectors, codebook)
-
-
-class IvfModel:
-    """
-    A class that represents a trained IVF model.
-    """
-
-    def __init__(self, centroids: pa.Array, distance_type: str):
-        self.centroids = centroids
-        """The centroids of the IVF clusters"""
-        self.distance_type = distance_type
-        """The distance type used to train the IVF model"""
-
-    @property
-    def num_partitions(self) -> int:
-        """
-        The number of partitions / centroids in the IVF model
-        """
-        return len(self.centroids)
-
-    def save(self, uri: str):
-        """
-        Save the IVF model to a lance file.
-
-        Parameters
-        ----------
-
-        uri: str
-            The URI to save the model to.  The URI can be a local file path or a
-            cloud storage path.
-        """
-        with LanceFileWriter(
-            uri,
-            pa.schema(
-                [pa.field("centroids", self.centroids.type)],
-                metadata={b"distance_type": self.distance_type.encode()},
-            ),
-        ) as writer:
-            batch = pa.table([self.centroids], names=["centroids"])
-            writer.write_batch(batch)
-
-    @classmethod
-    def load(cls, uri: str):
-        """
-        Load an IVF model from a lance file.
-
-        Parameters
-        ----------
-
-        uri: str
-            The URI to load the model from.  The URI can be a local file path or a
-            cloud storage path.
-        """
-        reader = LanceFileReader(uri)
-        num_rows = reader.metadata().num_rows
-        metadata = reader.metadata().schema.metadata
-        distance_type = metadata[b"distance_type"].decode()
-        centroids = (
-            reader.read_all(batch_size=num_rows).to_table().column("centroids").chunk(0)
-        )
-        return cls(centroids, distance_type)
-
+    from lance import LanceFragment
 
 # Some transforms hardcode their output column names
 PARTITION_COLUMN = "__ivf_part_id"
@@ -241,6 +113,8 @@ class IndicesBuilder:
         self._verify_ivf_params(num_partitions)
 
         if accelerator is None:
+            from lance.lance import indices
+
             ivf_centroids = indices.train_ivf_model(
                 self.dataset._ds,
                 self.column[0],
@@ -253,7 +127,7 @@ class IndicesBuilder:
             return IvfModel(ivf_centroids, distance_type)
         else:
             # Use accelerator to train ivf centroids
-            from .vector import train_ivf_centroids_on_accelerator
+            from lance.vector import train_ivf_centroids_on_accelerator
 
             ivf_centroids, _ = train_ivf_centroids_on_accelerator(
                 self.dataset,
@@ -310,6 +184,8 @@ class IndicesBuilder:
         max_iters: int
             This parameter is used in the same way as in the IVF model.
         """
+        from lance.lance import indices
+
         num_rows = self.dataset.count_rows()
         self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension)
@@ -365,9 +241,9 @@ class IndicesBuilder:
             The path of the partition assignment dataset (will be equal to
             output_uri unless the value is None)
         """
-        from .dependencies import torch
-        from .torch.kmeans import KMeans
-        from .vector import compute_partitions
+        from lance.dependencies import torch
+        from lance.torch.kmeans import KMeans
+        from lance.vector import compute_partitions
 
         centroids = torch.from_numpy(
             np.stack(ivf_model.centroids.to_numpy(zero_copy_only=False))
@@ -387,7 +263,7 @@ class IndicesBuilder:
         ivf: IvfModel,
         pq: PqModel,
         dest_uri: str,
-        fragments: Optional[list[LanceFragment]] = None,
+        fragments: Optional[list["LanceFragment"]] = None,
         partition_ds_uri: Optional[str] = None,
     ):
         """
@@ -413,6 +289,8 @@ class IndicesBuilder:
             transform to be skipped, using the precomputed value instead.  This is
             optional.
         """
+        from lance.lance import indices
+
         dimension = self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = pq.num_subvectors
         distance_type = ivf.distance_type
@@ -468,6 +346,8 @@ class IndicesBuilder:
             form `shuffle_output_root_filename_i.lance`.
         """
         if isinstance(unsorted_filenames, list):
+            from lance.lance import indices
+
             return indices.shuffle_transformed_vectors(
                 unsorted_filenames,
                 dir_path,
@@ -509,6 +389,8 @@ class IndicesBuilder:
         distance_type = ivf.distance_type
 
         if isinstance(filenames, list):
+            from lance.lance import indices
+
             return indices.load_shuffled_vectors(
                 filenames,
                 dir_path,

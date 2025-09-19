@@ -896,6 +896,11 @@ def test_fts_on_list(tmp_path):
     results = ds.to_table(full_text_query=PhraseQuery("lance database", "text"))
     assert results.num_rows == 2
 
+    # Append new data without fts index, then query.
+    ds.insert(data)
+    results = ds.to_table(full_text_query="lance")
+    assert results.num_rows == 6
+
 
 def test_fts_fuzzy_query(tmp_path):
     data = pa.table(
@@ -1021,7 +1026,7 @@ def test_fts_boost_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("text", "INVERTED", with_position=True)
     results = ds.to_table(
         full_text_query=BoostQuery(
             MatchQuery("puppy", "text"),
@@ -1029,6 +1034,22 @@ def test_fts_boost_query(tmp_path):
             negative_boost=0.5,
         ),
     )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
+
+    # boost using phrase
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            PhraseQuery("a happy puppy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+
     assert results.num_rows == 3
     assert set(results["text"].to_pylist()) == {
         "frodo was a puppy",
@@ -1077,7 +1098,7 @@ def test_fts_boolean_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("text", "INVERTED", with_position=True)
 
     query = MatchQuery("puppy", "text") & MatchQuery("happy", "text")
     results = ds.to_table(
@@ -1101,6 +1122,20 @@ def test_fts_boolean_query(tmp_path):
             [
                 (Occur.MUST, MatchQuery("puppy", "text")),
                 (Occur.MUST_NOT, MatchQuery("happy", "text")),
+            ]
+        ),
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
+    results = ds.to_table(
+        full_text_query=BooleanQuery(
+            [
+                (Occur.MUST, MatchQuery("puppy", "text")),
+                (Occur.MUST_NOT, PhraseQuery("a happy puppy", "text")),
             ]
         ),
     )
