@@ -344,7 +344,6 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
             );
         }
     } else {
-        output.reserve(remaining_items);
         // Padding would waste space; append tail values as-is.
         output.extend_from_slice(&data_buffer[last_chunk_start..]);
     }
