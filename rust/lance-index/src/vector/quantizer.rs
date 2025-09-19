@@ -94,7 +94,7 @@ impl std::fmt::Display for QuantizationType {
             Self::Flat => write!(f, "FLAT"),
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
-            Self::Rabit => write!(f, "RABIT"),
+            Self::Rabit => write!(f, "RQ"),
         }
     }
 }
