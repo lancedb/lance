@@ -722,7 +722,7 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     Arc::new(arrow_schema::Schema::new(fields))
 }
 
-fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
+pub fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
     batch: &RecordBatch,
     doc_col: &Arc<dyn Array>,
 ) -> Result<RecordBatch> {
