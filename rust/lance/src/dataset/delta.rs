@@ -434,6 +434,7 @@ impl DatasetDiffBuilder {
 #[cfg(test)]
 mod tests {
     use crate::dataset::delta::{DatasetDiffBuilder, DiffOperation};
+    use crate::dataset::transaction::Operation;
     use crate::dataset::{Dataset, WriteMode, WriteParams};
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, StringArray};
@@ -443,7 +444,6 @@ mod tests {
     use lance_core::utils::testing::MockClock;
     use lance_datagen::{array, BatchCount, RowCount};
     use std::sync::Arc;
-    use crate::dataset::transaction::Operation;
 
     async fn create_test_dataset() -> Dataset {
         let data = lance_datagen::gen_batch()
