@@ -174,7 +174,7 @@ impl ProjectionPlan {
         // The _rowid and _rowaddr columns will be recognized and added to the physical projection
         //
         // Any columns with an id of -1 (e.g. _rowoffset) will be ignored
-        let physical_projection = Projection::empty(base).union_schema(projection);
+        let mut physical_projection = Projection::empty(base).union_schema(projection);
         let mut must_add_row_offset = false;
         // Now calculate the output expressions.  This will only reorder top-level columns.  We don't
         // support reordering nested fields.
@@ -184,6 +184,11 @@ impl ProjectionPlan {
             .map(|f| {
                 if f.name == ROW_ADDR {
                     must_add_row_offset = true;
+                    physical_projection.with_row_addr = true;
+                }
+                if f.name == ROW_ID {
+                    must_add_row_offset = true;
+                    physical_projection.with_row_id = true;
                 }
                 OutputColumn {
                     expr: Expr::Column(Column::from_name(&f.name)),
