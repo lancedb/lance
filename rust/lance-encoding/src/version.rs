@@ -18,22 +18,22 @@ pub enum LanceFileVersion {
     // this way comparisons like x >= V2_0 will work the same if x is Stable or V2_0
     /// The legacy (0.1) format
     Legacy,
-    #[default]
     V2_0,
+    #[default]
+    V2_1,
     /// The latest stable release
     Stable,
-    V2_1,
+    V2_2,
     /// The latest unstable release
     Next,
-    V2_2,
 }
 
 impl LanceFileVersion {
     /// Convert Stable or Next to the actual version
     pub fn resolve(&self) -> Self {
         match self {
-            Self::Stable => Self::V2_0,
-            Self::Next => Self::V2_1,
+            Self::Stable => Self::V2_1,
+            Self::Next => Self::V2_2,
             _ => *self,
         }
     }
