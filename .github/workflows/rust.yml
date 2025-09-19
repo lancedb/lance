@@ -107,17 +107,17 @@ jobs:
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES} --lib --doc
       - name: Build tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run
+          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run --lib --doc
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --features ${ALL_FEATURES} --workspace
+          cargo test --features ${ALL_FEATURES} --workspace --lib --doc
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -127,6 +127,33 @@ jobs:
           files: coverage.codecov
           flags: unittests
           fail_ci_if_error: false
+
+  integration_test:
+    # Runs integration tests on release mode. These tests are much broader and
+    # slower than the unit tests, so we run them separately.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      # pin the toolchain version to avoid surprises
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Build
+        run: cargo build --locked --test integration_tests --profile release-with-debug
+      - name: Run integration tests
+        run: cargo test --locked --test integration_tests --profile release-with-debug
+
   linux-arm:
     runs-on: ubuntu-2404-4x-arm64
     timeout-minutes: 75

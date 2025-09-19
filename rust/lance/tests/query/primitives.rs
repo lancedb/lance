@@ -51,21 +51,9 @@ async fn test_query_bool() {
 #[case::uint32(DataType::UInt32)]
 #[case::uint64(DataType::UInt64)]
 async fn test_query_integer(#[case] data_type: DataType) {
-    let value_generator = match data_type {
-        DataType::Int8 => array::rand_primitive::<Int8Type>(data_type),
-        DataType::Int16 => array::rand_primitive::<Int16Type>(data_type),
-        DataType::Int32 => array::rand_primitive::<Int32Type>(data_type),
-        DataType::Int64 => array::rand_primitive::<Int64Type>(data_type),
-        DataType::UInt8 => array::rand_primitive::<UInt8Type>(data_type),
-        DataType::UInt16 => array::rand_primitive::<UInt16Type>(data_type),
-        DataType::UInt32 => array::rand_primitive::<UInt32Type>(data_type),
-        DataType::UInt64 => array::rand_primitive::<UInt64Type>(data_type),
-        _ => unreachable!(),
-    };
-
     let batch = gen_batch()
         .col("id", array::step::<Int32Type>())
-        .col("value", value_generator.with_random_nulls(0.1))
+        .col("value", array::rand_type(&data_type).with_random_nulls(0.1))
         .into_batch_rows(RowCount::from(60))
         .unwrap();
     DatasetTestCases::from_data(batch)

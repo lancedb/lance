@@ -11,6 +11,7 @@ use lance::{
     dataset::{InsertBuilder, WriteParams},
     Dataset,
 };
+use lance_file::version::LanceFileVersion;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -35,6 +36,35 @@ pub enum DeletionState {
     DeleteOdd,
     /// Delete even rows.
     DeleteEven,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DatasetState {
+    pub fragmentation: Fragmentation,
+    pub deletion: DeletionState,
+    pub file_version: LanceFileVersion,
+}
+
+impl DatasetState {
+    pub fn all_states() -> Vec<Self> {
+        let mut states = Vec::new();
+        for &fragmentation in &[Fragmentation::SingleFragment, Fragmentation::MultiFragment] {
+            for &deletion in &[
+                DeletionState::NoDeletions,
+                DeletionState::DeleteOdd,
+                DeletionState::DeleteEven,
+            ] {
+                for &file_version in &[LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
+                    states.push(Self {
+                        fragmentation,
+                        deletion,
+                        file_version,
+                    });
+                }
+            }
+        }
+        states
+    }
 }
 
 pub struct DatasetTestCases {
@@ -75,27 +105,16 @@ impl DatasetTestCases {
         F: Fn(Dataset, RecordBatch) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        for fragmentation in [Fragmentation::SingleFragment, Fragmentation::MultiFragment] {
-            for deletion in [
-                DeletionState::NoDeletions,
-                DeletionState::DeleteOdd,
-                DeletionState::DeleteEven,
-            ] {
-                let index_combinations = self.generate_index_combinations();
-                for indices in index_combinations {
-                    let ds =
-                        build_dataset(self.original.clone(), fragmentation, deletion, &indices)
-                            .await;
-                    let context = format!(
-                        "fragmentation: {:?}, deletion: {:?}, index: {:?}",
-                        fragmentation, deletion, indices
-                    );
-                    // Catch unwind so we can add test context to the panic.
-                    AssertUnwindSafe(test_fn(ds, self.original.clone()))
-                        .catch_unwind()
-                        .await
-                        .unwrap_or_else(|_| panic!("Test failed for {}", context));
-                }
+        for dataset_state in DatasetState::all_states() {
+            let index_combinations = self.generate_index_combinations();
+            for indices in index_combinations {
+                let ds = build_dataset(self.original.clone(), &dataset_state, &indices).await;
+                let context = format!("dataset_state: {:?}, index: {:?}", dataset_state, indices);
+                // Catch unwind so we can add test context to the panic.
+                AssertUnwindSafe(test_fn(ds, self.original.clone()))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| panic!("Test failed for {}", context));
             }
         }
     }
@@ -107,13 +126,12 @@ impl DatasetTestCases {
 /// created for the deleted rows created by `DeletionState`.)
 async fn build_dataset(
     original: RecordBatch,
-    fragmentation: Fragmentation,
-    deletion: DeletionState,
+    ds_state: &DatasetState,
     indices: &[(&str, IndexType)],
 ) -> Dataset {
-    let data_to_write = fill_deleted_rows(&original, deletion);
+    let data_to_write = fill_deleted_rows(&original, ds_state.deletion);
 
-    let max_rows_per_file = if let Fragmentation::MultiFragment = fragmentation {
+    let max_rows_per_file = if let Fragmentation::MultiFragment = ds_state.fragmentation {
         3
     } else {
         1_000_000
@@ -122,6 +140,7 @@ async fn build_dataset(
     let mut ds = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
             max_rows_per_file,
+            data_storage_version: Some(ds_state.file_version),
             ..Default::default()
         })
         .execute(vec![data_to_write])
