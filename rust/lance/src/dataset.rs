@@ -6891,6 +6891,8 @@ mod tests {
         writer.write_batch(&batch).await.unwrap();
         writer.finish().await.unwrap();
 
+        let (major, minor) = lance_file::version::LanceFileVersion::Stable.to_numbers();
+
         // find the datafile we want to replace
         let new_data_file = DataFile {
             path: "test.lance".to_string(),
@@ -6898,8 +6900,8 @@ mod tests {
             fields: vec![1],
             // is located in the first column of this datafile
             column_indices: vec![0],
-            file_major_version: 2,
-            file_minor_version: 0,
+            file_major_version: major,
+            file_minor_version: minor,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
         };
@@ -6953,8 +6955,8 @@ mod tests {
             fields: vec![0],
             // is located in the first column of this datafile
             column_indices: vec![0],
-            file_major_version: 2,
-            file_minor_version: 0,
+            file_major_version: major,
+            file_minor_version: minor,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
         };

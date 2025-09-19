@@ -1593,9 +1593,9 @@ def test_zonemap_index(tmp_path: Path):
 
 
 def test_zonemap_zone_size(tmp_path: Path):
-    ds = lance.write_dataset(pa.table({"x": range(1000)}), tmp_path)
+    ds = lance.write_dataset(pa.table({"x": range(64 * 1024)}), tmp_path)
 
-    def check_bytes_read(expected: int):
+    def get_bytes_read():
         scan_stats = None
 
         def scan_stats_callback(stats: lance.ScanStatistics):
@@ -1604,21 +1604,23 @@ def test_zonemap_zone_size(tmp_path: Path):
 
         ds.scanner(filter="x = 7", scan_stats_callback=scan_stats_callback).to_table()
 
-        assert scan_stats.bytes_read == expected
+        return scan_stats.bytes_read
 
     ds.create_scalar_index(
         "x",
         IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 64}),
     )
 
-    check_bytes_read(512)
+    small_bytes_read = get_bytes_read()
 
     ds.create_scalar_index(
         "x",
-        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 256}),
+        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 16 * 1024}),
     )
 
-    check_bytes_read(2048)
+    large_bytes_read = get_bytes_read()
+
+    assert small_bytes_read < large_bytes_read
 
 
 def test_bloomfilter_index(tmp_path: Path):

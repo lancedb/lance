@@ -2329,6 +2329,21 @@ pub mod array {
         cycle_vec(underlying, dimension)
     }
 
+    /// Create a generator of 1d vectors (of a primitive type) consisting of randomly sampled nullable values
+    pub fn rand_vec_nullable<DataType>(
+        dimension: Dimension,
+        null_probability: f64,
+    ) -> Box<dyn ArrayGenerator>
+    where
+        DataType::Native: Copy + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
+        DataType: ArrowPrimitiveType,
+        rand::distr::StandardUniform: rand::distr::Distribution<DataType::Native>,
+    {
+        let underlying = rand::<DataType>().with_random_nulls(null_probability);
+        cycle_vec(underlying, dimension)
+    }
+
     /// Create a generator of randomly sampled time32 values covering the entire
     /// range of 1 day
     pub fn rand_time32(resolution: &TimeUnit) -> Box<dyn ArrayGenerator> {
