@@ -303,7 +303,7 @@ impl ExecutionPlan for AddRowAddrExec {
         // is a minimum size of 64 bytes.
         let mut added_byte_size = stats
             .num_rows
-            .map(|n| (n * 8).max(64))
+            .map(|n| n * 8)
             .add(&Precision::Exact(base_size));
         if row_id_col_stats
             .null_count
