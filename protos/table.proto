@@ -177,7 +177,8 @@ message Manifest {
 
   // The transaction that created this version.
   oneof inline_transaction {
-    // if < 200KB, store the transaction content inline
+    // If < 200KB, store the transaction content inline
+    // Use bytes instead of Transaction to avoid circular dependency
     bytes transaction_content = 19;
     // if >= 200KB, store the transaction content at the specified offset
     TransactionSection transaction_section = 20;
