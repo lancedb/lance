@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
+use arrow::array::Float32Builder;
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
@@ -296,6 +297,11 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             false,
         ),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
+        Field::new(
+            DIST_COL,
+            DataType::List(Field::new_list_field(DataType::Float32, false).into()),
+            false,
+        ),
     ]))
 });
 
@@ -491,18 +497,26 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
-                    let (partitions, _dists) = index.find_partitions(&query).map_err(|e| {
+                    let (partitions, dists) = index.find_partitions(&query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
 
-                    let mut list_builder = ListBuilder::new(UInt32Builder::new())
+                    let mut part_id_builder = ListBuilder::new(UInt32Builder::new())
                         .with_field(Field::new("item", DataType::UInt32, false));
-                    list_builder.append_value(partitions.iter());
-                    let partition_col = list_builder.finish();
+                    part_id_builder.append_value(partitions.iter());
+                    let mut dist_builder = ListBuilder::new(Float32Builder::new())
+                        .with_field(Field::new("item", DataType::Float32, false));
+                    dist_builder.append_value(dists.iter());
+                    let part_id_col = part_id_builder.finish();
+                    let dist_col = dist_builder.finish();
                     let uuid_col = StringArray::from(vec![uuid.as_str()]);
                     let batch = RecordBatch::try_new(
                         KNN_PARTITION_SCHEMA.clone(),
-                        vec![Arc::new(partition_col), Arc::new(uuid_col)],
+                        vec![
+                            Arc::new(part_id_col),
+                            Arc::new(uuid_col),
+                            Arc::new(dist_col),
+                        ],
                     )?;
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     Ok::<_, DataFusionError>(batch)
@@ -940,19 +954,25 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     .column_by_name(PART_ID_COLUMN)
                     .expect("ANNSubIndexExec: input missing part_id column");
                 let part_id_arr = part_id_col.as_list::<i32>().clone();
+                let dist_col = batch
+                    .column_by_name(DIST_COL)
+                    .expect("ANNSubIndexExec: input missing dist column");
+                let dist_arr = dist_col.as_list::<i32>().clone();
                 let index_uuid_col = batch
                     .column_by_name(INDEX_UUID_COLUMN)
                     .expect("ANNSubIndexExec: input missing index_uuid column");
                 let index_uuid = index_uuid_col.as_string::<i32>().clone();
 
-                let plan: Vec<DataFusionResult<(_, _)>> = part_id_arr
+                let plan: Vec<DataFusionResult<(_, _, _)>> = part_id_arr
                     .iter()
                     .zip(index_uuid.iter())
-                    .map(|(part_id, uuid)| {
+                    .zip(dist_arr.iter())
+                    .map(|((part_id, uuid), dists)| {
                         let partitions =
                             Arc::new(part_id.unwrap().as_primitive::<UInt32Type>().clone());
                         let uuid = uuid.unwrap().to_string();
-                        Ok((partitions, uuid))
+                        let dists = dists.unwrap().as_primitive::<Float32Type>().clone();
+                        Ok((partitions, uuid, Arc::new(dists)))
                     })
                     .collect_vec();
                 async move { DataFusionResult::Ok(stream::iter(plan)) }
@@ -981,14 +1001,17 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             per_index_stream
-                .and_then(move |(part_ids, index_uuid)| {
+                .and_then(move |(part_ids, index_uuid, dists)| {
                     let ds = ds.clone();
                     let column = column.clone();
                     let metrics = metrics.clone();
                     let pre_filter = pre_filter.clone();
                     let state = state.clone();
-                    let query = query.clone();
-
+                    let mut query = query.clone();
+                    query.minimum_nprobes = std::cmp::min(
+                        query.minimum_nprobes,
+                        early_pruning(dists.values(), query.k),
+                    );
                     async move {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
@@ -1054,6 +1077,17 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+}
+
+fn early_pruning(dists: &[f32], k: usize) -> usize {
+    const PRUNING_FACTORS: [f32; 3] = [0.6, 7.0, 81.0];
+    let factor = match k {
+        ..=1 => PRUNING_FACTORS[0],
+        2..=10 => PRUNING_FACTORS[1],
+        11.. => PRUNING_FACTORS[2],
+    };
+    let dist_threshold = dists[0] * factor;
+    dists.partition_point(|dist| *dist <= dist_threshold)
 }
 
 #[derive(Debug)]
