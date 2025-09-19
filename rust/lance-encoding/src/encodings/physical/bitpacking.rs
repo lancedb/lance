@@ -387,9 +387,8 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     }
 
     if tail_values > 0 {
-        // Older buffers always padded the tail to 1024 items and then packed it.
-        // New buffers append the raw tail values directly to the compressed blocks.
-        // We infer the layout from the buffer length so we can decode both versions.
+        // The tail might be padded and bit packed or it might be appended raw.  We infer the
+        // layout from the buffer length to decode appropriately.
         if tail_is_raw {
             let tail_start = expected_full_words;
             decompressed.extend_from_slice(&compressed_words[tail_start..tail_start + tail_values]);
