@@ -768,10 +768,12 @@ async fn rewrite_files(
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-        lance_table::rowids::version::set_version_metadata_for_fragments(
-            &mut new_fragments,
-            dataset.manifest.version,
-        );
+        if dataset.manifest.uses_stable_row_ids() {
+            lance_table::rowids::version::set_version_metadata_for_fragments(
+                &mut new_fragments,
+                dataset.manifest.version,
+            );
+        }
 
         if options.defer_index_remap {
             let no_addrs = RoaringTreemap::new();

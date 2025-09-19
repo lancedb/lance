@@ -1370,9 +1370,11 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
-                    set_version_metadata_for_fragments(&mut new_fragments, self.read_version + 1);
                 }
                 final_fragments.extend(new_fragments);
+                if config.use_stable_row_ids {
+                    set_version_metadata_for_fragments(&mut final_fragments, self.read_version + 1);
+                }
             }
             Operation::Delete {
                 ref updated_fragments,
@@ -1423,7 +1425,9 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
-                set_version_metadata_for_fragments(&mut final_fragments, self.read_version + 1);
+                if config.use_stable_row_ids {
+                    set_version_metadata_for_fragments(&mut final_fragments, self.read_version + 1);
+                }
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
                 if let Some(mem_wal_to_merge) = mem_wal_to_merge {
@@ -1446,9 +1450,11 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
-                    set_version_metadata_for_fragments(&mut new_fragments, self.read_version + 1);
                 }
                 final_fragments.extend(new_fragments);
+                if config.use_stable_row_ids {
+                    set_version_metadata_for_fragments(&mut final_fragments, self.read_version + 1);
+                }
                 final_indices = Vec::new();
             }
             Operation::Rewrite {
