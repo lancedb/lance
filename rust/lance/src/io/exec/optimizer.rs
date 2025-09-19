@@ -17,6 +17,7 @@ use datafusion::{
     },
 };
 use datafusion_physical_expr::{expressions::Column, PhysicalExpr};
+use datafusion_physical_plan::projection::ProjectionExpr;
 
 /// Rule that eliminates [TakeExec] nodes that are immediately followed by another [TakeExec].
 #[derive(Debug)]
@@ -143,14 +144,16 @@ impl PhysicalOptimizerRule for SimplifyProjection {
                         return Ok(Transformed::no(plan));
                     }
 
-                    if proj.expr().iter().enumerate().all(|(index, (expr, name))| {
-                        if let Some(expr) = expr.as_any().downcast_ref::<Column>() {
-                            // no renaming, no reordering
-                            expr.index() == index && expr.name() == name
-                        } else {
-                            false
-                        }
-                    }) {
+                    if proj.expr().iter().enumerate().all(
+                        |(index, ProjectionExpr { expr, alias })| {
+                            if let Some(expr) = expr.as_any().downcast_ref::<Column>() {
+                                // no renaming, no reordering
+                                expr.index() == index && expr.name() == alias
+                            } else {
+                                false
+                            }
+                        },
+                    ) {
                         return Ok(Transformed::yes(input.clone()));
                     }
                 }

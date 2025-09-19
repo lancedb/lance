@@ -60,17 +60,17 @@ lance-test-macros = { version = "=0.37.0", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=0.37.0", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "55.2", optional = false, features = ["prettyprint"] }
-arrow-arith = "55.2"
-arrow-array = "55.2"
-arrow-buffer = "55.2"
-arrow-cast = "55.2"
-arrow-data = "55.2"
-arrow-ipc = { version = "55.2", features = ["zstd"] }
-arrow-ord = "55.2"
-arrow-row = "55.2"
-arrow-schema = "55.2"
-arrow-select = "55.2"
+arrow = { version = "56.1", optional = false, features = ["prettyprint"] }
+arrow-arith = "56.1"
+arrow-array = "56.1"
+arrow-buffer = "56.1"
+arrow-cast = "56.1"
+arrow-data = "56.1"
+arrow-ipc = { version = "56.1", features = ["zstd"] }
+arrow-ord = "56.1"
+arrow-row = "56.1"
+arrow-schema = "56.1"
+arrow-select = "56.1"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "1.2.0"
@@ -96,7 +96,7 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "49.0.2", default-features = false, features = [
+datafusion = { version = "50.0.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
@@ -105,16 +105,16 @@ datafusion = { version = "49.0.2", default-features = false, features = [
     "datetime_expressions",
     "string_expressions",
 ] }
-datafusion-common = "49.0.2"
-datafusion-functions = { version = "49.0.2", features = ["regex_expressions"] }
-datafusion-sql = "49.0.2"
-datafusion-expr = "49.0.2"
-datafusion-ffi = "49.0.2"
-datafusion-execution = "49.0.2"
-datafusion-optimizer = "49.0.2"
-datafusion-physical-expr = { version = "49.0.2" }
-datafusion-physical-plan = { version = "49.0.2" }
-datafusion-substrait = { version = "49.0.2" }
+datafusion-common = "50.0.0"
+datafusion-functions = { version = "50.0.0", features = ["regex_expressions"] }
+datafusion-sql = "50.0.0"
+datafusion-expr = "50.0.0"
+datafusion-ffi = "50.0.0"
+datafusion-execution = "50.0.0"
+datafusion-optimizer = "50.0.0"
+datafusion-physical-expr = { version = "50.0.0" }
+datafusion-physical-plan = { version = "50.0.0" }
+datafusion-substrait = { version = "50.0.0" }
 deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
