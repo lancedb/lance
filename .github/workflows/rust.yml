@@ -187,7 +187,7 @@ jobs:
           cargo test --locked --features ${ALL_FEATURES}
   build-no-lock:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       # Need up-to-date compilers for kernels
       CC: clang
