@@ -27,7 +27,6 @@ env:
   # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
   # CI builds are faster with incremental disabled.
   CARGO_INCREMENTAL: "0"
-  CARGO_BUILD_JOBS: "1"
 
 jobs:
   format:
@@ -72,7 +71,7 @@ jobs:
           command: check
 
   linux-build:
-    runs-on: "ubuntu-24.04"
+    runs-on: ubuntu-2404-8x-x64
     timeout-minutes: 60
     strategy:
       matrix:
@@ -103,21 +102,21 @@ jobs:
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Collect features
+        run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+        run: cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES} --lib
       - name: Build tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run
+        run: cargo test --locked --features ${ALL_FEATURES} --workspace --no-run --lib
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --features ${ALL_FEATURES} --workspace
+        run: cargo test --features ${ALL_FEATURES} --workspace --lib
+      - name: Run doctests
+        run: cargo test --features ${ALL_FEATURES} --workspace --doc
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -127,6 +126,37 @@ jobs:
           files: coverage.codecov
           flags: unittests
           fail_ci_if_error: false
+
+  integration_test:
+    # Runs integration tests on release mode. These tests are much broader and
+    # slower than the unit tests, so we run them separately.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      # pin the toolchain version to avoid surprises
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-workspace-crates: true
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Build
+        run: cargo build --locked --test integration_tests --profile release-with-debug
+      - name: Run integration tests
+        run: cargo test --locked --test integration_tests --profile release-with-debug
+
   linux-arm:
     runs-on: ubuntu-2404-4x-arm64
     timeout-minutes: 75
@@ -157,7 +187,7 @@ jobs:
           cargo test --locked --features ${ALL_FEATURES}
   build-no-lock:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       # Need up-to-date compilers for kernels
       CC: clang
