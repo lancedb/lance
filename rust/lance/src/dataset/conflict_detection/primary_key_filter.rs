@@ -140,12 +140,6 @@ impl PrimaryKeyBloomFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use std::sync::Arc;
-
     use crate::dataset::conflict_detection::{
         conflict_detector::{ConflictDetector, DefaultConflictDetector},
         primary_key_filter::{PrimaryKeyBloomFilter, PrimaryKeyValue},
@@ -193,7 +187,7 @@ mod tests {
         filter2.insert(key3).unwrap();
 
         // Should detect intersection
-        assert!(filter1.has_intersection(&filter2));
+        assert!(filter1.has_intersection(filter2));
     }
 
     #[test]
@@ -211,18 +205,6 @@ mod tests {
             deserialized.primary_key_columns(),
             filter.primary_key_columns()
         );
-    }
-
-    fn create_test_record_batch(user_ids: Vec<&str>, scores: Vec<i64>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::Utf8, false),
-            Field::new("score", DataType::Int64, false),
-        ]));
-
-        let user_id_array = StringArray::from(user_ids);
-        let score_array = Int64Array::from(scores);
-
-        RecordBatch::try_new(schema, vec![Arc::new(user_id_array), Arc::new(score_array)]).unwrap()
     }
 
     #[test]
@@ -283,7 +265,7 @@ mod tests {
             PrimaryKeyValue::Int64(67890),
         ];
 
-        for (idx, key) in test_keys.iter().enumerate() {
+        for (_idx, key) in test_keys.iter().enumerate() {
             original_filter.insert(key.clone()).unwrap();
         }
 
@@ -317,7 +299,7 @@ mod tests {
             PrimaryKeyValue::String("charlie".to_string()),
         ];
 
-        for (idx, key) in keys1.iter().enumerate() {
+        for (_idx, key) in keys1.iter().enumerate() {
             filter1.insert(key.clone()).unwrap();
         }
 
@@ -327,7 +309,7 @@ mod tests {
             PrimaryKeyValue::String("eve".to_string()),
         ];
 
-        for (idx, key) in keys2.iter().enumerate() {
+        for (_idx, key) in keys2.iter().enumerate() {
             filter2.insert(key.clone()).unwrap();
         }
 
@@ -338,7 +320,7 @@ mod tests {
         assert!(conflict_result.has_conflict(), "should detect conflict");
         assert_eq!(
             conflict_result.conflicting_uuid(),
-            Some(&"test_transaction_uuid".to_string())
+            Some(&"test_transaction_uuid".to_string()).map(|x| x.as_str())
         );
     }
 
@@ -355,7 +337,7 @@ mod tests {
             PrimaryKeyValue::String("charlie".to_string()),
         ];
 
-        for (idx, key) in keys1.iter().enumerate() {
+        for (_idx, key) in keys1.iter().enumerate() {
             filter1.insert(key.clone()).unwrap();
         }
 
@@ -365,7 +347,7 @@ mod tests {
             PrimaryKeyValue::String("frank".to_string()),
         ];
 
-        for (idx, key) in keys2.iter().enumerate() {
+        for (_idx, key) in keys2.iter().enumerate() {
             filter2.insert(key.clone()).unwrap();
         }
 
@@ -388,7 +370,7 @@ mod tests {
             PrimaryKeyValue::String("transaction_user_2".to_string()),
         ];
 
-        for (idx, key) in keys.iter().enumerate() {
+        for (_idx, key) in keys.iter().enumerate() {
             bloom_filter.insert(key.clone()).unwrap();
         }
 
@@ -410,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_transaction_protobuf_serialization_with_bloom_filter() {
-        use crate::dataset::transaction::pb;
+        use lance_table::format::pb;
 
         let mut bloom_filter = PrimaryKeyBloomFilter::new(vec!["user_id".to_string()]);
         bloom_filter
@@ -431,8 +413,8 @@ mod tests {
         let pb_transaction: pb::Transaction = (&original_transaction).into();
         assert!(pb_transaction.primary_key_bloom_filter.is_some());
         assert_eq!(
-            pb_transaction.primary_key_bloom_filter.unwrap(),
-            filter_data
+            pb_transaction.primary_key_bloom_filter.as_ref().unwrap(),
+            &filter_data
         );
 
         let deserialized_transaction: Transaction = pb_transaction.try_into().unwrap();
@@ -557,7 +539,10 @@ mod tests {
                 conflict_result.has_conflict(),
                 "A conflict should be detected"
             );
-            assert_eq!(conflict_result.conflicting_uuid(), Some(&transaction2.uuid));
+            assert_eq!(
+                conflict_result.conflicting_uuid(),
+                Some(&transaction2.uuid).map(|x| x.as_str())
+            );
             // Since the current implementation uses an exact map, there are no false positives.
             assert!(!conflict_result.might_be_false_positive());
         } else {
