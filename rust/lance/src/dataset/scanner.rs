@@ -3286,7 +3286,7 @@ impl Scanner {
             },
         };
         let sort_expr_row_id = PhysicalSortExpr {
-            expr: expressions::col(ROW_ID, inner_fanout_search.schema().as_ref())?,
+            expr: expressions::col(ROW_ADDR, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
@@ -3345,7 +3345,7 @@ impl Scanner {
                 },
             };
             let sort_expr_row_id = PhysicalSortExpr {
-                expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+                expr: expressions::col(ROW_ADDR, ann_node.schema().as_ref())?,
                 options: SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -3368,7 +3368,7 @@ impl Scanner {
             },
         };
         let sort_expr_row_id = PhysicalSortExpr {
-            expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+            expr: expressions::col(ROW_ADDR, ann_node.schema().as_ref())?,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,

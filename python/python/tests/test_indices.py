@@ -188,7 +188,7 @@ def test_assign_partitions(rand_dataset, rand_ivf):
     partitions = lance.dataset(partitions_uri)
     found_row_ids = set()
     for batch in partitions.to_batches():
-        row_ids = batch["row_id"]
+        row_ids = batch["row_addr"]
         for row_id in row_ids:
             found_row_ids.add(row_id)
         part_ids = batch["partition"]
@@ -211,7 +211,7 @@ def test_assign_partitions_mostly_null(mostly_null_dataset, distance_type):
     partitions = lance.dataset(partitions_uri)
     found_row_ids = set()
     for batch in partitions.to_batches():
-        row_ids = batch["row_id"]
+        row_ids = batch["row_addr"]
         for row_id in row_ids:
             found_row_ids.add(row_id)
         part_ids = batch["partition"]
@@ -240,7 +240,7 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
-    row_id = data.column("_rowid")
+    row_id = data.column("_rowaddr")
     assert row_id.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
@@ -281,7 +281,7 @@ def test_vector_transform_with_precomputed_partitions(
     assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
-    row_id = data.column("_rowid")
+    row_id = data.column("_rowaddr")
     assert row_id.type == pa.uint64()
 
     pq_code = data.column("__pq_code")

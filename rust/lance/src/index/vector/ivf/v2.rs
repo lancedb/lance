@@ -658,7 +658,7 @@ mod tests {
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
-    use lance_core::{Result, ROW_ID};
+    use lance_core::{Result, ROW_ADDR};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::v2::{
         reader::{FileReader, FileReaderOptions},
@@ -818,7 +818,7 @@ mod tests {
     ) -> HashSet<u64> {
         let batch = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .nearest(column, query, k)
             .unwrap()
             .distance_metric(distance_type)
@@ -826,7 +826,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        batch[ROW_ID]
+        batch[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
@@ -1019,11 +1019,11 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
             .minimum_nprobes(nlist)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
-        let row_ids = results[ROW_ID]
+        let row_ids = results[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
@@ -1050,7 +1050,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
             .minimum_nprobes(nlist)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1418,11 +1418,11 @@ mod tests {
             .nearest("vector", &query, k)
             .unwrap()
             .minimum_nprobes(nlist)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
-        let row_ids = result[ROW_ID]
+        let row_ids = result[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
@@ -1648,12 +1648,12 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
         assert_eq!(result.num_rows(), k);
-        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        let row_ids = result[ROW_ADDR].as_primitive::<UInt64Type>().values();
         let dists = result[DIST_COL].as_primitive::<Float32Type>().values();
 
         let part_idx = k / 2;
@@ -1665,7 +1665,7 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .distance_range(None, Some(part_dist))
             .try_into_batch()
             .await
@@ -1676,7 +1676,7 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .distance_range(Some(part_dist), None)
             .try_into_batch()
             .await
@@ -1686,8 +1686,8 @@ mod tests {
         if dist_type != DistanceType::Hamming {
             assert_eq!(left_res.num_rows(), part_idx);
             assert_eq!(right_res.num_rows(), k - part_idx);
-            let left_row_ids = left_res[ROW_ID].as_primitive::<UInt64Type>().values();
-            let right_row_ids = right_res[ROW_ID].as_primitive::<UInt64Type>().values();
+            let left_row_ids = left_res[ROW_ADDR].as_primitive::<UInt64Type>().values();
+            let right_row_ids = right_res[ROW_ADDR].as_primitive::<UInt64Type>().values();
             row_ids.iter().enumerate().for_each(|(i, id)| {
                 if i < part_idx {
                     assert_eq!(left_row_ids[i], *id,);
@@ -1711,7 +1711,7 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .distance_range(dists.first().copied(), dists.last().copied())
             .try_into_batch()
             .await
@@ -1719,7 +1719,7 @@ mod tests {
         if dist_type != DistanceType::Hamming {
             let excluded_count = dists.iter().filter(|d| *d == dists.last().unwrap()).count();
             assert_eq!(exclude_last_res.num_rows(), k - excluded_count);
-            let res_row_ids = exclude_last_res[ROW_ID]
+            let res_row_ids = exclude_last_res[ROW_ADDR]
                 .as_primitive::<UInt64Type>()
                 .values();
             row_ids.iter().enumerate().for_each(|(i, id)| {
@@ -1792,12 +1792,12 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
             .nprobs(nlist)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
 
-        let row_ids = result[ROW_ID]
+        let row_ids = result[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();

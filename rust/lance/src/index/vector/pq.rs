@@ -20,7 +20,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR_FIELD, ROW_ID};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -356,7 +356,7 @@ impl VectorIndex for PQIndex {
                 let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
                     .enumerate()
                     .filter_map(|(vec_idx, old_row_id)| {
-                        let new_row_id = frag_reuse_index_ref.remap_row_id(*old_row_id);
+                        let new_row_id = frag_reuse_index_ref.remap_row_addr(*old_row_id);
                         new_row_id.map(|new_row_id| {
                             (
                                 new_row_id,
@@ -394,7 +394,7 @@ impl VectorIndex for PQIndex {
         })?;
 
         let num_rows = row_ids.len();
-        let mut fields = vec![ROW_ID_FIELD.clone()];
+        let mut fields = vec![ROW_ADDR_FIELD.clone()];
         let mut columns: Vec<ArrayRef> = vec![row_ids];
         if with_vector {
             let transposed_codes = self.code.clone().ok_or(Error::Index {

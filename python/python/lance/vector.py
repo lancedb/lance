@@ -319,7 +319,7 @@ def compute_pq_codes(
         dataset,
         batch_size=batch_size,
         with_row_id=False,
-        columns=["row_id", "partition"] + field_names,
+        columns=["row_addr", "partition"] + field_names,
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
@@ -329,7 +329,7 @@ def compute_pq_codes(
     )
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
+            pa.field("row_addr", pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
             pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
         ]
@@ -359,7 +359,7 @@ def compute_pq_codes(
                 )
                 pq_codes = pq_codes.to(torch.uint8)
 
-                ids = batch["row_id"].reshape(-1)
+                ids = batch["row_addr"].reshape(-1)
                 partitions = batch["partition"].reshape(-1)
 
                 ids = ids.cpu()
@@ -473,7 +473,7 @@ def compute_partitions(
 
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
+            pa.field("row_addr", pa.uint64()),
             pa.field("partition", pa.uint32()),
         ]
         + fields
@@ -658,7 +658,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
 
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
+            pa.field("row_addr", pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
             pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
         ]

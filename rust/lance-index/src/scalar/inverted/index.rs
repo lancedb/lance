@@ -44,8 +44,10 @@ use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
-use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{
+    container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus, ROW_ADDR_FIELD,
+};
+use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
@@ -105,10 +107,14 @@ pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
 
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
-pub static FTS_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
+pub static FTS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        ROW_ADDR_FIELD.clone(),
+        SCORE_FIELD.clone(),
+    ]))
+});
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub enum TokenSetFormat {
@@ -575,7 +581,7 @@ impl ScalarIndex for InvertedIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_id();
+        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_addr();
         if self.is_legacy() {
             UpdateCriteria::requires_old_data(criteria)
         } else {
@@ -2185,7 +2191,7 @@ impl DocSet {
                     .iter()
                     .filter_map(|id| {
                         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
+                            frag_reuse_index_ref.remap_row_addr(*id)
                         } else {
                             Some(*id)
                         }
@@ -2203,7 +2209,7 @@ impl DocSet {
                     .iter()
                     .filter_map(|id| {
                         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
+                            frag_reuse_index_ref.remap_row_addr(*id)
                         } else {
                             Some(*id)
                         }

@@ -87,7 +87,7 @@ impl InvertedIndexTrainingRequest {
     pub fn new(parameters: InvertedIndexParams) -> Self {
         Self {
             parameters,
-            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         }
     }
 }

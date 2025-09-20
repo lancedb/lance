@@ -11,7 +11,7 @@ use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ADDR_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,7 @@ use std::sync::LazyLock;
 static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ])
     .into()
 });

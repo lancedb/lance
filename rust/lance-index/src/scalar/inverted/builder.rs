@@ -19,8 +19,8 @@ use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu, ROW_ADDR_FIELD};
+use lance_core::{Error, Result, ROW_ID};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use snafu::location;
@@ -811,7 +811,7 @@ pub fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
             docs.data_type().clone(),
             true,
         ),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
     Ok(batch)

@@ -29,7 +29,7 @@ use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result, ROW_ADDR, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::FileReader;
 use lance_file::v2::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
@@ -283,7 +283,7 @@ pub async fn shuffle_dataset(
                     let mut batch = b?;
 
                     if !partition_map.is_empty() {
-                        let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+                        let row_ids = batch.column_by_name(ROW_ADDR).ok_or(Error::Index {
                             message: "column does not exist".to_string(),
                             location: location!(),
                         })?;
@@ -676,8 +676,8 @@ impl IvfShuffler {
                     continue;
                 }
 
-                if let Some((row_id_idx, _)) = batch.schema().column_with_name("row_id") {
-                    batch = batch.rename_column(row_id_idx, ROW_ID)?;
+                if let Some((row_addr_idx, _)) = batch.schema().column_with_name("row_addr") {
+                    batch = batch.rename_column(row_addr_idx, ROW_ADDR)?;
                 }
 
                 let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
@@ -867,7 +867,7 @@ mod test {
     };
     use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::ROW_ID_FIELD;
+    use lance_core::{ROW_ADDR_FIELD};
     use lance_io::stream::RecordBatchStreamAdapter;
     use rand::RngCore;
 
@@ -877,7 +877,7 @@ mod test {
 
     fn make_schema(pq_dim: u32) -> Arc<arrow_schema::Schema> {
         Arc::new(arrow_schema::Schema::new(vec![
-            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
             arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
             arrow_schema::Field::new(
                 PQ_CODE_COLUMN,

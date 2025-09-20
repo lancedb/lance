@@ -1251,7 +1251,9 @@ impl ScalarIndex for BTreeIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
+        UpdateCriteria::only_new_data(
+            TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
+        )
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -1901,7 +1903,7 @@ impl BTreeTrainingRequest {
         Self {
             parameters,
             // BTree indexes need data sorted by the value column
-            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_addr(),
         }
     }
 }

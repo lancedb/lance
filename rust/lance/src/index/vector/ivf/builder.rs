@@ -118,7 +118,7 @@ async fn load_precomputed_partitions(
     let partition_lookup = stream
         .try_fold(lookup, |mut lookup, batch| {
             let row_addrs: &UInt64Array = batch
-                .column_by_name("row_id")
+                .column_by_name("row_addr")
                 .expect("malformed partition file: missing row_id column")
                 .as_primitive();
             let partitions: &UInt32Array = batch
