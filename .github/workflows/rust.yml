@@ -107,17 +107,19 @@ jobs:
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES} --lib --doc
+          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES} --lib
       - name: Build tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run --lib --doc
+          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run --lib
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --features ${ALL_FEATURES} --workspace --lib --doc
+          cargo test --features ${ALL_FEATURES} --workspace --lib
+      - name: Run doctests
+        run: cargo test --features ${ALL_FEATURES} --workspace --doc
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -149,6 +151,10 @@ jobs:
         with:
           cache-targets: false
           cache-workspace-crates: true
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
       - name: Build
         run: cargo build --locked --test integration_tests --profile release-with-debug
       - name: Run integration tests
