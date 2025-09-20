@@ -1153,7 +1153,7 @@ fn rows_in_buffer(
 pub mod test {
     use crate::{
         format::pb,
-        testing::{check_round_trip_encoding_generated, ArrayGeneratorProvider},
+        testing::{check_round_trip_encoding_generated, ArrayGeneratorProvider, TestCases},
         version::LanceFileVersion,
     };
 
@@ -1686,12 +1686,8 @@ pub mod test {
 
         for (data_type, array_gen_provider) in bitpacked_test_cases {
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_generated(
-                field,
-                array_gen_provider.copy(),
-                LanceFileVersion::V2_1,
-            )
-            .await;
+            let test_cases = TestCases::basic().with_min_file_version(LanceFileVersion::V2_1);
+            check_round_trip_encoding_generated(field, array_gen_provider.copy(), test_cases).await;
         }
     }
 }

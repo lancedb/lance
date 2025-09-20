@@ -952,7 +952,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("rle")
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
 
         // Test both explicit metadata and automatic selection
         // 1. Test with explicit RLE threshold metadata (also disable BSS)

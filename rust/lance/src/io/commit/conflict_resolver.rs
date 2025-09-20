@@ -1751,7 +1751,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::V2_0,
+                &LanceFileVersion::Stable,
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -1883,7 +1883,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::V2_0,
+                &LanceFileVersion::Stable,
                 NonZero::new(10),
             )
             .with_physical_rows(3);

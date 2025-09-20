@@ -494,14 +494,15 @@ mod tests {
     use super::*;
 
     fn sample_fragment() -> Fragment {
+        let (major_version, minor_version) = LanceFileVersion::Stable.to_numbers();
         Fragment {
             id: 0,
             files: vec![DataFile {
                 path: "file.lance".to_string(),
                 fields: vec![0],
                 column_indices: vec![0],
-                file_major_version: 2,
-                file_minor_version: 0,
+                file_major_version: major_version,
+                file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
             }],

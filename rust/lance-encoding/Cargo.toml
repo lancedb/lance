@@ -34,6 +34,7 @@ hyperloglogplus.workspace = true
 prost-types.workspace = true
 rand.workspace = true
 snafu.workspace = true
+strum = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 tracing.workspace = true
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
