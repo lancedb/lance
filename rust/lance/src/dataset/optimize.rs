@@ -768,6 +768,12 @@ async fn rewrite_files(
     } else {
         log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+        if dataset.manifest.uses_stable_row_ids() {
+            lance_table::rowids::version::set_version_metadata_for_fragments(
+                &mut new_fragments,
+                dataset.manifest.version,
+            );
+        }
 
         if options.defer_index_remap {
             let no_addrs = RoaringTreemap::new();
@@ -1024,6 +1030,7 @@ mod tests {
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
+            row_latest_update_version_meta: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
