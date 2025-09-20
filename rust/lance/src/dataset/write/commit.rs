@@ -522,6 +522,7 @@ mod tests {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
+            primary_key_bloom_filter: None,
         }
     }
 
@@ -797,6 +798,7 @@ mod tests {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
+            primary_key_bloom_filter: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])
