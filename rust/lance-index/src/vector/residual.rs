@@ -23,8 +23,6 @@ use tracing::instrument;
 
 use super::{transform::Transformer, PQ_CODE_COLUMN};
 
-pub const RESIDUAL_COLUMN: &str = "__residual_vector";
-
 /// Compute the residual vector of a Vector Matrix to their centroids.
 ///
 /// The residual vector is the difference between the original vector and the centroid.
@@ -193,7 +191,6 @@ impl Transformer for ResidualTransform {
         let residual_arr =
             compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
-        // Replace original column with residual column.
         let batch = if residual_arr.data_type() != original.data_type() {
             batch.replace_column_schema_by_name(
                 &self.vec_col,

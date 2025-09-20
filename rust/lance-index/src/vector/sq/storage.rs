@@ -380,7 +380,7 @@ impl VectorStore for ScalarQuantizationStorage {
     ///
     /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+    fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         SQDistCalculator::new(query, self, self.quantizer.bounds())
     }
 
