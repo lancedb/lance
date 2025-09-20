@@ -1476,7 +1476,7 @@ impl Dataset {
 
         // Iterate through the sorted addresses and sorted fragments (and sorted deletion vectors)
         // and filter out addresses that have been deleted
-        let mut filtered_sorted_ids = Vec::with_capacity(sorted_addrs.len());
+        let mut filtered_sorted_addrs = Vec::with_capacity(sorted_addrs.len());
         let mut sorted_addr_iter = sorted_addrs.into_iter().map(RowAddress::from);
         let mut next_addr = sorted_addr_iter.next().unwrap();
         let mut exhausted = false;
@@ -1491,7 +1491,7 @@ impl Dataset {
                         while next_addr.fragment_id() == *frag_id
                             && next_addr.row_offset() < deleted
                         {
-                            filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                            filtered_sorted_addrs.push(Some(u64::from(next_addr)));
                             if let Some(next) = sorted_addr_iter.next() {
                                 next_addr = next;
                             } else {
@@ -1506,7 +1506,7 @@ impl Dataset {
                             break;
                         }
                         if next_addr.row_offset() == deleted {
-                            filtered_sorted_ids.push(None);
+                            filtered_sorted_addrs.push(None);
                             if let Some(next) = sorted_addr_iter.next() {
                                 next_addr = next;
                             } else {
@@ -1522,7 +1522,7 @@ impl Dataset {
                 // Either no deletion vector, or we've exhausted it, keep everything else
                 // in this frag
                 while next_addr.fragment_id() == *frag_id {
-                    filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                    filtered_sorted_addrs.push(Some(u64::from(next_addr)));
                     if let Some(next) = sorted_addr_iter.next() {
                         next_addr = next;
                     } else {
@@ -1532,7 +1532,7 @@ impl Dataset {
             } else {
                 // Frag doesn't exist (possibly deleted), delete all items
                 while next_addr.fragment_id() == *frag_id {
-                    filtered_sorted_ids.push(None);
+                    filtered_sorted_addrs.push(None);
                     if let Some(next) = sorted_addr_iter.next() {
                         next_addr = next;
                     } else {
@@ -1545,10 +1545,10 @@ impl Dataset {
         // filtered_sorted_ids is now a Vec with the same size as sorted_addrs, but with None
         // values where the corresponding address was deleted.  We now need to un-sort it and
         // filter out the deleted addresses.
-        perm.apply_inv_slice_in_place(&mut filtered_sorted_ids);
+        perm.apply_inv_slice_in_place(&mut filtered_sorted_addrs);
         Ok(addr_or_ids
             .iter()
-            .zip(filtered_sorted_ids)
+            .zip(filtered_sorted_addrs)
             .filter_map(|(addr_or_id, maybe_addr)| maybe_addr.map(|_| *addr_or_id))
             .collect())
     }
