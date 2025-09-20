@@ -764,6 +764,7 @@ impl From<&Manifest> for pb::Manifest {
                     path: base_path.path.clone(),
                 })
                 .collect(),
+            inline_transaction: None,
         }
     }
 }
