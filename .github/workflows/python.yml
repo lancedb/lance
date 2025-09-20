@@ -129,7 +129,7 @@ jobs:
   forward-compat:
     needs: linux
     runs-on: ubuntu-24.04
-    name: Forward Compatibility Tests ({{ matrix.lance-version }})
+    name: Forward Compatibility Tests (${{ matrix.lance-version }})
     strategy:
       matrix:
         lance-version: ["0.16.0", "0.29.1.beta2", "0.36.0"]
@@ -155,7 +155,9 @@ jobs:
         run: |
           pip install $(ls wheels/pylance-*.whl)[tests,ray]
       - name: Generate forward compatibility files
-        run: python python/tests/forward_compat/datagen.py
+        env:
+          PYTHONPATH: python/tests
+        run: python -m forward_compat.datagen
       - name: Run forward compatibility tests (pylance ${{ matrix.lance-version }})
         run: |
           python -m venv venv
