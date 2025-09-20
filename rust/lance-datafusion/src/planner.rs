@@ -30,7 +30,9 @@ use datafusion::logical_expr::{
     Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
-use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
+use datafusion::sql::planner::{
+    ContextProvider, NullOrdering, ParserOptions, PlannerContext, SqlToRel,
+};
 use datafusion::sql::sqlparser::ast::{
     AccessExpr, Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo,
     Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
@@ -52,7 +54,7 @@ use snafu::location;
 
 use lance_core::{Error, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CastListF16Udf {
     signature: Signature,
 }
@@ -448,6 +450,7 @@ impl Planner {
                 enable_options_value_normalization: false,
                 collect_spans: false,
                 map_string_types_to_utf8view: false,
+                default_null_ordering: NullOrdering::NullsFirst,
             },
         );
 
@@ -708,7 +711,10 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                escape_char.as_ref().and_then(|c| c.chars().next()),
+                escape_char.as_ref().and_then(|c| match c {
+                    Value::SingleQuotedString(char) if char.len() == 1 => char.chars().next(),
+                    _ => None,
+                }),
                 true,
             ))),
             SQLExpr::Like {
@@ -721,7 +727,10 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                escape_char.as_ref().and_then(|c| c.chars().next()),
+                escape_char.as_ref().and_then(|c| match c {
+                    Value::SingleQuotedString(char) if char.len() == 1 => char.chars().next(),
+                    _ => None,
+                }),
                 false,
             ))),
             SQLExpr::Cast {
