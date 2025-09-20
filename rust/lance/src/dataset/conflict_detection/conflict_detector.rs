@@ -256,8 +256,8 @@ mod tests {
         let mut filter2 = PrimaryKeyBloomFilter::new(vec!["id".to_string()]);
 
         let shared_key = PrimaryKeyValue::String("shared_key".to_string());
-        filter1.insert(shared_key.clone(), 1).unwrap();
-        filter2.insert(shared_key, 2).unwrap();
+        filter1.insert(shared_key.clone()).unwrap();
+        filter2.insert(shared_key).unwrap();
 
         let result = detector
             .check_filter_conflict(&filter1, &filter2, "uuid2", 2)
@@ -272,15 +272,15 @@ mod tests {
         let detector = DefaultConflictDetector::new();
         let mut current_filter = PrimaryKeyBloomFilter::new(vec!["id".to_string()]);
         let shared_key = PrimaryKeyValue::String("shared_key".to_string());
-        current_filter.insert(shared_key.clone(), 1).unwrap();
+        current_filter.insert(shared_key.clone()).unwrap();
 
         // Create concurrent transactions
         let mut filter1 = PrimaryKeyBloomFilter::new(vec!["id".to_string()]);
-        filter1.insert(shared_key.clone(), 2).unwrap();
+        filter1.insert(shared_key.clone()).unwrap();
 
         let mut filter2 = PrimaryKeyBloomFilter::new(vec!["id".to_string()]);
         filter2
-            .insert(PrimaryKeyValue::String("other_key".to_string()), 3)
+            .insert(PrimaryKeyValue::String("other_key".to_string()))
             .unwrap();
 
         let transactions = vec![
