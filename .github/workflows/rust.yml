@@ -27,7 +27,6 @@ env:
   # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
   # CI builds are faster with incremental disabled.
   CARGO_INCREMENTAL: "0"
-  CARGO_BUILD_JOBS: "1"
 
 jobs:
   format:
@@ -72,7 +71,7 @@ jobs:
           command: check
 
   linux-build:
-    runs-on: "ubuntu-24.04"
+    runs-on: ubuntu-2404-8x-x64
     timeout-minutes: 60
     strategy:
       matrix:
@@ -103,21 +102,19 @@ jobs:
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Collect features
+        run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES} --lib
+        run: cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES} --lib
       - name: Build tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run --lib
+        run: cargo test --locked --features ${ALL_FEATURES} --workspace --no-run --lib
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --features ${ALL_FEATURES} --workspace --lib
+        run: cargo test --features ${ALL_FEATURES} --workspace --lib
       - name: Run doctests
         run: cargo test --features ${ALL_FEATURES} --workspace --doc
       - name: Upload coverage to Codecov
