@@ -129,7 +129,7 @@ jobs:
   forward-compat:
     needs: linux
     runs-on: ubuntu-24.04
-    name: Python Linux 3.12 ARM
+    name: Forward Compatibility Tests ({{ matrix.lance-version }})
     strategy:
       matrix:
         lance-version: ["0.16.0", "0.29.1.beta2", "0.36.0"]
@@ -150,7 +150,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: linux-wheels
-          path: wheels
+          path: python/wheels
       - name: Install dependencies
         run: |
           pip install $(ls wheels/pylance-*.whl)[tests,ray]
