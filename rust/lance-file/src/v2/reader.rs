@@ -2014,10 +2014,13 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), total_rows);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_blocking_take() {
+    async fn test_blocking_take(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let fs = FsFixture::default();
-        let WrittenFile { data, schema, .. } = create_some_file(&fs, LanceFileVersion::V2_1).await;
+        let WrittenFile { data, schema, .. } = create_some_file(&fs, version).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
         let file_scheduler = fs
@@ -2027,10 +2030,7 @@ pub mod tests {
             .unwrap();
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
-            Some(
-                ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["score"])
-                    .unwrap(),
-            ),
+            Some(ReaderProjection::from_column_names(version, &schema, &["score"]).unwrap()),
             Arc::<DecoderPlugins>::default(),
             &test_cache(),
             FileReaderOptions::default(),
