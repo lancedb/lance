@@ -856,7 +856,7 @@ mod tests {
             FixedSizeBinaryArray::try_new_from_values(&UInt8Array::from_iter(binary_data), 8)
                 .unwrap();
 
-        let list_offsets = (0..202).step_by(2).collect();
+        let list_offsets: Int32Array = (0..202).step_by(2).collect();
         let list_values =
             StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
         let list_arr: arrow_array::GenericListArray<i32> =
@@ -868,7 +868,7 @@ mod tests {
         let large_list_arr: arrow_array::GenericListArray<i64> =
             try_new_generic_list_array(large_list_values, &large_list_offsets).unwrap();
 
-        let list_dict_offsets = (0..202).step_by(2).collect();
+        let list_dict_offsets: Int32Array = (0..202).step_by(2).collect();
         let list_dict_vec = (0..200).map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
         let list_dict_arr: DictionaryArray<UInt32Type> = list_dict_vec.into_iter().collect();
         let list_dict_arr: arrow_array::GenericListArray<i32> =
