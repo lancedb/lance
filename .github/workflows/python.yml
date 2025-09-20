@@ -119,18 +119,48 @@ jobs:
           cache-workspace-crates: true
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
+      - name: Upload wheels as artifacts
+        if: ${{ matrix.python-minor-version == '12' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-wheels
+          path: python/target/wheels/pylance-*.whl
+
+  forward-compat:
+    needs: linux
+    runs-on: ubuntu-24.04
+    name: Python Linux 3.12 ARM
+    strategy:
+      matrix:
+        lance-version: ["0.16.0", "0.29.1.beta2", "0.36.0"]
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-wheels
+          path: wheels
+      - name: Install dependencies
+        run: |
+          pip install $(ls wheels/pylance-*.whl)[tests,ray]
       - name: Generate forward compatibility files
         run: python python/tests/forward_compat/datagen.py
-      - name: Run forward compatibility tests (pylance 0.16.0)
+      - name: Run forward compatibility tests (pylance ${{ matrix.lance-version }})
         run: |
           python -m venv venv
           source venv/bin/activate
-          pip install pytest pylance==0.16.0
-          pytest python/tests/forward_compat --run-forward
-      - name: Run forward compatibility tests (pylance 0.29.1.beta2)
-        run: |
-          source venv/bin/activate
-          pip install pytest --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance==0.29.1.beta2
+          pip install pytest pylance==${{ matrix.lance-version }}
           pytest python/tests/forward_compat --run-forward
 
   linux-arm:
