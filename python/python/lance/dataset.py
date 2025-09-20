@@ -4998,6 +4998,7 @@ def write_dataset(
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
+    data_bucket_uris: Optional[List[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5076,6 +5077,15 @@ def write_dataset(
         and can be retrieved using read_transaction().
         If both `commit_message` and `properties` are provided, `commit_message` will
         override any "lance.commit.message" key in `properties`.
+    data_bucket_uris: list of str, optional
+        *Experimental*. Additional bucket URIs for data file distribution.
+        When provided, data files will be distributed across these additional
+        bucket URIs using hash-based distribution. The primary URI (from the 
+        `uri` parameter) will store the manifest and metadata files, while
+        data files are distributed only across the additional buckets.
+        This helps overcome storage quota limitations by spreading data files
+        across multiple buckets.
+        Example: ["s3://bucket2/data", "s3://bucket3/data"]
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -5117,6 +5127,7 @@ def write_dataset(
         "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
         "transaction_properties": merged_properties,
+        "data_bucket_uris": data_bucket_uris,
     }
 
     if commit_lock:
