@@ -2381,8 +2381,10 @@ mod tests {
     use crate::datafusion::LanceTableProvider;
     use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::udf::register_functions;
+    use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -7691,6 +7693,237 @@ mod tests {
 
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_index() {
+        let text_col = Arc::new(StringArray::from(vec![
+            r#"{
+              "Title": "HarryPotter Chapter One",
+              "Content": "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say...",
+              "Author": "J.K. Rowling",
+              "Price": 128,
+              "Language": ["english", "chinese"]
+          }"#,
+            r#"{
+             "Title": "Fairy Talest",
+             "Content": "Once upon a time, on a bitterly cold New Year's Eve, a little girl...",
+             "Author": "ANDERSEN",
+             "Price": 50,
+             "Language": ["english", "chinese"]
+          }"#,
+        ]));
+
+        // Prepare dataset
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("json_field", DataType::Utf8, false).with_metadata(metadata)
+            ])
+            .into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        // Create inverted index for json col
+        let json_index_params = r#"{
+          "target_index_type": "inverted",
+          "target_index_parameters": "{\"base_tokenizer\": \"json\",\"language\":\"English\",\"with_position\": true,\"max_token_length\": 1000,\"lower_case\":true,\"stem\":false,\"remove_stop_words\":false,\"ascii_folding\":true,\"min_ngram_length\":3,\"max_ngram_length\":3,\"prefix_only\": false}",
+          "path": "none"
+        }"#;
+
+        dataset
+            .create_index(
+                &["json_field"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams {
+                    index_type: "json".to_string(),
+                    params: Some(json_index_params.to_string()),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test match query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("title,str,harrypotter".to_string())
+                    .with_column(Some("json_field".to_string())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("title,str,harrypotter;language,str,english".to_string())
+                    .with_column(Some("json_field".to_string())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
+
+        // Test phrase query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Phrase(
+                PhraseQuery::new(
+                    "title,str,harrypotter;title,str,one;title,str,chapter".to_string(),
+                )
+                .with_column(Some("json_field".to_string())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Phrase(
+                PhraseQuery::new(
+                    "title,str,harrypotter;title,str,chapter;title,str,one".to_string(),
+                )
+                .with_column(Some("json_field".to_string())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        // Test multi match query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::MultiMatch(MultiMatchQuery {
+                match_queries: vec![
+                    MatchQuery::new("title,str,harrypotter".to_string())
+                        .with_column(Some("json_field".to_string())),
+                    MatchQuery::new("language,str,english".to_string())
+                        .with_column(Some("json_field".to_string())),
+                ],
+            }),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
+
+        // Test boolean query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Boolean(BooleanQuery {
+                should: vec![],
+                must: vec![
+                    FtsQuery::Match(
+                        MatchQuery::new("language,str,english".to_string())
+                            .with_column(Some("json_field".to_string())),
+                    ),
+                    FtsQuery::Match(
+                        MatchQuery::new("title,str,harrypotter".to_string())
+                            .with_column(Some("json_field".to_string())),
+                    ),
+                ],
+                must_not: vec![],
+            }),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        // Append data
+        let text_col = Arc::new(StringArray::from(vec![
+            r#"{
+              "Title": "HarryPotter Chapter Two",
+              "Content": "Nearly ten years had passed since the Dursleys had woken up...",
+              "Author": "J.K. Rowling",
+              "Price": 128,
+              "Language": ["english", "chinese"]
+            }"#,
+        ]));
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("json_field", DataType::Utf8, false).with_metadata(metadata)
+            ])
+            .into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        dataset.append(stream, None).await.unwrap();
+
+        // Test match query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("title,str,harrypotter".to_string())
+                    .with_column(Some("json_field".to_string())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
     }
 
     #[tokio::test]
