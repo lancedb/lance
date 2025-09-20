@@ -50,6 +50,13 @@ public class LanceFileReader implements AutoCloseable {
 
   private native void populateSchemaNative(long arrowSchemaMemoryAddress);
 
+  private native void takeNative(
+      int batchSize,
+      @Nullable List<String> projectedNames,
+      List<Integer> row_indices,
+      long streamMemoryAddress)
+      throws IOException;
+
   private native void readAllNative(
       int batchSize,
       @Nullable List<String> projectedNames,
@@ -136,6 +143,23 @@ public class LanceFileReader implements AutoCloseable {
       throws IOException {
     try (ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator)) {
       readAllNative(batchSize, projectedNames, ranges, ffiArrowArrayStream.memoryAddress());
+      return Data.importArrayStream(allocator, ffiArrowArrayStream);
+    }
+  }
+
+  /**
+   * Take rows from the Lance file
+   *
+   * @param batchSize the maximum number of rows to read in a single batch
+   * @param projectedNames optional list of column names to project; if null, all columns are read
+   * @param row_indices row indices.
+   * @return an ArrowReader for the Lance file
+   */
+  public ArrowReader take(
+      @Nullable List<String> projectedNames, List<Integer> row_indices, int batchSize)
+      throws IOException {
+    try (ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator)) {
+      takeNative(batchSize, projectedNames, row_indices, ffiArrowArrayStream.memoryAddress());
       return Data.importArrayStream(allocator, ffiArrowArrayStream);
     }
   }
