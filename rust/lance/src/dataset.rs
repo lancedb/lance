@@ -189,7 +189,7 @@ impl From<&Manifest> for Version {
         Self {
             version: m.version,
             timestamp: m.timestamp(),
-            metadata: BTreeMap::default(),
+            metadata: m.summary().into(),
         }
     }
 }
