@@ -29,7 +29,8 @@ use crate::scalar::registry::{
     VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
-use crate::{pb, Index, IndexType};
+use crate::{Index, IndexType};
+use lance_table::format::pb as table_pb;
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 const LABEL_LIST_INDEX_VERSION: u32 = 0;
@@ -194,7 +195,7 @@ impl ScalarIndex for LabelListIndex {
         self.values_index.remap(mapping, dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&table_pb::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
         })
@@ -211,7 +212,7 @@ impl ScalarIndex for LabelListIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&table_pb::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
         })
@@ -442,7 +443,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             .train_index(data, index_store, request, fragment_ids)
             .await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&table_pb::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
         })

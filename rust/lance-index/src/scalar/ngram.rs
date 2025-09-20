@@ -21,7 +21,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::vector::VectorIndex;
-use crate::{pb, Index, IndexType};
+use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
@@ -39,6 +39,7 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use lance_core::{Result, ROW_ID};
 use lance_io::object_store::ObjectStore;
+use lance_table::format::pb as table_pb;
 use log::info;
 use object_store::path::Path;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -512,7 +513,8 @@ impl ScalarIndex for NGramIndex {
         writer.finish().await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&table_pb::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
@@ -530,7 +532,8 @@ impl ScalarIndex for NGramIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&table_pb::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
@@ -1300,7 +1303,8 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
 
         Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&table_pb::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
