@@ -198,7 +198,7 @@ fn bench_warm_indexed(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let fixture = rt.block_on(BenchmarkFixture::open());
     let details =
-        prost_types::Any::from_msg(&lance_table::format::pb::BTreeIndexDetails::default()).unwrap();
+        prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
 
     let index = rt
         .block_on(BTreeIndexPlugin.load_index(

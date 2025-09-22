@@ -3,7 +3,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::pbold;
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -14,6 +13,7 @@ use lance_core::cache::LanceCache;
 use lance_core::ROW_ID;
 use lance_datagen::{array, RowCount};
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndexBuilder, NGramIndexBuilderOptions, NGramIndexPlugin};
 use lance_index::scalar::{registry::ScalarIndexPlugin, TextQuery};
