@@ -31,6 +31,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{datatypes::Projection, Error, Result};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
@@ -413,7 +414,7 @@ impl FilteredReadStream {
 
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map(|scoped_fragment| {
-                tokio::task::spawn(Self::read_fragment(scoped_fragment))
+                tokio::task::spawn(Self::read_fragment(scoped_fragment).in_current_span())
                     .map(|thread_result| thread_result.unwrap())
             })
             .buffered(fragment_readahead);
