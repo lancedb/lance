@@ -17,6 +17,7 @@ import com.lancedb.lance.Dataset;
 import com.lancedb.lance.FragmentMetadata;
 import com.lancedb.lance.TestUtils;
 import com.lancedb.lance.Transaction;
+import com.lancedb.lance.operation.Update.UpdateMode;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
@@ -25,6 +26,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -77,6 +79,7 @@ public class UpdateTest extends OperationTestBase {
                           Collections.singletonList(
                               Long.valueOf(dataset.getFragments().get(0).getId())))
                       .newFragments(Collections.singletonList(newFragment))
+                      .updateMode(Optional.of(UpdateMode.RewriteRows))
                       .build())
               .build();
 
@@ -86,6 +89,10 @@ public class UpdateTest extends OperationTestBase {
         assertEquals(rowCount, dataset.countRows());
 
         Transaction txn = dataset.readTransaction().orElse(null);
+        Update commit = (Update) transaction.operation();
+        Update read = (Update) txn.operation();
+        System.out.println(String.format("operation equals: %s", read.equals(commit)));
+        assertEquals(commit, read);
         assertEquals(transaction, txn);
       }
     }
