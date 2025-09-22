@@ -507,7 +507,8 @@ fn convert_to_java_operation_inner<'local>(
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
             let new_fragments_obj = export_vec(env, &new_fragments)?;
             let fields_modified = JLance(fields_modified.clone()).into_java(env)?;
-            let fields_for_preserving_frag_bitmap = JLance(fields_for_preserving_frag_bitmap.clone()).into_java(env)?;
+            let fields_for_preserving_frag_bitmap =
+                JLance(fields_for_preserving_frag_bitmap.clone()).into_java(env)?;
             let update_mode = match update_mode {
                 Some(update_mode) => update_mode.into_java(env),
                 None => Ok(JObject::null()),
@@ -936,13 +937,19 @@ fn convert_to_rust_operation(
                     fragment.extract_object(env)
                 })?;
 
-            let fields_modified = env.call_method(java_operation, "fieldsModified", "()[J", &[])?.l()?;
+            let fields_modified = env
+                .call_method(java_operation, "fieldsModified", "()[J", &[])?
+                .l()?;
             let fields_modified = JLongArray::from(fields_modified).extract_object(env)?;
 
-            let fields_for_preserving_frag_bitmap = env.call_method(java_operation, "fieldsForPreservingFragBitmap", "()[J", &[])?.l()?;
-            let fields_for_preserving_frag_bitmap = JLongArray::from(fields_for_preserving_frag_bitmap).extract_object(env)?;
+            let fields_for_preserving_frag_bitmap = env
+                .call_method(java_operation, "fieldsForPreservingFragBitmap", "()[J", &[])?
+                .l()?;
+            let fields_for_preserving_frag_bitmap =
+                JLongArray::from(fields_for_preserving_frag_bitmap).extract_object(env)?;
 
-            let update_mode: Option<UpdateMode> = env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
+            let update_mode: Option<UpdateMode> =
+                env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
                     update_mode.extract_object(env)
                 })?;
 
