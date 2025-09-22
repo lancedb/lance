@@ -3,15 +3,9 @@
 
 //! Utilities for working with datafusion execution plans
 
-use std::{
-    collections::HashMap,
-    fmt::{self, Formatter},
-    sync::{Arc, LazyLock, Mutex},
-    time::Duration,
-};
-
 use arrow_array::RecordBatch;
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -33,6 +27,13 @@ use datafusion::{
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use std::any::Any;
+use std::{
+    collections::HashMap,
+    fmt::{self, Formatter},
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
+};
 
 use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
@@ -198,6 +199,99 @@ impl ExecutionPlan for OneShotExec {
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         &self.properties
+    }
+}
+
+/// A source execution node created from existing record batches.
+pub struct RecordBatchExec {
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl RecordBatchExec {
+    pub fn new(batches: Vec<RecordBatch>) -> Result<Self> {
+        if batches.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "RecordBatchExec requires at least one batch".into(),
+                location: location!(),
+            });
+        }
+        let schema = batches[0].schema();
+        Ok(Self {
+            batches,
+            schema: schema.clone(),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::RoundRobinBatch(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ),
+        })
+    }
+}
+
+impl std::fmt::Debug for RecordBatchExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "RecordBatchExec")
+    }
+}
+
+impl DisplayAs for RecordBatchExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(f, "RecordBatchExec")
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for RecordBatchExec {
+    fn name(&self) -> &str {
+        "RecordBatchExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Internal(
+                "RecordBatchExec does not support children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        Ok(Box::pin(MemoryStream::try_new(
+            self.batches.clone(),
+            self.schema.clone(),
+            None,
+        )?))
     }
 }
 
