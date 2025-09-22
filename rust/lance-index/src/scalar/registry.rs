@@ -10,6 +10,7 @@ use lance_core::{cache::LanceCache, Error, Result};
 use snafu::location;
 
 use crate::pb;
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -19,7 +20,6 @@ use crate::{
         CreatedIndex, IndexStore, ScalarIndex,
     },
 };
-use lance_table::format::pb as table_pb;
 
 pub const VALUE_COLUMN_NAME: &str = "value";
 
@@ -196,13 +196,13 @@ impl ScalarIndexPluginRegistry {
         let mut registry = Self {
             plugins: HashMap::new(),
         };
-        registry.add_plugin::<table_pb::BTreeIndexDetails, BTreeIndexPlugin>();
-        registry.add_plugin::<table_pb::BitmapIndexDetails, BitmapIndexPlugin>();
-        registry.add_plugin::<table_pb::LabelListIndexDetails, LabelListIndexPlugin>();
-        registry.add_plugin::<table_pb::NGramIndexDetails, NGramIndexPlugin>();
-        registry.add_plugin::<table_pb::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
+        registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
+        registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
+        registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
+        registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
+        registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
-        registry.add_plugin::<table_pb::InvertedIndexDetails, InvertedIndexPlugin>();
+        registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
 
         let registry = Arc::new(registry);

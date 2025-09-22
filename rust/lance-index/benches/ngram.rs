@@ -3,6 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use crate::pbold;
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -17,7 +18,6 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndexBuilder, NGramIndexBuilderOptions, NGramIndexPlugin};
 use lance_index::scalar::{registry::ScalarIndexPlugin, TextQuery};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::pb as table_pb;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -89,7 +89,7 @@ fn bench_ngram(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
-    let details = prost_types::Any::from_msg(&table_pb::NGramIndexDetails::default()).unwrap();
+    let details = prost_types::Any::from_msg(&pbold::NGramIndexDetails::default()).unwrap();
     let index = rt
         .block_on(NGramIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
         .unwrap();

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{sync::Arc, time::Duration};
 
+use crate::pbold;
 use arrow_array::{Int32Array, RecordBatch, UInt64Array};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -17,7 +18,6 @@ use lance_index::scalar::zonemap::{
 };
 use lance_index::scalar::{registry::ScalarIndexPlugin, SargableQuery};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::pb as table_pb;
 use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -86,7 +86,7 @@ fn bench_zonemap(c: &mut Criterion) {
     group
         .sample_size(10)
         .measurement_time(Duration::from_secs(10));
-    let details = prost_types::Any::from_msg(&table_pb::ZoneMapIndexDetails::default()).unwrap();
+    let details = prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap();
     let index = rt
         .block_on(ZoneMapIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
         .unwrap();

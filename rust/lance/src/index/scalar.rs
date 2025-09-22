@@ -21,6 +21,9 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::pbold::{
+    BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
+};
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
@@ -32,9 +35,6 @@ use lance_index::scalar::{
 };
 use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType, ScalarIndexCriteria, VECTOR_INDEX_VERSION};
-use lance_table::format::pb::{
-    BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
-};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
 use snafu::location;
@@ -519,8 +519,8 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
+    use lance_index::pbold::NGramIndexDetails;
     use lance_index::IndexType;
-    use lance_table::format::pb::NGramIndexDetails;
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(

@@ -26,6 +26,7 @@ pub use tokenizer::*;
 use lance_core::Error;
 use snafu::location;
 
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -34,7 +35,6 @@ use crate::{
         CreatedIndex, ScalarIndex,
     },
 };
-use lance_table::format::pb as table_pb;
 
 use super::IndexStore;
 
@@ -59,7 +59,7 @@ impl InvertedIndexPlugin {
             }
         });
 
-        let details = table_pb::InvertedIndexDetails::try_from(&params)?;
+        let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask);
         inverted_index.update(data, index_store).await?;
@@ -70,7 +70,7 @@ impl InvertedIndexPlugin {
     }
 
     /// Return true if the query can be used to speed up contains_tokens queries
-    fn can_accelerate_queries(details: &table_pb::InvertedIndexDetails) -> bool {
+    fn can_accelerate_queries(details: &pbold::InvertedIndexDetails) -> bool {
         details.base_tokenizer == Some("simple".to_string())
             && details.max_token_length.is_none()
             && details.language == serde_json::to_string(&Language::English).unwrap()
@@ -140,7 +140,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        let Ok(index_details) = _index_details.to_msg::<table_pb::InvertedIndexDetails>() else {
+        let Ok(index_details) = _index_details.to_msg::<pbold::InvertedIndexDetails>() else {
             return None;
         };
 

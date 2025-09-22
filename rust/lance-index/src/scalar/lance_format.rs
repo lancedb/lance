@@ -307,6 +307,7 @@ pub mod tests {
     use std::{collections::HashMap, ops::Bound, path::Path};
 
     use crate::metrics::NoOpMetricsCollector;
+    use crate::pbold;
     use crate::scalar::bitmap::BitmapIndexPlugin;
     use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
     use crate::scalar::label_list::LabelListIndexPlugin;
@@ -317,7 +318,6 @@ pub mod tests {
         flat::FlatIndexMetadata,
         LabelListQuery, SargableQuery, ScalarIndex,
     };
-    use lance_table::format::pb as table_pb;
 
     use super::*;
     use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
@@ -390,7 +390,7 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<table_pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
             )
@@ -455,7 +455,7 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<table_pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
             )
@@ -482,7 +482,7 @@ pub mod tests {
         let updated_index = BTreeIndexPlugin
             .load_index(
                 updated_index_store,
-                &default_details::<table_pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
             )
@@ -570,7 +570,7 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<table_pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
             )
@@ -814,7 +814,7 @@ pub mod tests {
             let index = BTreeIndexPlugin
                 .load_index(
                     index_store,
-                    &default_details::<table_pb::BTreeIndexDetails>(),
+                    &default_details::<pbold::BTreeIndexDetails>(),
                     None,
                     &LanceCache::no_cache(),
                 )
@@ -874,7 +874,7 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<table_pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1438,7 +1438,7 @@ pub mod tests {
                 let index = LabelListIndexPlugin
                     .load_index(
                         index_store,
-                        &default_details::<table_pb::LabelListIndexDetails>(),
+                        &default_details::<pbold::LabelListIndexDetails>(),
                         None,
                         &LanceCache::no_cache(),
                     )

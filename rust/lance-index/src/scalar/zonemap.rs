@@ -12,6 +12,7 @@
 //! false positives that require rechecking.
 //!
 //!
+use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -26,7 +27,6 @@ use futures::TryStreamExt;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
-use lance_table::format::pb as table_pb;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
@@ -607,7 +607,7 @@ impl ScalarIndex for ZoneMapIndex {
         combined_builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::ZoneMapIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })
@@ -1003,7 +1003,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             })?;
         Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::ZoneMapIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })

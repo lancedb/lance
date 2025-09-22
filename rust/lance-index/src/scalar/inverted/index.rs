@@ -72,13 +72,13 @@ use super::{
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
+use crate::pbold;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
-use lance_table::format::pb as table_pb;
 
 pub const INVERTED_INDEX_VERSION: u32 = 0;
 
@@ -486,7 +486,7 @@ impl ScalarIndex for InvertedIndex {
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
-        let details = table_pb::InvertedIndexDetails::try_from(&self.params)?;
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -501,7 +501,7 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 
-        let details = table_pb::InvertedIndexDetails::try_from(&self.params)?;
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),

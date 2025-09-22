@@ -14,6 +14,7 @@ use super::{
     flat::FlatIndexMetadata, AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter,
     MetricsCollector, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -54,7 +55,6 @@ use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
 use lance_io::object_store::ObjectStore;
-use lance_table::format::pb as table_pb;
 use log::{debug, warn};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -1218,7 +1218,7 @@ impl ScalarIndex for BTreeIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::BTreeIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
@@ -1244,7 +1244,7 @@ impl ScalarIndex for BTreeIndex {
         .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::BTreeIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
@@ -1982,7 +1982,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         )
         .await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::BTreeIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })

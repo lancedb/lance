@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::pbold;
 use arrow::array::BinaryBuilder;
 use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -23,7 +24,6 @@ use lance_core::{
     utils::mask::RowIdTreeMap,
     Error, Result, ROW_ID,
 };
-use lance_table::format::pb as table_pb;
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
@@ -534,7 +534,7 @@ impl ScalarIndex for BitmapIndex {
         BitmapIndexPlugin::write_bitmap_index(state, dest_store, &self.value_type).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::BitmapIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
         })
@@ -563,7 +563,7 @@ impl ScalarIndex for BitmapIndex {
         BitmapIndexPlugin::do_train_bitmap_index(new_data, state, dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::BitmapIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
         })
@@ -743,7 +743,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 
         Self::train_bitmap_index(data, index_store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&table_pb::BitmapIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
         })
