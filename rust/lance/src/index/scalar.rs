@@ -21,6 +21,9 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::pbold::{
+    BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
+};
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
@@ -358,18 +361,18 @@ pub(crate) async fn infer_scalar_index_details(
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
     let index_details = if let DataType::List(_) = col.data_type() {
-        prost_types::Any::from_msg(&lance_index::pb::LabelListIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
-        prost_types::Any::from_msg(&lance_index::pb::BitmapIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&inverted_list_lookup).await?
         || dataset
             .object_store
             .exists(&legacy_inverted_list_lookup)
             .await?
     {
-        prost_types::Any::from_msg(&lance_index::pb::InvertedIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
-        prost_types::Any::from_msg(&lance_index::pb::BTreeIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
 
     let index_details = Arc::new(index_details);
@@ -516,10 +519,8 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::{
-        pb::{BTreeIndexDetails, InvertedIndexDetails, NGramIndexDetails},
-        IndexType,
-    };
+    use lance_index::pbold::NGramIndexDetails;
+    use lance_index::IndexType;
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(

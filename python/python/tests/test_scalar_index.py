@@ -3142,6 +3142,26 @@ def test_backward_compatibility_no_fragment_ids(tmp_path):
     assert results.num_rows > 0
 
 
+def test_backward_compatibility_changed_index_protos(tmp_path):
+    path = (
+        Path(__file__).parent.parent.parent.parent
+        / "test_data"
+        / "0.36.0"
+        / "btree_in_index_pkg.lance"
+    )
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
+    ds = lance.dataset(tmp_path)
+
+    indices = ds.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["name"] == "x_idx"
+    assert indices[0]["type"] == "BTree"
+
+    results = ds.scanner(filter="x = 100").to_table()
+    assert results.num_rows == 1
+    assert results.column("x").to_pylist() == [100]
+
+
 def test_distribute_btree_index_build(tmp_path):
     """
     Test distributed B-tree index build similar to test_distribute_fts_index_build.
