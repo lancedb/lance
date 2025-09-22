@@ -46,6 +46,11 @@ def test_ngram_index():
 
 
 @pytest.mark.forward
+@pytest.mark.forward
+@pytest.mark.skipif(
+    Version(lance.__version__) < Version("0.20.0"),
+    reason="Version is too old to read index files stored with Lance 2.0 file format",
+)
 def test_index_search():
     ds = lance.dataset(get_path("scalar_index"))
 
