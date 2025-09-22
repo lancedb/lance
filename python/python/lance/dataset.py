@@ -1003,16 +1003,30 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Replace the schema metadata of the dataset
 
+        .. deprecated:: 0.32.1
+            Use :func:`update_schema_metadata` with ``replace=True`` instead.
+            This method will be removed in a future version.
+
         Parameters
         ----------
         new_metadata: dict
             The new metadata to set
         """
-        self._ds.replace_schema_metadata(new_metadata)
+        warnings.warn(
+            "replace_schema_metadata is deprecated. "
+            "Use update_schema_metadata(metadata, replace=True) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.update_schema_metadata(new_metadata, replace=True)
 
     def replace_field_metadata(self, field_name: str, new_metadata: Dict[str, str]):
         """
         Replace the metadata of a field in the schema
+
+        .. deprecated:: 0.32.1
+            Use :func:`update_field_metadata` with ``replace=True`` instead.
+            This method will be removed in a future version.
 
         Parameters
         ----------
@@ -1021,7 +1035,200 @@ class LanceDataset(pa.dataset.Dataset):
         new_metadata: dict
             The new metadata to set
         """
-        self._ds.replace_field_metadata(field_name, new_metadata)
+        warnings.warn(
+            "replace_field_metadata is deprecated. "
+            "Use update_field_metadata with field paths and replace=True instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.update_field_metadata({field_name: new_metadata}, replace=True)
+
+    # Unified metadata APIs
+
+    @property
+    def metadata(self) -> Dict[str, str]:
+        """
+        Get the table metadata of the dataset.
+
+        Returns
+        -------
+        Dict[str, str]
+            The table metadata as a dictionary of key-value pairs.
+        """
+        return self._ds.metadata()
+
+    @property
+    def schema_metadata(self) -> Dict[str, str]:
+        """
+        Get the schema metadata of the dataset.
+
+        Returns
+        -------
+        Dict[str, str]
+            The schema metadata as a dictionary of key-value pairs.
+        """
+        return self._ds.schema_metadata()
+
+    def update_metadata(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the table metadata of the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Metadata updates where keys are metadata keys and values are:
+            - str: Set the metadata key to this value
+            - None: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all table metadata with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_metadata")
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_metadata(
+        ...     {"author": "John", "version": "1.2"}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_metadata({"old_key": None}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Full replacement (replaces all metadata)
+        >>> dataset.update_metadata(
+        ...     {"author": "John"}, replace=True) # doctest: +ELLIPSIS
+        {...}
+        """
+        return self._ds.update_metadata(values, replace=replace)
+
+    def update_config(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the configuration of the dataset using unified API.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Configuration updates where keys are config keys and values are:
+            - str: Set the config key to this value
+            - None: Remove the config key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all configuration with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_config")
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_config(
+        ...     {"batch_size": "1000", "compression": "zstd"}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_config({"batch_size": None}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Full replacement (replaces all config)
+        >>> dataset.update_config(
+        ...     {"batch_size": "1000"}, replace=True) # doctest: +ELLIPSIS
+        {...}
+        """
+        return self._ds.update_config(values, replace=replace)
+
+    def update_schema_metadata(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the schema metadata of the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Schema metadata updates where keys are metadata keys and values are:
+            - str: Set the metadata key to this value
+            - None: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all schema metadata with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_schema")
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_schema_metadata(
+        ...     {"encoding": "utf-8", "created_by": "lance"}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_schema_metadata({"encoding": None}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Full replacement (replaces all schema metadata)
+        >>> dataset.update_schema_metadata(
+        ...     {"encoding": "utf-8"}, replace=True) # doctest: +ELLIPSIS
+        {...}
+        """
+        return self._ds.update_schema_metadata(values, replace=replace)
+
+    def update_field_metadata(
+        self,
+        field_updates: Dict[str, Dict[str, Optional[str]]],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """
+        Update metadata for multiple fields in the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        field_updates : Dict[str, Dict[str, Optional[str]]]
+            Field metadata updates where keys are field paths and values are
+            metadata dictionaries.
+            For each field's metadata dictionary:
+            - str values: Set the metadata key to this value
+            - None values: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all metadata for the specified fields.
+            If False, incrementally update only the specified keys for each field.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3]), pa.array(['a', 'b', 'c'])],
+        ...                names=['user_id', 'user_name'])
+        >>> dataset = lance.write_dataset(data, "memory://test_field")
+        >>> # Incremental update for multiple fields
+        >>> dataset.update_field_metadata({
+        ...     "user_id": {"description": "User ID", "nullable": "false"},
+        ...     "user_name": {"description": "User name", "max_length": "100"}
+        ... })
+        >>>
+        >>> # Remove keys (incremental mode only)
+        >>> dataset.update_field_metadata({"user_id": {"old_key": None}})
+        >>>
+        >>> # Full replacement for specific fields
+        >>> dataset.update_field_metadata({
+        ...     "user_id": {"description": "User ID"}
+        ... }, replace=True)
+        """
+        # Use the new path-based Rust function directly
+        self._ds.update_field_metadata_by_path(field_updates, replace=replace)
 
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
@@ -3088,20 +3295,6 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
-    def update_config(self, upsert_values: Dict[str, str]) -> None:
-        """
-        Update the dataset configuration.
-
-        This method inserts or updates configuration key-value pairs for the dataset.
-
-        Parameters
-        ----------
-        upsert_values : dict of str to str
-            The configuration items to insert or update.
-            Both keys and values should be strings.
-        """
-        self._ds.update_config(upsert_values)
-
     def delete_config_keys(self, keys: list[str]) -> None:
         """Delete specified configuration keys from the dataset.
 
@@ -3866,6 +4059,51 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+
+    @dataclass
+    class UpdateMap:
+        """
+        Represents updates to a metadata map.
+
+        Attributes
+        ----------
+        updates : Dict[str, Optional[str]]
+            Dictionary of key-value pairs to update. None values mean delete the key.
+        replace : bool
+            If True, replace the entire map with the new entries.
+            If False, merge the new entries with the existing map.
+        """
+
+        updates: Dict[str, Optional[str]]
+        replace: bool = False
+
+    @dataclass
+    class UpdateConfig(BaseOperation):
+        """
+        Operation that updates dataset metadata.
+
+        This operation can update various metadata levels:
+        - Dataset configuration
+        - Table metadata
+        - Schema metadata
+        - Field-specific metadata
+
+        Attributes
+        ----------
+        config_updates : Optional[UpdateMap]
+            Updates to the dataset configuration.
+        table_metadata_updates : Optional[UpdateMap]
+            Updates to the table metadata.
+        schema_metadata_updates : Optional[UpdateMap]
+            Updates to the schema metadata.
+        field_metadata_updates : Optional[Dict[int, UpdateMap]]
+            Updates to field metadata, keyed by field ID.
+        """
+
+        config_updates: Optional[LanceOperation.UpdateMap] = None
+        table_metadata_updates: Optional[LanceOperation.UpdateMap] = None
+        schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
+        field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
 
 
 @dataclass

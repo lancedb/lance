@@ -27,6 +27,57 @@ pub struct Schema {
     pub metadata: HashMap<String, String>,
 }
 
+/// Reference to a field in a schema, either by ID or by path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FieldRef<'a> {
+    /// Reference by field ID
+    ById(i32),
+    /// Reference by field path (e.g., "struct_field.sub_field")
+    ByPath(&'a str),
+}
+
+impl FieldRef<'_> {
+    /// Convert this field reference to a field ID by looking it up in the schema.
+    pub fn into_id(self, schema: &Schema) -> Result<i32> {
+        match self {
+            FieldRef::ById(id) => {
+                if schema.field_by_id(id).is_none() {
+                    return Err(Error::InvalidInput {
+                        source: format!("Field ID {} not found in schema", id).into(),
+                        location: location!(),
+                    });
+                }
+                Ok(id)
+            }
+            FieldRef::ByPath(path) => {
+                let field = schema.field(path).ok_or_else(|| Error::InvalidInput {
+                    source: format!("Field '{}' not found in schema", path).into(),
+                    location: location!(),
+                })?;
+                Ok(field.id)
+            }
+        }
+    }
+}
+
+impl From<i32> for FieldRef<'_> {
+    fn from(id: i32) -> Self {
+        FieldRef::ById(id)
+    }
+}
+
+impl<'a> From<&'a str> for FieldRef<'a> {
+    fn from(path: &'a str) -> Self {
+        FieldRef::ByPath(path)
+    }
+}
+
+impl<'a> From<&'a String> for FieldRef<'a> {
+    fn from(path: &'a String) -> Self {
+        FieldRef::ByPath(path.as_str())
+    }
+}
+
 /// State for a pre-order DFS iterator over the fields of a schema.
 struct SchemaFieldIterPreOrder<'a> {
     field_stack: Vec<&'a Field>,
