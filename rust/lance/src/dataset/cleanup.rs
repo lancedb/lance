@@ -44,7 +44,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_table::{
-    format::{Index, Manifest},
+    format::{IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -210,7 +210,7 @@ impl<'a> CleanupTask<'a> {
     fn process_manifest(
         &self,
         manifest: &Manifest,
-        indexes: &Vec<Index>,
+        indexes: &Vec<IndexMetadata>,
         in_working_set: bool,
         inspection: &mut MutexGuard<CleanupInspection>,
     ) -> Result<()> {
@@ -1202,7 +1202,12 @@ mod tests {
             new_cleanup_interval.to_string(),
         );
 
-        dataset.update_config(new_autoclean_params).await.unwrap();
+        // Convert to new API format
+        let config_updates = new_autoclean_params
+            .into_iter()
+            .map(|(k, v)| (k, Some(v)))
+            .collect::<HashMap<String, Option<String>>>();
+        dataset.update_config(config_updates).await.unwrap();
 
         // Fast forward so we are outside of the new "older_than" window.
         fixture

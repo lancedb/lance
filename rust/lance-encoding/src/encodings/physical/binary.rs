@@ -69,6 +69,7 @@ fn chunk_offsets<N: OffsetSizeTrait>(
             (num_values_in_this_chunk + 1) * byte_width + chunk_bytes.to_usize().unwrap();
 
         let padded_chunk_size = this_chunk_size.next_multiple_of(alignment);
+        debug_assert!(padded_chunk_size > 0);
 
         let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * byte_width;
         chunks_info.push(ChunkInfo {

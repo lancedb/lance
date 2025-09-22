@@ -12,6 +12,8 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
+use crate::dataset::metadata::UpdateFieldMetadataBuilder;
+use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -33,8 +35,8 @@ use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION,
-    MINOR_VERSION,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, MAGIC,
+    MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
@@ -63,6 +65,7 @@ mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
+mod metadata;
 pub mod optimize;
 pub mod progress;
 pub mod refs;
@@ -82,7 +85,7 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction};
+use self::transaction::{Operation, Transaction, UpdateMapEntry};
 use self::write::write_fragments_internal;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::delta::DatasetDelta;
@@ -519,10 +522,10 @@ impl Dataset {
                 let message_data =
                     &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
                 let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-                let indices: Vec<Index> = section
+                let indices: Vec<IndexMetadata> = section
                     .indices
                     .into_iter()
-                    .map(Index::try_from)
+                    .map(IndexMetadata::try_from)
                     .collect::<Result<Vec<_>>>()?;
 
                 let ds_index_cache = session.index_cache.for_dataset(uri);
@@ -1059,11 +1062,6 @@ impl Dataset {
         Ok(())
     }
 
-    /// Get the table config from manifest
-    pub fn config(&self) -> Result<HashMap<String, String>> {
-        Ok(self.manifest.config.clone())
-    }
-
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -1281,7 +1279,7 @@ impl Dataset {
     }
 
     /// Get the indices directory for a specific index, considering its base_id
-    pub(crate) fn indice_files_dir(&self, index: &Index) -> Result<Path> {
+    pub(crate) fn indice_files_dir(&self, index: &IndexMetadata) -> Result<Path> {
         match index.base_id.as_ref() {
             Some(base_id) => {
                 let base_paths = &self.manifest.base_paths;
@@ -1478,7 +1476,7 @@ impl Dataset {
 
         // Iterate through the sorted addresses and sorted fragments (and sorted deletion vectors)
         // and filter out addresses that have been deleted
-        let mut filtered_sorted_ids = Vec::with_capacity(sorted_addrs.len());
+        let mut filtered_sorted_addrs = Vec::with_capacity(sorted_addrs.len());
         let mut sorted_addr_iter = sorted_addrs.into_iter().map(RowAddress::from);
         let mut next_addr = sorted_addr_iter.next().unwrap();
         let mut exhausted = false;
@@ -1493,7 +1491,7 @@ impl Dataset {
                         while next_addr.fragment_id() == *frag_id
                             && next_addr.row_offset() < deleted
                         {
-                            filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                            filtered_sorted_addrs.push(Some(u64::from(next_addr)));
                             if let Some(next) = sorted_addr_iter.next() {
                                 next_addr = next;
                             } else {
@@ -1508,7 +1506,7 @@ impl Dataset {
                             break;
                         }
                         if next_addr.row_offset() == deleted {
-                            filtered_sorted_ids.push(None);
+                            filtered_sorted_addrs.push(None);
                             if let Some(next) = sorted_addr_iter.next() {
                                 next_addr = next;
                             } else {
@@ -1524,7 +1522,7 @@ impl Dataset {
                 // Either no deletion vector, or we've exhausted it, keep everything else
                 // in this frag
                 while next_addr.fragment_id() == *frag_id {
-                    filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                    filtered_sorted_addrs.push(Some(u64::from(next_addr)));
                     if let Some(next) = sorted_addr_iter.next() {
                         next_addr = next;
                     } else {
@@ -1534,7 +1532,7 @@ impl Dataset {
             } else {
                 // Frag doesn't exist (possibly deleted), delete all items
                 while next_addr.fragment_id() == *frag_id {
-                    filtered_sorted_ids.push(None);
+                    filtered_sorted_addrs.push(None);
                     if let Some(next) = sorted_addr_iter.next() {
                         next_addr = next;
                     } else {
@@ -1547,10 +1545,10 @@ impl Dataset {
         // filtered_sorted_ids is now a Vec with the same size as sorted_addrs, but with None
         // values where the corresponding address was deleted.  We now need to un-sort it and
         // filter out the deleted addresses.
-        perm.apply_inv_slice_in_place(&mut filtered_sorted_ids);
+        perm.apply_inv_slice_in_place(&mut filtered_sorted_addrs);
         Ok(addr_or_ids
             .iter()
-            .zip(filtered_sorted_ids)
+            .zip(filtered_sorted_addrs)
             .filter_map(|(addr_or_id, maybe_addr)| maybe_addr.map(|_| *addr_or_id))
             .collect())
     }
@@ -1640,7 +1638,7 @@ impl Dataset {
         Ok(())
     }
 
-    fn validate_indices(&self, indices: &[Index]) -> Result<()> {
+    fn validate_indices(&self, indices: &[IndexMetadata]) -> Result<()> {
         // Make sure there are no duplicate ids
         let mut index_ids = HashSet::new();
         for index in indices.iter() {
@@ -2038,54 +2036,185 @@ impl Dataset {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
     }
+}
 
-    async fn update_op(&mut self, op: Operation) -> Result<()> {
-        let transaction =
-            Transaction::new(self.manifest.version, op, /*blobs_op=*/ None, None);
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+/// # Dataset metadata APIs
+///
+/// There are four kinds of metadata on datasets:
+///
+///  - **Schema metadata**: metadata about the data itself.
+///  - **Field metadata**: metadata about the dataset itself.
+///  - **Dataset metadata**: metadata about the dataset. For example, this could
+///    store a created_at date.
+///  - **Dataset config**: configuration values controlling how engines should
+///    manage the dataset. This configures things like auto-cleanup.
+///
+/// You can get
+impl Dataset {
+    /// Get dataset metadata.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.manifest.table_metadata
     }
 
-    /// Update key-value pairs in config.
-    pub async fn update_config(
-        &mut self,
-        upsert_values: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<()> {
-        self.update_op(Operation::UpdateConfig {
-            upsert_values: Some(HashMap::from_iter(upsert_values)),
-            delete_keys: None,
-            schema_metadata: None,
-            field_metadata: None,
-        })
-        .await
+    /// Get the dataset config from manifest
+    pub fn config(&self) -> &HashMap<String, String> {
+        &self.manifest.config
     }
 
     /// Delete keys from the config.
+    #[deprecated(
+        note = "Use the new update_config(values, replace) method - pass None values to delete keys"
+    )]
     pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
-        self.update_op(Operation::UpdateConfig {
-            upsert_values: None,
-            delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
-            schema_metadata: None,
-            field_metadata: None,
-        })
-        .await
+        let updates = delete_keys.iter().map(|key| (*key, None));
+        self.update_config(updates).await?;
+        Ok(())
+    }
+
+    /// Update table metadata.
+    ///
+    /// Pass `None` for a value to remove that key.
+    ///
+    /// Use `.replace()` to replace the entire metadata map instead of merging.
+    ///
+    /// Returns the updated metadata map after the operation.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::transaction::UpdateMapEntry;
+    /// # async fn test_update_metadata(dataset: &mut Dataset) -> Result<()> {
+    /// // Update single key
+    /// dataset.update_metadata([("key", "value")]).await?;
+    ///
+    /// // Remove a key
+    /// dataset.update_metadata([("to_delete", None)]).await?;
+    ///
+    /// // Clear all metadata
+    /// dataset.update_metadata([] as [UpdateMapEntry; 0]).replace().await?;
+    ///
+    /// // Replace full metadata
+    /// dataset.update_metadata([("k1", "v1"), ("k2", "v2")]).replace().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_metadata(
+        &mut self,
+        values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
+    ) -> metadata::UpdateMetadataBuilder<'_> {
+        metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::TableMetadata)
+    }
+
+    /// Update config.
+    ///
+    /// Pass `None` for a value to remove that key.
+    ///
+    /// Use `.replace()` to replace the entire config map instead of merging.
+    ///
+    /// Returns the updated config map after the operation.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::transaction::UpdateMapEntry;
+    /// # async fn test_update_config(dataset: &mut Dataset) -> Result<()> {
+    /// // Update single key
+    /// dataset.update_config([("key", "value")]).await?;
+    ///
+    /// // Remove a key
+    /// dataset.update_config([("to_delete", None)]).await?;
+    ///
+    /// // Clear all config
+    /// dataset.update_config([] as [UpdateMapEntry; 0]).replace().await?;
+    ///
+    /// // Replace full config
+    /// dataset.update_config([("k1", "v1"), ("k2", "v2")]).replace().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_config(
+        &mut self,
+        values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
+    ) -> metadata::UpdateMetadataBuilder<'_> {
+        metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::Config)
+    }
+
+    /// Update schema metadata.
+    ///
+    /// Pass `None` for a value to remove that key.
+    ///
+    /// Use `.replace()` to replace the entire schema metadata map instead of merging.
+    ///
+    /// Returns the updated schema metadata map after the operation.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::transaction::UpdateMapEntry;
+    /// # async fn test_update_schema_metadata(dataset: &mut Dataset) -> Result<()> {
+    /// // Update single key
+    /// dataset.update_schema_metadata([("key", "value")]).await?;
+    ///
+    /// // Remove a key
+    /// dataset.update_schema_metadata([("to_delete", None)]).await?;
+    ///
+    /// // Clear all schema metadata
+    /// dataset.update_schema_metadata([] as [UpdateMapEntry; 0]).replace().await?;
+    ///
+    /// // Replace full schema metadata
+    /// dataset.update_schema_metadata([("k1", "v1"), ("k2", "v2")]).replace().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_schema_metadata(
+        &mut self,
+        values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
+    ) -> metadata::UpdateMetadataBuilder<'_> {
+        metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::SchemaMetadata)
     }
 
     /// Update schema metadata
+    #[deprecated(note = "Use the new update_schema_metadata(values).replace() instead")]
     pub async fn replace_schema_metadata(
         &mut self,
         new_values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
-        self.update_op(Operation::UpdateConfig {
-            upsert_values: None,
-            delete_keys: None,
-            schema_metadata: Some(HashMap::from_iter(new_values)),
-            field_metadata: None,
-        })
-        .await
+        let new_values = new_values
+            .into_iter()
+            .map(|(k, v)| (k, Some(v)))
+            .collect::<HashMap<_, _>>();
+        self.update_schema_metadata(new_values).replace().await?;
+        Ok(())
+    }
+
+    /// Update field metadata
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::transaction::UpdateMapEntry;
+    /// # async fn test_update_field_metadata(dataset: &mut Dataset) -> Result<()> {
+    /// // Update metadata by field path
+    /// dataset.update_field_metadata()
+    ///     .update("path.to_field", [("key", "value")])?
+    ///     .await?;
+    ///
+    /// // Update metadata by field id
+    /// dataset.update_field_metadata()
+    ///     .update(12, [("key", "value")])?
+    ///     .await?;
+    ///
+    /// // Clear field metadata
+    /// dataset.update_field_metadata()
+    ///     .replace("path.to_field", [] as [UpdateMapEntry; 0])?
+    ///     .replace(12, [] as [UpdateMapEntry; 0])?
+    ///     .await?;
+    ///
+    /// // Replace field metadata
+    /// dataset.update_field_metadata()
+    ///     .replace("field_name", [("k1", "v1"), ("k2", "v2")])?
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_field_metadata(&mut self) -> UpdateFieldMetadataBuilder<'_> {
+        UpdateFieldMetadataBuilder::new(self)
     }
 
     /// Update field metadata
@@ -2094,12 +2223,24 @@ impl Dataset {
         new_values: impl IntoIterator<Item = (u32, HashMap<String, String>)>,
     ) -> Result<()> {
         let new_values = new_values.into_iter().collect::<HashMap<_, _>>();
-        self.update_op(Operation::UpdateConfig {
-            upsert_values: None,
-            delete_keys: None,
-            schema_metadata: None,
-            field_metadata: Some(new_values),
-        })
+        let field_metadata_updates = new_values
+            .into_iter()
+            .map(|(field_id, metadata)| {
+                (
+                    field_id as i32,
+                    translate_schema_metadata_updates(&metadata),
+                )
+            })
+            .collect();
+        metadata::execute_metadata_update(
+            self,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates,
+            },
+        )
         .await
     }
 }
@@ -2142,7 +2283,7 @@ pub(crate) async fn write_manifest_file(
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
 ) -> std::result::Result<ManifestLocation, CommitError> {
@@ -2169,7 +2310,7 @@ pub(crate) async fn write_manifest_file(
 fn write_manifest_file_to_path<'a>(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
 ) -> BoxFuture<'a, Result<WriteResult>> {
     Box::pin(async {
@@ -2238,7 +2379,6 @@ mod tests {
     use lance_table::format::{DataFile, WriterVersion};
 
     use crate::datafusion::LanceTableProvider;
-    use all_asserts::assert_true;
     use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
     use lance_datafusion::datagen::DatafusionDatagenExt;
@@ -4301,109 +4441,6 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_update_config() {
-        // Create a table
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::UInt32,
-            false,
-        )]));
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
-        );
-        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
-
-        let mut desired_config = dataset.manifest.config.clone();
-        desired_config.insert("lance.test".to_string(), "value".to_string());
-        desired_config.insert("other-key".to_string(), "other-value".to_string());
-
-        dataset.update_config(desired_config.clone()).await.unwrap();
-        assert_eq!(dataset.manifest.config, desired_config);
-        assert_eq!(dataset.config().unwrap(), desired_config);
-
-        let config = dataset.config().unwrap().clone();
-        let other_value = config.get("other-key").unwrap();
-        let mut expected = HashMap::new();
-        expected.insert("other-key".to_string(), "other-value".to_string());
-        assert_eq!(other_value, "other-value");
-
-        desired_config.remove("other-key");
-        dataset.delete_config_keys(&["other-key"]).await.unwrap();
-        assert_eq!(dataset.manifest.config, desired_config);
-        assert_eq!(dataset.config().unwrap(), desired_config);
-        assert_true!(!dataset.config().unwrap().contains_key("other-key"));
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_replace_schema_metadata_preserves_fragments() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::UInt32,
-            false,
-        )]));
-
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
-        );
-
-        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
-
-        let manifest_before = dataset.manifest.clone();
-
-        let mut new_schema_meta = HashMap::new();
-        new_schema_meta.insert("new_key".to_string(), "new_value".to_string());
-        dataset
-            .replace_schema_metadata(new_schema_meta.clone())
-            .await
-            .unwrap();
-
-        let manifest_after = dataset.manifest.clone();
-
-        assert_eq!(manifest_before.fragments, manifest_after.fragments);
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_replace_fragment_metadata_preserves_fragments() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::UInt32,
-            false,
-        )]));
-
-        let data = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
-        );
-
-        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
-
-        let manifest_before = dataset.manifest.clone();
-
-        let mut new_field_meta = HashMap::new();
-        new_field_meta.insert("new_key".to_string(), "new_value".to_string());
-        dataset
-            .replace_field_metadata(vec![(0, new_field_meta.clone())])
-            .await
-            .unwrap();
-
-        let manifest_after = dataset.manifest.clone();
-
-        assert_eq!(manifest_before.fragments, manifest_after.fragments);
-    }
-
-    #[rstest]
-    #[tokio::test]
     async fn test_tag(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
@@ -5145,7 +5182,7 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 2);
-        fn get_bitmap(meta: &Index) -> Vec<u32> {
+        fn get_bitmap(meta: &IndexMetadata) -> Vec<u32> {
             meta.fragment_bitmap.as_ref().unwrap().iter().collect()
         }
         assert_eq!(get_bitmap(&indices[0]), vec![0]);

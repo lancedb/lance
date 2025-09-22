@@ -209,10 +209,10 @@ pub struct WriteParams {
 
     /// If Some and this is a new dataset, old dataset versions will be
     /// automatically cleaned up according to the parameters set out in
-    /// `AutoCleanupParams`. This parameter has no effect on existing datasets.
-    /// To add autocleaning to an existing dataset, use Dataset::update_config
-    /// to set lance.auto_cleanup.interval and lance.auto_cleanup.older_than.
-    /// Both parameters must be set to invoke autocleaning.
+    /// [`AutoCleanupParams`]. This parameter has no effect on existing datasets.
+    /// To add auto-cleanup to an existing dataset, use [`Dataset::update_config`]
+    /// to set `lance.auto_cleanup.interval` and `lance.auto_cleanup.older_than`.
+    /// Both parameters must be set to invoke auto-cleanup.
     pub auto_cleanup: Option<AutoCleanupParams>,
 
     /// If true, skip auto cleanup during commits. This should be set to true

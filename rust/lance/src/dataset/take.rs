@@ -188,8 +188,8 @@ async fn do_take_rows(
         let mut row_addr_iter = row_addrs.iter().enumerate();
         'outer: loop {
             let (fragment_id, range) = loop {
-                if let Some((i, row_id)) = row_addr_iter.next() {
-                    let fragment_id = row_id >> 32;
+                if let Some((i, row_addr)) = row_addr_iter.next() {
+                    let fragment_id = row_addr >> 32;
                     if fragment_id != current_fragment {
                         let next = (current_fragment, current_start..i);
                         current_fragment = fragment_id;
@@ -384,23 +384,23 @@ struct RowAddressStats {
     contiguous: bool,
 }
 
-fn check_row_addrs(row_ids: &[u64]) -> RowAddressStats {
+fn check_row_addrs(row_addrs: &[u64]) -> RowAddressStats {
     let mut sorted = true;
     let mut contiguous = true;
 
-    if row_ids.is_empty() {
+    if row_addrs.is_empty() {
         return RowAddressStats { sorted, contiguous };
     }
 
-    let mut last_id = row_ids[0];
-    let first_fragment_id = row_ids[0] >> 32;
+    let mut last_offset = row_addrs[0];
+    let first_fragment_id = row_addrs[0] >> 32;
 
-    for id in row_ids.iter().skip(1) {
-        sorted &= *id > last_id;
-        contiguous &= *id == last_id + 1;
+    for addr in row_addrs.iter().skip(1) {
+        sorted &= *addr > last_offset;
+        contiguous &= *addr == last_offset + 1;
         // Contiguous also requires the fragment ids are all the same
-        contiguous &= (*id >> 32) == first_fragment_id;
-        last_id = *id;
+        contiguous &= (*addr >> 32) == first_fragment_id;
+        last_offset = *addr;
     }
 
     RowAddressStats { sorted, contiguous }

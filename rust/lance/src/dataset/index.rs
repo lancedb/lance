@@ -18,7 +18,7 @@ use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::DatasetIndexExt;
 use lance_table::format::pb::VectorIndexDetails;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
@@ -45,7 +45,7 @@ struct DatasetIndexRemapper {
 impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
-        index: &Index,
+        index: &IndexMetadata,
         mapping: &HashMap<u64, Option<u64>>,
     ) -> Result<RemapResult> {
         remap_index(&self.dataset, &index.uuid, mapping).await
@@ -127,7 +127,7 @@ pub trait LanceIndexStoreExt {
         Self: Sized;
 
     /// Open an index store for an existing index (might be relative or absolute)
-    fn from_dataset_for_existing(dataset: &Dataset, index: &Index) -> Result<Self>
+    fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self>
     where
         Self: Sized;
 }
@@ -143,7 +143,7 @@ impl LanceIndexStoreExt for LanceIndexStore {
         ))
     }
 
-    fn from_dataset_for_existing(dataset: &Dataset, index: &Index) -> Result<Self> {
+    fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self> {
         let index_dir = dataset
             .indice_files_dir(index)?
             .child(index.uuid.to_string());

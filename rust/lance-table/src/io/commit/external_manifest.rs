@@ -19,7 +19,7 @@ use super::{
     current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,
     ManifestNamingScheme, MANIFEST_EXTENSION,
 };
-use crate::format::{Index, Manifest};
+use crate::format::{IndexMetadata, Manifest};
 use crate::io::commit::{CommitError, CommitHandler, ManifestWriter};
 
 /// External manifest store
@@ -363,7 +363,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,

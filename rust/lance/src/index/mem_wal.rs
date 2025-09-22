@@ -8,14 +8,14 @@ use lance_core::{Error, Result};
 use lance_index::mem_wal::{MemWal, MemWalId, MemWalIndex, MemWalIndexDetails, MEM_WAL_INDEX_NAME};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::{is_system_index, DatasetIndexExt};
-use lance_table::format::{pb, Index};
+use lance_table::format::{pb, IndexMetadata};
 use prost::Message;
 use snafu::location;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-fn load_mem_wal_index_details(index: Index) -> Result<MemWalIndexDetails> {
+fn load_mem_wal_index_details(index: IndexMetadata) -> Result<MemWalIndexDetails> {
     if let Some(details_any) = index.index_details.as_ref() {
         if !details_any.type_url.ends_with("MemWalIndexDetails") {
             return Err(Error::Index {
@@ -38,7 +38,7 @@ fn load_mem_wal_index_details(index: Index) -> Result<MemWalIndexDetails> {
     }
 }
 
-pub(crate) fn open_mem_wal_index(index: Index) -> Result<Arc<MemWalIndex>> {
+pub(crate) fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex>> {
     Ok(Arc::new(MemWalIndex::new(load_mem_wal_index_details(
         index,
     )?)))
@@ -332,7 +332,7 @@ pub async fn mark_mem_wal_as_merged(
 pub(crate) fn update_mem_wal_index_in_indices_list(
     dataset_read_version: u64,
     dataset_new_version: u64,
-    indices: &mut Vec<Index>,
+    indices: &mut Vec<IndexMetadata>,
     added: Vec<MemWal>,
     updated: Vec<MemWal>,
     removed: Vec<MemWal>,
@@ -548,8 +548,8 @@ where
 pub(crate) fn new_mem_wal_index_meta(
     dataset_version: u64,
     new_mem_wal_list: Vec<MemWal>,
-) -> Result<Index> {
-    Ok(Index {
+) -> Result<IndexMetadata> {
+    Ok(IndexMetadata {
         uuid: Uuid::new_v4(),
         name: MEM_WAL_INDEX_NAME.to_string(),
         fields: vec![],

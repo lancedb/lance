@@ -15,7 +15,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 use deepsize::{Context, DeepSizeOf};
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_index::frag_reuse::FragReuseIndex;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for index data.
@@ -96,7 +96,7 @@ pub struct IndexMetadataKey {
 }
 
 impl CacheKey for IndexMetadataKey {
-    type ValueType = Vec<Index>;
+    type ValueType = Vec<IndexMetadata>;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(self.version.to_string())

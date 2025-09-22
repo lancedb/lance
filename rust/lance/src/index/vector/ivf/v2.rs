@@ -944,10 +944,10 @@ mod tests {
     async fn test_remap(params: VectorIndexParams, nlist: usize) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_remap_impl::<UInt8Type>(params, nlist, 0..4).await;
+                Box::pin(test_remap_impl::<UInt8Type>(params, nlist, 0..4)).await;
             }
             _ => {
-                test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+                Box::pin(test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0)).await;
             }
         }
     }
