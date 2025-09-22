@@ -137,25 +137,21 @@ mod tests {
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field};
     use lance_datagen::{array, gen_array, ArrayGeneratorExt, RowCount};
-    use rstest::rstest;
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
 
     const PRIMITIVE_TYPES: &[DataType] = &[DataType::Int8, DataType::Float32, DataType::Float64];
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_value_fsl_primitive(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_value_fsl_primitive() {
         for data_type in PRIMITIVE_TYPES {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field, version).await;
+            check_basic_random(field).await;
         }
     }
 
@@ -186,7 +182,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
 
         check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::default()).await;
     }
@@ -213,7 +209,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
 
         check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::default()).await;
     }
@@ -264,7 +260,7 @@ mod tests {
             .with_range(1..3)
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![2])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
 
         check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::default()).await;
     }

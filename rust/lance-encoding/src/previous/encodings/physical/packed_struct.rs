@@ -259,24 +259,14 @@ impl ArrayEncoder for PackedStructEncoder {
 #[cfg(test)]
 pub mod tests {
 
-    use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Int32Array, StructArray, UInt64Array, UInt8Array,
-    };
-    use arrow_data::ArrayData;
+    use arrow_array::{ArrayRef, Int32Array, StructArray, UInt64Array, UInt8Array};
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::{
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
-        version::LanceFileVersion,
-    };
-    use rstest::rstest;
+    use crate::testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases};
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_random_packed_struct(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_random_packed_struct() {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("a", DataType::UInt64, false),
             Field::new("b", DataType::UInt32, false),
@@ -286,14 +276,11 @@ pub mod tests {
 
         let field = Field::new("", data_type, false).with_metadata(metadata);
 
-        check_round_trip_encoding_random(field, version).await;
+        check_basic_random(field).await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_specific_packed_struct(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_specific_packed_struct() {
         let array1 = Arc::new(UInt64Array::from(vec![1, 2, 3, 4]));
         let array2 = Arc::new(Int32Array::from(vec![5, 6, 7, 8]));
         let array3 = Arc::new(UInt8Array::from(vec![9, 10, 11, 12]));
@@ -336,8 +323,7 @@ pub mod tests {
             .with_range(0..2)
             .with_range(0..6)
             .with_range(1..4)
-            .with_indices(vec![1, 3, 7])
-            .with_file_version(version);
+            .with_indices(vec![1, 3, 7]);
 
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
@@ -348,49 +334,5 @@ pub mod tests {
             metadata,
         )
         .await;
-    }
-
-    // the current Lance V2.1 `packed-struct encoding` doesn't support `fixed size list`.
-    // the current Lance V2.0 test is disabled for now as we don't have statistics for `FixedSizeList`
-    #[rstest]
-    #[test_log::test(tokio::test)]
-    async fn test_fsl_packed_struct(
-        #[values(/*LanceFileVersion::V2_0,*/ /*LanceFileVersion::V2_1)*/)]
-        version: LanceFileVersion,
-    ) {
-        let int_array = Arc::new(Int32Array::from(vec![12, 13, 14, 15]));
-
-        let list_data_type =
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 3);
-        let inner_array = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        let list_data = ArrayData::builder(list_data_type.clone())
-            .len(4)
-            .add_child_data(inner_array.into_data())
-            .build()
-            .unwrap();
-        let list_array = FixedSizeListArray::from(list_data);
-
-        let struct_array = Arc::new(StructArray::from(vec![
-            (
-                Arc::new(Field::new("x", list_data_type.clone(), false)),
-                Arc::new(list_array) as ArrayRef,
-            ),
-            (
-                Arc::new(Field::new("x", DataType::Int32, false)),
-                int_array as ArrayRef,
-            ),
-        ]));
-
-        let test_cases = TestCases::default()
-            .with_range(1..3)
-            .with_range(0..1)
-            .with_range(2..4)
-            .with_indices(vec![0, 2, 3])
-            .with_file_version(version);
-
-        let mut metadata = HashMap::new();
-        metadata.insert("packed".to_string(), "true".to_string());
-
-        check_round_trip_encoding_of_data(vec![struct_array], &test_cases, metadata).await;
     }
 }

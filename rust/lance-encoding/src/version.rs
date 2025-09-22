@@ -12,7 +12,7 @@ pub const V2_FORMAT_2_1: &str = "2.1";
 pub const V2_FORMAT_2_2: &str = "2.2";
 
 /// Lance file version
-#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd, strum::EnumIter)]
 pub enum LanceFileVersion {
     // Note that Stable must come AFTER the stable version and Next must come AFTER the next version
     // this way comparisons like x >= V2_0 will work the same if x is Stable or V2_0
@@ -63,6 +63,12 @@ impl LanceFileVersion {
             Self::Stable => self.resolve().to_numbers(),
             Self::Next => self.resolve().to_numbers(),
         }
+    }
+
+    pub fn iter_non_legacy() -> impl Iterator<Item = Self> {
+        use strum::IntoEnumIterator;
+
+        Self::iter().filter(|&v| v != Self::Stable && v != Self::Next && v != Self::Legacy)
     }
 }
 
