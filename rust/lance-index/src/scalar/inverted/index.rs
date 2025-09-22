@@ -72,6 +72,8 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
+use crate::scalar::inverted::lance_tokenizer::TextTokenizer;
+use crate::scalar::inverted::scorer::{IndexBM25Scorer, MemoryBM25Scorer};
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
@@ -79,6 +81,7 @@ use crate::scalar::{
 };
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+use arrow_array::builder::Int32Builder;
 use std::str::FromStr;
 
 // Version 0: Arrow TokenSetFormat (legacy)
@@ -265,7 +268,7 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = BM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
         while let Some(res) = parts.try_next().await? {
             for DocCandidate {
                 row_id,
@@ -770,7 +773,7 @@ impl InvertedPartition {
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-        let scorer = BM25Scorer::new(std::iter::once(self));
+        let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
         wand.search(params, mask, metrics)
     }
@@ -1836,6 +1839,33 @@ impl PostingListBuilder {
         }
     }
 
+    pub fn to_plain_posting_list(self, docs: &DocSet) -> Result<PlainPostingList> {
+        let max_score = docs.calculate_max_scores(self.doc_ids.iter(), self.frequencies.iter());
+
+        let positions = if let Some(positions) = self.positions {
+            let mut builder = ListBuilder::new(Int32Builder::new());
+            for i in 0..positions.len() {
+                let pos_i = positions
+                    .get(i)
+                    .iter()
+                    .map(|v| Some(*v as i32))
+                    .collect::<Vec<_>>();
+                builder.append_value(pos_i);
+                builder.append(true);
+            }
+            Some(builder.finish())
+        } else {
+            None
+        };
+
+        Ok(PlainPostingList::new(
+            ScalarBuffer::from_iter(self.doc_ids.iter().map(|id| *id as u64)),
+            ScalarBuffer::from_iter(self.frequencies.iter().map(|freq| *freq as f32)),
+            Some(max_score),
+            positions,
+        ))
+    }
+
     // assume the posting list is sorted by doc id
     pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let length = self.len();
@@ -1937,6 +1967,14 @@ impl PositionBuilder {
 
     pub fn total_len(&self) -> usize {
         self.positions.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn push(&mut self, positions: Vec<u32>) {
@@ -2119,6 +2157,24 @@ impl DocSet {
     #[inline]
     pub fn average_length(&self) -> f32 {
         self.total_tokens as f32 / self.len() as f32
+    }
+
+    pub fn calculate_max_scores<'a>(
+        &self,
+        doc_ids: impl Iterator<Item = &'a u32>,
+        freqs: impl Iterator<Item = &'a u32>,
+    ) -> f32 {
+        let avgdl = self.average_length();
+        let mut max_score = f32::MIN;
+        for (doc_id, freq) in doc_ids.zip(freqs) {
+            let doc_norm = K1 * (1.0 - B + B * self.num_tokens(*doc_id) as f32 / avgdl);
+            let freq = *freq as f32;
+            let score = freq / (freq + doc_norm);
+            if score > max_score {
+                max_score = score;
+            }
+        }
+        max_score
     }
 
     pub fn calculate_block_max_scores<'a>(
@@ -2404,17 +2460,42 @@ pub fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
     query: String,
-    index: &InvertedIndex,
+    index: &Option<InvertedIndex>,
+    unindexed_scorer: MemoryBM25Scorer,
 ) -> SendableRecordBatchStream {
-    let mut tokenizer = Box::new(index.tokenizer.clone());
+    let mut tokenizer = match index {
+        Some(index) => index.tokenizer(),
+        // TODO: allow users to specify a tokenizer when querying columns without an inverted index.
+        None => Box::new(TextTokenizer::new(
+            tantivy::tokenizer::TextAnalyzer::builder(
+                tantivy::tokenizer::SimpleTokenizer::default(),
+            )
+            .build(),
+        )),
+    };
     let tokens = collect_query_tokens(&query, &mut tokenizer, None)
         .into_iter()
         .sorted_unstable()
         .collect::<HashSet<_>>();
 
-    let bm25_scorer = BM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
+    let bm25_scorer = match index {
+        Some(index) => {
+            let index_bm25_scorer =
+                IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
+            if index_bm25_scorer.num_docs() == 0 {
+                BM25Scorer::Memory(unindexed_scorer)
+            } else {
+                BM25Scorer::Union(
+                    Box::new(BM25Scorer::Index(index_bm25_scorer)),
+                    Box::new(BM25Scorer::Memory(unindexed_scorer)),
+                )
+            }
+        }
+        None => BM25Scorer::Memory(unindexed_scorer),
+    };
     let num_docs = bm25_scorer.num_docs();
     let avgdl = bm25_scorer.avgdl();
+
     let mut nq = HashMap::with_capacity(tokens.len());
     for token in &tokens {
         let token_nq = bm25_scorer.nq(token).max(1);
@@ -2452,8 +2533,64 @@ pub fn is_phrase_query(query: &str) -> bool {
     query.starts_with('\"') && query.ends_with('\"')
 }
 
+pub async fn compute_fts_scorer(
+    mut input: SendableRecordBatchStream,
+    doc_col: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+    with_position: bool,
+) -> Result<MemoryBM25Scorer> {
+    let mut posting_lists: Vec<PostingListBuilder> = vec![];
+    let mut tokens = TokenSet::default();
+    let mut doc_set = DocSet::default();
+    while let Some(batch) = input.next().await {
+        let batch = batch?;
+
+        // Parse docs into doc set
+        let row_id_col = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let doc_iter = iter_str_array(&batch[doc_col]);
+        let docs = doc_iter
+            .zip(row_id_col.values().iter())
+            .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
+
+        for (doc, row_id) in docs {
+            let mut token_occurrences = HashMap::new();
+            let mut token_num = 0;
+            {
+                let mut token_stream = tokenizer.token_stream_for_doc(doc);
+                while token_stream.advance() {
+                    let token = token_stream.token_mut();
+                    let token_text = std::mem::take(&mut token.text);
+                    let token_id = tokens.add(token_text) as usize;
+                    token_occurrences
+                        .entry(token_id as u32)
+                        .or_insert_with(|| PositionRecorder::new(with_position))
+                        .push(token.position as u32);
+                    token_num += 1;
+                }
+            }
+            posting_lists.resize_with(tokens.len(), || PostingListBuilder::new(with_position));
+            let doc_id = doc_set.append(row_id, token_num);
+
+            token_occurrences
+                .into_iter()
+                .for_each(|(token_id, term_positions)| {
+                    let posting_list = &mut posting_lists[token_id as usize];
+                    posting_list.add(doc_id, term_positions);
+                });
+        }
+    }
+
+    let posting_lists = posting_lists
+        .into_iter()
+        .map(|builder| builder.to_plain_posting_list(&doc_set))
+        .collect::<Result<Vec<PlainPostingList>>>()?;
+
+    Ok(MemoryBM25Scorer::new(posting_lists, tokens, doc_set))
+}
+
 #[cfg(test)]
 mod tests {
+    use arrow_array::GenericStringArray;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
@@ -2466,6 +2603,121 @@ mod tests {
     use crate::scalar::lance_format::LanceIndexStore;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_compute_fts_scorer() {
+        // Prepare stream
+        let text_col = GenericStringArray::<i32>::from(vec![
+            "title hello",
+            "lance title lance title",
+            "title common",
+        ]);
+        let rowid_col = UInt64Array::from(vec![10, 20, 30]);
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![
+                Field::new("text", text_col.data_type().to_owned(), false),
+                ROW_ID_FIELD.clone(),
+            ])
+            .into(),
+            vec![
+                Arc::new(text_col) as ArrayRef,
+                Arc::new(rowid_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(vec![Ok(batch)]));
+
+        let mut tokenizer = InvertedIndexParams::default().stem(false).build().unwrap();
+        let scorer = compute_fts_scorer(Box::pin(stream), "text", &mut tokenizer, true)
+            .await
+            .unwrap();
+
+        assert_eq!(scorer.tokens_set.len(), 4);
+        assert!(scorer.tokens_set.get("title").is_some());
+        assert!(scorer.tokens_set.get("hello").is_some());
+        assert!(scorer.tokens_set.get("lance").is_some());
+        assert!(scorer.tokens_set.get("common").is_some());
+
+        assert_eq!(scorer.num_docs(), 3);
+        assert_eq!(scorer.doc_set.total_tokens_num(), 8);
+        assert_eq!(scorer.avgdl(), 8f32 / 3f32);
+        assert_eq!(scorer.doc_set.row_ids, vec![10, 20, 30]);
+
+        assert_eq!(scorer.posting_lists.len(), 4);
+
+        // token "title"
+        let token_id = scorer.tokens_set.get("title").unwrap() as usize;
+        let posting_list = scorer.posting_lists.get(token_id).unwrap();
+        assert_eq!(posting_list.row_ids.to_vec(), vec![0, 1, 2]);
+        assert_eq!(posting_list.frequencies.to_vec(), vec![1f32, 2f32, 1f32]);
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_value(vec![Some(0)]);
+        builder.append(true);
+        builder.append_value(vec![Some(1), Some(3)]);
+        builder.append(true);
+        builder.append_value(vec![Some(0)]);
+        builder.append(true);
+        assert_eq!(
+            &builder
+                .finish()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap(),
+            &posting_list.positions.as_ref().unwrap()
+        );
+
+        // token "hello"
+        let token_id = scorer.tokens_set.get("hello").unwrap() as usize;
+        let posting_list = scorer.posting_lists.get(token_id).unwrap();
+        assert_eq!(posting_list.row_ids.to_vec(), vec![0]);
+        assert_eq!(posting_list.frequencies.to_vec(), vec![1f32]);
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_value(vec![Some(1)]);
+        builder.append(true);
+        assert_eq!(
+            &builder
+                .finish()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap(),
+            &posting_list.positions.as_ref().unwrap()
+        );
+
+        // token "lance"
+        let token_id = scorer.tokens_set.get("lance").unwrap() as usize;
+        let posting_list = scorer.posting_lists.get(token_id).unwrap();
+        assert_eq!(posting_list.row_ids.to_vec(), vec![1]);
+        assert_eq!(posting_list.frequencies.to_vec(), vec![2f32]);
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_value(vec![Some(0), Some(2)]);
+        builder.append(true);
+        assert_eq!(
+            &builder
+                .finish()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap(),
+            &posting_list.positions.as_ref().unwrap()
+        );
+
+        // token "common"
+        let token_id = scorer.tokens_set.get("common").unwrap() as usize;
+        let posting_list = scorer.posting_lists.get(token_id).unwrap();
+        assert_eq!(posting_list.row_ids.to_vec(), vec![2]);
+        assert_eq!(posting_list.frequencies.to_vec(), vec![1f32]);
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_value(vec![Some(1)]);
+        builder.append(true);
+        assert_eq!(
+            &builder
+                .finish()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap(),
+            &posting_list.positions.as_ref().unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn test_posting_builder_remap() {

@@ -842,15 +842,14 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
+    use super::*;
+    use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::inverted::{
-            encoding::compress_posting_list, scorer::BM25Scorer, CompressedPostingList,
-            PlainPostingList,
+            encoding::compress_posting_list, CompressedPostingList, PlainPostingList,
         },
     };
-
-    use super::*;
 
     fn generate_posting_list(
         doc_ids: Vec<u32>,
@@ -915,7 +914,7 @@ mod tests {
             ),
         ];
 
-        let bm25 = BM25Scorer::new(std::iter::empty());
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
         let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
         // This should trigger the bug when the second posting list becomes empty
         let result = wand
@@ -954,7 +953,7 @@ mod tests {
             ),
         ];
 
-        let bm25 = BM25Scorer::new(std::iter::empty());
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
         let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, bm25);
 
         // set a threshold that the sum of max scores can hit,

@@ -931,7 +931,7 @@ mod tests {
 
         let input = lance_datagen::gen_batch()
             .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
-            .into_df_exec(RowCount::from(50), BatchCount::from(2));
+            .into_df_once_exec(RowCount::from(50), BatchCount::from(2));
 
         let take = TakeExec::try_new(
             arc_dasaset.clone(),

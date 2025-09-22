@@ -5771,6 +5771,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fts_unindexed_data_on_empty_index() {
+        let test_uri = TempStrDir::default();
+
+        // Empty dataset with fts index
+        let params = InvertedIndexParams::default();
+        let title_col = GenericStringArray::<i32>::from(Vec::<&str>::new());
+        let content_col = GenericStringArray::<i32>::from(Vec::<&str>::new());
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+        dataset
+            .create_index(&["title"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        // Test fts search
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                MatchQuery::new("title".to_owned()).with_column(Some("title".to_owned())),
+            )))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 0);
+
+        // write new data
+        let title_col =
+            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
+        let content_col = GenericStringArray::<i32>::from(vec![
+            "content world",
+            "content database",
+            "content common",
+        ]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            batches,
+            &test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Match(
+                MatchQuery::new("title".to_owned()).with_column(Some("title".to_owned())),
+            )))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_fts_without_index() {
+        let test_uri = TempStrDir::default();
+
+        // create table without index
+        let title_col =
+            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
+        let content_col = GenericStringArray::<i32>::from(vec![
+            "content world",
+            "content database",
+            "content common",
+        ]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+
+        // match query on title and content
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("title".to_owned())
+                    .with_columns(&["title".to_string(), "content".to_string()])
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+
+        // write new data
+        let title_col = GenericStringArray::<i32>::from(vec!["new title"]);
+        let content_col = GenericStringArray::<i32>::from(vec!["new content"]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("title", title_col.data_type().to_owned(), false),
+                Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            batches,
+            &test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // match query on title and content
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("title".to_owned())
+                    .with_columns(&["title".to_string(), "content".to_string()])
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 4);
+
+        let results = dataset
+            .scan()
+            .full_text_search(
+                FullTextSearchQuery::new("new".to_owned())
+                    .with_columns(&["title".to_string(), "content".to_string()])
+                    .unwrap(),
+            )
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
+    }
+
+    #[tokio::test]
     async fn test_fts_rank() {
         let params = InvertedIndexParams::default();
         let text_col =

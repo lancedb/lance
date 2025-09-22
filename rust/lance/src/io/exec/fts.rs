@@ -31,7 +31,7 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
+    compute_fts_scorer, flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
@@ -406,7 +406,11 @@ impl ExecutionPlan for FlatMatchQueryExec {
             "column not set for MatchQuery {}",
             query.terms
         )))?;
-        let unindexed_input =
+        let unindexed_input_for_scorer = document_input(
+            self.unindexed_input.execute(partition, context.clone())?,
+            &column,
+        )?;
+        let unindexed_input_for_query =
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
@@ -416,29 +420,39 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         .for_column(&column)
                         .supports_fts(),
                 )
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
-            let inverted_idx = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
+            let inverted_idx = match index_meta {
+                Some(index_meta) => {
+                    let uuid = index_meta.uuid.to_string();
+                    let index = ds
+                        .open_generic_index(&column, &uuid, &metrics.index_metrics)
+                        .await?;
+                    index.as_any().downcast_ref::<InvertedIndex>().cloned()
+                }
+                None => None,
+            };
+
+            let mut tokenizer = if let Some(inverted_idx) = &inverted_idx {
+                inverted_idx.tokenizer().clone()
+            } else {
+                // TODO: allow users to specify a tokenizer when querying columns without an inverted index.
+                Box::new(TextTokenizer::new(
+                    tantivy::tokenizer::TextAnalyzer::builder(
+                        tantivy::tokenizer::SimpleTokenizer::default(),
+                    )
+                    .build(),
+                ))
+            };
+            let unindexed_scorer =
+                compute_fts_scorer(unindexed_input_for_scorer, &column, &mut tokenizer, false)
+                    .await?;
+
             Ok::<_, DataFusionError>(flat_bm25_search_stream(
-                unindexed_input,
+                unindexed_input_for_query,
                 column,
                 query.terms,
-                inverted_idx,
+                &inverted_idx,
+                unindexed_scorer,
             ))
         })
         .try_flatten_unordered(None)
@@ -1138,7 +1152,8 @@ pub mod tests {
                 "text",
                 lance_datagen::array::rand_utf8(ByteCount::from(10), false),
             )
-            .into_df_exec(RowCount::from(15), BatchCount::from(2));
+            .into_df_repeat_exec(RowCount::from(15), BatchCount::from(2))
+            .unwrap();
 
         let flat_match_query = FlatMatchQueryExec::new(
             Arc::new(fixture.dataset.clone()),
