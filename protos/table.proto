@@ -116,7 +116,11 @@ message Manifest {
   // The path format is "{read_version}-{uuid}.txn" where {read_version} is the version of
   // the table the transaction read from (serialized to decimal with no padding digits),
   // and {uuid} is a hyphen-separated UUID.
-  string transaction_file = 12;
+  // Make this field optional since we have inline_transaction by transaction_section.
+  optional string transaction_file = 12;
+
+  // The file position of the transaction content.
+  uint64 transaction_section = 19;
 
   // The next unused row id. If zero, then the table does not have any rows.
   //
@@ -174,24 +178,7 @@ message Manifest {
   // base_paths[id = 0] + /data/ + file.path
   // the key(a.k.a index) starts from 0, increased by 1 for each new base path.
   repeated BasePath base_paths = 18;
-
-  // The transaction that created this version.
-  oneof inline_transaction {
-    // If < 200KB, store the transaction content inline
-    // Use bytes instead of Transaction to avoid circular dependency
-    bytes transaction_content = 19;
-    // if >= 200KB, store the transaction content at the specified offset
-    TransactionSection transaction_section = 20;
-  }
-
-  message TransactionSection {
-    // The summary of the transaction including operation type and some kvs in transaction_properties
-    // This is used to get some information about the transaction without loading the whole transaction content
-    map<string, string> summary = 1;
-    // The offset of the transaction content in the manifest file
-    uint64 position = 2;
-  }
-} // Manifest
+}
 
 // external dataset base path
 message BasePath {
