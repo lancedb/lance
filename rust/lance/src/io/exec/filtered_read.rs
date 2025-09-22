@@ -613,7 +613,130 @@ impl FilteredReadStream {
             }
         }
 
+        if let Some(range_after_filter) = &options.scan_range_after_filter {
+            Self::apply_scan_range_after_filter(
+                &mut scoped_fragments,
+                range_after_filter,
+                &refine_filter,
+                evaluated_index.as_ref(),
+            );
+        }
+
         Ok(scoped_fragments)
+    }
+
+    fn apply_scan_range_after_filter(
+        scoped_fragments: &mut Vec<ScopedFragmentRead>,
+        range_after_filter: &Range<u64>,
+        refine_filter: &Option<Expr>,
+        evaluated_index: Option<&Arc<EvaluatedIndex>>,
+    ) {
+        if refine_filter.is_some() || evaluated_index.is_none() {
+            return;
+        }
+
+        let evaluated_index = evaluated_index.unwrap();
+
+        match &evaluated_index.index_result {
+            IndexExprResult::Exact(_) => {
+                Self::trim_fragments_to_range(scoped_fragments, range_after_filter);
+            }
+            IndexExprResult::AtLeast(_) => {
+                // For AtLeast, check if total guaranteed rows >= end of range
+                let total_guaranteed = scoped_fragments
+                    .iter()
+                    .map(|frag| frag.ranges.iter().map(|r| r.end - r.start).sum::<u64>())
+                    .sum::<u64>();
+
+                if total_guaranteed >= range_after_filter.end {
+                    Self::trim_fragments_to_range(scoped_fragments, range_after_filter);
+                }
+            }
+            _ => {
+                // Cannot optimize AtMost or other cases
+            }
+        }
+    }
+
+    fn trim_fragments_to_range(scoped_fragments: &mut Vec<ScopedFragmentRead>, range: &Range<u64>) {
+        let mut to_skip = range.start;
+        let mut to_take = range.end - range.start;
+        let mut fragments_to_keep = Vec::new();
+
+        for mut fragment in scoped_fragments.drain(..) {
+            if to_take == 0 {
+                break;
+            }
+
+            let fragment_rows: u64 = fragment.ranges.iter().map(|r| r.end - r.start).sum();
+
+            if fragment_rows <= to_skip {
+                to_skip -= fragment_rows;
+                continue;
+            }
+            if to_skip == 0 && to_take >= fragment_rows {
+                fragments_to_keep.push(fragment);
+                to_take -= fragment_rows;
+                continue;
+            }
+            let skip_in_fragment = to_skip;
+            let available_after_skip = fragment_rows - skip_in_fragment;
+            let take_from_fragment = available_after_skip.min(to_take);
+
+            let trimmed_ranges =
+                Self::trim_ranges_by_offset(fragment.ranges, skip_in_fragment, take_from_fragment);
+
+            fragment.ranges = trimmed_ranges;
+            fragments_to_keep.push(fragment);
+
+            // Update our global skip and take counters
+            to_skip = 0; // We've finished skipping
+            to_take -= take_from_fragment;
+        }
+
+        *scoped_fragments = fragments_to_keep;
+    }
+
+    /// Trim physical ranges to skip `to_skip` rows and take at most `to_take` rows
+    fn trim_ranges_by_offset(
+        physical_ranges: Vec<Range<u64>>,
+        to_skip: u64,
+        to_take: u64,
+    ) -> Vec<Range<u64>> {
+        let mut trimmed_ranges = Vec::new();
+        let mut skip_remaining = to_skip;
+        let mut take_remaining = to_take;
+
+        for range in physical_ranges {
+            if take_remaining == 0 {
+                break;
+            }
+            let range_size = range.end - range.start;
+
+            if range_size <= skip_remaining {
+                skip_remaining -= range_size;
+                continue;
+            }
+
+            if skip_remaining == 0 && take_remaining >= range_size {
+                trimmed_ranges.push(range);
+                take_remaining -= range_size;
+                continue;
+            }
+
+            let skip_in_range = skip_remaining;
+            let available_in_range = range_size - skip_in_range;
+            let take_from_range = available_in_range.min(take_remaining);
+
+            let new_start = range.start + skip_in_range;
+            let new_end = new_start + take_from_range;
+            trimmed_ranges.push(new_start..new_end);
+            take_remaining -= take_from_range;
+
+            skip_remaining = 0;
+        }
+
+        trimmed_ranges
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1160,16 +1283,19 @@ impl FilteredReadExec {
         }
 
         if options.scan_range_after_filter.is_some() {
-            // TODO: Add support for this.  It isn't too tricky to apply the limit when we have a scalar index.
-            // However, we need to make sure and apply the limit with unindexed fragments too.  This is also not
-            // too bad...unless there are multiple partitions.  In that case we have several readers reading in
-            // parallel and applying the limit after the fact is tricky.
-            return Err(Error::NotSupported {
-                source: "scan_range_after_filter not yet implemented"
-                    .to_string()
-                    .into(),
-                location: location!(),
-            });
+            // We now support this for single partitions with index results
+            // Multi-partition support will be added in the future
+            if matches!(
+                options.threading_mode,
+                FilteredReadThreadingMode::MultiplePartitions(_)
+            ) {
+                return Err(Error::NotSupported {
+                    source: "scan_range_after_filter not yet supported with multiple partitions"
+                        .to_string()
+                        .into(),
+                    location: location!(),
+                });
+            }
         }
         let output_schema = Arc::new(options.projection.to_arrow_schema());
         let num_partitions = match options.threading_mode {
@@ -1489,22 +1615,26 @@ impl ExecutionPlan for FilteredReadExec {
 
     fn fetch(&self) -> Option<usize> {
         if self.options.full_filter.is_none() {
-            self.options.scan_range_before_filter
+            self.options
+                .scan_range_before_filter
                 .as_ref()
                 .map(|range| (range.end - range.start) as usize)
                 .or_else(|| {
-                    self.options.scan_range_after_filter
+                    self.options
+                        .scan_range_after_filter
                         .as_ref()
                         .map(|range| (range.end - range.start) as usize)
                 })
         } else {
-            self.options.scan_range_after_filter
+            self.options
+                .scan_range_after_filter
                 .as_ref()
                 .map(|range| (range.end - range.start) as usize)
         }
     }
 
     fn supports_limit_pushdown(&self) -> bool {
+        // This is to push limits down to downstream execs
         false
     }
 
@@ -1514,6 +1644,7 @@ impl ExecutionPlan for FilteredReadExec {
         }
         // Support limit push down
         let mut updated_options = self.options.clone();
+        let fetch = limit.unwrap();
 
         if self.options.full_filter.is_none() {
             let new_range = if let Some(existing_range) = &self.options.scan_range_before_filter {
@@ -1526,7 +1657,10 @@ impl ExecutionPlan for FilteredReadExec {
             updated_options.scan_range_before_filter = Some(new_range);
         } else {
             // TODO: Support multiple partitions in the future by coordinating limits across partitions
-            if matches!(self.options.threading_mode, FilteredReadThreadingMode::MultiplePartitions(_)) {
+            if matches!(
+                self.options.threading_mode,
+                FilteredReadThreadingMode::MultiplePartitions(_)
+            ) {
                 return None;
             }
 

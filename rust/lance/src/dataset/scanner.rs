@@ -7780,60 +7780,76 @@ mod test {
 
     #[tokio::test]
     async fn test_limit_pushdown_without_filter() -> Result<()> {
-        use datafusion::physical_plan::display::DisplayableExecutionPlan;
         use datafusion::execution::TaskContext;
         use datafusion::physical_plan::common::collect;
-        
+        use datafusion::physical_plan::display::DisplayableExecutionPlan;
+
         // Create a test dataset
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        
+
         // Create data with 10000 rows
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-        ]));
-        
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
         let mut batches = vec![];
         for i in 0..10 {
             let batch = RecordBatch::try_new(
                 schema.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(i*1000..(i+1)*1000))],
+                vec![Arc::new(Int32Array::from_iter_values(
+                    i * 1000..(i + 1) * 1000,
+                ))],
             )?;
             batches.push(batch);
         }
-        
+
         let batch_reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(batch_reader, test_uri, None).await?;
-        
+
         // Test scanner with just limit, no filter
         let mut scanner = dataset.scan();
-        scanner.limit(Some(10), None)?;  // Just limit 10
-        
+        scanner.limit(Some(10), None)?; // Just limit 10
+
         let plan = scanner.create_plan().await?;
-        
+
         // Verify the plan has the expected structure
-        let plan_string = format!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent(true));
+        let plan_string = format!(
+            "{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+        );
         // Without filter, limit is pushed as range_before
-        assert!(plan_string.contains("range_before=Some(0..10)"), 
-                "Plan should have range_before set to 0..10 for limit without filter");
-        assert!(!plan_string.contains("GlobalLimitExec"), 
-                "GlobalLimitExec should be removed when limit is pushed down");
-        
+        assert!(
+            plan_string.contains("range_before=Some(0..10)"),
+            "Plan should have range_before set to 0..10 for limit without filter"
+        );
+        assert!(
+            !plan_string.contains("GlobalLimitExec"),
+            "GlobalLimitExec should be removed when limit is pushed down"
+        );
+
         let task_ctx = Arc::new(TaskContext::default());
-        
+
         // Execute and collect results
         let stream = plan.execute(0, task_ctx)?;
         let results = collect(stream).await?;
-        
+
         let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-        
+
         // Verify results
-        assert_eq!(total_rows, 10, "Should return exactly 10 rows due to limit pushdown");
-        
+        assert_eq!(
+            total_rows, 10,
+            "Should return exactly 10 rows due to limit pushdown"
+        );
+
         // Extract and verify the actual IDs
-        let ids: Vec<i32> = results.iter()
+        let ids: Vec<i32> = results
+            .iter()
             .flat_map(|batch| {
-                batch.column(0)
+                batch
+                    .column(0)
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .unwrap()
@@ -7843,70 +7859,87 @@ mod test {
                     .collect::<Vec<_>>()
             })
             .collect();
-        
+
         // Should get the first 10 IDs
         let expected_ids: Vec<i32> = (0..10).collect();
         assert_eq!(ids, expected_ids, "Should get IDs 0-9");
-        
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_limit_pushdown_with_filter_no_index() -> Result<()> {
-        use datafusion::physical_plan::display::DisplayableExecutionPlan;
         use datafusion::execution::TaskContext;
         use datafusion::physical_plan::common::collect;
-        
+        use datafusion::physical_plan::display::DisplayableExecutionPlan;
+
         // Create a test dataset without index
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        
+
         // Create data with 10000 rows
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-        ]));
-        
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
         let mut batches = vec![];
         for i in 0..10 {
             let batch = RecordBatch::try_new(
                 schema.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(i*1000..(i+1)*1000))],
+                vec![Arc::new(Int32Array::from_iter_values(
+                    i * 1000..(i + 1) * 1000,
+                ))],
             )?;
             batches.push(batch);
         }
-        
+
         let batch_reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(batch_reader, test_uri, None).await?;
-        
+
         // Test scanner with filter but no index
         let mut scanner = dataset.scan();
-        scanner.filter("id >= 5000 AND id < 6000")?  // This matches 1000 rows
-            .limit(Some(10), None)?;  // But we only want 10
-        
+        scanner
+            .filter("id >= 5000 AND id < 6000")? // This matches 1000 rows
+            .limit(Some(10), None)?; // But we only want 10
+
         let plan = scanner.create_plan().await?;
-        
+
         // Verify the plan has the expected structure
-        let plan_string = format!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent(true));
-        assert!(plan_string.contains("range_after=Some(0..10)"), 
-                "Plan should have range_after set to 0..10 for limit with filter");
-        assert!(!plan_string.contains("GlobalLimitExec"), 
-                "GlobalLimitExec should be removed when limit is pushed down");
-        
+        let plan_string = format!(
+            "{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_string.contains("range_after=Some(0..10)"),
+            "Plan should have range_after set to 0..10 for limit with filter"
+        );
+        assert!(
+            !plan_string.contains("GlobalLimitExec"),
+            "GlobalLimitExec should be removed when limit is pushed down"
+        );
+
         let task_ctx = Arc::new(TaskContext::default());
-        
+
         // Execute and collect results
         let stream = plan.execute(0, task_ctx)?;
         let results = collect(stream).await?;
-        
+
         let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-        
+
         // Verify results
-        assert_eq!(total_rows, 10, "Should return exactly 10 rows due to limit pushdown");
-        
+        assert_eq!(
+            total_rows, 10,
+            "Should return exactly 10 rows due to limit pushdown"
+        );
+
         // Extract and verify the actual IDs
-        let ids: Vec<i32> = results.iter()
+        let ids: Vec<i32> = results
+            .iter()
             .flat_map(|batch| {
-                batch.column(0)
+                batch
+                    .column(0)
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .unwrap()
@@ -7916,39 +7949,45 @@ mod test {
                     .collect::<Vec<_>>()
             })
             .collect();
-        
+
         // All IDs should be in the filtered range
-        assert!(ids.iter().all(|&id| id >= 5000 && id < 6000),
-            "All returned IDs should be in the filtered range [5000, 6000)");
-        
+        assert!(
+            ids.iter().all(|&id| id >= 5000 && id < 6000),
+            "All returned IDs should be in the filtered range [5000, 6000)"
+        );
+
         // Should get the first 10 IDs from the filtered range
         let expected_ids: Vec<i32> = (5000..5010).collect();
         assert_eq!(ids, expected_ids, "Should get IDs 5000-5009");
-        
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_limit_pushdown_with_index() -> Result<()> {
-        use lance_index::scalar::ScalarIndexParams;
-        use datafusion::physical_plan::display::DisplayableExecutionPlan;
         use datafusion::execution::TaskContext;
         use datafusion::physical_plan::common::collect;
+        use datafusion::physical_plan::display::DisplayableExecutionPlan;
+        use lance_index::scalar::ScalarIndexParams;
 
         // Create a test dataset with one column
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
         // Create data with 10000 rows
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
 
         let mut batches = vec![];
         for i in 0..10 {
             let batch = RecordBatch::try_new(
                 schema.clone(),
-                vec![Arc::new(Int32Array::from_iter_values(i*1000..(i+1)*1000))],
+                vec![Arc::new(Int32Array::from_iter_values(
+                    i * 1000..(i + 1) * 1000,
+                ))],
             )?;
             batches.push(batch);
         }
@@ -7957,69 +7996,89 @@ mod test {
         let mut dataset = Dataset::write(batch_reader, test_uri, None).await?;
 
         // Create a bitmap index on the id column
-        dataset.create_index(
-            &["id"],
-            lance_index::IndexType::Scalar,
-            Some("bitmap".to_string()),
-            &ScalarIndexParams::default(),
-            true
-        ).await?;
+        dataset
+            .create_index(
+                &["id"],
+                lance_index::IndexType::Scalar,
+                Some("bitmap".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await?;
 
         // Test scanner with filter and limit - filter matches 1000 rows but limit is 10
         let mut scanner = dataset.scan();
-        scanner.filter("id >= 5000 AND id < 6000")?  // This matches 1000 rows
-            .limit(Some(10), None)?;  // But we only want 10
+        scanner
+            .filter("id >= 5000 AND id < 6000")? // This matches 1000 rows
+            .limit(Some(10), None)?; // But we only want 10
 
         let plan = scanner.create_plan().await?;
 
         // Verify the plan has the expected structure
-        let plan_string = format!("{}", DisplayableExecutionPlan::new(plan.as_ref()).indent(true));
-        assert!(plan_string.contains("range_after=Some(0..10)"), "Plan should have range_after set to 0..10");
-        assert!(!plan_string.contains("GlobalLimitExec"), "GlobalLimitExec should be removed when limit is pushed down");
+        let plan_string = format!(
+            "{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_string.contains("range_after=Some(0..10)"),
+            "Plan should have range_after set to 0..10"
+        );
+        assert!(
+            !plan_string.contains("GlobalLimitExec"),
+            "GlobalLimitExec should be removed when limit is pushed down"
+        );
 
         let task_ctx = Arc::new(TaskContext::default());
-        
+
         // Run analyze to see execution statistics
         // Note: AnalyzeExec produces a different schema with plan description and metrics
-        use datafusion::physical_plan::analyze::AnalyzeExec;
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-        
+        use datafusion::physical_plan::analyze::AnalyzeExec;
+
         // AnalyzeExec needs a special output schema
         let analyze_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("plan_type", DataType::Utf8, false),
             Field::new("plan", DataType::Utf8, false),
         ]));
-        
+
         let analyze_exec = Arc::new(AnalyzeExec::new(
-            true,  // verbose - show full details
-            true,  // show_statistics  
+            true, // verbose - show full details
+            true, // show_statistics
             plan.clone(),
-            analyze_schema
+            analyze_schema,
         ));
-        
+
         // Run analyze to verify execution statistics
         let analyze_stream = analyze_exec.execute(0, task_ctx.clone())?;
         let analyze_batches = collect(analyze_stream).await?;
-        
+
         // Verify analyze results show correct metrics
         if !analyze_batches.is_empty() {
             let batch = &analyze_batches[0];
-            
+
             // The second column contains the plan with metrics
             let plan_column = batch.column(1);
-            if let Some(str_array) = plan_column.as_any().downcast_ref::<arrow_array::StringArray>() {
+            if let Some(str_array) = plan_column
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+            {
                 if str_array.len() > 0 {
                     // First row contains "Plan with Metrics"
                     let plan_with_metrics = str_array.value(0);
-                    
+
                     // Verify the metrics show output_rows=10
-                    assert!(plan_with_metrics.contains("output_rows=10"), 
-                           "Analyze should show output_rows=10, got: {}", plan_with_metrics);
-                    
+                    assert!(
+                        plan_with_metrics.contains("output_rows=10"),
+                        "Analyze should show output_rows=10, got: {}",
+                        plan_with_metrics
+                    );
+
                     // Note: We currently scan all 1000 rows matching the filter
                     // Future optimization could reduce this when we have exact index matches
-                    assert!(plan_with_metrics.contains("rows_scanned=1000"),
-                           "Should have scanned 1000 rows (those matching the filter)");
+                    assert!(
+                        plan_with_metrics.contains("rows_scanned=1000"),
+                        "Should have scanned 1000 rows (those matching the filter)"
+                    );
                 }
             }
         }
@@ -8033,9 +8092,11 @@ mod test {
         let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
 
         // Extract the actual IDs
-        let ids: Vec<i32> = results.iter()
+        let ids: Vec<i32> = results
+            .iter()
             .flat_map(|batch| {
-                batch.column(0)
+                batch
+                    .column(0)
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .unwrap()
@@ -8047,12 +8108,17 @@ mod test {
             .collect();
 
         // Verify results
-        assert_eq!(total_rows, 10, "Should return exactly 10 rows due to limit pushdown");
+        assert_eq!(
+            total_rows, 10,
+            "Should return exactly 10 rows due to limit pushdown"
+        );
         assert_eq!(ids.len(), 10, "Should have exactly 10 IDs");
 
         // All IDs should be in the filtered range
-        assert!(ids.iter().all(|&id| id >= 5000 && id < 6000),
-            "All returned IDs should be in the filtered range [5000, 6000)");
+        assert!(
+            ids.iter().all(|&id| id >= 5000 && id < 6000),
+            "All returned IDs should be in the filtered range [5000, 6000)"
+        );
 
         // Verify we got the first 10 IDs from the filtered range
         let expected_ids: Vec<i32> = (5000..5010).collect();
@@ -8063,20 +8129,24 @@ mod test {
 
     #[tokio::test]
     async fn test_limit_pushdown_rejected_for_multiple_partitions() -> Result<()> {
+        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
         use datafusion::execution::TaskContext;
         use datafusion::physical_plan::collect;
-        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-        
+
         let test_dir = tempdir()?;
         let test_uri = test_dir.path().to_str().unwrap();
-        
+
         // Create a simple test dataset
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", ArrowDataType::Int32, false)]));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            ArrowDataType::Int32,
+            false,
+        )]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..10000))],
         )?;
-        
+
         let write_params = WriteParams {
             max_rows_per_file: 10_000,
             max_rows_per_group: 10_000,
@@ -8096,27 +8166,30 @@ mod test {
             .project(&["i"])?;
 
         let plan = scanner.create_plan().await?;
-        
+
         // Get the plan string representation
         let formatted = format!("{:?}", plan);
-        
+
         // When using multiple partitions, the plan should still have GlobalLimitExec
         // because we reject limit pushdown for multiple partitions
         if formatted.contains("MultiplePartitions") {
             // The plan should have GlobalLimitExec when using multiple partitions
             // because we rejected the pushdown
             let _plan_str = format!("{:?}", plan.as_ref());
-            
+
             // We can't easily verify GlobalLimitExec is preserved without running the optimizer
             // But we can verify that if we have multiple partitions, the limit still works correctly
             let context = Arc::new(TaskContext::default());
             let results = collect(plan.clone(), context).await?;
             let total_rows = results.iter().map(|b| b.num_rows()).sum::<usize>();
-            
+
             // Even with multiple partitions, we should still get exactly 10 rows
-            assert_eq!(total_rows, 10, "Should return exactly 10 rows even with multiple partitions");
+            assert_eq!(
+                total_rows, 10,
+                "Should return exactly 10 rows even with multiple partitions"
+            );
         }
-        
+
         Ok(())
     }
 }
