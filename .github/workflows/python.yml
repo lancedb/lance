@@ -132,7 +132,7 @@ jobs:
     name: Forward Compatibility Tests (${{ matrix.lance-version }})
     strategy:
       matrix:
-        lance-version: ["0.16.0", "0.29.1", "0.36.0"]
+        lance-version: ["0.16.0", "0.30.0", "0.36.0"]
     defaults:
       run:
         shell: bash
