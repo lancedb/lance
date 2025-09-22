@@ -89,10 +89,6 @@ public class UpdateTest extends OperationTestBase {
         assertEquals(rowCount, dataset.countRows());
 
         Transaction txn = dataset.readTransaction().orElse(null);
-        Update commit = (Update) transaction.operation();
-        Update read = (Update) txn.operation();
-        System.out.println(String.format("operation equals: %s", read.equals(commit)));
-        assertEquals(commit, read);
         assertEquals(transaction, txn);
       }
     }

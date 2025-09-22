@@ -264,7 +264,6 @@ impl FromJObjectWithEnv<Vec<u32>> for JLongArray<'_> {
     }
 }
 
-
 impl FromJObjectWithEnv<i32> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<i32> {
         let ret = env.call_method(self, "intValue", "()I", &[])?.i()?;

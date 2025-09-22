@@ -28,7 +28,7 @@ public class Update implements Operation {
   private final List<FragmentMetadata> updatedFragments;
   private final List<FragmentMetadata> newFragments;
   private final long[] fieldsModified;
-  private final long[] fieldsForRreservingFragBitmap;
+  private final long[] fieldsForPreservingFragBitmap;
   private final Optional<UpdateMode> updateMode;
 
   private Update(
@@ -36,13 +36,13 @@ public class Update implements Operation {
       List<FragmentMetadata> updatedFragments,
       List<FragmentMetadata> newFragments,
       long[] fieldsModified,
-      long[] fieldsForRreservingFragBitmap,
+      long[] fieldsForPreservingFragBitmap,
       Optional<UpdateMode> updateMode) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
     this.newFragments = newFragments;
     this.fieldsModified = fieldsModified;
-    this.fieldsForRreservingFragBitmap = fieldsForRreservingFragBitmap;
+    this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
     this.updateMode = updateMode;
   }
 
@@ -66,8 +66,8 @@ public class Update implements Operation {
     return fieldsModified;
   }
 
-  public long[] fieldsForRreservingFragBitmap() {
-    return fieldsForRreservingFragBitmap;
+  public long[] fieldsForPreservingFragBitmap() {
+    return fieldsForPreservingFragBitmap;
   }
 
   public Optional<UpdateMode> updateMode() {
@@ -85,7 +85,7 @@ public class Update implements Operation {
         .add("updatedFragments", updatedFragments)
         .add("newFragments", newFragments)
         .add("fieldsModified", fieldsModified)
-        .add("fieldsForRreservingFragBitmap", fieldsForRreservingFragBitmap)
+        .add("fieldsForPreservingFragBitmap", fieldsForPreservingFragBitmap)
         .add("updateMode", updateMode)
         .toString();
   }
@@ -99,7 +99,7 @@ public class Update implements Operation {
         && Objects.equals(updatedFragments, that.updatedFragments)
         && Objects.equals(newFragments, that.newFragments)
         && Arrays.equals(fieldsModified, that.fieldsModified)
-        && Arrays.equals(fieldsForRreservingFragBitmap, that.fieldsForRreservingFragBitmap)
+        && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
         && Objects.equals(updateMode, that.updateMode);
   }
 
@@ -113,7 +113,7 @@ public class Update implements Operation {
     private List<FragmentMetadata> updatedFragments = Collections.emptyList();
     private List<FragmentMetadata> newFragments = Collections.emptyList();
     private long[] fieldsModified = new long[0];
-    private long[] fieldsForRreservingFragBitmap = new long[0];
+    private long[] fieldsForPreservingFragBitmap = new long[0];
     private Optional<UpdateMode> updateMode = Optional.empty();
 
     private Builder() {}
@@ -138,8 +138,8 @@ public class Update implements Operation {
       return this;
     }
 
-    public Builder fieldsForRreservingFragBitmap(long[] fieldsForRreservingFragBitmap) {
-      this.fieldsForRreservingFragBitmap = fieldsForRreservingFragBitmap;
+    public Builder fieldsForPreservingFragBitmap(long[] fieldsForPreservingFragBitmap) {
+      this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
       return this;
     }
 
@@ -154,7 +154,7 @@ public class Update implements Operation {
           updatedFragments,
           newFragments,
           fieldsModified,
-          fieldsForRreservingFragBitmap,
+          fieldsForPreservingFragBitmap,
           updateMode);
     }
   }
