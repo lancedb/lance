@@ -235,14 +235,14 @@ impl DecodeMiniBlockTask {
             let mut rep = rep.as_ref();
             // If there is a preamble and we need to skip it then do that first.  The work is the same
             // whether there is def information or not
-            let mut items_in_preamble = 0;
+            let mut items_in_preamble = 0_u64;
             let first_row_start = match preamble_action {
                 PreambleAction::Skip | PreambleAction::Take => {
                     let first_row_start = if let Some(def) = def.as_ref() {
                         let mut first_row_start = None;
                         for (idx, (rep, def)) in rep.iter().zip(def.as_ref()).enumerate() {
                             if *rep == max_rep {
-                                first_row_start = Some(idx);
+                                first_row_start = Some(idx as u64);
                                 break;
                             }
                             if *def <= max_visible_def {
@@ -251,8 +251,9 @@ impl DecodeMiniBlockTask {
                         }
                         first_row_start
                     } else {
-                        let first_row_start = rep.iter().position(|&r| r == max_rep);
-                        items_in_preamble = first_row_start.unwrap_or(rep.len());
+                        let first_row_start =
+                            rep.iter().position(|&r| r == max_rep).map(|r| r as u64);
+                        items_in_preamble = first_row_start.unwrap_or(rep.len() as u64);
                         first_row_start
                     };
                     // It is possible for a chunk to be entirely partial values but if it is then it
@@ -261,7 +262,7 @@ impl DecodeMiniBlockTask {
                         assert!(preamble_action == PreambleAction::Take);
                         return (0..total_items, 0..rep.len() as u64);
                     }
-                    let first_row_start = first_row_start.unwrap() as u64;
+                    let first_row_start = first_row_start.unwrap();
                     rep = &rep[first_row_start as usize..];
                     first_row_start
                 }
@@ -274,7 +275,8 @@ impl DecodeMiniBlockTask {
             // We hit this case when all we needed was the preamble
             if range.start == range.end {
                 debug_assert!(preamble_action == PreambleAction::Take);
-                return (0..items_in_preamble as u64, 0..first_row_start);
+                debug_assert!(items_in_preamble <= total_items);
+                return (0..items_in_preamble, 0..first_row_start);
             }
             assert!(range.start < range.end);
 
@@ -300,9 +302,9 @@ impl DecodeMiniBlockTask {
                                 new_levels_start = idx as u64 + 1;
                                 break;
                             }
-                            if *def > max_visible_def {
-                                lead_invis_seen += 1;
-                            }
+                        }
+                        if *def > max_visible_def {
+                            lead_invis_seen += 1;
                         }
                     }
                 }
@@ -325,15 +327,14 @@ impl DecodeMiniBlockTask {
                             new_levels_end = idx as u64 + new_levels_start + 1;
                             break;
                         }
-                        if *def > max_visible_def {
-                            tail_invis_seen += 1;
-                        }
+                    }
+                    if *def > max_visible_def {
+                        tail_invis_seen += 1;
                     }
                 }
 
                 if new_end == u64::MAX {
                     new_levels_end = rep.len() as u64;
-                    // This is the total number of visible items (minus any items in the preamble)
                     let total_invis_seen = lead_invis_seen + tail_invis_seen;
                     new_end = rep.len() as u64 - total_invis_seen;
                 }
@@ -342,19 +343,18 @@ impl DecodeMiniBlockTask {
 
                 // Adjust for any skipped preamble
                 if preamble_action == PreambleAction::Skip {
-                    // TODO: Should this be items_in_preamble?  If so, add a
-                    // unit test for this case
-                    new_start += first_row_start;
-                    new_end += first_row_start;
+                    new_start += items_in_preamble;
+                    new_end += items_in_preamble;
                     new_levels_start += first_row_start;
                     new_levels_end += first_row_start;
                 } else if preamble_action == PreambleAction::Take {
                     debug_assert_eq!(new_start, 0);
                     debug_assert_eq!(new_levels_start, 0);
-                    new_end += first_row_start;
+                    new_end += items_in_preamble;
                     new_levels_end += first_row_start;
                 }
 
+                debug_assert!(new_end <= total_items);
                 (new_start..new_end, new_levels_start..new_levels_end)
             } else {
                 // Easy case, there are no invisible items, so we don't need to check for them
@@ -396,6 +396,7 @@ impl DecodeMiniBlockTask {
                     new_end += first_row_start;
                 }
 
+                debug_assert!(new_end <= total_items);
                 (new_start..new_end, new_start..new_end)
             }
         } else {
@@ -533,6 +534,15 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 chunk.items_in_chunk,
                 instructions.preamble_action,
             );
+            if item_range.end - item_range.start > chunk.items_in_chunk {
+                return Err(lance_core::Error::Internal {
+                    message: format!(
+                        "Item range {:?} is greater than chunk items in chunk {:?}",
+                        item_range, chunk.items_in_chunk
+                    ),
+                    location: location!(),
+                });
+            }
 
             // Now we append the data to the output buffers
             Self::extend_levels(level_range.clone(), &mut repbuf, &rep, level_offset);
@@ -4748,6 +4758,83 @@ mod tests {
         check(0..1, 1..3, 1..3);
         check(1..2, 3..4, 3..4);
         check(0..2, 1..4, 1..4);
+
+        // If we have nested lists then non-top level lists may be empty/null
+        // and we need to make sure we still handle them as invisible items (we
+        // failed to do this previously)
+        let rep = Some(vec![2, 1, 2, 0, 1, 2]);
+        let def = Some(vec![0, 1, 2, 0, 0, 0]);
+        let max_rep = 2;
+        let max_visible_def = 0;
+        let total_items = 4;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..3, 0..4, 0..6);
+        check(0..1, 0..1, 0..2);
+        check(1..2, 1..3, 2..5);
+        check(2..3, 3..4, 5..6);
+
+        // Invisible items in a preamble that we are taking (regressing a previous failure)
+        let rep = Some(vec![0, 0, 1, 0, 1, 1]);
+        let def = Some(vec![0, 1, 0, 0, 0, 0]);
+        let max_rep = 1;
+        let max_visible_def = 0;
+        let total_items = 5;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Take,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..0, 0..1, 0..2);
+        check(0..1, 0..3, 0..4);
+        check(0..2, 0..4, 0..5);
+
+        // Skip preamble (with invis items) and skip a few rows (with invis items)
+        // and then take a few rows but not all the rows
+        let rep = Some(vec![0, 1, 0, 1, 0, 1, 0, 1]);
+        let def = Some(vec![1, 0, 1, 1, 0, 0, 0, 0]);
+        let max_rep = 1;
+        let max_visible_def = 0;
+        let total_items = 5;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Skip,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(2..3, 2..4, 5..7);
     }
 
     #[test]
@@ -5328,7 +5415,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_file_version(LanceFileVersion::V2_1)
+            .with_min_file_version(LanceFileVersion::V2_1)
             .with_batch_size(100)
             .with_range(0..num_rows.min(500) as u64)
             .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
