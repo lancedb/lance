@@ -1488,86 +1488,77 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn fetch(&self) -> Option<usize> {
-        // If we have a scan_range_after_filter, we can report that as our fetch limit
-        // This allows DataFusion's optimizer to know we already have a limit built in
-        self.options.scan_range_after_filter.as_ref().map(|range| {
-            // The range is 0-based, so the end is the number of rows we'll fetch
-            range.end as usize
-        })
+        if self.options.full_filter.is_none() {
+            self.options.scan_range_before_filter
+                .as_ref()
+                .map(|range| (range.end - range.start) as usize)
+                .or_else(|| {
+                    self.options.scan_range_after_filter
+                        .as_ref()
+                        .map(|range| (range.end - range.start) as usize)
+                })
+        } else {
+            self.options.scan_range_after_filter
+                .as_ref()
+                .map(|range| (range.end - range.start) as usize)
+        }
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        // Return false because we don't want the limit node moved below us.
-        // Instead, we handle limits internally via with_fetch()
         false
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        // This is called by add_fetch_to_child when DataFusion wants to push
-        // a limit into us without rearranging the tree.
-        // 
-        // IMPORTANT: Reject pushdown for multiple partitions to avoid issues where
-        // each partition could return up to 'limit' rows, resulting in limit * num_partitions total.
-        // Let DataFusion's GlobalLimitExec handle the coordination for multi-partition cases.
-        if matches!(self.options.threading_mode, FilteredReadThreadingMode::MultiplePartitions(_)) {
+        if limit.is_none() {
             return None;
         }
-        
-        // IMPORTANT: DataFusion passes us the total rows needed (skip + fetch).
-        // We always create a range starting at 0 since we don't support skip at scan level.
-        // DataFusion's GlobalLimitExec above us (if skip > 0) will handle the skip.
-        if let Some(fetch) = limit {
-            // fetch here is the total rows needed (including any skip amount)
-            let new_range = 0..(fetch as u64);
-            
-            // If there's already a scan_range_after_filter, compute the intersection
-            let final_range = if let Some(existing_range) = &self.options.scan_range_after_filter {
-                // Handle the case where existing range might not start at 0
-                // (even though our validation currently requires it)
-                let start = existing_range.start.max(new_range.start);
-                let end = existing_range.end.min(new_range.end);
-                
-                // Check if ranges overlap
-                if start >= end {
-                    // Ranges don't overlap, reject the fetch
-                    log::debug!("Cannot apply fetch limit: ranges don't overlap");
-                    return None;
-                }
-                
-                // For now we still require ranges to start at 0 due to our implementation
-                if start != 0 {
-                    log::debug!("Cannot apply fetch limit: combined range doesn't start at 0");
-                    return None;
-                }
-                
+        // Support limit push down
+        let mut updated_options = self.options.clone();
+
+        if self.options.full_filter.is_none() {
+            let new_range = if let Some(existing_range) = &self.options.scan_range_before_filter {
+                let start = existing_range.start;
+                let end = existing_range.end.min(start + fetch as u64);
                 start..end
             } else {
-                new_range
+                0..(fetch as u64)
             };
-            
-            // Try to apply the new range
-            match self.options.clone().with_scan_range_after_filter(final_range.clone()) {
-                Ok(updated_options) => {
-                    match FilteredReadExec::try_new(
-                        self.dataset.clone(),
-                        updated_options,
-                        self.index_input.clone(),
-                    ) {
-                        Ok(exec) => Some(Arc::new(exec)),
-                        Err(e) => {
-                            log::debug!("Failed to apply fetch limit to FilteredReadExec: {}", e);
-                            None
-                        }
-                    }
+            updated_options.scan_range_before_filter = Some(new_range);
+        } else {
+            // TODO: Support multiple partitions in the future by coordinating limits across partitions
+            if matches!(self.options.threading_mode, FilteredReadThreadingMode::MultiplePartitions(_)) {
+                return None;
+            }
+
+            let new_range = if let Some(existing_range) = &self.options.scan_range_after_filter {
+                let start = existing_range.start;
+                let end = existing_range.end.min(start + fetch as u64);
+                start..end
+            } else {
+                0..(fetch as u64)
+            };
+
+            match updated_options.with_scan_range_after_filter(new_range) {
+                Ok(options) => {
+                    updated_options = options;
                 }
                 Err(e) => {
-                    log::debug!("Cannot apply fetch limit to FilteredReadExec: {}", e);
-                    None
+                    log::debug!("Cannot apply fetch limit to scan_range_after_filter: {}", e);
+                    return None;
                 }
             }
-        } else {
-            // No limit, return self unchanged
-            None
+        }
+
+        match FilteredReadExec::try_new(
+            self.dataset.clone(),
+            updated_options,
+            self.index_input.clone(),
+        ) {
+            Ok(exec) => Some(Arc::new(exec)),
+            Err(e) => {
+                log::debug!("Failed to create FilteredReadExec with fetch limit: {}", e);
+                None
+            }
         }
     }
 }
