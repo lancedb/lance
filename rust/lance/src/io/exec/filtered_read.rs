@@ -345,7 +345,7 @@ struct FilteredReadStream {
     active_partitions_counter: Arc<AtomicUsize>,
     /// The threading mode for the scan
     threading_mode: FilteredReadThreadingMode,
-    /// Range to apply to the stream if not already pushed down in planning
+    /// Range to apply to the result stream if not already pushed down in planning phase
     range_to_apply: Option<Range<u64>>,
 }
 
@@ -403,17 +403,17 @@ impl FilteredReadStream {
         let scheduler_config = SchedulerConfig::max_bandwidth(obj_store.as_ref());
         let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
 
-        let (scoped_fragments, options) = Self::plan_scan(
+        let (scoped_fragments, scan_planned_with_limit_pushed_down) = Self::plan_scan(
             dataset.as_ref(),
             loaded_fragments,
             &evaluated_index,
-            options,
+            &options,
             &global_metrics,
             scan_scheduler.clone(),
         )
         .await?;
 
-        let range_to_apply = if !options.scan_planned_with_limit_pushed_down {
+        let range_to_apply = if !scan_planned_with_limit_pushed_down {
             options.scan_range_after_filter
         } else {
             None
@@ -482,19 +482,22 @@ impl FilteredReadStream {
     // We need to figure out which ranges to read from each fragment.
     //
     // If the scan range is ignoring the filters we can push it down here.
-    // If the scan range is not ignoring the filters we can only push it down if the index
-    // result is an exact match.
+    // If the scan range is not ignoring the filters we can only push it down if:
+    // 1. The index result is an exact match (we know exactly which rows will be in the result)
+    // 2. The index result is AtLeast with guaranteed rows >= limit (we have enough guaranteed matches)
+    // Returns: (fragment reads, whether limit was pushed down to fragment ranges)
     #[instrument(name = "plan_scan", skip_all)]
     async fn plan_scan(
         dataset: &Dataset,
         fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
-        mut options: FilteredReadOptions,
+        options: &FilteredReadOptions,
         global_metrics: &FilteredReadGlobalMetrics,
         scan_scheduler: Arc<ScanScheduler>,
-    ) -> Result<(Vec<ScopedFragmentRead>, FilteredReadOptions)> {
+    ) -> Result<(Vec<ScopedFragmentRead>, bool)> {
         let mut scoped_fragments = Vec::with_capacity(fragments.len());
         let projection = Arc::new(options.projection.clone());
+        let mut scan_planned_with_limit_pushed_down = false;
 
         // The current offset, includes filtered rows, but not deleted rows
         let mut range_offset = 0;
@@ -627,18 +630,19 @@ impl FilteredReadStream {
         }
 
         if let Some(range_after_filter) = &options.scan_range_after_filter {
-            let pushed_down = Self::apply_scan_range_after_filter(
+            scan_planned_with_limit_pushed_down = Self::apply_scan_range_after_filter(
                 &mut scoped_fragments,
                 range_after_filter,
                 &refine_filter,
                 evaluated_index.as_ref(),
             );
-            options.scan_planned_with_limit_pushed_down = pushed_down;
         }
 
-        Ok((scoped_fragments, options))
+        Ok((scoped_fragments, scan_planned_with_limit_pushed_down))
     }
 
+    /// Apply scan_range_after_filter optimization to fragment reads
+    /// Returns true if the limit was successfully pushed down to fragment ranges
     fn apply_scan_range_after_filter(
         scoped_fragments: &mut Vec<ScopedFragmentRead>,
         range_after_filter: &Range<u64>,
@@ -1170,9 +1174,6 @@ pub struct FilteredReadOptions {
     pub full_filter: Option<Expr>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
-    /// Whether the scan was planned with limit pushed down to the fragment ranges
-    /// When true, the stream should NOT apply skip/limit again
-    pub scan_planned_with_limit_pushed_down: bool,
 }
 
 impl FilteredReadOptions {
@@ -1202,7 +1203,6 @@ impl FilteredReadOptions {
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
-            scan_planned_with_limit_pushed_down: false,
         }
     }
 
