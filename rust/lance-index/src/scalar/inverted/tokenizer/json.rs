@@ -107,7 +107,7 @@ impl Stream for JsonTripletStream {
                     .iter()
                     .enumerate()
                     .map(|(idx, col)| {
-                        if col.name() == &self.jsonb_col {
+                        if col.name().as_str() == self.jsonb_col {
                             Ok(jsonb_to_json(batch.column(idx), &self.jsonb_col)?)
                         } else {
                             Ok(batch.column(idx).clone())
@@ -120,8 +120,8 @@ impl Stream for JsonTripletStream {
                     .fields()
                     .iter()
                     .map(|col| {
-                        if col.name() == &self.jsonb_col {
-                            Field::new(&self.jsonb_col, DataType::Utf8, true)
+                        if col.name().as_str() == self.jsonb_col {
+                            Field::new(&self.jsonb_col, DataType::LargeUtf8, true)
                         } else {
                             col.as_ref().clone()
                         }
@@ -153,7 +153,8 @@ pub fn jsonb_to_json(col: &ArrayRef, col_name: &str) -> lance_core::Result<Array
         .as_any()
         .downcast_ref::<LargeBinaryArray>()
         .unwrap_or_else(|| panic!("column {} is not a large binary array", col_name));
-    let mut builder = arrow_array::builder::StringBuilder::with_capacity(binary_array.len(), 1024);
+    let mut builder =
+        arrow_array::builder::LargeStringBuilder::with_capacity(binary_array.len(), 1024);
     for i in 0..binary_array.len() {
         if binary_array.is_null(i) {
             builder.append_null();
@@ -211,9 +212,7 @@ fn flatten_json(
             let value_type = match value {
                 Value::Null => "null",
                 Value::Bool(_) => "bool",
-                Value::Number(n) if n.is_i64() => "i64",
-                Value::Number(n) if n.is_f64() => "f64",
-                Value::Number(n) if n.is_u64() => "u64",
+                Value::Number(_) => "number",
                 _ => unreachable!(),
             };
             out.push((
@@ -234,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_json_tokenizer() {
-        let text = r#"a,i64,1;b.c,str,d;b.c,str,e"#;
+        let text = r#"a,number,1;b.c,str,d;b.c,str,e"#;
         let mut tokenizer = TripletTokenizer {};
         let mut stream = tokenizer.token_stream(text);
 
@@ -248,17 +247,17 @@ mod tests {
             tokens[0],
             Token {
                 offset_from: 0,
-                offset_to: 7,
+                offset_to: 10,
                 position: 0,
-                text: "a,i64,1".to_string(),
+                text: "a,number,1".to_string(),
                 position_length: 1,
             }
         );
         assert_eq!(
             tokens[1],
             Token {
-                offset_from: 8,
-                offset_to: 17,
+                offset_from: 11,
+                offset_to: 20,
                 position: 1,
                 text: "b.c,str,d".to_string(),
                 position_length: 1,
@@ -267,8 +266,8 @@ mod tests {
         assert_eq!(
             tokens[2],
             Token {
-                offset_from: 18,
-                offset_to: 27,
+                offset_from: 21,
+                offset_to: 30,
                 position: 2,
                 text: "b.c,str,e".to_string(),
                 position_length: 1,
@@ -306,7 +305,7 @@ mod tests {
         let text = flatten_json_value(&value).unwrap();
         assert_eq!(
             text.as_str(),
-            "a,i64,1;b.c,str,hello;b.c,str,world;b.c,str,e;c,bool,true;d,null,null;e.f,f64,1.0"
+            "a,number,1;b.c,str,hello;b.c,str,world;b.c,str,e;c,bool,true;d,null,null;e.f,number,1.0"
         );
 
         let json = r#"{}"#;
@@ -321,6 +320,6 @@ mod tests {
         let jsonb_bytes = jsonb::parse_value(json.as_bytes()).unwrap().to_vec();
         let json_bytes: &[u8] = &jsonb_bytes;
         let text = flatten_jsonb(json_bytes).unwrap();
-        assert_eq!(text.as_str(), "a,i64,1;a,i64,2;a,i64,3");
+        assert_eq!(text.as_str(), "a,number,1;a,number,2;a,number,3");
     }
 }

@@ -4,6 +4,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::PreFilterSource;
+use crate::index::scalar::IndexDetails;
+use crate::{index::DatasetIndexInternalExt, Dataset};
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
@@ -20,17 +24,10 @@ use datafusion_physical_plan::metrics::BaselineMetrics;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
-use lance_table::format::IndexMetadata;
-use snafu::location;
-
-use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
-use super::PreFilterSource;
-use crate::index::scalar::IndexDetails;
-use crate::{index::DatasetIndexInternalExt, Dataset};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::error::LanceOptionExt;
+use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::json::JsonTripletStream;
 use lance_index::scalar::inverted::query::{
@@ -42,6 +39,8 @@ use lance_index::scalar::inverted::{
 use lance_index::scalar::json::JsonIndex;
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery, Index, IndexType};
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use lance_table::format::IndexMetadata;
+use snafu::location;
 use tracing::instrument;
 
 pub struct FtsIndexMetrics {
@@ -445,7 +444,7 @@ fn unindexed_input(
         }
         DataType::Binary | DataType::LargeBinary => {
             match field.metadata().get(ARROW_EXT_NAME_KEY) {
-                Some(name) if name == &JSON_EXT_NAME.to_string() => {
+                Some(name) if name.as_str() == JSON_EXT_NAME => {
                     Ok(Box::pin(JsonTripletStream::new(input, column.to_string())))
                 }
                 _ => Err(lance_core::Error::InvalidInput {
