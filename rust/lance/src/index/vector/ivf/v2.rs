@@ -1683,7 +1683,7 @@ mod tests {
             .await
             .unwrap();
         if dist_type != DistanceType::Hamming {
-            let excluded_count = dists.iter().counts_by(|d| *d == dists[k - 1]).unwrap();
+            let excluded_count = dists.iter().filter(|d| *d == dists.last().unwrap()).count();
             assert_eq!(exclude_last_res.num_rows(), k - excluded_count);
             let res_row_ids = exclude_last_res[ROW_ID]
                 .as_primitive::<UInt64Type>()
