@@ -25,11 +25,7 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
 use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
-<<<<<<< HEAD
-use futures::{future, FutureExt, Stream, StreamExt, TryStreamExt};
-=======
-use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
+use futures::{future, FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
@@ -461,39 +457,31 @@ impl FilteredReadStream {
             dataset.as_ref(),
             loaded_fragments,
             &evaluated_index,
-<<<<<<< HEAD
             &options,
             &global_metrics,
-=======
-            options,
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
             scan_scheduler.clone(),
         )
         .await?;
 
-<<<<<<< HEAD
         let range_to_apply = if !scan_planned_with_limit_pushed_down {
             options.scan_range_after_filter
         } else {
             None
         };
 
+        let global_metrics_clone = global_metrics.clone();
+
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map({
                 let range_to_apply = range_to_apply.clone();
                 move |scoped_fragment| {
+                    let metrics = global_metrics_clone.clone();
                     let limit = range_to_apply.as_ref().map(|r| r.end);
-                    tokio::task::spawn(Self::read_fragment(scoped_fragment, limit))
-                        .map(|thread_result| thread_result.unwrap())
-                }
-=======
-        let global_metrics_clone = global_metrics.clone();
-        let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map(move |scoped_fragment| {
-                let metrics = global_metrics_clone.clone();
-                tokio::task::spawn(Self::read_fragment(scoped_fragment, metrics).in_current_span())
+                    tokio::task::spawn(
+                        Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
+                    )
                     .map(|thread_result| thread_result.unwrap())
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
+                }
             })
             .buffered(fragment_readahead);
         let task_stream = fragment_streams.try_flatten().boxed();
@@ -558,12 +546,8 @@ impl FilteredReadStream {
         dataset: &Dataset,
         fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
-<<<<<<< HEAD
         options: &FilteredReadOptions,
         global_metrics: &FilteredReadGlobalMetrics,
-=======
-        options: FilteredReadOptions,
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<(Vec<ScopedFragmentRead>, bool)> {
         let mut scoped_fragments = Vec::with_capacity(fragments.len());
@@ -985,8 +969,12 @@ impl FilteredReadStream {
                         partition_metrics_clone
                             .baseline_metrics
                             .record_output(batch.num_rows());
-<<<<<<< HEAD
-                    });
+                        global_metrics.io_metrics.record(&scan_scheduler);
+                    })
+                    .finally(move || {
+                        partition_metrics.baseline_metrics.done();
+                    })
+                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
 
                 let batch_stream = if let Some(ref range) = self.range_to_apply {
                     Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
@@ -994,16 +982,7 @@ impl FilteredReadStream {
                     base_batch_stream.boxed()
                 };
 
-                let final_stream = batch_stream
-=======
-                        global_metrics.io_metrics.record(&scan_scheduler);
-                    })
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
-                    .finally(move || {
-                        partition_metrics.baseline_metrics.done();
-                    })
-                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
-                Box::pin(RecordBatchStreamAdapter::new(output_schema, final_stream))
+                Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
             FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
                 assert!(partition < num_partitions);
@@ -1063,11 +1042,8 @@ impl FilteredReadStream {
     #[instrument(name = "read_fragment", skip_all)]
     async fn read_fragment(
         mut fragment_read_task: ScopedFragmentRead,
-<<<<<<< HEAD
-        fragment_soft_limit: Option<u64>,
-=======
         global_metrics: Arc<FilteredReadGlobalMetrics>,
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
+        fragment_soft_limit: Option<u64>,
     ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
         let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
@@ -1107,9 +1083,6 @@ impl FilteredReadStream {
             })
             .transpose()?;
 
-<<<<<<< HEAD
-        let fragment_stream = fragment_reader
-=======
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
         // used in the scan anyways.
@@ -1118,8 +1091,7 @@ impl FilteredReadStream {
             fragment_read_task.ranges.clone(),
         )));
 
-        Ok(fragment_reader
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
+        let fragment_stream = fragment_reader
             .read_ranges(
                 fragment_read_task.ranges.into(),
                 fragment_read_task.batch_size,
@@ -2595,7 +2567,6 @@ mod tests {
         assert_eq!(ranges, expected);
     }
 
-<<<<<<< HEAD
     #[test]
     fn test_trim_ranges_by_offset() {
         // Test case 1: No skip, take all
@@ -3334,7 +3305,8 @@ mod tests {
             .collect();
         let expected: Vec<u32> = (250..300).collect();
         assert_eq!(all_values, expected);
-=======
+    }
+
     #[tokio::test]
     async fn test_metrics_with_limit_partial_fragment() {
         let fixture = TestFixture::new().await;
@@ -3386,6 +3358,5 @@ mod tests {
             .map(|v| v.as_usize())
             .unwrap_or(0);
         assert!(iops > 0, "Should have recorded IO operations");
->>>>>>> c6eb6c05c47429b6ceeba4c88a123b56aa3087ad
     }
 }
