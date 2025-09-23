@@ -2363,7 +2363,7 @@ impl SqlQuery {
         let builder = self.builder.clone();
         let fut = Box::pin(async move {
             let query = builder.build().await?;
-            let stream = query.into_stream().await;
+            let stream = query.into_stream().await?;
             Ok::<Pin<Box<dyn datafusion::execution::RecordBatchStream + Send>>, lance::Error>(
                 stream,
             )

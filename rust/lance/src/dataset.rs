@@ -1719,7 +1719,7 @@ impl Dataset {
         &mut self,
         target_path: &str,
         version: impl Into<refs::Ref>,
-        store_params: ObjectStoreParams,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let ref_: refs::Ref = version.into();
         let (version_number, ref_name) = match ref_ {
@@ -1735,7 +1735,7 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params)
+            .with_store_params(store_params.unwrap_or_default())
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
@@ -3020,7 +3020,7 @@ mod tests {
             .await
             .unwrap();
         let cloned_dataset = dataset
-            .shallow_clone(cloned_uri, "test_tag", ObjectStoreParams::default())
+            .shallow_clone(cloned_uri, "test_tag", None)
             .await
             .unwrap();
 
@@ -3141,7 +3141,7 @@ mod tests {
                 .unwrap();
 
             current_dataset = current_dataset
-                .shallow_clone(clone_path, "v1", ObjectStoreParams::default())
+                .shallow_clone(clone_path, "v1", None)
                 .await
                 .unwrap();
             current_dataset = write_dataset(
