@@ -867,7 +867,7 @@ mod test {
     };
     use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::{ROW_ADDR_FIELD};
+    use lance_core::ROW_ADDR_FIELD;
     use lance_io::stream::RecordBatchStreamAdapter;
     use rand::RngCore;
 
