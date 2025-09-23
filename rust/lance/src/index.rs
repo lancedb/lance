@@ -3416,11 +3416,7 @@ mod tests {
 
             // Perform shallow clone for this round (chain cloning from current dataset)
             let mut round_cloned_dataset = current_dataset
-                .shallow_clone(
-                    round_cloned_uri,
-                    tag_name.as_str(),
-                    ObjectStoreParams::default(),
-                )
+                .shallow_clone(round_cloned_uri, tag_name.as_str(), None)
                 .await
                 .unwrap();
 
