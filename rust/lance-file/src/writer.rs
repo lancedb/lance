@@ -748,7 +748,13 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, ListArray, NullArray, PrimitiveArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray, UInt8Array};
+    use arrow_array::{
+        types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
+        DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
+        Int64Array, ListArray, NullArray, PrimitiveArray, StringArray, TimestampMicrosecondArray,
+        TimestampSecondArray, UInt8Array,
+    };
     use arrow_buffer::i256;
     use arrow_schema::{
         Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
@@ -850,7 +856,7 @@ mod tests {
             FixedSizeBinaryArray::try_new_from_values(&UInt8Array::from_iter(binary_data), 8)
                 .unwrap();
 
-        let list_offsets : PrimitiveArray<Int32Type> = (0..202).step_by(2).collect();
+        let list_offsets: PrimitiveArray<Int32Type> = (0..202).step_by(2).collect();
         let list_values =
             StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
         let list_arr: arrow_array::GenericListArray<i32> =
