@@ -547,7 +547,7 @@ impl FilteredReadStream {
         fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
-        global_metrics: &FilteredReadGlobalMetrics,
+        _global_metrics: &FilteredReadGlobalMetrics,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<(Vec<ScopedFragmentRead>, bool)> {
         let mut scoped_fragments = Vec::with_capacity(fragments.len());
@@ -973,13 +973,16 @@ impl FilteredReadStream {
                     })
                     .finally(move || {
                         partition_metrics.baseline_metrics.done();
-                    })
-                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
+                    });
 
                 let batch_stream = if let Some(ref range) = self.range_to_apply {
-                    Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
+                    Self::apply_hard_range(base_batch_stream, range.clone())
+                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
+                        .boxed()
                 } else {
-                    base_batch_stream.boxed()
+                    base_batch_stream
+                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
+                        .boxed()
                 };
 
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
