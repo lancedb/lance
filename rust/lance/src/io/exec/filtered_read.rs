@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::any::Any;
 use std::iter::Peekable;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
@@ -24,7 +25,7 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
 use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
@@ -297,6 +298,56 @@ impl FilteredReadPartitionMetrics {
     }
 }
 
+/// Tracks the number of ranges scanned based on the number of rows processed
+struct RangeMetricsTracker {
+    ranges: Vec<Range<u64>>,
+    cumulative_rows: usize,
+    current_range_index: usize,
+    rows_processed_in_range: usize,
+}
+
+impl RangeMetricsTracker {
+    fn new(ranges: Vec<Range<u64>>) -> Self {
+        Self {
+            ranges,
+            cumulative_rows: 0,
+            current_range_index: 0,
+            rows_processed_in_range: 0,
+        }
+    }
+
+    // Counts ranges started scanning (not necessarily finished).
+    fn incremental_ranges_scanned(&mut self, num_rows: usize) -> usize {
+        self.cumulative_rows += num_rows;
+        let mut additional_ranges = 0;
+
+        while self.current_range_index < self.ranges.len() {
+            let current_range = &self.ranges[self.current_range_index];
+            let range_size = (current_range.end - current_range.start) as usize;
+
+            if self.cumulative_rows >= range_size {
+                // We've completed this range
+                if self.rows_processed_in_range == 0 {
+                    // We are completing a range we never started
+                    additional_ranges += 1;
+                }
+                self.cumulative_rows -= range_size;
+                self.current_range_index += 1;
+                self.rows_processed_in_range = 0;
+            } else {
+                // Still within the current range
+                if self.rows_processed_in_range == 0 {
+                    additional_ranges += 1;
+                }
+                self.rows_processed_in_range += num_rows;
+                break;
+            }
+        }
+
+        additional_ranges
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilteredReadThreadingMode {
     /// This mode allows for multi-threading to be used even if there is only a single
@@ -361,7 +412,7 @@ impl FilteredReadStream {
         metrics: &ExecutionPlanMetricsSet,
         evaluated_index: Option<Arc<EvaluatedIndex>>,
     ) -> DataFusionResult<Self> {
-        let global_metrics = FilteredReadGlobalMetrics::new(metrics);
+        let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
 
         let threading_mode = options.threading_mode;
 
@@ -375,7 +426,6 @@ impl FilteredReadStream {
             .fragments
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
-        global_metrics.fragments_scanned.add(fragments.len());
 
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
@@ -406,14 +456,15 @@ impl FilteredReadStream {
             loaded_fragments,
             &evaluated_index,
             options,
-            &global_metrics,
             scan_scheduler.clone(),
         )
         .await?;
 
+        let global_metrics_clone = global_metrics.clone();
         let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map(|scoped_fragment| {
-                tokio::task::spawn(Self::read_fragment(scoped_fragment).in_current_span())
+            .map(move |scoped_fragment| {
+                let metrics = global_metrics_clone.clone();
+                tokio::task::spawn(Self::read_fragment(scoped_fragment, metrics).in_current_span())
                     .map(|thread_result| thread_result.unwrap())
             })
             .buffered(fragment_readahead);
@@ -423,7 +474,7 @@ impl FilteredReadStream {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
             scan_scheduler,
-            metrics: Arc::new(global_metrics),
+            metrics: global_metrics,
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
         })
@@ -477,7 +528,6 @@ impl FilteredReadStream {
         fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: FilteredReadOptions,
-        global_metrics: &FilteredReadGlobalMetrics,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<Vec<ScopedFragmentRead>> {
         let mut scoped_fragments = Vec::with_capacity(fragments.len());
@@ -577,12 +627,8 @@ impl FilteredReadStream {
             }
 
             if !to_read.is_empty() {
-                global_metrics
-                    .rows_scanned
-                    .add(to_read.iter().map(|r| r.end - r.start).sum::<u64>() as usize);
-                global_metrics.ranges_scanned.add(to_read.len());
                 log::trace!(
-                    "Reading {} ranges ({} rows) from fragment {} with filter: {:?}",
+                    "Planning {} ranges ({} rows) from fragment {} with filter: {:?}",
                     to_read.len(),
                     to_read.iter().map(|r| r.end - r.start).sum::<u64>(),
                     fragment.id(),
@@ -734,9 +780,7 @@ impl FilteredReadStream {
         self.active_partitions_counter
             .fetch_add(1, Ordering::Relaxed);
 
-        // Each partition needs a copy of these things because the last partition
-        // to finish has to record the I/O stats
-        let active_partitions_counter = self.active_partitions_counter.clone();
+        // Each partition needs these to record incremental metrics.
         let global_metrics = self.metrics.clone();
         let scan_scheduler = self.scan_scheduler.clone();
 
@@ -776,11 +820,9 @@ impl FilteredReadStream {
                         partition_metrics_clone
                             .baseline_metrics
                             .record_output(batch.num_rows());
+                        global_metrics.io_metrics.record(&scan_scheduler);
                     })
                     .finally(move || {
-                        if active_partitions_counter.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            global_metrics.io_metrics.record_final(&scan_scheduler);
-                        }
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
@@ -790,9 +832,13 @@ impl FilteredReadStream {
                 assert!(partition < num_partitions);
                 let output_schema = self.output_schema.clone();
                 let task_stream = self.task_stream.clone();
+                let global_metrics_clone = global_metrics.clone();
+                let scan_scheduler_clone = scan_scheduler.clone();
                 let batch_stream = futures::stream::try_unfold(task_stream, {
                     move |task_stream| {
                         let partition_metrics = partition_metrics.clone();
+                        let global_metrics = global_metrics_clone.clone();
+                        let scan_scheduler = scan_scheduler_clone.clone();
                         async move {
                             // This isn't quite right.  It's counting I/O time in addition to
                             // compute time.
@@ -811,6 +857,9 @@ impl FilteredReadStream {
                                 partition_metrics
                                     .baseline_metrics
                                     .record_output(batch.num_rows());
+
+                                global_metrics.io_metrics.record(&scan_scheduler);
+
                                 Ok(Some((batch, task_stream)))
                             } else {
                                 partition_metrics.baseline_metrics.done();
@@ -827,11 +876,6 @@ impl FilteredReadStream {
                         Some(batch)
                     }))
                 })
-                .finally(move || {
-                    if active_partitions_counter.fetch_sub(1, Ordering::Relaxed) == 1 {
-                        global_metrics.io_metrics.record_final(&scan_scheduler);
-                    }
-                })
                 .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
@@ -842,6 +886,7 @@ impl FilteredReadStream {
     #[instrument(name = "read_fragment", skip_all)]
     async fn read_fragment(
         mut fragment_read_task: ScopedFragmentRead,
+        global_metrics: Arc<FilteredReadGlobalMetrics>,
     ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
         let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
@@ -881,11 +926,40 @@ impl FilteredReadStream {
             })
             .transpose()?;
 
+        // We are going to count the fragment as scanned on the first batch we
+        // read. This might miss empty fragments, but we assume that wouldn't be
+        // used in the scan anyways.
+        let fragment_counted = Arc::new(AtomicBool::new(false));
+        let range_tracker = Arc::new(Mutex::new(RangeMetricsTracker::new(
+            fragment_read_task.ranges.clone(),
+        )));
+
         Ok(fragment_reader
             .read_ranges(
                 fragment_read_task.ranges.into(),
                 fragment_read_task.batch_size,
             )?
+            .map(move |batch_fut: ReadBatchFut| {
+                let global_metrics = global_metrics.clone();
+                let fragment_counted = fragment_counted.clone();
+                let range_tracker = range_tracker.clone();
+                batch_fut
+                    .inspect_ok(move |batch| {
+                        let num_rows = batch.num_rows();
+                        global_metrics.rows_scanned.add(num_rows);
+                        if !fragment_counted.swap(true, Ordering::Relaxed) {
+                            global_metrics.fragments_scanned.add(1);
+                        }
+                        // Note: this is an approximation. Batches may come in out-of-order,
+                        // in which case this might be inaccurate.
+                        if let Ok(mut range_tracker) = range_tracker.lock() {
+                            let additional_ranges =
+                                range_tracker.incremental_ranges_scanned(num_rows);
+                            global_metrics.ranges_scanned.add(additional_ranges);
+                        }
+                    })
+                    .boxed()
+            })
             .zip(futures::stream::repeat((
                 physical_filter.clone(),
                 output_schema.clone(),
@@ -2188,5 +2262,58 @@ mod tests {
         let ranges = FilteredReadStream::full_frag_range(53, &Some(dv));
         let expected = vec![0..13, 14..17, 18..51];
         assert_eq!(ranges, expected);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_with_limit_partial_fragment() {
+        let fixture = TestFixture::new().await;
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset).with_batch_size(10);
+        let filtered_read =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+
+        let batches = filtered_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .take(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 30);
+
+        // Check metrics reflect partial fragment read
+        let metrics = filtered_read.metrics().unwrap();
+
+        // Should show approximately 30 rows scanned (might be slightly more due to buffering)
+        // But should be significantly less than full fragment (100 rows)
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            (30..100).contains(&rows_scanned),
+            "rows_scanned ({}) should be close to limit (30), not full fragment (100)",
+            rows_scanned
+        );
+
+        // Should show 1 fragment was accessed
+        let fragments_scanned = metrics
+            .sum_by_name("fragments_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert_eq!(fragments_scanned, 1);
+
+        let ranges_scanned = metrics
+            .sum_by_name("ranges_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(ranges_scanned > 0, "Should have scanned some ranges");
+
+        // Should have some IO metrics
+        let iops = metrics
+            .sum_by_name("iops")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(iops > 0, "Should have recorded IO operations");
     }
 }
