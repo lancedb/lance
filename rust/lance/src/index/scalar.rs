@@ -21,6 +21,9 @@ use lance_core::datatypes::Field;
 use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::pbold::{
+    BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
+};
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, ScalarIndexPluginRegistry, TrainingCriteria, TrainingOrdering,
@@ -358,18 +361,18 @@ pub(crate) async fn infer_scalar_index_details(
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
     let index_details = if let DataType::List(_) = col.data_type() {
-        prost_types::Any::from_msg(&lance_index::pb::LabelListIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
-        prost_types::Any::from_msg(&lance_index::pb::BitmapIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
     } else if dataset.object_store.exists(&inverted_list_lookup).await?
         || dataset
             .object_store
             .exists(&legacy_inverted_list_lookup)
             .await?
     {
-        prost_types::Any::from_msg(&lance_index::pb::InvertedIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else {
-        prost_types::Any::from_msg(&lance_index::pb::BTreeIndexDetails::default()).unwrap()
+        prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
 
     let index_details = Arc::new(index_details);
@@ -387,6 +390,7 @@ pub fn index_matches_criteria(
     criteria: &ScalarIndexCriteria,
     field: &Field,
     has_multiple_indices: bool,
+    schema: &lance_core::datatypes::Schema,
 ) -> Result<bool> {
     if let Some(name) = &criteria.has_name {
         if &index.name != name {
@@ -398,7 +402,14 @@ pub fn index_matches_criteria(
         if index.fields.len() != 1 {
             return Ok(false);
         }
-        if for_column != field.name {
+        // Build the full field path for nested fields
+        let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+            let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+            lance_core::datatypes::format_field_path(&field_refs)
+        } else {
+            field.name.clone()
+        };
+        if for_column != field_path {
             return Ok(false);
         }
     }
@@ -516,10 +527,8 @@ mod tests {
     use futures::TryStreamExt;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
-    use lance_index::{
-        pb::{BTreeIndexDetails, InvertedIndexDetails, NGramIndexDetails},
-        IndexType,
-    };
+    use lance_index::pbold::NGramIndexDetails;
+    use lance_index::IndexType;
     use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
@@ -571,10 +580,14 @@ mod tests {
         };
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
-        let result = index_matches_criteria(&index1, &criteria, &field, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+        let result = index_matches_criteria(&index1, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
 
-        let result = index_matches_criteria(&index1, &criteria, &field, false).unwrap();
+        let result = index_matches_criteria(&index1, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
     }
 
@@ -592,10 +605,16 @@ mod tests {
         };
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         // test for_column
@@ -605,11 +624,13 @@ mod tests {
             for_column: Some("mycol"),
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.for_column = Some("mycol2");
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         // test has_name
@@ -619,15 +640,19 @@ mod tests {
             for_column: None,
             has_name: Some("btree_index"),
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.has_name = Some("btree_index2");
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         // test supports_exact_equality
@@ -637,15 +662,18 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, false, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result = index_matches_criteria(&inverted_index, &criteria, &field, false).unwrap();
+        let result =
+            index_matches_criteria(&inverted_index, &criteria, &field, false, &schema).unwrap();
         assert!(!result);
 
         criteria.must_support_fts = false;
-        let result = index_matches_criteria(&ngram_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
         assert!(!result);
 
         // test multiple indices
@@ -655,15 +683,18 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result = index_matches_criteria(&btree_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result = index_matches_criteria(&inverted_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&inverted_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
 
         criteria.must_support_fts = false;
-        let result = index_matches_criteria(&ngram_index, &criteria, &field, true).unwrap();
+        let result =
+            index_matches_criteria(&ngram_index, &criteria, &field, true, &schema).unwrap();
         assert!(result);
     }
 

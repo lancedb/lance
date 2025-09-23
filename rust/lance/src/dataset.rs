@@ -76,6 +76,7 @@ pub mod sql;
 pub mod statistics;
 mod take;
 pub mod transaction;
+pub mod udtf;
 pub mod updater;
 mod utils;
 mod write;
