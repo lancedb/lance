@@ -76,6 +76,7 @@ pub const IO_TYPE_LOAD_VECTOR_PART: &str = "load_vector_part";
 pub const IO_TYPE_LOAD_SCALAR_PART: &str = "load_scalar_part";
 pub const TRACE_EXECUTION: &str = "lance::execution";
 pub const EXECUTION_PLAN_RUN: &str = "plan_run";
+pub const TRACE_DATAFUSION: &str = "lance::datafusion";
 pub const TRACE_DATASET_EVENTS: &str = "lance::dataset_events";
 pub const DATASET_WRITING_EVENT: &str = "writing";
 pub const DATASET_COMMITTED_EVENT: &str = "committed";
