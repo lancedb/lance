@@ -66,6 +66,7 @@ impl ValueEncoder {
         debug_assert_eq!(vals_per_chunk % values_per_word, 0);
         let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
         let bytes_per_chunk = u16::try_from(bytes_per_chunk).unwrap();
+        debug_assert!(bytes_per_chunk > 0);
 
         let data_buffer = data.data;
 
@@ -75,13 +76,14 @@ impl ValueEncoder {
         let mut bytes_counter = 0;
         loop {
             if row_offset + vals_per_chunk <= data.num_values {
+                // We can make a full chunk
                 chunks.push(MiniBlockChunk {
                     log_num_values: log_vals_per_chunk as u8,
                     buffer_sizes: vec![bytes_per_chunk],
                 });
                 row_offset += vals_per_chunk;
                 bytes_counter += bytes_per_chunk as u64;
-            } else {
+            } else if row_offset < data.num_values {
                 // Final chunk, special values
                 let num_bytes = data_buffer.len() as u64 - bytes_counter;
                 let num_bytes = u16::try_from(num_bytes).unwrap();
@@ -90,8 +92,13 @@ impl ValueEncoder {
                     buffer_sizes: vec![num_bytes],
                 });
                 break;
+            } else {
+                // If we get here then all chunks were full chunks and we have no remainder chunk
+                break;
             }
         }
+
+        debug_assert_eq!(chunks.len(), num_chunks);
 
         MiniBlockCompressed {
             chunks,
@@ -161,6 +168,7 @@ impl ValueEncoder {
         let bits_in_chunk = data.bits_per_value * num_values as u64;
         let bytes_in_chunk = bits_in_chunk.div_ceil(8);
         let bytes_in_chunk = u16::try_from(bytes_in_chunk).unwrap();
+        debug_assert!(bytes_in_chunk > 0);
         buffer_sizes.push(bytes_in_chunk);
 
         buffer_sizes
@@ -744,7 +752,6 @@ pub(crate) mod tests {
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
-    use rstest::rstest;
 
     use crate::{
         compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
@@ -757,7 +764,7 @@ pub(crate) mod tests {
             physical::value::ValueDecompressor,
         },
         format::pb21::compressive_encoding::Compression,
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
 
@@ -808,20 +815,32 @@ pub(crate) mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_value_primitive(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_simple_range() {
+        let items = Arc::new(Int32Array::from_iter((0..5000).map(|i| {
+            if i % 2 == 0 {
+                Some(i)
+            } else {
+                None
+            }
+        })));
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_value_primitive() {
         for data_type in PRIMITIVE_TYPES {
             log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field, version).await;
+            check_basic_random(field).await;
         }
     }
 
@@ -832,21 +851,18 @@ pub(crate) mod tests {
         )]
     });
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_large_primitive(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_large_primitive() {
         for data_type in LARGE_TYPES.iter() {
             log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field, version).await;
+            check_basic_random(field).await;
         }
     }
 
     #[test_log::test(tokio::test)]
     async fn test_decimal128_dictionary_encoding() {
-        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
         let decimals: Vec<i32> = (0..100).collect();
         let repeated_strings: Vec<_> = decimals
             .iter()
@@ -900,7 +916,7 @@ pub(crate) mod tests {
                 let test_cases = TestCases::default()
                     .with_page_sizes(vec![1000, 2000, 3000, 60000])
                     .with_batch_size(batch_size)
-                    .with_file_version(LanceFileVersion::V2_1);
+                    .with_min_file_version(LanceFileVersion::V2_1);
 
                 check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
             }
@@ -1094,7 +1110,7 @@ pub(crate) mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("flat")
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
 
         // Test both explicit configuration and automatic fallback scenarios
         // 1. Test explicit "none" compression to force flat encoding

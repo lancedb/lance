@@ -14,7 +14,7 @@ use lance_core::{
 };
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::MemWal;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use snafu::{location, Location};
 use std::{
@@ -32,7 +32,7 @@ pub struct TransactionRebase<'a> {
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowIdTreeMap>,
-    conflicting_frag_reuse_indices: Vec<Index>,
+    conflicting_frag_reuse_indices: Vec<IndexMetadata>,
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -338,7 +338,7 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::Update {
-            mem_wal_to_flush, ..
+            mem_wal_to_merge, ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
@@ -445,13 +445,13 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateMemWalState { added, updated, .. } => {
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         added,
-                        mem_wal_to_flush.as_slice(),
+                        mem_wal_to_merge.as_slice(),
                         other_transaction,
                         other_version,
                     )?;
                     self.check_update_mem_wal_state_not_modify_same_mem_wal(
                         updated,
-                        mem_wal_to_flush.as_slice(),
+                        mem_wal_to_merge.as_slice(),
                         other_transaction,
                         other_version,
                     )?;
@@ -961,8 +961,8 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::UpdateConfig {
-            schema_metadata,
-            field_metadata,
+            schema_metadata_updates,
+            field_metadata_updates,
             ..
         } = &self.transaction.operation
         {
@@ -970,8 +970,8 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
-                    if schema_metadata.is_some()
-                        || field_metadata.is_some()
+                    if schema_metadata_updates.is_some()
+                        || !field_metadata_updates.is_empty()
                         || self
                             .transaction
                             .operation
@@ -1077,9 +1077,9 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::Update {
-                    mem_wal_to_flush, ..
+                    mem_wal_to_merge, ..
                 } => {
-                    if mem_wal_to_flush.is_some() {
+                    if mem_wal_to_merge.is_some() {
                         // TODO: This check could be more detailed, there is an assumption that
                         //  once a MemWAL is sealed, there is no other operation that could change
                         //  the state back to open, and at that point it can always be flushed.
@@ -1537,7 +1537,7 @@ mod tests {
     use lance_core::Error;
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreParams;
-    use lance_table::format::Index;
+    use lance_table::format::IndexMetadata;
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
@@ -1580,6 +1580,53 @@ mod tests {
         (dataset, io_stats)
     }
 
+    /// Helper function for tests to create UpdateConfig operations using old-style parameters
+    #[cfg(test)]
+    fn create_update_config_for_test(
+        upsert_values: Option<HashMap<String, String>>,
+        delete_keys: Option<Vec<String>>,
+        schema_metadata: Option<HashMap<String, String>>,
+        field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
+    ) -> Operation {
+        use crate::dataset::transaction::{
+            translate_config_updates, translate_schema_metadata_updates,
+        };
+
+        let config_updates = if let Some(upsert) = &upsert_values {
+            if let Some(delete) = &delete_keys {
+                Some(translate_config_updates(upsert, delete))
+            } else {
+                Some(translate_config_updates(upsert, &[]))
+            }
+        } else {
+            delete_keys
+                .as_ref()
+                .map(|delete| translate_config_updates(&HashMap::new(), delete))
+        };
+
+        let schema_metadata_updates = schema_metadata
+            .as_ref()
+            .map(translate_schema_metadata_updates);
+
+        let field_metadata_updates = field_metadata
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(field_id, metadata)| {
+                (
+                    field_id as i32,
+                    translate_schema_metadata_updates(&metadata),
+                )
+            })
+            .collect();
+
+        Operation::UpdateConfig {
+            config_updates,
+            table_metadata_updates: None,
+            schema_metadata_updates,
+            field_metadata_updates,
+        }
+    }
+
     #[tokio::test]
     async fn test_non_overlapping_rebase_delete_update() {
         let (dataset, io_tracker) = test_dataset(5, 5).await;
@@ -1588,7 +1635,9 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
-            mem_wal_to_flush: None,
+            mem_wal_to_merge: None,
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1597,7 +1646,9 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1609,7 +1660,9 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1698,7 +1751,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::V2_0,
+                &LanceFileVersion::Stable,
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -1708,7 +1761,9 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1720,7 +1775,9 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
         ];
         let transactions =
@@ -1826,7 +1883,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::V2_0,
+                &LanceFileVersion::Stable,
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -1839,7 +1896,9 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
                 },
             ),
             (
@@ -1849,7 +1908,9 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
                 },
             ),
             (
@@ -1950,7 +2011,7 @@ mod tests {
     fn test_conflicts() {
         use io::commit::conflict_resolver::tests::{modified_fragment_ids, ConflictResult::*};
 
-        let index0 = Index {
+        let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: "test".to_string(),
             fields: vec![0],
@@ -2004,23 +2065,25 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
-                mem_wal_to_flush: None,
+                mem_wal_to_merge: None,
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
             },
-            Operation::UpdateConfig {
-                upsert_values: Some(HashMap::from_iter(vec![(
+            create_update_config_for_test(
+                Some(HashMap::from_iter(vec![(
                     "lance.test".to_string(),
                     "value".to_string(),
                 )])),
-                delete_keys: Some(vec!["remove-key".to_string()]),
-                schema_metadata: Some(HashMap::from_iter(vec![(
+                Some(vec!["remove-key".to_string()]),
+                Some(HashMap::from_iter(vec![(
                     "schema-key".to_string(),
                     "schema-value".to_string(),
                 )])),
-                field_metadata: Some(HashMap::from_iter(vec![(
+                Some(HashMap::from_iter(vec![(
                     0,
                     HashMap::from_iter(vec![("field-key".to_string(), "field-value".to_string())]),
                 )])),
-            },
+            ),
         ];
         let other_transactions = other_operations
             .iter()
@@ -2196,7 +2259,9 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
-                    mem_wal_to_flush: None,
+                    mem_wal_to_merge: None,
+                    fields_for_preserving_frag_bitmap: vec![],
+                    update_mode: None,
                 },
                 [
                     Compatible,    // append
@@ -2212,28 +2277,28 @@ mod tests {
             ),
             (
                 // Update config that should not conflict with anything
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
                         "other-key".to_string(),
                         "new-value".to_string(),
                     )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                    None,
+                    None,
+                    None,
+                ),
                 [Compatible; 9],
             ),
             (
                 // Update config that conflicts with key being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
                         "lance.test".to_string(),
                         "new-value".to_string(),
                     )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                    None,
+                    None,
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2248,15 +2313,15 @@ mod tests {
             ),
             (
                 // Update config that conflicts with key being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
                         "remove-key".to_string(),
                         "new-value".to_string(),
                     )])),
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                    None,
+                    None,
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2271,22 +2336,22 @@ mod tests {
             ),
             (
                 // Delete config keys currently being deleted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["remove-key".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                create_update_config_for_test(
+                    None,
+                    Some(vec!["remove-key".to_string()]),
+                    None,
+                    None,
+                ),
                 [Compatible; 9],
             ),
             (
                 // Delete config keys currently being upserted by other UpdateConfig operation
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: Some(vec!["lance.test".to_string()]),
-                    schema_metadata: None,
-                    field_metadata: None,
-                },
+                create_update_config_for_test(
+                    None,
+                    Some(vec!["lance.test".to_string()]),
+                    None,
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2302,15 +2367,15 @@ mod tests {
             (
                 // Changing schema metadata conflicts with another update changing schema
                 // metadata or with an overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    None,
+                    None,
+                    Some(HashMap::from_iter(vec![(
                         "schema-key".to_string(),
                         "new-value".to_string(),
                     )])),
-                    field_metadata: None,
-                },
+                    None,
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2326,18 +2391,18 @@ mod tests {
             (
                 // Changing field metadata conflicts with another update changing same field
                 // metadata or overwrite
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    None,
+                    None,
+                    None,
+                    Some(HashMap::from_iter(vec![(
                         0,
                         HashMap::from_iter(vec![(
                             "field_key".to_string(),
                             "field_value".to_string(),
                         )]),
                     )])),
-                },
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index
@@ -2352,18 +2417,18 @@ mod tests {
             ),
             (
                 // Updates to different field metadata are allowed
-                Operation::UpdateConfig {
-                    upsert_values: None,
-                    delete_keys: None,
-                    schema_metadata: None,
-                    field_metadata: Some(HashMap::from_iter(vec![(
+                create_update_config_for_test(
+                    None,
+                    None,
+                    None,
+                    Some(HashMap::from_iter(vec![(
                         1,
                         HashMap::from_iter(vec![(
                             "field_key".to_string(),
                             "field_value".to_string(),
                         )]),
                     )])),
-                },
+                ),
                 [
                     Compatible,    // append
                     Compatible,    // create index

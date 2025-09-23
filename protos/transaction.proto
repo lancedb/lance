@@ -192,12 +192,53 @@ message Transaction {
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
-    /// The MemWAL (pre-image) that should be marked as flushed after this transaction
-    MemWalIndexDetails.MemWal mem_wal_to_flush = 5;
+    /// The MemWAL (pre-image) that should be marked as merged after this transaction
+    MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
+    /// The fields that used to judge whether to preserve the new frag's id into
+    /// the frag bitmap of the specified indices.
+    repeated uint32 fields_for_preserving_frag_bitmap = 6;
+    // The mode of update
+    UpdateMode update_mode = 7;
+  }
+
+  // The mode of update operation
+  enum UpdateMode {
+
+    /// rows are deleted in current fragments and rewritten in new fragments.
+    /// This is most optimal when the majority of columns are being rewritten
+    /// or only a few rows are being updated.
+    REWRITE_ROWS = 0;
+
+    /// within each fragment, columns are fully rewritten and inserted as new data files.
+    /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
+    /// but a small subset of columns are affected.
+    REWRITE_COLUMNS = 1;
+  }
+
+  // An entry for a map update. If value is not set, the key will be removed from the map.
+  message UpdateMapEntry {
+    // The key of the map entry to update.
+    string key = 1;
+    // The value to set for the key.
+    optional string value = 2;
+  }
+
+  message UpdateMap {
+    repeated UpdateMapEntry update_entries = 1;
+    // If true, the map will be replaced entirely with the new entries.
+    // If false, the new entries will be merged with the existing map.
+    bool replace = 2;
   }
   
-  // An operation that updates the table config.
+  // An operation that updates the table config, table metadata, schema metadata,
+  // or field metadata.
   message UpdateConfig {
+    UpdateMap config_updates = 6;
+    UpdateMap table_metadata_updates = 7;
+    UpdateMap schema_metadata_updates = 8;
+    map<int32, UpdateMap> field_metadata_updates = 9;
+
+    // Deprecated -------------------------------
     map<string, string> upsert_values = 1;
     repeated string delete_keys = 2;
     map<string, string> schema_metadata = 3;

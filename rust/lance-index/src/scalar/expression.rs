@@ -18,8 +18,8 @@ use datafusion_expr::{
 };
 
 use super::{
-    AnyQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
-    TextQuery, TokenQuery,
+    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
+    SearchResult, TextQuery, TokenQuery,
 };
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Error, Result};
@@ -238,6 +238,15 @@ impl SargableQueryParser {
 }
 
 impl ScalarQueryParser for SargableQueryParser {
+    fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
+        match func {
+            Expr::Column(_) => Some(data_type.clone()),
+            // Also accept get_field expressions for nested field access
+            Expr::ScalarFunction(udf) if udf.name() == "get_field" => Some(data_type.clone()),
+            _ => None,
+        }
+    }
+
     fn visit_between(
         &self,
         column: &str,
@@ -316,6 +325,95 @@ impl ScalarQueryParser for SargableQueryParser {
         _: &ScalarUDF,
         _: &[Expr],
     ) -> Option<IndexedExpression> {
+        None
+    }
+}
+
+/// A parser for bloom filter indices that only support equals, is_null, and is_in operations
+#[derive(Debug)]
+pub struct BloomFilterQueryParser {
+    index_name: String,
+    needs_recheck: bool,
+}
+
+impl BloomFilterQueryParser {
+    pub fn new(index_name: String, needs_recheck: bool) -> Self {
+        Self {
+            index_name,
+            needs_recheck,
+        }
+    }
+}
+
+impl ScalarQueryParser for BloomFilterQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        // Bloom filters don't support range queries
+        None
+    }
+
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        let query = BloomFilterQuery::IsIn(in_list.to_vec());
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(BloomFilterQuery::Equals(ScalarValue::Boolean(Some(value)))),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(BloomFilterQuery::IsNull()),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        let query = match op {
+            // Bloom filters only support equality comparisons
+            Operator::Eq => BloomFilterQuery::Equals(value.clone()),
+            // This will be negated by the caller
+            Operator::NotEq => BloomFilterQuery::Equals(value.clone()),
+            // Bloom filters don't support range operations
+            _ => return None,
+        };
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_scalar_function(
+        &self,
+        _: &str,
+        _: &DataType,
+        _: &ScalarUDF,
+        _: &[Expr],
+    ) -> Option<IndexedExpression> {
+        // Bloom filters don't support scalar functions
         None
     }
 }
@@ -1007,21 +1105,73 @@ fn maybe_column(expr: &Expr) -> Option<&str> {
     }
 }
 
+// Extract the full nested column path from a get_field expression chain
+// For example: get_field(get_field(metadata, "status"), "code") -> "metadata.status.code"
+fn extract_nested_column_path(expr: &Expr) -> Option<String> {
+    let mut current_expr = expr;
+    let mut parts = Vec::new();
+
+    // Walk up the get_field chain
+    loop {
+        match current_expr {
+            Expr::ScalarFunction(udf) if udf.name() == "get_field" => {
+                if udf.args.len() != 2 {
+                    return None;
+                }
+                // Extract the field name from the second argument
+                // The Literal now has two fields: ScalarValue and Option<FieldMetadata>
+                if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = &udf.args[1] {
+                    parts.push(field_name.clone());
+                } else {
+                    return None;
+                }
+                // Move up to the parent expression
+                current_expr = &udf.args[0];
+            }
+            Expr::Column(col) => {
+                // We've reached the base column
+                parts.push(col.name.clone());
+                break;
+            }
+            _ => {
+                return None;
+            }
+        }
+    }
+
+    // Reverse to get the correct order (parent.child.grandchild)
+    parts.reverse();
+
+    // Format the path correctly
+    let field_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+    Some(lance_core::datatypes::format_field_path(&field_refs))
+}
+
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
 // is some kind of projection into a column (e.g. json_extract(json, '$.name')).
-fn maybe_indexed_column<'a, 'b>(
-    expr: &'a Expr,
+// Third way is nested field access (e.g. get_field(metadata, "status.code"))
+fn maybe_indexed_column<'b>(
+    expr: &Expr,
     index_info: &'b dyn IndexInformationProvider,
-) -> Option<(&'a str, DataType, &'b dyn ScalarQueryParser)> {
+) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
+    // First try to extract the full nested column path for get_field expressions
+    if let Some(nested_path) = extract_nested_column_path(expr) {
+        if let Some((data_type, parser)) = index_info.get_index(&nested_path) {
+            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
+                return Some((nested_path, data_type, parser));
+            }
+        }
+    }
+
     match expr {
         Expr::Column(col) => {
             let col = col.name.as_str();
             let (data_type, parser) = index_info.get_index(col)?;
             if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col, data_type, parser))
+                Some((col.to_string(), data_type, parser))
             } else {
                 None
             }
@@ -1030,10 +1180,11 @@ fn maybe_indexed_column<'a, 'b>(
             if udf.args.is_empty() {
                 return None;
             }
+            // For non-get_field functions, fall back to old behavior
             let col = maybe_column(&udf.args[0])?;
             let (data_type, parser) = index_info.get_index(col)?;
             if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col, data_type, parser))
+                Some((col.to_string(), data_type, parser))
             } else {
                 None
             }
@@ -1115,7 +1266,7 @@ fn visit_between(
     let high = maybe_scalar(&between.high, &col_type)?;
 
     let indexed_expr =
-        query_parser.visit_between(column, &Bound::Included(low), &Bound::Included(high))?;
+        query_parser.visit_between(&column, &Bound::Included(low), &Bound::Included(high))?;
 
     if between.negated {
         indexed_expr.maybe_not()
@@ -1131,7 +1282,7 @@ fn visit_in_list(
     let (column, col_type, query_parser) = maybe_indexed_column(&in_list.expr, index_info)?;
     let values = maybe_scalar_list(&in_list.list, &col_type)?;
 
-    let indexed_expr = query_parser.visit_in_list(column, &values)?;
+    let indexed_expr = query_parser.visit_in_list(&column, &values)?;
 
     if in_list.negated {
         indexed_expr.maybe_not()
@@ -1149,7 +1300,7 @@ fn visit_is_bool(
     if col_type != DataType::Boolean {
         None
     } else {
-        query_parser.visit_is_bool(column, value)
+        query_parser.visit_is_bool(&column, value)
     }
 }
 
@@ -1162,7 +1313,7 @@ fn visit_column(
     if col_type != DataType::Boolean {
         None
     } else {
-        query_parser.visit_is_bool(column, true)
+        query_parser.visit_is_bool(&column, true)
     }
 }
 
@@ -1172,7 +1323,7 @@ fn visit_is_null(
     negated: bool,
 ) -> Option<IndexedExpression> {
     let (column, _, query_parser) = maybe_indexed_column(expr, index_info)?;
-    let indexed_expr = query_parser.visit_is_null(column)?;
+    let indexed_expr = query_parser.visit_is_null(&column)?;
     if negated {
         indexed_expr.maybe_not()
     } else {
@@ -1196,7 +1347,7 @@ fn visit_comparison(
     let left_col = maybe_indexed_column(&expr.left, index_info);
     if let Some((column, col_type, query_parser)) = left_col {
         let scalar = maybe_scalar(&expr.right, &col_type)?;
-        query_parser.visit_comparison(column, &scalar, &expr.op)
+        query_parser.visit_comparison(&column, &scalar, &expr.op)
     } else {
         // Datafusion's query simplifier will canonicalize expressions and so we shouldn't reach this case.  If, for some reason, we
         // do reach this case we can handle it in the future by inverting expr.op and swapping the left and right sides
@@ -1259,7 +1410,7 @@ fn maybe_range(
         _ => return None,
     };
 
-    parser.visit_between(left_col, &low, &high)
+    parser.visit_between(&left_col, &low, &high)
 }
 
 fn visit_and(
@@ -1333,7 +1484,7 @@ fn visit_scalar_fn(
         return None;
     }
     let (col, data_type, query_parser) = maybe_indexed_column(&scalar_fn.args[0], index_info)?;
-    query_parser.visit_scalar_function(col, &data_type, &scalar_fn.func, &scalar_fn.args)
+    query_parser.visit_scalar_function(&col, &data_type, &scalar_fn.func, &scalar_fn.args)
 }
 
 fn visit_node(

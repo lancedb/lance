@@ -511,7 +511,7 @@ impl IvfShuffler {
                 let file = scheduler
                     .open_file(&path, &CachedFileSize::unknown())
                     .await?;
-                let cache = LanceCache::with_capacity(128 * 1024 * 1024);
+                let cache = lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024);
 
                 let reader = Lancev2FileReader::try_open(
                     file,

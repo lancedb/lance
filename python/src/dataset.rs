@@ -32,6 +32,7 @@ use pyo3::{
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
+use lance::dataset::index::LanceIndexStoreExt;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, MaterializationStyle,
@@ -63,6 +64,7 @@ use lance_file::v2::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
 };
@@ -211,6 +213,11 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn use_index(mut slf: PyRefMut<'_, Self>, use_index: bool) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.use_index(use_index);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -222,7 +229,7 @@ impl MergeInsertBuilder {
 
         let (new_dataset, stats) = RT
             .spawn(Some(py), job.execute_reader(new_data))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         let dataset = self.dataset.bind(py);
 
@@ -247,7 +254,7 @@ impl MergeInsertBuilder {
             transaction, stats, ..
         } = RT
             .spawn(Some(py), job.execute_uncommitted(new_data))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         let stats = Self::build_stats(&stats, py)?;
 
@@ -384,7 +391,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None))]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None, metadata_cache_size_bytes=None, index_cache_size_bytes=None, read_params=None, session=None))]
     fn new(
         py: Python,
         uri: String,
@@ -398,6 +405,7 @@ impl Dataset {
         metadata_cache_size_bytes: Option<usize>,
         index_cache_size_bytes: Option<usize>,
         read_params: Option<&Bound<PyDict>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let mut params = ReadParams::default();
         if let Some(metadata_cache_size_bytes) = metadata_cache_size_bytes {
@@ -480,6 +488,10 @@ impl Dataset {
             builder = builder.with_serialized_manifest(manifest).infer_error()?;
         }
 
+        if let Some(session) = session {
+            builder = builder.with_session(session.inner.clone());
+        }
+
         let dataset = RT.block_on(Some(py), builder.load())?;
 
         match dataset {
@@ -487,7 +499,6 @@ impl Dataset {
                 uri,
                 ds: Arc::new(ds),
             }),
-            // TODO: return an appropriate error type, such as IOError or NotFound.
             Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }
@@ -514,8 +525,15 @@ impl Dataset {
 
     fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.replace_schema_metadata(metadata))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let metadata_options: HashMap<String, Option<String>> =
+            metadata.into_iter().map(|(k, v)| (k, Some(v))).collect();
+        RT.block_on(None, async {
+            new_self
+                .update_schema_metadata(metadata_options)
+                .replace()
+                .await
+        })?
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -526,14 +544,17 @@ impl Dataset {
         metadata: HashMap<String, String>,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let field = new_self
-            .schema()
-            .field(field_name)
-            .ok_or_else(|| PyKeyError::new_err(format!("Field \"{}\" not found", field_name)))?;
-        let new_field_meta: HashMap<u32, HashMap<String, String>> =
-            HashMap::from_iter(vec![(field.id as u32, metadata)]);
-        RT.block_on(None, new_self.replace_field_metadata(new_field_meta))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let future = async move {
+            new_self
+                .update_field_metadata()
+                .replace(field_name, metadata)?
+                .await?;
+            Ok(new_self)
+        };
+
+        let new_self = RT
+            .block_on(None, future)?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -1018,7 +1039,7 @@ impl Dataset {
         .infer_error()?;
         let batch = RT
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
     }
@@ -1049,7 +1070,7 @@ impl Dataset {
                 Some(self_.py()),
                 self_.ds.take_rows(&row_indices, projection),
             )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
     }
@@ -1178,7 +1199,7 @@ impl Dataset {
             .spawn(None, async move {
                 new_self.alter_columns(&alterations).await.map(|_| new_self)
             })?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -1197,7 +1218,7 @@ impl Dataset {
                     .await
                     .map(|_| new_self)
             })?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -1264,7 +1285,7 @@ impl Dataset {
 
         let new_self = RT
             .block_on(None, operation.execute())?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         self.ds = new_self.new_dataset;
         let update_dict = PyDict::new(updates.py());
@@ -1328,7 +1349,7 @@ impl Dataset {
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         RT.block_on(None, new_self.restore())?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -1351,7 +1372,7 @@ impl Dataset {
                     error_if_tagged_old_versions,
                 ),
             )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(CleanupStats {
             bytes_removed: cleanup_stats.bytes_removed,
             old_versions: cleanup_stats.old_versions,
@@ -1453,9 +1474,6 @@ impl Dataset {
                         .map_err(|err| PyValueError::new_err(err.to_string()))?,
                 );
             }
-            if let Some(retrain) = kwargs.get_item("retrain")? {
-                options.retrain = retrain.extract()?;
-            }
         }
         RT.block_on(
             None,
@@ -1487,6 +1505,7 @@ impl Dataset {
             "BITMAP" => IndexType::Bitmap,
             "NGRAM" => IndexType::NGram,
             "ZONEMAP" => IndexType::ZoneMap,
+            "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => {
@@ -1520,6 +1539,10 @@ impl Dataset {
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 index_type: "label_list".to_string(),
+                params: None,
+            }),
+            "BLOOMFILTER" => Box::new(ScalarIndexParams {
+                index_type: "bloomfilter".to_string(),
                 params: None,
             }),
             "SCALAR" => {
@@ -1607,9 +1630,49 @@ impl Dataset {
         if let Some(name) = name {
             builder = builder.name(name);
         }
+
+        // Extract fragment_ids and fragment_uuid from kwargs
+        let fragment_ids: Option<Vec<u32>> = if let Some(kwargs) = kwargs {
+            kwargs
+                .get_item("fragment_ids")?
+                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .transpose()?
+        } else {
+            None
+        };
+
+        let fragment_uuid: Option<String> = if let Some(kwargs) = kwargs {
+            kwargs
+                .get_item("fragment_uuid")?
+                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .transpose()?
+        } else {
+            None
+        };
+
+        // Add fragment_ids and fragment_uuid support
+        let has_fragment_ids = fragment_ids.is_some();
+        if let Some(fragment_ids) = fragment_ids {
+            builder = builder.fragments(fragment_ids);
+        }
+        if let Some(fragment_uuid) = fragment_uuid {
+            builder = builder.fragment_uuid(fragment_uuid);
+        }
+
         use std::future::IntoFuture;
-        RT.block_on(None, builder.into_future())?.infer_error()?;
-        self.ds = Arc::new(new_self);
+
+        // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
+        if has_fragment_ids {
+            // For fragment-level indexing, use execute_uncommitted
+            let _index_metadata = RT
+                .block_on(None, builder.execute_uncommitted())?
+                .infer_error()?;
+            // Note: We don't update self.ds here as the index is not committed
+        } else {
+            // For regular indexing, use the standard execute path
+            RT.block_on(None, builder.into_future())?.infer_error()?;
+            self.ds = Arc::new(new_self);
+        }
 
         Ok(())
     }
@@ -1626,6 +1689,45 @@ impl Dataset {
     fn prewarm_index(&self, name: &str) -> PyResult<()> {
         RT.block_on(None, self.ds.prewarm_index(name))?
             .infer_error()
+    }
+
+    #[pyo3(signature = (index_uuid, index_type, batch_readhead))]
+    fn merge_index_metadata(
+        &self,
+        index_uuid: &str,
+        index_type: &str,
+        batch_readhead: Option<usize>,
+    ) -> PyResult<()> {
+        RT.block_on(None, async {
+            let store = LanceIndexStore::from_dataset_for_new(self.ds.as_ref(), index_uuid)?;
+            let index_dir = self.ds.indices_dir().child(index_uuid);
+            match index_type.to_uppercase().as_str() {
+                "INVERTED" => {
+                    // Call merge_index_files function for inverted index
+                    lance_index::scalar::inverted::builder::merge_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
+                        Arc::new(store),
+                    )
+                    .await
+                }
+                "BTREE" => {
+                    // Call merge_index_files function for btree index
+                    lance_index::scalar::btree::merge_index_files(
+                        self.ds.object_store(),
+                        &index_dir,
+                        Arc::new(store),
+                        batch_readhead,
+                    )
+                    .await
+                }
+                _ => Err(Error::InvalidInput {
+                    source: format!("Index type {} is not supported.", index_type).into(),
+                    location: location!(),
+                }),
+            }
+        })?
+        .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
     fn count_fragments(&self) -> usize {
@@ -1785,7 +1887,7 @@ impl Dataset {
                 commit_lock.map(|cl| cl.py()),
                 builder.execute(transaction.0),
             )?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         let uri = ds.uri().to_string();
         Ok(Self {
@@ -1841,7 +1943,7 @@ impl Dataset {
 
         let res = RT
             .block_on(None, builder.execute_batch(transactions))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         let uri = res.dataset.uri().to_string();
         let ds = Self {
             ds: Arc::new(res.dataset),
@@ -1859,7 +1961,7 @@ impl Dataset {
     fn migrate_manifest_paths_v2(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         RT.block_on(None, new_self.migrate_manifest_paths_v2())?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
@@ -1961,47 +2063,163 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
-    #[pyo3(signature = (upsert_values))]
-    fn update_config(&mut self, upsert_values: &Bound<'_, PyDict>) -> PyResult<()> {
-        let upsert: HashMap<String, String> = upsert_values
-            .iter()
-            .map(|(k, v)| Ok((k.extract::<String>()?, v.extract::<String>()?)))
-            .collect::<PyResult<_>>()?;
-
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.update_config(upsert))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        self.ds = Arc::new(new_self);
-        Ok(())
-    }
-
     #[pyo3(signature = (keys))]
     fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
-        let key_refs: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.delete_config_keys(&key_refs))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let delete_updates: HashMap<String, Option<String>> =
+            keys.into_iter().map(|k| (k, None)).collect();
+        RT.block_on(None, async { new_self.update_config(delete_updates).await })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
 
     #[pyo3(signature = ())]
-    fn config(&mut self) -> PyResult<PyObject> {
+    fn config(&self) -> HashMap<String, String> {
+        self.ds.config().clone()
+    }
+
+    // Unified metadata APIs
+
+    #[pyo3(signature = ())]
+    fn get_table_metadata(&mut self) -> PyResult<PyObject> {
         let new_self = self.ds.as_ref().clone();
 
-        let config = new_self
-            .config()
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let table_metadata = new_self.metadata().clone();
 
         self.ds = Arc::new(new_self);
 
         Python::with_gil(|py| {
             let dict = PyDict::new(py);
-            for (k, v) in config {
+            for (k, v) in table_metadata {
                 dict.set_item(k, v)?;
             }
             Ok(dict.into())
         })
+    }
+
+    #[pyo3(signature = ())]
+    fn metadata(&self) -> HashMap<String, String> {
+        self.ds.metadata().clone()
+    }
+
+    #[pyo3(signature = (values, *, replace = false))]
+    fn update_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> PyResult<HashMap<String, String>> {
+        let mut new_self = self.ds.as_ref().clone();
+        let result = if replace {
+            RT.block_on(None, async {
+                new_self.update_metadata(values).replace().await
+            })?
+        } else {
+            RT.block_on(None, async { new_self.update_metadata(values).await })?
+        }
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(result)
+    }
+
+    #[pyo3(signature = (values, *, replace = false))]
+    fn update_config(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> PyResult<HashMap<String, String>> {
+        let mut new_self = self.ds.as_ref().clone();
+        let new_config = if replace {
+            RT.block_on(None, async {
+                new_self.update_config(values).replace().await
+            })?
+        } else {
+            RT.block_on(None, async { new_self.update_config(values).await })?
+        }
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(new_config)
+    }
+
+    #[pyo3(signature = (values, *, replace = false))]
+    fn update_schema_metadata(
+        &mut self,
+        values: HashMap<String, Option<String>>,
+        replace: bool,
+    ) -> PyResult<HashMap<String, String>> {
+        let mut new_self = self.ds.as_ref().clone();
+        let result = if replace {
+            RT.block_on(None, async {
+                new_self.update_schema_metadata(values).replace().await
+            })?
+        } else {
+            RT.block_on(None, async {
+                new_self.update_schema_metadata(values).await
+            })?
+        }
+        .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(result)
+    }
+
+    fn schema_metadata(&self) -> PyResult<HashMap<String, String>> {
+        Ok(self.ds.schema().metadata.clone())
+    }
+
+    #[pyo3(signature = (field_updates, *, replace = false))]
+    fn update_field_metadata(
+        &mut self,
+        field_updates: HashMap<u32, HashMap<String, Option<String>>>,
+        replace: bool,
+    ) -> PyResult<()> {
+        let ds_clone = self.ds.as_ref().clone();
+        let new_self = RT
+            .block_on(None, async move {
+                let mut new_self = ds_clone;
+                let mut builder = new_self.update_field_metadata();
+                for (field_id, metadata_updates) in field_updates {
+                    let converted_updates: Vec<(String, Option<String>)> =
+                        metadata_updates.into_iter().collect();
+                    if replace {
+                        builder = builder.replace(field_id as i32, converted_updates)?;
+                    } else {
+                        builder = builder.update(field_id as i32, converted_updates)?;
+                    }
+                }
+                builder.await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    #[pyo3(signature = (field_updates, *, replace = false))]
+    fn update_field_metadata_by_path(
+        &mut self,
+        field_updates: HashMap<String, HashMap<String, Option<String>>>,
+        replace: bool,
+    ) -> PyResult<()> {
+        let ds_clone = self.ds.as_ref().clone();
+        let new_self = RT
+            .block_on(None, async move {
+                let mut new_self = ds_clone;
+                let mut builder = new_self.update_field_metadata();
+                for (field_path, metadata_updates) in field_updates {
+                    let converted_updates: Vec<(String, Option<String>)> =
+                        metadata_updates.into_iter().collect();
+                    if replace {
+                        builder = builder.replace(field_path.as_str(), converted_updates)?;
+                    } else {
+                        builder = builder.update(field_path.as_str(), converted_updates)?;
+                    }
+                }
+                builder.await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     #[pyo3(signature = (index_name))]
@@ -2145,7 +2363,7 @@ impl SqlQuery {
         let builder = self.builder.clone();
         let fut = Box::pin(async move {
             let query = builder.build().await?;
-            let stream = query.into_stream().await;
+            let stream = query.into_stream().await?;
             Ok::<Pin<Box<dyn datafusion::execution::RecordBatchStream + Send>>, lance::Error>(
                 stream,
             )
@@ -2470,7 +2688,11 @@ fn prepare_vector_index_params(
 
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
-            ivf_params.num_partitions = n.extract()?
+            ivf_params.num_partitions = Some(n.extract()?)
+        };
+
+        if let Some(n) = kwargs.get_item("target_partition_size")? {
+            ivf_params.target_partition_size = Some(n.extract()?)
         };
 
         if let Some(n) = kwargs.get_item("shuffle_partition_concurrency")? {
@@ -2577,9 +2799,8 @@ fn prepare_vector_index_params(
     }
 
     let mut params = match index_type {
-        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::ivf_flat(
-            ivf_params.num_partitions,
-            m_type,
+        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::with_ivf_flat_params(
+            m_type, ivf_params,
         ))),
 
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(

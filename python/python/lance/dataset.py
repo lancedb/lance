@@ -67,7 +67,7 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import td_to_micros
+from .util import _target_partition_size_to_num_partitions, td_to_micros
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -208,6 +208,27 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).retry_timeout(timeout)
 
+    def use_index(self, use_index: bool) -> "MergeInsertBuilder":
+        """
+        Controls whether to use indices for the merge operation.
+
+        When set to False, forces a full table scan even if an index exists on
+        the join key. This can be useful for benchmarking or when the optimizer
+        chooses a suboptimal path.
+
+        Parameters
+        ----------
+        use_index : bool
+            If True (default), uses an index if available. If False, forces a
+            full table scan.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).use_index(use_index)
+
     def explain_plan(
         self, schema: Optional[pa.Schema] = None, verbose: bool = False
     ) -> str:
@@ -254,7 +275,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
               ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...]
                 CoalesceBatchesExec: target_batch_size=...
                   HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                    LanceRead: uri=test_dataset/data, projection=[id], ...
+                    CooperativeExec
+                      LanceRead: uri=test_dataset/data, projection=[id], ...
                     RepartitionExec: ...
                       StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
@@ -335,10 +357,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MergeInsert: on=[id], ..., metrics=[..., bytes_written=..., ...], cumulative_cpu=...
               CoalescePartitionsExec, metrics=[output_rows=..., elapsed_compute=...], cumulative_cpu=...
                 ProjectionExec: expr=[_rowid@1 as _rowid, ...], metrics=[...], cumulative_cpu=...
-                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], ...
+                  ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...], cumulative_cpu=...
                     CoalesceBatchesExec: ..., metrics=[...], cumulative_cpu=...
                       HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                        LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
+                        CooperativeExec, metrics=[], cumulative_cpu=...
+                          LanceRead: ..., metrics=[..., bytes_read=..., ...], cumulative_cpu=...
                         RepartitionExec: ...
                           StreamingTableExec: ..., metrics=[], ...
 
@@ -381,6 +404,7 @@ class LanceDataset(pa.dataset.Dataset):
         metadata_cache_size_bytes: Optional[int] = None,
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
+        session: Optional[Session] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -410,6 +434,7 @@ class LanceDataset(pa.dataset.Dataset):
             metadata_cache_size_bytes=metadata_cache_size_bytes,
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
+            session=session,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -978,16 +1003,30 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Replace the schema metadata of the dataset
 
+        .. deprecated:: 0.32.1
+            Use :func:`update_schema_metadata` with ``replace=True`` instead.
+            This method will be removed in a future version.
+
         Parameters
         ----------
         new_metadata: dict
             The new metadata to set
         """
-        self._ds.replace_schema_metadata(new_metadata)
+        warnings.warn(
+            "replace_schema_metadata is deprecated. "
+            "Use update_schema_metadata(metadata, replace=True) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.update_schema_metadata(new_metadata, replace=True)
 
     def replace_field_metadata(self, field_name: str, new_metadata: Dict[str, str]):
         """
         Replace the metadata of a field in the schema
+
+        .. deprecated:: 0.32.1
+            Use :func:`update_field_metadata` with ``replace=True`` instead.
+            This method will be removed in a future version.
 
         Parameters
         ----------
@@ -996,7 +1035,200 @@ class LanceDataset(pa.dataset.Dataset):
         new_metadata: dict
             The new metadata to set
         """
-        self._ds.replace_field_metadata(field_name, new_metadata)
+        warnings.warn(
+            "replace_field_metadata is deprecated. "
+            "Use update_field_metadata with field paths and replace=True instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.update_field_metadata({field_name: new_metadata}, replace=True)
+
+    # Unified metadata APIs
+
+    @property
+    def metadata(self) -> Dict[str, str]:
+        """
+        Get the table metadata of the dataset.
+
+        Returns
+        -------
+        Dict[str, str]
+            The table metadata as a dictionary of key-value pairs.
+        """
+        return self._ds.metadata()
+
+    @property
+    def schema_metadata(self) -> Dict[str, str]:
+        """
+        Get the schema metadata of the dataset.
+
+        Returns
+        -------
+        Dict[str, str]
+            The schema metadata as a dictionary of key-value pairs.
+        """
+        return self._ds.schema_metadata()
+
+    def update_metadata(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the table metadata of the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Metadata updates where keys are metadata keys and values are:
+            - str: Set the metadata key to this value
+            - None: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all table metadata with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_metadata")
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_metadata(
+        ...     {"author": "John", "version": "1.2"}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_metadata({"old_key": None}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Full replacement (replaces all metadata)
+        >>> dataset.update_metadata(
+        ...     {"author": "John"}, replace=True) # doctest: +ELLIPSIS
+        {...}
+        """
+        return self._ds.update_metadata(values, replace=replace)
+
+    def update_config(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the configuration of the dataset using unified API.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Configuration updates where keys are config keys and values are:
+            - str: Set the config key to this value
+            - None: Remove the config key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all configuration with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_config")
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_config(
+        ...     {"batch_size": "1000", "compression": "zstd"}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_config({"batch_size": None}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Full replacement (replaces all config)
+        >>> dataset.update_config(
+        ...     {"batch_size": "1000"}, replace=True) # doctest: +ELLIPSIS
+        {...}
+        """
+        return self._ds.update_config(values, replace=replace)
+
+    def update_schema_metadata(
+        self, values: Dict[str, Optional[str]], *, replace: bool = False
+    ) -> Dict[str, str]:
+        """
+        Update the schema metadata of the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        values : Dict[str, Optional[str]]
+            Schema metadata updates where keys are metadata keys and values are:
+            - str: Set the metadata key to this value
+            - None: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all schema metadata with the provided values.
+            If False, incrementally update only the specified keys.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3])], names=['x'])
+        >>> dataset = lance.write_dataset(data, "memory://test_schema")
+        >>> # Incremental update (add/update specific keys)
+        >>> dataset.update_schema_metadata(
+        ...     {"encoding": "utf-8", "created_by": "lance"}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Remove a key (incremental mode only)
+        >>> dataset.update_schema_metadata({"encoding": None}) # doctest: +ELLIPSIS
+        {...}
+        >>> # Full replacement (replaces all schema metadata)
+        >>> dataset.update_schema_metadata(
+        ...     {"encoding": "utf-8"}, replace=True) # doctest: +ELLIPSIS
+        {...}
+        """
+        return self._ds.update_schema_metadata(values, replace=replace)
+
+    def update_field_metadata(
+        self,
+        field_updates: Dict[str, Dict[str, Optional[str]]],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """
+        Update metadata for multiple fields in the dataset.
+
+        This method supports both incremental updates (default) and full replacement.
+
+        Parameters
+        ----------
+        field_updates : Dict[str, Dict[str, Optional[str]]]
+            Field metadata updates where keys are field paths and values are
+            metadata dictionaries.
+            For each field's metadata dictionary:
+            - str values: Set the metadata key to this value
+            - None values: Remove the metadata key (ignored in replace mode)
+        replace : bool, default False
+            If True, completely replace all metadata for the specified fields.
+            If False, incrementally update only the specified keys for each field.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table([pa.array([1, 2, 3]), pa.array(['a', 'b', 'c'])],
+        ...                names=['user_id', 'user_name'])
+        >>> dataset = lance.write_dataset(data, "memory://test_field")
+        >>> # Incremental update for multiple fields
+        >>> dataset.update_field_metadata({
+        ...     "user_id": {"description": "User ID", "nullable": "false"},
+        ...     "user_name": {"description": "User name", "max_length": "100"}
+        ... })
+        >>>
+        >>> # Remove keys (incremental mode only)
+        >>> dataset.update_field_metadata({"user_id": {"old_key": None}})
+        >>>
+        >>> # Full replacement for specific fields
+        >>> dataset.update_field_metadata({
+        ...     "user_id": {"description": "User ID"}
+        ... }, replace=True)
+        """
+        # Use the new path-based Rust function directly
+        self._ds.update_field_metadata_by_path(field_updates, replace=replace)
 
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
@@ -1883,12 +2115,15 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
+            Literal["BLOOMFILTER"],
             IndexConfig,
         ],
         name: Optional[str] = None,
         *,
         replace: bool = True,
         train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        fragment_uuid: Optional[str] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1949,6 +2184,9 @@ class LanceDataset(pa.dataset.Dataset):
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
+        * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
+             but can only handle filters with equals and not equals and may require
+             more I/O than a btree or bitmap index```
 
         Note that the ``LANCE_BYPASS_SPILLING`` environment variable can be used to
         bypass spilling to disk. Setting this to true can avoid memory exhaustion
@@ -1963,7 +2201,8 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"`` or ``"INVERTED"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"FTS"``,
+            ``"INVERTED"`` or ``"BLOOMFILTER"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1973,6 +2212,17 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data to determine optimal
             structure. If False, an empty index will be created that can be
             populated later.
+        fragment_ids : List[int], optional
+            If provided, the index will be created only on the specified fragments.
+            This enables distributed/fragment-level indexing. When provided, the
+            method returns an IndexMetadata object but does not commit the index
+            to the dataset. The index can be committed later using the commit API.
+            This parameter is passed via kwargs internally.
+        fragment_uuid : str, optional
+            A UUID to use for fragment-level distributed indexing
+            multiple fragment-level indices need to share UUID for later merging.
+            If not provided, a new UUID will be generated. This parameter is passed via
+            kwargs internally.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2062,11 +2312,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "ZONEMAP",
                 "LABEL_LIST",
                 "INVERTED",
+                "BLOOMFILTER",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        'or "INVERTED" are supported for '
+                        'or "INVERTED" or "BLOOMFILTER" are supported for '
                         f"scalar columns.  Received {index_type}",
                     )
                 )
@@ -2121,6 +2372,12 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
+        # Add fragment_ids and fragment_uuid to kwargs if provided
+        if fragment_ids is not None:
+            kwargs["fragment_ids"] = fragment_ids
+        if fragment_uuid is not None:
+            kwargs["fragment_uuid"] = fragment_uuid
+
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
     def create_index(
@@ -2149,6 +2406,8 @@ class LanceDataset(pa.dataset.Dataset):
         filter_nan: bool = True,
         one_pass_ivfpq: bool = False,
         train: bool = True,
+        *,
+        target_partition_size: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -2172,6 +2431,7 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
+            Deprecated. Use target_partition_size instead.
         ivf_centroids : optional
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
@@ -2219,6 +2479,10 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        target_partition_size: int, optional
+            The target partition size. If set, the number of partitions will be computed
+            based on the target partition size.
+            Otherwise, the target partition size will be set by index type.
         kwargs :
             Parameters passed to the index building process.
 
@@ -2391,7 +2655,11 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
             LOGGER.info("Doing one-pass ivfpq accelerated computations")
-
+            if num_partitions is None:
+                num_rows = self.count_rows()
+                num_partitions = _target_partition_size_to_num_partitions(
+                    num_rows, target_partition_size
+                )
             timers["ivf+pq_train:start"] = time.time()
             (
                 ivf_centroids,
@@ -2447,18 +2715,17 @@ class LanceDataset(pa.dataset.Dataset):
                     ivf_centroids = np.load(f)
                 num_partitions = ivf_centroids.shape[0]
 
-            if num_partitions is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
                 num_partitions = int(num_partitions)
-            elif not isinstance(num_partitions, int):
+            elif num_partitions is not None and not isinstance(num_partitions, int):
                 raise TypeError(
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
-            kwargs["num_partitions"] = num_partitions
+            if num_partitions is not None:
+                kwargs["num_partitions"] = num_partitions
+            if target_partition_size is not None:
+                kwargs["target_partition_size"] = target_partition_size
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -2499,6 +2766,11 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
                 timers["ivf_train:start"] = time.time()
+                if num_partitions is None:
+                    num_rows = self.count_rows()
+                    num_partitions = _target_partition_size_to_num_partitions(
+                        num_rows, target_partition_size
+                    )
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
@@ -2696,6 +2968,39 @@ class LanceDataset(pa.dataset.Dataset):
             The name of the index to prewarm.
         """
         return self._ds.prewarm_index(name)
+
+    def merge_index_metadata(
+        self,
+        index_uuid: str,
+        index_type: str,
+        batch_readhead: Optional[int] = None,
+    ):
+        """
+        Merge an index which is not commit at present.
+
+        Parameters
+        ----------
+        index_uuid: str
+            The uuid of the index which want to merge.
+        index_type: str
+            The type of the index.
+            Only "BTREE" and "INVERTED" are supported now.
+        batch_readhead: int, optional
+            The number of prefetch batches of sub-page files for merging.
+            Default 1.
+        """
+        index_type = index_type.upper()
+        if index_type not in [
+            "BTREE",
+            "INVERTED",
+        ]:
+            raise NotImplementedError(
+                (
+                    'Only "BTREE" or "INVERTED" are supported for '
+                    f"merge index metadata.  Received {index_type}",
+                )
+            )
+        return self._ds.merge_index_metadata(index_uuid, index_type, batch_readhead)
 
     def session(self) -> Session:
         """
@@ -2989,20 +3294,6 @@ class LanceDataset(pa.dataset.Dataset):
         And it should also run until completion before resuming other operations.
         """
         self._ds.migrate_manifest_paths_v2()
-
-    def update_config(self, upsert_values: Dict[str, str]) -> None:
-        """
-        Update the dataset configuration.
-
-        This method inserts or updates configuration key-value pairs for the dataset.
-
-        Parameters
-        ----------
-        upsert_values : dict of str to str
-            The configuration items to insert or update.
-            Both keys and values should be strings.
-        """
-        self._ds.update_config(upsert_values)
 
     def delete_config_keys(self, keys: list[str]) -> None:
         """Delete specified configuration keys from the dataset.
@@ -3564,12 +3855,17 @@ class LanceOperation:
             If any fields are modified in updated_fragments, then they must be
             listed here so those fragments can be removed from indices covering
             those fields.
+        fields_for_preserving_frag_bitmap: list[int]
+            The fields that used to judge whether to preserve the new frag's id into
+            the frag bitmap of the specified indices.
         """
 
         removed_fragment_ids: List[int]
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
         fields_modified: List[int]
+        fields_for_preserving_frag_bitmap: List[int]
+        update_mode: str
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -3763,6 +4059,51 @@ class LanceOperation:
         """
 
         schema: LanceSchema
+
+    @dataclass
+    class UpdateMap:
+        """
+        Represents updates to a metadata map.
+
+        Attributes
+        ----------
+        updates : Dict[str, Optional[str]]
+            Dictionary of key-value pairs to update. None values mean delete the key.
+        replace : bool
+            If True, replace the entire map with the new entries.
+            If False, merge the new entries with the existing map.
+        """
+
+        updates: Dict[str, Optional[str]]
+        replace: bool = False
+
+    @dataclass
+    class UpdateConfig(BaseOperation):
+        """
+        Operation that updates dataset metadata.
+
+        This operation can update various metadata levels:
+        - Dataset configuration
+        - Table metadata
+        - Schema metadata
+        - Field-specific metadata
+
+        Attributes
+        ----------
+        config_updates : Optional[UpdateMap]
+            Updates to the dataset configuration.
+        table_metadata_updates : Optional[UpdateMap]
+            Updates to the table metadata.
+        schema_metadata_updates : Optional[UpdateMap]
+            Updates to the schema metadata.
+        field_metadata_updates : Optional[Dict[int, UpdateMap]]
+            Updates to field metadata, keyed by field ID.
+        """
+
+        config_updates: Optional[LanceOperation.UpdateMap] = None
+        table_metadata_updates: Optional[LanceOperation.UpdateMap] = None
+        schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
+        field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
 
 
 @dataclass
@@ -4449,7 +4790,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False
+        retrain: bool, default False, deprecated
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,

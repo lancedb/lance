@@ -447,7 +447,7 @@ impl Planner {
                 support_varchar_with_length: false,
                 enable_options_value_normalization: false,
                 collect_spans: false,
-                map_varchar_to_utf8view: false,
+                map_string_types_to_utf8view: false,
             },
         );
 
@@ -937,10 +937,22 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
     fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
         match node {
             Expr::Column(Column { name, .. }) => {
+                // Build the field path from the column name and any nested fields
+                // The nested field names from get_field already come as literal strings,
+                // so we just need to concatenate them properly
                 let mut path = name.clone();
                 for part in self.current_path.drain(..) {
                     path.push('.');
-                    path.push_str(&part);
+                    // Check if the part needs quoting (contains dots)
+                    if part.contains('.') || part.contains('`') {
+                        // Quote the field name with backticks and escape any existing backticks
+                        let escaped = part.replace('`', "``");
+                        path.push('`');
+                        path.push_str(&escaped);
+                        path.push('`');
+                    } else {
+                        path.push_str(&part);
+                    }
                 }
                 self.columns.insert(path);
                 self.current_path.clear();

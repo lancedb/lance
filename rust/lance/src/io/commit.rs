@@ -31,7 +31,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
+    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
     WriterVersion, DETACHED_VERSION_MASK,
 };
 use lance_table::io::commit::{
@@ -155,7 +155,7 @@ async fn do_commit_new_dataset(
                 .indices
                 .into_iter()
                 .map(|index_pb| {
-                    let mut index = lance_table::format::Index::try_from(index_pb)?;
+                    let mut index = IndexMetadata::try_from(index_pb)?;
                     index.base_id = Some(new_base_id);
                     Ok(index)
                 })
@@ -268,7 +268,7 @@ pub(crate) async fn commit_new_dataset(
 /// `dataset.delete(false)`, which won't modify data but will cause a migration.
 /// However, you don't want to always have to do this, so we provide this method
 /// to check if a migration is needed.
-pub fn manifest_needs_migration(manifest: &Manifest, indices: &[Index]) -> bool {
+pub fn manifest_needs_migration(manifest: &Manifest, indices: &[IndexMetadata]) -> bool {
     manifest.writer_version.is_none()
         || manifest.fragments.iter().any(|f| {
             f.physical_rows.is_none()
@@ -528,7 +528,10 @@ pub(crate) async fn migrate_fragments(
     new_fragments.try_collect().await
 }
 
-fn must_recalculate_fragment_bitmap(index: &Index, version: Option<&WriterVersion>) -> bool {
+fn must_recalculate_fragment_bitmap(
+    index: &IndexMetadata,
+    version: Option<&WriterVersion>,
+) -> bool {
     // If the fragment bitmap was written by an old version of lance then we need to recalculate
     // it because it could be corrupt due to a bug in versions < 0.8.15
     index.fragment_bitmap.is_none() || version.map(|v| v.older_than(0, 8, 15)).unwrap_or(true)
@@ -537,7 +540,7 @@ fn must_recalculate_fragment_bitmap(index: &Index, version: Option<&WriterVersio
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
-async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
+async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
         Err(BadFragmentBitmapError { bad_indices }) => {
@@ -578,7 +581,7 @@ pub(crate) struct BadFragmentBitmapError {
 /// Detect whether a given index has overlapping fragment bitmaps in its index
 /// segments.
 pub(crate) fn detect_overlapping_fragments(
-    indices: &[Index],
+    indices: &[IndexMetadata],
 ) -> std::result::Result<(), BadFragmentBitmapError> {
     let index_names: HashSet<&str> = indices.iter().map(|i| i.name.as_str()).collect();
     let mut bad_indices = Vec::new(); // (index_name, overlapping_fragments)
@@ -1394,7 +1397,10 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .update_config(HashMap::from([(
+                            key.to_string(),
+                            Some("value".to_string()),
+                        )]))
                         .await
                 })
             })
@@ -1417,7 +1423,11 @@ mod tests {
             .iter()
             .map(|key| {
                 let mut dataset = dataset.clone();
-                tokio::spawn(async move { dataset.delete_config_keys(&[key]).await })
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(HashMap::from([(key.to_string(), None)]))
+                        .await
+                })
             })
             .collect();
         let results = join_all(futures).await;
@@ -1447,7 +1457,10 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .update_config(HashMap::from([(
+                            key.to_string(),
+                            Some("value".to_string()),
+                        )]))
                         .await
                 })
             })

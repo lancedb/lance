@@ -12,16 +12,19 @@
 //! false positives that require rechecking.
 //!
 //!
+use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-use crate::scalar::{CreatedIndex, SargableQuery, UpdateCriteria};
-use crate::{pb, Any};
+use crate::scalar::{
+    BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
+};
+use crate::Any;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
 use futures::TryStreamExt;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::ROW_ADDR;
 use lance_datafusion::chunker::chunk_concat_stream;
 use serde::{Deserialize, Serialize};
@@ -43,10 +46,10 @@ use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use roaring::RoaringBitmap;
 use snafu::location;
-const ZONEMAP_DEFAULT_SIZE: u64 = 8192; // 1 zone every two batches
+const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
-const ZONEMAP_SIZE_META_KEY: &str = "zonemap_size";
+const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
@@ -61,7 +64,7 @@ struct ZoneMapStatistics {
     // zone_start is the start row of the zone in the fragment, also known
     // as local row offset
     zone_start: u64,
-    zone_size: usize,
+    zone_length: usize,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -82,14 +85,27 @@ impl DeepSizeOf for ZoneMapStatistics {
 /// This is an inexact filter, similar to a bloom filter. It can return false positives that require rechecking.
 ///
 /// Note that it cannot return false negatives.
+/// Input:
+/// * Fragment 1: - 10 rows   -> 0  -> 9
+/// * Fragment 2: - 7 rows    -> 10 -> 16
+/// * Fragment 3: - 4 rows    -> 20 -> 23
+/// * Zone size AKA “rows_per_zone” (from user) - 5
+///
+/// Output:
+/// fragment id | min | max | zone_length
+/// 1           | 0   |  4  | 5
+/// 1           | 5   |  9  | 5
+/// 2           | 10  | 14  | 5
+/// 2           | 15  | 16  | 2
+/// 3           | 20  | 23  | 4
 pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
-    // The maximum size of a zone provided by user
-    max_zonemap_size: u64,
+    // The maximum rows per zone provided by user
+    rows_per_zone: u64,
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<FragReuseIndex>>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl std::fmt::Debug for ZoneMapIndex {
@@ -97,7 +113,7 @@ impl std::fmt::Debug for ZoneMapIndex {
         f.debug_struct("ZoneMapIndex")
             .field("zones", &self.zones)
             .field("data_type", &self.data_type)
-            .field("max_zonemap_size", &self.max_zonemap_size)
+            .field("rows_per_zone", &self.rows_per_zone)
             .field("store", &self.store)
             .field("fri", &self.fri)
             .field("index_cache", &self.index_cache)
@@ -315,7 +331,7 @@ impl ZoneMapIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -326,17 +342,17 @@ impl ZoneMapIndex {
             .await?;
         let file_schema = index_file.schema();
 
-        let max_zonemap_size: u64 = file_schema
+        let rows_per_zone: u64 = file_schema
             .metadata
             .get(ZONEMAP_SIZE_META_KEY)
             .and_then(|bs| bs.parse().ok())
-            .unwrap_or(ZONEMAP_DEFAULT_SIZE);
+            .unwrap_or(ROWS_PER_ZONE_DEFAULT);
         Ok(Arc::new(Self::try_from_serialized(
             zone_maps,
             store,
             fri,
             index_cache,
-            max_zonemap_size,
+            rows_per_zone,
         )?))
     }
 
@@ -344,8 +360,8 @@ impl ZoneMapIndex {
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
-        max_zonemap_size: u64,
+        index_cache: &LanceCache,
+        rows_per_zone: u64,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
         let min_col = data.column_by_name("min").ok_or_else(|| {
@@ -380,16 +396,16 @@ impl ZoneMapIndex {
                     location!(),
                 )
             })?;
-        let zone_size = data
-            .column_by_name("zone_size")
+        let zone_length = data
+            .column_by_name("zone_length")
             .ok_or_else(|| {
-                Error::invalid_input("ZoneMapIndex: missing 'zone_size' column", location!())
+                Error::invalid_input("ZoneMapIndex: missing 'zone_length' column", location!())
             })?
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "ZoneMapIndex: 'zone_size' column is not Uint64",
+                    "ZoneMapIndex: 'zone_length' column is not Uint64",
                     location!(),
                 )
             })?;
@@ -428,10 +444,10 @@ impl ZoneMapIndex {
             return Ok(Self {
                 zones: Vec::new(),
                 data_type,
-                max_zonemap_size,
+                rows_per_zone,
                 store,
                 fri,
-                index_cache,
+                index_cache: WeakLanceCache::from(index_cache),
             });
         }
 
@@ -450,17 +466,17 @@ impl ZoneMapIndex {
                 nan_count,
                 fragment_id: fragment_id_col.value(i),
                 zone_start: zone_start_col.value(i),
-                zone_size: zone_size.value(i) as usize,
+                zone_length: zone_length.value(i) as usize,
             });
         }
 
         Ok(Self {
             zones,
             data_type,
-            max_zonemap_size,
+            rows_per_zone,
             store,
             fri,
-            index_cache,
+            index_cache: WeakLanceCache::from(index_cache),
         })
     }
 }
@@ -489,9 +505,8 @@ impl Index for ZoneMapIndex {
 
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "type": "ZoneMap",
             "num_zones": self.zones.len(),
-            "max_zonemap_size": self.max_zonemap_size,
+            "rows_per_zone": self.rows_per_zone,
         }))
     }
 
@@ -530,7 +545,7 @@ impl ScalarIndex for ZoneMapIndex {
                 // Calculate the range of row addresses for this zone
                 // Row addresses are: (fragment_id << 32) + zone_start
                 let zone_start_addr = (zone.fragment_id << 32) + zone.zone_start;
-                let zone_end_addr = zone_start_addr + (zone.zone_size as u64);
+                let zone_end_addr = zone_start_addr + (zone.zone_length as u64);
 
                 // Add all row addresses in this zone to the result
                 row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
@@ -567,7 +582,7 @@ impl ScalarIndex for ZoneMapIndex {
         let value_type = batches_source.schema().field(0).data_type().clone();
 
         let mut builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderParams::new(self.max_zonemap_size),
+            ZoneMapIndexBuilderParams::new(self.rows_per_zone),
             value_type,
         )?;
 
@@ -582,17 +597,18 @@ impl ScalarIndex for ZoneMapIndex {
 
         // Create a new builder with all zones to write them out
         let mut combined_builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderParams::new(self.max_zonemap_size),
+            ZoneMapIndexBuilderParams::new(self.rows_per_zone),
             self.data_type.clone(),
         )?;
         combined_builder.maps = all_zones;
-        combined_builder.options.rows_per_zone = self.max_zonemap_size;
+        combined_builder.options.rows_per_zone = self.rows_per_zone;
 
         // Write the updated index to dest_store
         combined_builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
+                .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })
     }
@@ -601,6 +617,11 @@ impl ScalarIndex for ZoneMapIndex {
         UpdateCriteria::only_new_data(
             TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
         )
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
     }
 }
 
@@ -616,9 +637,9 @@ pub struct ZoneMapIndexBuilderParams {
 
 static DEFAULT_ROWS_PER_ZONE: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
-        .unwrap_or_else(|_| (ZONEMAP_DEFAULT_SIZE).to_string())
+        .unwrap_or_else(|_| (ROWS_PER_ZONE_DEFAULT).to_string())
         .parse()
-        .expect("failed to parse Lance_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
+        .expect("failed to parse LANCE_ZONEMAP_DEFAULT_ROWS_PER_ZONE")
 });
 
 impl Default for ZoneMapIndexBuilderParams {
@@ -630,8 +651,12 @@ impl Default for ZoneMapIndexBuilderParams {
 }
 
 impl ZoneMapIndexBuilderParams {
-    fn new(rows_per_zone: u64) -> Self {
+    pub fn new(rows_per_zone: u64) -> Self {
         Self { rows_per_zone }
+    }
+
+    pub fn rows_per_zone(&self) -> u64 {
+        self.rows_per_zone
     }
 }
 
@@ -709,7 +734,7 @@ impl ZoneMapIndexBuilder {
             .maps
             .iter()
             .filter(|zone| zone.fragment_id == fragment_id)
-            .map(|zone| zone.zone_size as u64)
+            .map(|zone| zone.zone_length as u64)
             .sum::<u64>();
         let new_map = ZoneMapStatistics {
             min: self.min.evaluate()?,
@@ -718,7 +743,7 @@ impl ZoneMapIndexBuilder {
             nan_count: self.nan_count,
             fragment_id,
             zone_start,
-            zone_size: self.cur_zone_offset,
+            zone_length: self.cur_zone_offset,
         };
 
         self.maps.push(new_map);
@@ -830,8 +855,8 @@ impl ZoneMapIndexBuilder {
         let fragment_ids =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.fragment_id));
 
-        let zone_sizes =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_size as u64));
+        let zone_lengths =
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_length as u64));
 
         let zone_starts =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.zone_start));
@@ -844,7 +869,7 @@ impl ZoneMapIndexBuilder {
             Field::new("nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_size", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
         ]));
 
         let columns: Vec<ArrayRef> = vec![
@@ -854,7 +879,7 @@ impl ZoneMapIndexBuilder {
             Arc::new(nan_counts) as ArrayRef,
             Arc::new(fragment_ids) as ArrayRef,
             Arc::new(zone_starts) as ArrayRef,
-            Arc::new(zone_sizes) as ArrayRef,
+            Arc::new(zone_lengths) as ArrayRef,
         ];
         Ok(RecordBatch::try_new(schema, columns)?)
     }
@@ -945,7 +970,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        ZONEMAP_INDEX_VERSION
     }
 
     fn new_query_parser(
@@ -961,7 +986,15 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "ZoneMap index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
             .map_err(|_| Error::InvalidInput {
@@ -970,7 +1003,8 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             })?;
         Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
+                .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })
     }
@@ -980,7 +1014,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
@@ -989,7 +1023,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 #[cfg(test)]
 mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
-    use crate::scalar::{zonemap::ZONEMAP_DEFAULT_SIZE, IndexStore};
+    use crate::scalar::{zonemap::ROWS_PER_ZONE_DEFAULT, IndexStore};
     use std::sync::Arc;
 
     use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
@@ -1073,12 +1107,12 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 0);
         assert_eq!(index.data_type, DataType::Int32);
-        assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(index.rows_per_zone, ROWS_PER_ZONE_DEFAULT);
 
         // Equals query: null (should match nothing, as there are no nulls)
         let query = SargableQuery::Equals(ScalarValue::Int32(None));
@@ -1117,14 +1151,14 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 10);
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.null_count, 1000);
             assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
-            assert_eq!(zone.zone_size, 5000);
+            assert_eq!(zone.zone_length, 5000);
             assert_eq!(zone.fragment_id, i as u64);
         }
 
@@ -1169,7 +1203,7 @@ mod tests {
             .unwrap();
 
         // Verify the updated index has more zones
-        let updated_index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let updated_index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load updated ZoneMapIndex");
 
@@ -1179,7 +1213,7 @@ mod tests {
         // Verify the new zone was added
         let new_zone = &updated_index.zones[10]; // Last zone should be the new one
         assert_eq!(new_zone.fragment_id, 10); // New fragment ID
-        assert_eq!(new_zone.zone_size, 5000);
+        assert_eq!(new_zone.zone_length, 5000);
         assert_eq!(new_zone.null_count, 0); // New data has no nulls
         assert_eq!(new_zone.nan_count, 0); // New data has no NaN values
 
@@ -1260,7 +1294,7 @@ mod tests {
         .unwrap();
 
         // Load the index
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
 
@@ -1272,7 +1306,11 @@ mod tests {
         // So each zone should have 20 NaN values (100/5 = 20)
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.nan_count, 20, "Zone {} should have 20 NaN values", i);
-            assert_eq!(zone.zone_size, 100, "Zone {} should have zone_size 100", i);
+            assert_eq!(
+                zone.zone_length, 100,
+                "Zone {} should have zone_length 100",
+                i
+            );
             assert_eq!(zone.fragment_id, 0, "Zone {} should have fragment_id 0", i);
         }
 
@@ -1476,7 +1514,7 @@ mod tests {
         assert_eq!(metadata.get(ZONEMAP_SIZE_META_KEY).unwrap(), "100");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 2);
@@ -1490,7 +1528,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 0,
-                    zone_size: 100,
+                    zone_length: 100,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int32(Some(100)),
@@ -1499,7 +1537,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 100,
-                    zone_size: 1,
+                    zone_length: 1,
                 }
             ]
         );
@@ -1509,7 +1547,7 @@ mod tests {
         }
 
         assert_eq!(index.data_type, DataType::Int32);
-        assert_eq!(index.max_zonemap_size, 100);
+        assert_eq!(index.rows_per_zone, 100);
         assert_eq!(
             index.calculate_included_frags().await.unwrap(),
             RoaringBitmap::from_iter(0..1)
@@ -1630,7 +1668,7 @@ mod tests {
 
         // Create data that will produce the expected zonemap zones
         let data =
-            arrow_array::Int64Array::from_iter_values(0..(ZONEMAP_DEFAULT_SIZE * 2 + 42) as i64);
+            arrow_array::Int64Array::from_iter_values(0..(ROWS_PER_ZONE_DEFAULT * 2 + 42) as i64);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Int64, false),
@@ -1654,7 +1692,7 @@ mod tests {
         log::debug!("Successfully wrote the index file");
 
         // Read the index file back and check its contents
-        let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex");
         assert_eq!(index.zones.len(), 3);
@@ -1668,7 +1706,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 0,
-                    zone_size: 8192,
+                    zone_length: 8192,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(8192)),
@@ -1677,7 +1715,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 8192,
-                    zone_size: 8192,
+                    zone_length: 8192,
                 },
                 ZoneMapStatistics {
                     min: ScalarValue::Int64(Some(16384)),
@@ -1686,7 +1724,7 @@ mod tests {
                     nan_count: 0,
                     fragment_id: 0,
                     zone_start: 16384,
-                    zone_size: 42,
+                    zone_length: 42,
                 }
             ]
         );
@@ -1696,7 +1734,7 @@ mod tests {
         }
 
         assert_eq!(index.data_type, DataType::Int64);
-        assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE);
+        assert_eq!(index.rows_per_zone, ROWS_PER_ZONE_DEFAULT);
         assert_eq!(
             index.calculate_included_frags().await.unwrap(),
             RoaringBitmap::from_iter(0..1)
@@ -1756,8 +1794,8 @@ mod tests {
         // Create multiple fragments with data that will produce expected zones
         // Fragment 0: values 0-8191 (first zone)
         let fragment0_data =
-            arrow_array::Int64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE as i64);
-        let fragment0_row_ids = UInt64Array::from_iter_values(0..ZONEMAP_DEFAULT_SIZE);
+            arrow_array::Int64Array::from_iter_values(0..ROWS_PER_ZONE_DEFAULT as i64);
+        let fragment0_row_ids = UInt64Array::from_iter_values(0..ROWS_PER_ZONE_DEFAULT);
         let fragment0_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment0_data), Arc::new(fragment0_row_ids)],
@@ -1766,10 +1804,10 @@ mod tests {
 
         // Fragment 1: values 8192-16383 (second zone)
         let fragment1_data = arrow_array::Int64Array::from_iter_values(
-            (ZONEMAP_DEFAULT_SIZE as i64)..((ZONEMAP_DEFAULT_SIZE * 2) as i64),
+            (ROWS_PER_ZONE_DEFAULT as i64)..((ROWS_PER_ZONE_DEFAULT * 2) as i64),
         );
         let fragment1_row_ids =
-            UInt64Array::from_iter_values((0..ZONEMAP_DEFAULT_SIZE).map(|i| i + (1 << 32)));
+            UInt64Array::from_iter_values((0..ROWS_PER_ZONE_DEFAULT).map(|i| i + (1 << 32)));
         let fragment1_batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(fragment1_data), Arc::new(fragment1_row_ids)],
@@ -1778,7 +1816,7 @@ mod tests {
 
         // Fragment 2: values 16384-16426 (third zone)
         let fragment2_data = arrow_array::Int64Array::from_iter_values(
-            ((ZONEMAP_DEFAULT_SIZE * 2) as i64)..((ZONEMAP_DEFAULT_SIZE * 2 + 42) as i64),
+            ((ROWS_PER_ZONE_DEFAULT * 2) as i64)..((ROWS_PER_ZONE_DEFAULT * 2 + 42) as i64),
         );
         let fragment2_row_ids =
             UInt64Array::from_iter_values((0..42).map(|i| (i as u64) + (2 << 32)));
@@ -1808,7 +1846,7 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 5);
@@ -1822,7 +1860,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 0,
-                        zone_size: 5000,
+                        zone_length: 5000,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(5000)),
@@ -1831,7 +1869,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 5000,
-                        zone_size: 3192,
+                        zone_length: 3192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
@@ -1840,7 +1878,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 0,
-                        zone_size: 5000,
+                        zone_length: 5000,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(13192)),
@@ -1849,7 +1887,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 5000,
-                        zone_size: 3192,
+                        zone_length: 3192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
@@ -1858,7 +1896,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 2,
                         zone_start: 0,
-                        zone_size: 42,
+                        zone_length: 42,
                     }
                 ]
             );
@@ -1868,7 +1906,7 @@ mod tests {
             }
 
             assert_eq!(index.data_type, DataType::Int64);
-            assert_eq!(index.max_zonemap_size, 5000);
+            assert_eq!(index.rows_per_zone, 5000);
             assert_eq!(
                 index.calculate_included_frags().await.unwrap(),
                 RoaringBitmap::from_iter(0..3)
@@ -1896,7 +1934,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 fragment0_rowaddrs.values().len(),
-                ZONEMAP_DEFAULT_SIZE as usize
+                ROWS_PER_ZONE_DEFAULT as usize
             );
             assert_eq!(fragment0_rowaddrs.values()[0], 0);
             assert_eq!(
@@ -1912,7 +1950,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 fragment1_rowaddrs.values().len(),
-                ZONEMAP_DEFAULT_SIZE as usize
+                ROWS_PER_ZONE_DEFAULT as usize
             );
             assert_eq!(fragment1_rowaddrs.values()[0], 1u64 << 32); // fragment_id=1, local_offset=0
             assert_eq!(
@@ -2006,7 +2044,7 @@ mod tests {
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);
@@ -2020,7 +2058,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
@@ -2029,7 +2067,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
@@ -2038,7 +2076,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 2,
                         zone_start: 0,
-                        zone_size: 42,
+                        zone_length: 42,
                     }
                 ]
             );
@@ -2048,7 +2086,7 @@ mod tests {
             }
 
             assert_eq!(index.data_type, DataType::Int64);
-            assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE);
+            assert_eq!(index.rows_per_zone, ROWS_PER_ZONE_DEFAULT);
             assert_eq!(
                 index.calculate_included_frags().await.unwrap(),
                 RoaringBitmap::from_iter(0..3)
@@ -2069,13 +2107,13 @@ mod tests {
             ZoneMapIndexPlugin::train_zonemap_index(
                 data_stream,
                 test_store.as_ref(),
-                Some(ZoneMapIndexBuilderParams::new(ZONEMAP_DEFAULT_SIZE * 3)),
+                Some(ZoneMapIndexBuilderParams::new(ROWS_PER_ZONE_DEFAULT * 3)),
             )
             .await
             .unwrap();
 
             // Read the index file back and check its contents
-            let index = ZoneMapIndex::load(test_store.clone(), None, LanceCache::no_cache())
+            let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .expect("Failed to load ZoneMapIndex");
             assert_eq!(index.zones.len(), 3);
@@ -2089,7 +2127,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 0,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(8192)),
@@ -2098,7 +2136,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 1,
                         zone_start: 0,
-                        zone_size: 8192,
+                        zone_length: 8192,
                     },
                     ZoneMapStatistics {
                         min: ScalarValue::Int64(Some(16384)),
@@ -2107,7 +2145,7 @@ mod tests {
                         nan_count: 0,
                         fragment_id: 2,
                         zone_start: 0,
-                        zone_size: 42,
+                        zone_length: 42,
                     }
                 ]
             );
@@ -2117,7 +2155,7 @@ mod tests {
             }
 
             assert_eq!(index.data_type, DataType::Int64);
-            assert_eq!(index.max_zonemap_size, ZONEMAP_DEFAULT_SIZE * 3);
+            assert_eq!(index.rows_per_zone, ROWS_PER_ZONE_DEFAULT * 3);
         }
     }
 

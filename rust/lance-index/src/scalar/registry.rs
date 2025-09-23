@@ -9,14 +9,15 @@ use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{cache::LanceCache, Error, Result};
 use snafu::location;
 
+use crate::pb;
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
-    pb,
     scalar::{
-        bitmap::BitmapIndexPlugin, btree::BTreeIndexPlugin, expression::ScalarQueryParser,
-        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin, CreatedIndex, IndexStore,
-        ScalarIndex,
+        bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
+        expression::ScalarQueryParser, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
+        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin,
+        CreatedIndex, IndexStore, ScalarIndex,
     },
 };
 
@@ -119,6 +120,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex>;
 
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
@@ -148,7 +150,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
     /// Optional hook that plugins can use if they need to be aware of the registry
@@ -194,12 +196,13 @@ impl ScalarIndexPluginRegistry {
         let mut registry = Self {
             plugins: HashMap::new(),
         };
-        registry.add_plugin::<pb::BTreeIndexDetails, BTreeIndexPlugin>();
-        registry.add_plugin::<pb::BitmapIndexDetails, BitmapIndexPlugin>();
-        registry.add_plugin::<pb::LabelListIndexDetails, LabelListIndexPlugin>();
-        registry.add_plugin::<pb::NGramIndexDetails, NGramIndexPlugin>();
-        registry.add_plugin::<pb::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
-        registry.add_plugin::<pb::InvertedIndexDetails, InvertedIndexPlugin>();
+        registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
+        registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
+        registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
+        registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
+        registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
+        registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
+        registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
 
         let registry = Arc::new(registry);

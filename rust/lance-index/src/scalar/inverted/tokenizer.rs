@@ -19,10 +19,10 @@ use jieba::JiebaTokenizerBuilder;
 #[cfg(feature = "tokenizer-lindera")]
 use lindera::LinderaTokenizerBuilder;
 
-use crate::pb;
+use crate::pbold;
 
 /// Tokenizer configs
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
@@ -79,7 +79,7 @@ pub struct InvertedIndexParams {
     pub(crate) prefix_only: bool,
 }
 
-impl TryFrom<&InvertedIndexParams> for pb::InvertedIndexDetails {
+impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
     type Error = Error;
 
     fn try_from(params: &InvertedIndexParams) -> Result<Self> {

@@ -238,14 +238,35 @@ You can add metadata columns to your vector dataset and query both vectors and f
 
 In real-life situations, users have other feature or metadata columns that need to be stored and fetched together. If you're managing data and the index separately, you have to do a bunch of annoying plumbing to put stuff together. 
 
-With Lance it's a single call:
+With Lance, you can add columns directly to the dataset using `add_columns()`. For basic use cases, you can use SQL:
 
 ```python
-tbl = sift1m.to_table()
-tbl = tbl.append_column("item_id", pa.array(range(len(tbl))))
-tbl = tbl.append_column("revenue", pa.array((np.random.randn(len(tbl))+5)*1000))
+sift1m.add_columns(
+    {
+        "item_id": "id + 1000000",
+        "revenue": "random() * 1000 + 5000",
+    }
+)
 ```
+For more complex columns, you can provide a Python function to generate the new column data:
+```python
+@lance.batch_udf()
+def add_columns_func(batch: pa.Table) -> pd.DataFrame:
+    """Add item_id and revenue columns to a batch of data.
 
+    Args:
+        batch: PyArrow Table containing the original data
+
+    Returns:
+        Pandas DataFrame with added item_id and revenue columns
+    """
+    item_ids: np.ndarray = np.arange(batch.num_rows)
+    revenue: np.ndarray = (np.random.randn(batch.num_rows) + 5) * 1000
+    return pd.DataFrame({"item_id": item_ids, "revenue": revenue})
+
+
+sift1m.add_columns(add_columns_func)
+```
 You can then query both vectors and metadata together:
 
 ```python

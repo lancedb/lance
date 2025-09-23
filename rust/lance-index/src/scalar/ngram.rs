@@ -9,11 +9,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::lance_format::LanceIndexStore;
 use super::{
-    AnyQuery, IndexReader, IndexStore, IndexWriter, MetricsCollector, ScalarIndex, SearchResult,
-    TextQuery,
+    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
 use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
+use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -21,7 +22,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::vector::VectorIndex;
-use crate::{pb, Index, IndexType};
+use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
@@ -31,7 +32,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -207,7 +208,7 @@ impl NGramPostingList {
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 }
 
 impl DeepSizeOf for NGramPostingListReader {
@@ -292,7 +293,7 @@ impl NGramIndex {
     async fn from_store(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
         let tokens = tokens
@@ -313,7 +314,7 @@ impl NGramIndex {
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
             frag_reuse_index,
-            index_cache,
+            index_cache: WeakLanceCache::from(index_cache),
         });
 
         Ok(Self {
@@ -368,7 +369,7 @@ impl NGramIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        index_cache: LanceCache,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -512,7 +513,8 @@ impl ScalarIndex for NGramIndex {
         writer.finish().await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
@@ -530,13 +532,18 @@ impl ScalarIndex for NGramIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
         UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::NGram))
     }
 }
 
@@ -1269,7 +1276,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        NGRAM_INDEX_VERSION
     }
 
     fn new_query_parser(
@@ -1285,10 +1292,19 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::InvalidInput {
+                source: "NGram index does not support fragment training".into(),
+                location: location!(),
+            });
+        }
+
         Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
@@ -1298,7 +1314,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(NGramIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
@@ -1399,7 +1415,7 @@ mod tests {
             .unwrap();
 
         (
-            NGramIndex::from_store(Arc::new(test_store), None, LanceCache::no_cache())
+            NGramIndex::from_store(Arc::new(test_store), None, &LanceCache::no_cache())
                 .await
                 .unwrap(),
             tmpdir,
@@ -1601,7 +1617,7 @@ mod tests {
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store, None, LanceCache::no_cache())
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert_eq!(index.tokens.len(), 3);
@@ -1639,7 +1655,7 @@ mod tests {
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
         index.remap(&remapping, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store, None, LanceCache::no_cache())
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         let row_ids = row_ids_in_index(&index).await;
@@ -1680,7 +1696,7 @@ mod tests {
 
         index.update(data, test_store.as_ref()).await.unwrap();
 
-        let index = NGramIndex::from_store(test_store, None, LanceCache::no_cache())
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         let row_ids = row_ids_in_index(&index).await;
@@ -1708,7 +1724,7 @@ mod tests {
 
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            data.map_err(|arrow_err| DataFusionError::ArrowError(arrow_err, None)),
+            data.map_err(|arrow_err| DataFusionError::ArrowError(Box::new(arrow_err), None)),
         ));
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {

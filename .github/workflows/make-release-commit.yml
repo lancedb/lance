@@ -23,12 +23,12 @@ on:
       dry_run:
         description: 'Dry run (simulate the release without pushing)'
         required: true
-        default: true
+        default: false
         type: boolean
       draft_release:
         description: 'Create a draft release on GitHub'
         required: true
-        default: true
+        default: false
         type: boolean
 
 jobs:
@@ -106,9 +106,9 @@ jobs:
           VERSION="${{ steps.new_version.outputs.version }}"
           TAG="v${VERSION}"
         else
-          # For preview releases, use current version
-          VERSION="${{ steps.current_version.outputs.version }}"
-          # Find the next beta number for current version
+          # For preview releases, base the beta tag on the next release version
+          VERSION="${{ steps.new_version.outputs.version }}"
+          # Find the next beta number for upcoming version
           BETA_TAGS=$(git tag -l "v${VERSION}-beta.*" | sort -V)
           if [ -z "$BETA_TAGS" ]; then
             BETA_NUM=1

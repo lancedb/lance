@@ -11,10 +11,10 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::{DFSchema, SchemaExt};
+use datafusion::common::{exec_datafusion_err, DFSchema, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
-use datafusion::logical_expr::{col, lit, Expr};
+use datafusion::logical_expr::{col, lit, Expr, ScalarUDF};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
@@ -32,6 +32,7 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
+use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Column};
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -41,7 +42,9 @@ use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
-use lance_core::datatypes::{Field, OnMissing, Projection};
+use lance_core::datatypes::{
+    escape_field_path_for_project, format_field_path, Field, OnMissing, Projection,
+};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
@@ -65,7 +68,7 @@ use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
@@ -432,13 +435,6 @@ pub struct Scanner {
     autoproject_scoring_columns: bool,
 }
 
-fn escape_column_name(name: &str) -> String {
-    name.split('.')
-        .map(|s| format!("`{}`", s))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
 /// Represents a user-requested take operation
 #[derive(Debug, Clone)]
 pub enum TakeOperation {
@@ -691,7 +687,7 @@ impl Scanner {
     pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
         let transformed_columns: Vec<(&str, String)> = columns
             .iter()
-            .map(|c| (c.as_ref(), escape_column_name(c.as_ref())))
+            .map(|c| (c.as_ref(), escape_field_path_for_project(c.as_ref())))
             .collect();
 
         self.project_with_transform(&transformed_columns)
@@ -1244,6 +1240,51 @@ impl Scanner {
         self
     }
 
+    /// Create a physical expression for a column that may be nested
+    fn create_column_expr(
+        column_name: &str,
+        dataset: &Dataset,
+        arrow_schema: &ArrowSchema,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let lance_schema = dataset.schema();
+        let field_path = lance_schema.resolve(column_name).ok_or_else(|| {
+            Error::invalid_input(
+                format!("Field '{}' not found in schema", column_name),
+                location!(),
+            )
+        })?;
+
+        if field_path.len() == 1 {
+            // Simple top-level column
+            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| Error::Internal {
+                message: format!(
+                    "Failed to create column expression for '{}': {}",
+                    column_name, e
+                ),
+                location: location!(),
+            })
+        } else {
+            // Nested field - build a chain of GetFieldFunc calls
+            let get_field_func = ScalarUDF::from(GetFieldFunc::default());
+
+            let mut expr = col(&field_path[0].name);
+            for nested_field in &field_path[1..] {
+                expr = get_field_func.call(vec![expr, lit(&nested_field.name)]);
+            }
+
+            // Convert logical to physical expression
+            let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
+            let execution_props = ExecutionProps::default();
+            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| Error::Internal {
+                message: format!(
+                    "Failed to create physical expression for nested field '{}': {}",
+                    column_name, e
+                ),
+                location: location!(),
+            })
+        }
+    }
+
     /// Set whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1631,6 +1672,10 @@ impl Scanner {
         if filter_plan.has_any_filter() {
             // If there is a filter we can't pushdown limit / offset
             Ok(None)
+        } else if self.ordering.is_some() {
+            // If there is ordering, we can't pushdown limit / offset
+            // because we need to sort all data first before applying the limit
+            Ok(None)
         } else {
             match (self.limit, self.offset) {
                 (None, None) => Ok(None),
@@ -1807,7 +1852,11 @@ impl Scanner {
                 .iter()
                 .map(|col| {
                     Ok(PhysicalSortExpr {
-                        expr: expressions::col(&col.column_name, plan.schema().as_ref())?,
+                        expr: Self::create_column_expr(
+                            &col.column_name,
+                            &self.dataset,
+                            plan.schema().as_ref(),
+                        )?,
                         options: SortOptions {
                             descending: !col.ascending,
                             nulls_first: col.nulls_first,
@@ -1815,7 +1864,11 @@ impl Scanner {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            plan = Arc::new(SortExec::new(LexOrdering::new(col_exprs), plan));
+            plan = Arc::new(SortExec::new(
+                LexOrdering::new(col_exprs)
+                    .ok_or(exec_datafusion_err!("Unexpected empty sort expressions"))?,
+                plan,
+            ));
         }
 
         // Stage 4: limit / offset
@@ -2287,37 +2340,47 @@ impl Scanner {
         }
         let query = if columns.is_empty() {
             // the field is not specified,
-            // try to search over all indexed fields
-            let string_columns =
-                self.dataset
-                    .schema()
-                    .fields
-                    .iter()
-                    .filter_map(|f| match f.data_type() {
-                        DataType::Utf8 | DataType::LargeUtf8 => Some(&f.name),
-                        DataType::List(field) | DataType::LargeList(field) => {
-                            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-                                Some(&f.name)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    });
-
+            // try to search over all indexed fields including nested ones
             let mut indexed_columns = Vec::new();
-            for column in string_columns {
-                let has_fts_index = self
-                    .dataset
-                    .load_scalar_index(
-                        ScalarIndexCriteria::default()
-                            .for_column(column)
-                            .supports_fts(),
-                    )
-                    .await?
-                    .is_some();
-                if has_fts_index {
-                    indexed_columns.push(column.clone());
+            for field in self.dataset.schema().fields_pre_order() {
+                // Check if this field is a string type that could have an inverted index
+                let is_string_field = match field.data_type() {
+                    DataType::Utf8 | DataType::LargeUtf8 => true,
+                    DataType::List(inner_field) | DataType::LargeList(inner_field) => {
+                        matches!(
+                            inner_field.data_type(),
+                            DataType::Utf8 | DataType::LargeUtf8
+                        )
+                    }
+                    _ => false,
+                };
+
+                if is_string_field {
+                    // Build the full field path for nested fields
+                    let column_path = if let Some(ancestors) =
+                        self.dataset.schema().field_ancestry_by_id(field.id)
+                    {
+                        let field_refs: Vec<&str> =
+                            ancestors.iter().map(|f| f.name.as_str()).collect();
+                        format_field_path(&field_refs)
+                    } else {
+                        continue; // Skip if we can't find the field ancestry
+                    };
+
+                    // Check if this field has an inverted index
+                    let has_fts_index = self
+                        .dataset
+                        .load_scalar_index(
+                            ScalarIndexCriteria::default()
+                                .for_column(&column_path)
+                                .supports_fts(),
+                        )
+                        .await?
+                        .is_some();
+
+                    if has_fts_index {
+                        indexed_columns.push(column_path);
+                    }
                 }
             }
 
@@ -2433,7 +2496,7 @@ impl Scanner {
                 };
 
                 Arc::new(
-                    SortExec::new(LexOrdering::new(vec![sort_expr]), fts_node)
+                    SortExec::new([sort_expr].into(), fts_node)
                         .with_fetch(self.limit.map(|l| l as usize)),
                 )
             }
@@ -2490,7 +2553,7 @@ impl Scanner {
                             &datafusion_expr::JoinType::Inner,
                             None,
                             datafusion_physical_plan::joins::PartitionMode::CollectLeft,
-                            false,
+                            NullEquality::NullEqualsNothing,
                         )?) as _);
                     } else {
                         must = Some(plan);
@@ -2621,10 +2684,8 @@ impl Scanner {
                     nulls_first: false,
                 },
             };
-            match_plan = Arc::new(
-                SortExec::new(LexOrdering::new(vec![sort_expr]), match_plan)
-                    .with_fetch(params.limit),
-            );
+            match_plan =
+                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit));
         }
         Ok(match_plan)
     }
@@ -2732,7 +2793,7 @@ impl Scanner {
     async fn knn_combined(
         &self,
         q: &Query,
-        index: &Index,
+        index: &IndexMetadata,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -3153,7 +3214,7 @@ impl Scanner {
 
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
-            LexOrdering::new(vec![
+            [
                 PhysicalSortExpr {
                     expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
                     options: SortOptions {
@@ -3168,7 +3229,8 @@ impl Scanner {
                         nulls_first: false,
                     },
                 },
-            ]),
+            ]
+            .into(),
             knn_plan,
         )
         .with_fetch(Some(q.k));
@@ -3187,7 +3249,7 @@ impl Scanner {
         }
     }
 
-    fn get_indexed_frags(&self, index: &[Index]) -> RoaringBitmap {
+    fn get_indexed_frags(&self, index: &[IndexMetadata]) -> RoaringBitmap {
         let all_fragments = self.get_fragments_as_bitmap();
 
         let mut all_indexed_frags = RoaringBitmap::new();
@@ -3208,7 +3270,7 @@ impl Scanner {
     async fn ann(
         &self,
         q: &Query,
-        index: &[Index],
+        index: &[IndexMetadata],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self
@@ -3230,11 +3292,8 @@ impl Scanner {
             },
         };
         Ok(Arc::new(
-            SortExec::new(
-                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                inner_fanout_search,
-            )
-            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new([sort_expr, sort_expr_row_id].into(), inner_fanout_search)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
     }
 
@@ -3242,7 +3301,7 @@ impl Scanner {
     async fn multivec_ann(
         &self,
         q: &Query,
-        index: &[Index],
+        index: &[IndexMetadata],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // we split the query procedure into two steps:
@@ -3292,11 +3351,8 @@ impl Scanner {
                 },
             };
             let ann_node = Arc::new(
-                SortExec::new(
-                    LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                    ann_node,
-                )
-                .with_fetch(Some(q.k * over_fetch_factor as usize)),
+                SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
+                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
             );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
@@ -3318,11 +3374,8 @@ impl Scanner {
             },
         };
         let ann_node = Arc::new(
-            SortExec::new(
-                LexOrdering::new(vec![sort_expr, sort_expr_row_id]),
-                ann_node,
-            )
-            .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+            SortExec::new([sort_expr, sort_expr_row_id].into(), ann_node)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         );
 
         Ok(ann_node)
@@ -7253,7 +7306,7 @@ mod test {
                     stages: vec![
                         StageParams::Ivf(IvfBuildParams {
                             max_iters: 2,
-                            num_partitions: 2,
+                            num_partitions: Some(2),
                             sample_rate: 2,
                             ..Default::default()
                         }),
@@ -7776,5 +7829,150 @@ mod test {
         assert_eq!(batches[0].schema().field(0).name(), "foo");
         let val = batches[0].column(0).as_primitive::<Int32Type>().values()[0];
         assert_eq!(val, 154);
+    }
+
+    #[tokio::test]
+    async fn test_nested_field_ordering() {
+        use arrow_array::StructArray;
+
+        // Create test data with nested structs
+        let id_array = Int32Array::from(vec![3, 1, 2]);
+        let nested_values = Int32Array::from(vec![30, 10, 20]);
+        let nested_struct = StructArray::from(vec![(
+            Arc::new(ArrowField::new("value", DataType::Int32, false)),
+            Arc::new(nested_values) as ArrayRef,
+        )]);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "nested",
+                DataType::Struct(vec![ArrowField::new("value", DataType::Int32, false)].into()),
+                false,
+            ),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(nested_struct)],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test ordering by nested field
+        let mut scanner = dataset.scan();
+        scanner
+            .order_by(Some(vec![ColumnOrdering {
+                column_name: "nested.value".to_string(),
+                ascending: true,
+                nulls_first: true,
+            }]))
+            .unwrap(); // ascending order
+
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        // Check that results are sorted by nested.value
+        let sorted_ids = batches[0].column(0).as_primitive::<Int32Type>().values();
+        assert_eq!(sorted_ids[0], 1); // id=1 has nested.value=10
+        assert_eq!(sorted_ids[1], 2); // id=2 has nested.value=20
+        assert_eq!(sorted_ids[2], 3); // id=3 has nested.value=30
+    }
+
+    #[tokio::test]
+    async fn test_limit_with_ordering_not_pushed_down() {
+        // This test verifies the fix for a bug where limit/offset could be pushed down
+        // even when ordering was specified. When ordering is present, we need to load
+        // all data first to sort it before applying limits.
+
+        // Create test data with specific ordering
+        let id_array = Int32Array::from(vec![5, 2, 8, 1, 3, 7, 4, 6]);
+        let value_array = Int32Array::from(vec![50, 20, 80, 10, 30, 70, 40, 60]);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(value_array)],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // Test 1: limit with ordering should return top N after sorting
+        let mut scanner = dataset.scan();
+        scanner
+            .order_by(Some(vec![ColumnOrdering {
+                column_name: "value".to_string(),
+                ascending: true,
+                nulls_first: true,
+            }]))
+            .unwrap();
+        scanner.limit(Some(3), None).unwrap();
+
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        // Results should be sorted by value and limited to 3
+        let sorted_ids = batches[0].column(0).as_primitive::<Int32Type>().values();
+        let sorted_values = batches[0].column(1).as_primitive::<Int32Type>().values();
+        assert_eq!(batches[0].num_rows(), 3);
+        assert_eq!(sorted_ids[0], 1); // value=10
+        assert_eq!(sorted_ids[1], 2); // value=20
+        assert_eq!(sorted_ids[2], 3); // value=30
+        assert_eq!(sorted_values[0], 10);
+        assert_eq!(sorted_values[1], 20);
+        assert_eq!(sorted_values[2], 30);
+
+        // Test 2: offset with ordering should skip first N after sorting
+        let mut scanner = dataset.scan();
+        scanner
+            .order_by(Some(vec![ColumnOrdering {
+                column_name: "value".to_string(),
+                ascending: true,
+                nulls_first: true,
+            }]))
+            .unwrap();
+        scanner.limit(Some(3), Some(2)).unwrap(); // Skip first 2, take next 3
+
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        let sorted_ids = batches[0].column(0).as_primitive::<Int32Type>().values();
+        let sorted_values = batches[0].column(1).as_primitive::<Int32Type>().values();
+        assert_eq!(batches[0].num_rows(), 3);
+        assert_eq!(sorted_ids[0], 3); // value=30 (skipped 10, 20)
+        assert_eq!(sorted_ids[1], 4); // value=40
+        assert_eq!(sorted_ids[2], 5); // value=50
+        assert_eq!(sorted_values[0], 30);
+        assert_eq!(sorted_values[1], 40);
+        assert_eq!(sorted_values[2], 50);
+
+        // Test 3: without ordering, limit can be pushed down (different behavior)
+        let mut scanner = dataset.scan();
+        scanner.limit(Some(3), None).unwrap();
+
+        let stream = scanner.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        // Should get first 3 rows in storage order (not sorted)
+        assert_eq!(batches[0].num_rows(), 3);
+        let unsorted_values = batches[0].column(1).as_primitive::<Int32Type>().values();
+        // These will be in original insertion order, not sorted
+        assert_eq!(unsorted_values[0], 50);
+        assert_eq!(unsorted_values[1], 20);
+        assert_eq!(unsorted_values[2], 80);
     }
 }

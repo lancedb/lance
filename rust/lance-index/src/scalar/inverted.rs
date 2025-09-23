@@ -26,9 +26,9 @@ pub use tokenizer::*;
 use lance_core::Error;
 use snafu::location;
 
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
-    pb,
     scalar::{
         expression::{FtsQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
@@ -46,9 +46,22 @@ impl InvertedIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         params: InvertedIndexParams,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
-        let details = pb::InvertedIndexDetails::try_from(&params)?;
-        let mut inverted_index = InvertedIndexBuilder::new(params);
+        let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
+            if !frag_ids.is_empty() {
+                // Create a mask with fragment_id in high 32 bits for distributed indexing
+                // This mask is used to filter partitions belonging to specific fragments
+                // If multiple fragments processed, use first fragment_id <<32 as mask
+                Some((frag_ids[0] as u64) << 32)
+            } else {
+                None
+            }
+        });
+
+        let details = pbold::InvertedIndexDetails::try_from(&params)?;
+        let mut inverted_index =
+            InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask);
         inverted_index.update(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -57,7 +70,7 @@ impl InvertedIndexPlugin {
     }
 
     /// Return true if the query can be used to speed up contains_tokens queries
-    fn can_accelerate_queries(details: &pb::InvertedIndexDetails) -> bool {
+    fn can_accelerate_queries(details: &pbold::InvertedIndexDetails) -> bool {
         details.base_tokenizer == Some("simple".to_string())
             && details.max_token_length.is_none()
             && details.language == serde_json::to_string(&Language::English).unwrap()
@@ -96,15 +109,18 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
-        if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return Err(Error::InvalidInput {
+        match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => (),
+            DataType::List(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            DataType::LargeList(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            _ => return Err(Error::InvalidInput {
                 source: format!(
-                    "A ngram index can only be created on a Utf8 or LargeUtf8 field.  Column has type {:?}",
+                    "A inverted index can only be created on a Utf8 or LargeUtf8 field/list. Column has type {:?}",
                     field.data_type()
                 )
-                .into(),
+                    .into(),
                 location: location!(),
-            });
+            })
         }
 
         let params = serde_json::from_str::<InvertedIndexParams>(params)?;
@@ -116,7 +132,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        0
+        INVERTED_INDEX_VERSION
     }
 
     fn new_query_parser(
@@ -124,7 +140,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        let Ok(index_details) = _index_details.to_msg::<pb::InvertedIndexDetails>() else {
+        let Ok(index_details) = _index_details.to_msg::<pbold::InvertedIndexDetails>() else {
             return None;
         };
 
@@ -150,6 +166,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<InvertedIndexTrainingRequest>()
@@ -157,7 +174,8 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                 source: "must provide training request created by new_training_request".into(),
                 location: location!(),
             })?;
-        Self::train_inverted_index(data, index_store, request.parameters.clone()).await
+        Self::train_inverted_index(data, index_store, request.parameters.clone(), fragment_ids)
+            .await
     }
 
     /// Load an index from storage
@@ -169,7 +187,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        cache: LanceCache,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             InvertedIndex::load(index_store, frag_reuse_index, cache).await?

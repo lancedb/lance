@@ -578,6 +578,37 @@ def test_create_4bit_ivf_pq_index(dataset, tmp_path):
     assert index["indices"][0]["sub_index"]["nbits"] == 4
 
 
+def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_sub_vectors=16,
+        target_partition_size=1000,
+    )
+    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 1
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_sub_vectors=16,
+        target_partition_size=500,
+        replace=True,
+    )
+    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
+
+    # setting both num_partitions and target_partition_size will use num_partitions
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_sub_vectors=16,
+        num_partitions=2,
+        target_partition_size=1000,
+        replace=True,
+    )
+    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
+
+
 def test_ivf_flat_over_binary_vector(tmp_path):
     dim = 128
     nvec = 1000
@@ -1299,6 +1330,7 @@ def test_optimize_indices(indexed_dataset):
     assert len(indices) == 2
 
 
+@pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")

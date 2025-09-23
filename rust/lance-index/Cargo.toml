@@ -41,6 +41,7 @@ lance-file.workspace = true
 lance-io.workspace = true
 lance-linalg.workspace = true
 lance-table.workspace = true
+libm.workspace = true
 log.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
@@ -61,6 +62,8 @@ tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
 uuid.workspace = true
+fastbloom = "0.14.0"
+twox-hash = "2.0"
 async-channel = "2.3.1"
 bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 lance-datagen.workspace = true

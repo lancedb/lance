@@ -3,14 +3,10 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use std::cmp::min;
-use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
-
+use super::{IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::LanceCache, Error, Result};
@@ -26,8 +22,9 @@ use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
-
-use super::{IndexReader, IndexStore, IndexWriter};
+use std::cmp::min;
+use std::collections::HashMap;
+use std::{any::Any, sync::Arc};
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -310,6 +307,7 @@ pub mod tests {
     use std::{collections::HashMap, ops::Bound, path::Path};
 
     use crate::metrics::NoOpMetricsCollector;
+    use crate::pbold;
     use crate::scalar::bitmap::BitmapIndexPlugin;
     use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
     use crate::scalar::label_list::LabelListIndexPlugin;
@@ -345,7 +343,9 @@ pub mod tests {
                 .now_or_never()
                 .unwrap()
                 .unwrap();
-        let cache = Arc::new(LanceCache::with_capacity(128 * 1024 * 1024));
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
@@ -368,7 +368,7 @@ pub mod tests {
             )
             .unwrap();
         btree_plugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
@@ -390,9 +390,9 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<crate::pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -455,9 +455,9 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<crate::pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -482,9 +482,9 @@ pub mod tests {
         let updated_index = BTreeIndexPlugin
             .load_index(
                 updated_index_store,
-                &default_details::<crate::pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -570,9 +570,9 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<crate::pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -814,9 +814,9 @@ pub mod tests {
             let index = BTreeIndexPlugin
                 .load_index(
                     index_store,
-                    &default_details::<crate::pb::BTreeIndexDetails>(),
+                    &default_details::<pbold::BTreeIndexDetails>(),
                     None,
-                    LanceCache::no_cache(),
+                    &LanceCache::no_cache(),
                 )
                 .await
                 .unwrap();
@@ -866,6 +866,7 @@ pub mod tests {
             &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
         )
         .await
         .unwrap();
@@ -873,9 +874,9 @@ pub mod tests {
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
-                &default_details::<crate::pb::BTreeIndexDetails>(),
+                &default_details::<pbold::BTreeIndexDetails>(),
                 None,
-                LanceCache::no_cache(),
+                &LanceCache::no_cache(),
             )
             .await
             .unwrap();
@@ -911,7 +912,7 @@ pub mod tests {
             .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
             .unwrap();
         BitmapIndexPlugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
@@ -952,7 +953,7 @@ pub mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -994,7 +995,7 @@ pub mod tests {
             .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1091,7 +1092,7 @@ pub mod tests {
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1279,7 +1280,7 @@ pub mod tests {
             .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1297,7 +1298,7 @@ pub mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store, None, LanceCache::no_cache())
+        let updated_index = BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1324,7 +1325,7 @@ pub mod tests {
             .col(ROW_ID, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1347,7 +1348,7 @@ pub mod tests {
             .remap(&mapping, remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store, None, LanceCache::no_cache())
+        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1399,7 +1400,7 @@ pub mod tests {
             )
             .unwrap();
         LabelListIndexPlugin
-            .train_index(data, index_store.as_ref(), request)
+            .train_index(data, index_store.as_ref(), request, None)
             .await
             .unwrap();
     }
@@ -1437,9 +1438,9 @@ pub mod tests {
                 let index = LabelListIndexPlugin
                     .load_index(
                         index_store,
-                        &default_details::<crate::pb::LabelListIndexDetails>(),
+                        &default_details::<pbold::LabelListIndexDetails>(),
                         None,
-                        LanceCache::no_cache(),
+                        &LanceCache::no_cache(),
                     )
                     .await
                     .unwrap();

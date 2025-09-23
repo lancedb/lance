@@ -71,6 +71,7 @@ impl BenchmarkFixture {
             &sub_index_trainer,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
+            None,
         )
         .await
         .unwrap();
@@ -197,14 +198,14 @@ fn bench_warm_indexed(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let fixture = rt.block_on(BenchmarkFixture::open());
     let details =
-        prost_types::Any::from_msg(&lance_index::pb::BTreeIndexDetails::default()).unwrap();
+        prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
 
     let index = rt
         .block_on(BTreeIndexPlugin.load_index(
             fixture.index_store.clone(),
             &details,
             None,
-            LanceCache::no_cache(),
+            &LanceCache::no_cache(),
         ))
         .unwrap();
 

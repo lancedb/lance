@@ -235,14 +235,14 @@ impl DecodeMiniBlockTask {
             let mut rep = rep.as_ref();
             // If there is a preamble and we need to skip it then do that first.  The work is the same
             // whether there is def information or not
-            let mut items_in_preamble = 0;
+            let mut items_in_preamble = 0_u64;
             let first_row_start = match preamble_action {
                 PreambleAction::Skip | PreambleAction::Take => {
                     let first_row_start = if let Some(def) = def.as_ref() {
                         let mut first_row_start = None;
                         for (idx, (rep, def)) in rep.iter().zip(def.as_ref()).enumerate() {
                             if *rep == max_rep {
-                                first_row_start = Some(idx);
+                                first_row_start = Some(idx as u64);
                                 break;
                             }
                             if *def <= max_visible_def {
@@ -251,8 +251,9 @@ impl DecodeMiniBlockTask {
                         }
                         first_row_start
                     } else {
-                        let first_row_start = rep.iter().position(|&r| r == max_rep);
-                        items_in_preamble = first_row_start.unwrap_or(rep.len());
+                        let first_row_start =
+                            rep.iter().position(|&r| r == max_rep).map(|r| r as u64);
+                        items_in_preamble = first_row_start.unwrap_or(rep.len() as u64);
                         first_row_start
                     };
                     // It is possible for a chunk to be entirely partial values but if it is then it
@@ -261,7 +262,7 @@ impl DecodeMiniBlockTask {
                         assert!(preamble_action == PreambleAction::Take);
                         return (0..total_items, 0..rep.len() as u64);
                     }
-                    let first_row_start = first_row_start.unwrap() as u64;
+                    let first_row_start = first_row_start.unwrap();
                     rep = &rep[first_row_start as usize..];
                     first_row_start
                 }
@@ -274,7 +275,8 @@ impl DecodeMiniBlockTask {
             // We hit this case when all we needed was the preamble
             if range.start == range.end {
                 debug_assert!(preamble_action == PreambleAction::Take);
-                return (0..items_in_preamble as u64, 0..first_row_start);
+                debug_assert!(items_in_preamble <= total_items);
+                return (0..items_in_preamble, 0..first_row_start);
             }
             assert!(range.start < range.end);
 
@@ -300,9 +302,9 @@ impl DecodeMiniBlockTask {
                                 new_levels_start = idx as u64 + 1;
                                 break;
                             }
-                            if *def > max_visible_def {
-                                lead_invis_seen += 1;
-                            }
+                        }
+                        if *def > max_visible_def {
+                            lead_invis_seen += 1;
                         }
                     }
                 }
@@ -325,15 +327,14 @@ impl DecodeMiniBlockTask {
                             new_levels_end = idx as u64 + new_levels_start + 1;
                             break;
                         }
-                        if *def > max_visible_def {
-                            tail_invis_seen += 1;
-                        }
+                    }
+                    if *def > max_visible_def {
+                        tail_invis_seen += 1;
                     }
                 }
 
                 if new_end == u64::MAX {
                     new_levels_end = rep.len() as u64;
-                    // This is the total number of visible items (minus any items in the preamble)
                     let total_invis_seen = lead_invis_seen + tail_invis_seen;
                     new_end = rep.len() as u64 - total_invis_seen;
                 }
@@ -342,19 +343,18 @@ impl DecodeMiniBlockTask {
 
                 // Adjust for any skipped preamble
                 if preamble_action == PreambleAction::Skip {
-                    // TODO: Should this be items_in_preamble?  If so, add a
-                    // unit test for this case
-                    new_start += first_row_start;
-                    new_end += first_row_start;
+                    new_start += items_in_preamble;
+                    new_end += items_in_preamble;
                     new_levels_start += first_row_start;
                     new_levels_end += first_row_start;
                 } else if preamble_action == PreambleAction::Take {
                     debug_assert_eq!(new_start, 0);
                     debug_assert_eq!(new_levels_start, 0);
-                    new_end += first_row_start;
+                    new_end += items_in_preamble;
                     new_levels_end += first_row_start;
                 }
 
+                debug_assert!(new_end <= total_items);
                 (new_start..new_end, new_levels_start..new_levels_end)
             } else {
                 // Easy case, there are no invisible items, so we don't need to check for them
@@ -396,6 +396,7 @@ impl DecodeMiniBlockTask {
                     new_end += first_row_start;
                 }
 
+                debug_assert!(new_end <= total_items);
                 (new_start..new_end, new_start..new_end)
             }
         } else {
@@ -533,6 +534,15 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 chunk.items_in_chunk,
                 instructions.preamble_action,
             );
+            if item_range.end - item_range.start > chunk.items_in_chunk {
+                return Err(lance_core::Error::Internal {
+                    message: format!(
+                        "Item range {:?} is greater than chunk items in chunk {:?}",
+                        item_range, chunk.items_in_chunk
+                    ),
+                    location: location!(),
+                });
+            }
 
             // Now we append the data to the output buffers
             Self::extend_levels(level_range.clone(), &mut repbuf, &rep, level_offset);
@@ -722,6 +732,7 @@ pub struct ComplexAllNullScheduler {
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
+    max_visible_level: u16,
 }
 
 impl ComplexAllNullScheduler {
@@ -729,10 +740,16 @@ impl ComplexAllNullScheduler {
         buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
         def_meaning: Arc<[DefinitionInterpretation]>,
     ) -> Self {
+        let max_visible_level = def_meaning
+            .iter()
+            .take_while(|l| !l.is_list())
+            .map(|l| l.num_def_levels())
+            .sum::<u16>();
         Self {
             buffer_offsets_and_sizes,
             def_meaning,
             repdef: None,
+            max_visible_level,
         }
     }
 }
@@ -811,6 +828,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             def: self.repdef.as_ref().unwrap().def.clone(),
             num_rows,
             def_meaning: self.def_meaning.clone(),
+            max_visible_level: self.max_visible_level,
         }) as Box<dyn StructuralPageDecoder>))
         .boxed())
     }
@@ -823,6 +841,7 @@ pub struct ComplexAllNullPageDecoder {
     def: Option<ScalarBuffer<u16>>,
     num_rows: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_level: u16,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -853,6 +872,7 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
             rep: self.rep.clone(),
             def: self.def.clone(),
             def_meaning: self.def_meaning.clone(),
+            max_visible_level: self.max_visible_level,
         }))
     }
 
@@ -869,6 +889,7 @@ pub struct DecodeComplexAllNullTask {
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_visible_level: u16,
 }
 
 impl DecodeComplexAllNullTask {
@@ -894,9 +915,19 @@ impl DecodeComplexAllNullTask {
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let data = DataBlock::AllNull(AllNullDataBlock { num_values });
         let rep = self.decode_level(&self.rep, num_values);
         let def = self.decode_level(&self.def, num_values);
+
+        // If there are definition levels there may be empty / null lists which are not visible
+        // in the items array.  We need to account for that here to figure out how many values
+        // should be in the items array.
+        let num_values = if let Some(def) = &def {
+            def.iter().filter(|&d| *d <= self.max_visible_level).count() as u64
+        } else {
+            num_values
+        };
+
+        let data = DataBlock::AllNull(AllNullDataBlock { num_values });
         let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning);
         Ok(DecodedPage {
             data,
@@ -2564,10 +2595,17 @@ impl DecodePageTask for VariableFullZipDecodeTask {
             block_info: BlockInfo::new(),
         };
         let decomopressed = self.decompressor.decompress(block)?;
-        let rep = self.rep.to_vec();
-        let def = self.def.to_vec();
-        let unraveler =
-            RepDefUnraveler::new(Some(rep), Some(def), self.details.def_meaning.clone());
+        let rep = if self.rep.is_empty() {
+            None
+        } else {
+            Some(self.rep.to_vec())
+        };
+        let def = if self.def.is_empty() {
+            None
+        } else {
+            Some(self.def.to_vec())
+        };
+        let unraveler = RepDefUnraveler::new(rep, def, self.details.def_meaning.clone());
         Ok(DecodedPage {
             data: decomopressed,
             repdef: unraveler,
@@ -3272,8 +3310,8 @@ impl PrimitiveStructuralEncoder {
     // P - Padding inserted to ensure each buffer is 8-byte aligned and the buffer size is a multiple
     //     of 8 bytes (so that the next chunk is 8-byte aligned).
     //
-    // Each block has a u16 word of metadata.  The upper 12 bits contain 1/6 the
-    // # of bytes in the block (if the block does not have an even number of bytes
+    // Each block has a u16 word of metadata.  The upper 12 bits contain the
+    // # of 8-byte words in the block (if the block does not fill the final word
     // then up to 7 bytes of padding are added).  The lower 4 bits describe the log_2
     // number of values (e.g. if there are 1024 then the lower 4 bits will be
     // 0xA)  All blocks except the last must have power-of-two number of values.
@@ -3396,7 +3434,7 @@ impl PrimitiveStructuralEncoder {
             }
 
             let chunk_bytes = data_buffer.len() - start_pos;
-            assert!(chunk_bytes <= 16 * 1024);
+            assert!(chunk_bytes <= 32 * 1024);
             assert!(chunk_bytes > 0);
             assert_eq!(chunk_bytes % 8, 0);
             // We subtract 1 here from chunk_bytes because we want to be able to express
@@ -3439,12 +3477,17 @@ impl PrimitiveStructuralEncoder {
         // Make the levels into a FixedWidth data block
         let num_levels = levels.num_levels() as u64;
         let levels_buf = levels.all_levels().clone();
-        let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+
+        let mut fixed_width_block = FixedWidthDataBlock {
             data: levels_buf,
             bits_per_value: 16,
             num_values: num_levels,
             block_info: BlockInfo::new(),
-        });
+        };
+        // Compute statistics to enable optimal compression for rep/def levels
+        fixed_width_block.compute_stat();
+
+        let levels_block = DataBlock::FixedWidth(fixed_width_block);
         let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
         // Pick a block compressor
         let (compressor, compressor_desc) =
@@ -3454,6 +3497,7 @@ impl PrimitiveStructuralEncoder {
         let mut values_counter = 0;
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let chunk_num_values = chunk.num_values(values_counter, num_elements);
+            debug_assert!(chunk_num_values > 0);
             values_counter += chunk_num_values;
             let chunk_levels = if chunk_idx < chunks.len() - 1 {
                 levels.slice_next(chunk_num_values as usize)
@@ -3509,12 +3553,14 @@ impl PrimitiveStructuralEncoder {
                 rep_index.push(num_rows as u64);
                 rep_index.push(num_leftovers as u64);
             }
-            let chunk_levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            let mut chunk_fixed_width = FixedWidthDataBlock {
                 data: chunk_levels,
                 bits_per_value: 16,
                 num_values: num_chunk_levels,
                 block_info: BlockInfo::new(),
-            });
+            };
+            chunk_fixed_width.compute_stat();
+            let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
             let compressed_levels = compressor.compress(chunk_levels_block)?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
@@ -4205,6 +4251,7 @@ impl PrimitiveStructuralEncoder {
                 // We should not encode empty arrays.  So if we get here that should mean that we
                 // either have all empty lists or all null lists (or a mix).  We still need to encode
                 // the rep/def information but we can skip the data encoding.
+                log::debug!("Encoding column {} with {} items ({} rows) using complex-null layout", column_idx, num_values, num_rows);
                 return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows);
             }
             let num_nulls = arrays
@@ -4215,13 +4262,20 @@ impl PrimitiveStructuralEncoder {
             if num_values == num_nulls {
                 return if repdefs.iter().all(|rd| rd.is_simple_validity()) {
                     log::debug!(
-                        "Encoding column {} with {} items using simple-null layout",
+                        "Encoding column {} with {} items ({} rows) using simple-null layout",
                         column_idx,
-                        num_values
+                        num_values,
+                        num_rows
                     );
                     // Simple case, no rep/def and all nulls, we don't need to encode any data
                     Self::encode_simple_all_null(column_idx, num_values, row_number)
                 } else {
+                    log::debug!(
+                        "Encoding column {} with {} items ({} rows) using complex-null layout",
+                        column_idx,
+                        num_values,
+                        num_rows
+                    );
                     // If we get here then we have definition levels and we need to store those
                     Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
                 };
@@ -4704,6 +4758,83 @@ mod tests {
         check(0..1, 1..3, 1..3);
         check(1..2, 3..4, 3..4);
         check(0..2, 1..4, 1..4);
+
+        // If we have nested lists then non-top level lists may be empty/null
+        // and we need to make sure we still handle them as invisible items (we
+        // failed to do this previously)
+        let rep = Some(vec![2, 1, 2, 0, 1, 2]);
+        let def = Some(vec![0, 1, 2, 0, 0, 0]);
+        let max_rep = 2;
+        let max_visible_def = 0;
+        let total_items = 4;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..3, 0..4, 0..6);
+        check(0..1, 0..1, 0..2);
+        check(1..2, 1..3, 2..5);
+        check(2..3, 3..4, 5..6);
+
+        // Invisible items in a preamble that we are taking (regressing a previous failure)
+        let rep = Some(vec![0, 0, 1, 0, 1, 1]);
+        let def = Some(vec![0, 1, 0, 0, 0, 0]);
+        let max_rep = 1;
+        let max_visible_def = 0;
+        let total_items = 5;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Take,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..0, 0..1, 0..2);
+        check(0..1, 0..3, 0..4);
+        check(0..2, 0..4, 0..5);
+
+        // Skip preamble (with invis items) and skip a few rows (with invis items)
+        // and then take a few rows but not all the rows
+        let rep = Some(vec![0, 1, 0, 1, 0, 1, 0, 1]);
+        let def = Some(vec![1, 0, 1, 1, 0, 0, 0, 0]);
+        let max_rep = 1;
+        let max_visible_def = 0;
+        let total_items = 5;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Skip,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(2..3, 2..4, 5..7);
     }
 
     #[test]
@@ -5019,7 +5150,6 @@ mod tests {
     #[tokio::test]
     async fn test_fullzip_repetition_index_caching() {
         use crate::testing::SimulatedScheduler;
-        use lance_core::cache::LanceCache;
 
         // Simplified FixedPerValueDecompressor for testing
         #[derive(Debug)]
@@ -5058,7 +5188,7 @@ mod tests {
 
         let data = bytes::Bytes::from(full_data);
         let io = Arc::new(SimulatedScheduler::new(data));
-        let _cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        let _cache = Arc::new(lance_core::cache::LanceCache::with_capacity(1024 * 1024));
 
         // Create FullZipScheduler with repetition index
         let mut scheduler = FullZipScheduler {
@@ -5285,7 +5415,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_file_version(LanceFileVersion::V2_1)
+            .with_min_file_version(LanceFileVersion::V2_1)
             .with_batch_size(100)
             .with_range(0..num_rows.min(500) as u64)
             .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);

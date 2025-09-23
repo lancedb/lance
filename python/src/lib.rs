@@ -23,6 +23,8 @@
 #![allow(clippy::useless_conversion)]
 
 use std::env;
+use std::fs::OpenOptions;
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use std::ffi::CString;
@@ -78,6 +80,7 @@ pub(crate) mod transaction;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
+use crate::file::LanceFileSession;
 use crate::fragment::{write_fragments, write_fragments_transaction};
 use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
@@ -124,12 +127,70 @@ pub fn init_logging(mut log_builder: Builder) {
     log::set_max_level(max_level);
 }
 
+fn set_timestamp_precision(builder: &mut env_logger::Builder) {
+    if let Ok(timestamp_precision) = env::var("LANCE_LOG_TS_PRECISION") {
+        match timestamp_precision.as_str() {
+            "ns" => {
+                builder.format_timestamp_nanos();
+            }
+            "us" => {
+                builder.format_timestamp_micros();
+            }
+            "ms" => {
+                builder.format_timestamp_millis();
+            }
+            "s" => {
+                builder.format_timestamp_secs();
+            }
+            _ => {
+                // Can't log here because logging is not initialized yet
+                println!(
+                    "Invalid timestamp precision (valid values: ns, us, ms, s): {}, using default",
+                    timestamp_precision
+                );
+            }
+        };
+    }
+}
+
+fn set_log_file_target(builder: &mut env_logger::Builder) {
+    if let Ok(log_file_path) = env::var("LANCE_LOG_FILE") {
+        let path = Path::new(&log_file_path);
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                println!(
+                    "Failed to create parent directories for log file '{}': {}, using stderr",
+                    log_file_path, e
+                );
+                return;
+            }
+        }
+
+        // Try to open/create the log file
+        match OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                println!(
+                    "Failed to open log file '{}': {}, using stderr",
+                    log_file_path, e
+                );
+            }
+        }
+    }
+}
+
 #[pymodule]
 fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
-    let log_builder = env_logger::Builder::from_env(env);
+    let mut log_builder = env_logger::Builder::from_env(env);
+    set_timestamp_precision(&mut log_builder);
+    set_log_file_target(&mut log_builder);
     init_logging(log_builder);
 
     m.add_class::<FFILanceTableProvider>()?;
@@ -142,6 +203,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileSession>()?;
     m.add_class::<LanceFileMetadata>()?;
     m.add_class::<LanceFileStatistics>()?;
     m.add_class::<LanceColumnMetadata>()?;

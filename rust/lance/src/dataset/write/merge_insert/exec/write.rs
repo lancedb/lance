@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, RecordBatch, UInt64Array, UInt8Array};
@@ -20,7 +21,9 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{stream, StreamExt};
 use roaring::RoaringTreemap;
 
+use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
+use crate::dataset::write::merge_insert::create_duplicate_row_error;
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
@@ -49,15 +52,21 @@ struct MergeState {
     metrics: MergeInsertMetrics,
     /// Whether the dataset uses stable row ids.
     stable_row_ids: bool,
+    /// Set to track processed row IDs to detect duplicates
+    processed_row_ids: HashSet<u64>,
+    /// The "on" column names for merge operation
+    on_columns: Vec<String>,
 }
 
 impl MergeState {
-    fn new(metrics: MergeInsertMetrics, stable_row_ids: bool) -> Self {
+    fn new(metrics: MergeInsertMetrics, stable_row_ids: bool, on_columns: Vec<String>) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(stable_row_ids))),
             metrics,
             stable_row_ids,
+            processed_row_ids: HashSet::new(),
+            on_columns,
         }
     }
 
@@ -68,6 +77,7 @@ impl MergeState {
         row_idx: usize,
         row_addr_array: &UInt64Array,
         row_id_array: &UInt64Array,
+        batch: &RecordBatch,
     ) -> DFResult<Option<usize>> {
         match action {
             Action::Delete => {
@@ -83,13 +93,17 @@ impl MergeState {
                 // Update action - delete old row AND insert new data
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
+                    let row_id = row_id_array.value(row_idx);
+
+                    // Check for duplicate _rowid in the current merge operation
+                    if !self.processed_row_ids.insert(row_id) {
+                        return Err(create_duplicate_row_error(batch, row_idx, &self.on_columns));
+                    }
+
                     self.delete_row_addrs.insert(row_addr);
 
                     if self.stable_row_ids {
-                        self.updating_row_ids
-                            .lock()
-                            .unwrap()
-                            .capture(&[row_id_array.value(row_idx)])?;
+                        self.updating_row_ids.lock().unwrap().capture(&[row_id])?;
                     }
                     // Don't count as actual delete - this is an update
                 }
@@ -238,7 +252,7 @@ impl FullSchemaMergeInsertExec {
                 })?;
 
                 if merge_state
-                    .process_row_action(action, row_idx, row_addr_array, row_id_array)?
+                    .process_row_action(action, row_idx, row_addr_array, row_id_array, &batch)?
                     .is_some()
                 {
                     keep_rows.push(row_idx as u32);
@@ -609,7 +623,7 @@ impl FullSchemaMergeInsertExec {
                 })?;
 
                 if merge_state
-                    .process_row_action(action, row_idx, row_addr_array, row_id_array)?
+                    .process_row_action(action, row_idx, row_addr_array, row_id_array, batch)?
                     .is_some()
                 {
                     match action {
@@ -780,6 +794,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let merge_state = Arc::new(Mutex::new(MergeState::new(
             MergeInsertMetrics::new(&self.metrics, partition),
             self.dataset.manifest.uses_stable_row_ids(),
+            self.params.on.clone(),
         )));
         let write_data_stream =
             self.create_filtered_write_stream(input_stream, merge_state.clone())?;
@@ -789,7 +804,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
-        let mem_wal_to_flush = self.params.mem_wal_to_flush.clone();
+        let mem_wal_to_merge = self.params.mem_wal_to_merge.clone();
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
             state.updating_row_ids.clone()
@@ -853,7 +868,14 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
-                mem_wal_to_flush,
+                mem_wal_to_merge,
+                fields_for_preserving_frag_bitmap: dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .map(|f| f.id as u32)
+                    .collect(),
+                update_mode: Some(RewriteRows),
             };
 
             // Step 5: Create and store the transaction
@@ -898,5 +920,61 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             empty_schema,
             result_stream,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::UInt64Array;
+
+    #[test]
+    fn test_merge_state_duplicate_rowid_detection() {
+        let metrics = MergeInsertMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let mut merge_state = MergeState::new(metrics, false, Vec::new());
+
+        let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
+        let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
+
+        let result1 = merge_state.process_row_action(
+            Action::UpdateAll,
+            0,
+            &row_addr_array,
+            &row_id_array,
+            &RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+        );
+        assert!(result1.is_ok(), "First call should succeed");
+
+        let result2 = merge_state.process_row_action(
+            Action::UpdateAll,
+            1,
+            &row_addr_array,
+            &row_id_array,
+            &RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+        );
+        assert!(
+            result2.is_err(),
+            "Second call with duplicate _rowid should fail"
+        );
+
+        let error_msg = result2.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Ambiguous merge insert")
+                && error_msg.contains("multiple source rows"),
+            "Error message should mention ambiguous merge insert and multiple source rows, got: {}",
+            error_msg
+        );
+
+        let result3 = merge_state.process_row_action(
+            Action::UpdateAll,
+            2,
+            &row_addr_array,
+            &row_id_array,
+            &RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+        );
+        assert!(
+            result3.is_ok(),
+            "Third call with different _rowid should succeed"
+        );
     }
 }

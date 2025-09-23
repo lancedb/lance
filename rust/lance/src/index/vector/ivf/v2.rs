@@ -23,7 +23,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, TryStreamExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, Result, ROW_ID};
@@ -119,7 +119,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     distance_type: DistanceType,
 
-    index_cache: LanceCache,
+    index_cache: WeakLanceCache,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -226,7 +226,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
-            index_cache,
+            index_cache: WeakLanceCache::from(&index_cache),
             _marker: PhantomData,
         })
     }
@@ -632,23 +632,20 @@ mod tests {
     use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, Float32Array,
-        Int64Array, ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
+        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
-    use crate::index::{vector::is_ivf_hnsw, DatasetIndexInternalExt};
+    use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexInternalExt;
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         dataset::optimize::{compact_files, CompactionOptions},
-        index::vector::{is_ivf_pq, IndexFileVersion},
-    };
-    use crate::{
-        dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams},
-        index::vector::is_ivf_flat,
+        index::vector::IndexFileVersion,
     };
     use crate::{index::vector::VectorIndexParams, Dataset};
     use lance_core::cache::LanceCache;
@@ -664,8 +661,7 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::{
-        ivf::storage::IvfModel, pq::storage::ProductQuantizationMetadata,
-        storage::STORAGE_METADATA_KEY,
+        pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
     use lance_index::{metrics::NoOpMetricsCollector, INDEX_AUXILIARY_FILE_NAME};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
@@ -872,9 +868,10 @@ mod tests {
                 )
                 .await;
 
+                let index_type = params.index_type();
                 // *_FLAT doesn't support float16/float64
-                if !(is_ivf_flat(&params.stages) // IVF_FLAT
-                    || (is_ivf_hnsw(&params.stages) && params.stages.len() == 2)) // IVF_HNSW_FLAT
+                if !(index_type == IndexType::IvfFlat
+                    || (index_type == IndexType::IvfHnswFlat && params.stages.len() == 2)) // IVF_HNSW_FLAT
                     && dataset.is_none()
                 // if dataset is provided, it has been created, so the data type is already determined, no need to test float64
                 {
@@ -925,7 +922,7 @@ mod tests {
 
         if params.stages.len() > 1
             && matches!(params.version, IndexFileVersion::V3)
-            && is_ivf_pq(&params.stages)
+            && params.index_type() == IndexType::IvfPq
         {
             let index = dataset.load_indices().await.unwrap();
             assert_eq!(index.len(), 1);
@@ -947,10 +944,10 @@ mod tests {
     async fn test_remap(params: VectorIndexParams, nlist: usize) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_remap_impl::<UInt8Type>(params, nlist, 0..4).await;
+                Box::pin(test_remap_impl::<UInt8Type>(params, nlist, 0..4)).await;
             }
             _ => {
-                test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+                Box::pin(test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0)).await;
             }
         }
     }
@@ -1051,137 +1048,6 @@ mod tests {
         assert_eq!(results.num_rows(), 1);
     }
 
-    async fn test_optimize_strategy(params: VectorIndexParams) {
-        match params.metric_type {
-            DistanceType::Hamming => {
-                test_optimize_strategy_impl::<UInt8Type>(params, 0..4).await;
-            }
-            _ => {
-                test_optimize_strategy_impl::<Float32Type>(params, 0.0..1.0).await;
-            }
-        }
-    }
-
-    async fn test_optimize_strategy_impl<T: ArrowPrimitiveType>(
-        params: VectorIndexParams,
-        range: Range<T::Native>,
-    ) where
-        T::Native: SampleUniform,
-    {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, _) = generate_test_dataset::<T>(test_uri, range.clone()).await;
-
-        let vector_column = "vector";
-        dataset
-            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
-            .await
-            .unwrap();
-
-        async fn get_ivf_models(dataset: &Dataset) -> Vec<IvfModel> {
-            let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
-            let mut ivf_models = vec![];
-            for idx in indices {
-                let index = dataset
-                    .open_vector_index(
-                        "vector",
-                        idx.uuid.to_string().as_str(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await
-                    .unwrap();
-                ivf_models.push(index.ivf_model().clone());
-            }
-            ivf_models
-        }
-
-        async fn get_losses(dataset: &Dataset) -> Vec<Option<f64>> {
-            let stats = dataset.index_statistics("vector_idx").await.unwrap();
-            let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
-            stats["indices"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|s| s.get("loss").map(|l| l.as_f64()))
-                .collect()
-        }
-
-        async fn get_avg_loss(dataset: &Dataset) -> f64 {
-            let losses = get_losses(dataset).await;
-            let total_loss = losses.iter().filter_map(|l| *l).sum::<f64>();
-            let num_rows = dataset.count_rows(None).await.unwrap();
-            total_loss / num_rows as f64
-        }
-
-        const AVG_LOSS_RETRAIN_THRESHOLD: f64 = 1.1;
-        let original_ivfs = get_ivf_models(&dataset).await;
-        let original_avg_loss = get_avg_loss(&dataset).await;
-        let original_ivf = &original_ivfs[0];
-        let mut count = 0;
-        #[allow(unused_assignments)]
-        let mut last_avg_loss = original_avg_loss;
-        // append more rows and make delta index until hitting the retrain threshold
-        loop {
-            let range = match count {
-                0 => range.clone(),
-                _ => match params.metric_type {
-                    DistanceType::Hamming => range.start..range.end.add_wrapping(range.end),
-                    _ => range.end.neg_wrapping()..range.start,
-                },
-            };
-            append_dataset::<T>(&mut dataset, NUM_ROWS / 5, range).await;
-            dataset
-                .optimize_indices(&OptimizeOptions::append())
-                .await
-                .unwrap();
-            count += 1;
-
-            last_avg_loss = get_avg_loss(&dataset).await;
-            if last_avg_loss / original_avg_loss >= AVG_LOSS_RETRAIN_THRESHOLD {
-                if count <= 1 {
-                    // the first append is with the same data distribution, so the loss should be
-                    // very close to the original loss, then it shouldn't hit the retrain threshold
-                    panic!(
-                        "retrain threshold {} should not be hit",
-                        AVG_LOSS_RETRAIN_THRESHOLD
-                    );
-                }
-
-                break;
-            }
-            if count >= 10 {
-                panic!(
-                    "failed to hit the retrain threshold {} < {}",
-                    last_avg_loss / original_avg_loss,
-                    AVG_LOSS_RETRAIN_THRESHOLD
-                );
-            }
-
-            // all delta indices should have the same centroids as the original index
-            let ivf_models = get_ivf_models(&dataset).await;
-            assert_eq!(ivf_models.len(), count + 1);
-            for ivf in ivf_models {
-                assert_eq!(original_ivf.centroids, ivf.centroids);
-            }
-        }
-
-        // this optimize would merge all indices and retrain the IVF
-        dataset
-            .optimize_indices(&OptimizeOptions::retrain())
-            .await
-            .unwrap();
-        let stats = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
-        assert_eq!(stats["num_indices"], 1);
-
-        let ivf_models = get_ivf_models(&dataset).await;
-        let ivf = &ivf_models[0];
-        assert_ne!(original_ivf.centroids, ivf.centroids);
-        if ivf.num_partitions() > 1 && params.metric_type != DistanceType::Hamming {
-            assert_lt!(get_avg_loss(&dataset).await, last_avg_loss);
-        }
-    }
-
     async fn test_delete_all_rows(params: VectorIndexParams) {
         match params.metric_type {
             DistanceType::Hamming => {
@@ -1279,7 +1145,6 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params.clone()).await;
         test_delete_all_rows(params).await;
     }
 
@@ -1328,7 +1193,6 @@ mod tests {
         }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params.clone()).await;
         test_delete_all_rows(params).await;
     }
 
@@ -1349,8 +1213,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1370,8 +1233,7 @@ mod tests {
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
-        test_remap(params.clone(), nlist).await;
-        test_optimize_strategy(params).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -1389,9 +1251,8 @@ mod tests {
         let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+            test_index_multivec(params, nlist, recall_requirement).await;
         }
-        test_optimize_strategy(params).await;
     }
 
     #[rstest]
@@ -1418,7 +1279,6 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_distance_range(Some(params.clone()), nlist).await;
-        test_optimize_strategy(params.clone()).await;
         test_delete_all_rows(params).await;
     }
 
@@ -1443,9 +1303,8 @@ mod tests {
         );
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+            test_index_multivec(params, nlist, recall_requirement).await;
         }
-        test_optimize_strategy(params).await;
     }
 
     #[rstest]
@@ -1469,9 +1328,8 @@ mod tests {
         );
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
-            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+            test_index_multivec(params, nlist, recall_requirement).await;
         }
-        test_optimize_strategy(params).await;
     }
 
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
@@ -1825,12 +1683,13 @@ mod tests {
             .await
             .unwrap();
         if dist_type != DistanceType::Hamming {
-            assert_eq!(exclude_last_res.num_rows(), k - 1);
+            let excluded_count = dists.iter().filter(|d| *d == dists.last().unwrap()).count();
+            assert_eq!(exclude_last_res.num_rows(), k - excluded_count);
             let res_row_ids = exclude_last_res[ROW_ID]
                 .as_primitive::<UInt64Type>()
                 .values();
             row_ids.iter().enumerate().for_each(|(i, id)| {
-                if i < k - 1 {
+                if i < k - excluded_count {
                     assert_eq!(res_row_ids[i], *id);
                 }
             });

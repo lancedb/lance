@@ -11,7 +11,7 @@ use crate::{
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
-    repdef::RepDefBuilder,
+    repdef::{CompositeRepDefUnraveler, RepDefBuilder},
 };
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Fields};
@@ -21,8 +21,8 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
-use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_arrow::FieldExt;
+use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
 use lance_core::Result;
 use log::trace;
 
@@ -69,6 +69,7 @@ struct RepDefStructSchedulingJob<'a> {
     /// A min-heap whose key is the # of rows currently scheduled
     children: BinaryHeap<StructuralSchedulingJobWithStatus<'a>>,
     rows_scheduled: u64,
+    num_rows: u64,
 }
 
 impl<'a> RepDefStructSchedulingJob<'a> {
@@ -91,6 +92,7 @@ impl<'a> RepDefStructSchedulingJob<'a> {
         Self {
             children,
             rows_scheduled: 0,
+            num_rows,
         }
     }
 }
@@ -100,6 +102,18 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
         &mut self,
         mut context: &mut SchedulerContext,
     ) -> Result<Option<ScheduledScanLine>> {
+        if self.children.is_empty() {
+            // Special path for empty structs
+            if self.rows_scheduled == self.num_rows {
+                return Ok(None);
+            }
+            self.rows_scheduled = self.num_rows;
+            return Ok(Some(ScheduledScanLine {
+                decoders: Vec::new(),
+                rows_scheduled: self.num_rows,
+            }));
+        }
+
         let mut decoders = Vec::new();
         let old_rows_scheduled = self.rows_scheduled;
         // Schedule as many children as we need to until we have scheduled at least one
@@ -153,7 +167,6 @@ pub struct StructuralStructScheduler {
 
 impl StructuralStructScheduler {
     pub fn new(children: Vec<Box<dyn StructuralFieldScheduler>>, child_fields: Fields) -> Self {
-        debug_assert!(!children.is_empty());
         Self {
             children,
             child_fields,
@@ -284,6 +297,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
             is_root: self.is_root,
+            num_rows,
         }))
     }
 
@@ -297,10 +311,18 @@ struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
     is_root: bool,
+    num_rows: u64,
 }
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        if self.children.is_empty() {
+            return Ok(DecodedArray {
+                array: Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
+                repdef: CompositeRepDefUnraveler::new(vec![]),
+            });
+        }
+
         let arrays = self
             .children
             .into_iter()
@@ -361,12 +383,14 @@ impl FieldEncoder for StructStructuralEncoder {
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_array = array.as_struct();
+        let mut struct_array = struct_array.normalize_slicing()?;
         if let Some(validity) = struct_array.nulls() {
             if self.keep_original_array {
                 repdef.add_validity_bitmap(validity.clone())
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap())
             }
+            struct_array = struct_array.pushdown_nulls()?;
         } else {
             repdef.add_no_null(struct_array.len());
         }
@@ -528,13 +552,13 @@ mod tests {
 
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
-        Array, ArrayRef, Int32Array, StructArray,
+        Array, ArrayRef, Int32Array, ListArray, StructArray,
     };
-    use arrow_buffer::NullBuffer;
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
 
@@ -545,7 +569,7 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -595,9 +619,71 @@ mod tests {
             Some(rows_validity),
         );
 
-        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
 
         check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_masked_nonempty_list() {
+        // [[1, 2], [NULL], [4], [], NULL, NULL-STRUCT]
+        //
+        let items = Int32Array::from(vec![Some(1), Some(2), None, Some(4), Some(5), Some(6)]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 3, 4, 4, 4, 5]));
+        let list_validity = BooleanBuffer::from(vec![true, true, true, true, false, true]);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(items),
+            Some(NullBuffer::new(list_validity)),
+        );
+        let struct_validity = BooleanBuffer::from(vec![true, true, true, true, true, false]);
+        let struct_array = StructArray::new(
+            Fields::from(vec![Field::new(
+                "inner_list",
+                list_array.data_type().clone(),
+                true,
+            )]),
+            vec![Arc::new(list_array)],
+            Some(NullBuffer::new(struct_validity)),
+        );
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(struct_array)],
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_struct_list() {
+        // [[1, 2], [NULL], [4], [], NULL, NULL-STRUCT]
+        //
+        let items = Int32Array::from(vec![Some(1), Some(2), None, Some(4)]);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 3, 4, 4, 4, 4]));
+        let list_validity = BooleanBuffer::from(vec![true, true, true, true, false, true]);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            offsets,
+            Arc::new(items),
+            Some(NullBuffer::new(list_validity)),
+        );
+        let struct_validity = BooleanBuffer::from(vec![true, true, true, true, true, false]);
+        let struct_array = StructArray::new(
+            Fields::from(vec![Field::new(
+                "inner_list",
+                list_array.data_type().clone(),
+                true,
+            )]),
+            vec![Arc::new(list_array)],
+            Some(NullBuffer::new(struct_validity)),
+        );
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(struct_array)],
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -611,7 +697,7 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -620,7 +706,7 @@ mod tests {
         // make sure we support that
         let data_type = DataType::Struct(Fields::from(Vec::<Field>::default()));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -642,7 +728,7 @@ mod tests {
             Field::new("outer_binary", DataType::Binary, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
