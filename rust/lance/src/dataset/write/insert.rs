@@ -293,7 +293,7 @@ impl<'a> InsertBuilder<'a> {
         match (&context.params.mode, &context.dest) {
             (WriteMode::Create, WriteDestination::Dataset(ds)) => {
                 return Err(Error::DatasetAlreadyExists {
-                    uri: ds.uri().clone(),
+                    uri: ds.uri.clone(),
                     location: location!(),
                 });
             }
@@ -386,7 +386,7 @@ impl<'a> InsertBuilder<'a> {
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
-                dataset.base().clone(),
+                dataset.base.clone(),
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {

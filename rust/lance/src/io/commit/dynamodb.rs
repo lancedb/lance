@@ -320,7 +320,7 @@ mod test {
             base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
             .rename(
-                &ManifestNamingScheme::V1.manifest_path(ds.base(), 6),
+                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
                 &version_six_staging_location,
             )
             .await
@@ -332,7 +332,7 @@ mod test {
             .size as u64;
         store
             .put_if_exists(
-                ds.base().as_ref(),
+                ds.base.as_ref(),
                 6,
                 version_six_staging_location.as_ref(),
                 size,

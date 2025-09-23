@@ -150,7 +150,7 @@ impl<'a> CleanupTask<'a> {
         let inspection = Mutex::new(CleanupInspection::default());
         self.dataset
             .commit_handler
-            .list_manifest_locations(self.dataset.base(), &self.dataset.object_store, false)
+            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
@@ -225,15 +225,15 @@ impl<'a> CleanupTask<'a> {
         for fragment in manifest.fragments.iter() {
             for file in fragment.files.iter() {
                 let full_data_path = self.dataset.data_dir().child(file.path.as_str());
-                let relative_data_path = remove_prefix(&full_data_path, self.dataset.base());
+                let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
                 referenced_files.data_paths.insert(relative_data_path);
             }
             let delpath = fragment
                 .deletion_file
                 .as_ref()
-                .map(|delfile| deletion_file_path(self.dataset.base(), fragment.id, delfile));
+                .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
             if let Some(delpath) = delpath {
-                let relative_path = remove_prefix(&delpath, self.dataset.base());
+                let relative_path = remove_prefix(&delpath, &self.dataset.base);
                 referenced_files.delete_paths.insert(relative_path);
             }
         }
@@ -262,7 +262,7 @@ impl<'a> CleanupTask<'a> {
             .dataset
             .object_store
             .read_dir_all(
-                self.dataset.base(),
+                &self.dataset.base,
                 inspection.earliest_retained_manifest_time,
             )
             .try_filter_map(|obj_meta| {
@@ -326,7 +326,7 @@ impl<'a> CleanupTask<'a> {
         maybe_in_progress: bool,
         inspection: &CleanupInspection,
     ) -> Result<Option<Path>> {
-        let relative_path = remove_prefix(&path, self.dataset.base());
+        let relative_path = remove_prefix(&path, &self.dataset.base);
         if relative_path.as_ref().starts_with("_versions/.tmp") {
             // This is a temporary manifest file.
             //

@@ -730,7 +730,7 @@ async fn rewrite_files(
     let new_fragments = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
-        dataset.base(),
+        &dataset.base,
         dataset.schema().clone(),
         reader,
         params,

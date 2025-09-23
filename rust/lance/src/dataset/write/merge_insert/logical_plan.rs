@@ -39,7 +39,7 @@ impl PartialEq for MergeInsertWriteNode {
     fn eq(&self, other: &Self) -> bool {
         self.params == other.params
             && self.input == other.input
-            && self.dataset.dataset_location == other.dataset.dataset_location
+            && self.dataset.base == other.dataset.base
     }
 }
 
@@ -49,7 +49,7 @@ impl std::hash::Hash for MergeInsertWriteNode {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.params.hash(state);
         self.input.hash(state);
-        self.dataset.dataset_location.hash(state);
+        self.dataset.base.hash(state);
     }
 }
 

@@ -11,7 +11,7 @@ use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::dataset::dataset_location::DatasetLocation;
+use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version};
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -25,15 +25,17 @@ use std::io::ErrorKind;
 /// Lance Ref
 #[derive(Debug, Clone)]
 pub enum Ref {
-    // This is a global version identifier, if branch name is None, it points to the main branch
-    Version(Option<String>, u64),
+    // This is a global version identifier present as (branch_name, version_number)
+    // if branch_name is None, it points to the main branch
+    // if version_number is None, it points to the latest version
+    Version(Option<String>, Option<u64>),
     // Tag name points to the global version identifier, could be considered as an alias of specific global version
     Tag(String),
 }
 
 impl From<u64> for Ref {
     fn from(ref_: u64) -> Self {
-        Version(None, ref_)
+        Version(None, Some(ref_))
     }
 }
 
@@ -45,6 +47,18 @@ impl From<&str> for Ref {
 
 impl From<(&str, u64)> for Ref {
     fn from(_ref: (&str, u64)) -> Self {
+        Version(Some(_ref.0.to_string()), Some(_ref.1))
+    }
+}
+
+impl From<(Option<String>, Option<u64>)> for Ref {
+    fn from(_ref: (Option<String>, Option<u64>)) -> Self {
+        Version(_ref.0, _ref.1)
+    }
+}
+
+impl From<(&str, Option<u64>)> for Ref {
+    fn from(_ref: (&str, Option<u64>)) -> Self {
         Version(Some(_ref.0.to_string()), _ref.1)
     }
 }
@@ -53,11 +67,11 @@ impl fmt::Display for Ref {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Version(branch, version_number) => {
-                if let Some(name) = branch {
-                    write!(f, "{}:{}", name, version_number)
-                } else {
-                    write!(f, "Main:{}", version_number)
-                }
+                let branch_name = branch.as_deref().unwrap_or("Main");
+                let version_str = version_number
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "latest".to_string());
+                write!(f, "{}:{}", branch_name, version_str)
             }
             Tag(tag_name) => write!(f, "{}", tag_name),
         }
@@ -68,19 +82,19 @@ impl fmt::Display for Ref {
 pub struct Refs {
     pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) commit_handler: Arc<dyn CommitHandler>,
-    pub(crate) dataset_location: DatasetLocation,
+    pub(crate) base_location: BranchLocation,
 }
 
 impl Refs {
     pub fn new(
         object_store: Arc<ObjectStore>,
         commit_handler: Arc<dyn CommitHandler>,
-        dataset_location: DatasetLocation,
+        base_location: BranchLocation,
     ) -> Self {
         Self {
             object_store,
             commit_handler,
-            dataset_location,
+            base_location,
         }
     }
 
@@ -93,11 +107,11 @@ impl Refs {
     }
 
     pub fn base(&self) -> &Path {
-        self.dataset_location.base_path()
+        &self.base_location.path
     }
 
-    pub fn root(&self) -> &Path {
-        self.dataset_location.root_path()
+    pub fn root(&self) -> Result<BranchLocation> {
+        self.base_location.find_root()
     }
 }
 
@@ -127,7 +141,8 @@ impl Branches {
 
 impl Tags {
     pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
-        let base_path = base_tags_path(self.refs.root());
+        let root_location = self.refs.root()?;
+        let base_path = base_tags_path(&root_location.path);
         let tag_files = self.object_store().read_dir(base_path).await?;
 
         let tag_names: Vec<String> = tag_files
@@ -136,13 +151,12 @@ impl Tags {
             .map(|name| name.to_string())
             .collect_vec();
 
+        let root_path = &root_location.path;
         futures::stream::iter(tag_names)
             .map(|tag_name| async move {
-                let contents = TagContents::from_path(
-                    &tag_path(self.refs.root(), &tag_name),
-                    self.object_store(),
-                )
-                .await?;
+                let contents =
+                    TagContents::from_path(&tag_path(root_path, &tag_name), self.object_store())
+                        .await?;
                 Ok((tag_name, contents))
             })
             .buffer_unordered(10)
@@ -180,7 +194,8 @@ impl Tags {
     pub async fn get(&self, tag: &str) -> Result<TagContents> {
         check_valid_tag(tag)?;
 
-        let tag_file = tag_path(self.refs.root(), tag);
+        let root_location = self.refs.root()?;
+        let tag_file = tag_path(&root_location.path, tag);
 
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
@@ -205,8 +220,9 @@ impl Tags {
     ) -> Result<()> {
         check_valid_tag(tag)?;
 
+        let root_location = self.refs.root()?;
         let branch = branch.map(String::from);
-        let tag_file = tag_path(self.refs.root(), tag);
+        let tag_file = tag_path(&root_location.path, tag);
 
         if self.object_store().exists(&tag_file).await? {
             return Err(Error::RefConflict {
@@ -214,11 +230,15 @@ impl Tags {
             });
         }
 
-        let base_path = dataset_base_path(&self.refs.dataset_location, branch.clone())?;
+        let branch_location = self.refs.base_location.find_branch(branch.clone())?;
         let manifest_file = self
             .refs
             .commit_handler
-            .resolve_version_location(&base_path, version_number, &self.refs.object_store.inner)
+            .resolve_version_location(
+                &branch_location.path,
+                version_number,
+                &self.refs.object_store.inner,
+            )
             .await?;
 
         if !self.object_store().exists(&manifest_file.path).await? {
@@ -255,7 +275,8 @@ impl Tags {
     pub async fn delete(&mut self, tag: &str) -> Result<()> {
         check_valid_tag(tag)?;
 
-        let tag_file = tag_path(self.refs.root(), tag);
+        let root_location = self.refs.root()?;
+        let tag_file = tag_path(&root_location.path, tag);
 
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
@@ -280,7 +301,8 @@ impl Tags {
         check_valid_tag(tag)?;
 
         let branch = branch.map(String::from);
-        let tag_file = tag_path(self.refs.root(), tag);
+        let root_location = self.refs.root()?;
+        let tag_file = tag_path(&root_location.path, tag);
 
         if !self.object_store().exists(&tag_file).await? {
             return Err(Error::RefNotFound {
@@ -288,11 +310,15 @@ impl Tags {
             });
         }
 
-        let base_path = dataset_base_path(&self.refs.dataset_location, branch.clone())?;
+        let target_branch_location = self.refs.base_location.find_branch(branch.clone())?;
         let manifest_file = self
             .refs
             .commit_handler
-            .resolve_version_location(&base_path, version_number, &self.refs.object_store.inner)
+            .resolve_version_location(
+                &target_branch_location.path,
+                version_number,
+                &self.refs.object_store.inner,
+            )
             .await?;
 
         if !self.object_store().exists(&manifest_file.path).await? {
@@ -325,7 +351,8 @@ impl Tags {
 
 impl Branches {
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
-        let base_path = base_branches_contents_path(self.refs.root());
+        let root_location = self.refs.root()?;
+        let base_path = base_branches_contents_path(&root_location.path);
         let branch_files = self.object_store().read_dir(base_path).await?;
 
         let branch_names: Vec<String> = branch_files
@@ -343,10 +370,11 @@ impl Branches {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let branch_path = &root_location.path;
         futures::stream::iter(branch_names)
             .map(|name| async move {
                 let contents = BranchContents::from_path(
-                    &branch_contents_path(self.refs.root(), &name),
+                    &branch_contents_path(branch_path, &name),
                     self.object_store(),
                 )
                 .await?;
@@ -366,7 +394,8 @@ impl Branches {
     pub async fn get(&self, branch: &str) -> Result<BranchContents> {
         check_valid_branch(branch)?;
 
-        let branch_file = branch_contents_path(self.refs.root(), branch);
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch);
 
         if !self.object_store().exists(&branch_file).await? {
             return Err(Error::RefNotFound {
@@ -388,19 +417,24 @@ impl Branches {
         check_valid_branch(branch_name)?;
 
         let source_branch = source_branch.map(String::from);
-        let branch_file = branch_contents_path(self.refs.root(), branch_name);
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch_name);
         if self.object_store().exists(&branch_file).await? {
             return Err(Error::RefConflict {
                 message: format!("branch {} already exists", branch_name),
             });
         }
 
-        let base_path = dataset_base_path(&self.refs.dataset_location, source_branch.clone())?;
+        let branch_location = self.refs.base_location.find_branch(source_branch.clone())?;
         // Verify the source version exists
         let manifest_file = self
             .refs
             .commit_handler
-            .resolve_version_location(&base_path, version_number, &self.refs.object_store.inner)
+            .resolve_version_location(
+                &branch_location.path,
+                version_number,
+                &self.refs.object_store.inner,
+            )
             .await?;
 
         if !self.object_store().exists(&manifest_file.path).await? {
@@ -432,7 +466,8 @@ impl Branches {
     pub async fn delete(&mut self, branch: &str) -> Result<()> {
         check_valid_branch(branch)?;
 
-        let branch_file = branch_contents_path(self.refs.root(), branch);
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch);
         if !self.object_store().exists(&branch_file).await? {
             return Err(Error::RefNotFound {
                 message: format!("branch {} does not exist", branch),
@@ -467,7 +502,7 @@ impl Branches {
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
 
         if let Some(delete_path) =
-            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.dataset_location)?
+            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?
         {
             if let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await {
                 match &e {
@@ -492,7 +527,7 @@ impl Branches {
     fn get_cleanup_path(
         branch: &str,
         remaining_branches: &[&str],
-        dataset_location: &DatasetLocation,
+        base_location: &BranchLocation,
     ) -> Result<Option<Path>> {
         let mut longest_used_length = 0;
         for &candidate in remaining_branches {
@@ -518,9 +553,9 @@ impl Branches {
         let unused_dir = &branch[used_relative_path.len()..].trim_start_matches('/');
         if let Some(sub_dir) = unused_dir.split('/').next() {
             let relative_dir = format!("{}/{}", used_relative_path, sub_dir);
-            // Use dataset_location to generate the cleanup path
-            let dir_location = dataset_location.switch_branch(Some(relative_dir))?;
-            Ok(Some(dir_location.base_path().clone()))
+            // Use base_location to generate the cleanup path
+            let completed_dir = base_location.find_branch(Some(relative_dir))?;
+            Ok(Some(completed_dir.path))
         } else {
             Ok(None)
         }
@@ -559,20 +594,6 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
 // Note: child will encode '/' to '%2F'
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).child(format!("{}.json", branch))
-}
-
-pub fn dataset_base_path(
-    dataset_location: &DatasetLocation,
-    branch: Option<String>,
-) -> Result<Path> {
-    if let Some(branch_name) = branch {
-        dataset_location
-            .switch_branch(Some(branch_name))
-            .map(|location| location.base_path().clone())
-    } else {
-        // current workspace may not be the root
-        Ok(dataset_location.root_path().clone())
-    }
 }
 
 async fn from_path<T>(path: &Path, object_store: &ObjectStore) -> Result<T>
@@ -917,15 +938,14 @@ mod tests {
         #[case] expected_relative_cleanup_path: Option<&str>,
     ) {
         let dataset_root_dir = "file:///var/balabala/dataset1".to_string();
-        let dataset_location = DatasetLocation::new(
-            dataset_root_dir.clone(),
-            Path::from(dataset_root_dir),
-            Some("random_branch".to_string()),
-        )
-        .unwrap();
+        let base_location = BranchLocation {
+            path: Path::from(dataset_root_dir.clone()),
+            uri: dataset_root_dir.clone(),
+            branch: Some("random_branch".to_string()),
+        };
 
         let result =
-            Branches::get_cleanup_path(branch_to_delete, remaining_branches, &dataset_location)
+            Branches::get_cleanup_path(branch_to_delete, remaining_branches, &base_location)
                 .unwrap();
 
         match expected_relative_cleanup_path {
@@ -935,10 +955,10 @@ mod tests {
                     "Expected cleanup path but got None for branch: {}",
                     branch_to_delete
                 );
-                let expected_full_path = dataset_location
-                    .switch_branch(Some(expected_relative.to_string()))
+                let expected_full_path = base_location
+                    .find_branch(Some(expected_relative.to_string()))
                     .unwrap()
-                    .base_path()
+                    .path
                     .clone();
                 assert_eq!(result.unwrap().as_ref(), expected_full_path.as_ref());
             }

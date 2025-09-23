@@ -73,7 +73,7 @@ impl WriteDestination<'_> {
 
     pub fn uri(&self) -> String {
         match self {
-            WriteDestination::Dataset(dataset) => dataset.uri().clone(),
+            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
             WriteDestination::Uri(uri) => uri.to_string(),
         }
     }

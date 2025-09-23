@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
-use crate::dataset::dataset_location::DatasetLocation;
+use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
@@ -190,7 +190,7 @@ impl<'a> CommitBuilder<'a> {
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
-                dataset.base().clone(),
+                dataset.base.clone(),
                 dataset.commit_handler.clone(),
             ),
             WriteDestination::Uri(uri) => {
@@ -211,7 +211,6 @@ impl<'a> CommitBuilder<'a> {
                 if let Some(passed_store) = self.object_store {
                     object_store = passed_store;
                 }
-
                 (object_store, base_path, commit_handler)
             }
         };
@@ -383,25 +382,25 @@ impl<'a> CommitBuilder<'a> {
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => {
-                let dataset_location = DatasetLocation::new(
-                    uri.to_string(),
-                    base_path.clone(),
-                    manifest.branch.clone(),
-                )?;
                 let refs = Refs::new(
                     object_store.clone(),
                     commit_handler.clone(),
-                    dataset_location.clone(),
+                    BranchLocation {
+                        path: base_path.clone(),
+                        uri: uri.to_string(),
+                        branch: manifest.branch.clone(),
+                    },
                 );
                 Ok(Dataset {
                     object_store,
-                    dataset_location,
+                    base: base_path,
+                    uri: uri.to_string(),
                     manifest: Arc::new(manifest),
                     manifest_location,
                     session,
                     commit_handler,
-                    tags: refs.tags(),
                     branches: refs.branches(),
+                    tags: refs.tags(),
                     index_cache,
                     fragment_bitmap,
                     metadata_cache,

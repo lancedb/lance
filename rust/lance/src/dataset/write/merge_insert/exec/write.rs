@@ -815,7 +815,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let write_result = write_fragments_internal(
                 Some(&dataset),
                 dataset.object_store.clone(),
-                dataset.base(),
+                &dataset.base,
                 dataset.schema().clone(),
                 write_data_stream,
                 WriteParams::default(),

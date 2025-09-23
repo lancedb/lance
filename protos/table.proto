@@ -176,7 +176,7 @@ message Manifest {
   repeated BasePath base_paths = 18;
 
   // The branch of the dataset. None means main branch.
-  optional string branch = 19;
+  optional string branch = 20;
 } // Manifest
 
 // external dataset base path
