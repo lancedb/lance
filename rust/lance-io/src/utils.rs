@@ -21,6 +21,12 @@ use crate::{
     traits::ProtoStruct,
 };
 use crate::{traits::Reader, ReadBatchParams};
+use log::warn;
+#[allow(unused_imports)]
+use std::env;
+use std::collections::HashMap;
+use std::str::FromStr;
+use object_store::aws::AmazonS3ConfigKey;
 use lance_core::{Error, Result};
 
 /// Read a binary array from a [Reader].
@@ -137,6 +143,51 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let offset_bytes = bytes.slice(len - 16..len - 8);
     Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
 }
+
+/// https://docs.aws.amazon.com/sdkref/latest/guide/environment-variables.html
+pub fn check_and_override_env_vars(storage_options: &HashMap<String, String>) {
+    let env_keys = vec![
+        (AmazonS3ConfigKey::AccessKeyId, "AWS_ACCESS_KEY_ID"),
+        (AmazonS3ConfigKey::SecretAccessKey, "AWS_SECRET_ACCESS_KEY"),
+        (AmazonS3ConfigKey::Token, "AWS_SESSION_TOKEN"),
+        (AmazonS3ConfigKey::DefaultRegion, "AWS_DEFAULT_REGION"),
+        (AmazonS3ConfigKey::Bucket, "AWS_BUCKET"),
+        (AmazonS3ConfigKey::Region, "AWS_REGION"),
+        (AmazonS3ConfigKey::Endpoint, "AWS_ENDPOINT"),
+    ];
+
+    let mut key_mapping = HashMap::new();
+    for (key, value) in storage_options {
+        if let Ok(config_key) = AmazonS3ConfigKey::from_str(key) {
+            key_mapping.insert(config_key, value);
+        }
+    }
+
+    for (config_key, env_var) in env_keys {
+        if let Some(config_value) = key_mapping.get(&config_key) {
+            let short_var = env_var.trim_start_matches("AWS_");
+
+            let env_exists = env::var(env_var).is_ok() || env::var(short_var).is_ok();
+
+            if env_exists {
+                let env_val = env::var(env_var)
+                    .or_else(|_| env::var(short_var))
+                    .unwrap_or_default();
+
+                if env_val != *config_value {
+                    warn!(
+                        "Overriding environment variable '{}'/'{}' with config value '{}'",
+                        env_var, short_var, config_value
+                    );
+                }
+
+                env::remove_var(env_var);
+                env::remove_var(short_var);
+            }
+        }
+    }
+}
+
 
 /// Read the version from the footer bytes
 pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {

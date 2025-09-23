@@ -292,6 +292,39 @@ def test_versions(tmp_path: Path):
     assert isinstance(v2["metadata"], dict)
 
 
+def test_environment_variable_override(tmp_path: Path, monkeypatch, caplog):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "env_key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "env_secret")
+
+    storage_options = {
+        "aws_access_key_id": "config_key",
+        "aws_secret_access_key": "config_secret",
+    }
+    dataset = lance.write_dataset(
+        pa.table({"a": [1, 2]}),
+        tmp_path / "explicit_config",
+        storage_options=storage_options,
+    )
+
+    assert "Overriding mismatched" in caplog.text
+    assert os.environ.get("AWS_ACCESS_KEY_ID") is None
+
+    caplog.clear()
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "same_value")
+    storage_options = {"aws_access_key_id": "same_value"}
+    lance.write_dataset(
+        pa.table({"a": [3, 4]}),
+        tmp_path / "same_value",
+        storage_options=storage_options,
+    )
+    assert "Overriding mismatched" not in caplog.text
+
+    caplog.clear()
+    del storage_options["aws_access_key_id"]
+    lance.write_dataset(pa.table({"a": [5, 6]}), tmp_path / "env_only")
+    assert "AWS_ACCESS_KEY_ID" in os.environ
+
+
 def test_version_id(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"

@@ -61,6 +61,7 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 pub use providers::{ObjectStoreProvider, ObjectStoreRegistry};
+use crate::utils::check_and_override_env_vars;
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -624,6 +625,7 @@ impl StorageOptions {
     /// Create a new instance of [`StorageOptions`]
     pub fn new(options: HashMap<String, String>) -> Self {
         let mut options = options;
+        check_and_override_env_vars(&options);
         if let Ok(value) = std::env::var("AZURE_STORAGE_ALLOW_HTTP") {
             options.insert("allow_http".into(), value);
         }
