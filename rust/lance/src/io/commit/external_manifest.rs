@@ -320,20 +320,20 @@ mod test {
             base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
             .rename(
-                &ManifestNamingScheme::V1.manifest_path(ds.base(), 6),
+                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
                 &version_six_staging_location,
             )
             .await
             .unwrap();
         {
             inner_store.lock().await.insert(
-                (ds.base().to_string(), 6),
+                (ds.base.to_string(), 6),
                 version_six_staging_location.to_string(),
             );
         }
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
-            .list(Some(ds.base()))
+            .list(Some(&ds.base))
             .try_filter(|p| {
                 let p = p.clone();
                 async move { p.location.filename().unwrap().starts_with("6.manifest-") }
@@ -345,7 +345,7 @@ mod test {
         let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
         {
             inner_store.lock().await.insert(
-                (ds.base().to_string(), 6),
+                (ds.base.to_string(), 6),
                 version_six_staging_location.to_string(),
             );
         }

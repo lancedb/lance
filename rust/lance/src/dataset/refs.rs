@@ -847,7 +847,7 @@ mod tests {
         let version_ref: Ref = 42u64.into();
         match version_ref {
             Version(branch, v) => {
-                assert_eq!(v, 42);
+                assert_eq!(v, Some(42));
                 assert_eq!(branch, None)
             }
             _ => panic!("Expected Version variant"),
@@ -865,7 +865,7 @@ mod tests {
         match branch_ref {
             Version(name, version) => {
                 assert_eq!(name.unwrap(), "test_branch");
-                assert_eq!(version, 10);
+                assert_eq!(version, Some(10));
             }
             _ => panic!("Expected Branch variant"),
         }
