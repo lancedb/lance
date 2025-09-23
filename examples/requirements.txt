@@ -1,0 +1,3 @@
+nuscenes-devkit
+pyarrow
+lance
