@@ -24,7 +24,7 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
 use datafusion_physical_plan::Statistics;
 use futures::stream::BoxStream;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{future, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
@@ -345,6 +345,8 @@ struct FilteredReadStream {
     active_partitions_counter: Arc<AtomicUsize>,
     /// The threading mode for the scan
     threading_mode: FilteredReadThreadingMode,
+    /// Options including limit information
+    options: FilteredReadOptions,
 }
 
 impl std::fmt::Debug for FilteredReadStream {
@@ -401,7 +403,7 @@ impl FilteredReadStream {
         let scheduler_config = SchedulerConfig::max_bandwidth(obj_store.as_ref());
         let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
 
-        let scoped_fragments = Self::plan_scan(
+        let (scoped_fragments, options) = Self::plan_scan(
             dataset.as_ref(),
             loaded_fragments,
             &evaluated_index,
@@ -411,9 +413,16 @@ impl FilteredReadStream {
         )
         .await?;
 
+        let fragment_limit = if !options.scan_planned_with_limit_pushed_down {
+            options.scan_range_after_filter.as_ref().map(|r| r.end)
+        } else {
+            None
+        };
+
         let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map(|scoped_fragment| {
-                tokio::task::spawn(Self::read_fragment(scoped_fragment))
+            .map(move |scoped_fragment| {
+                let limit = fragment_limit;
+                tokio::task::spawn(Self::read_fragment(scoped_fragment, limit))
                     .map(|thread_result| thread_result.unwrap())
             })
             .buffered(fragment_readahead);
@@ -426,6 +435,7 @@ impl FilteredReadStream {
             metrics: Arc::new(global_metrics),
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
+            options,
         })
     }
 
@@ -476,12 +486,12 @@ impl FilteredReadStream {
         dataset: &Dataset,
         fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
-        options: FilteredReadOptions,
+        mut options: FilteredReadOptions,
         global_metrics: &FilteredReadGlobalMetrics,
         scan_scheduler: Arc<ScanScheduler>,
-    ) -> Result<Vec<ScopedFragmentRead>> {
+    ) -> Result<(Vec<ScopedFragmentRead>, FilteredReadOptions)> {
         let mut scoped_fragments = Vec::with_capacity(fragments.len());
-        let projection = Arc::new(options.projection);
+        let projection = Arc::new(options.projection.clone());
 
         // The current offset, includes filtered rows, but not deleted rows
         let mut range_offset = 0;
@@ -491,8 +501,8 @@ impl FilteredReadStream {
         // know the number of filtered rows up front
         let mut _filtered_range_offset = Some(0);
 
-        let refine_filter = options.refine_filter;
-        let full_filter = options.full_filter;
+        let refine_filter = options.refine_filter.clone();
+        let full_filter = options.full_filter.clone();
 
         for (
             priority,
@@ -614,15 +624,16 @@ impl FilteredReadStream {
         }
 
         if let Some(range_after_filter) = &options.scan_range_after_filter {
-            Self::apply_scan_range_after_filter(
+            let pushed_down = Self::apply_scan_range_after_filter(
                 &mut scoped_fragments,
                 range_after_filter,
                 &refine_filter,
                 evaluated_index.as_ref(),
             );
+            options.scan_planned_with_limit_pushed_down = pushed_down;
         }
 
-        Ok(scoped_fragments)
+        Ok((scoped_fragments, options))
     }
 
     fn apply_scan_range_after_filter(
@@ -630,9 +641,9 @@ impl FilteredReadStream {
         range_after_filter: &Range<u64>,
         refine_filter: &Option<Expr>,
         evaluated_index: Option<&Arc<EvaluatedIndex>>,
-    ) {
+    ) -> bool {
         if refine_filter.is_some() || evaluated_index.is_none() {
-            return;
+            return false;
         }
 
         let evaluated_index = evaluated_index.unwrap();
@@ -640,6 +651,7 @@ impl FilteredReadStream {
         match &evaluated_index.index_result {
             IndexExprResult::Exact(_) => {
                 Self::trim_fragments_to_range(scoped_fragments, range_after_filter);
+                true
             }
             IndexExprResult::AtLeast(_) => {
                 // For AtLeast, check if total guaranteed rows >= end of range
@@ -650,10 +662,14 @@ impl FilteredReadStream {
 
                 if total_guaranteed >= range_after_filter.end {
                     Self::trim_fragments_to_range(scoped_fragments, range_after_filter);
+                    true
+                } else {
+                    false
                 }
             }
             _ => {
                 // Cannot optimize AtMost or other cases
+                false
             }
         }
     }
@@ -886,7 +902,7 @@ impl FilteredReadStream {
                     }
                 });
                 let partition_metrics_clone = partition_metrics.clone();
-                let batch_stream = futures_stream
+                let base_batch_stream = futures_stream
                     .try_buffered(num_threads)
                     .try_filter_map(move |batch| {
                         std::future::ready(Ok(if batch.num_rows() == 0 {
@@ -899,7 +915,18 @@ impl FilteredReadStream {
                         partition_metrics_clone
                             .baseline_metrics
                             .record_output(batch.num_rows());
-                    })
+                    });
+
+                let batch_stream = if self.options.scan_range_after_filter.is_some()
+                    && !self.options.scan_planned_with_limit_pushed_down
+                {
+                    let range = self.options.scan_range_after_filter.clone().unwrap();
+                    Self::apply_hard_range(base_batch_stream, range).boxed()
+                } else {
+                    base_batch_stream.boxed()
+                };
+
+                let final_stream = batch_stream
                     .finally(move || {
                         if active_partitions_counter.fetch_sub(1, Ordering::Relaxed) == 1 {
                             global_metrics.io_metrics.record_final(&scan_scheduler);
@@ -907,7 +934,7 @@ impl FilteredReadStream {
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
-                Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
+                Box::pin(RecordBatchStreamAdapter::new(output_schema, final_stream))
             }
             FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
                 assert!(partition < num_partitions);
@@ -965,6 +992,7 @@ impl FilteredReadStream {
     #[instrument(name = "read_fragment", skip_all)]
     async fn read_fragment(
         mut fragment_read_task: ScopedFragmentRead,
+        per_fragment_limit: Option<u64>,
     ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
         let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
@@ -1004,7 +1032,8 @@ impl FilteredReadStream {
             })
             .transpose()?;
 
-        Ok(fragment_reader
+        // Create the base stream
+        let fragment_stream = fragment_reader
             .read_ranges(
                 fragment_read_task.ranges.into(),
                 fragment_read_task.batch_size,
@@ -1013,7 +1042,15 @@ impl FilteredReadStream {
                 physical_filter.clone(),
                 output_schema.clone(),
             )))
-            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1)))
+            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
+
+        if let Some(limit) = per_fragment_limit {
+            Ok(Box::pin(
+                Self::apply_soft_limit(fragment_stream, limit).boxed(),
+            ))
+        } else {
+            Ok(Box::pin(fragment_stream.boxed()))
+        }
     }
 
     fn wrap_with_filter(
@@ -1037,6 +1074,79 @@ impl FilteredReadStream {
         } else {
             Ok(batch_fut)
         }
+    }
+
+    fn apply_soft_limit<S>(stream: S, limit: u64) -> impl Stream<Item = Result<ReadBatchFut>>
+    where
+        S: Stream<Item = Result<ReadBatchFut>>,
+    {
+        let rows_read = Arc::new(AtomicUsize::new(0));
+
+        stream
+            .take_while({
+                let rows_read = rows_read.clone();
+                move |_| future::ready(rows_read.load(Ordering::Relaxed) < limit as usize)
+            })
+            .map(move |batch_fut_result| {
+                let rows_read = rows_read.clone();
+                batch_fut_result.map(move |batch_fut| {
+                    let rows_read = rows_read.clone();
+
+                    batch_fut
+                        .map(move |batch_result| {
+                            batch_result.map(|batch| {
+                                let batch_rows = batch.num_rows();
+                                rows_read.fetch_add(batch_rows, Ordering::Relaxed);
+                                batch
+                            })
+                        })
+                        .boxed()
+                })
+            })
+    }
+
+    fn apply_hard_range<S>(stream: S, range: Range<u64>) -> impl Stream<Item = Result<RecordBatch>>
+    where
+        S: Stream<Item = Result<RecordBatch>>,
+    {
+        let start = range.start as usize;
+        let end = range.end as usize;
+        let rows_seen = Arc::new(AtomicUsize::new(0));
+
+        stream
+            .try_filter_map({
+                let rows_seen = rows_seen.clone();
+                move |batch| {
+                    if batch.num_rows() == 0 {
+                        return future::ready(Ok(None));
+                    }
+
+                    let batch_rows = batch.num_rows();
+                    let current_position = rows_seen.fetch_add(batch_rows, Ordering::SeqCst);
+                    let batch_end = current_position + batch_rows;
+                    if batch_end <= start || current_position >= end {
+                        return future::ready(Ok(None));
+                    }
+
+                    let skip = start.saturating_sub(current_position);
+                    let end_pos = (end - current_position).min(batch_rows);
+                    let take = end_pos.saturating_sub(skip);
+
+                    if take == 0 {
+                        return future::ready(Ok(None));
+                    }
+
+                    let result = if skip == 0 && take == batch_rows {
+                        batch
+                    } else {
+                        batch.slice(skip, take)
+                    };
+                    future::ready(Ok(Some(result)))
+                }
+            })
+            .take_while(move |result| {
+                future::ready(result.is_err() || rows_seen.load(Ordering::Relaxed) < end)
+            })
     }
 }
 
@@ -1066,6 +1176,9 @@ pub struct FilteredReadOptions {
     pub full_filter: Option<Expr>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
+    /// Whether the scan was planned with limit pushed down to the fragment ranges
+    /// When true, the stream should NOT apply skip/limit again
+    pub scan_planned_with_limit_pushed_down: bool,
 }
 
 impl FilteredReadOptions {
@@ -1095,6 +1208,7 @@ impl FilteredReadOptions {
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
+            scan_planned_with_limit_pushed_down: false,
         }
     }
 
@@ -2449,30 +2563,27 @@ mod tests {
     // Test trim_fragments_to_range using simulated fragments
     #[test]
     fn test_trim_fragments_logic() {
-        // We can't easily create ScopedFragmentRead in tests,
-        // so let's test the logic with a simplified version
-        
         struct TestFragment {
             ranges: Vec<Range<u64>>,
         }
-        
+
         fn apply_trim(fragments: &mut Vec<TestFragment>, range: &Range<u64>) {
             let mut to_skip = range.start;
             let mut to_take = range.end - range.start;
             let mut fragments_to_keep = Vec::new();
-            
+
             for mut fragment in fragments.drain(..) {
                 if to_take == 0 {
                     break;
                 }
-                
+
                 let fragment_rows: u64 = fragment.ranges.iter().map(|r| r.end - r.start).sum();
-                
+
                 if fragment_rows <= to_skip {
                     to_skip -= fragment_rows;
                     continue;
                 }
-                
+
                 // Same optimization as in the real implementation
                 if to_skip == 0 && to_take >= fragment_rows {
                     fragments_to_keep.push(fragment);
@@ -2481,29 +2592,35 @@ mod tests {
                     let skip_in_fragment = to_skip;
                     let available_after_skip = fragment_rows - skip_in_fragment;
                     let take_from_fragment = available_after_skip.min(to_take);
-                    
+
                     let trimmed_ranges = FilteredReadStream::trim_ranges_by_offset(
                         fragment.ranges,
                         skip_in_fragment,
                         take_from_fragment,
                     );
-                    
+
                     fragment.ranges = trimmed_ranges;
                     fragments_to_keep.push(fragment);
-                    
+
                     to_skip = 0;
                     to_take -= take_from_fragment;
                 }
             }
-            
+
             *fragments = fragments_to_keep;
         }
-        
+
         // Test case 1: Take all fragments
         let mut fragments = vec![
-            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
-            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
-            TestFragment { ranges: vec![0..10] },          // 10 rows
+            TestFragment {
+                ranges: vec![0..10, 20..30],
+            },
+            TestFragment {
+                ranges: vec![0..15, 25..35],
+            },
+            TestFragment {
+                ranges: vec![0..10],
+            },
         ];
         apply_trim(&mut fragments, &(0..100));
         assert_eq!(fragments.len(), 3);
@@ -2513,31 +2630,49 @@ mod tests {
 
         // Test case 2: Skip first fragment
         let mut fragments = vec![
-            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows
-            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
-            TestFragment { ranges: vec![0..10] },          // 10 rows
+            TestFragment {
+                ranges: vec![0..10, 20..30],
+            },
+            TestFragment {
+                ranges: vec![0..15, 25..35],
+            },
+            TestFragment {
+                ranges: vec![0..10],
+            },
         ];
         apply_trim(&mut fragments, &(20..50));
         assert_eq!(fragments.len(), 2);
-        assert_eq!(fragments[0].ranges, vec![0..15, 25..35]);  // Take all 25 rows
-        assert_eq!(fragments[1].ranges, vec![0..5]);           // Take 5 rows (total 30)
+        assert_eq!(fragments[0].ranges, vec![0..15, 25..35]);
+        assert_eq!(fragments[1].ranges, vec![0..5]);
 
         // Test case 3: Skip into first fragment
         let mut fragments = vec![
-            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
-            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
-            TestFragment { ranges: vec![0..10] },          // 10 rows
+            TestFragment {
+                ranges: vec![0..10, 20..30],
+            },
+            TestFragment {
+                ranges: vec![0..15, 25..35],
+            },
+            TestFragment {
+                ranges: vec![0..10],
+            },
         ];
         apply_trim(&mut fragments, &(5..45));
         assert_eq!(fragments.len(), 2);
-        assert_eq!(fragments[0].ranges, vec![5..10, 20..30]);  // Skip 5, take 15
-        assert_eq!(fragments[1].ranges, vec![0..15, 25..35]);  // Take all 25 (total 40)
+        assert_eq!(fragments[0].ranges, vec![5..10, 20..30]);
+        assert_eq!(fragments[1].ranges, vec![0..15, 25..35]);
 
-        // Test case 4: Take limited from first fragment  
+        // Test case 4: Take limited from first fragment
         let mut fragments = vec![
-            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
-            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
-            TestFragment { ranges: vec![0..10] },          // 10 rows
+            TestFragment {
+                ranges: vec![0..10, 20..30],
+            },
+            TestFragment {
+                ranges: vec![0..15, 25..35],
+            },
+            TestFragment {
+                ranges: vec![0..10],
+            },
         ];
         apply_trim(&mut fragments, &(0..5));
         assert_eq!(fragments.len(), 1);
@@ -2545,27 +2680,41 @@ mod tests {
 
         // Test case 5: Skip and take across fragments
         let mut fragments = vec![
-            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
-            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
-            TestFragment { ranges: vec![0..10] },          // 10 rows
+            TestFragment {
+                ranges: vec![0..10, 20..30],
+            },
+            TestFragment {
+                ranges: vec![0..15, 25..35],
+            },
+            TestFragment {
+                ranges: vec![0..10],
+            },
         ];
         apply_trim(&mut fragments, &(15..30));
         assert_eq!(fragments.len(), 2);
-        assert_eq!(fragments[0].ranges, vec![25..30]);  // Skip 15 rows, take 5 from first fragment  
-        assert_eq!(fragments[1].ranges, vec![0..10]);   // Take 10 from second fragment
+        assert_eq!(fragments[0].ranges, vec![25..30]);
+        assert_eq!(fragments[1].ranges, vec![0..10]);
 
         // Test case 6: Empty range
         let mut fragments = vec![
-            TestFragment { ranges: vec![0..10, 20..30] },
-            TestFragment { ranges: vec![0..15, 25..35] },
+            TestFragment {
+                ranges: vec![0..10, 20..30],
+            },
+            TestFragment {
+                ranges: vec![0..15, 25..35],
+            },
         ];
         apply_trim(&mut fragments, &(10..10));
         assert_eq!(fragments.len(), 0);
 
         // Test case 7: Skip all fragments
         let mut fragments = vec![
-            TestFragment { ranges: vec![0..10, 20..30] },
-            TestFragment { ranges: vec![0..15, 25..35] },
+            TestFragment {
+                ranges: vec![0..10, 20..30],
+            },
+            TestFragment {
+                ranges: vec![0..15, 25..35],
+            },
         ];
         apply_trim(&mut fragments, &(100..150));
         assert_eq!(fragments.len(), 0);
