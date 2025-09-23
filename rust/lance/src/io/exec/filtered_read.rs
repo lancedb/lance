@@ -413,7 +413,7 @@ impl FilteredReadStream {
 
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map(|scoped_fragment| {
-                tokio::task::spawn(Self::read_fragment(scoped_fragment))
+                tokio::task::spawn(Self::read_fragment(scoped_fragment).in_current_span())
                     .map(|thread_result| thread_result.unwrap())
             })
             .buffered(fragment_readahead);
