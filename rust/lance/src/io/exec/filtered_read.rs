@@ -2402,4 +2402,172 @@ mod tests {
         let expected = vec![0..13, 14..17, 18..51];
         assert_eq!(ranges, expected);
     }
+
+    #[test]
+    fn test_trim_ranges_by_offset() {
+        // Test case 1: No skip, take all
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges.clone(), 0, 100);
+        assert_eq!(result, ranges);
+
+        // Test case 2: Skip some, take all remaining
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 5, 100);
+        assert_eq!(result, vec![5..10, 20..30, 40..50]);
+
+        // Test case 3: Skip first range entirely
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 10, 100);
+        assert_eq!(result, vec![20..30, 40..50]);
+
+        // Test case 4: Skip into second range
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 15, 100);
+        assert_eq!(result, vec![25..30, 40..50]);
+
+        // Test case 5: Take limited rows
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 0, 15);
+        assert_eq!(result, vec![0..10, 20..25]);
+
+        // Test case 6: Skip and take limited
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 5, 10);
+        assert_eq!(result, vec![5..10, 20..25]);
+
+        // Test case 7: Skip all
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 100, 10);
+        assert_eq!(result, vec![]);
+
+        // Test case 8: Take 0
+        let ranges = vec![0..10, 20..30, 40..50];
+        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 0, 0);
+        assert_eq!(result, vec![]);
+    }
+
+    // Test trim_fragments_to_range using simulated fragments
+    #[test]
+    fn test_trim_fragments_logic() {
+        // We can't easily create ScopedFragmentRead in tests,
+        // so let's test the logic with a simplified version
+        
+        struct TestFragment {
+            ranges: Vec<Range<u64>>,
+        }
+        
+        fn apply_trim(fragments: &mut Vec<TestFragment>, range: &Range<u64>) {
+            let mut to_skip = range.start;
+            let mut to_take = range.end - range.start;
+            let mut fragments_to_keep = Vec::new();
+            
+            for mut fragment in fragments.drain(..) {
+                if to_take == 0 {
+                    break;
+                }
+                
+                let fragment_rows: u64 = fragment.ranges.iter().map(|r| r.end - r.start).sum();
+                
+                if fragment_rows <= to_skip {
+                    to_skip -= fragment_rows;
+                    continue;
+                }
+                
+                // Same optimization as in the real implementation
+                if to_skip == 0 && to_take >= fragment_rows {
+                    fragments_to_keep.push(fragment);
+                    to_take -= fragment_rows;
+                } else {
+                    let skip_in_fragment = to_skip;
+                    let available_after_skip = fragment_rows - skip_in_fragment;
+                    let take_from_fragment = available_after_skip.min(to_take);
+                    
+                    let trimmed_ranges = FilteredReadStream::trim_ranges_by_offset(
+                        fragment.ranges,
+                        skip_in_fragment,
+                        take_from_fragment,
+                    );
+                    
+                    fragment.ranges = trimmed_ranges;
+                    fragments_to_keep.push(fragment);
+                    
+                    to_skip = 0;
+                    to_take -= take_from_fragment;
+                }
+            }
+            
+            *fragments = fragments_to_keep;
+        }
+        
+        // Test case 1: Take all fragments
+        let mut fragments = vec![
+            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
+            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
+            TestFragment { ranges: vec![0..10] },          // 10 rows
+        ];
+        apply_trim(&mut fragments, &(0..100));
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(fragments[0].ranges, vec![0..10, 20..30]);
+        assert_eq!(fragments[1].ranges, vec![0..15, 25..35]);
+        assert_eq!(fragments[2].ranges, vec![0..10]);
+
+        // Test case 2: Skip first fragment
+        let mut fragments = vec![
+            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows
+            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
+            TestFragment { ranges: vec![0..10] },          // 10 rows
+        ];
+        apply_trim(&mut fragments, &(20..50));
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].ranges, vec![0..15, 25..35]);  // Take all 25 rows
+        assert_eq!(fragments[1].ranges, vec![0..5]);           // Take 5 rows (total 30)
+
+        // Test case 3: Skip into first fragment
+        let mut fragments = vec![
+            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
+            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
+            TestFragment { ranges: vec![0..10] },          // 10 rows
+        ];
+        apply_trim(&mut fragments, &(5..45));
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].ranges, vec![5..10, 20..30]);  // Skip 5, take 15
+        assert_eq!(fragments[1].ranges, vec![0..15, 25..35]);  // Take all 25 (total 40)
+
+        // Test case 4: Take limited from first fragment  
+        let mut fragments = vec![
+            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
+            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
+            TestFragment { ranges: vec![0..10] },          // 10 rows
+        ];
+        apply_trim(&mut fragments, &(0..5));
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].ranges, vec![0..5]);
+
+        // Test case 5: Skip and take across fragments
+        let mut fragments = vec![
+            TestFragment { ranges: vec![0..10, 20..30] },  // 20 rows (10+10)
+            TestFragment { ranges: vec![0..15, 25..35] },  // 25 rows (15+10)
+            TestFragment { ranges: vec![0..10] },          // 10 rows
+        ];
+        apply_trim(&mut fragments, &(15..30));
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].ranges, vec![25..30]);  // Skip 15 rows, take 5 from first fragment  
+        assert_eq!(fragments[1].ranges, vec![0..10]);   // Take 10 from second fragment
+
+        // Test case 6: Empty range
+        let mut fragments = vec![
+            TestFragment { ranges: vec![0..10, 20..30] },
+            TestFragment { ranges: vec![0..15, 25..35] },
+        ];
+        apply_trim(&mut fragments, &(10..10));
+        assert_eq!(fragments.len(), 0);
+
+        // Test case 7: Skip all fragments
+        let mut fragments = vec![
+            TestFragment { ranges: vec![0..10, 20..30] },
+            TestFragment { ranges: vec![0..15, 25..35] },
+        ];
+        apply_trim(&mut fragments, &(100..150));
+        assert_eq!(fragments.len(), 0);
+    }
 }
