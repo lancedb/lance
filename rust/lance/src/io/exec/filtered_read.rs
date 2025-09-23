@@ -1111,40 +1111,37 @@ impl FilteredReadStream {
         let end = range.end as usize;
         let rows_seen = Arc::new(AtomicUsize::new(0));
 
-        stream
-            .try_filter_map({
-                let rows_seen = rows_seen.clone();
-                move |batch| {
-                    if batch.num_rows() == 0 {
-                        return future::ready(Ok(None));
-                    }
-
-                    let batch_rows = batch.num_rows();
-                    let current_position = rows_seen.fetch_add(batch_rows, Ordering::SeqCst);
-                    let batch_end = current_position + batch_rows;
-                    if batch_end <= start || current_position >= end {
-                        return future::ready(Ok(None));
-                    }
-
-                    let skip = start.saturating_sub(current_position);
-                    let end_pos = (end - current_position).min(batch_rows);
-                    let take = end_pos.saturating_sub(skip);
-
-                    if take == 0 {
-                        return future::ready(Ok(None));
-                    }
-
-                    let result = if skip == 0 && take == batch_rows {
-                        batch
-                    } else {
-                        batch.slice(skip, take)
-                    };
-                    future::ready(Ok(Some(result)))
+        stream.try_filter_map({
+            let rows_seen = rows_seen.clone();
+            move |batch| {
+                if batch.num_rows() == 0 {
+                    return future::ready(Ok(None));
                 }
-            })
-            .take_while(move |result| {
-                future::ready(result.is_err() || rows_seen.load(Ordering::Relaxed) < end)
-            })
+
+                let batch_rows = batch.num_rows();
+                let current_position = rows_seen.fetch_add(batch_rows, Ordering::SeqCst);
+                let batch_end = current_position + batch_rows;
+
+                if batch_end <= start || current_position >= end {
+                    return future::ready(Ok(None));
+                }
+
+                let skip = start.saturating_sub(current_position);
+                let end_pos = (end - current_position).min(batch_rows);
+                let take = end_pos.saturating_sub(skip);
+
+                if take == 0 {
+                    return future::ready(Ok(None));
+                }
+
+                let result = if skip == 0 && take == batch_rows {
+                    batch
+                } else {
+                    batch.slice(skip, take)
+                };
+                future::ready(Ok(Some(result)))
+            }
+        })
     }
 }
 
@@ -2537,5 +2534,702 @@ mod tests {
         let ranges = vec![0..10, 20..30, 40..50];
         let result = FilteredReadStream::trim_ranges_by_offset(ranges, 0, 0);
         assert_eq!(result, vec![]);
+    }
+
+    #[tokio::test]
+    async fn test_with_fetch_limit_pushdown() {
+        // Test that with_fetch() properly updates scan ranges for limit pushdown
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        // Case 1: No filter - with_fetch should update scan_range_before_filter
+        {
+            let plan = fixture.make_plan(base_options.clone()).await;
+            assert_eq!(plan.options().scan_range_before_filter, None);
+            assert_eq!(plan.fetch(), None);
+            let new_plan = plan.with_fetch(Some(100)).unwrap();
+            let new_plan = new_plan
+                .as_any()
+                .downcast_ref::<FilteredReadExec>()
+                .unwrap();
+            assert_eq!(new_plan.options().scan_range_before_filter, Some(0..100));
+            assert_eq!(new_plan.fetch(), Some(100));
+        }
+
+        // Case 2: No filter with existing scan_range_before_filter - with_fetch should update it
+        {
+            let options = base_options
+                .clone()
+                .with_scan_range_before_filter(50..200)
+                .unwrap();
+            let plan = fixture.make_plan(options).await;
+            assert_eq!(plan.options().scan_range_before_filter, Some(50..200));
+            assert_eq!(plan.fetch(), Some(150));
+
+            let new_plan = plan.with_fetch(Some(80)).unwrap();
+            let new_plan = new_plan
+                .as_any()
+                .downcast_ref::<FilteredReadExec>()
+                .unwrap();
+            assert_eq!(new_plan.options().scan_range_before_filter, Some(50..130));
+            assert_eq!(new_plan.fetch(), Some(80));
+        }
+
+        // Case 3: With filter - with_fetch should update scan_range_after_filter
+        {
+            let filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
+            let options = base_options.clone().with_filter_plan(filter_plan);
+            let plan = fixture.make_plan(options).await;
+            assert_eq!(plan.options().scan_range_after_filter, None);
+            assert_eq!(plan.fetch(), None);
+            let new_plan = plan.with_fetch(Some(50)).unwrap();
+            let new_plan = new_plan
+                .as_any()
+                .downcast_ref::<FilteredReadExec>()
+                .unwrap();
+            assert_eq!(new_plan.options().scan_range_after_filter, Some(0..50));
+            assert_eq!(new_plan.fetch(), Some(50));
+        }
+
+        // Case 4: Multiple partitions mode - with_fetch should reject pushdown
+        {
+            let mut options = base_options.clone();
+            options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(4);
+            let filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
+            options = options.with_filter_plan(filter_plan);
+            let plan = fixture.make_plan(options).await;
+            let result = plan.with_fetch(Some(100));
+            assert!(result.is_none());
+        }
+
+        // Case 5: Existing offset with filter - with_fetch should respect it
+        {
+            let filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
+            let options = base_options
+                .clone()
+                .with_filter_plan(filter_plan)
+                .with_scan_range_after_filter(100..300)
+                .unwrap();
+            let plan = fixture.make_plan(options).await;
+            assert_eq!(plan.options().scan_range_after_filter, Some(100..300));
+            let new_plan = plan.with_fetch(Some(50)).unwrap();
+            let new_plan = new_plan
+                .as_any()
+                .downcast_ref::<FilteredReadExec>()
+                .unwrap();
+            assert_eq!(new_plan.options().scan_range_after_filter, Some(100..150));
+            assert_eq!(new_plan.fetch(), Some(50));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_limit_pushdown_comprehensive() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        // Test 1: No index with limit - should pushdown to scan_range_before_filter
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(0..100)
+            .unwrap();
+        let plan = fixture.make_plan(options.clone()).await;
+        assert_eq!(plan.options().scan_range_before_filter, Some(0..100));
+        assert_eq!(plan.options().scan_range_after_filter, None);
+        test_scan_range(&fixture, options, (0..100).collect(), "No index with limit").await;
+
+        // Test 2: Exact match index with limit
+        let filter_plan = fixture.filter_plan("fully_indexed < 50", false).await;
+        let options = base_options
+            .clone()
+            .with_filter_plan(filter_plan)
+            .with_scan_range_after_filter(0..25)
+            .unwrap()
+            .with_batch_size(10);
+        let plan = fixture.make_plan(options.clone()).await;
+        assert_eq!(plan.options().scan_range_after_filter, Some(0..25));
+        assert_eq!(plan.options().scan_range_before_filter, None);
+        test_scan_range(
+            &fixture,
+            options,
+            (0..25).collect(),
+            "Exact match index with limit",
+        )
+        .await;
+
+        // Test 3: Regression test for batch boundary bug
+        let filter_plan = fixture.filter_plan("not_indexed >= 0", false).await;
+        let options = base_options
+            .with_filter_plan(filter_plan)
+            .with_scan_range_after_filter(0..250)
+            .unwrap()
+            .with_batch_size(50);
+        let expected_values: Vec<u32> = (0..100).chain(250..400).take(250).collect();
+        test_scan_range(
+            &fixture,
+            options,
+            expected_values,
+            "Batch boundary regression",
+        )
+        .await;
+    }
+
+    /// Helper to extract fully_indexed column values from batches
+    async fn get_fully_indexed_values(batches: Vec<RecordBatch>) -> Vec<u32> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("fully_indexed")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Helper to test scan range with expected values
+    async fn test_scan_range(
+        fixture: &TestFixture,
+        options: FilteredReadOptions,
+        expected_values: Vec<u32>,
+        test_description: &str,
+    ) {
+        let plan = fixture.make_plan(options).await;
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let actual_values = get_fully_indexed_values(batches).await;
+        assert_eq!(
+            actual_values, expected_values,
+            "Failed test: {}",
+            test_description
+        );
+    }
+
+    /// Helper to compute expected values for scan range tests
+    /// Dataset layout: [0..100] deleted:[100..250] [250..400]
+    fn compute_range_values(range: Range<u64>) -> Vec<u32> {
+        let mut result = Vec::new();
+        for pos in range {
+            if pos < 100 {
+                result.push(pos as u32);
+            } else if pos < 250 {
+                // Positions 100-249 map to values 250-399
+                result.push((250 + (pos - 100)) as u32);
+            }
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn test_no_filter_scan_range_before_filter() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        // Test cases: (scan_range, description)
+        let test_cases = vec![
+            // Basic cases
+            (0..50, "Limit from start"),
+            (30..80, "Offset + limit"),
+            (0..250, "Limit equals total rows"),
+            (0..500, "Limit exceeds total rows"),
+            // Edge cases
+            (0..1, "Single row"),
+            (99..100, "Last row of first fragment"),
+            (100..101, "First row of second fragment (deleted area)"),
+            (249..250, "Last available row"),
+            // Fragment boundaries
+            (0..100, "Entire first fragment"),
+            (100..200, "Middle of dataset (deleted area)"),
+            (50..150, "Across fragment boundary"),
+            (90..110, "Around deletion boundary"),
+            // Large offsets
+            (200..250, "Large offset into second fragment"),
+            (240..260, "Near end with overrun"),
+            (300..400, "Beyond available data"),
+            // Zero-width ranges
+            (50..50, "Empty range in data"),
+            (150..150, "Empty range in deleted area"),
+            (400..400, "Empty range beyond data"),
+        ];
+
+        for (range, description) in test_cases {
+            let options = base_options
+                .clone()
+                .with_scan_range_before_filter(range.clone())
+                .unwrap();
+            let expected = compute_range_values(range);
+            test_scan_range(&fixture, options, expected, description).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exact_match_filter_scan_range_after_filter() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        // Test cases: (filter, scan_range, expected_values, description)
+        let test_cases = vec![
+            // Basic limit tests with diverse ranges
+            (
+                "fully_indexed < 100",
+                0..50,
+                (0..50).collect(),
+                "Limit < matches",
+            ),
+            (
+                "fully_indexed < 100",
+                20..50,
+                (20..50).collect(),
+                "Offset + limit within matches",
+            ),
+            (
+                "fully_indexed < 100",
+                0..100,
+                (0..100).collect(),
+                "Limit = matches",
+            ),
+            (
+                "fully_indexed < 50",
+                0..200,
+                (0..50).collect(),
+                "Limit > matches",
+            ),
+            ("fully_indexed < 100", 0..1, vec![0], "Single row"),
+            (
+                "fully_indexed < 100",
+                99..100,
+                vec![99],
+                "Last matching row",
+            ),
+            (
+                "fully_indexed < 100",
+                5..15,
+                (5..15).collect(),
+                "Small window",
+            ),
+            (
+                "fully_indexed < 100",
+                90..110,
+                (90..100).collect(),
+                "Range beyond matches",
+            ),
+            (
+                "fully_indexed < 100",
+                45..55,
+                (45..55).collect(),
+                "Mid-range window",
+            ),
+            (
+                "fully_indexed < 100",
+                0..10000,
+                (0..100).collect(),
+                "Huge limit",
+            ),
+            // Range filter tests with more diverse ranges
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                0..20,
+                (50..70).collect(),
+                "Range filter with limit",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                10..25,
+                (60..75).collect(),
+                "Range filter with offset+limit",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                0..30,
+                (50..80).collect(),
+                "Range filter exact match",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                0..100,
+                (50..80).collect(),
+                "Range filter limit exceeds",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                0..5,
+                (50..55).collect(),
+                "First 5 rows",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                25..30,
+                (75..80).collect(),
+                "Last 5 rows",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                15..16,
+                vec![65],
+                "Single row middle",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                2..8,
+                (52..58).collect(),
+                "Small offset window",
+            ),
+            (
+                "fully_indexed >= 50 AND fully_indexed < 80",
+                100..200,
+                vec![],
+                "Offset beyond data",
+            ),
+            // Boundary tests
+            ("fully_indexed = 0", 0..10, vec![0], "Single value at start"),
+            (
+                "fully_indexed = 99",
+                0..10,
+                vec![99],
+                "Single value at fragment end",
+            ),
+            (
+                "fully_indexed = 250",
+                0..10,
+                vec![250],
+                "Single value at second fragment start",
+            ),
+            (
+                "fully_indexed = 399",
+                0..10,
+                vec![399],
+                "Single value at dataset end",
+            ),
+            // Empty result tests
+            (
+                "fully_indexed = 150",
+                0..10,
+                vec![],
+                "No match in deleted range",
+            ),
+            (
+                "fully_indexed > 500",
+                0..100,
+                vec![],
+                "No match beyond data",
+            ),
+            // Fragment boundary tests with diverse ranges
+            (
+                "fully_indexed > 200",
+                0..100,
+                (250..350).collect(),
+                "Filter skips deleted fragment",
+            ),
+            (
+                "fully_indexed >= 250",
+                0..50,
+                (250..300).collect(),
+                "Start of second fragment",
+            ),
+            (
+                "fully_indexed >= 350",
+                0..100,
+                (350..400).collect(),
+                "End of second fragment",
+            ),
+            (
+                "fully_indexed < 400",
+                200..250,
+                (350..400).collect(),
+                "Large offset into second fragment",
+            ),
+            (
+                "fully_indexed >= 250",
+                0..1,
+                vec![250],
+                "First row second fragment",
+            ),
+            (
+                "fully_indexed >= 250",
+                149..150,
+                vec![399],
+                "Last row second fragment",
+            ),
+            (
+                "fully_indexed >= 250",
+                10..20,
+                (260..270).collect(),
+                "Small window in second",
+            ),
+            (
+                "fully_indexed >= 250",
+                75..100,
+                (325..350).collect(),
+                "Middle of second fragment",
+            ),
+            (
+                "fully_indexed >= 250",
+                100..200,
+                (350..400).collect(),
+                "End portion of second",
+            ),
+            (
+                "fully_indexed >= 300",
+                25..75,
+                (325..375).collect(),
+                "Mid to late second fragment",
+            ),
+            // Complex filters with various ranges
+            (
+                "fully_indexed IN (5, 15, 25, 35, 45)",
+                0..10,
+                vec![5, 15, 25, 35, 45],
+                "IN clause all",
+            ),
+            (
+                "fully_indexed IN (5, 15, 25, 35, 45)",
+                0..3,
+                vec![5, 15, 25],
+                "IN clause first 3",
+            ),
+            (
+                "fully_indexed IN (5, 15, 25, 35, 45)",
+                2..4,
+                vec![25, 35],
+                "IN clause middle 2",
+            ),
+            (
+                "fully_indexed IN (5, 15, 25, 35, 45)",
+                1..5,
+                vec![15, 25, 35, 45],
+                "IN clause skip first",
+            ),
+            (
+                "fully_indexed % 10 = 0",
+                0..15,
+                vec![
+                    0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 250, 260, 270, 280, 290,
+                ],
+                "Modulo all",
+            ),
+            (
+                "fully_indexed % 10 = 0",
+                0..3,
+                vec![0, 10, 20],
+                "Modulo first 3",
+            ),
+            (
+                "fully_indexed % 10 = 0",
+                5..10,
+                vec![50, 60, 70, 80, 90],
+                "Modulo middle range",
+            ),
+            (
+                "fully_indexed % 10 = 0",
+                8..12,
+                vec![80, 90, 250, 260],
+                "Modulo cross fragment",
+            ),
+            (
+                "fully_indexed % 10 = 0",
+                10..15,
+                vec![250, 260, 270, 280, 290],
+                "Modulo second fragment",
+            ),
+            (
+                "fully_indexed >= 80 AND fully_indexed <= 280",
+                0..50,
+                vec![
+                    80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+                    250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265,
+                    266, 267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278, 279,
+                ],
+                "Cross-fragment full",
+            ),
+            (
+                "fully_indexed >= 80 AND fully_indexed <= 280",
+                0..10,
+                (80..90).collect(),
+                "Cross-fragment first 10",
+            ),
+            (
+                "fully_indexed >= 80 AND fully_indexed <= 280",
+                15..25,
+                vec![95, 96, 97, 98, 99, 250, 251, 252, 253, 254],
+                "Cross-fragment boundary",
+            ),
+            (
+                "fully_indexed >= 80 AND fully_indexed <= 280",
+                20..40,
+                (250..270).collect(),
+                "Cross-fragment second only",
+            ),
+            (
+                "fully_indexed >= 80 AND fully_indexed <= 280",
+                18..22,
+                vec![98, 99, 250, 251],
+                "Cross-fragment exact boundary",
+            ),
+            // Edge cases
+            ("fully_indexed < 400", 0..0, vec![], "Zero-width range"),
+            (
+                "fully_indexed >= 0",
+                1000..2000,
+                vec![],
+                "Huge offset beyond data",
+            ),
+            (
+                "fully_indexed BETWEEN 95 AND 255",
+                3..8,
+                vec![98, 99, 250, 251, 252],
+                "BETWEEN crossing deletion",
+            ),
+        ];
+
+        for (filter_expr, range, expected, description) in test_cases {
+            let filter_plan = fixture.filter_plan(filter_expr, false).await;
+            let options = base_options
+                .clone()
+                .with_filter_plan(filter_plan)
+                .with_scan_range_after_filter(range)
+                .unwrap();
+            test_scan_range(&fixture, options, expected, description).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_at_least_match_filter_scan_range_after_filter() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        struct TestCase {
+            filter: &'static str,
+            scan_range: Range<u64>,
+            validate: Box<dyn Fn(Vec<u32>)>,
+            description: &'static str,
+        }
+
+        let test_cases = vec![
+            TestCase {
+                filter: "recheck_idx = 'cat'",
+                scan_range: 0..30,
+                validate: Box::new(|values| {
+                    assert!(values.len() <= 30, "Should have at most 30 rows");
+                    for val in &values {
+                        assert_eq!(*val % 3, 0, "Values should be multiples of 3");
+                    }
+                }),
+                description: "Limit < at-least matches",
+            },
+            TestCase {
+                filter: "recheck_idx = 'cat'",
+                scan_range: 10..40,
+                validate: Box::new(|values| {
+                    assert!(values.len() <= 30, "Should have at most 30 rows");
+                    assert!(
+                        values[0] > 0,
+                        "Should have skipped initial matches due to offset"
+                    );
+                    for val in &values {
+                        assert_eq!(*val % 3, 0, "Values should be multiples of 3");
+                    }
+                }),
+                description: "Offset + limit with at-least match",
+            },
+            TestCase {
+                filter: "recheck_idx = 'cat' AND fully_indexed < 100",
+                scan_range: 0..20,
+                validate: Box::new(|values| {
+                    assert!(values.len() <= 20, "Should have at most 20 rows");
+                    for val in &values {
+                        assert!(*val < 100, "Values should be < 100");
+                        assert_eq!(*val % 3, 0, "Values should be multiples of 3");
+                    }
+                }),
+                description: "Complex filter with refine",
+            },
+        ];
+
+        for test_case in test_cases {
+            let filter_plan = fixture.filter_plan(test_case.filter, false).await;
+            let options = base_options
+                .clone()
+                .with_filter_plan(filter_plan)
+                .with_scan_range_after_filter(test_case.scan_range)
+                .unwrap();
+
+            let plan = fixture.make_plan(options).await;
+            let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let values = get_fully_indexed_values(batches).await;
+            (test_case.validate)(values);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_edge_cases_limit_pushdown() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+
+        // Test 5.1: Batch boundary test (regression for original bug)
+        let filter_plan = fixture.filter_plan("not_indexed >= 0", false).await;
+        let options = base_options
+            .clone()
+            .with_filter_plan(filter_plan)
+            .with_scan_range_after_filter(0..250)
+            .unwrap()
+            .with_batch_size(24);
+        let plan = fixture.make_plan(options).await;
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 250);
+
+        // Test 5.2: Empty result set
+        let filter_plan = fixture.filter_plan("fully_indexed < 0", false).await;
+        let options = base_options
+            .clone()
+            .with_filter_plan(filter_plan)
+            .with_scan_range_after_filter(0..100)
+            .unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let num_rows = stream
+            .map_ok(|batch| batch.num_rows())
+            .try_fold(0, |acc, val| std::future::ready(Ok(acc + val)))
+            .await
+            .unwrap();
+        assert_eq!(num_rows, 0);
+
+        // Test 5.3: Offset + Limit combination
+        let options = base_options
+            .clone()
+            .with_scan_range_before_filter(100..150)
+            .unwrap();
+        let plan = fixture.make_plan(options).await;
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 50);
+
+        // Due to fragment deletion, rows 100-199 don't exist
+        // Row offset 100 starts at fragment 2 which has values 250+
+        let all_values: Vec<u32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("fully_indexed")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let expected: Vec<u32> = (250..300).collect();
+        assert_eq!(all_values, expected);
     }
 }
