@@ -345,8 +345,8 @@ struct FilteredReadStream {
     active_partitions_counter: Arc<AtomicUsize>,
     /// The threading mode for the scan
     threading_mode: FilteredReadThreadingMode,
-    /// Limit to apply to the stream if not already pushed down in planning
-    limit_to_apply: Option<u64>,
+    /// Range to apply to the stream if not already pushed down in planning
+    range_to_apply: Option<Range<u64>>,
 }
 
 impl std::fmt::Debug for FilteredReadStream {
@@ -413,17 +413,20 @@ impl FilteredReadStream {
         )
         .await?;
 
-        let limit_to_apply = if !options.scan_planned_with_limit_pushed_down {
-            options.scan_range_after_filter.as_ref().map(|r| r.end)
+        let range_to_apply = if !options.scan_planned_with_limit_pushed_down {
+            options.scan_range_after_filter
         } else {
             None
         };
 
         let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map(move |scoped_fragment| {
-                let limit = limit_to_apply;
-                tokio::task::spawn(Self::read_fragment(scoped_fragment, limit))
-                    .map(|thread_result| thread_result.unwrap())
+            .map({
+                let range_to_apply = range_to_apply.clone();
+                move |scoped_fragment| {
+                    let limit = range_to_apply.as_ref().map(|r| r.end);
+                    tokio::task::spawn(Self::read_fragment(scoped_fragment, limit))
+                        .map(|thread_result| thread_result.unwrap())
+                }
             })
             .buffered(fragment_readahead);
         let task_stream = fragment_streams.try_flatten().boxed();
@@ -435,7 +438,7 @@ impl FilteredReadStream {
             metrics: Arc::new(global_metrics),
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
-            limit_to_apply,
+            range_to_apply,
         })
     }
 
@@ -915,8 +918,8 @@ impl FilteredReadStream {
                             .record_output(batch.num_rows());
                     });
 
-                let batch_stream = if let Some(limit) = self.limit_to_apply {
-                    Self::apply_hard_range(base_batch_stream, 0..limit).boxed()
+                let batch_stream = if let Some(ref range) = self.range_to_apply {
+                    Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
                 } else {
                     base_batch_stream.boxed()
                 };
@@ -1084,14 +1087,11 @@ impl FilteredReadStream {
             .map(move |batch_fut_result| {
                 let rows_read = rows_read.clone();
                 batch_fut_result.map(move |batch_fut| {
-                    let rows_read = rows_read.clone();
-
                     batch_fut
                         .map(move |batch_result| {
-                            batch_result.map(|batch| {
+                            batch_result.inspect(|batch| {
                                 let batch_rows = batch.num_rows();
                                 rows_read.fetch_add(batch_rows, Ordering::Relaxed);
-                                batch
                             })
                         })
                         .boxed()
@@ -1734,9 +1734,7 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        if limit.is_none() {
-            return None;
-        }
+        limit?;
         // Support limit push down
         let mut updated_options = self.options.clone();
         let fetch = limit.unwrap();
@@ -1778,7 +1776,7 @@ impl ExecutionPlan for FilteredReadExec {
             }
         }
 
-        match FilteredReadExec::try_new(
+        match Self::try_new(
             self.dataset.clone(),
             updated_options,
             self.index_input.clone(),
