@@ -11,10 +11,10 @@ import pytest
 from lance.file import LanceFileReader
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
-NUM_ROWS_PER_FRAGMENT = 10000
-DIMENSION = 128
-NUM_SUBVECTORS = 8
-NUM_FRAGMENTS = 3
+NUM_ROWS_PER_FRAGMENT = 1000
+DIMENSION = 32
+NUM_SUBVECTORS = 2
+NUM_FRAGMENTS = 2
 NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
@@ -53,11 +53,12 @@ def small_rand_dataset(tmpdir, request):
 @pytest.fixture
 def mostly_null_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(np.float32)
+    # Create a mask: every 10th row is not null, others are null
+    mask = np.zeros(NUM_ROWS, dtype=bool)
+    mask[::10] = True
+    vectors = np.where(mask[:, None], vectors, np.nan)
     vectors.shape = -1
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
-    vectors = vectors.to_pylist()
-    vectors = [vec if i % 10 == 0 else None for i, vec in enumerate(vectors)]
-    vectors = pa.array(vectors, pa.list_(pa.float32(), DIMENSION))
     table = pa.Table.from_arrays([vectors], names=["vectors"])
 
     uri = str(tmpdir / "nulls_dataset")
@@ -244,7 +245,7 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     assert row_id.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
-    assert pq_code.type == pa.list_(pa.uint8(), 8)
+    assert pq_code.type == pa.list_(pa.uint8(), NUM_SUBVECTORS)
 
     part_id = data.column("__ivf_part_id")
     assert part_id.type == pa.uint32()
@@ -285,7 +286,7 @@ def test_vector_transform_with_precomputed_partitions(
     assert row_id.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
-    assert pq_code.type == pa.list_(pa.uint8(), 8)
+    assert pq_code.type == pa.list_(pa.uint8(), NUM_SUBVECTORS)
 
     part_id = data.column("__ivf_part_id")
     assert part_id.type == pa.uint32()
