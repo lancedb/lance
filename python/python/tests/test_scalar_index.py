@@ -1605,21 +1605,17 @@ def test_zonemap_zone_size(tmp_path: Path):
         ds.scanner(filter="x = 7", scan_stats_callback=scan_stats_callback).to_table()
 
         assert scan_stats.bytes_read == expected
-        
+
     ds.create_scalar_index(
         "x",
-        IndexConfig(
-            index_type="zonemap", parameters={"rows_per_zone": 64}
-        ),
+        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 64}),
     )
 
     check_bytes_read(512)
 
     ds.create_scalar_index(
         "x",
-        IndexConfig(
-            index_type="zonemap", parameters={"rows_per_zone": 256}
-        ),
+        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 256}),
     )
 
     check_bytes_read(2048)
