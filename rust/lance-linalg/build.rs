@@ -47,7 +47,7 @@ fn main() -> Result<(), String> {
             // It's likely the compiler doesn't support the sapphirerapids architecture
             // Clang 12 and GCC 11 are the first versions with sapphire rapids support
             println!(
-                "cargo:warning=Skipping build of AVX-512 fp16 kernels.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {}",
+                "cargo:warning=Skipping build of AVX-512 fp16 kernels. Error: {}",
                 err
             );
         } else {
@@ -57,7 +57,7 @@ fn main() -> Result<(), String> {
         };
         if let Err(err) = build_dist_table_with_flags("avx512", &["-march=native"]) {
             println!(
-                "cargo:warning=Skipping build of AVX-512 dist_table.  Clang/GCC too old or compiler does not support AVX512.  Error: {}",
+                "cargo:warning=Skipping build of AVX-512 dist_table. Error: {}",
                 err
             );
         } else {
