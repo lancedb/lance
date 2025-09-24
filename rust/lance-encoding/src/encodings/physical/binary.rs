@@ -34,7 +34,14 @@ use lance_core::{Error, Result};
 #[derive(Debug, Default)]
 pub struct BinaryMiniBlockEncoder {}
 
-const AIM_MINICHUNK_SIZE: i64 = 4 * 1024;
+const DEFAULT_AIM_MINICHUNK_SIZE: i64 = 4 * 1024;
+
+static AIM_MINICHUNK_SIZE: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_MINIBLOCK_CHUNK_SIZE")
+        .unwrap_or_else(|_| DEFAULT_AIM_MINICHUNK_SIZE.to_string())
+        .parse::<i64>()
+        .unwrap_or(DEFAULT_AIM_MINICHUNK_SIZE)
+});
 
 // Make it to support both u32 and u64
 fn chunk_offsets<N: OffsetSizeTrait>(
@@ -144,7 +151,7 @@ fn search_next_offset_idx<N: OffsetSizeTrait>(offsets: &[N], last_offset_idx: us
             // existing bytes plus the new offset size
             let new_size = existing_bytes
                 + N::from_usize((offsets.len() - last_offset_idx) * N::get_byte_width()).unwrap();
-            if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
+            if new_size.to_i64().unwrap() <= *AIM_MINICHUNK_SIZE {
                 // case 1: can fit the rest of all data into a miniblock
                 return offsets.len() - 1;
             } else {
@@ -155,7 +162,7 @@ fn search_next_offset_idx<N: OffsetSizeTrait>(offsets: &[N], last_offset_idx: us
         let existing_bytes = offsets[last_offset_idx + new_num_values] - offsets[last_offset_idx];
         let new_size =
             existing_bytes + N::from_usize((new_num_values + 1) * N::get_byte_width()).unwrap();
-        if new_size.to_i64().unwrap() <= AIM_MINICHUNK_SIZE {
+        if new_size.to_i64().unwrap() <= *AIM_MINICHUNK_SIZE {
             num_values = new_num_values;
             new_num_values *= 2;
         } else {
