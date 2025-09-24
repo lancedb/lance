@@ -19,9 +19,9 @@ impl BranchLocation {
             let mut path = self.path.clone();
             let mut uri = self.uri.clone();
             let segment_count = branch_name.split('/').count();
-            for _ in 0..segment_count {
-                path = Path::parse(Self::parent_str(self.path.as_ref())?)?;
-                uri = Self::parent_str(self.uri.as_str())?.to_string();
+            for _ in 0..segment_count + 1 {
+                path = Path::parse(Self::parent_str(path.as_ref())?)?;
+                uri = Self::parent_str(uri.as_str())?.to_string();
             }
             Ok(Self {
                 path,
@@ -47,8 +47,8 @@ impl BranchLocation {
                     (self.path.clone(), self.uri.clone())
                 } else {
                     let segments = target_branch.split('/');
-                    let mut new_path_str = self.path.as_ref().to_string();
-                    let mut new_uri = self.uri.clone();
+                    let mut new_path_str = Self::join_str(root_location.path.as_ref(), "tree")?;
+                    let mut new_uri = Self::join_str(root_location.uri.as_str(), "tree")?;
                     for segment in segments {
                         new_path_str = Self::join_str(new_path_str.as_str(), segment)?;
                         new_uri = Self::join_str(new_uri.as_str(), segment)?;
@@ -97,8 +97,8 @@ mod tests {
     // Create a BranchLocation instance for testing
     fn create_test_location() -> BranchLocation {
         BranchLocation {
-            path: Path::parse("/repo/root").unwrap(),
-            uri: "https://example.com/repo/root".to_string(),
+            path: Path::parse("/repo/root/tree/feature/new").unwrap(),
+            uri: "https://example.com/repo/root/tree/feature/new".to_string(),
             branch: Some("feature/new".to_string()),
         }
     }
@@ -108,8 +108,8 @@ mod tests {
         let location = create_test_location();
         let root_location = location.find_root().unwrap();
 
-        assert_eq!(root_location.path.as_ref(), "/repo");
-        assert_eq!(root_location.uri, "https://example.com/repo");
+        assert_eq!(root_location.path.as_ref(), "repo/root");
+        assert_eq!(root_location.uri, "https://example.com/repo/root");
         assert_eq!(root_location.branch, None);
     }
 
@@ -153,8 +153,11 @@ mod tests {
         let new_branch = Some("featureA".to_string());
         let new_location = location.find_branch(new_branch.clone()).unwrap();
 
-        assert_eq!(new_location.path.as_ref(), "/repo/tree/featureA");
-        assert_eq!(new_location.uri, "https://example.com/repo/tree/featureA");
+        assert_eq!(new_location.path.as_ref(), "repo/root/tree/featureA");
+        assert_eq!(
+            new_location.uri,
+            "https://example.com/repo/root/tree/featureA"
+        );
         assert_eq!(new_location.branch, new_branch);
     }
 
@@ -164,10 +167,13 @@ mod tests {
         let new_branch = Some("bugfix/issue-123".to_string());
         let new_location = location.find_branch(new_branch.clone()).unwrap();
 
-        assert_eq!(new_location.path.as_ref(), "/repo/tree/bugfix/issue-123");
+        assert_eq!(
+            new_location.path.as_ref(),
+            "repo/root/tree/bugfix/issue-123"
+        );
         assert_eq!(
             new_location.uri,
-            "https://example.com/repo/tree/bugfix/issue-123"
+            "https://example.com/repo/root/tree/bugfix/issue-123"
         );
         assert_eq!(new_location.branch, new_branch);
     }
