@@ -318,11 +318,13 @@ impl DatasetBuilder {
         let file_reader_options = self.file_reader_options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
-        // Two cases that need to checkout after loading the manifest:
-        // 1. If the target is a configured as a branch, we need to check the branch field in the manifest and reload the right branch in case the uri is not the right one.
-        // 2. If the target is a configured as a tag, and we don't find the tag under the table_uri. We need to get the root_location after loading the manifest and get the right version.
+        // Two cases that need to check out after loading the manifest:
+        // 1. If the target is a configured as a branch, we need to check the branch field in the manifest
+        // and reload the right branch in case the uri is not the right one.
+        // 2. If the target is a configured as a tag, and we don't find the tag under the table_uri,
+        // we need to get the root_location after loading the manifest and get the right version.
+        // In practice, we should try best to use the right uri and avoid double loading.
         let mut need_delay_checkout = false;
-        // Here we assume
         let (mut branch, mut version_number) = match target_ref.clone() {
             Some(Ref::Version(branch, version_number)) => {
                 if branch.is_some() {
@@ -353,8 +355,6 @@ impl DatasetBuilder {
             None => (None, None),
         };
 
-        // First we try to load the manifest from the configured version_number
-        // This may fail due to the uri is not the right branch
         let dataset = Self::load_by_uri(
             session,
             manifest,
@@ -414,6 +414,8 @@ impl DatasetBuilder {
                     let target_manifest_result = commit_handler
                         .resolve_version_location(&base_path, version, &object_store.inner)
                         .await;
+                    // This may fail due to the uri is not the right branch
+                    // In this case we should try to load the latest version and checkout the right branch and version_number
                     match target_manifest_result {
                         Ok(manifest_location) => manifest_location,
                         Err(e) => {
