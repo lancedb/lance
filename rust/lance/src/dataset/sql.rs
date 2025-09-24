@@ -7,6 +7,7 @@ use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
 use std::sync::Arc;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
@@ -88,20 +89,16 @@ impl SqlQuery {
         Self { dataframe }
     }
 
-    pub async fn into_stream(self) -> SendableRecordBatchStream {
-        self.dataframe.execute_stream().await.unwrap()
+    pub async fn into_stream(self) -> lance_core::Result<SendableRecordBatchStream> {
+        self.dataframe.execute_stream().await.map_err(|e| e.into())
     }
 
     pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {
-        use futures::TryStreamExt;
-
-        Ok(self
-            .dataframe
-            .execute_stream()
-            .await
-            .unwrap()
+        self.into_stream()
+            .await?
             .try_collect::<Vec<_>>()
-            .await?)
+            .await
+            .map_err(|e| e.into())
     }
 
     pub fn into_dataframe(self) -> DataFrame {
@@ -112,9 +109,11 @@ impl SqlQuery {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{assert_string_matches, DatagenExt, FragmentCount, FragmentRowCount};
+
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+
     use lance_datagen::{array, gen_batch};
 
     #[tokio::test]
@@ -277,7 +276,7 @@ mod tests {
   "Plan with Metrics",
 ], StringArray
 [
-  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., bytes_read=..., fragments_scanned=..., iops=..., ranges_scanned=..., requests=..., rows_scanned=..., task_wait_time=...]\n",
+  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., fragments_scanned=..., ranges_scanned=..., rows_scanned=..., bytes_read=..., iops=..., requests=..., task_wait_time=...]\n",
 ]], row_count: 1 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
     }
