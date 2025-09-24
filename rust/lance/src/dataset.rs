@@ -8051,7 +8051,7 @@ mod tests {
             .create_branch("branch1", original_version, None)
             .await
             .unwrap();
-        assert_eq!(branch1_dataset.uri, test_uri.to_owned() + "/tree/branch1");
+        assert_eq!(branch1_dataset.uri, format!("{}/tree/branch1", test_uri));
 
         branch1_dataset = write_dataset(
             branch1_dataset.uri(),
@@ -8072,7 +8072,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             branch2_dataset.uri,
-            test_uri.to_owned() + "/tree/dev/branch2"
+            format!("{}/tree/dev/branch2", test_uri)
         );
 
         branch2_dataset = write_dataset(
@@ -8101,7 +8101,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             branch3_dataset.uri,
-            test_uri.to_owned() + "/tree/feature/nathan/branch3"
+            format!("{}/tree/feature/nathan/branch3", test_uri)
         );
 
         branch3_dataset = write_dataset(
