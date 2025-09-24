@@ -35,9 +35,11 @@ use futures::{
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
-use lance_io::object_writer::WriteResult;
+use lance_io::object_writer::{ObjectWriter, WriteResult};
 use log::warn;
 use object_store::PutOptions;
+use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use super::manifest::write_manifest;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::location;
 use url::Url;
@@ -48,6 +50,7 @@ pub mod external_manifest;
 
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
+use lance_io::traits::WriteExt;
 
 #[cfg(feature = "dynamodb")]
 use {
@@ -61,7 +64,7 @@ use {
     std::time::{Duration, SystemTime},
 };
 
-use crate::format::{is_detached_version, IndexMetadata, Manifest};
+use crate::format::{is_detached_version, IndexMetadata, Manifest, pb};
 
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
@@ -176,12 +179,34 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
 /// Function that writes the manifest to the object store.
 ///
 /// Returns the size of the written manifest.
-pub type ManifestWriter = for<'a> fn(
-    object_store: &'a ObjectStore,
+pub type ManifestWriter = for<'b, 'a> fn(
+    object_store: &'b ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
+    inline_transaction: Option<pb::Transaction>,
 ) -> BoxFuture<'a, Result<WriteResult>>;
+
+pub fn write_manifest_file_to_path<'b, 'a>(
+    object_store: &'b ObjectStore,
+    manifest: &'a mut Manifest,
+    indices: Option<Vec<IndexMetadata>>,
+    path: &'a Path,
+    inline_transaction: Option<pb::Transaction>,
+) -> BoxFuture<'a, Result<WriteResult>>
+where
+    'b: 'a,
+{
+    Box::pin(async move {
+        let mut object_writer = ObjectWriter::new(object_store, path).await?;
+        let pos = write_manifest(&mut object_writer, manifest, indices, inline_transaction).await?;
+        object_writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await?;
+        let res = object_writer.shutdown().await?;
+        Ok(res)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ManifestLocation {
@@ -552,6 +577,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
+        inline_transaction: Option<pb::Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError>;
 
     /// Delete the recorded manifest information for a dataset at the base_path
@@ -812,6 +838,7 @@ impl CommitHandler for UnsafeCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
+        inline_transaction: Option<pb::Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -824,7 +851,7 @@ impl CommitHandler for UnsafeCommitHandler {
 
         let version_path = naming_scheme.manifest_path(base_path, manifest.version);
         // Write the manifest naively
-        let res = manifest_writer(object_store, manifest, indices, &version_path).await?;
+        let res = manifest_writer(object_store, manifest, indices, &version_path, inline_transaction).await?;
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -878,6 +905,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
+        inline_transaction: Option<pb::Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         // NOTE: once we have the lease we cannot use ? to return errors, since
@@ -902,7 +930,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
                 return Err(CommitError::OtherError(e.into()));
             }
         }
-        let res = manifest_writer(object_store, manifest, indices, &path).await;
+        let res = manifest_writer(object_store, manifest, indices, &path, inline_transaction).await;
 
         // Release the lock
         lease.release(res.is_ok()).await?;
@@ -928,6 +956,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
+        inline_transaction: Option<pb::Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         self.as_ref()
             .commit(
@@ -937,6 +966,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
                 object_store,
                 manifest_writer,
                 naming_scheme,
+                inline_transaction,
             )
             .await
     }
@@ -957,6 +987,7 @@ impl CommitHandler for RenameCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
+        inline_transaction: Option<pb::Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
@@ -965,7 +996,7 @@ impl CommitHandler for RenameCommitHandler {
         let tmp_path = make_staging_manifest_path(&path)?;
 
         // Write the manifest to the temporary path
-        let res = manifest_writer(object_store, manifest, indices, &tmp_path).await?;
+        let res = manifest_writer(object_store, manifest, indices, &tmp_path, inline_transaction).await?;
 
         match object_store
             .inner
@@ -1015,12 +1046,13 @@ impl CommitHandler for ConditionalPutCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
+        inline_transaction: Option<pb::Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
         let memory_store = ObjectStore::memory();
         let dummy_path = "dummy";
-        manifest_writer(&memory_store, manifest, indices, &dummy_path.into()).await?;
+        manifest_writer(&memory_store, manifest, indices, &dummy_path.into(), inline_transaction).await?;
         let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
         let size = dummy_data.len() as u64;
         let res = object_store

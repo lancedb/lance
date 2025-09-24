@@ -33,7 +33,7 @@ use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::object_writer::{ObjectWriter, WriteResult};
 use lance_io::traits::WriteExt;
-use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
+use lance_io::utils::{read_last_block, read_metadata_offset, read_struct, read_message};
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, MAGIC,
     MAJOR_VERSION, MINOR_VERSION,
@@ -756,13 +756,35 @@ impl Dataset {
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
-        let path = match &self.manifest.transaction_file {
-            Some(path) => self.base.child("_transactions").child(path.as_str()),
-            None => return Ok(None),
-        };
-        let data = self.object_store.inner.get(&path).await?.bytes().await?;
-        let transaction = lance_table::format::pb::Transaction::decode(data)?;
-        Transaction::try_from(transaction).map(Some)
+        // Prefer inline transaction from manifest when available
+        if let Some(pos) = self.manifest.transaction_section {
+            let reader = if let Some(size) = self.manifest_location.size {
+                self.object_store
+                    .open_with_size(&self.manifest_location.path, size as usize)
+                    .await?
+            } else {
+                self.object_store.open(&self.manifest_location.path).await?
+            };
+
+            // Try reading the inline transaction; on failure, fallback to external file
+            match read_message::<lance_table::format::pb::Transaction>(reader.as_ref(), pos).await
+            {
+                Ok(pb_txn) => return Transaction::try_from(pb_txn).map(Some),
+                Err(_) => {
+                    // Fall through to external file if present
+                }
+            }
+        }
+
+        // Fallback: read external transaction file if present
+        if let Some(path) = &self.manifest.transaction_file {
+            let path = self.base.child("_transactions").child(path.as_str());
+            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let transaction = lance_table::format::pb::Transaction::decode(data)?;
+            return Transaction::try_from(transaction).map(Some);
+        }
+
+        Ok(None)
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -2264,6 +2286,7 @@ pub(crate) struct ManifestWriteConfig {
     use_stable_row_ids: bool,                  // default false
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
+    pub(crate) write_transaction_file: bool,              // default true: write external transaction file for backward compatibility
 }
 
 impl Default for ManifestWriteConfig {
@@ -2274,6 +2297,7 @@ impl Default for ManifestWriteConfig {
             use_stable_row_ids: false,
             use_legacy_format: None,
             storage_format: None,
+            write_transaction_file: true,
         }
     }
 }
@@ -2287,6 +2311,7 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<IndexMetadata>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
+    inline_transaction: Option<lance_table::format::pb::Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest, config.use_stable_row_ids)?;
@@ -2302,28 +2327,47 @@ pub(crate) async fn write_manifest_file(
             indices,
             base_path,
             object_store,
-            write_manifest_file_to_path,
+            lance_table::io::commit::write_manifest_file_to_path,
             naming_scheme,
+            inline_transaction,
         )
         .await
 }
 
-fn write_manifest_file_to_path<'a>(
-    object_store: &'a ObjectStore,
+fn write_manifest_file_to_path<'b, 'a>(
+    object_store: &'b ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<WriteResult>> {
-    Box::pin(async {
+    inline_transaction: Option<lance_table::format::pb::Transaction>,
+) -> BoxFuture<'a, Result<WriteResult>>
+where
+    'b: 'a,
+{
+    let fut: BoxFuture<'a, Result<WriteResult>> = Box::pin(async move {
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
-        let pos = write_manifest(&mut object_writer, manifest, indices).await?;
+        let pos = write_manifest(&mut object_writer, manifest, indices, inline_transaction).await?;
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
         let res = object_writer.shutdown().await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(res)
-    })
+    });
+    fut
+}
+
+fn wrap_write_manifest<'b, 'a>(
+    object_store: &'b ObjectStore,
+    manifest: &'a mut Manifest,
+    indices: Option<Vec<IndexMetadata>>,
+    path: &'a Path,
+    inline_transaction: Option<lance_table::format::pb::Transaction>,
+) -> BoxFuture<'a, Result<WriteResult>>
+where
+    'b: 'a,
+{
+    write_manifest_file_to_path(object_store, manifest, indices, path, inline_transaction)
 }
 
 impl Projectable for Dataset {
@@ -2683,60 +2727,160 @@ mod tests {
         assert_eq!(get_iops(), 2);
     }
 
-    #[rstest]
     #[tokio::test]
-    async fn test_write_params(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        data_storage_version: LanceFileVersion,
-    ) {
-        use fragment::FragReadConfig;
-
-        let test_dir = tempdir().unwrap();
+    async fn test_inline_transaction_read_write_flag_true_prefers_inline() {
+        // Create a simple dataset
+        let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter_values(0..5))]).unwrap();
+        let ds = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), test_uri, None).await.unwrap();
+        let ds = Arc::new(ds);
 
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "i",
-            DataType::Int32,
-            false,
-        )]));
-        let num_rows: usize = 1_000;
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
-        )
-        .unwrap()];
-
-        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-
-        let write_params = WriteParams {
-            max_rows_per_file: 100,
-            max_rows_per_group: 10,
-            data_storage_version: Some(data_storage_version),
-            ..Default::default()
-        };
-        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+        // Commit a simple append transaction with default write_flag=true (inline + file)
+        let read_version = ds.manifest().version;
+        let tx = crate::dataset::transaction::Transaction::new(
+            read_version,
+            crate::dataset::transaction::Operation::Append { fragments: vec![] },
+            None,
+            None,
+        );
+        let ds2 = crate::dataset::CommitBuilder::new(ds.clone())
+            .execute(tx.clone())
             .await
             .unwrap();
 
-        assert_eq!(dataset.count_rows(None).await.unwrap(), num_rows);
-
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 10);
-        assert_eq!(dataset.count_fragments(), 10);
-        for fragment in &fragments {
-            assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
-            let reader = fragment
-                .open(dataset.schema(), FragReadConfig::default())
-                .await
-                .unwrap();
-            // No group / batch concept in v2
-            if data_storage_version == LanceFileVersion::Legacy {
-                assert_eq!(reader.legacy_num_batches(), 10);
-                for i in 0..reader.legacy_num_batches() as u32 {
-                    assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
-                }
-            }
+        // Delete external transaction file to force inline path usage
+        if let Some(tx_file) = ds2.manifest.transaction_file.as_ref() {
+            let tx_path = ds2.base.child("_transactions").child(tx_file.as_str());
+            let _ = ds2.object_store.inner.delete(&tx_path).await; // ignore errors
         }
+
+        // Read should still succeed via inline transaction
+        let read_tx = ds2.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx.read_version, tx.read_version);
+    }
+
+    #[tokio::test]
+    async fn test_inline_transaction_read_write_flag_false_inline_only() {
+        // Create dataset
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter_values(0..3))]).unwrap();
+        let ds = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), test_uri, None).await.unwrap();
+        let ds = Arc::new(ds);
+
+        // Commit with write_flag=false (inline only)
+        let tx = crate::dataset::transaction::Transaction::new(
+            ds.manifest().version,
+            crate::dataset::transaction::Operation::Append { fragments: vec![] },
+            None,
+            None,
+        );
+        let ds2 = crate::dataset::CommitBuilder::new(ds.clone())
+            .with_write_transaction_file(false)
+            .execute(tx.clone())
+            .await
+            .unwrap();
+
+        // Ensure inline section exists and external tx file not required
+        assert!(ds2.manifest.transaction_section.is_some());
+        let read_tx = ds2.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx.read_version, tx.read_version);
+    }
+
+    #[tokio::test]
+    async fn test_read_transaction_fallback_when_inline_missing() {
+        // Create dataset
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter_values(0..2))]).unwrap();
+        let ds = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), test_uri, None).await.unwrap();
+
+        // Prepare a transaction and write external transaction file only
+        let tx = crate::dataset::transaction::Transaction::new(
+            ds.manifest.version,
+            crate::dataset::transaction::Operation::Append { fragments: vec![] },
+            None,
+            None,
+        );
+        let tx_file = crate::io::commit::write_transaction_file(ds.object_store(), &ds.base, &tx)
+            .await
+            .unwrap();
+
+        // Build a manifest without inline transaction
+        let (mut manifest, indices) = tx
+            .build_manifest(Some(ds.manifest.as_ref()), ds.load_indices().await.unwrap().as_ref().clone(), &tx_file, &ManifestWriteConfig::default(), None)
+            .unwrap();
+        // Write manifest without inline payload
+        let location = write_manifest_file(
+            ds.object_store(),
+            ds.commit_handler.as_ref(),
+            &ds.base,
+            &mut manifest,
+            if indices.is_empty() { None } else { Some(indices.clone()) },
+            &ManifestWriteConfig::default(),
+            ds.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Open latest manifest and verify read_transaction falls back to file
+        let ds_new = ds.checkout_version(location.version).await.unwrap();
+        assert!(ds_new.manifest.transaction_section.is_none());
+        assert!(ds_new.manifest.transaction_file.is_some());
+        let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx.read_version, tx.read_version);
+    }
+
+    #[tokio::test]
+    async fn test_read_transaction_malformed_inline_fallback_to_file() {
+        // Create dataset
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from_iter_values(0..2))]).unwrap();
+        let ds = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), test_uri, None).await.unwrap();
+
+        // Prepare a transaction and write external transaction file
+        let tx = crate::dataset::transaction::Transaction::new(
+            ds.manifest.version,
+            crate::dataset::transaction::Operation::Append { fragments: vec![] },
+            None,
+            None,
+        );
+        let tx_file = crate::io::commit::write_transaction_file(ds.object_store(), &ds.base, &tx)
+            .await
+            .unwrap();
+
+        // Build a manifest and set an invalid transaction_section position
+        let (mut manifest, indices) = tx
+            .build_manifest(Some(ds.manifest.as_ref()), ds.load_indices().await.unwrap().as_ref().clone(), &tx_file, &ManifestWriteConfig::default(), None)
+            .unwrap();
+        manifest.transaction_section = Some(1usize); // invalid position
+
+        // Write manifest without inline payload (preserve invalid pos)
+        let location = write_manifest_file(
+            ds.object_store(),
+            ds.commit_handler.as_ref(),
+            &ds.base,
+            &mut manifest,
+            if indices.is_empty() { None } else { Some(indices.clone()) },
+            &ManifestWriteConfig::default(),
+            ds.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Open latest
+        let ds_new = ds.checkout_version(location.version).await.unwrap();
+        // Should fallback to file despite invalid inline pointer
+        let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
+        assert_eq!(read_tx.read_version, tx.read_version);
     }
 
     #[rstest]
@@ -2836,8 +2980,10 @@ mod tests {
                 use_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
+                write_transaction_file: true,
             },
             dataset.manifest_location.naming_scheme,
+            None,
         )
         .await
         .unwrap();

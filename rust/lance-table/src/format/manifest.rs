@@ -77,6 +77,9 @@ pub struct Manifest {
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
 
+    /// The file position of the inline transaction content inside the manifest
+    pub transaction_section: Option<usize>,
+
     /// Precomputed logic offset of each fragment
     /// accelerating the fragment search using offset ranges.
     fragment_offsets: Vec<usize>,
@@ -149,6 +152,7 @@ impl Manifest {
             writer_feature_flags: 0,
             max_fragment_id: None,
             transaction_file: None,
+            transaction_section: None,
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
@@ -184,6 +188,7 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
+            transaction_section: None,
             fragment_offsets,
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
@@ -239,6 +244,7 @@ impl Manifest {
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
+            transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
@@ -684,11 +690,8 @@ impl TryFrom<pb::Manifest> for Manifest {
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
             fragments,
-            transaction_file: if p.transaction_file.is_empty() {
-                None
-            } else {
-                Some(p.transaction_file)
-            },
+            transaction_file: p.transaction_file,
+            transaction_section: p.transaction_section.map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -746,7 +749,7 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
-            transaction_file: m.transaction_file.clone().unwrap_or_default(),
+            transaction_file: m.transaction_file.clone(),
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
                 file_format: m.data_storage_format.file_format.clone(),
@@ -764,7 +767,7 @@ impl From<&Manifest> for pb::Manifest {
                     path: base_path.path.clone(),
                 })
                 .collect(),
-            inline_transaction: None,
+            transaction_section: m.transaction_section.map(|i| i as u64),
         }
     }
 }
