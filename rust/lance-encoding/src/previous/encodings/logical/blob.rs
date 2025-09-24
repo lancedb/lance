@@ -400,7 +400,7 @@ pub mod tests {
 
     use crate::{
         format::pb::column_encoding,
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{check_round_trip_encoding_of_data, check_specific_random, TestCases},
         version::LanceFileVersion,
     };
 
@@ -414,7 +414,9 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_blob() {
         let field = Field::new("", DataType::LargeBinary, false).with_metadata(BLOB_META.clone());
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        // TODO (https://github.com/lancedb/lance/issues/4781)
+        let test_cases = TestCases::default().with_max_file_version(LanceFileVersion::V2_0);
+        check_specific_random(field, test_cases).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -422,26 +424,32 @@ pub mod tests {
         let val1: &[u8] = &[1, 2, 3];
         let val2: &[u8] = &[7, 8, 9];
         let array = Arc::new(LargeBinaryArray::from(vec![Some(val1), None, Some(val2)]));
-        let test_cases = TestCases::default().with_verify_encoding(Arc::new(|cols| {
-            assert_eq!(cols.len(), 1);
-            let col = &cols[0];
-            assert!(matches!(
-                col.encoding.column_encoding.as_ref().unwrap(),
-                column_encoding::ColumnEncoding::Blob(_)
-            ));
-        }));
+        let test_cases = TestCases::default()
+            // TODO (https://github.com/lancedb/lance/issues/4781)
+            .with_max_file_version(LanceFileVersion::V2_0)
+            .with_verify_encoding(Arc::new(|cols| {
+                assert_eq!(cols.len(), 1);
+                let col = &cols[0];
+                assert!(matches!(
+                    col.encoding.column_encoding.as_ref().unwrap(),
+                    column_encoding::ColumnEncoding::Blob(_)
+                ));
+            }));
         // Use blob encoding if requested
         check_round_trip_encoding_of_data(vec![array.clone()], &test_cases, BLOB_META.clone())
             .await;
 
-        let test_cases = TestCases::default().with_verify_encoding(Arc::new(|cols| {
-            assert_eq!(cols.len(), 1);
-            let col = &cols[0];
-            assert!(!matches!(
-                col.encoding.column_encoding.as_ref().unwrap(),
-                column_encoding::ColumnEncoding::Blob(_)
-            ));
-        }));
+        let test_cases = TestCases::default()
+            // TODO (https://github.com/lancedb/lance/issues/4781)
+            .with_max_file_version(LanceFileVersion::V2_0)
+            .with_verify_encoding(Arc::new(|cols| {
+                assert_eq!(cols.len(), 1);
+                let col = &cols[0];
+                assert!(!matches!(
+                    col.encoding.column_encoding.as_ref().unwrap(),
+                    column_encoding::ColumnEncoding::Blob(_)
+                ));
+            }));
         // Don't use blob encoding if not requested
         check_round_trip_encoding_of_data(vec![array], &test_cases, Default::default()).await;
     }

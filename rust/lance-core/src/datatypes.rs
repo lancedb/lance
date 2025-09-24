@@ -21,7 +21,10 @@ pub use field::{
     Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions, StorageClass,
     LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
 };
-pub use schema::{FieldRef, OnMissing, Projectable, Projection, Schema};
+pub use schema::{
+    escape_field_path_for_project, format_field_path, parse_field_path, FieldRef, OnMissing,
+    Projectable, Projection, Schema,
+};
 
 // NOTE: BLOB_META_KEY is used in lance-core's field.rs, so it must stay here
 // to avoid circular dependency with lance-encoding

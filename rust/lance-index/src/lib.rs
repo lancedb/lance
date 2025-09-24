@@ -48,6 +48,11 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }
 
+pub mod pbold {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+}
+
 /// Generic methods common across all types of secondary indices
 ///
 #[async_trait]

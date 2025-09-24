@@ -2890,7 +2890,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3902,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3920,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3929,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3964,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3994,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4011,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4039,6 +4039,7 @@ dependencies = [
  "prost-types 0.13.5",
  "rand 0.9.1",
  "snafu",
+ "strum 0.25.0",
  "tokio",
  "tracing",
  "xxhash-rust",
@@ -4047,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4081,7 +4082,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4143,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4183,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4206,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4431,8 +4432,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "strum",
- "strum_macros",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "unicode-blocks",
  "unicode-normalization",
  "unicode-segmentation",
@@ -5629,7 +5630,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.10.5",
  "log",
  "multimap",
@@ -5649,7 +5650,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.10.5",
  "log",
  "multimap",
@@ -5740,7 +5741,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6828,7 +6829,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1961e2ef424c1424204d3a5d6975f934f56b6d50ff5732382d84ebf460e147f7"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -6933,11 +6934,33 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "290d54ea6f91c969195bdbcd7442c8c2a2ba87da8bf60a7ee86a235d4bc1e125"
+dependencies = [
+ "strum_macros 0.25.3",
+]
+
+[[package]]
+name = "strum"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f64def088c51c9510a8579e3c5d67c65349dcf755e5479ad3d010aa6454e2c32"
 dependencies = [
- "strum_macros",
+ "strum_macros 0.27.1",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23dc1fa9ac9c169a78ba62f0b841814b7abae11bdd047b9c58f893439e309ea0"
+dependencies = [
+ "heck 0.4.1",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 2.0.104",
 ]
 
 [[package]]

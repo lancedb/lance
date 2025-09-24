@@ -106,7 +106,7 @@ impl Stream for LanceStream {
         let poll_result = match this.inner_stream.poll_next_unpin(cx) {
             Poll::Ready(None) => {
                 if let Some(scheduler) = &this.scan_scheduler {
-                    this.scan_metrics.io_metrics.record_final(scheduler);
+                    this.scan_metrics.io_metrics.record(scheduler);
                 }
                 Poll::Ready(None)
             }

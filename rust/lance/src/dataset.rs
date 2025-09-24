@@ -77,6 +77,7 @@ pub mod sql;
 pub mod statistics;
 mod take;
 pub mod transaction;
+pub mod udtf;
 pub mod updater;
 mod utils;
 mod write;
@@ -193,7 +194,7 @@ impl From<&Manifest> for Version {
         Self {
             version: m.version,
             timestamp: m.timestamp(),
-            metadata: BTreeMap::default(),
+            metadata: m.summary().into(),
         }
     }
 }
