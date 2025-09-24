@@ -940,7 +940,7 @@ mod tests {
         let dataset_root_dir = "file:///var/balabala/dataset1".to_string();
         let base_location = BranchLocation {
             path: Path::from(dataset_root_dir.clone()),
-            uri: dataset_root_dir.clone(),
+            uri: dataset_root_dir,
             branch: Some("random_branch".to_string()),
         };
 
@@ -958,8 +958,7 @@ mod tests {
                 let expected_full_path = base_location
                     .find_branch(Some(expected_relative.to_string()))
                     .unwrap()
-                    .path
-                    .clone();
+                    .path;
                 assert_eq!(result.unwrap().as_ref(), expected_full_path.as_ref());
             }
             None => {
