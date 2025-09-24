@@ -81,25 +81,31 @@ impl BackgroundExecutor {
 
         let handle = self.runtime.spawn(fut);
 
-        loop {
-            // Check for keyboard interrupts
-            match Python::with_gil(|py| py.check_signals()) {
-                Ok(_) => {}
-                Err(err) => {
-                    handle.abort();
-                    return Err(err);
-                }
-            }
-            // Wait for 100ms before checking signals again
-            match rx.recv_timeout(SIGNAL_CHECK_INTERVAL) {
-                Ok(output) => return Ok(output),
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    handle.abort();
-                    return Err(PyRuntimeError::new_err("Task was aborted"));
-                }
-            }
-        }
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                Python::with_gil(|py| {
+                    let rx = rx;
+                    loop {
+                        if let Err(err) = py.check_signals() {
+                            handle.abort();
+                            return Err(err);
+                        }
+
+                        // Wait for 100ms before checking signals again
+                        match rx.recv_timeout(SIGNAL_CHECK_INTERVAL) {
+                            Ok(output) => return Ok(output),
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                handle.abort();
+                                return Err(PyRuntimeError::new_err("Task was aborted"));
+                            }
+                        }
+                    }
+                })
+            })
+            .join()
+            .unwrap()
+        })
     }
 
     /// Spawn a task in the background
