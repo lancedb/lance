@@ -113,7 +113,7 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         SCORE_FIELD.clone(),
     ]))
 });
-static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
+static ROW_ADDR_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
@@ -293,7 +293,7 @@ impl InvertedIndex {
         Ok(candidates
             .into_sorted_vec()
             .into_iter()
-            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+            .map(|Reverse(doc)| (doc.row_addr, doc.score.0))
             .unzip())
     }
 
@@ -513,7 +513,7 @@ impl InvertedIndex {
             .await?;
 
         Ok(RecordBatch::try_new(
-            ROW_ID_SCHEMA.clone(),
+            ROW_ADDR_SCHEMA.clone(),
             vec![Arc::new(UInt64Array::from(doc_ids))],
         )?)
     }
