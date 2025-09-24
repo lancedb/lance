@@ -323,15 +323,15 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                 ),
                 location: location!(),
             })? {
-            if actual_file_version > data_storage_version {
-                log::warn!(
+                if actual_file_version > data_storage_version {
+                    log::warn!(
                         "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
                         data_storage_version,
                         actual_file_version
                     );
-                manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
+                    manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
+                }
             }
-        }
     } else {
         // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
         // match the data storage version.  This is a sanity assertion to prevent data corruption.
