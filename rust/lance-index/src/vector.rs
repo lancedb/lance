@@ -175,7 +175,8 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// that are most likely to contain the nearest neighbors (e.g. the closest
     /// partitions to the query vector).
     ///
-    /// The results should be in sorted order from closest to farthest.
+    /// Return the partition ids and the distances between the query and the centroids,
+    /// the results should be in sorted order from closest to farthest.
     fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)>;
 
     /// Get the total number of partitions in the index.
