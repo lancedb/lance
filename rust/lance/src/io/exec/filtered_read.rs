@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::any::Any;
 use std::iter::Peekable;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{ops::Range, sync::Arc};
@@ -458,7 +459,6 @@ impl FilteredReadStream {
             loaded_fragments,
             &evaluated_index,
             &options,
-            &global_metrics,
             scan_scheduler.clone(),
         )
         .await?;
@@ -547,7 +547,6 @@ impl FilteredReadStream {
         fragments: Vec<LoadedFragment>,
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
-        _global_metrics: &FilteredReadGlobalMetrics,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<(Vec<ScopedFragmentRead>, bool)> {
         let mut scoped_fragments = Vec::with_capacity(fragments.len());
@@ -711,20 +710,8 @@ impl FilteredReadStream {
                 Self::trim_fragments_to_range(scoped_fragments, range_after_filter);
                 true
             }
-            IndexExprResult::AtLeast(_) => {
-                let total_guaranteed = scoped_fragments
-                    .iter()
-                    .map(|frag| frag.ranges.iter().map(|r| r.end - r.start).sum::<u64>())
-                    .sum::<u64>();
-
-                if total_guaranteed >= range_after_filter.end {
-                    Self::trim_fragments_to_range(scoped_fragments, range_after_filter);
-                    true
-                } else {
-                    false
-                }
-            }
             _ => {
+                // TODO push down for AtLeast if guaranteed rows >= limit
                 // Cannot optimize AtMost or other cases
                 false
             }
@@ -734,7 +721,7 @@ impl FilteredReadStream {
     fn trim_fragments_to_range(scoped_fragments: &mut Vec<ScopedFragmentRead>, range: &Range<u64>) {
         let mut to_skip = range.start;
         let mut to_take = range.end - range.start;
-        let mut fragments_to_keep = Vec::new();
+        let mut fragments_to_keep = Vec::with_capacity(scoped_fragments.len());
 
         for mut fragment in scoped_fragments.drain(..) {
             if to_take == 0 {
@@ -1126,13 +1113,13 @@ impl FilteredReadStream {
             )))
             .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
 
-        if let Some(limit) = fragment_soft_limit {
-            Ok(Box::pin(
-                Self::apply_soft_limit(fragment_stream, limit).boxed(),
-            ))
-        } else {
-            Ok(Box::pin(fragment_stream.boxed()))
-        }
+        let result: Pin<Box<dyn Stream<Item = Result<ReadBatchFut>> + Send>> =
+            if let Some(limit) = fragment_soft_limit {
+                Box::pin(Self::apply_soft_limit(fragment_stream, limit))
+            } else {
+                Box::pin(fragment_stream)
+            };
+        Ok(result)
     }
 
     fn wrap_with_filter(
@@ -1200,7 +1187,7 @@ impl FilteredReadStream {
                 }
 
                 let batch_rows = batch.num_rows();
-                let current_position = rows_seen.fetch_add(batch_rows, Ordering::SeqCst);
+                let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
                 let batch_end = current_position + batch_rows;
 
                 if batch_end <= start || current_position >= end {
@@ -1469,6 +1456,18 @@ impl FilteredReadExec {
         }
 
         if options.scan_range_after_filter.is_some() {
+            // Validate that there's a filter when using scan_range_after_filter
+            if options.full_filter.is_none()
+                && options.refine_filter.is_none()
+                && index_input.is_none()
+            {
+                return Err(Error::InvalidInput {
+                    source: "scan_range_after_filter requires a filter to be applied. Use scan_range_before_filter for unfiltered scans."
+                        .into(),
+                    location: location!(),
+                });
+            }
+
             // TODO: support multi partition
             if matches!(
                 options.threading_mode,
@@ -1807,51 +1806,38 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        // This is to push limits down to downstream execs
+        // This is to push the limit through the node and into an upstream node.
+        // The only upstream node is the index search and we can't push the limit
+        // to that node.
         false
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        limit?;
-        // Support limit push down
-        let mut updated_options = self.options.clone();
-        let fetch = limit.unwrap();
+        // TODO: Support multiple partitions in the future by coordinating limits across partitions
+        if matches!(
+            self.options.threading_mode,
+            FilteredReadThreadingMode::MultiplePartitions(_)
+        ) {
+            return None;
+        }
+        if limit.is_none() {
+            // None means should remove any existing pushed down limit
+            return None;
+        }
+        let limit = limit?;
 
-        if self.options.full_filter.is_none() {
-            let new_range = if let Some(existing_range) = &self.options.scan_range_before_filter {
-                let start = existing_range.start;
-                let end = existing_range.end.min(start + fetch as u64);
-                start..end
-            } else {
-                0..(fetch as u64)
-            };
-            updated_options.scan_range_before_filter = Some(new_range);
-        } else {
-            // TODO: Support multiple partitions in the future by coordinating limits across partitions
-            if matches!(
-                self.options.threading_mode,
-                FilteredReadThreadingMode::MultiplePartitions(_)
-            ) {
+        let mut updated_options = self.options.clone();
+
+        if self.options.full_filter.is_none() && self.options.refine_filter.is_none() {
+            if self.options.scan_range_before_filter.is_some() {
                 return None;
             }
-
-            let new_range = if let Some(existing_range) = &self.options.scan_range_after_filter {
-                let start = existing_range.start;
-                let end = existing_range.end.min(start + fetch as u64);
-                start..end
-            } else {
-                0..(fetch as u64)
-            };
-
-            match updated_options.with_scan_range_after_filter(new_range) {
-                Ok(options) => {
-                    updated_options = options;
-                }
-                Err(e) => {
-                    log::debug!("Cannot apply fetch limit to scan_range_after_filter: {}", e);
-                    return None;
-                }
+            updated_options.scan_range_before_filter = Some(0..(limit as u64));
+        } else {
+            if self.options.scan_range_after_filter.is_some() {
+                return None;
             }
+            updated_options.scan_range_after_filter = Some(0..(limit as u64));
         }
 
         match Self::try_new(
@@ -1861,7 +1847,11 @@ impl ExecutionPlan for FilteredReadExec {
         ) {
             Ok(exec) => Some(Arc::new(exec)),
             Err(e) => {
-                log::debug!("Failed to create FilteredReadExec with fetch limit: {}", e);
+                log::warn!(
+                    "Failed to create FilteredReadExec for {} with fetch limit: {}",
+                    self.dataset.uri(),
+                    e
+                );
                 None
             }
         }
