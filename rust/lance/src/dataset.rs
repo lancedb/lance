@@ -412,7 +412,7 @@ impl Dataset {
     }
 
     /// Check out the latest version of the branch
-    pub async fn checkout_branch(&mut self, branch: &str) -> Result<Self> {
+    pub async fn checkout_branch(&self, branch: &str) -> Result<Self> {
         self.checkout_by_ref(None, Some(branch.to_string())).await
     }
 
@@ -7981,6 +7981,13 @@ mod tests {
         )
     }
 
+    // This test covers
+    // 1. Create branch from main, a branch and a global tag
+    // 2. Write to each created branch and verify data
+    // 2. Load branch from nested uris
+    // 3. Checkout branch from main, a branch and a global tag
+    // 4. List branches and verify branch metadata
+    // 5. Delete branches
     #[tokio::test]
     async fn test_branch() {
         let test_dir = tempdir().unwrap();
@@ -8044,6 +8051,7 @@ mod tests {
             .create_branch("branch1", original_version, None)
             .await
             .unwrap();
+        assert_eq!(branch1_dataset.uri, test_uri.to_owned() + "/tree/branch1");
 
         branch1_dataset = write_dataset(
             branch1_dataset.uri(),
@@ -8062,6 +8070,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            branch2_dataset.uri,
+            test_uri.to_owned() + "/tree/dev/branch2"
+        );
 
         branch2_dataset = write_dataset(
             branch2_dataset.uri(),
@@ -8087,6 +8099,10 @@ mod tests {
             .create_branch("feature/nathan/branch3", "tag1", None)
             .await
             .unwrap();
+        assert_eq!(
+            branch3_dataset.uri,
+            test_uri.to_owned() + "/tree/feature/nathan/branch3"
+        );
 
         branch3_dataset = write_dataset(
             branch3_dataset.uri(),
@@ -8154,6 +8170,59 @@ mod tests {
         assert!(branch3_content.create_at > 0);
         assert!(branch3_content.manifest_size > 0);
         assert!(branch3_content.create_at >= branch2_content.create_at);
+
+        // Verify checkout_branch
+        let checkout_branch1 = main_dataset.checkout_branch("branch1").await.unwrap();
+        let checkout_branch2 = checkout_branch1
+            .checkout_branch("dev/branch2")
+            .await
+            .unwrap();
+        let checkout_branch2_tag = checkout_branch1.checkout_version("tag1").await.unwrap();
+        let checkout_branch3 = checkout_branch2_tag
+            .checkout_branch("feature/nathan/branch3")
+            .await
+            .unwrap();
+        let checkout_branch3_at_version3 = checkout_branch2
+            .checkout_version(("feature/nathan/branch3", 3))
+            .await
+            .unwrap();
+        assert_eq!(checkout_branch3.version().version, 4);
+        assert_eq!(checkout_branch3_at_version3.version().version, 3);
+        assert_eq!(checkout_branch2.version().version, 3);
+        assert_eq!(checkout_branch2_tag.version().version, 3);
+        assert_eq!(checkout_branch1.version().version, 2);
+        assert_eq!(checkout_branch3.count_rows(None).await.unwrap(), 125);
+        assert_eq!(
+            checkout_branch3_at_version3.count_rows(None).await.unwrap(),
+            100
+        );
+        assert_eq!(checkout_branch2.count_rows(None).await.unwrap(), 100);
+        assert_eq!(checkout_branch2_tag.count_rows(None).await.unwrap(), 100);
+        assert_eq!(checkout_branch1.count_rows(None).await.unwrap(), 80);
+        assert_eq!(
+            checkout_branch3.manifest.branch.as_deref().unwrap(),
+            "feature/nathan/branch3"
+        );
+        assert_eq!(
+            checkout_branch3_at_version3
+                .manifest
+                .branch
+                .as_deref()
+                .unwrap(),
+            "feature/nathan/branch3"
+        );
+        assert_eq!(
+            checkout_branch2.manifest.branch.as_deref().unwrap(),
+            "dev/branch2"
+        );
+        assert_eq!(
+            checkout_branch2_tag.manifest.branch.as_deref().unwrap(),
+            "dev/branch2"
+        );
+        assert_eq!(
+            checkout_branch1.manifest.branch.as_deref().unwrap(),
+            "branch1"
+        );
 
         let mut dataset = main_dataset;
         // Finally delete all branches
