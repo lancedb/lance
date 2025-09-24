@@ -300,6 +300,10 @@ impl ExecutionPlan for MatchQueryExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 /// Calculates the FTS score for each row in the input
@@ -460,6 +464,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -675,6 +683,10 @@ impl ExecutionPlan for PhraseQueryExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -845,6 +857,10 @@ impl ExecutionPlan for BoostQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 

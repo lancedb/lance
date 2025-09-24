@@ -236,6 +236,10 @@ impl ExecutionPlan for ScalarIndexExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 pub static INDEX_LOOKUP_SCHEMA: LazyLock<SchemaRef> =
@@ -442,6 +446,10 @@ impl ExecutionPlan for MapIndexExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -755,6 +763,10 @@ impl ExecutionPlan for MaterializeIndexExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 

@@ -765,6 +765,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         &self.properties
     }
 
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+
     fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
         // We require a single partition for the merge operation to ensure all data is processed
         vec![datafusion_physical_expr::Distribution::SinglePartition]
