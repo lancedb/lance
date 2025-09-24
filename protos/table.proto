@@ -120,7 +120,7 @@ message Manifest {
   optional string transaction_file = 12;
 
   // The file position of the transaction content.
-  uint64 transaction_section = 19;
+  optional uint64 transaction_section = 21;
 
   // The next unused row id. If zero, then the table does not have any rows.
   //
