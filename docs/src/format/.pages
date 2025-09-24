@@ -2,4 +2,5 @@ nav:
   - Overview: index.md
   - File Format: file
   - Table Format: table
+  - Index Format: indices
 
