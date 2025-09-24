@@ -153,6 +153,21 @@ message AllNullLayout {
   repeated RepDefLayer layers = 5;
 }
 
+// A layout where large binary data is encoded externally and only
+// the descriptions (position + size) are placed in the page
+//
+// Repdef information is stored in the descriptions.  A description with a size of
+// 0 and a position of 0 is an empty value.  A description with a size of 0 and a
+// non-zero position is a null value and the position is the repdef value.
+message BlobLayout {
+  // The inner layout used to store the descriptions
+  PageLayout inner_layout = 1;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  //
+  // The inner layout's repdef layers will always be 1 all valid item layer
+  repeated RepDefLayer layers = 2;
+}
+
 // Describes the structural encoding of a page
 message PageLayout {
   oneof layout {
@@ -162,6 +177,9 @@ message PageLayout {
     AllNullLayout all_null_layout = 2;
     // A layout used for pages where the data is large
     FullZipLayout full_zip_layout = 3;
+    // A layout where large binary data is encoded externally
+    // and only the descriptions are put in the page
+    BlobLayout blob_layout = 4;
   }
 }
 
