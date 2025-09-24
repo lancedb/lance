@@ -32,10 +32,6 @@ pub struct OptimizeOptions {
     /// This would be faster than re-create the index from scratch.
     ///
     /// NOTE: this option is only supported for v3 vector indices.
-    #[deprecated(
-        since = "0.35.0",
-        note = "lance>=0.35.0 always incrementally updates the index, this option is ignored"
-    )]
     pub retrain: bool,
 }
 

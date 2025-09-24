@@ -4,10 +4,11 @@
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
 
-use arrow::datatypes;
+use arrow::compute::sort_to_indices;
+use arrow::datatypes::{self, Float16Type, Float32Type, Float64Type};
 use arrow::{array::AsArray, datatypes::UInt64Type};
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::Fields;
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::{DataType, Fields};
 use futures::stream;
 use futures::{
     prelude::stream::{StreamExt, TryStreamExt},
@@ -21,6 +22,8 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::v2::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::ivf::IvfTransformer;
+use lance_index::vector::kmeans::{KMeansAlgoFloat, KMeansParams};
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
@@ -47,7 +50,7 @@ use lance_index::{
     },
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
-use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_index::{IndexMetadata, IndexType, INDEX_METADATA_SCHEMA_KEY, MAX_PARTITION_SIZE_FACTOR};
 use lance_io::local::to_local_path;
 use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
@@ -68,6 +71,9 @@ use super::{
     ivf::load_precomputed_partitions_if_available,
     utils::{self, get_vector_type},
 };
+
+// the number of partitions to evaluate for reassigning
+const REASSIGN_RANGE: usize = 64;
 
 // Builder for IVF index
 // The builder will train the IVF model and quantizer, shuffle the dataset, and build the sub index
@@ -96,6 +102,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
     // fields for merging indices / remapping
     existing_indices: Vec<Arc<dyn VectorIndex>>,
+    should_split: bool,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 }
@@ -135,6 +142,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             quantizer: None,
             shuffle_reader: None,
             existing_indices: Vec::new(),
+            should_split: false,
             frag_reuse_index,
         })
     }
@@ -194,6 +202,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             quantizer: Some(ivf_index.quantizer().try_into()?),
             shuffle_reader: None,
             existing_indices: vec![index],
+            should_split: false,
             frag_reuse_index: None,
         })
     }
@@ -281,17 +290,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]
     async fn load_or_build_ivf(&self) -> Result<IvfModel> {
-        let Some(dataset) = self.dataset.as_ref() else {
-            return Err(Error::invalid_input(
-                "dataset not set before loading or building IVF",
-                location!(),
-            ));
-        };
-
-        let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
         match &self.ivf {
             Some(ivf) => Ok(ivf.clone()),
             None => {
+                let Some(dataset) = self.dataset.as_ref() else {
+                    return Err(Error::invalid_input(
+                        "dataset not set before loading or building IVF",
+                        location!(),
+                    ));
+                };
+                let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
                 let ivf_params = self.ivf_params.as_ref().ok_or(Error::invalid_input(
                     "IVF build params not set",
                     location!(),
@@ -463,14 +471,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         &mut self,
         data: Option<impl RecordBatchStream + Unpin + 'static>,
     ) -> Result<&mut Self> {
-        if data.is_none() {
+        let Some(data) = data else {
             // If we don't specify the shuffle reader, it's going to re-read the
             // dataset and duplicate the data.
             self.shuffle_reader = Some(Arc::new(EmptyReader));
 
             return Ok(self);
-        }
-        let data = data.unwrap();
+        };
 
         let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input(
@@ -591,7 +598,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     #[instrument(name = "build_partitions", level = "debug", skip_all)]
     async fn build_partitions(&mut self) -> Result<BuildStream<S, Q>> {
-        let Some(ivf) = self.ivf.as_mut() else {
+        let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input(
                 "IVF not set before building partitions",
                 location!(),
@@ -617,7 +624,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let reader = reader.clone();
-        let existing_indices = Arc::new(self.existing_indices.clone());
+        self.should_split = Self::should_split(&ivf, reader.as_ref(), &self.existing_indices)?;
+        // if no partitions to split, we just create a new delta index,
+        // otherwise, we need to merge all existing indices and split large partitions.
+        let existing_indices = if self.should_split {
+            Arc::new(self.existing_indices.clone())
+        } else {
+            Arc::new(Vec::new())
+        };
         let distance_type = self.distance_type;
         let column = self.column.clone();
         let frag_reuse_index = self.frag_reuse_index.clone();
@@ -771,6 +785,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             Default::default(),
         )?;
 
+        let index_type = IndexType::try_from(
+            index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
+        )?;
+
         // maintain the IVF partitions
         let mut storage_ivf = IvfModel::empty();
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap(), ivf.loss);
@@ -778,6 +796,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let mut part_id = 0;
         let mut total_loss = 0.0;
+        let mut new_centroids = Vec::with_capacity(ivf.num_partitions());
         log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
@@ -794,6 +813,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
             if storage.len() == 0 {
                 storage_ivf.add_partition(0);
+            } else if storage.len() > MAX_PARTITION_SIZE_FACTOR * index_type.target_partition_size()
+            {
             } else {
                 let batches = storage.to_batches()?.collect::<Vec<_>>();
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
@@ -882,11 +903,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(())
     }
 
-    // take vectors from the dataset
-    // used for reading vectors from existing indices
-    #[allow(dead_code)]
+    // take raw vectors from the dataset
+    //
+    // returns batches of schema | row_id | vector |
     async fn take_vectors(
-        dataset: &Arc<Dataset>,
+        dataset: &Dataset,
         column: &str,
         store: &ObjectStore,
         row_ids: &[u64],
@@ -906,6 +927,131 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             batches.push(batch);
         }
         Ok(batches)
+    }
+
+    // return the partition ids that should be split
+    fn should_split(
+        ivf: &IvfModel,
+        reader: &dyn ShuffleReader,
+        existing_indices: &[Arc<dyn VectorIndex>],
+    ) -> Result<bool> {
+        let index_type = IndexType::try_from(
+            index_type_string(S::name().try_into()?, Q::quantization_type()).as_str(),
+        )?;
+
+        for partition in 0..ivf.num_partitions() {
+            let mut num_rows = reader.partition_size(partition)?;
+            for index in existing_indices.iter() {
+                num_rows += index.ivf_model().partition_size(partition);
+            }
+            if num_rows > MAX_PARTITION_SIZE_FACTOR * index_type.target_partition_size() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // split this partition,
+    // 1. take raw vectors by row ids in this partition
+    // 2. run KMeans with k=2 to get 2 new centroids
+    // 3. reassign the vectors to the 2 new partitions
+    async fn split_partition(
+        &self,
+        part_id: usize,
+        ivf: &IvfModel,
+        storage: &Q::Storage,
+        centroids: &mut Vec<ArrayRef>,
+    ) -> Result<(Q::Storage, Q::Storage)> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Err(Error::invalid_input(
+                "dataset not set before split partition",
+                location!(),
+            ));
+        };
+        let Some(quantizer) = self.quantizer.clone() else {
+            return Err(Error::invalid_input(
+                "quantizer not set before shuffle data",
+                location!(),
+            ));
+        };
+
+        // take the raw vectors from dataset
+        let row_ids = storage.row_ids().copied().collect::<Vec<_>>();
+        let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+        let vectors = batch[&self.column].as_fixed_size_list();
+        let dimension = vectors.value_length() as usize;
+
+        // train kmeans to get 2 new centroids
+        let params = KMeansParams::new(None, 50, 1, self.distance_type);
+        let kmeans = match vectors.value_type() {
+            DataType::Float16 => lance_index::vector::kmeans::train_kmeans::<Float16Type>(
+                vectors.values().as_primitive(),
+                params,
+                dimension,
+                2,
+                256,
+            )?,
+            DataType::Float32 => lance_index::vector::kmeans::train_kmeans::<Float32Type>(
+                vectors.values().as_primitive(),
+                params,
+                dimension,
+                2,
+                256,
+            )?,
+            DataType::Float64 => lance_index::vector::kmeans::train_kmeans::<Float64Type>(
+                vectors.values().as_primitive(),
+                params,
+                dimension,
+                2,
+                256,
+            )?,
+            _ => {
+                return Err(Error::invalid_input("unsupported vector type", location!()));
+            }
+        };
+        let c0 = ivf.centroid(part_id).ok_or(Error::invalid_input(
+            "original centroid not found",
+            location!(),
+        ))?;
+        let c1 = kmeans.centroids.slice(0, dimension);
+        let c2 = kmeans.centroids.slice(dimension, dimension);
+        centroids.push(c1);
+        centroids.push(c2);
+
+        // get top REASSIGN_RANGE centroids from c0
+        let reassign_range = std::cmp::min(REASSIGN_RANGE + 1, ivf.num_partitions());
+        let centroid_dists =
+            self.distance_type.arrow_batch_func()(&c0, ivf.centroids_array().unwrap())?;
+        let reassign_range_candidates =
+            sort_to_indices(centroid_dists.as_ref(), None, Some(reassign_range))?;
+        // exclude the original centroid itself
+        let reassign_range_candidates = &reassign_range_candidates.values()[1..];
+
+        // compute the distance between the vectors and the 3 centroids (original one and the 2 new ones)
+        let d0 = self.distance_type.arrow_batch_func()(&c0, &vectors)?;
+        let d1 = self.distance_type.arrow_batch_func()(&c1, &vectors)?;
+        let d2 = self.distance_type.arrow_batch_func()(&c2, &vectors)?;
+        let d0 = d0.values();
+        let d1 = d1.values();
+        let d2 = d2.values();
+
+        // evaluate LIRE protocol:
+        // if d0[i] <= d1[i] and d0[i] <= d2[i], then the vector i needs to be reassigned,
+        // otherwise, just assign it to the closest cluster (c1 or c2)
+        let half_length = vectors.len() / 2;
+        let mut part1_row_ids = Vec::with_capacity(half_length);
+        let mut part1_vectors = Vec::with_capacity(half_length * dimension);
+        let mut part2_row_ids = Vec::with_capacity(half_length);
+        let mut part2_vectors = Vec::with_capacity(half_length * dimension);
+        for (i, row_id) in row_ids.iter().enumerate() {
+            if d0[i] <= d1[i] && d0[i] <= d2[i] {
+                // reassign this vector
+            } else if d1[i] <= d0[i] && d1[i] <= d2[i] {
+                part2_row_ids.push(row_id);
+                part2_vectors.extend(vectors[i].iter().copied());
+            }
+        }
     }
 }
 
