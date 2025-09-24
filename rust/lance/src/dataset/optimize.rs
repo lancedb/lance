@@ -220,7 +220,7 @@ pub async fn compact_files(
     mut options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
-    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = dataset.uri());
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     options.validate();
 
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
