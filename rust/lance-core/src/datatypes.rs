@@ -34,13 +34,11 @@ pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     ])
 });
 
-pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
-    ArrowField::new(
-        "description",
-        DataType::Struct(BLOB_DESC_FIELDS.clone()),
-        true,
-    )
-});
+pub static BLOB_DESC_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_DESC_FIELDS.clone()));
+
+pub static BLOB_DESC_FIELD: LazyLock<ArrowField> =
+    LazyLock::new(|| ArrowField::new("description", BLOB_DESC_TYPE.clone(), true));
 
 pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
