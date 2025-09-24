@@ -1883,7 +1883,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
-    use lance_core::{ROW_ADDR, ROW_ID};
+    use lance_core::ROW_ADDR;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;

@@ -3368,7 +3368,7 @@ impl Scanner {
             },
         };
         let sort_expr_row_id = PhysicalSortExpr {
-            expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+            expr: expressions::col(ROW_ADDR, ann_node.schema().as_ref())?,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
@@ -6016,7 +6016,7 @@ mod test {
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   ProjectionExec: expr=[_rowid@1 as _rowid]
-    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
+    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
         )
         .await
         .unwrap();
