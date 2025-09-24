@@ -57,7 +57,7 @@ const MAX_DEPTH: usize = 500;
 ///
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct IndexedExpression {
     /// The portion of the query that can be satisfied by scalar indices
     pub scalar_query: Option<ScalarIndexExpr>,
@@ -142,22 +142,166 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
 /// A generic parser that wraps multiple scalar query parsers
 ///
 /// It will search each parser in order and return the first non-None result
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexTypeHint {
+    BTree,
+    BloomFilter,
+    ZoneMap,
+    Bitmap,
+    Json,
+    Inverted,
+    LabelList,
+    Unknown,
+}
+
+impl IndexTypeHint {
+    fn from_plugin_name(name: &str) -> Self {
+        match name {
+            "btree" => Self::BTree,
+            "bloomfilter" => Self::BloomFilter,
+            "zonemap" => Self::ZoneMap,
+            "bitmap" => Self::Bitmap,
+            "json" => Self::Json,
+            "inverted" => Self::Inverted,
+            "label_list" => Self::LabelList,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IndexSelectionOptions {
+    /// Query-level type hints, ordered by preference
+    pub query_hints: Vec<IndexTypeHint>,
+    /// Column-level type hints, ordered by preference
+    pub column_hints: HashMap<String, Vec<IndexTypeHint>>,
+}
+
+#[derive(Debug)]
+struct ParserEntry {
+    plugin_name: String,
+    parser: Box<dyn ScalarQueryParser>,
+}
+
 #[derive(Debug)]
 pub struct MultiQueryParser {
-    parsers: Vec<Box<dyn ScalarQueryParser>>,
+    entries: Vec<ParserEntry>,
+    column_name: Option<String>,
+    options: Option<IndexSelectionOptions>,
 }
 
 impl MultiQueryParser {
     /// Create a new MultiQueryParser with a single parser
     pub fn single(parser: Box<dyn ScalarQueryParser>) -> Self {
         Self {
-            parsers: vec![parser],
+            entries: vec![ParserEntry {
+                plugin_name: "unknown".to_string(),
+                parser,
+            }],
+            column_name: None,
+            options: None,
         }
     }
 
-    /// Add a new parser to the MultiQueryParser
+    /// Create a new MultiQueryParser with options and initial parser
+    pub fn with_options(
+        column_name: Option<String>,
+        options: Option<IndexSelectionOptions>,
+        plugin_name: String,
+        parser: Box<dyn ScalarQueryParser>,
+    ) -> Self {
+        Self {
+            entries: vec![ParserEntry {
+                plugin_name,
+                parser,
+            }],
+            column_name,
+            options,
+        }
+    }
+
+    /// Add a new parser to the MultiQueryParser with plugin name
+    pub fn add_with_name(&mut self, plugin_name: String, other: Box<dyn ScalarQueryParser>) {
+        self.entries.push(ParserEntry {
+            plugin_name,
+            parser: other,
+        });
+    }
+
+    /// Backward-compatible add without plugin name
     pub fn add(&mut self, other: Box<dyn ScalarQueryParser>) {
-        self.parsers.push(other);
+        self.entries.push(ParserEntry {
+            plugin_name: "unknown".to_string(),
+            parser: other,
+        });
+    }
+
+    fn preferred_order(&self) -> Vec<usize> {
+        // Determine preferred order indices based on column or query hints
+        let mut indices: Vec<usize> = (0..self.entries.len()).collect();
+        let Some(opts) = &self.options else {
+            return indices;
+        };
+
+        // Determine target hint list
+        let mut hints: Vec<IndexTypeHint> = if let Some(col) = &self.column_name {
+            opts.column_hints.get(col).cloned().unwrap_or_default()
+        } else {
+            vec![]
+        };
+        if hints.is_empty() {
+            hints = opts.query_hints.clone();
+        }
+        if hints.is_empty() {
+            return indices;
+        }
+
+        // Stable sort indices based on first matching hint position
+        indices.sort_by_key(|&i| {
+            let hint = IndexTypeHint::from_plugin_name(&self.entries[i].plugin_name);
+            match hints.iter().position(|h| *h == hint) {
+                Some(pos) => pos as i32,
+                None => i32::MAX, // non-hinted go last
+            }
+        });
+        indices
+    }
+
+    fn select_candidate(
+        &self,
+        candidates: &[(usize, IndexedExpression)],
+    ) -> Option<(usize, IndexedExpression)> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Hint-based ordering
+        let mut ordered: Vec<(usize, IndexedExpression)> = candidates.to_vec();
+        let hint_order = self.preferred_order();
+        ordered.sort_by_key(
+            |(idx, _)| match hint_order.iter().position(|hidx| hidx == idx) {
+                Some(pos) => pos as i32,
+                None => i32::MAX,
+            },
+        );
+
+        // Check if we have hints and if the best candidate matches the hints
+        if !hint_order.is_empty() && hint_order[0] != 0 {
+            // We have hints and the best candidate doesn't match the hints
+            // In strict mode, if no candidate matches the hints, return None
+            if hint_order.iter().all(|&hidx| {
+                !candidates
+                    .iter()
+                    .any(|(idx, _)| hint_order.iter().position(|&x| x == *idx) == Some(hidx))
+            }) {
+                return None;
+            }
+        }
+
+        // Default: first after hint sort (or original order)
+        Some(ordered[0].clone())
     }
 }
 
@@ -168,24 +312,40 @@ impl ScalarQueryParser for MultiQueryParser {
         low: &Bound<ScalarValue>,
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
-        self.parsers
-            .iter()
-            .find_map(|parser| parser.visit_between(column, low, high))
+        let mut candidates: Vec<(usize, IndexedExpression)> = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let Some(idx_expr) = entry.parser.visit_between(column, low, high) {
+                candidates.push((i, idx_expr));
+            }
+        }
+        self.select_candidate(&candidates).map(|(_, expr)| expr)
     }
     fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
-        self.parsers
-            .iter()
-            .find_map(|parser| parser.visit_in_list(column, in_list))
+        let mut candidates: Vec<(usize, IndexedExpression)> = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let Some(idx_expr) = entry.parser.visit_in_list(column, in_list) {
+                candidates.push((i, idx_expr));
+            }
+        }
+        self.select_candidate(&candidates).map(|(_, expr)| expr)
     }
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
-        self.parsers
-            .iter()
-            .find_map(|parser| parser.visit_is_bool(column, value))
+        let mut candidates: Vec<(usize, IndexedExpression)> = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let Some(idx_expr) = entry.parser.visit_is_bool(column, value) {
+                candidates.push((i, idx_expr));
+            }
+        }
+        self.select_candidate(&candidates).map(|(_, expr)| expr)
     }
     fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
-        self.parsers
-            .iter()
-            .find_map(|parser| parser.visit_is_null(column))
+        let mut candidates: Vec<(usize, IndexedExpression)> = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let Some(idx_expr) = entry.parser.visit_is_null(column) {
+                candidates.push((i, idx_expr));
+            }
+        }
+        self.select_candidate(&candidates).map(|(_, expr)| expr)
     }
     fn visit_comparison(
         &self,
@@ -193,9 +353,13 @@ impl ScalarQueryParser for MultiQueryParser {
         value: &ScalarValue,
         op: &Operator,
     ) -> Option<IndexedExpression> {
-        self.parsers
-            .iter()
-            .find_map(|parser| parser.visit_comparison(column, value, op))
+        let mut candidates: Vec<(usize, IndexedExpression)> = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let Some(idx_expr) = entry.parser.visit_comparison(column, value, op) {
+                candidates.push((i, idx_expr));
+            }
+        }
+        self.select_candidate(&candidates).map(|(_, expr)| expr)
     }
     fn visit_scalar_function(
         &self,
@@ -204,9 +368,16 @@ impl ScalarQueryParser for MultiQueryParser {
         func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression> {
-        self.parsers
-            .iter()
-            .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+        let mut candidates: Vec<(usize, IndexedExpression)> = Vec::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if let Some(idx_expr) = entry
+                .parser
+                .visit_scalar_function(column, data_type, func, args)
+            {
+                candidates.push((i, idx_expr));
+            }
+        }
+        self.select_candidate(&candidates).map(|(_, expr)| expr)
     }
     /// TODO(low-priority): This is maybe not quite right.  We should filter down the list of parsers based
     /// on those that consider the reference valid.  Instead what we are doing is checking all parsers if any one
@@ -215,9 +386,9 @@ impl ScalarQueryParser for MultiQueryParser {
     /// This will be a problem if the user creates two indexes (e.g. btree and json) on the same column and those two
     /// indexes have different reference schemes.
     fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
-        self.parsers
+        self.entries
             .iter()
-            .find_map(|parser| parser.is_valid_reference(func, data_type))
+            .find_map(|entry| entry.parser.is_valid_reference(func, data_type))
     }
 }
 
@@ -2168,5 +2339,71 @@ mod tests {
         check_no_index(&index_info, "aisle = NULL");
         check_no_index(&index_info, "aisle BETWEEN 5 AND NULL");
         check_no_index(&index_info, "aisle BETWEEN NULL AND 10");
+    }
+
+    #[test]
+    fn test_column_hints_order_equal() {
+        use std::collections::HashMap as StdHashMap;
+        let mut ch: StdHashMap<String, Vec<IndexTypeHint>> = StdHashMap::new();
+        ch.insert(
+            "aisle".to_string(),
+            vec![IndexTypeHint::BloomFilter, IndexTypeHint::BTree],
+        );
+        let opts = IndexSelectionOptions {
+            query_hints: vec![],
+            column_hints: ch,
+        };
+        let mut mqp = MultiQueryParser::with_options(
+            Some("aisle".to_string()),
+            Some(opts),
+            "bloomfilter".to_string(),
+            Box::new(BloomFilterQueryParser::new("bf_idx".to_string(), false)),
+        );
+        mqp.add_with_name(
+            "btree".to_string(),
+            Box::new(SargableQueryParser::new("bt_idx".to_string(), false)),
+        );
+        let expr = mqp
+            .visit_comparison("aisle", &ScalarValue::UInt32(Some(10)), &Operator::Eq)
+            .unwrap();
+        match expr.scalar_query {
+            Some(ScalarIndexExpr::Query(search)) => assert_eq!(search.index_name, "bf_idx"),
+            _ => panic!("expected scalar query"),
+        }
+    }
+
+    #[test]
+    fn test_range_prefers_btree_when_bloom_unsupported() {
+        use std::collections::HashMap as StdHashMap;
+        let mut ch: StdHashMap<String, Vec<IndexTypeHint>> = StdHashMap::new();
+        ch.insert(
+            "aisle".to_string(),
+            vec![IndexTypeHint::BloomFilter, IndexTypeHint::BTree],
+        );
+        let opts = IndexSelectionOptions {
+            query_hints: vec![],
+            column_hints: ch,
+        };
+        let mut mqp = MultiQueryParser::with_options(
+            Some("aisle".to_string()),
+            Some(opts),
+            "bloomfilter".to_string(),
+            Box::new(BloomFilterQueryParser::new("bf_idx".to_string(), false)),
+        );
+        mqp.add_with_name(
+            "btree".to_string(),
+            Box::new(SargableQueryParser::new("bt_idx".to_string(), false)),
+        );
+        let expr = mqp
+            .visit_between(
+                "aisle",
+                &Bound::Included(ScalarValue::UInt32(Some(5))),
+                &Bound::Included(ScalarValue::UInt32(Some(10))),
+            )
+            .unwrap();
+        match expr.scalar_query {
+            Some(ScalarIndexExpr::Query(search)) => assert_eq!(search.index_name, "bt_idx"),
+            _ => panic!("expected scalar query"),
+        }
     }
 }

@@ -375,6 +375,35 @@ class LanceFragment(pa.dataset.Fragment):
             ).count_rows()
         return self._fragment.count_rows(filter)
 
+    def approx_count_rows(
+        self, filter: Optional[Union[pa.compute.Expression, str]] = None
+    ) -> int:
+        """
+        Approximate the number of rows in this fragment.
+
+        When no filter is provided, the behavior aligns with count_rows(None)
+        (returns the exact number of live rows). When a filter is provided,
+        if RowIds can be derived through index lookup:
+        - partial (bitmap/range): returns an exact count;
+        - full fragment: returns an approximate lower bound of
+        "physical_rows - deleted_rows".
+        If index derivation is not possible,
+        it falls back to the exact path count_rows(filter).
+
+        Parameters
+        ----------
+        filter: pa.compute.Expression or str, optional
+            The filter to apply to the fragment. If not specified, returns the
+            exact number of live rows in the fragment.
+
+        Returns
+        -------
+        int
+            The approximate number of rows in the fragment after applying the filter.
+        """
+        filter_str = str(filter) if filter is not None else None
+        return self._fragment.approx_count_rows(filter_str)
+
     @property
     def num_deletions(self) -> int:
         """Return the number of deleted rows in this fragment."""
@@ -890,3 +919,11 @@ class FragmentSession:
         table : pyarrow.Table
         """
         return pa.Table.from_batches([self._session.take(indices)])
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

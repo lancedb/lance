@@ -558,6 +558,31 @@ impl RowIdTreeMap {
         }
     }
 
+    /// Returns true if the given fragment is marked as fully selected in this map
+    pub fn is_fragment_full(&self, fragment_id: u32) -> bool {
+        matches!(self.inner.get(&fragment_id), Some(RowIdSelection::Full))
+    }
+
+    /// Approximate count of row ids contained in this map
+    ///
+    /// Semantics:
+    /// - If the map contains only per-fragment partial bitmaps, this returns the exact count
+    ///   in O(k) time where k is the number of fragments present
+    /// - If the map contains any full fragments (RowIdSelection::Full), this returns a lower-bound
+    ///   approximation by summing only the known partial bitmap sizes and treating full fragments
+    ///   as unknown (0)
+    /// - Callers that have fragment metadata (e.g., FileFragment) can combine this with per-fragment
+    ///   row counts to obtain a tighter approximation
+    pub fn approx_count_rows(&self) -> usize {
+        self.inner
+            .values()
+            .map(|sel| match sel {
+                RowIdSelection::Full => 0usize,
+                RowIdSelection::Partial(indices) => indices.len() as usize,
+            })
+            .sum()
+    }
+
     /// Returns whether the set contains the given value
     pub fn contains(&self, value: u64) -> bool {
         let upper = (value >> 32) as u32;
@@ -1271,5 +1296,28 @@ mod tests {
         allow_list.insert_fragment(0);
         mask.allow_list = Some(allow_list);
         assert!(mask.iter_ids().is_none());
+    }
+}
+
+#[cfg(test)]
+mod approx_count_rows_tests {
+    use super::*;
+
+    #[test]
+    fn test_approx_count_rows_partial_and_full() {
+        // Partial-only fragment
+        let mut map = RowIdTreeMap::new();
+        map.insert(RowAddress::new_from_parts(1, 10).into());
+        map.insert(RowAddress::new_from_parts(1, 20).into());
+        map.insert(RowAddress::new_from_parts(1, 30).into());
+        assert_eq!(map.len(), Some(3));
+        assert_eq!(map.approx_count_rows(), 3);
+
+        // Add a full fragment, len becomes None (unknown), approx_count_rows remains lower bound
+        map.insert_fragment(2);
+        assert_eq!(map.len(), None);
+        assert_eq!(map.approx_count_rows(), 3);
+        assert!(map.is_fragment_full(2));
+        assert!(!map.is_fragment_full(1));
     }
 }
