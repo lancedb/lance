@@ -30,7 +30,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
+use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ADDR};
 
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -398,7 +398,7 @@ impl JsonIndexPlugin {
             .column_with_name(VALUE_COLUMN_NAME)
             .expect_ok()?
             .0;
-        let row_id_column_idx = input_schema.column_with_name(ROW_ID).expect_ok()?.0;
+        let row_id_column_idx = input_schema.column_with_name(ROW_ADDR).expect_ok()?.0;
 
         // Call json_extract_with_type UDF
         let exprs = vec![
@@ -414,8 +414,8 @@ impl JsonIndexPlugin {
                 "json_result".to_string(),
             ),
             (
-                Arc::new(Column::new(ROW_ID, row_id_column_idx)) as Arc<dyn PhysicalExpr>,
-                ROW_ID.to_string(),
+                Arc::new(Column::new(ROW_ADDR, row_id_column_idx)) as Arc<dyn PhysicalExpr>,
+                ROW_ADDR.to_string(),
             ),
         ];
 
@@ -671,7 +671,7 @@ impl JsonIndexPlugin {
 
             // Get row_id column
             let row_id_column = batch
-                .column_by_name(ROW_ID)
+                .column_by_name(ROW_ADDR)
                 .ok_or_else(|| Error::InvalidInput {
                     source: "Missing row_id column".into(),
                     location: location!(),
@@ -681,7 +681,7 @@ impl JsonIndexPlugin {
             // Create new batch with converted values
             let new_schema = Arc::new(Schema::new(vec![
                 ArrowField::new(VALUE_COLUMN_NAME, target_type.clone(), true),
-                ArrowField::new(ROW_ID, DataType::UInt64, false),
+                ArrowField::new(ROW_ADDR, DataType::UInt64, false),
             ]));
 
             let new_batch =
@@ -866,7 +866,7 @@ mod tests {
         // Create test batch with JSONB data
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let jsonb_array = LargeBinaryArray::from(

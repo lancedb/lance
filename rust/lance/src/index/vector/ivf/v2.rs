@@ -26,7 +26,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
@@ -551,7 +551,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             store.schema().clone()
         } else {
             let schema = store.schema();
-            let row_id_idx = schema.index_of(ROW_ID)?;
+            let row_id_idx = schema.index_of(ROW_ADDR)?;
             Arc::new(store.schema().project(&[row_id_idx])?)
         };
 

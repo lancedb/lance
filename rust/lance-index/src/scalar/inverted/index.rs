@@ -45,9 +45,10 @@ use lance_core::utils::{
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{
-    container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus, ROW_ADDR_FIELD,
+    container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus, ROW_ADDR,
+    ROW_ADDR_FIELD,
 };
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
@@ -1280,7 +1281,7 @@ impl PostingListReader {
         token_id: u32,
         with_position: bool,
     ) -> Result<RecordBatch> {
-        let mut columns = vec![ROW_ID, FREQUENCY_COL];
+        let mut columns = vec![ROW_ADDR, FREQUENCY_COL];
         if with_position {
             columns.push(POSITION_COL);
         }
@@ -1432,7 +1433,7 @@ impl PostingListReader {
 
     fn posting_columns(&self, with_position: bool) -> Vec<&'static str> {
         let mut base_columns = match self.offsets {
-            Some(_) => vec![ROW_ID, FREQUENCY_COL],
+            Some(_) => vec![ROW_ADDR, FREQUENCY_COL],
             None => vec![POSTING_COL],
         };
         if with_position {
@@ -1637,7 +1638,10 @@ impl PlainPostingList {
     }
 
     pub fn from_batch(batch: &RecordBatch, max_score: Option<f32>) -> Self {
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().clone();
+        let row_ids = batch[ROW_ADDR]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .clone();
         let frequencies = batch[FREQUENCY_COL]
             .as_primitive::<Float32Type>()
             .values()
@@ -2158,7 +2162,7 @@ impl DocSet {
         let num_tokens_col = UInt32Array::from_iter_values(self.num_tokens.iter().cloned());
 
         let schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
             arrow_schema::Field::new(NUM_TOKEN_COL, DataType::UInt32, false),
         ]);
 
@@ -2178,7 +2182,7 @@ impl DocSet {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let row_id_col = batch[ROW_ADDR].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
         let (row_ids, num_tokens, inv) = match is_legacy {
@@ -2329,7 +2333,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
         .collect::<HashSet<_>>();
 
     for batch in batches {
-        let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
@@ -2440,7 +2444,7 @@ pub fn flat_bm25_search_stream(
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
         let batch = arrow::compute::filter_record_batch(&batch, &mask)?;
-        debug_assert!(batch[ROW_ID].null_count() == 0, "flat FTS produces nulls");
+        debug_assert!(batch[ROW_ADDR].null_count() == 0, "flat FTS produces nulls");
         Ok(batch)
     });
 

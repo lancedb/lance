@@ -196,7 +196,7 @@ impl Index for FlatIndex {
             .ids()
             .as_primitive::<UInt64Type>()
             .iter()
-            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
+            .map(|row_addr| RowAddress::from(row_addr.unwrap()).fragment_id())
             .collect::<Vec<_>>();
         frag_ids.sort();
         frag_ids.dedup();

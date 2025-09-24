@@ -3153,7 +3153,7 @@ mod tests {
         assert_eq!(k, results[0].num_rows());
 
         let row_ids = results[0]
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()

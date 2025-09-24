@@ -20,7 +20,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -600,7 +600,7 @@ pub(crate) fn build_pq_storage(
     std::mem::drop(code_array);
 
     let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
-        (ROW_ID, row_ids, true),
+        (ROW_ADDR, row_ids, true),
         (pq.column(), pq_column, false),
     ])?;
     let pq_store = ProductQuantizationStorage::new(

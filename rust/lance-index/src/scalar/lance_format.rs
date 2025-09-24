@@ -332,7 +332,7 @@ pub mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::utils::mask::RowIdTreeMap;
-    use lance_core::ROW_ID;
+    use lance_core::{ROW_ADDR, ROW_ID};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -384,7 +384,7 @@ pub mod tests {
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
@@ -449,7 +449,7 @@ pub mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
@@ -467,7 +467,7 @@ pub mod tests {
                 VALUE_COLUMN_NAME,
                 array::step_custom::<Int32Type>(4096 * 100, 1),
             )
-            .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
+            .col(ROW_ADDR, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = tempdir().unwrap();
@@ -534,7 +534,7 @@ pub mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
             .col(

@@ -29,7 +29,7 @@ use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ADDR, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result, ROW_ADDR};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::FileReader;
 use lance_file::v2::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
@@ -462,7 +462,7 @@ impl IvfShuffler {
         // validate the schema,
         // we need to have row ID and partition ID column
         schema
-            .column_with_name(ROW_ID)
+            .column_with_name(ROW_ADDR)
             .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
         schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
             "partition ID column not found".to_owned(),
@@ -946,7 +946,7 @@ mod test {
 
     fn check_batch(batch: RecordBatch, idx: usize, num_rows: usize) {
         let row_ids = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_primitive::<UInt64Type>();
         let part_ids = batch

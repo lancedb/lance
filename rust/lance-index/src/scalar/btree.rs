@@ -48,7 +48,7 @@ use lance_core::{
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
-    Error, Result, ROW_ID,
+    Error, Result, ROW_ADDR,
 };
 use lance_datafusion::{
     chunker::chunk_concat_stream,
@@ -951,7 +951,7 @@ impl BTreeIndex {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let schema = self.sub_index.schema().clone();
         let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
+        let row_id_field = schema.field(1).clone().with_name(ROW_ADDR);
         let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
         let new_schema_clone = new_schema.clone();
         let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
@@ -1660,7 +1660,7 @@ async fn merge_pages(
     );
 
     let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
+    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ADDR);
     let stream_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
 
     // Create execution plans for each stream

@@ -1221,7 +1221,7 @@ impl FilteredReadExec {
     ) -> Result<Self> {
         if options.with_deleted_rows {
             // Ensure we have the row id column if with_deleted_rows is set
-            options.projection = options.projection.with_row_id();
+            options.projection = options.projection.with_row_addr();
         }
 
         if options.projection.is_empty() {

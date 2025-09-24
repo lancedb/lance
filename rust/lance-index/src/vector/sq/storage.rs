@@ -13,7 +13,7 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
 use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType};
@@ -89,7 +89,7 @@ impl SQStorageChunk {
     // Create a new chunk from a RecordBatch.
     fn new(batch: RecordBatch) -> Result<Self> {
         let row_ids = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .ok_or(Error::Index {
                 message: "Row ID column not found in the batch".to_owned(),
                 location: location!(),
@@ -514,7 +514,7 @@ mod tests {
         let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
             Field::new(
                 SQ_CODE_COLUMN,
                 DataType::FixedSizeList(
@@ -554,7 +554,7 @@ mod tests {
         let fsl = FixedSizeListArray::try_new_from_values(vector_data, DIM as i32).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
             Field::new(
                 "vector",
                 DataType::FixedSizeList(
