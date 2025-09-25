@@ -29,7 +29,7 @@ Index section stores a list of index metadata:
 ### Index ID, Name and Delta Indices
 
 Each index has a unique UUID. Multiple indexes of different IDs can share the same name.
-When this happends, these indexes are called **Delta Indices** because they together forms a complete index.
+When this happens, these indexes are called **Delta Indices** because they together forms a complete index.
 Delta indices are typically used when the index is updated incrementally to avoid full rebuild.
 
 ## Index Coverage and Fragment Bitmap

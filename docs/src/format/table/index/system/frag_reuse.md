@@ -14,7 +14,7 @@ Fragment Reuse Index allows a compaction to defer the index remap process.
 Suppose a compaction removes fragments A and B and produced C.
 At query runtime, it reuses the old fragments A and B by 
 updating the row addresses related to A and B in the index to the latest ones in C.
-Because indexes are typcially cached in memory after initial load,
+Because indexes are typically cached in memory after initial load,
 the in-memory index is up to date after the fragment reuse application process.
 
 ## Index Details
