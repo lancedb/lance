@@ -9,6 +9,7 @@
 
 use deepsize::DeepSizeOf;
 use lance_core::Error;
+use lance_core::Result;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::location;
@@ -177,6 +178,35 @@ impl RowLatestUpdateVersionSequence {
             .filter_map(|(rid, v)| if v > threshold { Some(rid) } else { None })
             .collect()
     }
+
+    /// Delete rows by positional offsets (e.g., from a deletion vector)
+    pub fn mask(&mut self, positions: impl IntoIterator<Item = u32>) -> Result<()> {
+        let mut local_positions: Vec<u32> = Vec::new();
+        let mut positions_iter = positions.into_iter();
+        let mut curr_position = positions_iter.next();
+        let mut offset: usize = 0;
+        let mut cutoff: usize = 0;
+
+        for run in self.runs.iter_mut() {
+            cutoff += run.span.len();
+            while let Some(position) = curr_position {
+                if position as usize >= cutoff {
+                    break;
+                }
+                local_positions.push(position - offset as u32);
+                curr_position = positions_iter.next();
+            }
+
+            if !local_positions.is_empty() {
+                run.span.mask(local_positions.as_slice());
+                local_positions.clear();
+            }
+            offset = cutoff;
+        }
+
+        self.runs.retain(|r| !r.span.is_empty());
+        Ok(())
+    }
 }
 
 /// Iterator over versions expanding runs lazily.
@@ -323,7 +353,7 @@ pub fn read_row_latest_update_versions(
                 version: pb_run.version,
             })
         })
-        .collect::<Result<Vec<_>, Error>>()?;
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(RowLatestUpdateVersionSequence {
         runs: segments,
@@ -331,34 +361,160 @@ pub fn read_row_latest_update_versions(
     })
 }
 
+/// Re-chunk a sequence of row version runs into new chunk sizes (aligned with RowIdSequence rechunking)
+pub fn rechunk_version_sequences(
+    sequences: impl IntoIterator<Item = RowLatestUpdateVersionSequence>,
+    chunk_sizes: impl IntoIterator<Item = u64>,
+    allow_incomplete: bool,
+) -> Result<Vec<RowLatestUpdateVersionSequence>> {
+    let chunk_sizes_vec: Vec<u64> = chunk_sizes.into_iter().collect();
+    let total_chunks = chunk_sizes_vec.len();
+    let mut chunked_sequences: Vec<RowLatestUpdateVersionSequence> =
+        Vec::with_capacity(total_chunks);
+
+    let mut run_iter = sequences
+        .into_iter()
+        .flat_map(|sequence| sequence.runs.into_iter())
+        .peekable();
+
+    let too_few_segments_error = |chunk_index: usize, expected_chunk_size: u64, remaining: u64| {
+        Error::invalid_input(
+            format!(
+                "Got too few version runs for chunk {}. Expected chunk size: {}, remaining needed: {}",
+                chunk_index, expected_chunk_size, remaining
+            ),
+            location!(),
+        )
+    };
+
+    let too_many_segments_error = |processed_chunks: usize, total_chunk_sizes: usize| {
+        Error::invalid_input(
+            format!(
+                "Got too many version runs for the provided chunk lengths. Processed {} chunks out of {} expected",
+                processed_chunks, total_chunk_sizes
+            ),
+            location!(),
+        )
+    };
+
+    let mut segment_offset = 0_u64;
+
+    for (chunk_index, chunk_size) in chunk_sizes_vec.iter().enumerate() {
+        let chunk_size = *chunk_size;
+        let mut out_seq = RowLatestUpdateVersionSequence::new();
+        let mut remaining = chunk_size;
+
+        while remaining > 0 {
+            let remaining_in_segment = run_iter
+                .peek()
+                .map_or(0, |run| run.span.len() as u64 - segment_offset);
+
+            if remaining_in_segment == 0 {
+                if run_iter.next().is_some() {
+                    segment_offset = 0;
+                    continue;
+                } else if allow_incomplete {
+                    break;
+                } else {
+                    return Err(too_few_segments_error(chunk_index, chunk_size, remaining));
+                }
+            }
+
+            match remaining_in_segment.cmp(&remaining) {
+                std::cmp::Ordering::Greater => {
+                    let run = run_iter.peek().unwrap();
+                    let seg = run.span.slice(segment_offset as usize, remaining as usize);
+                    out_seq.runs.push(RowVersionRun {
+                        span: seg,
+                        version: run.version,
+                    });
+                    segment_offset += remaining;
+                    remaining = 0;
+                }
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+                    let run = run_iter.next().ok_or_else(|| {
+                        too_few_segments_error(chunk_index, chunk_size, remaining)
+                    })?;
+                    let seg = run
+                        .span
+                        .slice(segment_offset as usize, remaining_in_segment as usize);
+                    out_seq.runs.push(RowVersionRun {
+                        span: seg,
+                        version: run.version,
+                    });
+                    segment_offset = 0;
+                    remaining -= remaining_in_segment;
+                }
+            }
+        }
+
+        chunked_sequences.push(out_seq);
+    }
+
+    if run_iter.peek().is_some() {
+        return Err(too_many_segments_error(
+            chunked_sequences.len(),
+            total_chunks,
+        ));
+    }
+
+    Ok(chunked_sequences)
+}
+
+/// Build version metadata for a fragment if it has physical rows and no existing metadata.
+fn build_version_meta(
+    fragment: &Fragment,
+    current_version: u64,
+) -> Option<RowLatestUpdateVersionMeta> {
+    if let Some(physical_rows) = fragment.physical_rows {
+        if physical_rows > 0 {
+            let row_count = if let Some(row_id_meta) = &fragment.row_id_meta {
+                match row_id_meta {
+                    crate::format::RowIdMeta::Inline(data) => {
+                        let sequence = read_row_ids(data).unwrap();
+                        sequence.len()
+                    }
+                    crate::format::RowIdMeta::External(_file) => {
+                        todo!("Currently, not supported!")
+                    }
+                }
+            } else {
+                panic!("Can not find row id meta, please make sure you have enabled stable row id.")
+            };
+
+            let version_sequence =
+                RowLatestUpdateVersionSequence::from_uniform_row_count(row_count, current_version);
+
+            return Some(RowLatestUpdateVersionMeta::from_sequence(&version_sequence).unwrap());
+        }
+    }
+    None
+}
+
 /// Set version metadata for a list of fragments
 pub fn set_version_metadata_for_fragments(fragments: &mut [Fragment], current_version: u64) {
     for fragment in fragments.iter_mut() {
-        // Only set version metadata if the fragment has rows
-        if let Some(physical_rows) = fragment.physical_rows {
-            if physical_rows > 0 {
-                let row_count = if let Some(row_id_meta) = &fragment.row_id_meta {
-                    match row_id_meta {
-                        crate::format::RowIdMeta::Inline(data) => {
-                            let sequence = read_row_ids(data).unwrap();
-                            sequence.len()
-                        }
-                        crate::format::RowIdMeta::External(_file) => {
-                            todo!("Currently, not supported!")
-                        }
-                    }
-                } else {
-                    panic!("Can not find row id meta, please make sure you have enabled stable row id.")
-                };
+        if fragment.row_latest_update_version_meta.is_some() {
+            continue;
+        }
+        if let Some(meta) = build_version_meta(fragment, current_version) {
+            fragment.row_latest_update_version_meta = Some(meta);
+        }
+    }
+}
 
-                let version_sequence = RowLatestUpdateVersionSequence::from_uniform_row_count(
-                    row_count,
-                    current_version,
-                );
-
-                fragment.row_latest_update_version_meta =
-                    Some(RowLatestUpdateVersionMeta::from_sequence(&version_sequence).unwrap());
-            }
+/// Set/override version metadata for specific fragments by id.
+pub fn set_version_metadata_for_fragments_by_ids(
+    fragments: &mut [Fragment],
+    current_version: u64,
+    target_ids: &std::collections::HashSet<u64>,
+) {
+    for fragment in fragments.iter_mut() {
+        if !target_ids.contains(&fragment.id) {
+            continue;
+        }
+        if let Some(meta) = build_version_meta(fragment, current_version) {
+            fragment.row_latest_update_version_meta = Some(meta);
         }
     }
 }
@@ -367,9 +523,7 @@ pub fn set_version_metadata_for_fragments(fragments: &mut [Fragment], current_ve
 impl TryFrom<pb::data_fragment::RowLatestUpdatedVersionSequence> for RowLatestUpdateVersionMeta {
     type Error = Error;
 
-    fn try_from(
-        value: pb::data_fragment::RowLatestUpdatedVersionSequence,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(value: pb::data_fragment::RowLatestUpdatedVersionSequence) -> Result<Self> {
         match value {
             pb::data_fragment::RowLatestUpdatedVersionSequence::InlineRowLatestUpdatedVersions(data) => {
                 Ok(Self::Inline(data))
