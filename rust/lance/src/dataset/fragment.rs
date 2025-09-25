@@ -2477,7 +2477,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        dataset::{transaction::Operation, InsertBuilder},
+        dataset::{
+            transaction::{Operation, UpdateMode},
+            InsertBuilder,
+        },
         session::Session,
         utils::test::{StatsHolder, TestDatasetGenerator},
     };
@@ -2685,7 +2688,7 @@ mod tests {
             batches.into_iter().map(Ok),
             schema,
         ));
-        let (updated_fragment, updated_field_ids) = fragment1
+        let (updated_fragment, fields_modified) = fragment1
             .update_columns(right_stream, ROW_ID, ROW_ID)
             .await
             .unwrap();
@@ -2693,8 +2696,10 @@ mod tests {
             removed_fragment_ids: vec![],
             updated_fragments: vec![updated_fragment],
             new_fragments: vec![],
-            fields_modified: updated_field_ids,
+            fields_modified,
             mem_wal_to_merge: None,
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
         };
         let new_dataset = Dataset::commit(
             test_uri1,

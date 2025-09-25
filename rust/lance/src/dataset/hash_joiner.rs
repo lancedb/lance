@@ -12,7 +12,6 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
 use dashmap::{DashMap, ReadOnlyView};
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::Schema;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use snafu::location;
 use tokio::task;
@@ -260,10 +259,7 @@ impl HashJoiner {
                     let task_result = task::spawn_blocking(move || {
                         let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
                         interleave(array_refs.as_ref(), indices.as_ref())
-                            .map_err(|err| Error::io(
-                                format!("HashJoiner: {}", err),
-                                location!(),
-                            ))
+                            .map_err(|err| Error::io(format!("HashJoiner: {}", err), location!()))
                     })
                     .await;
                     match task_result {
@@ -288,12 +284,9 @@ impl HashJoiner {
                                 ));
                             }
                             Ok(array)
-                        },
+                        }
                         Ok(Err(err)) => Err(err),
-                        Err(err) => Err(Error::io(
-                            format!("HashJoiner: {}", err),
-                            location!(),
-                        )),
+                        Err(err) => Err(Error::io(format!("HashJoiner: {}", err), location!())),
                     }
                 }
             })
