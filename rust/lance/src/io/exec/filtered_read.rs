@@ -331,7 +331,7 @@ struct FilteredReadStream {
     /// The threading mode for the scan
     threading_mode: FilteredReadThreadingMode,
     /// Range to apply to the result stream if not already pushed down in planning phase
-    range_to_apply: Option<Range<u64>>,
+    scan_range_after_filter: Option<Range<u64>>,
 }
 
 impl std::fmt::Debug for FilteredReadStream {
@@ -396,7 +396,7 @@ impl FilteredReadStream {
         )
         .await?;
 
-        let range_to_apply = if !scan_planned_with_limit_pushed_down {
+        let scan_range_after_filter = if !scan_planned_with_limit_pushed_down {
             options.scan_range_after_filter
         } else {
             None
@@ -406,10 +406,10 @@ impl FilteredReadStream {
 
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map({
-                let range_to_apply = range_to_apply.clone();
+                let scan_range_after_filter = scan_range_after_filter.clone();
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
-                    let limit = range_to_apply.as_ref().map(|r| r.end);
+                    let limit = scan_range_after_filter.as_ref().map(|r| r.end);
                     tokio::task::spawn(
                         Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
                     )
@@ -426,7 +426,7 @@ impl FilteredReadStream {
             metrics: global_metrics,
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
-            range_to_apply,
+            scan_range_after_filter,
         })
     }
 
@@ -517,19 +517,18 @@ impl FilteredReadStream {
             deletion_vector,
         } in fragments.iter()
         {
-            let range_start = range_offset;
-            let range_end = if options.with_deleted_rows {
-                range_offset += num_physical_rows;
-                range_start + num_physical_rows
-            } else {
-                range_offset += num_logical_rows;
-                range_start + num_logical_rows
-            };
-
             let mut to_read: Vec<Range<u64>> =
                 Self::full_frag_range(*num_physical_rows, deletion_vector);
 
             if let Some(range_before_filter) = &options.scan_range_before_filter {
+                let range_start = range_offset;
+                let range_end = if options.with_deleted_rows {
+                    range_offset += num_physical_rows;
+                    range_start + num_physical_rows
+                } else {
+                    range_offset += num_logical_rows;
+                    range_start + num_logical_rows
+                };
                 to_read = Self::trim_ranges(to_read, range_start..range_end, range_before_filter);
             }
 
@@ -633,18 +632,14 @@ impl FilteredReadStream {
                         let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
                         updated_to_read = Self::intersect_ranges(&updated_to_read, &valid_ranges);
 
-                        (*to_skip, *to_take) = Self::apply_skip_take_to_ranges(
-                            &mut updated_to_read,
-                            *to_skip,
-                            *to_take,
-                        );
+                        Self::apply_skip_take_to_ranges(&mut updated_to_read, to_skip, to_take);
 
                         use_refine = true;
 
                         if *to_take == 0 {
                             fragment_read_plans
                                 .insert(fragment.id() as u32, (updated_to_read, use_refine));
-                            return (true, true); // (should_stop, limit_pushed_down)
+                            return (true, true);
                         }
                     }
                     IndexExprResult::AtMost(row_id_mask) => {
@@ -656,15 +651,12 @@ impl FilteredReadStream {
                         let mut guaranteed_ranges =
                             Self::intersect_ranges(&updated_to_read, &valid_ranges);
 
-                        (*to_skip, *to_take) = Self::apply_skip_take_to_ranges(
-                            &mut guaranteed_ranges,
-                            *to_skip,
-                            *to_take,
-                        );
+                        Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
 
                         atleast_guaranteed_ranges.insert(fragment.id() as u32, guaranteed_ranges);
 
                         if *to_take == 0 {
+                            fragment_read_plans.clear();
                             for (frag_id, ranges) in atleast_guaranteed_ranges.drain() {
                                 fragment_read_plans.insert(frag_id, (ranges, false));
                             }
@@ -680,58 +672,17 @@ impl FilteredReadStream {
         (false, scan_planned_with_limit_pushed_down)
     }
 
-    fn trim_fragments_to_range(scoped_fragments: &mut Vec<ScopedFragmentRead>, range: &Range<u64>) {
-        let mut to_skip = range.start;
-        let mut to_take = range.end - range.start;
-        let mut fragments_to_keep = Vec::with_capacity(scoped_fragments.len());
-
-        for mut fragment in scoped_fragments.drain(..) {
-            if to_take == 0 {
-                break;
-            }
-
-            let fragment_rows: u64 = fragment.ranges.iter().map(|r| r.end - r.start).sum();
-
-            if fragment_rows <= to_skip {
-                to_skip -= fragment_rows;
-                continue;
-            }
-            if to_skip == 0 && to_take >= fragment_rows {
-                fragments_to_keep.push(fragment);
-                to_take -= fragment_rows;
-                continue;
-            }
-            let skip_in_fragment = to_skip;
-            let available_after_skip = fragment_rows - skip_in_fragment;
-            let take_from_fragment = available_after_skip.min(to_take);
-
-            let trimmed_ranges =
-                Self::trim_ranges_by_offset(fragment.ranges, skip_in_fragment, take_from_fragment);
-
-            fragment.ranges = trimmed_ranges;
-            fragments_to_keep.push(fragment);
-
-            to_skip = 0;
-            to_take -= take_from_fragment;
-        }
-
-        *scoped_fragments = fragments_to_keep;
-    }
-
     /// Trim physical ranges to skip `to_skip` rows and take at most `to_take` rows
-    fn trim_ranges_by_offset(
-        physical_ranges: Vec<Range<u64>>,
-        to_skip: u64,
-        to_take: u64,
-    ) -> Vec<Range<u64>> {
-        let mut trimmed_ranges = Vec::new();
+    fn trim_ranges_by_offset(physical_ranges: &mut Vec<Range<u64>>, to_skip: u64, to_take: u64) {
         let mut skip_remaining = to_skip;
         let mut take_remaining = to_take;
+        let mut write_idx = 0;
 
-        for range in physical_ranges {
+        for read_idx in 0..physical_ranges.len() {
             if take_remaining == 0 {
                 break;
             }
+            let range = physical_ranges[read_idx].clone();
             let range_size = range.end - range.start;
 
             if range_size <= skip_remaining {
@@ -740,24 +691,25 @@ impl FilteredReadStream {
             }
 
             if skip_remaining == 0 && take_remaining >= range_size {
-                trimmed_ranges.push(range);
+                physical_ranges[write_idx] = range;
+                write_idx += 1;
                 take_remaining -= range_size;
                 continue;
             }
 
             let skip_in_range = skip_remaining;
-            let available_in_range = range_size - skip_in_range;
+            let available_in_range = range_size.saturating_sub(skip_in_range);
             let take_from_range = available_in_range.min(take_remaining);
 
             let new_start = range.start + skip_in_range;
             let new_end = new_start + take_from_range;
-            trimmed_ranges.push(new_start..new_end);
-            take_remaining -= take_from_range;
-
+            physical_ranges[write_idx] = new_start..new_end;
+            write_idx += 1;
             skip_remaining = 0;
+            take_remaining -= take_from_range;
         }
 
-        trimmed_ranges
+        physical_ranges.truncate(write_idx);
     }
 
     /// Intersect two sets of sorted ranges
@@ -790,24 +742,26 @@ impl FilteredReadStream {
     }
 
     /// Apply skip and take to ranges and update the counters
-    /// Returns (updated to_skip, updated to_take)
     fn apply_skip_take_to_ranges(
         to_read: &mut Vec<Range<u64>>,
-        to_skip: u64,
-        to_take: u64,
-    ) -> (u64, u64) {
-        if to_take == 0 {
+        to_skip: &mut u64,
+        to_take: &mut u64,
+    ) {
+        if *to_take == 0 {
             to_read.clear();
-            return (0, 0);
+            *to_skip = 0;
+            return;
         }
         let original_rows: u64 = to_read.iter().map(|r| r.end - r.start).sum();
-        if to_skip >= original_rows {
+        if *to_skip >= original_rows {
             to_read.clear();
-            return (to_skip - original_rows, to_take);
+            *to_skip -= original_rows;
+            return;
         }
-        *to_read = Self::trim_ranges_by_offset(std::mem::take(to_read), to_skip, to_take);
+        Self::trim_ranges_by_offset(to_read, *to_skip, *to_take);
         let rows_taken: u64 = to_read.iter().map(|r| r.end - r.start).sum();
-        (0, to_take.saturating_sub(rows_taken))
+        *to_skip = 0;
+        *to_take = to_take.saturating_sub(rows_taken);
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -962,7 +916,7 @@ impl FilteredReadStream {
                         partition_metrics.baseline_metrics.done();
                     });
 
-                let batch_stream = if let Some(ref range) = self.range_to_apply {
+                let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
                     Self::apply_hard_range(base_batch_stream, range.clone())
                         .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
                         .boxed()
@@ -2531,44 +2485,45 @@ mod tests {
     #[test]
     fn test_trim_ranges_by_offset() {
         // Test case 1: No skip, take all
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges.clone(), 0, 100);
-        assert_eq!(result, ranges);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        let expected = ranges.clone();
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 0, 100);
+        assert_eq!(ranges, expected);
 
         // Test case 2: Skip some, take all remaining
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 5, 100);
-        assert_eq!(result, vec![5..10, 20..30, 40..50]);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 5, 100);
+        assert_eq!(ranges, vec![5..10, 20..30, 40..50]);
 
         // Test case 3: Skip first range entirely
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 10, 100);
-        assert_eq!(result, vec![20..30, 40..50]);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 10, 100);
+        assert_eq!(ranges, vec![20..30, 40..50]);
 
         // Test case 4: Skip into second range
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 15, 100);
-        assert_eq!(result, vec![25..30, 40..50]);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 15, 100);
+        assert_eq!(ranges, vec![25..30, 40..50]);
 
         // Test case 5: Take limited rows
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 0, 15);
-        assert_eq!(result, vec![0..10, 20..25]);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 0, 15);
+        assert_eq!(ranges, vec![0..10, 20..25]);
 
         // Test case 6: Skip and take limited
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 5, 10);
-        assert_eq!(result, vec![5..10, 20..25]);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 5, 10);
+        assert_eq!(ranges, vec![5..10, 20..25]);
 
         // Test case 7: Skip all
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 100, 10);
-        assert_eq!(result, vec![]);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 100, 10);
+        assert_eq!(ranges, vec![]);
 
         // Test case 8: Take 0
-        let ranges = vec![0..10, 20..30, 40..50];
-        let result = FilteredReadStream::trim_ranges_by_offset(ranges, 0, 0);
-        assert_eq!(result, vec![]);
+        let mut ranges = vec![0..10, 20..30, 40..50];
+        FilteredReadStream::trim_ranges_by_offset(&mut ranges, 0, 0);
+        assert_eq!(ranges, vec![]);
     }
 
     #[tokio::test]
