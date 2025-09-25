@@ -1,5 +1,4 @@
 title: System Indices
 nav:
-  - Overview: index.md
-  - Fragment Reuse Index: frag_reuse.md
-  - MemWAL Index: memwal.md
+  - Fragment Reuse: frag_reuse.md
+  - MemWAL: memwal.md
