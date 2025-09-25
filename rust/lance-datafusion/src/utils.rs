@@ -11,7 +11,9 @@ use background_iterator::BackgroundIterator;
 use datafusion::{
     execution::RecordBatchStream,
     physical_plan::{
-        metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet, Time},
+        metrics::{
+            Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue, MetricsSet, Time,
+        },
         stream::RecordBatchStreamAdapter,
         SendableRecordBatchStream,
     },
@@ -180,6 +182,7 @@ impl MetricsExt for MetricsSet {
 pub trait ExecutionPlanMetricsSetExt {
     fn new_count(&self, name: &'static str, partition: usize) -> Count;
     fn new_time(&self, name: &'static str, partition: usize) -> Time;
+    fn new_gauge(&self, name: &'static str, partition: usize) -> Gauge;
 }
 
 impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
@@ -203,6 +206,17 @@ impl ExecutionPlanMetricsSetExt for ExecutionPlanMetricsSet {
                 time: time.clone(),
             });
         time
+    }
+
+    fn new_gauge(&self, name: &'static str, partition: usize) -> Gauge {
+        let gauge = Gauge::new();
+        MetricBuilder::new(self)
+            .with_partition(partition)
+            .build(MetricValue::Gauge {
+                name: Cow::Borrowed(name),
+                gauge: gauge.clone(),
+            });
+        gauge
     }
 }
 

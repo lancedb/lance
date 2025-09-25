@@ -143,10 +143,7 @@ impl<'a> StructuralListSchedulingJob<'a> {
 }
 
 impl StructuralSchedulingJob for StructuralListSchedulingJob<'_> {
-    fn schedule_next(
-        &mut self,
-        context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>> {
+    fn schedule_next(&mut self, context: &mut SchedulerContext) -> Result<Vec<ScheduledScanLine>> {
         self.child.schedule_next(context)
     }
 }
@@ -164,7 +161,7 @@ impl StructuralListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralListDecoder {
-    fn accept_page(&mut self, child: crate::decoder::LoadedPage) -> Result<()> {
+    fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }
 

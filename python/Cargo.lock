@@ -1128,7 +1128,7 @@ dependencies = [
  "bitflags 2.9.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -2890,7 +2890,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "rand 0.9.1",
@@ -3837,7 +3837,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3902,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3920,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrayref",
  "paste",
@@ -3929,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3964,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3994,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4011,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4048,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4082,7 +4082,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4144,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4184,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5631,7 +5631,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
  "heck 0.5.0",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -5651,7 +5651,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -5684,7 +5684,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -5697,7 +5697,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -5741,7 +5741,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "arrow",
  "arrow-array",
