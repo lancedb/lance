@@ -950,10 +950,6 @@ impl TokenSet {
     }
 
     async fn load_v0(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let mut next_id = 0;
-        let mut total_length = 0;
-        let mut tokens = fst::MapBuilder::memory();
-
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
 
         let (tokens, next_id, total_length) = spawn_blocking(move || {
