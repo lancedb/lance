@@ -461,9 +461,10 @@ impl IvfShuffler {
 
         // validate the schema,
         // we need to have row ID and partition ID column
-        schema
-            .column_with_name(ROW_ADDR)
-            .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
+        schema.column_with_name(ROW_ADDR).ok_or(Error::io(
+            "row addr column not found".to_owned(),
+            location!(),
+        ))?;
         schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
             "partition ID column not found".to_owned(),
             location!(),
