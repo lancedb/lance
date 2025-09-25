@@ -29,6 +29,7 @@ pub struct SizeBasedMerger<'a> {
     input: Vec<InvertedPartition>,
     with_position: bool,
     target_size: u64,
+    token_set_version: u32,
     builder: InnerBuilder,
     partitions: Vec<u64>,
 }
@@ -42,6 +43,7 @@ impl<'a> SizeBasedMerger<'a> {
         dest_store: &'a dyn IndexStore,
         input: Vec<InvertedPartition>,
         target_size: u64,
+        token_set_version: u32,
     ) -> Self {
         let max_id = input.iter().map(|p| p.id()).max().unwrap_or(0);
         let with_position = input
@@ -54,7 +56,8 @@ impl<'a> SizeBasedMerger<'a> {
             input,
             with_position,
             target_size,
-            builder: InnerBuilder::new(max_id + 1, with_position),
+            token_set_version,
+            builder: InnerBuilder::new(max_id + 1, with_position, token_set_version),
             partitions: Vec::new(),
         }
     }
@@ -70,7 +73,11 @@ impl<'a> SizeBasedMerger<'a> {
                 start.elapsed()
             );
             self.partitions.push(self.builder.id());
-            self.builder = InnerBuilder::new(self.builder.id() + 1, self.with_position);
+            self.builder = InnerBuilder::new(
+                self.builder.id() + 1,
+                self.with_position,
+                self.token_set_version,
+            );
         }
         Ok(())
     }
