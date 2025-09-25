@@ -348,7 +348,6 @@ impl InvertedIndex {
                 tokens,
                 inverted_list,
                 docs,
-                fragments: Default::default(),
                 token_set_format: TokenSetFormat::Arrow,
             })],
         }))
@@ -606,7 +605,6 @@ pub struct InvertedPartition {
     pub(crate) tokens: TokenSet,
     pub(crate) inverted_list: Arc<PostingListReader>,
     pub(crate) docs: DocSet,
-    pub(crate) fragments: HashSet<u32>,
     token_set_format: TokenSetFormat,
 }
 
@@ -650,7 +648,6 @@ impl InvertedPartition {
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
-        let fragments = docs.fragment_ids();
 
         Ok(Self {
             id,
@@ -658,7 +655,6 @@ impl InvertedPartition {
             tokens,
             inverted_list: Arc::new(inverted_list),
             docs,
-            fragments,
             token_set_format,
         })
     }
@@ -2102,13 +2098,6 @@ impl DocSet {
             }
         }
     }
-    pub fn fragment_ids(&self) -> HashSet<u32> {
-        self.row_ids
-            .iter()
-            .map(|row_id| (row_id >> 32) as u32)
-            .collect()
-    }
-
     pub fn total_tokens_num(&self) -> u64 {
         self.total_tokens
     }
