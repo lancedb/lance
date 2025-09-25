@@ -1817,7 +1817,6 @@ impl ExecutionPlan for FilteredReadExec {
         ) {
             return None;
         }
-        // None means should remove any existing pushed down limit
         let limit = limit?;
 
         let mut updated_options = self.options.clone();
