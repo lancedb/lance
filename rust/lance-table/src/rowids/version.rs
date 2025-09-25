@@ -98,27 +98,6 @@ impl RowLatestUpdateVersionSequence {
         VersionsIter::new(&self.runs)
     }
 
-    /// Zipped iteration of row ids and versions without materializing a map.
-    /// The positional order must be the same between `row_ids` and this sequence.
-    pub fn zip_rows_with_versions<'a>(
-        &'a self,
-        row_ids: &'a RowIdSequence,
-    ) -> impl Iterator<Item = (u64, u64)> + 'a {
-        row_ids.iter().zip(self.versions())
-    }
-
-    /// Build (or rebuild) a lightweight prefix-sum index for random access.
-    /// The index stores cumulative run lengths: prefix_end[i] = sum(runs[0..=i].len).
-    pub fn build_index(&mut self) {
-        let mut prefix = Vec::with_capacity(self.runs.len());
-        let mut acc = 0usize;
-        for r in &self.runs {
-            acc += r.len();
-            prefix.push(acc);
-        }
-        self.index = Some(prefix);
-    }
-
     /// Random access: get the version at global row position `index`.
     /// If an index has been built (via `build_index`), performs a binary search (O(log R)).
     /// Otherwise, falls back to a linear scan (O(R)). Returns None if out of bounds.
@@ -542,38 +521,6 @@ impl TryFrom<pb::data_fragment::RowLatestUpdatedVersionSequence> for RowLatestUp
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_versions_iter_and_zip() {
-        // Build runs: [3 * v1] [2 * v2] [1 * v3]
-        let seq = RowLatestUpdateVersionSequence {
-            runs: vec![
-                RowVersionRun {
-                    span: U64Segment::Range(0..3),
-                    version: 1,
-                },
-                RowVersionRun {
-                    span: U64Segment::Range(0..2),
-                    version: 2,
-                },
-                RowVersionRun {
-                    span: U64Segment::Range(0..1),
-                    version: 3,
-                },
-            ],
-            index: None,
-        };
-        let row_ids = RowIdSequence::from(100..106);
-
-        let versions: Vec<u64> = seq.versions().collect();
-        assert_eq!(versions, vec![1, 1, 1, 2, 2, 3]);
-
-        let pairs: Vec<(u64, u64)> = seq.zip_rows_with_versions(&row_ids).collect();
-        assert_eq!(
-            pairs,
-            vec![(100, 1), (101, 1), (102, 1), (103, 2), (104, 2), (105, 3)]
-        );
-    }
 
     #[test]
     fn test_version_random_access_indexing() {
