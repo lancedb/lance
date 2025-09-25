@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::any::Any;
 use std::collections::HashMap;
-use std::iter::Peekable;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -185,73 +184,6 @@ impl<I: Iterator<Item = u64> + Send> Iterator for DvToValidRanges<I> {
             // Still some rows after the last deleted row, return them
             Some(position..self.num_rows)
         }
-    }
-}
-
-/// Given a sorted iterator of ranges and a deletion vector, return a sorted iterator of
-/// ranges that have been filtered by the deletion vector
-///
-/// For example, given the ranges [0..10, 50..60] and the deletion vector [7, 52, 53, 54]
-/// then return the ranges [0..7, 8..10, 50..52, 55..60]
-struct DvRangeFilter<I: Iterator<Item = Range<u64>>, D: Iterator<Item = u64>> {
-    ranges: Peekable<I>,
-    deletion_vector: Peekable<D>,
-}
-
-impl<I: Iterator<Item = Range<u64>>, D: Iterator<Item = u64>> DvRangeFilter<I, D> {
-    fn new(
-        ranges: impl IntoIterator<IntoIter = I>,
-        deletion_vector: impl IntoIterator<IntoIter = D>,
-    ) -> Self {
-        Self {
-            ranges: ranges.into_iter().peekable(),
-            deletion_vector: deletion_vector.into_iter().peekable(),
-        }
-    }
-}
-
-impl<I: Iterator<Item = Range<u64>>, D: Iterator<Item = u64>> Iterator for DvRangeFilter<I, D> {
-    type Item = Range<u64>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(next_range) = self.ranges.peek_mut() {
-            while let Some(cur_dv_pos) = self.deletion_vector.peek() {
-                if *cur_dv_pos < next_range.start {
-                    // Delete is before the range, skip the delete
-                    self.deletion_vector.next();
-                } else if *cur_dv_pos >= next_range.end {
-                    // Delete is after the range, return the range, keep the delete
-                    return self.ranges.next();
-                } else {
-                    // Delete intersects the range
-                    if *cur_dv_pos == next_range.start {
-                        next_range.start += 1;
-                        if next_range.start == next_range.end {
-                            // The range is now empty, consume it and grab the next range
-                            break;
-                        }
-                    } else {
-                        // Delete is in the middle of the range, split the range
-                        let new_range = next_range.start..*cur_dv_pos;
-                        next_range.start = *cur_dv_pos + 1;
-                        if next_range.start == next_range.end {
-                            // The range is now empty, consume it
-                            self.ranges.next();
-                        }
-                        return Some(new_range);
-                    }
-                }
-            }
-            if !next_range.is_empty() {
-                // No more deletes, consume and return the range
-                return self.ranges.next();
-            } else {
-                // We got here because we broke out on an empty range, move to next range
-                self.ranges.next();
-            }
-        }
-        // No more ranges, return None
-        None
     }
 }
 
@@ -577,16 +509,13 @@ impl FilteredReadStream {
         // This will be set to None once we encounter a fragment where we don't
         // know the number of filtered rows up front
         let mut _filtered_range_offset = Some(0);
-        for (
-            _priority,
-            LoadedFragment {
-                row_id_sequence,
-                fragment,
-                num_logical_rows,
-                num_physical_rows,
-                deletion_vector,
-            },
-        ) in fragments.iter().enumerate()
+        for LoadedFragment {
+            row_id_sequence,
+            fragment,
+            num_logical_rows,
+            num_physical_rows,
+            deletion_vector,
+        } in fragments.iter()
         {
             let range_start = range_offset;
             let range_end = if options.with_deleted_rows {
@@ -676,6 +605,7 @@ impl FilteredReadStream {
 
     /// Apply index to a fragment and handle all the logic for different index result types
     /// Returns (should_stop, limit_pushed_down)
+    #[allow(clippy::too_many_arguments)]
     fn apply_index_to_fragment(
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         fragment: &FileFragment,
@@ -830,18 +760,6 @@ impl FilteredReadStream {
         trimmed_ranges
     }
 
-    #[instrument(level = "debug", skip_all)]
-    fn filter_deleted_rows(
-        ranges: Vec<Range<u64>>,
-        deletion_vector: &Arc<DeletionVector>,
-    ) -> Vec<Range<u64>> {
-        DvRangeFilter::new(
-            ranges,
-            deletion_vector.to_sorted_iter().map(|pos| pos as u64),
-        )
-        .collect()
-    }
-
     /// Intersect two sets of sorted ranges
     fn intersect_ranges(ranges1: &[Range<u64>], ranges2: &[Range<u64>]) -> Vec<Range<u64>> {
         let mut result = Vec::new();
@@ -887,8 +805,7 @@ impl FilteredReadStream {
             to_read.clear();
             return (to_skip - original_rows, to_take);
         }
-        *to_read =
-            FilteredReadStream::trim_ranges_by_offset(std::mem::take(to_read), to_skip, to_take);
+        *to_read = Self::trim_ranges_by_offset(std::mem::take(to_read), to_skip, to_take);
         let rows_taken: u64 = to_read.iter().map(|r| r.end - r.start).sum();
         (0, to_take.saturating_sub(rows_taken))
     }
@@ -2143,31 +2060,6 @@ mod tests {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
-    }
-
-    #[test]
-    fn test_dv_range_filter() {
-        let check = |dv: DeletionVector, ranges: Vec<Range<u64>>, expected: Vec<Range<u64>>| {
-            let ranges = DvRangeFilter::new(ranges, dv.into_sorted_iter().map(|val| val as u64))
-                .collect::<Vec<_>>();
-            assert_eq!(ranges, expected);
-        };
-
-        // Range already doesn't include 10, no change
-        let dv = DeletionVector::from_iter(vec![10, 50]);
-        check(dv.clone(), vec![0..10, 11..20], vec![0..10, 11..20]);
-
-        // Range starts with 10
-        check(dv.clone(), vec![10..20, 21..30], vec![11..20, 21..30]);
-
-        // Range ends with 10
-        check(dv, vec![0..3, 7..11, 15..16], vec![0..3, 7..10, 15..16]);
-
-        // Sequence of deleted rows
-        let dv = DeletionVector::from_iter(vec![15, 16, 17, 18, 19, 20]);
-        check(dv.clone(), vec![0..3, 15..21], vec![0..3]);
-
-        check(dv, vec![0..3, 15..30], vec![0..3, 21..30]);
     }
 
     #[test_log::test(tokio::test)]
