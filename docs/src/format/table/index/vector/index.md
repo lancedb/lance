@@ -1,7 +1,7 @@
 # Vector Indices
 
 Lance provides a powerful and extensible secondary index system for efficient vector similarity search. 
-All vector indices are stored as regular files, making them portable and easy to manage.
+All vector indices are stored as regular Lance files, making them portable and easy to manage.
 It is designed for efficient similarity search across large-scale vector datasets.
 
 ## Concepts
@@ -57,11 +57,41 @@ Each vector index is stored as 2 regular Lance files - index file and auxiliary 
 ### Index File
 
 The index structure file containing the search graph/structure with index-specific schema.
-It is stored as `index.idx` within the index directory.
+It is stored as a Lance file with name `index.idx` within the index directory.
 
-#### Metadata
+#### Arrow Schema
 
-The index file contains metadata in its schema metadata to describe the index configuration and structure:
+The index file stores the search structure with graph or flat organization.
+The Arrow schema of the Lance file varies depending on the sub-index type used.
+
+!!! note
+All partitions are stored in the same file, and partitions must be written in order.
+
+##### FLAT
+
+FLAT indices perform exact search with no approximation. This is essentially an empty file with a minimal schema:
+
+| Column          | Type   | Nullable | Description                                  |
+|-----------------|--------|----------|----------------------------------------------|
+| `__flat_marker` | uint64 | false    | Marker field for FLAT index (no actual data) |
+
+##### HNSW
+
+HNSW (Hierarchical Navigable Small World) indices provide fast approximate search through a multi-level graph structure. This stores the HNSW graph with the following schema:
+
+| Column        | Type          | Nullable | Description            |
+|---------------|---------------|----------|------------------------|
+| `__vector_id` | uint64        | false    | Vector identifier      |
+| `__neighbors` | list<uint32>  | false    | Neighbor node IDs      |
+| `_distance`   | list<float32> | false    | Distances to neighbors |
+
+!!! note
+HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
+
+
+#### Arrow Schema Metadata
+
+The index file contains metadata in its Arrow schema metadata to describe the index configuration and structure:
 
 ##### "lance:index"
 
@@ -101,7 +131,7 @@ The `params` object contains the following HNSW construction parameters:
 | `ef_construction`   | usize         | Size of the dynamic list for candidates                        | 150     |
 | `prefetch_distance` | Option<usize> | Number of vectors ahead to prefetch while building             | Some(2) |
 
-#### Global Buffer
+#### Lance File Global Buffer
 
 ##### IVF Metadata
 
@@ -111,43 +141,49 @@ For efficiency, Lance serializes IVF metadata to protobuf format and stores it i
 %%% proto.message.IVF %%%
 ```
 
-#### Schema
-
-The index file stores the search structure with graph or flat organization. 
-The schema varies depending on the sub-index type used.
-
-!!! note
-    All partitions are stored in the same file, and partitions must be written in order.
-
-##### FLAT
-
-FLAT indices perform exact search with no approximation. This is essentially an empty file with a minimal schema:
-
-| Column          | Type   | Nullable | Description                                  |
-|-----------------|--------|----------|----------------------------------------------|
-| `__flat_marker` | uint64 | false    | Marker field for FLAT index (no actual data) |
-
-##### HNSW
-
-HNSW (Hierarchical Navigable Small World) indices provide fast approximate search through a multi-level graph structure. This stores the HNSW graph with the following schema:
-
-| Column        | Type          | Nullable | Description            |
-|---------------|---------------|----------|------------------------|
-| `__vector_id` | uint64        | false    | Vector identifier      |
-| `__neighbors` | list<uint32>  | false    | Neighbor node IDs      |
-| `_distance`   | list<float32> | false    | Distances to neighbors |
-
-!!! note
-    HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
-
 ### Auxiliary File
 
 The auxiliary file is a vector storage for quantized vectors.
-It is stored as `auxiliary.idx` within the index directory.
+It is stored as a Lance file named `auxiliary.idx` within the index directory.
 
-#### Metadata
+#### Arrow Schema
 
-The auxiliary file also contains metadata in its schema metadata for vector storage configuration:
+Since the auxiliary file stores the actual (quantized) vectors,
+the Arrow schema of the Lance file varies depending on the quantization method used.
+
+!!!note
+All partitions are stored in the same file, and partitions must be written in order.
+
+##### FLAT
+
+No quantization applied - stores original vectors in their full precision:
+
+| Column   | Type                            | Nullable | Description                                           |
+|----------|---------------------------------|----------|-------------------------------------------------------|
+| `_rowid` | uint64                          | false    | Row identifier                                        |
+| `flat`   | list<float32>[dimension]        | false    | Original vector values (list_size = vector dimension) |
+
+##### PQ
+
+Compresses vectors using product quantization for significant memory savings:
+
+| Column      | Type           | Nullable | Description                                 |
+|-------------|----------------|----------|---------------------------------------------|
+| `_rowid`    | uint64         | false    | Row identifier                              |
+| `__pq_code` | list<uint8>[m] | false    | PQ codes (list_size = number of subvectors) |
+
+##### SQ
+
+Compresses vectors using scalar quantization for moderate memory savings:
+
+| Column      | Type                   | Nullable | Description                             |
+|-------------|------------------------|----------|-----------------------------------------|
+| `_rowid`    | uint64                 | false    | Row identifier                          |
+| `__sq_code` | list<uint8>[dimension] | false    | SQ codes (list_size = vector dimension) |
+
+#### Arrow Schema Metadata
+
+The auxiliary file also contains metadata in its Arrow schema metadata for vector storage configuration:
 
 ##### "distance_type"
 The distance metric used to compute similarity between vectors (e.g., "l2", "cosine", "dot").
@@ -181,7 +217,7 @@ For **Scalar Quantization (SQ)**:
 | `num_bits` | u16        | Number of bits for quantization        |
 | `bounds`   | Range<f64> | Min/max bounds for scalar quantization |
 
-#### Global Buffer
+#### Lance File Global Buffer
 
 ##### Quantization Codebook
 
@@ -192,41 +228,6 @@ in the auxiliary file's global buffer for efficient access:
 %%% proto.message.Tensor %%%
 ```
 
-#### Schema
-
-Since the auxiliary file stores the actual (quantized) vectors, 
-the schema varies depending on the quantization method used.
-
-!!!note
-    All partitions are stored in the same file, and partitions must be written in order.
-
-##### FLAT
-
-No quantization applied - stores original vectors in their full precision:
-
-| Column   | Type                            | Nullable | Description                                           |
-|----------|---------------------------------|----------|-------------------------------------------------------|
-| `_rowid` | uint64                          | false    | Row identifier                                        |
-| `flat`   | list<float32>[dimension]        | false    | Original vector values (list_size = vector dimension) |
-
-##### PQ
-
-Compresses vectors using product quantization for significant memory savings:
-
-| Column      | Type           | Nullable | Description                                 |
-|-------------|----------------|----------|---------------------------------------------|
-| `_rowid`    | uint64         | false    | Row identifier                              |
-| `__pq_code` | list<uint8>[m] | false    | PQ codes (list_size = number of subvectors) |
-
-##### SQ
-
-Compresses vectors using scalar quantization for moderate memory savings:
-
-| Column      | Type                   | Nullable | Description                             |
-|-------------|------------------------|----------|-----------------------------------------|
-| `_rowid`    | uint64                 | false    | Row identifier                          |
-| `__sq_code` | list<uint8>[dimension] | false    | SQ codes (list_size = vector dimension) |
-
 ## Appendices
 
 ### Appendix 1: Example IVF_PQ Format
@@ -235,12 +236,12 @@ This example shows how an `IVF_PQ` index is physically laid out. Assume vectors 
 
 #### Index File
 
-- Metadata (schema metadata):
+- Arrow Schema Metadata:
     - `"lance:index"` → `{ "type": "IVF_PQ", "distance_type": "l2" }`
     - `"lance:ivf"` → "1" (references IVF metadata in the global buffer)
     - `"lance:flat"` → `["", "", ...]` (one empty string per partition; IVF_PQ uses a FLAT sub-index inside each partition)
 
-- Global buffer (Protobuf):
+- Lance File Global buffer (Protobuf):
     - `Ivf` message containing:
         - `centroids_tensor`: shape `[num_partitions, 128]` (float32)
         - `offsets`: start offset (row) of each partition in `auxiliary.idx`
@@ -249,13 +250,13 @@ This example shows how an `IVF_PQ` index is physically laid out. Assume vectors 
 
 #### Auxiliary File
 
-- Metadata (schema metadata):
+- Arrow Schema Metadata:
     - `"distance_type"` → `"l2"`
     - `"lance:ivf"` → tracks per-partition `offsets` and `lengths` (no centroids here)
     - `"storage_metadata"` → `[ "{"pq":{"num_sub_vectors":16,"nbits":8,"dimension":128,"transposed":true}}" ]`
-- Global buffer:
+- Lance File Global buffer:
     - `Tensor` codebook with shape `[256, num_sub_vectors, dim/num_sub_vectors]` = `[256, 16, 8]` (float32)
-- Rows with Arrow schema:
+- Rows with Arrow schema: 
 
 ```python
 pa.schema([
