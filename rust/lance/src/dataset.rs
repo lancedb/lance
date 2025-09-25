@@ -7878,9 +7878,11 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])?;
 
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Create;
-        write_params.max_rows_per_file = 100;
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
 
         let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         Dataset::write(
@@ -8007,9 +8009,11 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])?;
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Create;
-        write_params.max_rows_per_file = 100;
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
         let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         Dataset::write(
             batch_reader,
@@ -8055,9 +8059,11 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(string_array)])?;
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Create;
-        write_params.max_rows_per_file = 100;
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
         let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         Dataset::write(
             batch_reader,
