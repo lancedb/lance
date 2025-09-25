@@ -6,13 +6,15 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
 
 pub use builder::IvfBuildParams;
 use lance_core::Result;
 use lance_linalg::distance::{DistanceType, MetricType};
 use tracing::instrument;
 
+use crate::vector::bq::builder::RabitQuantizer;
+use crate::vector::bq::transform::RQTransformer;
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array};
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
@@ -75,6 +77,13 @@ pub fn new_ivf_transformer_with_quantizer(
             metric_type,
             vector_column,
             sq,
+            range,
+        )),
+        Quantizer::Rabit(rq) => Ok(IvfTransformer::with_rq(
+            centroids,
+            metric_type,
+            vector_column,
+            rq,
             range,
         )),
     }
@@ -242,6 +251,55 @@ impl IvfTransformer {
         Self::new(centroids, distance_type, transforms)
     }
 
+    fn with_rq(
+        centroids: FixedSizeListArray,
+        distance_type: DistanceType,
+        vector_column: &str,
+        rq: RabitQuantizer,
+        range: Option<Range<u32>>,
+    ) -> Self {
+        let mut transforms: Vec<Arc<dyn Transformer>> =
+            vec![Arc::new(super::transform::Flatten::new(vector_column))];
+
+        let distance_type = if distance_type == MetricType::Cosine {
+            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                vector_column,
+            )));
+            MetricType::L2
+        } else {
+            distance_type
+        };
+        transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
+
+        let partition_transform = Arc::new(
+            PartitionTransformer::new(centroids.clone(), distance_type, vector_column)
+                .with_distance(true),
+        );
+        transforms.push(partition_transform);
+
+        if let Some(range) = range {
+            transforms.push(Arc::new(transform::PartitionFilter::new(
+                PART_ID_COLUMN,
+                range,
+            )));
+        }
+
+        transforms.push(Arc::new(ResidualTransform::new(
+            centroids.clone(),
+            PART_ID_COLUMN,
+            vector_column,
+        )));
+
+        transforms.push(Arc::new(RQTransformer::new(
+            rq,
+            distance_type,
+            centroids.clone(),
+            vector_column,
+        )));
+
+        Self::new(centroids, distance_type, transforms)
+    }
+
     #[inline]
     pub fn compute_residual(&self, data: &FixedSizeListArray) -> Result<FixedSizeListArray> {
         compute_residual(&self.centroids, data, Some(self.distance_type), None)
@@ -255,7 +313,11 @@ impl IvfTransformer {
         )
     }
 
-    pub fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {
+    pub fn find_partitions(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+    ) -> Result<(UInt32Array, Float32Array)> {
         Ok(kmeans_find_partitions_arrow_array(
             &self.centroids,
             query,

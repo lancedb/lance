@@ -1,0 +1,5 @@
+title: Index
+nav:
+  - index.md
+  - Scalar Indices: scalar
+  - System Indices: system

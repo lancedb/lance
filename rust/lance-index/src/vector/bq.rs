@@ -12,6 +12,12 @@ use lance_core::{Error, Result};
 use num_traits::Float;
 use snafu::location;
 
+use crate::vector::quantizer::QuantizerBuildParams;
+
+pub mod builder;
+pub mod storage;
+pub mod transform;
+
 #[derive(Clone, Default)]
 pub struct BinaryQuantization {}
 
@@ -72,6 +78,29 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
             });
             bits
         }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RQBuildParams {
+    pub num_bits: u8,
+}
+
+impl RQBuildParams {
+    pub fn new(num_bits: u8) -> Self {
+        Self { num_bits }
+    }
+}
+
+impl QuantizerBuildParams for RQBuildParams {
+    fn sample_size(&self) -> usize {
+        0
+    }
+}
+
+impl Default for RQBuildParams {
+    fn default() -> Self {
+        Self { num_bits: 1 }
+    }
 }
 
 #[cfg(test)]
