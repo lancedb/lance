@@ -253,6 +253,16 @@ impl ScalarQueryParser for SargableQueryParser {
         low: &Bound<ScalarValue>,
         high: &Bound<ScalarValue>,
     ) -> Option<IndexedExpression> {
+        if let Bound::Included(val) | Bound::Excluded(val) = low {
+            if val.is_null() {
+                return None;
+            }
+        }
+        if let Bound::Included(val) | Bound::Excluded(val) = high {
+            if val.is_null() {
+                return None;
+            }
+        }
         let query = SargableQuery::Range(low.clone(), high.clone());
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
@@ -263,6 +273,9 @@ impl ScalarQueryParser for SargableQueryParser {
     }
 
     fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        if in_list.iter().any(|val| val.is_null()) {
+            return None;
+        }
         let query = SargableQuery::IsIn(in_list.to_vec());
         Some(IndexedExpression::index_query_with_recheck(
             column.to_string(),
@@ -296,6 +309,9 @@ impl ScalarQueryParser for SargableQueryParser {
         value: &ScalarValue,
         op: &Operator,
     ) -> Option<IndexedExpression> {
+        if value.is_null() {
+            return None;
+        }
         let query = match op {
             Operator::Lt => SargableQuery::Range(Bound::Unbounded, Bound::Excluded(value.clone())),
             Operator::LtEq => {
@@ -1704,6 +1720,7 @@ mod tests {
         expected: Option<IndexedExpression>,
         optimize: bool,
     ) {
+        println!("Checking expression: {}", expr);
         let schema = Schema::new(vec![
             Field::new("color", DataType::Utf8, false),
             Field::new("size", DataType::Float32, false),
@@ -1941,6 +1958,7 @@ mod tests {
                 Bound::Included(ScalarValue::UInt32(Some(10))),
             ),
         );
+        // Small in-list (in-list with 3 or fewer items optimizes into or-chain)
         check_simple(
             &index_info,
             "aisle IN (5, 6, 7)",
@@ -1969,6 +1987,42 @@ mod tests {
                 ScalarValue::UInt32(Some(5)),
                 ScalarValue::UInt32(Some(6)),
                 ScalarValue::UInt32(Some(7)),
+            ]),
+        );
+        check_simple(
+            &index_info,
+            "aisle IN (5, 6, 7, 8, 9)",
+            "aisle",
+            SargableQuery::IsIn(vec![
+                ScalarValue::UInt32(Some(5)),
+                ScalarValue::UInt32(Some(6)),
+                ScalarValue::UInt32(Some(7)),
+                ScalarValue::UInt32(Some(8)),
+                ScalarValue::UInt32(Some(9)),
+            ]),
+        );
+        check_simple_negated(
+            &index_info,
+            "NOT aisle IN (5, 6, 7, 8, 9)",
+            "aisle",
+            SargableQuery::IsIn(vec![
+                ScalarValue::UInt32(Some(5)),
+                ScalarValue::UInt32(Some(6)),
+                ScalarValue::UInt32(Some(7)),
+                ScalarValue::UInt32(Some(8)),
+                ScalarValue::UInt32(Some(9)),
+            ]),
+        );
+        check_simple_negated(
+            &index_info,
+            "aisle NOT IN (5, 6, 7, 8, 9)",
+            "aisle",
+            SargableQuery::IsIn(vec![
+                ScalarValue::UInt32(Some(5)),
+                ScalarValue::UInt32(Some(6)),
+                ScalarValue::UInt32(Some(7)),
+                ScalarValue::UInt32(Some(8)),
+                ScalarValue::UInt32(Some(9)),
             ]),
         );
         check_simple(
@@ -2101,6 +2155,19 @@ mod tests {
         );
 
         // Non-normalized arithmetic (can use expression simplification)
-        check_no_index(&index_info, "aisle + 3 < 10")
+        check_no_index(&index_info, "aisle + 3 < 10");
+
+        // Currently we assume that the return of an index search tells us which rows are
+        // TRUE and all other rows are FALSE.  This will need to change but for now it is
+        // safer to not support the following cases because the return value of non-matched
+        // rows is NULL and not FALSE.
+        check_no_index(&index_info, "aisle IN (5, 6, NULL)");
+        // OR-list with NULL (in future DF version this will be optimized repr of
+        // small in-list with NULL so let's get ready for it)
+        check_no_index(&index_info, "aisle = 5 OR aisle = 6 OR NULL");
+        check_no_index(&index_info, "aisle IN (5, 6, 7, 8, NULL)");
+        check_no_index(&index_info, "aisle = NULL");
+        check_no_index(&index_info, "aisle BETWEEN 5 AND NULL");
+        check_no_index(&index_info, "aisle BETWEEN NULL AND 10");
     }
 }
