@@ -98,6 +98,18 @@ impl RowLatestUpdateVersionSequence {
         VersionsIter::new(&self.runs)
     }
 
+    /// Build (or rebuild) a lightweight prefix-sum index for random access.
+    /// The index stores cumulative run lengths: prefix_end[i] = sum(runs[0..=i].len).
+    pub fn build_index(&mut self) {
+        let mut prefix = Vec::with_capacity(self.runs.len());
+        let mut acc = 0usize;
+        for r in &self.runs {
+            acc += r.len();
+            prefix.push(acc);
+        }
+        self.index = Some(prefix);
+    }
+
     /// Random access: get the version at global row position `index`.
     /// If an index has been built (via `build_index`), performs a binary search (O(log R)).
     /// Otherwise, falls back to a linear scan (O(R)). Returns None if out of bounds.
