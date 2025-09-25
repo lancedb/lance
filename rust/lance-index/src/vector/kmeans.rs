@@ -1015,7 +1015,7 @@ pub fn kmeans_find_partitions_arrow_array(
     query: &dyn Array,
     nprobes: usize,
     distance_type: DistanceType,
-) -> arrow::error::Result<UInt32Array> {
+) -> arrow::error::Result<(UInt32Array, Float32Array)> {
     if centroids.value_length() as usize != query.len() {
         return Err(ArrowError::InvalidArgumentError(format!(
             "Centroids and vectors have different dimensions: {} != {}",
@@ -1073,7 +1073,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     query: &[T],
     nprobes: usize,
     distance_type: DistanceType,
-) -> arrow::error::Result<UInt32Array> {
+) -> arrow::error::Result<(UInt32Array, Float32Array)> {
     let dists: Vec<f32> = match distance_type {
         DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
         DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
@@ -1087,7 +1087,11 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
 
     // TODO: use heap to just keep nprobes smallest values.
     let dists_arr = Float32Array::from(dists);
-    sort_to_indices(&dists_arr, None, Some(nprobes))
+    let indices = sort_to_indices(&dists_arr, None, Some(nprobes))?;
+    let dists = arrow::compute::take(&dists_arr, &indices, None)?
+        .as_primitive::<Float32Type>()
+        .clone();
+    Ok((indices, dists))
 }
 
 pub fn kmeans_find_partitions_binary(
@@ -1095,7 +1099,7 @@ pub fn kmeans_find_partitions_binary(
     query: &[u8],
     nprobes: usize,
     distance_type: DistanceType,
-) -> arrow::error::Result<UInt32Array> {
+) -> arrow::error::Result<(UInt32Array, Float32Array)> {
     let dists: Vec<f32> = match distance_type {
         DistanceType::Hamming => hamming_distance_batch(query, centroids, query.len()).collect(),
         _ => {
@@ -1108,7 +1112,11 @@ pub fn kmeans_find_partitions_binary(
 
     // TODO: use heap to just keep nprobes smallest values.
     let dists_arr = Float32Array::from(dists);
-    sort_to_indices(&dists_arr, None, Some(nprobes))
+    let indices = sort_to_indices(&dists_arr, None, Some(nprobes))?;
+    let dists = arrow::compute::take(&dists_arr, &indices, None)?
+        .as_primitive::<Float32Type>()
+        .clone();
+    Ok((indices, dists))
 }
 
 /// Compute partitions from Arrow FixedSizeListArray.
