@@ -319,9 +319,9 @@ impl DatasetBuilder {
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         // Two cases that need to check out after loading the manifest:
-        // 1. If the target is a configured as a branch, we need to check the branch field in the manifest
+        // 1. If the target is configured as a branch, we need to check the branch field in the manifest
         // and reload the right branch in case the uri is not the right one.
-        // 2. If the target is a configured as a tag, and we don't find the tag under the table_uri,
+        // 2. If the target is configured as a tag, and we don't find the tag under the table_uri,
         // we need to get the root_location after loading the manifest and get the right version.
         // In practice, we should try best to use the right uri and avoid double loading.
         let mut need_delay_checkout = false;

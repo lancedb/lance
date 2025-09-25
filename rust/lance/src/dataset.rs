@@ -1839,8 +1839,8 @@ impl Dataset {
         builder.execute(transaction).await
     }
 
-    async fn resolve_reference(&self, _ref: refs::Ref) -> Result<(Option<String>, u64)> {
-        match _ref {
+    async fn resolve_reference(&self, reference: refs::Ref) -> Result<(Option<String>, u64)> {
+        match reference {
             refs::Ref::Version(branch, version_number) => {
                 if let Some(version_number) = version_number {
                     Ok((branch, version_number))
