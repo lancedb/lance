@@ -1179,36 +1179,33 @@ impl FilteredReadStream {
         let end = range.end as usize;
         let rows_seen = Arc::new(AtomicUsize::new(0));
 
-        stream.try_filter_map({
-            let rows_seen = rows_seen.clone();
-            move |batch| {
-                if batch.num_rows() == 0 {
-                    return future::ready(Ok(None));
-                }
-
-                let batch_rows = batch.num_rows();
-                let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
-                let batch_end = current_position + batch_rows;
-
-                if batch_end <= start || current_position >= end {
-                    return future::ready(Ok(None));
-                }
-
-                let skip = start.saturating_sub(current_position);
-                let end_pos = (end - current_position).min(batch_rows);
-                let take = end_pos.saturating_sub(skip);
-
-                if take == 0 {
-                    return future::ready(Ok(None));
-                }
-
-                let result = if skip == 0 && take == batch_rows {
-                    batch
-                } else {
-                    batch.slice(skip, take)
-                };
-                future::ready(Ok(Some(result)))
+        stream.try_filter_map(move |batch| {
+            if batch.num_rows() == 0 {
+                return future::ready(Ok(None));
             }
+
+            let batch_rows = batch.num_rows();
+            let current_position = rows_seen.fetch_add(batch_rows, Ordering::Relaxed);
+            let batch_end = current_position + batch_rows;
+
+            if batch_end <= start || current_position >= end {
+                return future::ready(Ok(None));
+            }
+
+            let skip = start.saturating_sub(current_position);
+            let end_pos = (end - current_position).min(batch_rows);
+            let take = end_pos.saturating_sub(skip);
+
+            if take == 0 {
+                return future::ready(Ok(None));
+            }
+
+            let result = if skip == 0 && take == batch_rows {
+                batch
+            } else {
+                batch.slice(skip, take)
+            };
+            future::ready(Ok(Some(result)))
         })
     }
 }
@@ -1820,10 +1817,7 @@ impl ExecutionPlan for FilteredReadExec {
         ) {
             return None;
         }
-        if limit.is_none() {
-            // None means should remove any existing pushed down limit
-            return None;
-        }
+        // None means should remove any existing pushed down limit
         let limit = limit?;
 
         let mut updated_options = self.options.clone();
@@ -2609,7 +2603,7 @@ mod tests {
         let fixture = Arc::new(TestFixture::new().await);
         let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
 
-        // Case 1: No filter - with_fetch should update scan_range_before_filter
+        // Case 1: No filter, no existing scan_range - should set scan_range_before_filter
         {
             let plan = fixture.make_plan(base_options.clone()).await;
             assert_eq!(plan.options().scan_range_before_filter, None);
@@ -2623,7 +2617,7 @@ mod tests {
             assert_eq!(new_plan.fetch(), Some(100));
         }
 
-        // Case 2: No filter with existing scan_range_before_filter - with_fetch should update it
+        // Case 2: No filter with existing scan_range_before_filter - should reject (return None)
         {
             let options = base_options
                 .clone()
@@ -2633,16 +2627,12 @@ mod tests {
             assert_eq!(plan.options().scan_range_before_filter, Some(50..200));
             assert_eq!(plan.fetch(), Some(150));
 
-            let new_plan = plan.with_fetch(Some(80)).unwrap();
-            let new_plan = new_plan
-                .as_any()
-                .downcast_ref::<FilteredReadExec>()
-                .unwrap();
-            assert_eq!(new_plan.options().scan_range_before_filter, Some(50..130));
-            assert_eq!(new_plan.fetch(), Some(80));
+            // Should return None because scan_range_before_filter already exists
+            let result = plan.with_fetch(Some(80));
+            assert!(result.is_none());
         }
 
-        // Case 3: With filter - with_fetch should update scan_range_after_filter
+        // Case 3: With filter, no existing scan_range_after_filter - should set scan_range_after_filter
         {
             let filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
             let options = base_options.clone().with_filter_plan(filter_plan);
@@ -2658,7 +2648,23 @@ mod tests {
             assert_eq!(new_plan.fetch(), Some(50));
         }
 
-        // Case 4: Multiple partitions mode - with_fetch should reject pushdown
+        // Case 4: With filter and existing scan_range_after_filter - should reject (return None)
+        {
+            let filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
+            let options = base_options
+                .clone()
+                .with_filter_plan(filter_plan)
+                .with_scan_range_after_filter(100..300)
+                .unwrap();
+            let plan = fixture.make_plan(options).await;
+            assert_eq!(plan.options().scan_range_after_filter, Some(100..300));
+
+            // Should return None because scan_range_after_filter already exists
+            let result = plan.with_fetch(Some(50));
+            assert!(result.is_none());
+        }
+
+        // Case 5: Multiple partitions mode - with_fetch should reject pushdown
         {
             let mut options = base_options.clone();
             options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(4);
@@ -2669,23 +2675,11 @@ mod tests {
             assert!(result.is_none());
         }
 
-        // Case 5: Existing offset with filter - with_fetch should respect it
+        // Case 6: None limit value - should be rejected
         {
-            let filter_plan = fixture.filter_plan("fully_indexed < 200", false).await;
-            let options = base_options
-                .clone()
-                .with_filter_plan(filter_plan)
-                .with_scan_range_after_filter(100..300)
-                .unwrap();
-            let plan = fixture.make_plan(options).await;
-            assert_eq!(plan.options().scan_range_after_filter, Some(100..300));
-            let new_plan = plan.with_fetch(Some(50)).unwrap();
-            let new_plan = new_plan
-                .as_any()
-                .downcast_ref::<FilteredReadExec>()
-                .unwrap();
-            assert_eq!(new_plan.options().scan_range_after_filter, Some(100..150));
-            assert_eq!(new_plan.fetch(), Some(50));
+            let plan = fixture.make_plan(base_options.clone()).await;
+            let result = plan.with_fetch(None);
+            assert!(result.is_none());
         }
     }
 
