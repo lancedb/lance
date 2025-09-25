@@ -229,11 +229,11 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 ## Appendices
 
-#### Appendix 1: Example IVF_PQ Format
+### Appendix 1: Example IVF_PQ Format
 
 This example shows how an `IVF_PQ` index is physically laid out. Assume vectors have dimension 128, PQ uses 16 subquantizers (m=16) with 256 codewords per subvector (ksub=256), and distance type is "l2".
 
-##### Index File
+#### Index File
 
 - Metadata (schema metadata):
     - `"lance:index"` → `{ "type": "IVF_PQ", "distance_type": "l2" }`
@@ -247,7 +247,7 @@ This example shows how an `IVF_PQ` index is physically laid out. Assume vectors 
         - `lengths`: number of vectors in each partition
         - `loss`: k-means loss (optional)
 
-##### Auxiliary File
+#### Auxiliary File
 
 - Metadata (schema metadata):
     - `"distance_type"` → `"l2"`
