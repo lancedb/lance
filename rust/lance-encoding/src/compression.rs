@@ -462,7 +462,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
     fn create_block_compressor(
         &self,
-        _field: &Field,
+        field: &Field,
         data: &DataBlock,
     ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
         match data {
@@ -486,7 +486,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 );
                 Ok((encoder, encoding))
             }
-            _ => unreachable!(),
+            _ => todo!(
+                "block compressor for field {:?} and block type {:?}",
+                field,
+                data.name()
+            ),
         }
     }
 }
