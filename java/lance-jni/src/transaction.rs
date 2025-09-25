@@ -957,10 +957,10 @@ fn convert_to_rust_operation(
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified: fields_modified,
+                fields_modified,
                 mem_wal_to_merge: None,
-                fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap,
-                update_mode: update_mode,
+                fields_for_preserving_frag_bitmap,
+                update_mode,
             }
         }
         "DataReplacement" => {
