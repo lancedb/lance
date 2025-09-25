@@ -124,7 +124,7 @@ impl<'a> CleanupTask<'a> {
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
 
-        let tags = self.dataset.tags.list().await?;
+        let tags = self.dataset.tags().list().await?;
         let tagged_versions: HashSet<u64> = tags
             .values()
             .map(|tag_content| tag_content.version)
@@ -1031,8 +1031,8 @@ mod tests {
 
         let mut dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
 
         fixture
             .clock
@@ -1051,7 +1051,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         cleanup_error = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1060,7 +1060,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         let removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1082,9 +1082,9 @@ mod tests {
 
         let mut dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
-        dataset.tags.create("tag-latest", 3).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("tag-latest", 3).await.unwrap();
 
         fixture
             .clock
@@ -1101,7 +1101,7 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(
@@ -1113,7 +1113,7 @@ mod tests {
             .unwrap();
         assert_eq!(removed.old_versions, 1);
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(

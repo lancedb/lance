@@ -98,12 +98,12 @@ impl Refs {
         }
     }
 
-    pub fn tags(&self) -> Tags {
-        Tags { refs: self.clone() }
+    pub fn tags(&self) -> Tags<'_> {
+        Tags { refs: self }
     }
 
-    pub fn branches(&self) -> Branches {
-        Branches { refs: self.clone() }
+    pub fn branches(&self) -> Branches<'_> {
+        Branches { refs: self }
     }
 
     pub fn base(&self) -> &Path {
@@ -117,29 +117,29 @@ impl Refs {
 
 /// Tags operation
 #[derive(Debug, Clone)]
-pub struct Tags {
-    pub(crate) refs: Refs,
+pub struct Tags<'a> {
+    refs: &'a Refs,
 }
 
 /// Branches operation
 #[derive(Debug, Clone)]
-pub struct Branches {
-    refs: Refs,
+pub struct Branches<'a> {
+    refs: &'a Refs,
 }
 
-impl Tags {
+impl Tags<'_> {
     fn object_store(&self) -> &ObjectStore {
         &self.refs.object_store
     }
 }
 
-impl Branches {
+impl Branches<'_> {
     fn object_store(&self) -> &ObjectStore {
         &self.refs.object_store
     }
 }
 
-impl Tags {
+impl Tags<'_> {
     pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_tags_path(&root_location.path);
@@ -349,7 +349,7 @@ impl Tags {
     }
 }
 
-impl Branches {
+impl Branches<'_> {
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_branches_contents_path(&root_location.path);
@@ -468,14 +468,9 @@ impl Branches {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        if !self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("branch {} does not exist", branch),
-            });
-        }
-
         self.object_store().delete(&branch_file).await?;
-        // Clean up empty branch directories
+
+        // Clean up branch directories
         self.cleanup_branch_directories(branch).await
     }
 

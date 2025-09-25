@@ -369,7 +369,7 @@ impl DatasetBuilder {
 
         if need_delay_checkout {
             if let Some(Ref::Tag(tag_name)) = target_ref {
-                let tag_content = dataset.tags.get(tag_name.as_str()).await?;
+                let tag_content = dataset.tags().get(tag_name.as_str()).await?;
                 branch = tag_content.branch.clone();
                 version_number = Some(tag_content.version);
             }

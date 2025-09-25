@@ -150,8 +150,7 @@ pub struct Dataset {
     // such as the index metadata.
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
-    pub(crate) branches: Branches,
-    pub tags: Tags,
+    pub refs: Refs,
 
     // Bitmap of fragment ids in this dataset.
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
@@ -389,11 +388,19 @@ impl Dataset {
                 self.checkout_by_ref(version_number, branch).await
             }
             refs::Ref::Tag(tag_name) => {
-                let tag_contents = self.tags.get(tag_name.as_str()).await?;
+                let tag_contents = self.tags().get(tag_name.as_str()).await?;
                 self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch)
                     .await
             }
         }
+    }
+
+    pub fn tags(&self) -> Tags<'_> {
+        self.refs.tags()
+    }
+
+    pub fn branches(&self) -> Branches<'_> {
+        self.refs.branches()
     }
 
     /// Check out the latest version of the dataset
@@ -416,6 +423,21 @@ impl Dataset {
         self.checkout_by_ref(None, Some(branch.to_string())).await
     }
 
+    /// This is a two-phase operation:
+    /// - Create the branch dataset by shallow cloning.
+    /// - Create the branch metadata (a.k.a. `BranchContent`).
+    ///
+    /// These two phases are not atomic. We consider `BranchContent` as the source of truth
+    /// for the branch.
+    ///
+    /// The cleanup procedure should:
+    /// - Clean up zombie branch datasets that have no related `BranchContent`.
+    /// - Delete broken `BranchContent` entries that have no related branch dataset.
+    ///
+    /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
+    /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
+    /// failure if we use the same name to `create_branch`. In that case, you need to call
+    /// `delete_branch` to interactively clean up the zombie dataset.
     pub async fn create_branch(
         &mut self,
         branch: &str,
@@ -441,19 +463,19 @@ impl Dataset {
         let dataset = builder.execute(transaction).await?;
 
         // Create BranchContent after shallow_clone
-        self.branches
+        self.branches()
             .create(branch, version_number, source_branch.as_deref())
             .await?;
         Ok(dataset)
     }
 
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
-        self.branches.delete(branch).await?;
+        self.branches().delete(branch).await?;
         Ok(())
     }
 
     pub async fn list_branches(&self) -> Result<HashMap<String, BranchContents>> {
-        self.branches.list().await
+        self.branches().list().await
     }
 
     fn already_checked_out(
@@ -654,8 +676,7 @@ impl Dataset {
             manifest_location,
             commit_handler,
             session,
-            tags: refs.tags(),
-            branches: refs.branches(),
+            refs,
             fragment_bitmap,
             metadata_cache,
             index_cache,
@@ -1854,7 +1875,7 @@ impl Dataset {
                 }
             }
             refs::Ref::Tag(tag_name) => {
-                let tag_contents = self.tags.get(tag_name.as_str()).await?;
+                let tag_contents = self.tags().get(tag_name.as_str()).await?;
                 Ok((tag_contents.branch, tag_contents.version))
             }
         }
@@ -3133,7 +3154,7 @@ mod tests {
 
         // Create tag and shallow clone
         dataset
-            .tags
+            .tags()
             .create("test_tag", original_version)
             .await
             .unwrap();
@@ -3253,7 +3274,7 @@ mod tests {
         for path in clone_paths.iter() {
             let clone_path = path.to_str().unwrap();
             current_dataset
-                .tags
+                .tags()
                 .create("v1", current_dataset.latest_version_id().await.unwrap())
                 .await
                 .unwrap();
@@ -4595,39 +4616,39 @@ mod tests {
         dataset.delete("i > 50").await.unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 0);
 
-        let bad_tag_creation = dataset.tags.create("tag1", 3).await;
+        let bad_tag_creation = dataset.tags().create("tag1", 3).await;
         assert_eq!(
             bad_tag_creation.err().unwrap().to_string(),
             "Version not found error: version Main::3 does not exist"
         );
 
-        let bad_tag_deletion = dataset.tags.delete("tag1").await;
+        let bad_tag_deletion = dataset.tags().delete("tag1").await;
         assert_eq!(
             bad_tag_deletion.err().unwrap().to_string(),
             "Ref not found error: tag tag1 does not exist"
         );
 
-        dataset.tags.create("tag1", 1).await.unwrap();
+        dataset.tags().create("tag1", 1).await.unwrap();
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 1);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 1);
 
-        let another_bad_tag_creation = dataset.tags.create("tag1", 1).await;
+        let another_bad_tag_creation = dataset.tags().create("tag1", 1).await;
         assert_eq!(
             another_bad_tag_creation.err().unwrap().to_string(),
             "Ref conflict error: tag tag1 already exists"
         );
 
-        dataset.tags.delete("tag1").await.unwrap();
+        dataset.tags().delete("tag1").await.unwrap();
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 0);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 0);
 
-        dataset.tags.create("tag1", 1).await.unwrap();
-        dataset.tags.create("tag2", 1).await.unwrap();
-        dataset.tags.create("v1.0.0-rc1", 2).await.unwrap();
+        dataset.tags().create("tag1", 1).await.unwrap();
+        dataset.tags().create("tag2", 1).await.unwrap();
+        dataset.tags().create("v1.0.0-rc1", 2).await.unwrap();
 
-        let default_order = dataset.tags.list_tags_ordered(None).await.unwrap();
+        let default_order = dataset.tags().list_tags_ordered(None).await.unwrap();
         let default_names: Vec<_> = default_order.iter().map(|t| &t.0).collect();
         assert_eq!(
             default_names,
@@ -4636,7 +4657,7 @@ mod tests {
         );
 
         let asc_order = dataset
-            .tags
+            .tags()
             .list_tags_ordered(Some(Ordering::Less))
             .await
             .unwrap();
@@ -4648,7 +4669,7 @@ mod tests {
         );
 
         let desc_order = dataset
-            .tags
+            .tags()
             .list_tags_ordered(Some(Ordering::Greater))
             .await
             .unwrap();
@@ -4659,7 +4680,7 @@ mod tests {
             "Descending ordering mismatch"
         );
 
-        assert_eq!(dataset.tags.list().await.unwrap().len(), 3);
+        assert_eq!(dataset.tags().list().await.unwrap().len(), 3);
 
         let bad_checkout = dataset.checkout_version("tag3").await;
         assert_eq!(
@@ -4678,23 +4699,23 @@ mod tests {
         assert_eq!(first_ver.version().version, 1);
 
         // test update tag
-        let bad_tag_update = dataset.tags.update("tag3", 1).await;
+        let bad_tag_update = dataset.tags().update("tag3", 1).await;
         assert_eq!(
             bad_tag_update.err().unwrap().to_string(),
             "Ref not found error: tag tag3 does not exist"
         );
 
-        let another_bad_tag_update = dataset.tags.update("tag1", 3).await;
+        let another_bad_tag_update = dataset.tags().update("tag1", 3).await;
         assert_eq!(
             another_bad_tag_update.err().unwrap().to_string(),
             "Version not found error: version 3 does not exist"
         );
 
-        dataset.tags.update("tag1", 2).await.unwrap();
+        dataset.tags().update("tag1", 2).await.unwrap();
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 2);
 
-        dataset.tags.update("tag1", 1).await.unwrap();
+        dataset.tags().update("tag1", 1).await.unwrap();
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, 1);
     }
@@ -8086,7 +8107,7 @@ mod tests {
         // Phase 3: Create a tag on branch2, the actual tag content is under root dataset
         // create branch3 based on that tag, write data batch 4
         branch2_dataset
-            .tags
+            .tags()
             .create_on_branch(
                 "tag1",
                 branch2_dataset.version().version,
