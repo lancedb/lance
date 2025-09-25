@@ -132,6 +132,7 @@ log = "0.4"
 mockall = { version = "0.13.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = { version = "0.12", features = ["future", "sync"] }
+ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
 object_store = { version = "0.12.3" }
 opendal = { version = "0.54" }
