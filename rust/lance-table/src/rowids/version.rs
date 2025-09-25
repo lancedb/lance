@@ -54,18 +54,12 @@ impl RowVersionRun {
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf, Default)]
 pub struct RowLatestUpdateVersionSequence {
     runs: Vec<RowVersionRun>,
-    /// Optional cumulative run lengths index (prefix sums of run lengths).
-    /// Not serialized; built on demand via `build_index`.
-    index: Option<Vec<usize>>, // prefix_end[i] = total length up to and including runs[i]
 }
 
 impl RowLatestUpdateVersionSequence {
     /// Create a new empty version sequence
     pub fn new() -> Self {
-        Self {
-            runs: Vec::new(),
-            index: None,
-        }
+        Self { runs: Vec::new() }
     }
 
     /// Create a version sequence with a single uniform run of `row_count` rows.
@@ -77,10 +71,7 @@ impl RowLatestUpdateVersionSequence {
             span: U64Segment::Range(0..row_count),
             version,
         };
-        Self {
-            runs: vec![run],
-            index: None,
-        }
+        Self { runs: vec![run] }
     }
 
     /// Number of rows tracked by this sequence (sum of run lengths).
@@ -98,47 +89,17 @@ impl RowLatestUpdateVersionSequence {
         VersionsIter::new(&self.runs)
     }
 
-    /// Build (or rebuild) a lightweight prefix-sum index for random access.
-    /// The index stores cumulative run lengths: prefix_end[i] = sum(runs[0..=i].len).
-    pub fn build_index(&mut self) {
-        let mut prefix = Vec::with_capacity(self.runs.len());
-        let mut acc = 0usize;
-        for r in &self.runs {
-            acc += r.len();
-            prefix.push(acc);
-        }
-        self.index = Some(prefix);
-    }
-
     /// Random access: get the version at global row position `index`.
-    /// If an index has been built (via `build_index`), performs a binary search (O(log R)).
-    /// Otherwise, falls back to a linear scan (O(R)). Returns None if out of bounds.
     pub fn version_at(&self, index: usize) -> Option<u64> {
-        if let Some(prefix) = &self.index {
-            if prefix.is_empty() {
-                return None;
+        let mut offset = 0usize;
+        for run in &self.runs {
+            let len = run.len();
+            if index < offset + len {
+                return Some(run.version());
             }
-            // Bounds check
-            if index >= *prefix.last().unwrap() {
-                return None;
-            }
-            // Binary search for the first prefix_end > index
-            match prefix.binary_search(&(index + 1)) {
-                Ok(pos) => Some(self.runs[pos].version()),
-                Err(pos) => Some(self.runs[pos].version()),
-            }
-        } else {
-            // Linear scan across runs
-            let mut offset = 0usize;
-            for run in &self.runs {
-                let len = run.len();
-                if index < offset + len {
-                    return Some(run.version());
-                }
-                offset += len;
-            }
-            None
+            offset += len;
         }
+        None
     }
 
     /// Get the version associated with a specific row id.
@@ -346,10 +307,7 @@ pub fn read_row_latest_update_versions(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(RowLatestUpdateVersionSequence {
-        runs: segments,
-        index: None,
-    })
+    Ok(RowLatestUpdateVersionSequence { runs: segments })
 }
 
 /// Re-chunk a sequence of row version runs into new chunk sizes (aligned with RowIdSequence rechunking)
@@ -535,8 +493,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_version_random_access_indexing() {
-        let mut seq = RowLatestUpdateVersionSequence {
+    fn test_version_random_access() {
+        let seq = RowLatestUpdateVersionSequence {
             runs: vec![
                 RowVersionRun {
                     span: U64Segment::Range(0..3),
@@ -551,17 +509,7 @@ mod tests {
                     version: 3,
                 },
             ],
-            index: None,
         };
-        assert_eq!(seq.version_at(0), Some(1));
-        assert_eq!(seq.version_at(2), Some(1));
-        assert_eq!(seq.version_at(3), Some(2));
-        assert_eq!(seq.version_at(4), Some(2));
-        assert_eq!(seq.version_at(5), Some(3));
-        assert_eq!(seq.version_at(6), None);
-
-        // Build index and verify binary search path
-        seq.build_index();
         assert_eq!(seq.version_at(0), Some(1));
         assert_eq!(seq.version_at(2), Some(1));
         assert_eq!(seq.version_at(3), Some(2));
@@ -583,7 +531,6 @@ mod tests {
                     version: 99,
                 },
             ],
-            index: None,
         };
         let bytes = write_row_latest_update_versions(&seq);
         let seq2 = read_row_latest_update_versions(&bytes).unwrap();
@@ -606,7 +553,6 @@ mod tests {
                     version: 9,
                 },
             ],
-            index: None,
         };
         let rows = RowIdSequence::from(10..14); // row ids: 10,11,12,13
         assert_eq!(seq.get_version_for_row_id(&rows, 10), Some(8));
