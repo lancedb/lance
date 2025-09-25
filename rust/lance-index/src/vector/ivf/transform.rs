@@ -6,10 +6,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::Float32Array;
 use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
-use arrow_schema::Field;
 use lance_table::utils::LanceIteratorExtension;
 use snafu::location;
 use tracing::instrument;
@@ -21,7 +21,7 @@ use lance_linalg::distance::DistanceType;
 use crate::vector::kmeans::compute_partitions_arrow_array;
 use crate::vector::transform::Transformer;
 use crate::vector::utils::SimpleIndex;
-use crate::vector::LOSS_METADATA_KEY;
+use crate::vector::{CENTROID_DIST_FIELD, LOSS_METADATA_KEY, PART_ID_FIELD};
 
 use super::PART_ID_COLUMN;
 
@@ -40,6 +40,7 @@ pub struct PartitionTransformer {
     distance_type: DistanceType,
     input_column: String,
     output_column: String,
+    with_distance: bool,
     index: Option<SimpleIndex>,
 }
 
@@ -61,8 +62,14 @@ impl PartitionTransformer {
             distance_type,
             input_column: input_column.as_ref().to_owned(),
             output_column: PART_ID_COLUMN.to_owned(),
+            with_distance: false,
             index,
         }
+    }
+
+    pub fn with_distance(mut self, with_distance: bool) -> Self {
+        self.with_distance = with_distance;
+        self
     }
 }
 impl Transformer for PartitionTransformer {
@@ -113,10 +120,12 @@ impl Transformer for PartitionTransformer {
             .map(|d| d.unwrap_or_default() as f64)
             .sum::<f64>();
         let part_ids = UInt32Array::from(part_ids);
-        let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
-        Ok(batch
-            .try_with_column(field, Arc::new(part_ids))?
-            .add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
+        let mut batch = batch.try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids))?;
+        if self.with_distance {
+            let dists = Float32Array::from(dists);
+            batch = batch.try_with_column(CENTROID_DIST_FIELD.clone(), Arc::new(dists))?;
+        }
+        Ok(batch.add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
     }
 }
 
