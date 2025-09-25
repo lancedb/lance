@@ -1,6 +1,15 @@
 # BTree Index
 
-The BTree index provides efficient range queries and sorted access by maintaining min/max statistics for data pages.
+The BTree index is a two-level structure that provides efficient range queries and sorted access. 
+It strikes a balance between an expensive memory structure containing all values 
+and an expensive disk structure that can't be efficiently searched.
+
+The upper layers of the BTree are designed to be cached in memory and stored in a 
+BTree structure (`page_lookup.lance`), while the leaves are searched using sub-indices 
+(`page_data.lance`, currently just a flat file). 
+This design enables efficient memory usage - for example, with 1 billion values, 
+the index can store 256K leaves of size 4K each, requiring only a few MiB of memory 
+(depending on data type) for the BTree metadata while narrowing any search to just 4K values.
 
 ## Index Details
 
@@ -12,45 +21,38 @@ The BTree index provides efficient range queries and sorted access by maintainin
 
 The BTree index consists of two files:
 
-### Files
+1. `page_lookup.lance` - The BTree structure mapping value ranges to page numbers
+2. `page_data.lance` - The actual sub-indices (flat file) containing sorted values and row IDs
 
-```
-page_lookup.lance       # Page statistics and lookup
-page_data.lance        # Actual data pages with values and row IDs
-```
+### Page Lookup File Schema (BTree Structure)
 
-### Page Lookup Structure
+| Column       | Type       | Nullable | Description                                              |
+|--------------|------------|----------|----------------------------------------------------------|
+| `min`        | {DataType} | true     | Minimum value in the page (forms BTree keys)             |
+| `max`        | {DataType} | true     | Maximum value in the page (for range pruning)            |
+| `null_count` | UInt32     | false    | Number of null values in the page                        |
+| `page_idx`   | UInt32     | false    | Page number pointing to the sub-index in page_data.lance |
 
-```
-page_lookup.lance
-├── Schema
-│   ├── min: {DataType}        # Minimum value in page
-│   ├── max: {DataType}        # Maximum value in page
-│   ├── page_id: UInt32        # Page identifier
-│   └── row_id_range: Struct   # Row ID range in page
-│       ├── start: UInt64
-│       └── end: UInt64
-└── Metadata
-    └── batch_size: u64        # Default: 4096
-```
+### Schema Metadata
 
-### Page Data Structure
+| Key | Type | Description |
+|-----|------|-------------|
+| `batch_size` | String | Number of rows per page (default: "4096") |
 
-```
-page_data.lance
-├── Schema (varies by sub-index type)
-│   ├── values: {DataType}     # Sorted values
-│   └── ids: UInt64            # Corresponding row IDs
-└── Data (Pages)
-    ├── Page 0
-    ├── Page 1
-    └── ...
-```
+### Page Data File Schema (Sub-indices)
 
-## Implementation Details
+| Column   | Type       | Nullable | Description                                       |
+|----------|------------|----------|---------------------------------------------------|
+| `values` | {DataType} | true     | Sorted values from the indexed column (flat file) |
+| `ids`    | UInt64     | false    | Row IDs corresponding to each value               |
 
-- **Page Organization**: Data is sorted and divided into fixed-size pages
-- **Statistics**: Each page stores min/max values for pruning
-- **Sub-indices**: Supports pluggable sub-index types (currently FlatIndex)
-- **Null Handling**: Tracks pages that may contain null values
-- **Lazy Loading**: Pages are loaded on-demand during queries
+## Accelerated Queries
+
+The BTree index provides exact results for the following query types:
+
+| Query Type | Description               | Operation                                                                   |
+|------------|---------------------------|-----------------------------------------------------------------------------|
+| **Equals** | `column = value`          | BTree lookup to find relevant pages, then search within sub-indices         |
+| **Range**  | `column BETWEEN a AND b`  | BTree traversal for pages overlapping the range, then search each sub-index |
+| **IsIn**   | `column IN (v1, v2, ...)` | Multiple BTree lookups, unions results from all matching sub-indices        |
+| **IsNull** | `column IS NULL`          | Returns rows from all pages where null_count > 0                            |

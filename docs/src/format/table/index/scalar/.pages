@@ -1,10 +1,10 @@
 title: Scalar Indices
 nav:
-  - Overview: index.md
   - BTree: btree.md
   - Bitmap: bitmap.md
+  - Label List: label_list.md
   - Zone Map: zonemap.md
   - Bloom Filter: bloom_filter.md
-  - Inverted: inverted.md
+  - Full Text Search: fts.md
   - N-gram: ngram.md
-  - Label List: label_list.md
+
