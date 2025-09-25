@@ -151,7 +151,7 @@ public class UpdateTest extends OperationTestBase {
               .operation(
                   Update.builder()
                       .updatedFragments(
-                          Collections.singletonList(updateResult.getFragmentMetadata()))
+                          Collections.singletonList(updateResult.getUpdatedFragment()))
                       .fieldsModified(updateResult.getFieldsModified())
                       .build())
               .build();

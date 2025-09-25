@@ -23,16 +23,16 @@ import org.apache.arrow.c.ArrowArrayStream;
  * Fragment.updateColumns()}.
  */
 public class FragmentUpdateResult {
-  private final FragmentMetadata fragmentMetadata;
+  private final FragmentMetadata updatedFragment;
   private final long[] fieldsModified;
 
-  public FragmentUpdateResult(FragmentMetadata fragmentMetadata, long[] updatedFieldIds) {
-    this.fragmentMetadata = fragmentMetadata;
+  public FragmentUpdateResult(FragmentMetadata updatedFragment, long[] updatedFieldIds) {
+    this.updatedFragment = updatedFragment;
     this.fieldsModified = updatedFieldIds;
   }
 
-  public FragmentMetadata getFragmentMetadata() {
-    return fragmentMetadata;
+  public FragmentMetadata getUpdatedFragment() {
+    return updatedFragment;
   }
 
   public long[] getFieldsModified() {
@@ -42,7 +42,7 @@ public class FragmentUpdateResult {
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
-        .add("fragmentMetadata", fragmentMetadata)
+        .add("fragmentMetadata", updatedFragment)
         .add("updatedFieldIds", fieldsModified)
         .toString();
   }

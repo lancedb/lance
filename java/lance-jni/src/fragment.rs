@@ -36,8 +36,8 @@ pub(crate) struct FragmentMergeResult {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentUpdateResult {
-    fragment: Fragment,
-    updated_field_ids: Vec<u32>,
+    updated_fragment: Fragment,
+    fields_modified: Vec<u32>,
 }
 
 //////////////////
@@ -402,10 +402,11 @@ fn inner_update_column<'local>(
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
     let left_on_str: String = left_on.extract(env)?;
     let right_on_str: String = right_on.extract(env)?;
-    let (new_frag, updated_field_ids) = RT.block_on(fragment.update_columns(reader, &left_on_str, &right_on_str))?;
+    let (updated_fragment, fields_modified) =
+        RT.block_on(fragment.update_columns(reader, &left_on_str, &right_on_str))?;
     let result = FragmentUpdateResult {
-        fragment: new_frag,
-        updated_field_ids: updated_field_ids,
+        updated_fragment,
+        fields_modified,
     };
     result.into_java(env)
 }
@@ -425,8 +426,7 @@ const FRAGMENT_MERGE_RESULT_CLASS: &str = "com/lancedb/lance/fragment/FragmentMe
 const FRAGMENT_MERGE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lcom/lancedb/lance/FragmentMetadata;Lcom/lancedb/lance/schema/LanceSchema;)V";
 const FRAGMENT_UPDATE_RESULT_CLASS: &str = "com/lancedb/lance/fragment/FragmentUpdateResult";
-const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lcom/lancedb/lance/FragmentMetadata;[J)V";
+const FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG: &str = "(Lcom/lancedb/lance/FragmentMetadata;[J)V";
 
 impl IntoJava for &FragmentMergeResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -445,14 +445,14 @@ impl IntoJava for &FragmentMergeResult {
 
 impl IntoJava for &FragmentUpdateResult {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let java_fragment_meta_data = self.fragment.into_java(env)?;
-        let java_updated_field_ids = JLance(self.updated_field_ids.clone()).into_java(env)?;
+        let java_updated_fragment = self.updated_fragment.into_java(env)?;
+        let java_fields_modified = JLance(self.fields_modified.clone()).into_java(env)?;
         Ok(env.new_object(
             FRAGMENT_UPDATE_RESULT_CLASS,
             FRAGMENT_UPDATE_RESULT_CONSTRUCTOR_SIG,
             &[
-                JValueGen::Object(&java_fragment_meta_data),
-                JValueGen::Object(&java_updated_field_ids),
+                JValueGen::Object(&java_updated_fragment),
+                JValueGen::Object(&java_fields_modified),
             ],
         )?)
     }
