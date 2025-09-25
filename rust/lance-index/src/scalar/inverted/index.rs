@@ -2576,6 +2576,10 @@ mod tests {
                 "params".to_owned(),
                 serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
             ),
+            (
+                TOKEN_SET_VERSION_KEY.to_owned(),
+                serde_json::to_string(&CURRENT_TOKEN_SET_VERSION).unwrap(),
+            ),
         ]);
         let mut writer = store
             .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
