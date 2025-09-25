@@ -3166,7 +3166,6 @@ mod tests {
             filter: &'static str,
             scan_range: Range<u64>,
             validate: Box<dyn Fn(Vec<u32>)>,
-            description: &'static str,
         }
 
         let test_cases = vec![
@@ -3179,7 +3178,6 @@ mod tests {
                         assert_eq!(*val % 3, 0, "Values should be multiples of 3");
                     }
                 }),
-                description: "Limit < at-least matches",
             },
             TestCase {
                 filter: "recheck_idx = 'cat'",
@@ -3194,7 +3192,6 @@ mod tests {
                         assert_eq!(*val % 3, 0, "Values should be multiples of 3");
                     }
                 }),
-                description: "Offset + limit with at-least match",
             },
             TestCase {
                 filter: "recheck_idx = 'cat' AND fully_indexed < 100",
@@ -3206,7 +3203,6 @@ mod tests {
                         assert_eq!(*val % 3, 0, "Values should be multiples of 3");
                     }
                 }),
-                description: "Complex filter with refine",
             },
         ];
 
