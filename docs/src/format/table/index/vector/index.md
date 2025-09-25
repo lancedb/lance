@@ -88,7 +88,6 @@ HNSW (Hierarchical Navigable Small World) indices provide fast approximate searc
 !!! note
 HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
 
-
 #### Arrow Schema Metadata
 
 The index file contains metadata in its Arrow schema metadata to describe the index configuration and structure:
@@ -104,8 +103,12 @@ Contains basic index configuration information in JSON:
 
 ##### "lance:ivf"
 
-References the IVF metadata stored in the Lance file global buffer. 
-Currently, this is always "1".
+References the IVF metadata stored in the Lance file global buffer.
+This value records the global buffer index, currently this is always "1".
+
+!!! note
+    Global buffer indices in Lance files are 1-based, 
+    so you need to subtract 1 when accessing them through code.
 
 ##### "lance:flat"
 
@@ -263,4 +266,47 @@ pa.schema([
     pa.field("_rowid", pa.uint64()),
     pa.field("__pq_code", pa.list(pa.uint8(), list_size=16)), # m subvector codes
 ])
+```
+
+### Appendix 2: Accessing Index File with Python
+
+The following example demonstrates how to read and parse the global buffer from Lance index files using Python:
+
+```python
+import pyarrow as pa
+import lance
+
+# Open the index file
+index_reader = lance.LanceFileReader.read_file("path/to/index.idx")
+
+# Access schema metadata
+schema_metadata = index_reader.metadata().schema.metadata
+
+# Get the IVF metadata reference from schema
+ivf_ref = schema_metadata.get(b"lance:ivf")  # Returns b"1" for global buffer index
+
+# Read the global buffer containing IVF metadata
+if ivf_ref:
+    buffer_index = int(ivf_ref) - 1  # Global buffer indices are 1-based
+    ivf_buffer = index_reader.global_buffer(buffer_index)
+
+    # Parse the protobuf message (requires lance protobuf definitions)
+    # ivf_metadata = parse_ivf_protobuf(ivf_buffer)
+
+# For auxiliary file with PQ codebook
+aux_reader = lance.LanceFileReader.read_file("path/to/auxiliary.idx")
+
+# Get storage metadata
+storage_metadata = aux_reader.metadata().schema.metadata.get(b"storage_metadata")
+if storage_metadata:
+    import json
+    pq_metadata = json.loads(storage_metadata.decode())[0]  # First element of the list
+    pq_params = json.loads(pq_metadata)
+
+    # Access the codebook from global buffer
+    codebook_position = pq_params.get("codebook_position", 1)
+    if codebook_position > 0:
+        codebook_buffer = aux_reader.global_buffer(codebook_position - 1)
+        # Parse the tensor protobuf
+        # codebook_tensor = parse_tensor_protobuf(codebook_buffer)
 ```
