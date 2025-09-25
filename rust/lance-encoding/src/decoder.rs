@@ -529,14 +529,36 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn is_primitive(data_type: &DataType) -> bool {
+    fn is_structural_primitive(data_type: &DataType) -> bool {
+        if data_type.is_primitive() {
+            true
+        } else {
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Dictionary(_, value_type) => Self::is_structural_primitive(value_type),
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Utf8
+                | DataType::LargeUtf8 => true,
+                DataType::FixedSizeList(inner, _) => {
+                    Self::is_structural_primitive(inner.data_type())
+                }
+                _ => false,
+            }
+        }
+    }
+
+    fn is_primitive_legacy(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
                 DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                DataType::FixedSizeList(inner, _) => Self::is_primitive_legacy(inner.data_type()),
                 _ => false,
             }
         }
@@ -673,7 +695,7 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
-        if Self::is_primitive(&data_type) {
+        if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
@@ -714,16 +736,6 @@ impl CoreFieldDecoderStrategy {
                         as Box<dyn StructuralFieldScheduler>,
                 )
             }
-            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
-                let column_info = column_infos.expect_next()?;
-                let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                    column_info.as_ref(),
-                    self.decompressor_strategy.as_ref(),
-                    self.cache_repetition_index,
-                )?);
-                column_infos.next_top_level();
-                Ok(scheduler)
-            }
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field
                     .children
@@ -734,7 +746,7 @@ impl CoreFieldDecoderStrategy {
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
-            _ => todo!(),
+            _ => todo!("create_structural_field_scheduler for {}", data_type),
         }
     }
 
@@ -745,7 +757,7 @@ impl CoreFieldDecoderStrategy {
         buffers: FileBuffers,
     ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         let data_type = field.data_type();
-        if Self::is_primitive(&data_type) {
+        if Self::is_primitive_legacy(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
@@ -804,7 +816,7 @@ impl CoreFieldDecoderStrategy {
             DataType::FixedSizeList(inner, _dimension) => {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
-                if Self::is_primitive(inner.data_type()) {
+                if Self::is_primitive_legacy(inner.data_type()) {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -814,7 +826,7 @@ impl CoreFieldDecoderStrategy {
                 }
             }
             DataType::Dictionary(_key_type, value_type) => {
-                if Self::is_primitive(value_type) || value_type.is_binary_like() {
+                if Self::is_primitive_legacy(value_type) || value_type.is_binary_like() {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
