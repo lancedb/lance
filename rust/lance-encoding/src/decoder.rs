@@ -401,7 +401,7 @@ pub struct ColumnInfoIter<'a> {
 
 impl<'a> ColumnInfoIter<'a> {
     pub fn new(column_infos: Vec<Arc<ColumnInfo>>, column_indices: &'a [u32]) -> Self {
-        let initial_pos = column_indices[0] as usize;
+        let initial_pos = column_indices.first().copied().unwrap_or(0) as usize;
         Self {
             column_infos,
             column_indices,
@@ -960,7 +960,7 @@ impl DecodeBatchScheduler {
             .metadata
             .insert("__lance_decoder_root".to_string(), "true".to_string());
 
-        if column_infos[0].is_structural() {
+        if column_infos.is_empty() || column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
             let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
@@ -1032,29 +1032,29 @@ impl DecodeBatchScheduler {
         let mut root_job = maybe_root_job.unwrap();
         let mut num_rows_scheduled = 0;
         loop {
-            let maybe_next_scan_line = root_job.schedule_next(&mut context);
-            if let Err(err) = maybe_next_scan_line {
+            let maybe_next_scan_lines = root_job.schedule_next(&mut context);
+            if let Err(err) = maybe_next_scan_lines {
                 schedule_action(Err(err));
                 return;
             }
-            let next_scan_line = maybe_next_scan_line.unwrap();
-            match next_scan_line {
-                Some(next_scan_line) => {
-                    trace!(
-                        "Scheduled scan line of {} rows and {} decoders",
-                        next_scan_line.rows_scheduled,
-                        next_scan_line.decoders.len()
-                    );
-                    num_rows_scheduled += next_scan_line.rows_scheduled;
-                    if !schedule_action(Ok(DecoderMessage {
-                        scheduled_so_far: num_rows_scheduled,
-                        decoders: next_scan_line.decoders,
-                    })) {
-                        // Decoder has disconnected
-                        return;
-                    }
+            let next_scan_lines = maybe_next_scan_lines.unwrap();
+            if next_scan_lines.is_empty() {
+                return;
+            }
+            for next_scan_line in next_scan_lines {
+                trace!(
+                    "Scheduled scan line of {} rows and {} decoders",
+                    next_scan_line.rows_scheduled,
+                    next_scan_line.decoders.len()
+                );
+                num_rows_scheduled += next_scan_line.rows_scheduled;
+                if !schedule_action(Ok(DecoderMessage {
+                    scheduled_so_far: num_rows_scheduled,
+                    decoders: next_scan_line.decoders,
+                })) {
+                    // Decoder has disconnected
+                    return;
                 }
-                None => return,
             }
         }
     }
@@ -1419,7 +1419,7 @@ impl BatchDecodeStream {
 // Utility types to smooth out the differences between the 2.0 and 2.1 decoders so that
 // we can have a single implementation of the batch decode iterator
 enum RootDecoderMessage {
-    LoadedPage(LoadedPage),
+    LoadedPage(LoadedPageShard),
     LegacyPage(crate::previous::decoder::DecoderReady),
 }
 trait RootDecoderType {
@@ -1501,7 +1501,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     ///
     /// If the data is not available this will perform a *blocking* wait (put
     /// the current thread to sleep)
-    fn wait_for_page(&self, unloaded_page: UnloadedPage) -> Result<LoadedPage> {
+    fn wait_for_page(&self, unloaded_page: UnloadedPageShard) -> Result<LoadedPageShard> {
         match maybe_done(unloaded_page.0) {
             // Fast path, avoid all runtime shenanigans if the data is ready
             MaybeDone::Done(loaded_page) => loaded_page,
@@ -2308,9 +2308,9 @@ impl SchedulerContext {
     }
 }
 
-pub struct UnloadedPage(pub BoxFuture<'static, Result<LoadedPage>>);
+pub struct UnloadedPageShard(pub BoxFuture<'static, Result<LoadedPageShard>>);
 
-impl std::fmt::Debug for UnloadedPage {
+impl std::fmt::Debug for UnloadedPageShard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnloadedPage").finish()
     }
@@ -2323,10 +2323,13 @@ pub struct ScheduledScanLine {
 }
 
 pub trait StructuralSchedulingJob: std::fmt::Debug {
-    fn schedule_next(
-        &mut self,
-        context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>>;
+    /// Schedule the next batch of data
+    ///
+    /// Normally this equates to scheduling the next page of data into one task.  Very large pages
+    /// might be split into multiple scan lines.  Each scan line has one or more rows.
+    ///
+    /// If a scheduler ends early it may return an empty vector.
+    fn schedule_next(&mut self, context: &mut SchedulerContext) -> Result<Vec<ScheduledScanLine>>;
 }
 
 /// A filter expression to apply to the data
@@ -2433,7 +2436,7 @@ pub enum MessageType {
     // Starting in 2.1 we use a simpler scheme where the scheduling happens in priority
     // order and the message is an unloaded decoder.  These can be awaited, in order, and
     // the decoder does not have to worry about waiting for I/O.
-    UnloadedPage(UnloadedPage),
+    UnloadedPage(UnloadedPageShard),
 }
 
 impl MessageType {
@@ -2446,7 +2449,7 @@ impl MessageType {
         }
     }
 
-    pub fn into_structural(self) -> UnloadedPage {
+    pub fn into_structural(self) -> UnloadedPageShard {
         match self {
             Self::UnloadedPage(unloaded) => unloaded,
             Self::DecoderReady(_) => {
@@ -2487,7 +2490,7 @@ pub trait StructuralPageDecoder: std::fmt::Debug + Send {
 }
 
 #[derive(Debug)]
-pub struct LoadedPage {
+pub struct LoadedPageShard {
     // The decoder that is ready to be decoded
     pub decoder: Box<dyn StructuralPageDecoder>,
     // The path to the decoder, the first value is the column index
@@ -2509,7 +2512,6 @@ pub struct LoadedPage {
     // handled through indirect I/O at the moment and so they don't
     // need to be represented (yet)
     pub path: VecDeque<u32>,
-    pub page_index: usize,
 }
 
 pub struct DecodedArray {
@@ -2526,7 +2528,7 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     ///
     /// The default implementation does not expect children and returns
     /// an error.
-    fn accept_page(&mut self, _child: LoadedPage) -> Result<()>;
+    fn accept_page(&mut self, _child: LoadedPageShard) -> Result<()>;
     /// Creates a task to decode `num_rows` of data into an array
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>>;
     /// The data type of the decoded data

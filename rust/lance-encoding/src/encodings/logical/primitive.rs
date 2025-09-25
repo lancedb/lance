@@ -17,8 +17,9 @@ use crate::{
         DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
         STRUCTURAL_ENCODING_MINIBLOCK,
     },
+    encodings::logical::primitive::blob::BlobPageScheduler,
     format::{
-        pb21::{self, compressive_encoding::Compression, CompressiveEncoding},
+        pb21::{self, compressive_encoding::Compression, CompressiveEncoding, PageLayout},
         ProtobufUtils21,
     },
 };
@@ -30,7 +31,7 @@ use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{CacheKey, Context, DeepSizeOf},
-    error::Error,
+    error::{Error, LanceOptionExt},
     utils::{bit::pad_bytes, hash::U8SliceKey},
 };
 use log::trace;
@@ -67,10 +68,10 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
     decoder::{
-        ColumnInfo, DecodePageTask, DecodedArray, DecodedPage, FilterExpression, LoadedPage,
+        ColumnInfo, DecodePageTask, DecodedArray, DecodedPage, FilterExpression, LoadedPageShard,
         MessageType, PageEncoding, PageInfo, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
-        StructuralPageDecoder, StructuralSchedulingJob, UnloadedPage,
+        StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
     },
     encoder::{
         EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
@@ -79,10 +80,16 @@ use crate::{
     EncodingsIo,
 };
 
+pub mod blob;
 pub mod fullzip;
 pub mod miniblock;
 
 const FILL_BYTE: u8 = 0xFE;
+
+struct PageLoadTask {
+    decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
+    num_rows: u64,
+}
 
 /// A trait for figuring out how to schedule the data within
 /// a single page.
@@ -95,11 +102,18 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
     /// Loads metadata from a previous initialize call
     fn load(&mut self, data: &Arc<dyn CachedPageData>);
     /// Schedules the read of the given ranges in the page
+    ///
+    /// The read may be split into multiple "shards" if the page is extremely large.
+    /// Each shard maps to one or more rows and can be decoded independently.
+    ///
+    /// Note: this sharding is for splitting up very large pages into smaller reads to
+    /// avoid buffering too much data in memory.  It is not related to the batch size or
+    /// compute units in any way.
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
-    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>>;
+    ) -> Result<Vec<PageLoadTask>>;
 }
 
 /// Metadata describing the decoded size of a mini-block
@@ -235,14 +249,14 @@ impl DecodeMiniBlockTask {
             let mut rep = rep.as_ref();
             // If there is a preamble and we need to skip it then do that first.  The work is the same
             // whether there is def information or not
-            let mut items_in_preamble = 0;
+            let mut items_in_preamble = 0_u64;
             let first_row_start = match preamble_action {
                 PreambleAction::Skip | PreambleAction::Take => {
                     let first_row_start = if let Some(def) = def.as_ref() {
                         let mut first_row_start = None;
                         for (idx, (rep, def)) in rep.iter().zip(def.as_ref()).enumerate() {
                             if *rep == max_rep {
-                                first_row_start = Some(idx);
+                                first_row_start = Some(idx as u64);
                                 break;
                             }
                             if *def <= max_visible_def {
@@ -251,8 +265,9 @@ impl DecodeMiniBlockTask {
                         }
                         first_row_start
                     } else {
-                        let first_row_start = rep.iter().position(|&r| r == max_rep);
-                        items_in_preamble = first_row_start.unwrap_or(rep.len());
+                        let first_row_start =
+                            rep.iter().position(|&r| r == max_rep).map(|r| r as u64);
+                        items_in_preamble = first_row_start.unwrap_or(rep.len() as u64);
                         first_row_start
                     };
                     // It is possible for a chunk to be entirely partial values but if it is then it
@@ -261,7 +276,7 @@ impl DecodeMiniBlockTask {
                         assert!(preamble_action == PreambleAction::Take);
                         return (0..total_items, 0..rep.len() as u64);
                     }
-                    let first_row_start = first_row_start.unwrap() as u64;
+                    let first_row_start = first_row_start.unwrap();
                     rep = &rep[first_row_start as usize..];
                     first_row_start
                 }
@@ -274,7 +289,8 @@ impl DecodeMiniBlockTask {
             // We hit this case when all we needed was the preamble
             if range.start == range.end {
                 debug_assert!(preamble_action == PreambleAction::Take);
-                return (0..items_in_preamble as u64, 0..first_row_start);
+                debug_assert!(items_in_preamble <= total_items);
+                return (0..items_in_preamble, 0..first_row_start);
             }
             assert!(range.start < range.end);
 
@@ -300,9 +316,9 @@ impl DecodeMiniBlockTask {
                                 new_levels_start = idx as u64 + 1;
                                 break;
                             }
-                            if *def > max_visible_def {
-                                lead_invis_seen += 1;
-                            }
+                        }
+                        if *def > max_visible_def {
+                            lead_invis_seen += 1;
                         }
                     }
                 }
@@ -325,15 +341,14 @@ impl DecodeMiniBlockTask {
                             new_levels_end = idx as u64 + new_levels_start + 1;
                             break;
                         }
-                        if *def > max_visible_def {
-                            tail_invis_seen += 1;
-                        }
+                    }
+                    if *def > max_visible_def {
+                        tail_invis_seen += 1;
                     }
                 }
 
                 if new_end == u64::MAX {
                     new_levels_end = rep.len() as u64;
-                    // This is the total number of visible items (minus any items in the preamble)
                     let total_invis_seen = lead_invis_seen + tail_invis_seen;
                     new_end = rep.len() as u64 - total_invis_seen;
                 }
@@ -342,19 +357,18 @@ impl DecodeMiniBlockTask {
 
                 // Adjust for any skipped preamble
                 if preamble_action == PreambleAction::Skip {
-                    // TODO: Should this be items_in_preamble?  If so, add a
-                    // unit test for this case
-                    new_start += first_row_start;
-                    new_end += first_row_start;
+                    new_start += items_in_preamble;
+                    new_end += items_in_preamble;
                     new_levels_start += first_row_start;
                     new_levels_end += first_row_start;
                 } else if preamble_action == PreambleAction::Take {
                     debug_assert_eq!(new_start, 0);
                     debug_assert_eq!(new_levels_start, 0);
-                    new_end += first_row_start;
+                    new_end += items_in_preamble;
                     new_levels_end += first_row_start;
                 }
 
+                debug_assert!(new_end <= total_items);
                 (new_start..new_end, new_levels_start..new_levels_end)
             } else {
                 // Easy case, there are no invisible items, so we don't need to check for them
@@ -396,6 +410,7 @@ impl DecodeMiniBlockTask {
                     new_end += first_row_start;
                 }
 
+                debug_assert!(new_end <= total_items);
                 (new_start..new_end, new_start..new_end)
             }
         } else {
@@ -533,6 +548,15 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 chunk.items_in_chunk,
                 instructions.preamble_action,
             );
+            if item_range.end - item_range.start > chunk.items_in_chunk {
+                return Err(lance_core::Error::Internal {
+                    message: format!(
+                        "Item range {:?} is greater than chunk items in chunk {:?}",
+                        item_range, chunk.items_in_chunk
+                    ),
+                    location: location!(),
+                });
+            }
 
             // Now we append the data to the output buffers
             Self::extend_levels(level_range.clone(), &mut repbuf, &rep, level_offset);
@@ -809,18 +833,22 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
         &self,
         ranges: &[Range<u64>],
         _io: &Arc<dyn EncodingsIo>,
-    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+    ) -> Result<Vec<PageLoadTask>> {
         let ranges = VecDeque::from_iter(ranges.iter().cloned());
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        Ok(std::future::ready(Ok(Box::new(ComplexAllNullPageDecoder {
+        let decoder = Box::new(ComplexAllNullPageDecoder {
             ranges,
             rep: self.repdef.as_ref().unwrap().rep.clone(),
             def: self.repdef.as_ref().unwrap().def.clone(),
             num_rows,
             def_meaning: self.def_meaning.clone(),
             max_visible_level: self.max_visible_level,
-        }) as Box<dyn StructuralPageDecoder>))
-        .boxed())
+        }) as Box<dyn StructuralPageDecoder>;
+        let page_load_task = PageLoadTask {
+            decoder_fut: std::future::ready(Ok(decoder)).boxed(),
+            num_rows,
+        };
+        Ok(vec![page_load_task])
     }
 }
 
@@ -947,12 +975,15 @@ impl StructuralPageScheduler for SimpleAllNullScheduler {
         &self,
         ranges: &[Range<u64>],
         _io: &Arc<dyn EncodingsIo>,
-    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+    ) -> Result<Vec<PageLoadTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        Ok(std::future::ready(Ok(
-            Box::new(SimpleAllNullPageDecoder { num_rows }) as Box<dyn StructuralPageDecoder>
-        ))
-        .boxed())
+        let decoder =
+            Box::new(SimpleAllNullPageDecoder { num_rows }) as Box<dyn StructuralPageDecoder>;
+        let page_load_task = PageLoadTask {
+            decoder_fut: std::future::ready(Ok(decoder)).boxed(),
+            num_rows,
+        };
+        Ok(vec![page_load_task])
     }
 }
 
@@ -1666,7 +1697,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         &self,
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
-    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+    ) -> Result<Vec<PageLoadTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
 
         let page_meta = self.page_meta.as_ref().unwrap();
@@ -1731,7 +1762,11 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             }) as Box<dyn StructuralPageDecoder>)
         }
         .boxed();
-        Ok(res)
+        let page_load_task = PageLoadTask {
+            decoder_fut: res,
+            num_rows,
+        };
+        Ok(vec![page_load_task])
     }
 }
 
@@ -2020,7 +2055,7 @@ impl FullZipScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
         rep_index: FullZipRepIndexDetails,
-    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+    ) -> Result<Vec<PageLoadTask>> {
         // Copy necessary fields to avoid lifetime issues
         let data_buf_position = self.data_buf_position;
         let cached_state = self.cached_state.clone();
@@ -2029,8 +2064,9 @@ impl FullZipScheduler {
         let bits_per_offset = self.bits_per_offset;
         let ranges = ranges.to_vec();
         let io_clone = io.clone();
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
 
-        Ok(async move {
+        let load_task = async move {
             // Step 1: Resolve byte ranges from repetition index
             let byte_ranges = Self::resolve_byte_ranges(
                 data_buf_position,
@@ -2055,7 +2091,12 @@ impl FullZipScheduler {
             // Step 4: Create decoder
             Self::create_decoder(details, data, num_rows, bits_per_offset)
         }
-        .boxed())
+        .boxed();
+        let page_load_task = PageLoadTask {
+            decoder_fut: load_task,
+            num_rows,
+        };
+        Ok(vec![page_load_task])
     }
 
     // In the simple case there is no repetition and we just have large fixed-width
@@ -2065,7 +2106,7 @@ impl FullZipScheduler {
         &self,
         ranges: &[Range<u64>],
         io: &dyn EncodingsIo,
-    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+    ) -> Result<Vec<PageLoadTask>> {
         // Convert row ranges to item ranges (i.e. multiply by items per row)
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
 
@@ -2091,7 +2132,7 @@ impl FullZipScheduler {
 
         let details = self.details.clone();
 
-        Ok(async move {
+        let load_task = async move {
             let data = data.await?;
             let data = data
                 .into_iter()
@@ -2106,7 +2147,12 @@ impl FullZipScheduler {
                 total_bytes_per_value: total_bytes_per_value as usize,
             }) as Box<dyn StructuralPageDecoder>)
         }
-        .boxed())
+        .boxed();
+        let page_load_task = PageLoadTask {
+            decoder_fut: load_task,
+            num_rows,
+        };
+        Ok(vec![page_load_task])
     }
 }
 
@@ -2179,7 +2225,7 @@ impl StructuralPageScheduler for FullZipScheduler {
         &self,
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
-    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+    ) -> Result<Vec<PageLoadTask>> {
         if let Some(rep_index) = self.rep_index {
             self.schedule_ranges_rep(ranges, io, rep_index)
         } else {
@@ -2744,12 +2790,9 @@ impl<'a> StructuralPrimitiveFieldSchedulingJob<'a> {
 }
 
 impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
-    fn schedule_next(
-        &mut self,
-        context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>> {
+    fn schedule_next(&mut self, context: &mut SchedulerContext) -> Result<Vec<ScheduledScanLine>> {
         if self.range_idx >= self.ranges.len() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         // Get our current range
         let mut range = self.ranges[self.range_idx].clone();
@@ -2792,10 +2835,9 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
             }
         }
 
-        let num_rows_in_next = ranges_in_page.iter().map(|r| r.end - r.start).sum();
         trace!(
             "Scheduling {} rows across {} ranges from page with {} rows (priority={}, column_index={}, page_index={})",
-            num_rows_in_next,
+            ranges_in_page.iter().map(|r| r.end - r.start).sum::<u64>(),
             ranges_in_page.len(),
             cur_page.num_rows,
             priority,
@@ -2806,26 +2848,30 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
         self.global_row_offset += cur_page.num_rows;
         self.page_idx += 1;
 
-        let page_decoder = cur_page
+        let page_decoders = cur_page
             .scheduler
             .schedule_ranges(&ranges_in_page, context.io())?;
 
         let cur_path = context.current_path();
-        let page_index = cur_page.page_index;
-        let unloaded_page = async move {
-            let page_decoder = page_decoder.await?;
-            Ok(LoadedPage {
-                decoder: page_decoder,
-                path: cur_path,
-                page_index,
+        page_decoders
+            .into_iter()
+            .map(|page_load_task| {
+                let cur_path = cur_path.clone();
+                let page_decoder = page_load_task.decoder_fut;
+                let unloaded_page = async move {
+                    let page_decoder = page_decoder.await?;
+                    Ok(LoadedPageShard {
+                        decoder: page_decoder,
+                        path: cur_path,
+                    })
+                }
+                .boxed();
+                Ok(ScheduledScanLine {
+                    decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(unloaded_page))],
+                    rows_scheduled: page_load_task.num_rows,
+                })
             })
-        }
-        .boxed();
-
-        Ok(Some(ScheduledScanLine {
-            decoders: vec![MessageType::UnloadedPage(UnloadedPage(unloaded_page))],
-            rows_scheduled: num_rows_in_next,
-        }))
+            .collect::<Result<Vec<_>>>()
     }
 }
 
@@ -2860,7 +2906,6 @@ impl StructuralPrimitiveFieldScheduler {
                 Self::page_info_to_scheduler(
                     page_info,
                     page_index,
-                    column_info.index as usize,
                     decompressors,
                     cache_repetition_index,
                 )
@@ -2872,55 +2917,85 @@ impl StructuralPrimitiveFieldScheduler {
         })
     }
 
+    fn page_layout_to_scheduler(
+        page_info: &PageInfo,
+        page_layout: &PageLayout,
+        decompressors: &dyn DecompressionStrategy,
+        cache_repetition_index: bool,
+    ) -> Result<Box<dyn StructuralPageScheduler>> {
+        use pb21::page_layout::Layout;
+        Ok(match page_layout.layout.as_ref().expect_ok()? {
+            Layout::MiniBlockLayout(mini_block) => Box::new(MiniBlockScheduler::try_new(
+                &page_info.buffer_offsets_and_sizes,
+                page_info.priority,
+                mini_block.num_items,
+                mini_block,
+                decompressors,
+            )?),
+            Layout::FullZipLayout(full_zip) => {
+                let mut scheduler = FullZipScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    page_info.num_rows,
+                    full_zip,
+                    decompressors,
+                )?;
+                scheduler.enable_cache = cache_repetition_index;
+                Box::new(scheduler)
+            }
+            Layout::AllNullLayout(all_null) => {
+                let def_meaning = all_null
+                    .layers
+                    .iter()
+                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .collect::<Vec<_>>();
+                if def_meaning.len() == 1
+                    && def_meaning[0] == DefinitionInterpretation::NullableItem
+                {
+                    Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
+                } else {
+                    Box::new(ComplexAllNullScheduler::new(
+                        page_info.buffer_offsets_and_sizes.clone(),
+                        def_meaning.into(),
+                    )) as Box<dyn StructuralPageScheduler>
+                }
+            }
+            Layout::BlobLayout(blob) => {
+                let inner_scheduler = Self::page_layout_to_scheduler(
+                    page_info,
+                    blob.inner_layout.as_ref().expect_ok()?.as_ref(),
+                    decompressors,
+                    cache_repetition_index,
+                )?;
+                let def_meaning = blob
+                    .layers
+                    .iter()
+                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .collect::<Vec<_>>();
+                let def_meaning = def_meaning.into();
+                Box::new(BlobPageScheduler::new(
+                    inner_scheduler,
+                    page_info.priority,
+                    page_info.num_rows,
+                    def_meaning,
+                ))
+            }
+        })
+    }
+
     fn page_info_to_scheduler(
         page_info: &PageInfo,
         page_index: usize,
-        _column_index: usize,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
     ) -> Result<PageInfoAndScheduler> {
-        let scheduler: Box<dyn StructuralPageScheduler> =
-            match page_info.encoding.as_structural().layout.as_ref() {
-                Some(pb21::page_layout::Layout::MiniBlockLayout(mini_block)) => {
-                    Box::new(MiniBlockScheduler::try_new(
-                        &page_info.buffer_offsets_and_sizes,
-                        page_info.priority,
-                        mini_block.num_items,
-                        mini_block,
-                        decompressors,
-                    )?)
-                }
-                Some(pb21::page_layout::Layout::FullZipLayout(full_zip)) => {
-                    let mut scheduler = FullZipScheduler::try_new(
-                        &page_info.buffer_offsets_and_sizes,
-                        page_info.priority,
-                        page_info.num_rows,
-                        full_zip,
-                        decompressors,
-                    )?;
-                    scheduler.enable_cache = cache_repetition_index;
-                    Box::new(scheduler)
-                }
-                Some(pb21::page_layout::Layout::AllNullLayout(all_null)) => {
-                    let def_meaning = all_null
-                        .layers
-                        .iter()
-                        .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
-                        .collect::<Vec<_>>();
-                    if def_meaning.len() == 1
-                        && def_meaning[0] == DefinitionInterpretation::NullableItem
-                    {
-                        Box::new(SimpleAllNullScheduler::default())
-                            as Box<dyn StructuralPageScheduler>
-                    } else {
-                        Box::new(ComplexAllNullScheduler::new(
-                            page_info.buffer_offsets_and_sizes.clone(),
-                            def_meaning.into(),
-                        )) as Box<dyn StructuralPageScheduler>
-                    }
-                }
-                _ => todo!(),
-            };
+        let page_layout = page_info.encoding.as_structural();
+        let scheduler = Self::page_layout_to_scheduler(
+            page_info,
+            page_layout,
+            decompressors,
+            cache_repetition_index,
+        )?;
         Ok(PageInfoAndScheduler {
             page_index,
             num_rows: page_info.num_rows,
@@ -3099,7 +3174,7 @@ impl StructuralPrimitiveFieldDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
-    fn accept_page(&mut self, child: LoadedPage) -> Result<()> {
+    fn accept_page(&mut self, child: LoadedPageShard) -> Result<()> {
         assert!(child.path.is_empty());
         self.page_decoders.push_back(child.decoder);
         Ok(())
@@ -3487,6 +3562,7 @@ impl PrimitiveStructuralEncoder {
         let mut values_counter = 0;
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let chunk_num_values = chunk.num_values(values_counter, num_elements);
+            debug_assert!(chunk_num_values > 0);
             values_counter += chunk_num_values;
             let chunk_levels = if chunk_idx < chunks.len() - 1 {
                 levels.slice_next(chunk_num_values as usize)
@@ -4747,6 +4823,83 @@ mod tests {
         check(0..1, 1..3, 1..3);
         check(1..2, 3..4, 3..4);
         check(0..2, 1..4, 1..4);
+
+        // If we have nested lists then non-top level lists may be empty/null
+        // and we need to make sure we still handle them as invisible items (we
+        // failed to do this previously)
+        let rep = Some(vec![2, 1, 2, 0, 1, 2]);
+        let def = Some(vec![0, 1, 2, 0, 0, 0]);
+        let max_rep = 2;
+        let max_visible_def = 0;
+        let total_items = 4;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..3, 0..4, 0..6);
+        check(0..1, 0..1, 0..2);
+        check(1..2, 1..3, 2..5);
+        check(2..3, 3..4, 5..6);
+
+        // Invisible items in a preamble that we are taking (regressing a previous failure)
+        let rep = Some(vec![0, 0, 1, 0, 1, 1]);
+        let def = Some(vec![0, 1, 0, 0, 0, 0]);
+        let max_rep = 1;
+        let max_visible_def = 0;
+        let total_items = 5;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Take,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..0, 0..1, 0..2);
+        check(0..1, 0..3, 0..4);
+        check(0..2, 0..4, 0..5);
+
+        // Skip preamble (with invis items) and skip a few rows (with invis items)
+        // and then take a few rows but not all the rows
+        let rep = Some(vec![0, 1, 0, 1, 0, 1, 0, 1]);
+        let def = Some(vec![1, 0, 1, 1, 0, 0, 0, 0]);
+        let max_rep = 1;
+        let max_visible_def = 0;
+        let total_items = 5;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Skip,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(2..3, 2..4, 5..7);
     }
 
     #[test]
@@ -5327,7 +5480,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_file_version(LanceFileVersion::V2_1)
+            .with_min_file_version(LanceFileVersion::V2_1)
             .with_batch_size(100)
             .with_range(0..num_rows.min(500) as u64)
             .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);

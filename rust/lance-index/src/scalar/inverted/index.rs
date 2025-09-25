@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
@@ -16,12 +16,11 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::inverted::builder::flatten_string_list;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
-    array::LargeBinaryBuilder,
-    datatypes::{self, Float32Type, Int32Type, UInt64Type},
-};
-use arrow::{
-    array::{AsArray, ListBuilder, StringBuilder, UInt32Builder},
+    array::{
+        AsArray, LargeBinaryBuilder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
+    },
     buffer::OffsetBuffer,
 };
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
@@ -50,6 +49,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
+use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
 use super::{
@@ -72,15 +72,16 @@ use super::{
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
+use crate::pbold;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
-use crate::{pb, Index};
+use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+use std::str::FromStr;
 
 pub const INVERTED_INDEX_VERSION: u32 = 0;
-
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -88,6 +89,9 @@ pub const METADATA_FILE: &str = "metadata.lance";
 
 pub const TOKEN_COL: &str = "_token";
 pub const TOKEN_ID_COL: &str = "_token_id";
+pub const TOKEN_FST_BYTES_COL: &str = "_token_fst_bytes";
+pub const TOKEN_NEXT_ID_COL: &str = "_token_next_id";
+pub const TOKEN_TOTAL_LENGTH_COL: &str = "_token_total_length";
 pub const FREQUENCY_COL: &str = "_frequency";
 pub const POSITION_COL: &str = "_position";
 pub const COMPRESSED_POSITION_COL: &str = "_compressed_position";
@@ -97,6 +101,8 @@ pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
+pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
+
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
 pub static FTS_SCHEMA: LazyLock<SchemaRef> =
@@ -104,11 +110,50 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
+pub enum TokenSetFormat {
+    Arrow,
+    #[default]
+    Fst,
+}
+
+impl Display for TokenSetFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Arrow => f.write_str("arrow"),
+            Self::Fst => f.write_str("fst"),
+        }
+    }
+}
+
+impl FromStr for TokenSetFormat {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim() {
+            "" => Ok(Self::Arrow),
+            "arrow" => Ok(Self::Arrow),
+            "fst" => Ok(Self::Fst),
+            other => Err(Error::Index {
+                message: format!("unsupported token set format {}", other),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+impl DeepSizeOf for TokenSetFormat {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        0
+    }
+}
+
 #[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,
     store: Arc<dyn IndexStore>,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
+    token_set_format: TokenSetFormat,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
 }
 
@@ -116,6 +161,7 @@ impl Debug for InvertedIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvertedIndex")
             .field("params", &self.params)
+            .field("token_set_format", &self.token_set_format)
             .field("partitions", &self.partitions)
             .finish()
     }
@@ -135,7 +181,13 @@ impl InvertedIndex {
     fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
-            InvertedIndexBuilder::new_with_fragment_mask(self.params.clone(), fragment_mask)
+            InvertedIndexBuilder::from_existing_index(
+                self.params.clone(),
+                None,
+                Vec::new(),
+                self.token_set_format,
+                fragment_mask,
+            )
         } else {
             let partitions = match fragment_mask {
                 Some(fragment_mask) => self
@@ -154,6 +206,7 @@ impl InvertedIndex {
                 self.params.clone(),
                 Some(self.store.clone()),
                 partitions,
+                self.token_set_format,
                 fragment_mask,
             )
         }
@@ -255,7 +308,7 @@ impl InvertedIndex {
                     .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
                     .transpose()?
                     .unwrap_or_default();
-                let tokens = TokenSet::load(token_reader).await?;
+                let tokens = TokenSet::load(token_reader, TokenSetFormat::Arrow).await?;
                 Result::Ok((tokenizer, tokens))
             }
         });
@@ -288,6 +341,7 @@ impl InvertedIndex {
             params: tokenizer_config,
             store: store.clone(),
             tokenizer,
+            token_set_format: TokenSetFormat::Arrow,
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
@@ -295,6 +349,7 @@ impl InvertedIndex {
                 inverted_list,
                 docs,
                 fragments: Default::default(),
+                token_set_format: TokenSetFormat::Arrow,
             })],
         }))
     }
@@ -332,12 +387,21 @@ impl InvertedIndex {
                             location: location!(),
                         })?;
                 let partitions: Vec<u64> = serde_json::from_str(partitions)?;
+                let token_set_format = reader
+                    .schema()
+                    .metadata
+                    .get(TOKEN_SET_FORMAT_KEY)
+                    .map(|name| TokenSetFormat::from_str(name))
+                    .transpose()?
+                    .unwrap_or(TokenSetFormat::Arrow);
 
+                let format = token_set_format;
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
                     let frag_reuse_index_clone = frag_reuse_index.clone();
                     let index_cache_for_part =
                         index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                    let token_set_format = format;
                     async move {
                         Result::Ok(Arc::new(
                             InvertedPartition::load(
@@ -345,6 +409,7 @@ impl InvertedIndex {
                                 id,
                                 frag_reuse_index_clone,
                                 &index_cache_for_part,
+                                token_set_format,
                             )
                             .await?,
                         ))
@@ -360,6 +425,7 @@ impl InvertedIndex {
                     params,
                     store,
                     tokenizer,
+                    token_set_format,
                     partitions,
                 }))
             }
@@ -485,7 +551,7 @@ impl ScalarIndex for InvertedIndex {
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
-        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -500,7 +566,7 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 
-        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -541,6 +607,7 @@ pub struct InvertedPartition {
     pub(crate) inverted_list: Arc<PostingListReader>,
     pub(crate) docs: DocSet,
     pub(crate) fragments: HashSet<u32>,
+    token_set_format: TokenSetFormat,
 }
 
 impl InvertedPartition {
@@ -575,9 +642,10 @@ impl InvertedPartition {
         id: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
-        let tokens = TokenSet::load(token_file).await?;
+        let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
@@ -591,6 +659,7 @@ impl InvertedPartition {
             inverted_list: Arc::new(inverted_list),
             docs,
             fragments,
+            token_set_format,
         })
     }
 
@@ -697,7 +766,11 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new(self.id, self.inverted_list.has_positions());
+        let mut builder = InnerBuilder::new(
+            self.id,
+            self.inverted_list.has_positions(),
+            self.token_set_format,
+        );
         builder.tokens = self.tokens;
         builder.docs = self.docs;
 
@@ -800,7 +873,14 @@ impl TokenSet {
         })
     }
 
-    pub fn to_batch(self) -> Result<RecordBatch> {
+    pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
+        match format {
+            TokenSetFormat::Arrow => self.into_arrow_batch(),
+            TokenSetFormat::Fst => self.into_fst_batch(),
+        }
+    }
+
+    fn into_arrow_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
 
@@ -838,34 +918,146 @@ impl TokenSet {
         Ok(batch)
     }
 
-    pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let mut next_id = 0;
-        let mut total_length = 0;
-        let mut tokens = fst::MapBuilder::memory();
+    fn into_fst_batch(mut self) -> Result<RecordBatch> {
+        let fst_map = match std::mem::take(&mut self.tokens) {
+            TokenMap::Fst(map) => map,
+            TokenMap::HashMap(map) => Self::build_fst_from_map(map)?,
+        };
+        let bytes = fst_map.into_fst().into_inner();
 
-        let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let token_col = batch[TOKEN_COL].as_string::<i32>();
-        let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
+        let mut fst_builder = LargeBinaryBuilder::with_capacity(1, bytes.len());
+        fst_builder.append_value(bytes);
+        let fst_col = fst_builder.finish();
 
-        for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
-            let token = token.ok_or(Error::Index {
-                message: "found null token in token set".to_owned(),
-                location: location!(),
-            })?;
-            next_id = next_id.max(token_id + 1);
-            total_length += token.len();
-            tokens
-                .insert(token, token_id as u64)
+        let mut next_id_builder = UInt32Builder::with_capacity(1);
+        next_id_builder.append_value(self.next_id);
+        let next_id_col = next_id_builder.finish();
+
+        let mut total_length_builder = UInt64Builder::with_capacity(1);
+        total_length_builder.append_value(self.total_length as u64);
+        let total_length_col = total_length_builder.finish();
+
+        let schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(TOKEN_FST_BYTES_COL, DataType::LargeBinary, false),
+            arrow_schema::Field::new(TOKEN_NEXT_ID_COL, DataType::UInt32, false),
+            arrow_schema::Field::new(TOKEN_TOTAL_LENGTH_COL, DataType::UInt64, false),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(fst_col) as ArrayRef,
+                Arc::new(next_id_col) as ArrayRef,
+                Arc::new(total_length_col) as ArrayRef,
+            ],
+        )?;
+        Ok(batch)
+    }
+
+    fn build_fst_from_map(map: HashMap<String, u32>) -> Result<fst::Map<Vec<u8>>> {
+        let mut entries: Vec<_> = map.into_iter().collect();
+        entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        let mut builder = fst::MapBuilder::memory();
+        for (token, token_id) in entries {
+            builder
+                .insert(&token, token_id as u64)
                 .map_err(|e| Error::Index {
                     message: format!("failed to insert token {}: {}", token, e),
                     location: location!(),
                 })?;
         }
+        Ok(builder.into_map())
+    }
+
+    pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
+        match format {
+            TokenSetFormat::Arrow => Self::load_arrow(reader).await,
+            TokenSetFormat::Fst => Self::load_fst(reader).await,
+        }
+    }
+
+    async fn load_arrow(reader: Arc<dyn IndexReader>) -> Result<Self> {
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+
+        let (tokens, next_id, total_length) = spawn_blocking(move || {
+            let mut next_id = 0;
+            let mut total_length = 0;
+            let mut tokens = fst::MapBuilder::memory();
+
+            let token_col = batch[TOKEN_COL].as_string::<i32>();
+            let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
+
+            for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
+                let token = token.ok_or(Error::Index {
+                    message: "found null token in token set".to_owned(),
+                    location: location!(),
+                })?;
+                next_id = next_id.max(token_id + 1);
+                total_length += token.len();
+                tokens
+                    .insert(token, token_id as u64)
+                    .map_err(|e| Error::Index {
+                        message: format!("failed to insert token {}: {}", token, e),
+                        location: location!(),
+                    })?;
+            }
+
+            Ok::<_, Error>((tokens.into_map(), next_id, total_length))
+        })
+        .await
+        .map_err(|err| Error::Execution {
+            message: format!("failed to spawn blocking task: {}", err),
+            location: location!(),
+        })??;
 
         Ok(Self {
-            tokens: TokenMap::Fst(tokens.into_map()),
+            tokens: TokenMap::Fst(tokens),
             next_id,
             total_length,
+        })
+    }
+
+    async fn load_fst(reader: Arc<dyn IndexReader>) -> Result<Self> {
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        if batch.num_rows() == 0 {
+            return Err(Error::Index {
+                message: "token set batch is empty".to_owned(),
+                location: location!(),
+            });
+        }
+
+        let fst_col = batch[TOKEN_FST_BYTES_COL].as_binary::<i64>();
+        let bytes = fst_col.value(0);
+        let map = fst::Map::new(bytes.to_vec()).map_err(|e| Error::Index {
+            message: format!("failed to load fst tokens: {}", e),
+            location: location!(),
+        })?;
+
+        let next_id_col = batch[TOKEN_NEXT_ID_COL].as_primitive::<datatypes::UInt32Type>();
+        let total_length_col =
+            batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
+
+        let next_id = next_id_col.values().first().copied().ok_or(Error::Index {
+            message: "token next id column is empty".to_owned(),
+            location: location!(),
+        })?;
+
+        let total_length = total_length_col
+            .values()
+            .first()
+            .copied()
+            .ok_or(Error::Index {
+                message: "token total length column is empty".to_owned(),
+                location: location!(),
+            })?;
+
+        Ok(Self {
+            tokens: TokenMap::Fst(map),
+            next_id,
+            total_length: usize::try_from(total_length).map_err(|_| Error::Index {
+                message: format!("token total length {} overflows usize", total_length),
+                location: location!(),
+            })?,
         })
     }
 
@@ -2316,7 +2508,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let mut builder = InnerBuilder::new(0, false);
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
 
         // index of docs:
         // 0: lance
@@ -2334,9 +2526,15 @@ mod tests {
         builder.docs.append(2, 1);
         builder.write(store.as_ref()).await.unwrap();
 
-        let index = InvertedPartition::load(store.clone(), 0, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
+        let index = InvertedPartition::load(
+            store.clone(),
+            0,
+            None,
+            &LanceCache::no_cache(),
+            TokenSetFormat::default(),
+        )
+        .await
+        .unwrap();
         let mut builder = index.into_builder().await.unwrap();
 
         let mapping = HashMap::from([(0, None), (2, Some(3))]);
@@ -2374,7 +2572,7 @@ mod tests {
         ));
 
         // Create first partition with one token and posting list length 1
-        let mut builder1 = InnerBuilder::new(0, false);
+        let mut builder1 = InnerBuilder::new(0, false, TokenSetFormat::default());
         builder1.tokens.add("test".to_owned());
         builder1.posting_lists.push(PostingListBuilder::new(false));
         builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -2382,7 +2580,7 @@ mod tests {
         builder1.write(store.as_ref()).await.unwrap();
 
         // Create second partition with one token and posting list length 4
-        let mut builder2 = InnerBuilder::new(1, false);
+        let mut builder2 = InnerBuilder::new(1, false, TokenSetFormat::default());
         builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
         builder2.posting_lists.push(PostingListBuilder::new(false));
         builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
@@ -2404,6 +2602,10 @@ mod tests {
             (
                 "params".to_owned(),
                 serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
             ),
         ]);
         let mut writer = store

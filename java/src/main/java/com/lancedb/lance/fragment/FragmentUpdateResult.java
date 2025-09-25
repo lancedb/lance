@@ -24,26 +24,26 @@ import org.apache.arrow.c.ArrowArrayStream;
  */
 public class FragmentUpdateResult {
   private final FragmentMetadata fragmentMetadata;
-  private final long[] updatedFieldIds;
+  private final long[] fieldsModified;
 
   public FragmentUpdateResult(FragmentMetadata fragmentMetadata, long[] updatedFieldIds) {
     this.fragmentMetadata = fragmentMetadata;
-    this.updatedFieldIds = updatedFieldIds;
+    this.fieldsModified = updatedFieldIds;
   }
 
   public FragmentMetadata getFragmentMetadata() {
     return fragmentMetadata;
   }
 
-  public long[] getUpdatedFieldIds() {
-    return updatedFieldIds;
+  public long[] getFieldsModified() {
+    return fieldsModified;
   }
 
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("fragmentMetadata", fragmentMetadata)
-        .add("updatedFieldIds", updatedFieldIds)
+        .add("updatedFieldIds", fieldsModified)
         .toString();
   }
 }

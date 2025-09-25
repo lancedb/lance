@@ -17,25 +17,33 @@ import com.lancedb.lance.FragmentMetadata;
 
 import com.google.common.base.MoreObjects;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 public class Update implements Operation {
   private final List<Long> removedFragmentIds;
   private final List<FragmentMetadata> updatedFragments;
   private final List<FragmentMetadata> newFragments;
-  private final long[] updatedFieldIds;
+  private final long[] fieldsModified;
+  private final long[] fieldsForPreservingFragBitmap;
+  private final Optional<UpdateMode> updateMode;
 
   private Update(
       List<Long> removedFragmentIds,
       List<FragmentMetadata> updatedFragments,
       List<FragmentMetadata> newFragments,
-      long[] updatedFieldIds) {
+      long[] fieldsModified,
+      long[] fieldsForPreservingFragBitmap,
+      Optional<UpdateMode> updateMode) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
     this.newFragments = newFragments;
-    this.updatedFieldIds = updatedFieldIds;
+    this.fieldsModified = fieldsModified;
+    this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
+    this.updateMode = updateMode;
   }
 
   public static Builder builder() {
@@ -54,8 +62,16 @@ public class Update implements Operation {
     return newFragments;
   }
 
-  public long[] updatedFieldIds() {
-    return updatedFieldIds;
+  public long[] fieldsModified() {
+    return fieldsModified;
+  }
+
+  public long[] fieldsForPreservingFragBitmap() {
+    return fieldsForPreservingFragBitmap;
+  }
+
+  public Optional<UpdateMode> updateMode() {
+    return updateMode;
   }
 
   @Override
@@ -68,7 +84,9 @@ public class Update implements Operation {
         .add("removedFragmentIds", removedFragmentIds)
         .add("updatedFragments", updatedFragments)
         .add("newFragments", newFragments)
-        .add("updatedFieldIds", updatedFieldIds)
+        .add("fieldsModified", fieldsModified)
+        .add("fieldsForPreservingFragBitmap", fieldsForPreservingFragBitmap)
+        .add("updateMode", updateMode)
         .toString();
   }
 
@@ -80,14 +98,23 @@ public class Update implements Operation {
     return Objects.equals(removedFragmentIds, that.removedFragmentIds)
         && Objects.equals(updatedFragments, that.updatedFragments)
         && Objects.equals(newFragments, that.newFragments)
-        && Objects.equals(updatedFieldIds, that.updatedFieldIds);
+        && Arrays.equals(fieldsModified, that.fieldsModified)
+        && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
+        && Objects.equals(updateMode, that.updateMode);
+  }
+
+  public enum UpdateMode {
+    RewriteRows,
+    RewriteColumns;
   }
 
   public static class Builder {
     private List<Long> removedFragmentIds = Collections.emptyList();
     private List<FragmentMetadata> updatedFragments = Collections.emptyList();
     private List<FragmentMetadata> newFragments = Collections.emptyList();
-    private long[] updatedFieldIds = new long[0];
+    private long[] fieldsModified = new long[0];
+    private long[] fieldsForPreservingFragBitmap = new long[0];
+    private Optional<UpdateMode> updateMode = Optional.empty();
 
     private Builder() {}
 
@@ -106,13 +133,29 @@ public class Update implements Operation {
       return this;
     }
 
-    public Builder updatedFieldIds(long[] updatedFieldIds) {
-      this.updatedFieldIds = updatedFieldIds;
+    public Builder fieldsModified(long[] fieldsModified) {
+      this.fieldsModified = fieldsModified;
+      return this;
+    }
+
+    public Builder fieldsForPreservingFragBitmap(long[] fieldsForPreservingFragBitmap) {
+      this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
+      return this;
+    }
+
+    public Builder updateMode(Optional<UpdateMode> updateMode) {
+      this.updateMode = updateMode;
       return this;
     }
 
     public Update build() {
-      return new Update(removedFragmentIds, updatedFragments, newFragments, updatedFieldIds);
+      return new Update(
+          removedFragmentIds,
+          updatedFragments,
+          newFragments,
+          fieldsModified,
+          fieldsForPreservingFragBitmap,
+          updateMode);
     }
   }
 }

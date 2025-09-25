@@ -129,40 +129,30 @@ mod tests {
     use arrow_array::BooleanArray;
     use arrow_schema::{DataType, Field};
     use bytes::Bytes;
-    use rstest::rstest;
     use std::{collections::HashMap, sync::Arc};
 
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
     use crate::previous::encodings::physical::bitmap::BitmapData;
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
-    };
-    use crate::version::LanceFileVersion;
+    use crate::testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases};
 
     use super::BitmapDecoder;
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_bitmap_boolean(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, false);
-        check_round_trip_encoding_random(field, version).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fsl_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, true);
         let field = Field::new("", DataType::FixedSizeList(Arc::new(field), 3), true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
+        check_basic_random(field).await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_boolean(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_simple_boolean() {
         let array = BooleanArray::from(vec![
             Some(false),
             Some(true),
@@ -179,25 +169,20 @@ mod tests {
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..9)
-            .with_indices(vec![0, 1, 3, 4])
-            .with_file_version(version);
+            .with_indices(vec![0, 1, 3, 4]);
         check_round_trip_encoding_of_data(vec![Arc::new(array)], &test_cases, HashMap::default())
             .await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_tiny_boolean(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_tiny_boolean() {
         // Test case for a tiny boolean array that is technically smaller than 1 byte
         let array = BooleanArray::from(vec![Some(false), Some(true), None]);
 
         let test_cases = TestCases::default()
             .with_range(0..1)
             .with_range(1..3)
-            .with_indices(vec![0, 2])
-            .with_file_version(version);
+            .with_indices(vec![0, 2]);
         check_round_trip_encoding_of_data(vec![Arc::new(array)], &test_cases, HashMap::default())
             .await;
     }

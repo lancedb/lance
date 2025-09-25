@@ -20,6 +20,7 @@ import com.lancedb.lance.TestUtils;
 import com.lancedb.lance.Transaction;
 import com.lancedb.lance.fragment.FragmentUpdateResult;
 import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.operation.Update.UpdateMode;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
@@ -35,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -87,6 +89,7 @@ public class UpdateTest extends OperationTestBase {
                           Collections.singletonList(
                               Long.valueOf(dataset.getFragments().get(0).getId())))
                       .newFragments(Collections.singletonList(newFragment))
+                      .updateMode(Optional.of(UpdateMode.RewriteRows))
                       .build())
               .build();
 
@@ -149,7 +152,7 @@ public class UpdateTest extends OperationTestBase {
                   Update.builder()
                       .updatedFragments(
                           Collections.singletonList(updateResult.getFragmentMetadata()))
-                      .updatedFieldIds(updateResult.getUpdatedFieldIds())
+                      .fieldsModified(updateResult.getFieldsModified())
                       .build())
               .build();
       try (Dataset dataset = updateTransaction.commit()) {

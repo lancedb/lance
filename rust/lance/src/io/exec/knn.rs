@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
+use arrow::array::Float32Builder;
 use arrow::datatypes::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
@@ -42,13 +43,13 @@ use lance_datafusion::utils::{
     PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::prefilter::PreFilter;
-use lance_index::vector::VectorIndex;
 use lance_index::vector::{
     flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
 };
+use lance_index::vector::{VectorIndex, DIST_Q_C_COLUMN};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use snafu::location;
 use tokio::sync::Notify;
 
@@ -295,13 +296,18 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             DataType::List(Field::new("item", DataType::UInt32, false).into()),
             false,
         ),
+        Field::new(
+            DIST_Q_C_COLUMN,
+            DataType::List(Field::new("item", DataType::Float32, false).into()),
+            false,
+        ),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
     ]))
 });
 
 pub fn new_knn_exec(
     dataset: Arc<Dataset>,
-    indices: &[Index],
+    indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -485,24 +491,34 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         .await?;
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?;
+                        let key = normalize_arrow(&query.key)?.0;
                         query.key = key;
                     };
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
-                    let partitions = index.find_partitions(&query).map_err(|e| {
+                    let (partitions, dist_q_c) = index.find_partitions(&query).map_err(|e| {
                         DataFusionError::Execution(format!("Failed to find partitions: {}", e))
                     })?;
 
-                    let mut list_builder = ListBuilder::new(UInt32Builder::new())
+                    let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
                         .with_field(Field::new("item", DataType::UInt32, false));
-                    list_builder.append_value(partitions.iter());
-                    let partition_col = list_builder.finish();
+                    part_list_builder.append_value(partitions.iter());
+                    let partition_col = part_list_builder.finish();
+
+                    let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new())
+                        .with_field(Field::new("item", DataType::Float32, false));
+                    dist_q_c_list_builder.append_value(dist_q_c.iter());
+                    let dist_q_c_col = dist_q_c_list_builder.finish();
+
                     let uuid_col = StringArray::from(vec![uuid.as_str()]);
                     let batch = RecordBatch::try_new(
                         KNN_PARTITION_SCHEMA.clone(),
-                        vec![Arc::new(partition_col), Arc::new(uuid_col)],
+                        vec![
+                            Arc::new(partition_col),
+                            Arc::new(dist_q_c_col),
+                            Arc::new(uuid_col),
+                        ],
                     )?;
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     Ok::<_, DataFusionError>(batch)
@@ -558,7 +574,7 @@ pub struct ANNIvfSubIndexExec {
 
     dataset: Arc<Dataset>,
 
-    indices: Vec<Index>,
+    indices: Vec<IndexMetadata>,
 
     /// Vector Query.
     query: Query,
@@ -576,7 +592,7 @@ impl ANNIvfSubIndexExec {
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
-        indices: Vec<Index>,
+        indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
@@ -691,6 +707,7 @@ impl ANNIvfSubIndexExec {
         index: Arc<dyn VectorIndex>,
         query: Query,
         partitions: Arc<UInt32Array>,
+        q_c_dists: Arc<Float32Array>,
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
@@ -762,7 +779,8 @@ impl ANNIvfSubIndexExec {
             futures::stream::iter(query.minimum_nprobes..max_nprobes)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
-                    let query = query.clone();
+                    let mut query = query.clone();
+                    query.dist_q_c = q_c_dists.value(idx);
                     let metrics = metrics.clone();
                     let pre_filter = prefilter.clone();
                     let state = state.clone();
@@ -770,7 +788,7 @@ impl ANNIvfSubIndexExec {
                     async move {
                         let mut query = query.clone();
                         if index.metric_type() == DistanceType::Cosine {
-                            let key = normalize_arrow(&query.key)?;
+                            let key = normalize_arrow(&query.key)?.0;
                             query.key = key;
                         };
 
@@ -808,6 +826,7 @@ impl ANNIvfSubIndexExec {
         index: Arc<dyn VectorIndex>,
         query: Query,
         partitions: Arc<UInt32Array>,
+        q_c_dists: Arc<Float32Array>,
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
@@ -818,7 +837,8 @@ impl ANNIvfSubIndexExec {
         futures::stream::iter(0..minimum_nprobes)
             .map(move |idx| {
                 let part_id = partitions.value(idx);
-                let query = query.clone();
+                let mut query = query.clone();
+                query.dist_q_c = q_c_dists.value(idx);
                 let metrics = metrics.clone();
                 let index = index.clone();
                 let pre_filter = prefilter.clone();
@@ -826,7 +846,7 @@ impl ANNIvfSubIndexExec {
                 async move {
                     let mut query = query.clone();
                     if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?;
+                        let key = normalize_arrow(&query.key)?.0;
                         query.key = key;
                     };
 
@@ -940,19 +960,26 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     .column_by_name(PART_ID_COLUMN)
                     .expect("ANNSubIndexExec: input missing part_id column");
                 let part_id_arr = part_id_col.as_list::<i32>().clone();
+                let dist_q_c_col = batch
+                    .column_by_name(DIST_Q_C_COLUMN)
+                    .expect("ANNSubIndexExec: input missing dist_q_c column");
+                let dist_q_c_arr = dist_q_c_col.as_list::<i32>().clone();
                 let index_uuid_col = batch
                     .column_by_name(INDEX_UUID_COLUMN)
                     .expect("ANNSubIndexExec: input missing index_uuid column");
                 let index_uuid = index_uuid_col.as_string::<i32>().clone();
 
-                let plan: Vec<DataFusionResult<(_, _)>> = part_id_arr
+                let plan: Vec<DataFusionResult<(_, _, _)>> = part_id_arr
                     .iter()
+                    .zip(dist_q_c_arr.iter())
                     .zip(index_uuid.iter())
-                    .map(|(part_id, uuid)| {
+                    .map(|((part_id, dist_q_c), uuid)| {
                         let partitions =
                             Arc::new(part_id.unwrap().as_primitive::<UInt32Type>().clone());
+                        let dist_q_c =
+                            Arc::new(dist_q_c.unwrap().as_primitive::<Float32Type>().clone());
                         let uuid = uuid.unwrap().to_string();
-                        Ok((partitions, uuid))
+                        Ok((partitions, dist_q_c, uuid))
                     })
                     .collect_vec();
                 async move { DataFusionResult::Ok(stream::iter(plan)) }
@@ -981,7 +1008,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             per_index_stream
-                .and_then(move |(part_ids, index_uuid)| {
+                .and_then(move |(part_ids, q_c_dists, index_uuid)| {
                     let ds = ds.clone();
                     let column = column.clone();
                     let metrics = metrics.clone();
@@ -998,6 +1025,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             raw_index.clone(),
                             query.clone(),
                             part_ids.clone(),
+                            q_c_dists.clone(),
                             pre_filter.clone(),
                             metrics.clone(),
                             state.clone(),
@@ -1006,6 +1034,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             raw_index.clone(),
                             query,
                             part_ids,
+                            q_c_dists,
                             pre_filter,
                             metrics,
                             state,
@@ -1414,6 +1443,7 @@ mod tests {
             refine_factor: None,
             metric_type: DistanceType::Cosine,
             use_index: true,
+            dist_q_c: 0.0,
         };
 
         async fn multivector_scoring(

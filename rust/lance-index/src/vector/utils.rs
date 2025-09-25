@@ -98,6 +98,7 @@ impl SimpleIndex {
                 ef: 15,
                 lower_bound: None,
                 upper_bound: None,
+                dist_q_c: 0.0,
             },
             None,
             &self.store,

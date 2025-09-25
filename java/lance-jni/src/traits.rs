@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use jni::objects::{JIntArray, JMap, JObject, JString, JValue, JValueGen};
+use jni::objects::{JIntArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::JNIEnv;
 
 use crate::error::Result;
@@ -193,9 +193,9 @@ impl IntoJava for JLance<Vec<i32>> {
 
 impl IntoJava for JLance<Vec<u32>> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let long_vec: Vec<i64> = self.0.into_iter().map(|val| val as i64).collect();
-        let arr = env.new_long_array(long_vec.len() as i32)?;
-        env.set_long_array_region(&arr, 0, &long_vec)?;
+        let arr = env.new_long_array(self.0.len() as i32)?;
+        let res: Vec<i64> = self.0.iter().map(|val| *val as i64).collect();
+        env.set_long_array_region(&arr, 0, &res)?;
         Ok(arr.into())
     }
 }
@@ -252,6 +252,15 @@ impl FromJObjectWithEnv<Vec<i32>> for JIntArray<'_> {
         let mut ret: Vec<i32> = vec![0; len as usize];
         env.get_int_array_region(self, 0, ret.as_mut_slice())?;
         Ok(ret)
+    }
+}
+
+impl FromJObjectWithEnv<Vec<u32>> for JLongArray<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Vec<u32>> {
+        let len = env.get_array_length(self)?;
+        let mut ret: Vec<i64> = vec![0; len as usize];
+        env.get_long_array_region(self, 0, ret.as_mut_slice())?;
+        Ok(ret.into_iter().map(|val| val as u32).collect())
     }
 }
 
