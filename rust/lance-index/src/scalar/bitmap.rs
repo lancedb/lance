@@ -290,6 +290,96 @@ impl BitmapIndex {
 
         Ok(Arc::new(bitmap))
     }
+
+    async fn row_ids_eq(
+        &self,
+        val: &ScalarValue,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowIdTreeMap> {
+        metrics.record_comparisons(1);
+        if val.is_null() {
+            Ok(RowIdTreeMap::new())
+        } else {
+            let key = OrderableScalarValue(val.clone());
+            let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
+            Ok((*bitmap).clone())
+        }
+    }
+
+    async fn row_ids_between(
+        &self,
+        start: &Bound<ScalarValue>,
+        end: &Bound<ScalarValue>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowIdTreeMap> {
+        let range_start = match start {
+            Bound::Included(v) | Bound::Excluded(v) if v.is_null() => {
+                return Ok(RowIdTreeMap::new())
+            }
+            Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
+            Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        let range_end = match end {
+            Bound::Included(v) | Bound::Excluded(v) if v.is_null() => {
+                return Ok(RowIdTreeMap::new())
+            }
+            Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
+            Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        let keys: Vec<_> = self
+            .index_map
+            .range((range_start, range_end))
+            .map(|(k, _v)| k.clone())
+            .collect();
+
+        metrics.record_comparisons(keys.len());
+
+        if keys.is_empty() {
+            Ok(RowIdTreeMap::default())
+        } else {
+            let mut bitmaps = Vec::new();
+            for key in keys {
+                let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
+                bitmaps.push(bitmap);
+            }
+
+            let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
+            Ok(RowIdTreeMap::union_all(&bitmap_refs))
+        }
+    }
+
+    async fn row_ids_in(
+        &self,
+        values: &Vec<ScalarValue>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowIdTreeMap> {
+        metrics.record_comparisons(values.len());
+
+        let mut bitmaps = Vec::new();
+
+        for val in values {
+            // Skip NULL values
+            if !val.is_null() {
+                let key = OrderableScalarValue(val.clone());
+                if self.index_map.contains_key(&key) {
+                    let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
+                    bitmaps.push(bitmap);
+                }
+            }
+        }
+
+        if bitmaps.is_empty() {
+            Ok(RowIdTreeMap::default())
+        } else {
+            // Convert Arc<RowIdTreeMap> to &RowIdTreeMap for union_all
+            let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
+            Ok(RowIdTreeMap::union_all(&bitmap_refs))
+        }
+    }
 }
 
 impl DeepSizeOf for BitmapIndex {
@@ -404,81 +494,9 @@ impl ScalarIndex for BitmapIndex {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
         let row_ids = match query {
-            SargableQuery::Equals(val) => {
-                metrics.record_comparisons(1);
-                if val.is_null() {
-                    (*self.null_map).clone()
-                } else {
-                    let key = OrderableScalarValue(val.clone());
-                    let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                    (*bitmap).clone()
-                }
-            }
-            SargableQuery::Range(start, end) => {
-                let range_start = match start {
-                    Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
-                    Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
-                    Bound::Unbounded => Bound::Unbounded,
-                };
-
-                let range_end = match end {
-                    Bound::Included(val) => Bound::Included(OrderableScalarValue(val.clone())),
-                    Bound::Excluded(val) => Bound::Excluded(OrderableScalarValue(val.clone())),
-                    Bound::Unbounded => Bound::Unbounded,
-                };
-
-                let keys: Vec<_> = self
-                    .index_map
-                    .range((range_start, range_end))
-                    .map(|(k, _v)| k.clone())
-                    .collect();
-
-                metrics.record_comparisons(keys.len());
-
-                if keys.is_empty() {
-                    RowIdTreeMap::default()
-                } else {
-                    let mut bitmaps = Vec::new();
-                    for key in keys {
-                        let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                        bitmaps.push(bitmap);
-                    }
-
-                    let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
-                    RowIdTreeMap::union_all(&bitmap_refs)
-                }
-            }
-            SargableQuery::IsIn(values) => {
-                metrics.record_comparisons(values.len());
-
-                let mut bitmaps = Vec::new();
-                let mut has_null = false;
-
-                for val in values {
-                    if val.is_null() {
-                        has_null = true;
-                    } else {
-                        let key = OrderableScalarValue(val.clone());
-                        if self.index_map.contains_key(&key) {
-                            let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                            bitmaps.push(bitmap);
-                        }
-                    }
-                }
-
-                // Add null bitmap if needed
-                if has_null && !self.null_map.is_empty() {
-                    bitmaps.push(self.null_map.clone());
-                }
-
-                if bitmaps.is_empty() {
-                    RowIdTreeMap::default()
-                } else {
-                    // Convert Arc<RowIdTreeMap> to &RowIdTreeMap for union_all
-                    let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
-                    RowIdTreeMap::union_all(&bitmap_refs)
-                }
-            }
+            SargableQuery::Equals(val) => self.row_ids_eq(val, metrics).await?,
+            SargableQuery::Range(start, end) => self.row_ids_between(start, end, metrics).await?,
+            SargableQuery::IsIn(values) => self.row_ids_in(values, metrics).await?,
             SargableQuery::IsNull() => {
                 metrics.record_comparisons(1);
                 (*self.null_map).clone()

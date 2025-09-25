@@ -216,13 +216,7 @@ impl ScalarIndex for FlatIndex {
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
         let mut predicate = match query {
-            SargableQuery::Equals(value) => {
-                if value.is_null() {
-                    arrow::compute::is_null(self.values())?
-                } else {
-                    arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
-                }
-            }
+            SargableQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?,
             SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
             SargableQuery::IsIn(values) => {
                 let mut has_null = false;

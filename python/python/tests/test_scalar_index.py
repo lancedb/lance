@@ -1710,26 +1710,22 @@ def test_null_handling(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
 
-    def check(has_index: bool):
+    def check():
         assert dataset.to_table(filter="x IS NULL").num_rows == 1
         assert dataset.to_table(filter="x IS NOT NULL").num_rows == 3
         assert dataset.to_table(filter="x > 0").num_rows == 3
         assert dataset.to_table(filter="x < 5").num_rows == 3
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
-        # Note: there is a bit of discrepancy here.  Datafusion does not consider
-        # NULL==NULL when doing an IN operation due to classic SQL shenanigans.
-        # We should decide at some point which behavior we want and make this
-        # consistent.
-        if has_index:
-            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 3
-        else:
-            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+        assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+        assert dataset.to_table(filter="x BETWEEN 1 AND 3").num_rows == 3
+        assert dataset.to_table(filter="x BETWEEN NULL AND 3").num_rows == 0
+        assert dataset.to_table(filter="x BETWEEN 3 AND NULL").num_rows == 0
 
-    check(False)
+    check()
     dataset.create_scalar_index("x", index_type="BITMAP")
-    check(True)
+    check()
     dataset.create_scalar_index("x", index_type="BTREE")
-    check(True)
+    check()
 
 
 def test_nan_handling(tmp_path: Path):

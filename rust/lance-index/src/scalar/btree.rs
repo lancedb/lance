@@ -582,7 +582,7 @@ impl BTreeLookup {
     // All pages that could have a value equal to val
     fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<u32> {
         if query.0.is_null() {
-            self.pages_null()
+            vec![]
         } else {
             self.pages_between((Bound::Included(query), Bound::Excluded(query)))
         }
