@@ -50,6 +50,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
 use std::sync::LazyLock;
+use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
 use super::{
@@ -72,11 +73,12 @@ use super::{
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
+use crate::pbold;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
-use crate::{pb, Index};
+use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 
 pub const INVERTED_INDEX_VERSION: u32 = 0;
@@ -485,7 +487,7 @@ impl ScalarIndex for InvertedIndex {
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
-        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -500,7 +502,7 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<CreatedIndex> {
         self.to_builder().update(new_data, dest_store).await?;
 
-        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+        let details = pbold::InvertedIndexDetails::try_from(&self.params)?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
@@ -839,31 +841,41 @@ impl TokenSet {
     }
 
     pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let mut next_id = 0;
-        let mut total_length = 0;
-        let mut tokens = fst::MapBuilder::memory();
-
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let token_col = batch[TOKEN_COL].as_string::<i32>();
-        let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
 
-        for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
-            let token = token.ok_or(Error::Index {
-                message: "found null token in token set".to_owned(),
-                location: location!(),
-            })?;
-            next_id = next_id.max(token_id + 1);
-            total_length += token.len();
-            tokens
-                .insert(token, token_id as u64)
-                .map_err(|e| Error::Index {
-                    message: format!("failed to insert token {}: {}", token, e),
+        let (tokens, next_id, total_length) = spawn_blocking(move || {
+            let mut next_id = 0;
+            let mut total_length = 0;
+            let mut tokens = fst::MapBuilder::memory();
+
+            let token_col = batch[TOKEN_COL].as_string::<i32>();
+            let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
+
+            for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
+                let token = token.ok_or(Error::Index {
+                    message: "found null token in token set".to_owned(),
                     location: location!(),
                 })?;
-        }
+                next_id = next_id.max(token_id + 1);
+                total_length += token.len();
+                tokens
+                    .insert(token, token_id as u64)
+                    .map_err(|e| Error::Index {
+                        message: format!("failed to insert token {}: {}", token, e),
+                        location: location!(),
+                    })?;
+            }
+
+            Ok::<_, Error>((tokens.into_map(), next_id, total_length))
+        })
+        .await
+        .map_err(|err| Error::Execution {
+            message: format!("failed to spawn blocking task: {}", err),
+            location: location!(),
+        })??;
 
         Ok(Self {
-            tokens: TokenMap::Fst(tokens.into_map()),
+            tokens: TokenMap::Fst(tokens),
             next_id,
             total_length,
         })
