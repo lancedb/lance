@@ -2200,14 +2200,13 @@ impl DocSet {
                     .collect();
                 let num_tokens = num_tokens_col.values().to_vec();
 
-                // build the inv
-                let inv = row_ids
+                // build the inv sorted by row_id for binary_search
+                let mut inv: Vec<(u64, u32)> = row_ids
                     .iter()
-                    .copied()
                     .enumerate()
-                    .sorted_unstable()
-                    .map(|(i, row_id)| (row_id, i as u32))
+                    .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
                     .collect();
+                inv.sort_unstable_by_key(|entry| entry.0);
                 (row_ids, num_tokens, inv)
             }
         };
