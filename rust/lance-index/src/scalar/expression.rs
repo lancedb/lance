@@ -1720,7 +1720,6 @@ mod tests {
         expected: Option<IndexedExpression>,
         optimize: bool,
     ) {
-        println!("Checking expression: {}", expr);
         let schema = Schema::new(vec![
             Field::new("color", DataType::Utf8, false),
             Field::new("size", DataType::Float32, false),
