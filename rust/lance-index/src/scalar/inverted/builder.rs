@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 
@@ -80,7 +81,7 @@ pub struct InvertedIndexBuilder {
     pub(crate) partitions: Vec<u64>,
     new_partitions: Vec<u64>,
     fragment_mask: Option<u64>,
-    token_set_version: u32,
+    token_set_format: TokenSetFormat,
     _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
     src_store: Arc<dyn IndexStore>,
@@ -96,7 +97,7 @@ impl InvertedIndexBuilder {
             params,
             None,
             Vec::new(),
-            CURRENT_TOKEN_SET_VERSION,
+            TokenSetFormat::default(),
             fragment_mask,
         )
     }
@@ -111,7 +112,7 @@ impl InvertedIndexBuilder {
         params: InvertedIndexParams,
         store: Option<Arc<dyn IndexStore>>,
         partitions: Vec<u64>,
-        token_set_version: u32,
+        token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
     ) -> Self {
         let tmpdir = tempdir().unwrap();
@@ -128,7 +129,7 @@ impl InvertedIndexBuilder {
             _tmpdir: tmpdir,
             local_store,
             src_store,
-            token_set_version,
+            token_set_format,
             fragment_mask,
         }
     }
@@ -175,7 +176,7 @@ impl InvertedIndexBuilder {
             let receiver = receiver.clone();
             let id_alloc = id_alloc.clone();
             let fragment_mask = self.fragment_mask;
-            let token_set_version = self.token_set_version;
+            let token_set_format = self.token_set_format;
             let task = tokio::task::spawn(async move {
                 let mut worker = IndexWorker::new(
                     store,
@@ -183,7 +184,7 @@ impl InvertedIndexBuilder {
                     with_position,
                     id_alloc,
                     fragment_mask,
-                    token_set_version,
+                    token_set_format,
                 )
                 .await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -253,7 +254,7 @@ impl InvertedIndexBuilder {
                 *part,
                 None,
                 &LanceCache::no_cache(),
-                self.token_set_version,
+                self.token_set_format,
             )
             .await?;
             let mut builder = part.into_builder().await?;
@@ -276,8 +277,8 @@ impl InvertedIndexBuilder {
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
             (
-                TOKEN_SET_VERSION_KEY.to_owned(),
-                serde_json::to_string(&self.token_set_version)?,
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                self.token_set_format.to_string(),
             ),
         ]);
         let mut writer = dest_store
@@ -301,8 +302,8 @@ impl InvertedIndexBuilder {
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
             (
-                TOKEN_SET_VERSION_KEY.to_owned(),
-                serde_json::to_string(&self.token_set_version)?,
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                self.token_set_format.to_string(),
             ),
         ]);
         // Use partition ID to generate a unique temporary filename
@@ -325,7 +326,7 @@ impl InvertedIndexBuilder {
                         *part,
                         None,
                         &no_cache,
-                        self.token_set_version,
+                        self.token_set_format,
                     )
                 })
                 .chain(self.new_partitions.iter().map(|part| {
@@ -334,7 +335,7 @@ impl InvertedIndexBuilder {
                         *part,
                         None,
                         &no_cache,
-                        self.token_set_version,
+                        self.token_set_format,
                     )
                 })),
         )
@@ -343,7 +344,7 @@ impl InvertedIndexBuilder {
             dest_store,
             partitions,
             *LANCE_FTS_TARGET_SIZE << 20,
-            self.token_set_version,
+            self.token_set_format,
         );
         let partitions = merger.merge().await?;
 
@@ -370,18 +371,18 @@ impl Default for InvertedIndexBuilder {
 pub struct InnerBuilder {
     id: u64,
     with_position: bool,
-    token_set_version: u32,
+    token_set_format: TokenSetFormat,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
 }
 
 impl InnerBuilder {
-    pub fn new(id: u64, with_position: bool, token_set_version: u32) -> Self {
+    pub fn new(id: u64, with_position: bool, token_set_format: TokenSetFormat) -> Self {
         Self {
             id,
             with_position,
-            token_set_version,
+            token_set_format,
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
@@ -498,7 +499,7 @@ impl InnerBuilder {
     async fn write_tokens(&mut self, store: &dyn IndexStore) -> Result<()> {
         log::info!("writing tokens of partition {}", self.id);
         let tokens = std::mem::take(&mut self.tokens);
-        let batch = tokens.to_versioned_batch(self.token_set_version)?;
+        let batch = tokens.to_batch(self.token_set_format)?;
         let mut writer = store
             .new_index_file(&token_file_path(self.id), batch.schema())
             .await?;
@@ -530,7 +531,7 @@ struct IndexWorker {
     estimated_size: u64,
     total_doc_length: usize,
     fragment_mask: Option<u64>,
-    token_set_version: u32,
+    token_set_format: TokenSetFormat,
 }
 
 impl IndexWorker {
@@ -540,7 +541,7 @@ impl IndexWorker {
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
-        token_set_version: u32,
+        token_set_format: TokenSetFormat,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
@@ -551,7 +552,7 @@ impl IndexWorker {
                 id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | fragment_mask.unwrap_or(0),
                 with_position,
-                token_set_version,
+                token_set_format,
             ),
             partitions: Vec::new(),
             id_alloc,
@@ -559,7 +560,7 @@ impl IndexWorker {
             estimated_size: 0,
             total_doc_length: 0,
             fragment_mask,
-            token_set_version,
+            token_set_format,
         })
     }
 
@@ -640,7 +641,7 @@ impl IndexWorker {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | self.fragment_mask.unwrap_or(0),
                 with_position,
-                self.token_set_version,
+                self.token_set_format,
             ),
         );
         builder.write(self.store.as_ref()).await?;
@@ -886,7 +887,7 @@ async fn merge_metadata_files(
     // Collect all partition IDs and params
     let mut all_partitions = Vec::new();
     let mut params = None;
-    let mut token_set_version = None;
+    let mut token_set_format = None;
 
     for file_name in part_metadata_files {
         let reader = store.open_index_file(file_name).await?;
@@ -920,17 +921,9 @@ async fn merge_metadata_files(
             );
         }
 
-        if token_set_version.is_none() {
-            if let Some(version_str) = metadata.get(TOKEN_SET_VERSION_KEY) {
-                token_set_version = Some(serde_json::from_str::<u32>(version_str).map_err(
-                    |e| Error::Index {
-                        message: format!(
-                            "failed to parse storage version from {}: {}",
-                            file_name, e
-                        ),
-                        location: location!(),
-                    },
-                )?);
+        if token_set_format.is_none() {
+            if let Some(name) = metadata.get(TOKEN_SET_FORMAT_KEY) {
+                token_set_format = Some(TokenSetFormat::from_str(name)?);
             }
         }
     }
@@ -1007,12 +1000,12 @@ async fn merge_metadata_files(
     // Write merged metadata with remapped IDs
     let remapped_partitions: Vec<u64> = (0..id_mapping.len() as u64).collect();
     let params = params.unwrap_or_default();
-    let token_set_version = token_set_version.unwrap_or(TOKEN_SET_VERSION_V0);
+    let token_set_format = token_set_format.unwrap_or(TokenSetFormat::Arrow);
     let builder = InvertedIndexBuilder::from_existing_index(
         params,
         None,
         remapped_partitions.clone(),
-        token_set_version,
+        token_set_format,
         None,
     );
     builder

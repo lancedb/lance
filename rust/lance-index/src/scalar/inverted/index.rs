@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::convert::TryFrom;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
@@ -80,13 +79,9 @@ use crate::scalar::{
 };
 use crate::Index;
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+use std::str::FromStr;
 
 pub const INVERTED_INDEX_VERSION: u32 = 0;
-pub const TOKEN_SET_VERSION_V0: u32 = 0;
-pub const TOKEN_SET_VERSION_V1: u32 = 1;
-pub const CURRENT_TOKEN_SET_VERSION: u32 = TOKEN_SET_VERSION_V1;
-pub const TOKEN_SET_VERSION_KEY: &str = "token_set_version";
-
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -106,6 +101,8 @@ pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
+pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
+
 pub static SCORE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
 pub static FTS_SCHEMA: LazyLock<SchemaRef> =
@@ -113,12 +110,50 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
+pub enum TokenSetFormat {
+    Arrow,
+    #[default]
+    Fst,
+}
+
+impl Display for TokenSetFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Arrow => f.write_str("arrow"),
+            Self::Fst => f.write_str("fst"),
+        }
+    }
+}
+
+impl FromStr for TokenSetFormat {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim() {
+            "" => Ok(Self::Arrow),
+            "arrow" => Ok(Self::Arrow),
+            "fst" => Ok(Self::Fst),
+            other => Err(Error::Index {
+                message: format!("unsupported token set format {}", other),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+impl DeepSizeOf for TokenSetFormat {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        0
+    }
+}
+
 #[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,
     store: Arc<dyn IndexStore>,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
-    token_set_version: u32,
+    token_set_format: TokenSetFormat,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
 }
 
@@ -126,7 +161,7 @@ impl Debug for InvertedIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvertedIndex")
             .field("params", &self.params)
-            .field("token_set_version", &self.token_set_version)
+            .field("token_set_format", &self.token_set_format)
             .field("partitions", &self.partitions)
             .finish()
     }
@@ -150,7 +185,7 @@ impl InvertedIndex {
                 self.params.clone(),
                 None,
                 Vec::new(),
-                self.token_set_version,
+                self.token_set_format,
                 fragment_mask,
             )
         } else {
@@ -171,7 +206,7 @@ impl InvertedIndex {
                 self.params.clone(),
                 Some(self.store.clone()),
                 partitions,
-                self.token_set_version,
+                self.token_set_format,
                 fragment_mask,
             )
         }
@@ -273,7 +308,7 @@ impl InvertedIndex {
                     .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
                     .transpose()?
                     .unwrap_or_default();
-                let tokens = TokenSet::load(token_reader, TOKEN_SET_VERSION_V0).await?;
+                let tokens = TokenSet::load(token_reader, TokenSetFormat::Arrow).await?;
                 Result::Ok((tokenizer, tokens))
             }
         });
@@ -306,7 +341,7 @@ impl InvertedIndex {
             params: tokenizer_config,
             store: store.clone(),
             tokenizer,
-            token_set_version: TOKEN_SET_VERSION_V0,
+            token_set_format: TokenSetFormat::Arrow,
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
@@ -314,7 +349,7 @@ impl InvertedIndex {
                 inverted_list,
                 docs,
                 fragments: Default::default(),
-                token_set_version: TOKEN_SET_VERSION_V0,
+                token_set_format: TokenSetFormat::Arrow,
             })],
         }))
     }
@@ -352,21 +387,21 @@ impl InvertedIndex {
                             location: location!(),
                         })?;
                 let partitions: Vec<u64> = serde_json::from_str(partitions)?;
-                let token_set_version = reader
+                let token_set_format = reader
                     .schema()
                     .metadata
-                    .get(TOKEN_SET_VERSION_KEY)
-                    .map(|value| serde_json::from_str::<u32>(value))
+                    .get(TOKEN_SET_FORMAT_KEY)
+                    .map(|name| TokenSetFormat::from_str(name))
                     .transpose()?
-                    .unwrap_or(TOKEN_SET_VERSION_V0);
+                    .unwrap_or(TokenSetFormat::Arrow);
 
-                let version = token_set_version;
+                let format = token_set_format;
                 let partitions = partitions.into_iter().map(|id| {
                     let store = store.clone();
                     let frag_reuse_index_clone = frag_reuse_index.clone();
                     let index_cache_for_part =
                         index_cache.with_key_prefix(format!("part-{}", id).as_str());
-                    let token_set_version = version;
+                    let token_set_format = format;
                     async move {
                         Result::Ok(Arc::new(
                             InvertedPartition::load(
@@ -374,7 +409,7 @@ impl InvertedIndex {
                                 id,
                                 frag_reuse_index_clone,
                                 &index_cache_for_part,
-                                token_set_version,
+                                token_set_format,
                             )
                             .await?,
                         ))
@@ -390,7 +425,7 @@ impl InvertedIndex {
                     params,
                     store,
                     tokenizer,
-                    token_set_version,
+                    token_set_format,
                     partitions,
                 }))
             }
@@ -572,7 +607,7 @@ pub struct InvertedPartition {
     pub(crate) inverted_list: Arc<PostingListReader>,
     pub(crate) docs: DocSet,
     pub(crate) fragments: HashSet<u32>,
-    token_set_version: u32,
+    token_set_format: TokenSetFormat,
 }
 
 impl InvertedPartition {
@@ -607,10 +642,10 @@ impl InvertedPartition {
         id: u64,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
-        token_set_version: u32,
+        token_set_format: TokenSetFormat,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
-        let tokens = TokenSet::load(token_file, token_set_version).await?;
+        let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
@@ -624,7 +659,7 @@ impl InvertedPartition {
             inverted_list: Arc::new(inverted_list),
             docs,
             fragments,
-            token_set_version,
+            token_set_format,
         })
     }
 
@@ -734,7 +769,7 @@ impl InvertedPartition {
         let mut builder = InnerBuilder::new(
             self.id,
             self.inverted_list.has_positions(),
-            self.token_set_version,
+            self.token_set_format,
         );
         builder.tokens = self.tokens;
         builder.docs = self.docs;
@@ -838,18 +873,14 @@ impl TokenSet {
         })
     }
 
-    pub fn to_versioned_batch(self, token_set_version: u32) -> Result<RecordBatch> {
-        match token_set_version {
-            TOKEN_SET_VERSION_V0 => self.into_batch_v0(),
-            TOKEN_SET_VERSION_V1 => self.into_batch_v1(),
-            other => Err(Error::Index {
-                message: format!("unsupported token set version {}", other),
-                location: location!(),
-            }),
+    pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
+        match format {
+            TokenSetFormat::Arrow => self.into_arrow_batch(),
+            TokenSetFormat::Fst => self.into_fst_batch(),
         }
     }
 
-    fn into_batch_v0(self) -> Result<RecordBatch> {
+    fn into_arrow_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
 
@@ -887,7 +918,7 @@ impl TokenSet {
         Ok(batch)
     }
 
-    fn into_batch_v1(mut self) -> Result<RecordBatch> {
+    fn into_fst_batch(mut self) -> Result<RecordBatch> {
         let fst_map = match std::mem::take(&mut self.tokens) {
             TokenMap::Fst(map) => map,
             TokenMap::HashMap(map) => Self::build_fst_from_map(map)?,
@@ -938,18 +969,14 @@ impl TokenSet {
         Ok(builder.into_map())
     }
 
-    pub async fn load(reader: Arc<dyn IndexReader>, token_set_version: u32) -> Result<Self> {
-        match token_set_version {
-            TOKEN_SET_VERSION_V0 => Self::load_v0(reader).await,
-            TOKEN_SET_VERSION_V1 => Self::load_v1(reader).await,
-            other => Err(Error::Index {
-                message: format!("unsupported token set version {}", other),
-                location: location!(),
-            }),
+    pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
+        match format {
+            TokenSetFormat::Arrow => Self::load_arrow(reader).await,
+            TokenSetFormat::Fst => Self::load_fst(reader).await,
         }
     }
 
-    async fn load_v0(reader: Arc<dyn IndexReader>) -> Result<Self> {
+    async fn load_arrow(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
 
         let (tokens, next_id, total_length) = spawn_blocking(move || {
@@ -990,7 +1017,7 @@ impl TokenSet {
         })
     }
 
-    async fn load_v1(reader: Arc<dyn IndexReader>) -> Result<Self> {
+    async fn load_fst(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         if batch.num_rows() == 0 {
             return Err(Error::Index {
@@ -2481,7 +2508,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let mut builder = InnerBuilder::new(0, false, CURRENT_TOKEN_SET_VERSION);
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
 
         // index of docs:
         // 0: lance
@@ -2504,7 +2531,7 @@ mod tests {
             0,
             None,
             &LanceCache::no_cache(),
-            CURRENT_TOKEN_SET_VERSION,
+            TokenSetFormat::default(),
         )
         .await
         .unwrap();
@@ -2545,7 +2572,7 @@ mod tests {
         ));
 
         // Create first partition with one token and posting list length 1
-        let mut builder1 = InnerBuilder::new(0, false, CURRENT_TOKEN_SET_VERSION);
+        let mut builder1 = InnerBuilder::new(0, false, TokenSetFormat::default());
         builder1.tokens.add("test".to_owned());
         builder1.posting_lists.push(PostingListBuilder::new(false));
         builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -2553,7 +2580,7 @@ mod tests {
         builder1.write(store.as_ref()).await.unwrap();
 
         // Create second partition with one token and posting list length 4
-        let mut builder2 = InnerBuilder::new(1, false, CURRENT_TOKEN_SET_VERSION);
+        let mut builder2 = InnerBuilder::new(1, false, TokenSetFormat::default());
         builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
         builder2.posting_lists.push(PostingListBuilder::new(false));
         builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
@@ -2577,8 +2604,8 @@ mod tests {
                 serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
             ),
             (
-                TOKEN_SET_VERSION_KEY.to_owned(),
-                serde_json::to_string(&CURRENT_TOKEN_SET_VERSION).unwrap(),
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
             ),
         ]);
         let mut writer = store
