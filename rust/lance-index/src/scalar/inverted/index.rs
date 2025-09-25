@@ -2219,11 +2219,14 @@ impl DocSet {
 
         let row_ids = row_id_col.values().to_vec();
         let num_tokens = num_tokens_col.values().to_vec();
-        let inv = row_ids
+        let mut inv: Vec<(u64, u32)> = row_ids
             .iter()
             .enumerate()
             .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
             .collect();
+        if !row_ids.is_sorted() {
+            inv.sort_unstable_by_key(|entry| entry.0);
+        }
         let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
         Ok(Self {
             row_ids,
