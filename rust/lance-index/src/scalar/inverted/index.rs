@@ -2164,53 +2164,66 @@ impl DocSet {
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-        let (row_ids, num_tokens, inv) = match is_legacy {
-            // for legacy format, the row id is doc id,
-            // in order to support efficient search, we need to sort the row ids,
-            // so that we can use binary search to get num_tokens
-            true => {
-                let (row_ids, num_tokens) = row_id_col
-                    .values()
-                    .iter()
-                    .filter_map(|id| {
-                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
-                        } else {
-                            Some(*id)
-                        }
-                    })
-                    .zip(num_tokens_col.values().iter())
-                    .sorted_unstable_by_key(|x| x.0)
-                    .unzip();
+        // for legacy format, the row id is doc id; sorting keeps binary search viable
+        if is_legacy {
+            let (row_ids, num_tokens): (Vec<_>, Vec<_>) = row_id_col
+                .values()
+                .iter()
+                .filter_map(|id| {
+                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                        frag_reuse_index_ref.remap_row_id(*id)
+                    } else {
+                        Some(*id)
+                    }
+                })
+                .zip(num_tokens_col.values().iter())
+                .sorted_unstable_by_key(|x| x.0)
+                .unzip();
 
-                // the legacy format doesn't need to store the inv
-                (row_ids, num_tokens, Vec::new())
+            let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
+            return Ok(Self {
+                row_ids,
+                num_tokens,
+                inv: Vec::new(),
+                total_tokens,
+            });
+        }
+
+        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
+        // remapped, we'll need resort to make sure binary_search works.
+        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+            let mut row_ids = Vec::with_capacity(row_id_col.len());
+            let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
+            for (row_id, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
+                if let Some(new_row_id) = frag_reuse_index_ref.remap_row_id(*row_id) {
+                    row_ids.push(new_row_id);
+                    num_tokens.push(*num_token);
+                }
             }
-            false => {
-                let row_ids: Vec<u64> = row_id_col
-                    .values()
-                    .iter()
-                    .filter_map(|id| {
-                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                            frag_reuse_index_ref.remap_row_id(*id)
-                        } else {
-                            Some(*id)
-                        }
-                    })
-                    .collect();
-                let num_tokens = num_tokens_col.values().to_vec();
 
-                // build the inv sorted by row_id for binary_search
-                let mut inv: Vec<(u64, u32)> = row_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
-                    .collect();
-                inv.sort_unstable_by_key(|entry| entry.0);
-                (row_ids, num_tokens, inv)
-            }
-        };
+            let mut inv: Vec<(u64, u32)> = row_ids
+                .iter()
+                .enumerate()
+                .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+                .collect();
+            inv.sort_unstable_by_key(|entry| entry.0);
 
+            let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
+            return Ok(Self {
+                row_ids,
+                num_tokens,
+                inv,
+                total_tokens,
+            });
+        }
+
+        let row_ids = row_id_col.values().to_vec();
+        let num_tokens = num_tokens_col.values().to_vec();
+        let inv = row_ids
+            .iter()
+            .enumerate()
+            .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+            .collect();
         let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
         Ok(Self {
             row_ids,
