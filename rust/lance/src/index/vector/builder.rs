@@ -4,16 +4,21 @@
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
 
+use arrow::array::{make_builder, FixedSizeListBuilder, PrimitiveBuilder};
 use arrow::compute::sort_to_indices;
 use arrow::datatypes::{self, Float16Type, Float32Type, Float64Type};
 use arrow::{array::AsArray, datatypes::UInt64Type};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, PrimitiveArray,
+    RecordBatch, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Fields};
 use futures::stream;
 use futures::{
     prelude::stream::{StreamExt, TryStreamExt},
     Stream,
 };
+use itertools::Itertools;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -1010,23 +1015,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 return Err(Error::invalid_input("unsupported vector type", location!()));
             }
         };
+        // the original centroid
         let c0 = ivf.centroid(part_id).ok_or(Error::invalid_input(
             "original centroid not found",
             location!(),
         ))?;
+        // the 2 new centroids
         let c1 = kmeans.centroids.slice(0, dimension);
         let c2 = kmeans.centroids.slice(dimension, dimension);
         centroids.push(c1);
         centroids.push(c2);
 
         // get top REASSIGN_RANGE centroids from c0
-        let reassign_range = std::cmp::min(REASSIGN_RANGE + 1, ivf.num_partitions());
-        let centroid_dists =
-            self.distance_type.arrow_batch_func()(&c0, ivf.centroids_array().unwrap())?;
-        let reassign_range_candidates =
-            sort_to_indices(centroid_dists.as_ref(), None, Some(reassign_range))?;
-        // exclude the original centroid itself
-        let reassign_range_candidates = &reassign_range_candidates.values()[1..];
+        let (reassign_candidate_ids, reassign_candidate_centroids) =
+            self.build_reassign_candidates(ivf, &c0)?;
 
         // compute the distance between the vectors and the 3 centroids (original one and the 2 new ones)
         let d0 = self.distance_type.arrow_batch_func()(&c0, &vectors)?;
@@ -1036,23 +1038,131 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let d1 = d1.values();
         let d2 = d2.values();
 
-        // evaluate LIRE protocol:
-        // if d0[i] <= d1[i] and d0[i] <= d2[i], then the vector i needs to be reassigned,
-        // otherwise, just assign it to the closest cluster (c1 or c2)
+        let (part1_row_ids, part1_vectors, part2_row_ids, part2_vectors) = self.assign_vectors(
+            &row_ids,
+            &vectors,
+            &d0,
+            &d1,
+            &d2,
+            &reassign_candidate_ids,
+            &reassign_candidate_centroids,
+        )?;
+        Ok((part1_row_ids, part1_vectors, part2_row_ids, part2_vectors))
+    }
+
+    // returns the closest REASSIGN_RANGE partitions (indices and centroids) from c0
+    fn build_reassign_candidates(
+        &self,
+        ivf: &IvfModel,
+        c0: &ArrayRef,
+    ) -> Result<(UInt32Array, FixedSizeListArray)> {
+        let reassign_range = std::cmp::min(REASSIGN_RANGE + 1, ivf.num_partitions());
+        let centroids = ivf.centroids_array().unwrap();
+        let centroid_dists = self.distance_type.arrow_batch_func()(&c0, centroids)?;
+        let reassign_range_candidates =
+            sort_to_indices(centroid_dists.as_ref(), None, Some(reassign_range))?;
+        // exclude the original centroid itself
+        let reassign_candidate_ids = &reassign_range_candidates.slice(1, reassign_range - 1);
+        let reassign_candidate_centroids =
+            arrow::compute::take(centroids, reassign_candidate_ids, None)?;
+        Ok((
+            reassign_candidate_ids.clone(),
+            reassign_candidate_centroids.as_fixed_size_list().clone(),
+        ))
+    }
+
+    // assign the vectors of original partition
+    fn assign_vectors<T: ArrowPrimitiveType>(
+        &self,
+        row_ids: &[u64],
+        vectors: &FixedSizeListArray,
+        d0: &[f32],
+        d1: &[f32],
+        d2: &[f32],
+        reassign_candidate_ids: &UInt32Array,
+        reassign_candidate_centroids: &FixedSizeListArray,
+    ) -> Result<(Vec<u64>, FixedSizeListArray, Vec<u64>, FixedSizeListArray)> {
         let half_length = vectors.len() / 2;
+        let dimension = vectors.value_length();
         let mut part1_row_ids = Vec::with_capacity(half_length);
-        let mut part1_vectors = Vec::with_capacity(half_length * dimension);
+        let mut part1_vectors = FixedSizeListBuilder::with_capacity(
+            PrimitiveBuilder::with_capacity(half_length * dimension as usize),
+            dimension,
+            half_length,
+        );
         let mut part2_row_ids = Vec::with_capacity(half_length);
-        let mut part2_vectors = Vec::with_capacity(half_length * dimension);
-        for (i, row_id) in row_ids.iter().enumerate() {
+        let mut part2_vectors = FixedSizeListBuilder::with_capacity(
+            PrimitiveBuilder::with_capacity(half_length * dimension as usize),
+            dimension,
+            half_length,
+        );
+        for (i, &row_id) in row_ids.iter().enumerate() {
             if d0[i] <= d1[i] && d0[i] <= d2[i] {
-                // reassign this vector
-            } else if d1[i] <= d0[i] && d1[i] <= d2[i] {
+                self.reassign_vectors(
+                    vectors.value(i).as_primitive::<T>(),
+                    d1[i],
+                    d2[i],
+                    reassign_candidate_ids,
+                    reassign_candidate_centroids,
+                )?;
+            } else if d1[i] <= d2[i] {
+                // centroid 1 is the closest one
+                part1_row_ids.push(row_id);
+                part1_vectors
+                    .values()
+                    .append_array(vectors.value(i).as_primitive::<T>());
+            } else {
+                // centroid 2 is the closest one
                 part2_row_ids.push(row_id);
-                part2_vectors.extend(vectors[i].iter().copied());
+                part2_vectors
+                    .values()
+                    .append_array(vectors.value(i).as_primitive::<T>());
             }
         }
+        Ok((
+            part1_row_ids,
+            part1_vectors.finish(),
+            part2_row_ids,
+            part2_vectors.finish(),
+        ))
     }
+
+    // assign a vector to the closest partition among:
+    // 1. the 2 new centroids
+    // 2. the closest REASSIGN_RANGE partitions from the original centroid
+    fn reassign_vectors<T: ArrowPrimitiveType>(
+        &self,
+        vector: &PrimitiveArray<T>,
+        d1: f32,
+        d2: f32,
+        reassign_candidate_ids: &UInt32Array,
+        reassign_candidate_centroids: &FixedSizeListArray,
+    ) -> Result<ReassignPartition> {
+        let dists = self.distance_type.arrow_batch_func()(vector, reassign_candidate_centroids)?;
+        let min_dist_idx = dists
+            .values()
+            .iter()
+            .position_min_by(|a, b| a.total_cmp(b))
+            .unwrap();
+        let min_dist = dists.value(min_dist_idx);
+        if min_dist <= d1 && min_dist <= d2 {
+            Ok(ReassignPartition::ReassignCandidate(
+                reassign_candidate_ids.value(min_dist_idx),
+            ))
+        } else if d1 <= d2 {
+            Ok(ReassignPartition::NewCentroid1)
+        } else {
+            Ok(ReassignPartition::NewCentroid2)
+        }
+    }
+}
+
+struct SplitPartition {}
+
+enum ReassignPartition {
+    NewCentroid1,
+    NewCentroid2,
+    ReassignCandidate(u32),
 }
 
 pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: QuantizationType) -> String {
