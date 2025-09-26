@@ -32,6 +32,7 @@ use snafu::location;
 
 use lance_core::{cache::LanceCache, error::LanceOptionExt, Error, Result, ROW_ID};
 
+use crate::scalar::inverted::json::JsonTripletStream;
 use crate::{
     frag_reuse::FragReuseIndex,
     metrics::MetricsCollector,
@@ -60,6 +61,10 @@ pub struct JsonIndex {
 impl JsonIndex {
     pub fn new(target_index: Arc<dyn ScalarIndex>, path: String) -> Self {
         Self { target_index, path }
+    }
+
+    pub fn target_index(&self) -> &Arc<dyn ScalarIndex> {
+        &self.target_index
     }
 }
 
@@ -779,40 +784,72 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             .unwrap();
         let path = request.parameters.path.clone();
 
-        // Extract JSON with type information
-        let (data_stream, inferred_type) =
-            Self::extract_json_with_type_info(data, path.clone()).await?;
+        match request.parameters.target_index_type.as_str() {
+            "inverted" => {
+                let registry = self.registry()?;
+                let target_plugin = registry.get_plugin_by_name("inverted")?;
+                let target_request = target_plugin.new_training_request(
+                    request
+                        .parameters
+                        .target_index_parameters
+                        .as_deref()
+                        .unwrap_or("{}"),
+                    &Field::new("", DataType::Utf8, true),
+                )?;
 
-        // Convert the stream to properly typed values based on inferred type
-        let converted_stream =
-            Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
+                let col_name = data.schema().fields()[0].name().clone();
+                let converted_stream = Box::pin(JsonTripletStream::new(data, col_name));
+                let target_index = target_plugin
+                    .train_index(converted_stream, index_store, target_request, fragment_ids)
+                    .await?;
 
-        // Update the target request with inferred type
-        let registry = self.registry()?;
-        let target_plugin = registry.get_plugin_by_name(&request.parameters.target_index_type)?;
+                let index_details = crate::pb::JsonIndexDetails {
+                    path: "none".to_string(),
+                    target_details: Some(target_index.index_details),
+                };
+                Ok(CreatedIndex {
+                    index_details: prost_types::Any::from_msg(&index_details)?,
+                    index_version: JSON_INDEX_VERSION,
+                })
+            }
+            _ => {
+                // Extract JSON with type information
+                let (data_stream, inferred_type) =
+                    Self::extract_json_with_type_info(data, path.clone()).await?;
 
-        // Create a new training request with the inferred type
-        let target_request = target_plugin.new_training_request(
-            request
-                .parameters
-                .target_index_parameters
-                .as_deref()
-                .unwrap_or("{}"),
-            &Field::new("", inferred_type, true),
-        )?;
+                // Convert the stream to properly typed values based on inferred type
+                let converted_stream =
+                    Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
 
-        let target_index = target_plugin
-            .train_index(converted_stream, index_store, target_request, fragment_ids)
-            .await?;
+                // Update the target request with inferred type
+                let registry = self.registry()?;
+                let target_plugin =
+                    registry.get_plugin_by_name(&request.parameters.target_index_type)?;
 
-        let index_details = crate::pb::JsonIndexDetails {
-            path,
-            target_details: Some(target_index.index_details),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&index_details)?,
-            index_version: JSON_INDEX_VERSION,
-        })
+                // Create a new training request with the inferred type
+                let target_request = target_plugin.new_training_request(
+                    request
+                        .parameters
+                        .target_index_parameters
+                        .as_deref()
+                        .unwrap_or("{}"),
+                    &Field::new("", inferred_type, true),
+                )?;
+
+                let target_index = target_plugin
+                    .train_index(converted_stream, index_store, target_request, fragment_ids)
+                    .await?;
+
+                let index_details = crate::pb::JsonIndexDetails {
+                    path,
+                    target_details: Some(target_index.index_details),
+                };
+                Ok(CreatedIndex {
+                    index_details: prost_types::Any::from_msg(&index_details)?,
+                    index_version: JSON_INDEX_VERSION,
+                })
+            }
+        }
     }
 
     async fn load_index(

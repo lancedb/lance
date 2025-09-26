@@ -4,9 +4,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::PreFilterSource;
+use crate::index::scalar::IndexDetails;
+use crate::{index::DatasetIndexInternalExt, Dataset};
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::DataType;
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -19,23 +24,24 @@ use datafusion_physical_plan::metrics::BaselineMetrics;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_core::error::LanceOptionExt;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
-
 use lance_index::metrics::MetricsCollector;
+use lance_index::scalar::inverted::json::JsonTripletStream;
 use lance_index::scalar::inverted::query::{
     collect_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
 use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
-use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_index::scalar::json::JsonIndex;
+use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery, Index, IndexType};
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use lance_table::format::IndexMetadata;
+use snafu::location;
 use tracing::instrument;
-
-use crate::{index::DatasetIndexInternalExt, Dataset};
-
-use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
-use super::PreFilterSource;
 
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
@@ -210,45 +216,25 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                .await?;
+            let index_loader =
+                InvertedIndexLoader::new(ds.clone(), column.clone(), metrics.clone()).await?;
 
             let pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
                 ds,
-                &[index_meta],
+                &[index_loader.index_meta().clone()],
             )?;
 
-            let inverted_idx = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
+            let inverted_idx = index_loader.inverted_index()?;
 
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
             let params = params
                 .with_fuzziness(query.fuzziness)
                 .with_max_expansions(query.max_expansions)
                 .with_prefix_length(query.prefix_length);
+
             let mut tokenizer = match is_fuzzy {
                 false => inverted_idx.tokenizer(),
                 true => tantivy::tokenizer::TextAnalyzer::from(
@@ -394,40 +380,20 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
-        let unindexed_input = self.unindexed_input.execute(partition, context)?;
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
         )))?;
 
+        let input = unindexed_input(self.unindexed_input.execute(partition, context)?, &column)?;
+
         let stream = stream::once(async move {
-            let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                .await?;
-            let inverted_idx = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
+            let index_loader =
+                InvertedIndexLoader::new(ds.clone(), column.clone(), metrics.clone()).await?;
+            let inverted_idx = index_loader.inverted_index()?;
             Ok::<_, DataFusionError>(flat_bm25_search_stream(
-                unindexed_input,
+                input,
                 column,
                 query.terms,
                 inverted_idx,
@@ -460,6 +426,37 @@ impl ExecutionPlan for FlatMatchQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+}
+
+fn unindexed_input(
+    input: SendableRecordBatchStream,
+    column: &str,
+) -> lance_core::Result<SendableRecordBatchStream> {
+    let schema = input.schema();
+    let field = schema.column_with_name(column).expect_ok()?.1;
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(input),
+        DataType::List(field)
+            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            Ok(input)
+        }
+        DataType::Binary | DataType::LargeBinary => {
+            match field.metadata().get(ARROW_EXT_NAME_KEY) {
+                Some(name) if name.as_str() == JSON_EXT_NAME => {
+                    Ok(Box::pin(JsonTripletStream::new(input, column.to_string())))
+                }
+                _ => Err(lance_core::Error::InvalidInput {
+                    source: format!("column {} is not json", column).into(),
+                    location: location!(),
+                }),
+            }
+        }
+        _ => Err(lance_core::Error::InvalidInput {
+            source: format!("column {} is not utf8 or list of utf8", column).into(),
+            location: location!(),
+        }),
     }
 }
 
@@ -600,39 +597,17 @@ impl ExecutionPlan for PhraseQueryExec {
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
-            let index_meta = ds
-                .load_scalar_index(
-                    ScalarIndexCriteria::default()
-                        .for_column(&column)
-                        .supports_fts(),
-                )
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                .await?;
+            let index_loader =
+                InvertedIndexLoader::new(ds.clone(), column.clone(), metrics.clone()).await?;
 
             let pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
                 ds,
-                &[index_meta],
+                &[index_loader.index_meta().clone()],
             )?;
-
-            let index = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
+            let index = index_loader.inverted_index()?;
 
             let mut tokenizer = index.tokenizer();
             let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
@@ -1077,6 +1052,89 @@ impl ExecutionPlan for BooleanQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+}
+
+/// Load inverted index from column
+struct InvertedIndexLoader {
+    index_meta: IndexMetadata,
+    index: Arc<dyn Index>,
+}
+
+impl InvertedIndexLoader {
+    async fn new(
+        ds: Arc<Dataset>,
+        column: String,
+        metrics: Arc<FtsIndexMetrics>,
+    ) -> Result<Self, lance_core::Error> {
+        let index_meta = ds
+            .load_scalar_index(
+                ScalarIndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts(),
+            )
+            .await?
+            .ok_or(DataFusionError::Execution(format!(
+                "No Inverted index found for column {}",
+                &column,
+            )))?;
+        let uuid = index_meta.uuid.to_string();
+        let index = ds
+            .open_generic_index(&column, &uuid, &metrics.index_metrics)
+            .await?;
+
+        Ok(Self { index_meta, index })
+    }
+
+    fn index_meta(&self) -> &IndexMetadata {
+        &self.index_meta
+    }
+
+    fn inverted_index(&self) -> Result<&InvertedIndex, DataFusionError> {
+        match &self.index_meta.index_details {
+            Some(details) => match IndexDetails(details.clone()).index_type() {
+                IndexType::Json => {
+                    let json_idx =
+                        self.index
+                            .as_any()
+                            .downcast_ref::<JsonIndex>()
+                            .ok_or_else(|| {
+                                DataFusionError::Execution("Expect a json index".to_string())
+                            })?;
+                    let inverted_idx = json_idx
+                        .target_index()
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("Index is not an inverted index".to_string())
+                        })?;
+                    Ok(inverted_idx)
+                }
+                IndexType::Inverted => {
+                    let inverted_idx = self
+                        .index
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("Index is not an inverted index".to_string())
+                        })?;
+                    Ok(inverted_idx)
+                }
+                _ => Err(DataFusionError::Execution(
+                    "Expect either inverted index or json index".to_string(),
+                )),
+            },
+            None => {
+                let inverted_idx = self
+                    .index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Index is not an inverted index".to_string())
+                    })?;
+                Ok(inverted_idx)
+            }
+        }
     }
 }
 
