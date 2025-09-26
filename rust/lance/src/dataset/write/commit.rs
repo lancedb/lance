@@ -459,6 +459,7 @@ impl<'a> CommitBuilder<'a> {
             tag: None,
             //TODO: handle batch transaction merges in the future
             transaction_properties: None,
+            primary_key_bloom_filter: None,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -522,6 +523,7 @@ mod tests {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
+            primary_key_bloom_filter: None,
         }
     }
 
@@ -797,6 +799,7 @@ mod tests {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
+            primary_key_bloom_filter: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])
