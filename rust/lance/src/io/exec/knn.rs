@@ -280,6 +280,10 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -537,6 +541,10 @@ impl ExecutionPlan for ANNIvfPartitionExec {
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
                 as SendableRecordBatchStream,
         )
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -1083,6 +1091,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -1277,6 +1289,10 @@ impl ExecutionPlan for MultivectorScoringExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 

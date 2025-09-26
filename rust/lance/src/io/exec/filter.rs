@@ -97,4 +97,8 @@ impl ExecutionPlan for LanceFilterExec {
     ) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
         self.filter.try_swapping_with_projection(projection)
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }

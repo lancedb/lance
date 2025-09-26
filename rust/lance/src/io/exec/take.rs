@@ -550,6 +550,10 @@ impl ExecutionPlan for TakeExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
