@@ -238,8 +238,8 @@ in the auxiliary file's global buffer for efficient access:
 
 ### Appendix 1: Example IVF_PQ Format
 
-This example shows how an `IVF_PQ` index is physically laid out. Assume vectors have dimension 128, 
-PQ uses 16 subquantizers (m=16) with 256 codewords per subvector (ksub=256), and distance type is "l2".
+This example shows how an `IVF_PQ` index is physically laid out. Assume vectors have dimension 128,
+PQ uses 16 num_sub_vectors (m=16) with 8 num_bits per subvector, and distance type is "l2".
 
 #### Index File
 
