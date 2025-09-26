@@ -24,6 +24,11 @@ import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.nio.file.Path;
 import java.util.Collections;
 
@@ -32,7 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /** Add test for distributed compaction. */
 public class CompactionTest {
   @Test
-  public void testBasicCompaction(@TempDir Path tempDir) {
+  public void testBasicCompaction(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("test_dataset_for_compaction").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -53,6 +58,9 @@ public class CompactionTest {
         assertEquals(2, task.getTaskData().getFragments().size());
 
         // Step-2: individually execute single task
+
+        // mock network transferring
+        task = serializeAndDeserialize(task);
         RewriteResult result = task.execute(dataset);
         CompactionMetrics metrics = result.getMetrics();
         // remove previous fragments and add new single fragment
@@ -60,6 +68,9 @@ public class CompactionTest {
         assertEquals(1, metrics.getFragmentsAdded());
 
         // Step-3: commit the RewriteResults
+
+        // mock network transferring
+        result = serializeAndDeserialize(result);
         CompactionMetrics ignored =
             Compaction.commitCompaction(
                 dataset, Collections.singletonList(result), compactionPlan.getCompactionOptions());
@@ -73,7 +84,7 @@ public class CompactionTest {
   }
 
   @Test
-  public void testDeletionCompaction(@TempDir Path tempDir) {
+  public void testDeletionCompaction(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("test_dataset_for_compaction").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -101,10 +112,12 @@ public class CompactionTest {
 
         CompactionTask task = compactionPlan.getCompactionTasks().get(0);
 
+        task = serializeAndDeserialize(task);
         RewriteResult result = task.execute(dataset);
         assertEquals(2, result.getMetrics().getFragmentsRemoved());
         assertEquals(1, result.getMetrics().getFragmentsAdded());
 
+        result = serializeAndDeserialize(result);
         CompactionMetrics ignored =
             Compaction.commitCompaction(
                 dataset, Collections.singletonList(result), compactionPlan.getCompactionOptions());
@@ -114,6 +127,21 @@ public class CompactionTest {
         assertEquals(1, dataset.getFragments().size());
         assertEquals(11, dataset.getFragments().get(0).countRows());
       }
+    }
+  }
+
+  private static <T> T serializeAndDeserialize(T object)
+      throws IOException, ClassNotFoundException {
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+    try (ObjectOutputStream out = new ObjectOutputStream(outputStream)) {
+      out.writeObject(object);
+    }
+    byte[] serialized = outputStream.toByteArray();
+    ByteArrayInputStream inputStream = new ByteArrayInputStream(serialized);
+    try (ObjectInputStream in = new ObjectInputStream(inputStream)) {
+      @SuppressWarnings("unchecked")
+      T deserialized = (T) in.readObject();
+      return deserialized;
     }
   }
 }
