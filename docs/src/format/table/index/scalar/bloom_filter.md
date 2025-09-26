@@ -60,8 +60,14 @@ The SBBF uses xxHash64 with seed=0 for primary hashing, combined with a salt-bas
 #### Salt Values
 
 ```
-SALT = [0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d,
-        0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31]
+0x47b6137b
+0x44974d91
+0x8824ad5b
+0xa2b7289d
+0x705495c7
+0x2df1424b
+0x9efc4947
+0x5c6bfb31
 ```
 
 Each salt value generates one bit position within the block, ensuring uniform distribution.
@@ -75,10 +81,44 @@ The SBBF automatically determines optimal filter size based on:
 The implementation uses binary search to find the minimum log₂(bytes) that achieves the desired FPP,
 using Putze et al.'s cache-efficient bloom filter formula.
 
-### False Positive Probability Convergence
+#### FPP Convergence
 
 The implementation uses up to 750 iterations of Poisson distribution calculations to ensure accurate FPP estimation,
 particularly for dense filters where NDV approaches filter capacity.
+
+### Serialization
+
+The SBBF is serialized as a contiguous byte array stored in the `bloom_filter_data` column:
+
+```
+[Block 0][Block 1]...[Block N-1]
+```
+
+Where each block is 32 bytes:
+
+```
+[Word 0][Word 1][Word 2][Word 3][Word 4][Word 5][Word 6][Word 7]
+```
+
+Each word is a 32-bit little-endian integer (4 bytes), with:
+
+- **Total size**: Must be a multiple of 32 bytes
+- **Byte order**: Little-endian for all 32-bit words
+- **Block alignment**: Each block starts at offset `i * 32`
+- **Word offset**: Word `j` in block `i` is at byte offset `i * 32 + j * 4`
+
+#### Example
+
+For a filter with 2 blocks (64 bytes total):
+```
+Offset  0-3:   Block 0, Word 0 (32-bit LE)
+Offset  4-7:   Block 0, Word 1 (32-bit LE)
+...
+Offset 28-31:  Block 0, Word 7 (32-bit LE)
+Offset 32-35:  Block 1, Word 0 (32-bit LE)
+...
+Offset 60-63:  Block 1, Word 7 (32-bit LE)
+```
 
 ## Accelerated Queries
 
