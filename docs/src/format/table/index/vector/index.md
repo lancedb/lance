@@ -10,9 +10,10 @@ Lance splits each vector index into 3 parts - clustering, sub-index and quantiza
 
 ### Clustering
 
-Lance uses Inverted File (IVF) as the primary clustering mechanism.
-IVF partitions the dataset into clusters using k-means clustering. 
-Each cluster (partition) contains vectors that are similar to the cluster centroid.
+Clustering divides all the vectors into different disjoint clusters (a.k.a. partitions).
+Lance currently supports using Inverted File (IVF) as the primary clustering mechanism.
+IVF partitions the vectors into clusters using the k-means clustering algorithm. 
+Each cluster contains vectors that are similar to the cluster centroid.
 During search, only the most relevant clusters are examined, dramatically reducing search time.
 IVF can be combined with any sub-index type and quantization method.
 
@@ -48,7 +49,7 @@ Here are the commonly used combinations:
 
 The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
-The specific version of the vector index is recorded in the `index_version` field of the generic index metadata.
+The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#index-metadata).
 
 ## Storage Layout (V3)
 
@@ -65,7 +66,7 @@ The index file stores the search structure with graph or flat organization.
 The Arrow schema of the Lance file varies depending on the sub-index type used.
 
 !!! note
-All partitions are stored in the same file, and partitions must be written in order.
+    All partitions are stored in the same file, and partitions must be written in order.
 
 ##### FLAT
 
@@ -86,11 +87,12 @@ HNSW (Hierarchical Navigable Small World) indices provide fast approximate searc
 | `_distance`   | list<float32> | false    | Distances to neighbors |
 
 !!! note
-HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
+    HNSW consists of multiple levels, and all levels must be written in order starting from level 0.
 
 #### Arrow Schema Metadata
 
-The index file contains metadata in its Arrow schema metadata to describe the index configuration and structure:
+The index file contains metadata in its Arrow schema metadata to describe the index configuration and structure.
+Here are the metadata keys and their corresponding values:
 
 ##### "lance:index"
 
@@ -154,8 +156,8 @@ It is stored as a Lance file named `auxiliary.idx` within the index directory.
 Since the auxiliary file stores the actual (quantized) vectors,
 the Arrow schema of the Lance file varies depending on the quantization method used.
 
-!!!note
-All partitions are stored in the same file, and partitions must be written in order.
+!!! note
+    All partitions are stored in the same file, and partitions must be written in order.
 
 ##### FLAT
 
@@ -186,7 +188,8 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 #### Arrow Schema Metadata
 
-The auxiliary file also contains metadata in its Arrow schema metadata for vector storage configuration:
+The auxiliary file also contains metadata in its Arrow schema metadata for vector storage configuration.
+Here are the metadata keys and their corresponding values:
 
 ##### "distance_type"
 The distance metric used to compute similarity between vectors (e.g., "l2", "cosine", "dot").
@@ -235,7 +238,8 @@ in the auxiliary file's global buffer for efficient access:
 
 ### Appendix 1: Example IVF_PQ Format
 
-This example shows how an `IVF_PQ` index is physically laid out. Assume vectors have dimension 128, PQ uses 16 subquantizers (m=16) with 256 codewords per subvector (ksub=256), and distance type is "l2".
+This example shows how an `IVF_PQ` index is physically laid out. Assume vectors have dimension 128,
+PQ uses 16 num_sub_vectors (m=16) with 8 num_bits per subvector, and distance type is "l2".
 
 #### Index File
 
@@ -270,7 +274,7 @@ pa.schema([
 
 ### Appendix 2: Accessing Index File with Python
 
-The following example demonstrates how to read and parse the global buffer from Lance index files using Python:
+The following example demonstrates how to read and parse different components in the Lance index files using Python:
 
 ```python
 import pyarrow as pa

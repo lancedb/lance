@@ -54,5 +54,5 @@ The BTree index provides exact results for the following query types:
 |------------|---------------------------|-----------------------------------------------------------------------------|
 | **Equals** | `column = value`          | BTree lookup to find relevant pages, then search within sub-indices         |
 | **Range**  | `column BETWEEN a AND b`  | BTree traversal for pages overlapping the range, then search each sub-index |
-| **IsIn**   | `column IN (v1, v2, ...)` | Multiple BTree lookups, unions results from all matching sub-indices        |
+| **IsIn**   | `column IN (v1, v2, ...)` | Multiple BTree lookups, union results from all matching sub-indices         |
 | **IsNull** | `column IS NULL`          | Returns rows from all pages where null_count > 0                            |
