@@ -133,14 +133,14 @@ public class CompactionTest {
   private static <T> T serializeAndDeserialize(T object)
       throws IOException, ClassNotFoundException {
     ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-    try (ObjectOutputStream oos = new ObjectOutputStream(outputStream)) {
-      oos.writeObject(object);
+    try (ObjectOutputStream out = new ObjectOutputStream(outputStream)) {
+      out.writeObject(object);
     }
     byte[] serialized = outputStream.toByteArray();
     ByteArrayInputStream inputStream = new ByteArrayInputStream(serialized);
-    try (ObjectInputStream ois = new ObjectInputStream(inputStream)) {
+    try (ObjectInputStream in = new ObjectInputStream(inputStream)) {
       @SuppressWarnings("unchecked")
-      T deserialized = (T) ois.readObject();
+      T deserialized = (T) in.readObject();
       return deserialized;
     }
   }

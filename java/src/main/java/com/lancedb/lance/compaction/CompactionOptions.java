@@ -107,26 +107,26 @@ public class CompactionOptions implements Serializable {
         .toString();
   }
 
-  private void writeObject(ObjectOutputStream oos) throws IOException {
-    oos.writeObject(targetRowsPerFragment.orElse(null));
-    oos.writeObject(maxRowsPerGroup.orElse(null));
-    oos.writeObject(maxBytesPerFile.orElse(null));
-    oos.writeObject(materializeDeletions.orElse(null));
-    oos.writeObject(materializeDeletionsThreshold.orElse(null));
-    oos.writeObject(numThreads.orElse(null));
-    oos.writeObject(batchSize.orElse(null));
-    oos.writeObject(deferIndexRemap.orElse(null));
+  private void writeObject(ObjectOutputStream output) throws IOException {
+    output.writeObject(targetRowsPerFragment.orElse(null));
+    output.writeObject(maxRowsPerGroup.orElse(null));
+    output.writeObject(maxBytesPerFile.orElse(null));
+    output.writeObject(materializeDeletions.orElse(null));
+    output.writeObject(materializeDeletionsThreshold.orElse(null));
+    output.writeObject(numThreads.orElse(null));
+    output.writeObject(batchSize.orElse(null));
+    output.writeObject(deferIndexRemap.orElse(null));
   }
 
-  private void readObject(ObjectInputStream ois) throws IOException, ClassNotFoundException {
-    this.targetRowsPerFragment = Optional.ofNullable((Long) ois.readObject());
-    this.maxRowsPerGroup = Optional.ofNullable((Long) ois.readObject());
-    this.maxBytesPerFile = Optional.ofNullable((Long) ois.readObject());
-    this.materializeDeletions = Optional.ofNullable((Boolean) ois.readObject());
-    this.materializeDeletionsThreshold = Optional.ofNullable((Float) ois.readObject());
-    this.numThreads = Optional.ofNullable((Long) ois.readObject());
-    this.batchSize = Optional.ofNullable((Long) ois.readObject());
-    this.deferIndexRemap = Optional.ofNullable((Boolean) ois.readObject());
+  private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
+    this.targetRowsPerFragment = Optional.ofNullable((Long) input.readObject());
+    this.maxRowsPerGroup = Optional.ofNullable((Long) input.readObject());
+    this.maxBytesPerFile = Optional.ofNullable((Long) input.readObject());
+    this.materializeDeletions = Optional.ofNullable((Boolean) input.readObject());
+    this.materializeDeletionsThreshold = Optional.ofNullable((Float) input.readObject());
+    this.numThreads = Optional.ofNullable((Long) input.readObject());
+    this.batchSize = Optional.ofNullable((Long) input.readObject());
+    this.deferIndexRemap = Optional.ofNullable((Boolean) input.readObject());
   }
 
   /** Builder for CompactionOptions. */
