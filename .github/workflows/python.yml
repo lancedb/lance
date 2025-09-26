@@ -95,7 +95,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["9", "12"]
+        python-minor-version: ["9", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04"
     defaults:
@@ -120,7 +120,7 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
       - name: Upload wheels as artifacts
-        if: ${{ matrix.python-minor-version == '12' }}
+        if: ${{ matrix.python-minor-version == '13' }}
         uses: actions/upload-artifact@v4
         with:
           name: linux-wheels
