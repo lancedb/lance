@@ -1751,7 +1751,7 @@ impl Dataset {
     }
 
     /// Returns true if Lance supports writing this datatype with nulls.
-    pub fn lance_supports_nulls(&self, datatype: &DataType) -> bool {
+    pub(crate) fn lance_supports_nulls(&self, datatype: &DataType) -> bool {
         match self
             .manifest()
             .data_storage_format
