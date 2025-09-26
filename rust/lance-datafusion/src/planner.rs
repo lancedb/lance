@@ -839,7 +839,7 @@ impl Planner {
     /// Note: the returned expression must be passed through [optimize_filter()]
     /// before being passed to [create_physical_expr()].
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
-        if let Ok(_) = self.schema.field_with_name(expr) {
+        if self.schema.field_with_name(expr).is_ok() {
             return Ok(col(expr));
         }
 
