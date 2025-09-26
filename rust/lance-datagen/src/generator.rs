@@ -1139,7 +1139,7 @@ impl BinaryPrefixPlusCounterGenerator {
             } else if counter < u32::MAX as u64 {
                 word.extend_from_slice(&(counter as u32).to_le_bytes());
             } else {
-                word.extend_from_slice(&(counter as u64).to_le_bytes());
+                word.extend_from_slice(&counter.to_le_bytes());
             }
             builder.append_value(&word);
         }
