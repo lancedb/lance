@@ -57,10 +57,8 @@ tests = [
     "polars[pyarrow,pandas]",
     "psutil",
     "pytest",
-    # Workardound for https://github.com/lancedb/lance/issues/4472
-    #
-    # tensorflow is broken on 2.20.0 with macOS ARM.
-    "tensorflow<=2.19.0",
+    # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
+    "tensorflow; sys_platform == 'linux'",
     "tqdm",
     # Need to align with the datafusion version we use at lance rust
     "datafusion==49.0.0",
