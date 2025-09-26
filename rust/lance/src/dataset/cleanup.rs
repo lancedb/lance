@@ -1029,7 +1029,7 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
         dataset.tags().create("old-tag", 1).await.unwrap();
         dataset.tags().create("another-old-tag", 2).await.unwrap();
@@ -1080,7 +1080,7 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
         dataset.tags().create("old-tag", 1).await.unwrap();
         dataset.tags().create("another-old-tag", 2).await.unwrap();

@@ -468,7 +468,11 @@ impl Branches<'_> {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        self.object_store().delete(&branch_file).await?;
+        if self.object_store().exists(&branch_file).await? {
+            self.object_store().delete(&branch_file).await?;
+        } else {
+            log::warn!("BranchContent of {} does not exist", branch);
+        }
 
         // Clean up branch directories
         self.cleanup_branch_directories(branch).await
@@ -549,8 +553,8 @@ impl Branches<'_> {
         if let Some(sub_dir) = unused_dir.split('/').next() {
             let relative_dir = format!("{}/{}", used_relative_path, sub_dir);
             // Use base_location to generate the cleanup path
-            let completed_dir = base_location.find_branch(Some(relative_dir))?;
-            Ok(Some(completed_dir.path))
+            let absolute_dir = base_location.find_branch(Some(relative_dir))?;
+            Ok(Some(absolute_dir.path))
         } else {
             Ok(None)
         }
@@ -666,6 +670,12 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     if branch_name.ends_with(".lock") {
         return Err(Error::InvalidRef {
             message: "Branch name cannot end with '.lock'".to_string(),
+        });
+    }
+
+    if branch_name.eq_ignore_ascii_case("main") {
+        return Err(Error::InvalidRef {
+            message: "Branch name cannot be 'main'".to_string(),
         });
     }
     Ok(())

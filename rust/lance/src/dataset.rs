@@ -2519,6 +2519,7 @@ mod tests {
     use lance_table::format::{DataFile, WriterVersion};
 
     use crate::datafusion::LanceTableProvider;
+    use crate::dataset::refs::branch_contents_path;
     use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
     use lance_datafusion::datagen::DatafusionDatagenExt;
@@ -8249,10 +8250,18 @@ mod tests {
         // Finally delete all branches
         dataset.delete_branch("branch1").await.unwrap();
         dataset.delete_branch("dev/branch2").await.unwrap();
+        // Test deleting zombie branch
+        let root_location = dataset.refs.root().unwrap();
+        let branch_file = branch_contents_path(&root_location.path, "feature/nathan/branch3");
+        dataset.object_store.delete(&branch_file).await.unwrap();
+        // Now "feature/nathan/branch3" is a zombie branch
+        // Use delete_branch to verify if the directory is cleaned up
         dataset
             .delete_branch("feature/nathan/branch3")
             .await
             .unwrap();
+        let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
+        assert!(!dataset.object_store.exists(&cleaned_path).await.unwrap());
 
         // Verify list_branches is empty
         let branches_after_delete = dataset.list_branches().await.unwrap();
