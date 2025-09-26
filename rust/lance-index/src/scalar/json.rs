@@ -15,7 +15,7 @@ use datafusion::{
     execution::SendableRecordBatchStream,
     physical_plan::{projection::ProjectionExec, ExecutionPlan},
 };
-use datafusion_common::ScalarValue;
+use datafusion_common::{config::ConfigOptions, ScalarValue};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
     expressions::{Column, Literal},
@@ -410,6 +410,7 @@ impl JsonIndexPlugin {
                         Arc::new(Literal::new(ScalarValue::Utf8(Some(path)))),
                     ],
                     &input_schema,
+                    Arc::new(ConfigOptions::default()),
                 )?) as Arc<dyn PhysicalExpr>,
                 "json_result".to_string(),
             ),
