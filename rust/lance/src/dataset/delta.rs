@@ -193,19 +193,7 @@ impl FragmentDiffAnalyzer {
             let row_exists_in_old = old_record_result.is_ok();
 
             let operation = if row_exists_in_old {
-                // If the row exists in both versions, we need to check if it actually changed
-                let old_record = old_record_result.unwrap();
-                let new_record = self.get_record_data(row_id, &self.current_dataset).await?;
-
-                // Compare the records to see if they're actually different
-                let is_actually_updated = self.records_are_different(&old_record, &new_record)?;
-
-                if is_actually_updated {
-                    DiffOperation::Update
-                } else {
-                    // Record exists in both versions but hasn't changed, skip it
-                    continue;
-                }
+                DiffOperation::Update
             } else {
                 DiffOperation::Insert
             };
@@ -306,36 +294,6 @@ impl FragmentDiffAnalyzer {
             .flatten_stream();
 
         Box::pin(dedup_stream)
-    }
-
-    /// Compare two record batches to see if they're different
-    fn records_are_different(
-        &self,
-        old_record: &RecordBatch,
-        new_record: &RecordBatch,
-    ) -> Result<bool> {
-        // First check if schemas are different
-        if old_record.schema() != new_record.schema() {
-            return Ok(true);
-        }
-
-        // Check if number of rows is different
-        if old_record.num_rows() != new_record.num_rows() {
-            return Ok(true);
-        }
-
-        // Compare each column
-        for i in 0..old_record.num_columns() {
-            let old_column = old_record.column(i);
-            let new_column = new_record.column(i);
-
-            // Use Arrow's equality comparison
-            if old_column != new_column {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 }
 
