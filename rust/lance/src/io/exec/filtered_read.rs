@@ -355,7 +355,7 @@ impl FilteredReadStream {
         let io_parallelism = dataset.object_store.io_parallelism();
         let fragment_readahead = options
             .fragment_readahead
-            .unwrap_or_else(|| ((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2)))
+            .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             .max(1);
 
         let fragments = options
@@ -482,15 +482,8 @@ impl FilteredReadStream {
         options: &FilteredReadOptions,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<(Vec<ScopedFragmentRead>, bool)> {
-        // Map from fragment_id to (ranges_to_read, use_refine_filter)
-        // true = use refine_filter, false = use full_filter
-        let mut fragment_read_plans: HashMap<u32, (Vec<Range<u64>>, bool)> = HashMap::new();
         // For pushing down scan_range_after_filter
         let mut scan_planned_with_limit_pushed_down = false;
-        // For AtLeast: track guaranteed ranges separately
-        // If we hit the limit with guaranteed matches, we use these ranges
-        // Otherwise, we need to read the entire fragment
-        let mut atleast_guaranteed_ranges: HashMap<u32, Vec<Range<u64>>> = HashMap::new();
         let mut to_skip = options
             .scan_range_after_filter
             .as_ref()
@@ -502,13 +495,11 @@ impl FilteredReadStream {
             .map(|r| r.end - r.start)
             .unwrap_or(u64::MAX);
 
+        let mut fragments_to_read: HashMap<u32, Vec<Range<u64>>> = HashMap::new();
+        let mut scan_push_down_fragments_to_read: HashMap<u32, Vec<Range<u64>>> = HashMap::new();
+
         // The current offset, includes filtered rows, but not deleted rows
         let mut range_offset = 0;
-        // The current offset, does not include filtered or deleted rows
-        //
-        // This will be set to None once we encounter a fragment where we don't
-        // know the number of filtered rows up front
-        let mut _filtered_range_offset = Some(0);
         for LoadedFragment {
             row_id_sequence,
             fragment,
@@ -517,6 +508,12 @@ impl FilteredReadStream {
             deletion_vector,
         } in fragments.iter()
         {
+            if let Some(range_before_filter) = &options.scan_range_before_filter {
+                if range_offset >= range_before_filter.end {
+                    break;
+                }
+            }
+
             let mut to_read: Vec<Range<u64>> =
                 Self::full_frag_range(*num_physical_rows, deletion_vector);
 
@@ -530,25 +527,28 @@ impl FilteredReadStream {
                     range_start + num_logical_rows
                 };
                 to_read = Self::trim_ranges(to_read, range_start..range_end, range_before_filter);
+                if to_read.is_empty() {
+                    continue;
+                }
             }
 
             // Apply index and apply scan range after filter if applicable
-            let (should_stop, limit_pushed) = Self::apply_index_to_fragment(
+            Self::apply_index_to_fragment(
                 evaluated_index,
                 fragment,
                 row_id_sequence,
                 to_read,
                 &mut to_skip,
                 &mut to_take,
-                &mut fragment_read_plans,
-                &mut atleast_guaranteed_ranges,
+                &mut fragments_to_read,
+                &mut scan_push_down_fragments_to_read,
             );
 
-            if limit_pushed {
+            if to_take == 0 {
                 scan_planned_with_limit_pushed_down = true;
-            }
-
-            if should_stop {
+                for (frag_id, ranges) in scan_push_down_fragments_to_read {
+                    fragments_to_read.insert(frag_id, ranges);
+                }
                 break;
             }
         }
@@ -561,13 +561,25 @@ impl FilteredReadStream {
         });
 
         let projection = Arc::new(options.projection.clone());
+
         for (priority, fragment) in fragments.into_iter().enumerate() {
-            if let Some((to_read, use_refine)) =
-                fragment_read_plans.get(&(fragment.fragment.id() as u32))
-            {
+            let fragment_id = fragment.fragment.id() as u32;
+            if let Some(to_read) = fragments_to_read.get(&fragment_id) {
                 if !to_read.is_empty() {
-                    let filter = if *use_refine {
-                        options.refine_filter.clone()
+                    let filter = if let Some(evaluated_index) = evaluated_index {
+                        if evaluated_index.applicable_fragments.contains(fragment_id) {
+                            match &evaluated_index.index_result {
+                                IndexExprResult::Exact(_) => options.refine_filter.clone(),
+                                IndexExprResult::AtLeast(_)
+                                    if scan_planned_with_limit_pushed_down =>
+                                {
+                                    options.refine_filter.clone()
+                                }
+                                _ => options.full_filter.clone(),
+                            }
+                        } else {
+                            options.full_filter.clone()
+                        }
                     } else {
                         options.full_filter.clone()
                     };
@@ -602,8 +614,7 @@ impl FilteredReadStream {
         Ok((scoped_fragments, scan_planned_with_limit_pushed_down))
     }
 
-    /// Apply index to a fragment and handle all the logic for different index result types
-    /// Returns (should_stop, limit_pushed_down)
+    /// Apply index to a fragment and apply skip/take to matched ranges if possible
     #[allow(clippy::too_many_arguments)]
     fn apply_index_to_fragment(
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
@@ -612,64 +623,46 @@ impl FilteredReadStream {
         to_read: Vec<Range<u64>>,
         to_skip: &mut u64,
         to_take: &mut u64,
-        fragment_read_plans: &mut HashMap<u32, (Vec<Range<u64>>, bool)>,
-        atleast_guaranteed_ranges: &mut HashMap<u32, Vec<Range<u64>>>,
-    ) -> (bool, bool) {
-        let mut use_refine = false;
-        let mut scan_planned_with_limit_pushed_down = false;
-        let mut updated_to_read = to_read;
+        fragments_to_read: &mut HashMap<u32, Vec<Range<u64>>>,
+        scan_push_down_fragments_to_read: &mut HashMap<u32, Vec<Range<u64>>>,
+    ) {
+        let fragment_id = fragment.id() as u32;
 
         if let Some(evaluated_index) = evaluated_index {
-            if evaluated_index
-                .applicable_fragments
-                .contains(fragment.id() as u32)
-            {
+            if evaluated_index.applicable_fragments.contains(fragment_id) {
                 let _span = tracing::span!(tracing::Level::DEBUG, "apply_index_result").entered();
 
                 match &evaluated_index.index_result {
                     IndexExprResult::Exact(row_id_mask) => {
-                        scan_planned_with_limit_pushed_down = true;
                         let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        updated_to_read = Self::intersect_ranges(&updated_to_read, &valid_ranges);
+                        let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
-                        Self::apply_skip_take_to_ranges(&mut updated_to_read, to_skip, to_take);
-
-                        use_refine = true;
-
-                        if *to_take == 0 {
-                            fragment_read_plans
-                                .insert(fragment.id() as u32, (updated_to_read, use_refine));
-                            return (true, true);
-                        }
+                        Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
+                        scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
                     }
                     IndexExprResult::AtMost(row_id_mask) => {
                         let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        updated_to_read = Self::intersect_ranges(&updated_to_read, &valid_ranges);
+                        let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        fragments_to_read.insert(fragment_id, matched_ranges);
                     }
                     IndexExprResult::AtLeast(row_id_mask) => {
                         let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        let mut guaranteed_ranges =
-                            Self::intersect_ranges(&updated_to_read, &valid_ranges);
+                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
                         Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
-
-                        atleast_guaranteed_ranges.insert(fragment.id() as u32, guaranteed_ranges);
-
-                        if *to_take == 0 {
-                            fragment_read_plans.clear();
-                            for (frag_id, ranges) in atleast_guaranteed_ranges.drain() {
-                                fragment_read_plans.insert(frag_id, (ranges, false));
-                            }
-                            return (true, true);
-                        }
+                        scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
                     }
                 }
+            } else {
+                // Fragment not indexed - add full fragment to unindexed_ranges
+                fragments_to_read.insert(fragment_id, to_read);
             }
+        } else {
+            // No index at all - add full fragment to unindexed_ranges
+            fragments_to_read.insert(fragment_id, to_read);
         }
-
-        fragment_read_plans.insert(fragment.id() as u32, (updated_to_read, use_refine));
-
-        (false, scan_planned_with_limit_pushed_down)
     }
 
     /// Trim physical ranges to skip `to_skip` rows and take at most `to_take` rows
