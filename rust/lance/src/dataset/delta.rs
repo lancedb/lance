@@ -1069,7 +1069,11 @@ mod tests {
         let diff_builder = DatasetDiffBuilder::new(Arc::new(dataset.clone()), 1);
         let result = diff_builder.execute().await;
 
-        assert!(result.is_err(), "Diff should fail without stable row IDs");
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Diff functionality requires stable row IDs to be enabled"));
     }
 
     #[tokio::test]
@@ -1080,23 +1084,29 @@ mod tests {
         // Test with version equal to current version (should fail)
         let diff_builder = DatasetDiffBuilder::new(Arc::new(dataset.clone()), current_version);
         let result = diff_builder.execute().await;
-        assert!(
-            result.is_err(),
-            "Should fail when compared version equals current version"
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Compared version 1 must be less than current version 1"));
 
         // Test with version greater than current version (should fail)
         let diff_builder = DatasetDiffBuilder::new(Arc::new(dataset.clone()), current_version + 1);
         let result = diff_builder.execute().await;
-        assert!(
-            result.is_err(),
-            "Should fail when compared version is greater than current version"
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Compared version 2 must be less than current version 1"));
 
         // Test with version 0 (should fail)
         let diff_builder = DatasetDiffBuilder::new(Arc::new(dataset.clone()), 0);
         let result = diff_builder.execute().await;
-        assert!(result.is_err(), "Should fail when compared version is 0");
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Compared version must be > 0 (got 0)"));
     }
 
     #[tokio::test]
