@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::Float32Array;
@@ -41,6 +42,7 @@ pub fn extract_write_params(
     max_bytes_per_file: &JObject,
     mode: &JObject,
     enable_stable_row_ids: &JObject,
+    file_format_version: &JObject,
     storage_options_obj: &JObject,
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
@@ -60,8 +62,19 @@ pub fn extract_write_params(
     if let Some(enable_stable_row_ids_val) = env.get_boolean_opt(enable_stable_row_ids)? {
         write_params.enable_stable_row_ids = enable_stable_row_ids_val;
     }
-    // Java code always sets the data storage version to stable for now
-    write_params.data_storage_version = Some(LanceFileVersion::Stable);
+    if let Some(file_format_version_val) = env.get_string_opt(file_format_version)? {
+        let version_str = file_format_version_val.as_str();
+        let file_version = LanceFileVersion::from_str(version_str).map_err(|e| {
+            Error::input_error(format!(
+                "Invalid file format version '{}': {}",
+                version_str, e
+            ))
+        })?;
+        write_params.data_storage_version = Some(file_version);
+    } else {
+        // Default to stable if not specified
+        write_params.data_storage_version = Some(LanceFileVersion::Stable);
+    }
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 
