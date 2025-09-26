@@ -42,10 +42,13 @@ impl MergeStream {
         let mut iter = std::mem::take(&mut self.next_batch);
         let task = async move {
             let mut batch = iter.next().await.unwrap()?;
+            println!("Batch A: {:?}", batch);
             while let Some(next) = iter.next().await {
                 let next = next?;
+                println!("Merging with: {:?}", next);
                 batch = batch.merge(&next)?;
             }
+            println!("Batch B: {:?}", batch);
             Ok(batch)
         }
         .boxed();

@@ -3870,21 +3870,35 @@ impl PrimitiveStructuralEncoder {
         );
 
         let bytes_per_value = fixed.bits_per_value as usize / 8;
-
-        let mut data_iter = fixed.data.chunks_exact(bytes_per_value);
         let mut offset = 0;
-        while let Some(control) = repdef.append_next(&mut zipped_data) {
-            if control.is_new_row {
-                // We have finished a row
-                debug_assert!(offset <= len);
-                // SAFETY: We know that `start <= len`
-                unsafe { rep_index_builder.append(offset as u64) };
+
+        if bytes_per_value == 0 {
+            // No data, just dump the repdef into the buffer
+            while let Some(control) = repdef.append_next(&mut zipped_data) {
+                if control.is_new_row {
+                    // We have finished a row
+                    debug_assert!(offset <= len);
+                    // SAFETY: We know that `start <= len`
+                    unsafe { rep_index_builder.append(offset as u64) };
+                }
+                offset = zipped_data.len();
             }
-            if control.is_visible {
-                let value = data_iter.next().unwrap();
-                zipped_data.extend_from_slice(value);
+        } else {
+            // We have data, zip it with the repdef
+            let mut data_iter = fixed.data.chunks_exact(bytes_per_value);
+            while let Some(control) = repdef.append_next(&mut zipped_data) {
+                if control.is_new_row {
+                    // We have finished a row
+                    debug_assert!(offset <= len);
+                    // SAFETY: We know that `start <= len`
+                    unsafe { rep_index_builder.append(offset as u64) };
+                }
+                if control.is_visible {
+                    let value = data_iter.next().unwrap();
+                    zipped_data.extend_from_slice(value);
+                }
+                offset = zipped_data.len();
             }
-            offset = zipped_data.len();
         }
 
         debug_assert_eq!(zipped_data.len(), len);
@@ -4191,6 +4205,17 @@ impl PrimitiveStructuralEncoder {
                     // If we get here then we have definition levels and we need to store those
                     Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
                 };
+            }
+
+            if let DataType::Struct(fields) = &field.data_type() {
+                if fields.is_empty() {
+                    if repdefs.iter().any(|rd| !rd.is_empty()) {
+                        return Err(Error::InvalidInput { source: format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into(), location: location!() });
+                    }
+                    // This is maybe a little confusing but the reader should never look at this anyways and it
+                    // seems like overkill to invent a new layout just for "empty structs".
+                    return Self::encode_simple_all_null(column_idx, num_values, row_number);
+                }
             }
 
             let data_block = DataBlock::from_arrays(&arrays, num_values);

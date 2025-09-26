@@ -321,6 +321,9 @@ impl ValueEncoder {
                 has_validity = true;
                 nullable.data.as_ref()
             }
+            DataBlock::AllNull(_) => {
+                return ProtobufUtils21::constant(None);
+            }
             _ => inner,
         };
         let inner_encoding = match inner {
@@ -328,7 +331,10 @@ impl ValueEncoder {
                 ProtobufUtils21::flat(fixed_width.bits_per_value, None)
             }
             DataBlock::FixedSizeList(inner) => Self::fsl_to_encoding(inner),
-            _ => unreachable!("Unexpected data block type in value encoder's fsl_to_encoding"),
+            _ => unreachable!(
+                "Unexpected data block type in value encoder's fsl_to_encoding: {}",
+                inner.name()
+            ),
         };
         ProtobufUtils21::fsl(fsl.dimension, has_validity, inner_encoding)
     }
@@ -396,6 +402,11 @@ impl ValueEncoder {
                         (fixed_width.bits_per_value.div_ceil(8) * cum_dim) as usize;
                     bytes_per_row += data_bytes_per_row;
                     data_buffer = fixed_width.data;
+                    break;
+                }
+                DataBlock::AllNull(_) => {
+                    data_bytes_per_row = 0;
+                    data_buffer = LanceBuffer::empty();
                     break;
                 }
                 _ => unreachable!(
@@ -747,8 +758,8 @@ pub(crate) mod tests {
     };
 
     use arrow_array::{
-        make_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray,
-        UInt8Array,
+        make_array, new_null_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray,
+        Int32Array, ListArray, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
@@ -1023,6 +1034,20 @@ pub(crate) mod tests {
         );
 
         assert_eq!(decompressed.as_ref(), &sample_list);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_all_null() {
+        let items = new_null_array(&DataType::Int32, 12);
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_nulls = BooleanBuffer::from(vec![true, false, false, false, true, true]);
+        let list_array =
+            FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
     }
 
     #[test_log::test(tokio::test)]

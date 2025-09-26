@@ -414,8 +414,9 @@ impl StructuralEncodingStrategy {
                         child_encoder,
                     )))
                 }
-                DataType::Struct(_) => {
-                    if field.is_packed_struct() {
+                DataType::Struct(fields) => {
+                    if field.is_packed_struct() || fields.is_empty() {
+                        // Both packed structs and empty structs are encoded as primitive
                         Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                             options,
                             self.compression_strategy.clone(),

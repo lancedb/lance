@@ -387,6 +387,24 @@ impl DataBlockBuilderImpl for StructDataBlockBuilder {
         })
     }
 }
+
+#[derive(Debug, Default)]
+struct AllNullDataBlockBuilder {
+    num_values: u64,
+}
+
+impl DataBlockBuilderImpl for AllNullDataBlockBuilder {
+    fn append(&mut self, _data_block: &DataBlock, selection: Range<u64>) {
+        self.num_values += selection.end - selection.start;
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        DataBlock::AllNull(AllNullDataBlock {
+            num_values: self.num_values,
+        })
+    }
+}
+
 /// A data block to represent a fixed size list
 #[derive(Debug, Clone)]
 pub struct FixedSizeListBlock {
@@ -1046,6 +1064,7 @@ impl DataBlock {
                     estimated_size_bytes,
                 ))
             }
+            Self::AllNull(_) => Box::new(AllNullDataBlockBuilder::default()),
             _ => todo!("make_builder for {:?}", self),
         }
     }

@@ -672,6 +672,12 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
         description: &CompressiveEncoding,
     ) -> Result<Box<dyn FixedPerValueDecompressor>> {
         match description.compression.as_ref().unwrap() {
+            Compression::Constant(constant) => Ok(Box::new(ConstantDecompressor::new(
+                constant
+                    .value
+                    .as_ref()
+                    .map(|v| LanceBuffer::from_bytes(v.clone(), 1)),
+            ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
             _ => todo!("fixed-per-value decompressor for {:?}", description),
@@ -720,7 +726,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             )),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::Constant(constant) => {
-                let scalar = LanceBuffer::from_bytes(constant.value.clone(), 1);
+                let scalar = constant
+                    .value
+                    .as_ref()
+                    .map(|v| LanceBuffer::from_bytes(v.clone(), 1));
                 Ok(Box::new(ConstantDecompressor::new(scalar)))
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
