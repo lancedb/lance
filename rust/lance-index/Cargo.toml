@@ -17,6 +17,7 @@ arrow-array.workspace = true
 arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+arrow-arith.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 bitvec.workspace = true
@@ -43,6 +44,7 @@ lance-linalg.workspace = true
 lance-table.workspace = true
 libm.workspace = true
 log.workspace = true
+ndarray.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
@@ -66,6 +68,7 @@ fastbloom = "0.14.0"
 twox-hash = "2.0"
 async-channel = "2.3.1"
 bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
+rand_distr.workspace = true
 lance-datagen.workspace = true
 
 [dev-dependencies]
@@ -95,6 +98,9 @@ pprof.workspace = true
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
 features = ["protoc"]
+
+[profile.bench]
+debug = true
 
 [[bench]]
 name = "find_partitions"
@@ -138,6 +144,10 @@ harness = false
 
 [[bench]]
 name = "compute_partition"
+harness = false
+
+[[bench]]
+name = "rq"
 harness = false
 
 [lints]

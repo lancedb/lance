@@ -18,8 +18,8 @@ use rand::{prelude::StdRng, Rng, SeedableRng};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-const PQ: usize = 96;
-const DIM: usize = 1536;
+const DIM: usize = 128;
+const PQ: usize = DIM / 8;
 const TOTAL: usize = 16 * 1000;
 
 fn construct_dist_table(c: &mut Criterion) {

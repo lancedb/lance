@@ -117,6 +117,7 @@ pub enum IndexType {
     IvfHnswSq = 104,
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
+    IvfRq = 107,
 }
 
 impl std::fmt::Display for IndexType {
@@ -137,6 +138,7 @@ impl std::fmt::Display for IndexType {
             Self::IvfHnswSq => write!(f, "IVF_HNSW_SQ"),
             Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
             Self::IvfHnswFlat => write!(f, "IVF_HNSW_FLAT"),
+            Self::IvfRq => write!(f, "IVF_RQ"),
         }
     }
 }
@@ -188,6 +190,7 @@ impl TryFrom<&str> for IndexType {
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
             "IVF_PQ" => Ok(Self::IvfPq),
+            "IVF_RQ" => Ok(Self::IvfRq),
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
@@ -224,6 +227,7 @@ impl IndexType {
                 | Self::IvfHnswFlat
                 | Self::IvfFlat
                 | Self::IvfSq
+                | Self::IvfRq
         )
     }
 
@@ -257,7 +261,8 @@ impl IndexType {
             | Self::IvfPq
             | Self::IvfHnswSq
             | Self::IvfHnswPq
-            | Self::IvfHnswFlat => 1,
+            | Self::IvfHnswFlat
+            | Self::IvfRq => 1,
         }
     }
 
