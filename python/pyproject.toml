@@ -34,6 +34,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering",
 ]
@@ -75,7 +76,7 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 "*.pyi" = ["E301", "E302"]
 
 [tool.pyright]
-pythonVersion = "3.12"
+pythonVersion = "3.13"
 # TODO: expand this list as we fix more files.
 include = [
     "python/lance/util.py",
