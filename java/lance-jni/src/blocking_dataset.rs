@@ -6,7 +6,7 @@ use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
     build_compaction_options, extract_storage_options, extract_write_params,
-    get_scalar_index_params, get_vector_index_params, to_rust_map,
+    get_scalar_index_params, get_vector_index_params, to_rust_map, WriteParamsExtractor,
 };
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
@@ -411,13 +411,15 @@ fn create_dataset<'local>(
 
     let write_params = extract_write_params(
         env,
-        &max_rows_per_file,
-        &max_rows_per_group,
-        &max_bytes_per_file,
-        &mode,
-        &enable_stable_row_ids,
-        &file_format_version,
-        &storage_options_obj,
+        WriteParamsExtractor {
+            max_rows_per_file: &max_rows_per_file,
+            max_rows_per_group: &max_rows_per_group,
+            max_bytes_per_file: &max_bytes_per_file,
+            mode: &mode,
+            enable_stable_row_ids: &enable_stable_row_ids,
+            file_format_version: &file_format_version,
+            storage_options_obj: &storage_options_obj,
+        },
     )?;
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;

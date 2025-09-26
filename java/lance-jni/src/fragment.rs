@@ -24,7 +24,7 @@ use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava, JLance
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
-    utils::extract_write_params,
+    utils::{extract_write_params, WriteParamsExtractor},
     JNIEnvExt, RT,
 };
 
@@ -223,13 +223,15 @@ fn create_fragment<'a>(
 
     let write_params = extract_write_params(
         env,
-        &max_rows_per_file,
-        &max_rows_per_group,
-        &max_bytes_per_file,
-        &mode,
-        &enable_stable_row_ids,
-        &file_format_version,
-        &storage_options_obj,
+        WriteParamsExtractor {
+            max_rows_per_file: &max_rows_per_file,
+            max_rows_per_group: &max_rows_per_group,
+            max_bytes_per_file: &max_bytes_per_file,
+            mode: &mode,
+            enable_stable_row_ids: &enable_stable_row_ids,
+            file_format_version: &file_format_version,
+            storage_options_obj: &storage_options_obj,
+        },
     )?;
     let fragments = RT.block_on(FileFragment::create_fragments(
         &path_str,

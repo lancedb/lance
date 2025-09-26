@@ -26,6 +26,18 @@ use crate::ffi::JNIEnvExt;
 use lance_index::vector::Query;
 use std::collections::HashMap;
 
+/// Parameters for extracting write configuration from Java objects
+#[derive(Debug)]
+pub struct WriteParamsExtractor<'a> {
+    pub max_rows_per_file: &'a JObject<'a>,
+    pub max_rows_per_group: &'a JObject<'a>,
+    pub max_bytes_per_file: &'a JObject<'a>,
+    pub mode: &'a JObject<'a>,
+    pub enable_stable_row_ids: &'a JObject<'a>,
+    pub file_format_version: &'a JObject<'a>,
+    pub storage_options_obj: &'a JObject<'a>,
+}
+
 pub fn extract_storage_options(
     env: &mut JNIEnv,
     storage_options_obj: &JObject,
@@ -37,32 +49,26 @@ pub fn extract_storage_options(
 
 pub fn extract_write_params(
     env: &mut JNIEnv,
-    max_rows_per_file: &JObject,
-    max_rows_per_group: &JObject,
-    max_bytes_per_file: &JObject,
-    mode: &JObject,
-    enable_stable_row_ids: &JObject,
-    file_format_version: &JObject,
-    storage_options_obj: &JObject,
+    params: WriteParamsExtractor,
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
-    if let Some(max_rows_per_file_val) = env.get_int_opt(max_rows_per_file)? {
+    if let Some(max_rows_per_file_val) = env.get_int_opt(params.max_rows_per_file)? {
         write_params.max_rows_per_file = max_rows_per_file_val as usize;
     }
-    if let Some(max_rows_per_group_val) = env.get_int_opt(max_rows_per_group)? {
+    if let Some(max_rows_per_group_val) = env.get_int_opt(params.max_rows_per_group)? {
         write_params.max_rows_per_group = max_rows_per_group_val as usize;
     }
-    if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
+    if let Some(max_bytes_per_file_val) = env.get_long_opt(params.max_bytes_per_file)? {
         write_params.max_bytes_per_file = max_bytes_per_file_val as usize;
     }
-    if let Some(mode_val) = env.get_string_opt(mode)? {
+    if let Some(mode_val) = env.get_string_opt(params.mode)? {
         write_params.mode = WriteMode::try_from(mode_val.as_str())?;
     }
-    if let Some(enable_stable_row_ids_val) = env.get_boolean_opt(enable_stable_row_ids)? {
+    if let Some(enable_stable_row_ids_val) = env.get_boolean_opt(params.enable_stable_row_ids)? {
         write_params.enable_stable_row_ids = enable_stable_row_ids_val;
     }
-    if let Some(file_format_version_val) = env.get_string_opt(file_format_version)? {
+    if let Some(file_format_version_val) = env.get_string_opt(params.file_format_version)? {
         let version_str = file_format_version_val.as_str();
         let file_version = LanceFileVersion::from_str(version_str).map_err(|e| {
             Error::input_error(format!(
@@ -76,7 +82,7 @@ pub fn extract_write_params(
         write_params.data_storage_version = Some(LanceFileVersion::Stable);
     }
     let storage_options: HashMap<String, String> =
-        extract_storage_options(env, storage_options_obj)?;
+        extract_storage_options(env, params.storage_options_obj)?;
 
     write_params.store_params = Some(ObjectStoreParams {
         storage_options: Some(storage_options),
