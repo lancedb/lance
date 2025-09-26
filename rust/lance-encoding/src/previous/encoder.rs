@@ -47,7 +47,8 @@ use crate::constants::{
     PACKED_STRUCT_META_KEY,
 };
 
-use lance_core::datatypes::{Field, BLOB_DESC_FIELD, BLOB_META_KEY};
+use lance_arrow::BLOB_META_KEY;
+use lance_core::datatypes::{Field, BLOB_DESC_FIELD};
 use lance_core::{Error, Result};
 
 /// An encoded array

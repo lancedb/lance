@@ -18,7 +18,7 @@ use crate::{
         STRUCTURAL_ENCODING_MINIBLOCK,
     },
     data::DictionaryDataBlock,
-    encodings::logical::primitive::blob::BlobPageScheduler,
+    encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
     format::{
         pb21::{self, compressive_encoding::Compression, CompressiveEncoding, PageLayout},
         ProtobufUtils21,
@@ -2894,6 +2894,7 @@ impl StructuralPrimitiveFieldScheduler {
         column_info: &ColumnInfo,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
+        target_field: &Field,
     ) -> Result<Self> {
         let page_schedulers = column_info
             .page_infos
@@ -2905,6 +2906,7 @@ impl StructuralPrimitiveFieldScheduler {
                     page_index,
                     decompressors,
                     cache_repetition_index,
+                    target_field,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2919,6 +2921,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_layout: &PageLayout,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
+        target_field: &Field,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
@@ -2963,19 +2966,28 @@ impl StructuralPrimitiveFieldScheduler {
                     blob.inner_layout.as_ref().expect_ok()?.as_ref(),
                     decompressors,
                     cache_repetition_index,
+                    target_field,
                 )?;
                 let def_meaning = blob
                     .layers
                     .iter()
                     .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
-                let def_meaning = def_meaning.into();
-                Box::new(BlobPageScheduler::new(
-                    inner_scheduler,
-                    page_info.priority,
-                    page_info.num_rows,
-                    def_meaning,
-                ))
+                if matches!(target_field.data_type(), DataType::Struct(_)) {
+                    // User wants to decode blob into struct
+                    Box::new(BlobDescriptionPageScheduler::new(
+                        inner_scheduler,
+                        def_meaning.into(),
+                    ))
+                } else {
+                    // User wants to decode blob into binary data
+                    Box::new(BlobPageScheduler::new(
+                        inner_scheduler,
+                        page_info.priority,
+                        page_info.num_rows,
+                        def_meaning.into(),
+                    ))
+                }
             }
         })
     }
@@ -2985,6 +2997,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_index: usize,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
+        target_field: &Field,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
@@ -2992,6 +3005,7 @@ impl StructuralPrimitiveFieldScheduler {
             page_layout,
             decompressors,
             cache_repetition_index,
+            target_field,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
