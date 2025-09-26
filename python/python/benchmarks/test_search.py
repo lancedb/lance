@@ -161,7 +161,7 @@ def test_knn_search(test_dataset, benchmark):
     result = benchmark(
         test_dataset.to_table,
         columns=[],
-        with_row_id=True,
+        with_row_address=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -179,7 +179,7 @@ def test_ann_no_refine(test_dataset, benchmark):
     result = benchmark(
         test_dataset.to_table,
         columns=[],
-        with_row_id=True,
+        with_row_address=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -196,7 +196,7 @@ def test_ann_with_refine(test_dataset, benchmark):
     result = benchmark(
         test_dataset.to_table,
         columns=[],
-        with_row_id=True,
+        with_row_address=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -218,7 +218,7 @@ def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_in
     result = benchmark(
         test_dataset.to_table,
         columns=[],
-        with_row_id=True,
+        with_row_address=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -266,7 +266,7 @@ def test_btree_index_prefilter(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -278,7 +278,7 @@ def test_btree_index_prefilter(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -323,13 +323,13 @@ def test_btree_index_search(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
         )
     else:
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             prefilter=True,
             filter=filter,
         )
@@ -367,7 +367,7 @@ def test_bitmap_index_prefilter(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -379,7 +379,7 @@ def test_bitmap_index_prefilter(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -424,13 +424,13 @@ def test_bitmap_index_search(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
         )
     else:
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             prefilter=True,
             filter=filter,
         )
@@ -451,7 +451,7 @@ def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -463,7 +463,7 @@ def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
         print(
             test_dataset.scanner(
                 columns=[],
-                with_row_id=True,
+                with_row_address=True,
                 nearest=dict(column="vector", q=q, k=100, nprobes=10),
                 prefilter=True,
                 filter=filter,
@@ -472,7 +472,7 @@ def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
         benchmark(
             test_dataset.to_table,
             columns=[],
-            with_row_id=True,
+            with_row_address=True,
             nearest=dict(
                 column="vector",
                 q=q,

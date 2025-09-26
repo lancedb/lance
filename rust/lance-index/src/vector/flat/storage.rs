@@ -18,7 +18,7 @@ use arrow_array::{
 };
 use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
@@ -62,9 +62,9 @@ impl QuantizerStorage for FlatFloatStorage {
 
         let row_ids = Arc::new(
             batch
-                .column_by_name(ROW_ID)
+                .column_by_name(ROW_ADDR)
                 .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
+                    message: format!("column {} not found", ROW_ADDR),
                     location: location!(),
                 })?
                 .as_primitive::<UInt64Type>()
@@ -220,9 +220,9 @@ impl QuantizerStorage for FlatBinStorage {
 
         let row_ids = Arc::new(
             batch
-                .column_by_name(ROW_ID)
+                .column_by_name(ROW_ADDR)
                 .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
+                    message: format!("column {} not found", ROW_ADDR),
                     location: location!(),
                 })?
                 .as_primitive::<UInt64Type>()
@@ -269,7 +269,7 @@ impl FlatBinStorage {
         let vectors = Arc::new(vectors);
 
         let batch = RecordBatch::try_from_iter_with_nullable(vec![
-            (ROW_ID, row_ids.clone() as ArrayRef, true),
+            (ROW_ADDR, row_ids.clone() as ArrayRef, true),
             (FLAT_COLUMN, vectors.clone() as ArrayRef, true),
         ])
         .unwrap();

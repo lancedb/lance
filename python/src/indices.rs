@@ -259,7 +259,7 @@ async fn do_transform_vectors(
         .with_fragments(fragments)
         .project(&[column])
         .infer_error()?
-        .with_row_id()
+        .with_row_address()
         .batch_size(8192)
         .try_into_stream()
         .await

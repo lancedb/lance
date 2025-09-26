@@ -1448,7 +1448,7 @@ def test_read_partition(indexed_dataset):
     for part_id in range(reader.num_partitions()):
         res = reader.read_partition(part_id)
         row_sum += res.num_rows
-        assert "_rowid" in res.column_names
+        assert "_rowaddr" in res.column_names
     assert row_sum == num_rows
 
     row_sum = 0
@@ -1456,7 +1456,7 @@ def test_read_partition(indexed_dataset):
         res = reader.read_partition(part_id, with_vector=True)
         row_sum += res.num_rows
         pq_column = res["__pq_code"]
-        assert "_rowid" in res.column_names
+        assert "_rowaddr" in res.column_names
         assert pq_column.type == pa.list_(pa.uint8(), 16)
     assert row_sum == num_rows
 

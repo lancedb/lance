@@ -16,7 +16,7 @@ use deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use roaring::RoaringBitmap;
 use snafu::location;
 
@@ -133,7 +133,7 @@ impl BTreeSubIndex for FlatIndexMetadata {
             self.schema.clone(),
             vec![
                 batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?.clone(),
-                batch.column_by_name(ROW_ID).expect_ok()?.clone(),
+                batch.column_by_name(ROW_ADDR).expect_ok()?.clone(),
             ],
         )?)
     }
@@ -196,7 +196,7 @@ impl Index for FlatIndex {
             .ids()
             .as_primitive::<UInt64Type>()
             .iter()
-            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
+            .map(|row_addr| RowAddress::from(row_addr.unwrap()).fragment_id())
             .collect::<Vec<_>>();
         frag_ids.sort();
         frag_ids.dedup();

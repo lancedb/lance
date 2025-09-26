@@ -36,8 +36,8 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::ROW_ID;
-use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, DELTAS_SEARCHED_METRIC, PARTITIONS_RANKED_METRIC,
     PARTITIONS_SEARCHED_METRIC,
@@ -285,7 +285,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ]))
 });
 
@@ -1174,7 +1174,7 @@ impl ExecutionPlan for MultivectorScoringExec {
         let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
             stream.map(|batch| {
                 let batch = batch?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 debug_assert_eq!(dists.null_count(), 0);
 
@@ -1184,26 +1184,26 @@ impl ExecutionPlan for MultivectorScoringExec {
                     .last()
                     .map(|dist| 1.0 - *dist)
                     .unwrap_or_default();
-                let mut new_row_ids = Vec::with_capacity(row_ids.len());
-                let mut new_sims = Vec::with_capacity(row_ids.len());
-                let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
+                let mut new_row_addrs = Vec::with_capacity(row_addrs.len());
+                let mut new_sims = Vec::with_capacity(row_addrs.len());
+                let mut visited_row_addrs = HashSet::with_capacity(row_addrs.len());
 
-                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
+                for (row_addr, dist) in row_addrs.values().iter().zip(dists.values().iter()) {
                     // the results are sorted by distance, so we can skip if we have seen this row id before
-                    if visited_row_ids.contains(row_id) {
+                    if visited_row_addrs.contains(row_addr) {
                         continue;
                     }
-                    visited_row_ids.insert(row_id);
-                    new_row_ids.push(*row_id);
+                    visited_row_addrs.insert(row_addr);
+                    new_row_addrs.push(*row_addr);
                     // it's cosine distance, so we need to convert it to similarity
                     new_sims.push(1.0 - *dist);
                 }
-                let new_row_ids = UInt64Array::from(new_row_ids);
+                let new_row_addrs = UInt64Array::from(new_row_addrs);
                 let new_dists = Float32Array::from(new_sims);
 
                 let batch = RecordBatch::try_new(
                     KNN_INDEX_SCHEMA.clone(),
-                    vec![Arc::new(new_dists), Arc::new(new_row_ids)],
+                    vec![Arc::new(new_dists), Arc::new(new_row_addrs)],
                 )?;
 
                 Ok::<_, DataFusionError>((min_sim, batch))
@@ -1218,10 +1218,10 @@ impl ExecutionPlan for MultivectorScoringExec {
             let mut results = HashMap::with_capacity(k * refactor);
             let mut missed_sim_sum = 0.0;
             while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let sims = batch[DIST_COL].as_primitive::<Float32Type>();
 
-                let query_results = row_ids
+                let query_results = row_addrs
                     .values()
                     .iter()
                     .copied()
@@ -1233,30 +1233,30 @@ impl ExecutionPlan for MultivectorScoringExec {
                 // if `r` is in only `query_results`, then `results[r] = query_results[r] + missed_similarities`,
                 // here `missed_similarities` is the sum of `min_sim` from previous iterations
                 // if `r` is in both, then `results[r] += query_results[r]`
-                results.iter_mut().for_each(|(row_id, sim)| {
-                    if let Some(new_dist) = query_results.get(row_id) {
+                results.iter_mut().for_each(|(row_addr, sim)| {
+                    if let Some(new_dist) = query_results.get(row_addr) {
                         *sim += new_dist;
                     } else {
                         *sim += min_sim;
                     }
                 });
-                query_results.into_iter().for_each(|(row_id, sim)| {
-                    results.entry(row_id).or_insert(sim + missed_sim_sum);
+                query_results.into_iter().for_each(|(row_addr, sim)| {
+                    results.entry(row_addr).or_insert(sim + missed_sim_sum);
                 });
                 missed_sim_sum += min_sim;
             }
 
-            let (row_ids, sims): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+            let (row_addrs, sims): (Vec<_>, Vec<_>) = results.into_iter().unzip();
             let dists = sims
                 .into_iter()
                 // it's similarity, so we need to convert it back to distance
                 .map(|sim| num_queries - sim)
                 .collect::<Vec<_>>();
-            let row_ids = UInt64Array::from(row_ids);
+            let row_addrs = UInt64Array::from(row_addrs);
             let dists = Float32Array::from(dists);
             let batch = RecordBatch::try_new(
                 KNN_INDEX_SCHEMA.clone(),
-                vec![Arc::new(dists), Arc::new(row_ids)],
+                vec![Arc::new(dists), Arc::new(row_addrs)],
             )?;
             Ok::<_, DataFusionError>(batch)
         });
@@ -1459,10 +1459,10 @@ mod tests {
                 .await?;
             let mut results = HashMap::new();
             for batch in batches {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
-                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
-                    results.insert(*row_id, *dist);
+                for (row_addr, dist) in row_addrs.values().iter().zip(dists.values().iter()) {
+                    results.insert(*row_addr, *dist);
                 }
             }
             Ok(results)
@@ -1493,8 +1493,8 @@ mod tests {
             let new_res = multivector_scoring(inputs, query.clone()).await.unwrap();
             assert_eq!(new_res.len(), 4);
             if let Some(res) = &res {
-                for (row_id, dist) in new_res.iter() {
-                    assert_eq!(res.get(row_id).unwrap(), dist)
+                for (row_addr, dist) in new_res.iter() {
+                    assert_eq!(res.get(row_addr).unwrap(), dist)
                 }
             } else {
                 res = Some(new_res);
@@ -1639,7 +1639,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1676,7 +1676,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1713,7 +1713,7 @@ mod tests {
                 .scan_stats_callback(stats_holder.get_setter())
                 .project(&Vec::<String>::new())
                 .unwrap()
-                .with_row_id()
+                .with_row_address()
                 .try_into_batch()
                 .await
                 .unwrap();
@@ -1751,7 +1751,7 @@ mod tests {
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1790,7 +1790,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1824,7 +1824,7 @@ mod tests {
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();

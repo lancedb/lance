@@ -7,7 +7,6 @@ use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
 use super::IVFIndex;
-use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use arrow::compute::concat;
 use arrow_array::UInt64Array;
@@ -20,7 +19,7 @@ use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::Error;
+use lance_core::{Error, ROW_ADDR};
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -86,8 +85,8 @@ async fn merge_streams(
 
         let row_ids: Arc<dyn Array> = Arc::new(
             batch
-                .column_by_name(ROW_ID)
-                .expect("row id column not found")
+                .column_by_name(ROW_ADDR)
+                .expect("row addr column not found")
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );

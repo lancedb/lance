@@ -198,10 +198,10 @@ def rand_pq(rand_dataset, rand_ivf):
 
 
 def gen_rand_part_ids(dataset, dest_uri):
-    row_ids = dataset.to_table(with_row_address=True, columns=[])
-    part_ids = np.random.randint(0, 35000, size=row_ids.num_rows, dtype=np.uint32)
-    table = pa.table({"row_id": row_ids.column(0), "partition": part_ids})
-    lance.write_dataset(table, dest_uri, max_rows_per_file=row_ids.num_rows)
+    row_addrs = dataset.to_table(with_row_address=True, columns=[])
+    part_ids = np.random.randint(0, 35000, size=row_addrs.num_rows, dtype=np.uint32)
+    table = pa.table({"row_addr": row_addrs.column(0), "partition": part_ids})
+    lance.write_dataset(table, dest_uri, max_rows_per_file=row_addrs.num_rows)
 
 
 @pytest.mark.benchmark(group="transform_vectors")

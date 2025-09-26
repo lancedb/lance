@@ -206,7 +206,7 @@ pub trait IndexBuilder {
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
-    row_id_map: &HashMap<u64, Option<u64>>,
+    row_addr_map: &HashMap<u64, Option<u64>>,
 ) -> Result<RemapResult> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
@@ -225,11 +225,11 @@ pub(crate) async fn remap_index(
         });
     }
 
-    if row_id_map.values().all(|v| v.is_none()) {
+    if row_addr_map.values().all(|v| v.is_none()) {
         let deleted_bitmap = RoaringBitmap::from_iter(
-            row_id_map
+            row_addr_map
                 .keys()
-                .map(|row_id| RowAddress::new_from_u64(*row_id))
+                .map(|row_addr| RowAddress::new_from_u64(*row_addr))
                 .map(|addr| addr.fragment_id()),
         );
         if Some(deleted_bitmap) == matched.fragment_bitmap {
@@ -296,10 +296,10 @@ pub(crate) async fn remap_index(
                         )
                         .await?
                     } else {
-                        scalar_index.remap(row_id_map, &new_store).await?
+                        scalar_index.remap(row_addr_map, &new_store).await?
                     }
                 }
-                _ => scalar_index.remap(row_id_map, &new_store).await?,
+                _ => scalar_index.remap(row_addr_map, &new_store).await?,
             }
         }
         it if it.is_vector() => {
@@ -309,7 +309,7 @@ pub(crate) async fn remap_index(
                 index_id,
                 &new_id,
                 matched,
-                row_id_map,
+                row_addr_map,
             )
             .await?;
             CreatedIndex {

@@ -30,7 +30,7 @@ use lance_core::{
         address::RowAddress,
         mask::{RowIdMask, RowIdTreeMap},
     },
-    Error, Result, ROW_ID_FIELD,
+    Error, Result, ROW_ADDR_FIELD,
 };
 use lance_datafusion::{
     chunker::break_stream,
@@ -239,7 +239,7 @@ impl ExecutionPlan for ScalarIndexExec {
 }
 
 pub static INDEX_LOOKUP_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 /// An execution node that translates index values into row addresses
 ///
@@ -446,7 +446,7 @@ impl ExecutionPlan for MapIndexExec {
 }
 
 pub static MATERIALIZE_INDEX_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 /// An execution node that performs a scalar index search and materializes the mask into row ids
 ///

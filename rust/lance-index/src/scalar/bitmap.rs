@@ -570,7 +570,7 @@ impl ScalarIndex for BitmapIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -707,7 +707,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             });
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
 
@@ -795,7 +795,7 @@ pub mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -1039,7 +1039,7 @@ pub mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -1154,7 +1154,7 @@ pub mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::UInt32, true),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
