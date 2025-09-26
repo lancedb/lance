@@ -47,10 +47,7 @@ pub fn extract_storage_options(
     Ok(storage_options)
 }
 
-pub fn extract_write_params(
-    env: &mut JNIEnv,
-    params: WriteParamsExtractor,
-) -> Result<WriteParams> {
+pub fn extract_write_params(env: &mut JNIEnv, params: WriteParamsExtractor) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
     if let Some(max_rows_per_file_val) = env.get_int_opt(params.max_rows_per_file)? {
