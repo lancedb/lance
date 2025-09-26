@@ -273,6 +273,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
+        println!("🔨 Building transaction with data_bucket_uris: {:?}", context.params.data_bucket_uris);
         let transaction = TransactionBuilder::new(
             context
                 .dest
@@ -283,7 +284,15 @@ impl<'a> InsertBuilder<'a> {
         )
         .blobs_op(blobs_op)
         .transaction_properties(context.params.transaction_properties.clone())
+        .data_bucket_uris(context.params.data_bucket_uris.clone())
         .build();
+        
+        println!("🔨 Transaction built with {} fragments", 
+                 match &transaction.operation {
+                     crate::dataset::transaction::Operation::Overwrite { fragments, .. } => fragments.len(),
+                     crate::dataset::transaction::Operation::Append { fragments } => fragments.len(),
+                     _ => 0
+                 });
 
         Ok(transaction)
     }

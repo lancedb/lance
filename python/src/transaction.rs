@@ -508,6 +508,9 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
+        let data_bucket_uris = ob
+            .getattr("data_bucket_uris")?
+            .extract::<Option<Vec<String>>>()?;
         Ok(Self(Transaction {
             read_version,
             uuid,
@@ -515,6 +518,7 @@ impl FromPyObject<'_> for PyLance<Transaction> {
             blobs_op,
             tag: None,
             transaction_properties,
+            data_bucket_uris,
         }))
     }
 }

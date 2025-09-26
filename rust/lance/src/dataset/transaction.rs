@@ -68,6 +68,7 @@ use lance_table::{
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
+use url::Url;
 use std::cmp::Ordering;
 use std::{
     collections::{HashMap, HashSet},
@@ -93,6 +94,8 @@ pub struct Transaction {
     pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Additional bucket URIs for data file distribution in multi-bucket layouts
+    pub data_bucket_uris: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1324,6 +1327,7 @@ pub struct TransactionBuilder {
     blobs_op: Option<Operation>,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    data_bucket_uris: Option<Vec<String>>,
 }
 
 impl TransactionBuilder {
@@ -1335,6 +1339,7 @@ impl TransactionBuilder {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
+            data_bucket_uris: None,
         }
     }
 
@@ -1361,6 +1366,11 @@ impl TransactionBuilder {
         self
     }
 
+    pub fn data_bucket_uris(mut self, data_bucket_uris: Option<Vec<String>>) -> Self {
+        self.data_bucket_uris = data_bucket_uris;
+        self
+    }
+
     pub fn build(self) -> Transaction {
         let uuid = self
             .uuid
@@ -1372,6 +1382,7 @@ impl TransactionBuilder {
             blobs_op: self.blobs_op,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
+            data_bucket_uris: self.data_bucket_uris,
         }
     }
 }
@@ -1475,10 +1486,43 @@ impl Transaction {
                 location: location!(),
             });
         }
-        let reference_paths = match current_manifest {
+        let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
             None => HashMap::new(),
         };
+
+        // If creating a new dataset and data_bucket_uris are provided, create base_paths
+        if current_manifest.is_none() {
+            if let Some(data_bucket_uris) = &self.data_bucket_uris {
+                println!("📋 Creating new dataset manifest with {} additional data buckets", data_bucket_uris.len());
+                // Add the primary bucket (bucket ID 0) - this will be inferred from the dataset URI
+                // The additional buckets get IDs 1, 2, 3, etc.
+                for (i, uri) in data_bucket_uris.iter().enumerate() {
+                    let bucket_id = (i + 1) as u32; // Start from 1, 0 is reserved for primary
+                    // Extract just the path portion from the URI for storage in manifest
+                    let path_portion = if let Ok(url) = Url::parse(uri) {
+                        format!("{}/data", url.path().trim_start_matches('/'))
+                    } else {
+                        format!("{}/data", uri)
+                    };
+                    println!("📋 Adding base_path: bucket {} -> {} (path: {})", bucket_id, uri, path_portion);
+                    reference_paths.insert(
+                        bucket_id,
+                        lance_table::format::BasePath {
+                            id: bucket_id,
+                            name: Some(format!("data_bucket_{}", bucket_id)),
+                            is_dataset_root: false, // Direct path to data directory
+                            path: path_portion, // Store just the path portion, not full URL
+                        },
+                    );
+                }
+                println!("📋 Total base_paths in manifest: {}", reference_paths.len());
+            } else {
+                println!("📋 Creating new dataset manifest with single bucket (no data_bucket_uris)");
+            }
+        } else {
+            println!("📋 Updating existing dataset manifest (preserving existing base_paths)");
+        }
 
         // Get the schema and the final fragment list
         let schema = match self.operation {
@@ -2714,6 +2758,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            data_bucket_uris: None, // TODO: Add protobuf support for data_bucket_uris
         })
     }
 }
