@@ -6,7 +6,7 @@ use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
     build_compaction_options, extract_storage_options, extract_write_params,
-    get_scalar_index_params, get_vector_index_params, to_rust_map,
+    get_scalar_index_params, get_vector_index_params, to_rust_map, WriteParamsExtractor,
 };
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
@@ -268,6 +268,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -281,6 +282,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            file_format_version,
             storage_options_obj
         )
     )
@@ -296,6 +298,7 @@ fn inner_create_with_ffi_schema<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -311,6 +314,7 @@ fn inner_create_with_ffi_schema<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        file_format_version,
         storage_options_obj,
         reader,
     )
@@ -341,6 +345,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -354,6 +359,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            file_format_version,
             storage_options_obj
         )
     )
@@ -369,6 +375,7 @@ fn inner_create_with_ffi_stream<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -381,6 +388,7 @@ fn inner_create_with_ffi_stream<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        file_format_version,
         storage_options_obj,
         reader,
     )
@@ -395,6 +403,7 @@ fn create_dataset<'local>(
     max_bytes_per_file: JObject,
     mode: JObject,
     enable_stable_row_ids: JObject,
+    file_format_version: JObject,
     storage_options_obj: JObject,
     reader: impl RecordBatchReader + Send + 'static,
 ) -> Result<JObject<'local>> {
@@ -402,12 +411,15 @@ fn create_dataset<'local>(
 
     let write_params = extract_write_params(
         env,
-        &max_rows_per_file,
-        &max_rows_per_group,
-        &max_bytes_per_file,
-        &mode,
-        &enable_stable_row_ids,
-        &storage_options_obj,
+        WriteParamsExtractor {
+            max_rows_per_file: &max_rows_per_file,
+            max_rows_per_group: &max_rows_per_group,
+            max_bytes_per_file: &max_bytes_per_file,
+            mode: &mode,
+            enable_stable_row_ids: &enable_stable_row_ids,
+            file_format_version: &file_format_version,
+            storage_options_obj: &storage_options_obj,
+        },
     )?;
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;

@@ -24,7 +24,7 @@ use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, IntoJava, JLance
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::FromJString,
-    utils::extract_write_params,
+    utils::{extract_write_params, WriteParamsExtractor},
     JNIEnvExt, RT,
 };
 
@@ -81,6 +81,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
@@ -95,6 +96,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            file_format_version,
             storage_options_obj
         ),
         JObject::default()
@@ -112,6 +114,7 @@ fn inner_create_with_ffi_array<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
@@ -135,6 +138,7 @@ fn inner_create_with_ffi_array<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        file_format_version,
         storage_options_obj,
         reader,
     )
@@ -151,6 +155,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
@@ -164,6 +169,7 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
             max_bytes_per_file,
             mode,
             enable_stable_row_ids,
+            file_format_version,
             storage_options_obj
         ),
         JObject::null()
@@ -180,6 +186,7 @@ fn inner_create_with_ffi_stream<'local>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -193,6 +200,7 @@ fn inner_create_with_ffi_stream<'local>(
         max_bytes_per_file,
         mode,
         enable_stable_row_ids,
+        file_format_version,
         storage_options_obj,
         reader,
     )
@@ -207,6 +215,7 @@ fn create_fragment<'a>(
     max_bytes_per_file: JObject,    // Optional<Long>
     mode: JObject,                  // Optional<String>
     enable_stable_row_ids: JObject, // Optional<Boolean>
+    file_format_version: JObject,   // Optional<String>
     storage_options_obj: JObject,   // Map<String, String>
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
@@ -214,12 +223,15 @@ fn create_fragment<'a>(
 
     let write_params = extract_write_params(
         env,
-        &max_rows_per_file,
-        &max_rows_per_group,
-        &max_bytes_per_file,
-        &mode,
-        &enable_stable_row_ids,
-        &storage_options_obj,
+        WriteParamsExtractor {
+            max_rows_per_file: &max_rows_per_file,
+            max_rows_per_group: &max_rows_per_group,
+            max_bytes_per_file: &max_bytes_per_file,
+            mode: &mode,
+            enable_stable_row_ids: &enable_stable_row_ids,
+            file_format_version: &file_format_version,
+            storage_options_obj: &storage_options_obj,
+        },
     )?;
     let fragments = RT.block_on(FileFragment::create_fragments(
         &path_str,
