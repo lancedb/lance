@@ -430,7 +430,17 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // If values are very large then use block compression on a per-value basis
                 //
                 // TODO: Could maybe use median here
-                if max_len > 32 * 1024 && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
+
+                let per_value_requested =
+                    if let Some(compression) = field_params.compression.as_deref() {
+                        compression != "none" && compression != "fsst"
+                    } else {
+                        false
+                    };
+
+                if (max_len > 32 * 1024 || per_value_requested)
+                    && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                {
                     return Ok(Box::new(CompressedBufferEncoder::default()));
                 }
 
