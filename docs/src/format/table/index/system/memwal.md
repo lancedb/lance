@@ -22,6 +22,6 @@ It is expected that:
 
 1. there is exactly one writer for each region, guaranteed by optimistic update of the owner_id
 2. each writer updates the MemWAL index after a successful write to WAL and MemTable
-3. a new writer always finds unsealed MemWALs and perform replay before accepting new writes
+3. a new writer always finds unsealed MemWALs and performs replay before accepting new writes
 4. background processes are responsible for merging flushed MemWALs to the main Lance table, and making index up to date.
 5. a MemWAL-aware reader is able to merge results of MemTables in the MemWALs with results in the base Lance table. 

@@ -11,7 +11,7 @@ Typically, the compaction would fail because it has to modify all indices and ta
 resulting in table layout degrading over time.
 
 Fragment Reuse Index allows a compaction to defer the index remap process.
-Suppose a compaction removes fragments A and B and produced C.
+Suppose a compaction removes fragments A and B and produces C.
 At query runtime, it reuses the old fragments A and B by 
 updating the row addresses related to A and B in the index to the latest ones in C.
 Because indices are typically cached in memory after initial load,
@@ -25,11 +25,11 @@ the in-memory index is up to date after the fragment reuse application process.
 
 ## Expected Use Pattern
 
-Fragment Reuse Index should be created if user defers index remap in compaction.
+Fragment Reuse Index should be created if the user defers index remap in compaction.
 The index accumulates a new **reuse version** every time a compaction is executed.
 
 As long as all the scalar and vector indices are created after the specific reuse version,
 the indices are all caught up and the specific reuse version can be trimmed.
 
-It is expected that user schedules additional process to trim the index periodically
-to keep the list of reuse version in control.
+It is expected that the user schedules an additional process to trim the index periodically
+to keep the list of reuse versions in control.

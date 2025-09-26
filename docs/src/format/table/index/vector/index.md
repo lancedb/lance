@@ -12,7 +12,7 @@ Lance splits each vector index into 3 parts - clustering, sub-index and quantiza
 
 Clustering divides all the vectors into different disjoint clusters (a.k.a. partitions).
 Lance currently supports using Inverted File (IVF) as the primary clustering mechanism.
-IVF partitions the vectors into clusters using k-means clustering algorithm. 
+IVF partitions the vectors into clusters using the k-means clustering algorithm. 
 Each cluster contains vectors that are similar to the cluster centroid.
 During search, only the most relevant clusters are examined, dramatically reducing search time.
 IVF can be combined with any sub-index type and quantization method.
@@ -49,7 +49,7 @@ Here are the commonly used combinations:
 
 The Lance vector index format has gone through 3 versions so far.
 This document currently only records version 3 which is the latest version.
-The specific version of the vector index is recorded in the `index_version` field of the generic index metadata.
+The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#index-metadata).
 
 ## Storage Layout (V3)
 
