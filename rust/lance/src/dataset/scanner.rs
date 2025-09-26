@@ -2835,8 +2835,8 @@ impl Scanner {
             // most common case is that fragments that are newer than the vector index are going to be newer
             // than the scalar indices anyways
             let mut scan_node = self.scan_fragments(
-                true,
                 false,
+                true,
                 false,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),

@@ -144,7 +144,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
                 codes,
             )?;
         }
-        
+
         debug_assert!(batch.column_by_name(ROW_ADDR).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 

@@ -37,8 +37,8 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{utils::mask::RowIdTreeMap, Error};
-use lance_core::{Result, ROW_ID};
+use lance_core::Result;
+use lance_core::{utils::mask::RowIdTreeMap, Error, ROW_ADDR};
 use lance_io::object_store::ObjectStore;
 use log::info;
 use object_store::path::Path;
@@ -745,7 +745,7 @@ impl NGramIndexBuilder {
                 location: location!(),
             });
         }
-        let row_id_field = schema.field_with_name(ROW_ID)?;
+        let row_id_field = schema.field_with_name(ROW_ADDR)?;
         if *row_id_field.data_type() != DataType::UInt64 {
             return Err(Error::InvalidInput {
                 source: "Second field in ngram index schema must be of type UInt64".into(),
@@ -846,7 +846,7 @@ impl NGramIndexBuilder {
     ) -> Result<Vec<Vec<(u32, u64)>>> {
         let text_iter = iter_str_array(batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?);
         let row_id_col = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .expect_ok()?
             .as_primitive::<UInt64Type>();
         // Guessing 1000 tokens per row to at least avoid some of the earlier allocations
@@ -1336,7 +1336,7 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{stream, TryStreamExt};
     use itertools::Itertools;
-    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ID};
+    use lance_core::{cache::LanceCache, utils::mask::RowIdTreeMap, ROW_ADDR, ROW_ID};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
@@ -1459,7 +1459,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1545,7 +1545,7 @@ mod tests {
     fn test_data_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]))
     }
 
@@ -1675,7 +1675,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64 + 100));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();

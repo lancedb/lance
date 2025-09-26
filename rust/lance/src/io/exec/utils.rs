@@ -28,7 +28,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
-use lance_core::{Result, ROW_ID};
+use lance_core::{Result, ROW_ADDR};
 use lance_index::prefilter::FilterLoader;
 use snafu::location;
 
@@ -79,7 +79,7 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
         let mut allow_list = RowIdTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
+            let row_ids = batch.column_by_name(ROW_ADDR).ok_or_else(|| Error::Internal {
                 message: "input batch missing row id column even though it is in the schema for the stream".into(),
                 location: location!(),
             })?;
