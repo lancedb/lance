@@ -4,7 +4,6 @@
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::location;
-use std::env;
 
 pub const BRANCH_DIR: &str = "tree";
 
@@ -37,7 +36,7 @@ impl BranchLocation {
         let root_path_str = path_str
             .strip_suffix(branch_suffix)
             .or_else(|| {
-                if env::consts::OS == "windows" {
+                if cfg!(windows) {
                     let windows_suffix = branch_suffix.replace('/', "\\");
                     path_str.strip_suffix(&windows_suffix)
                 } else {
@@ -236,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     fn test_branch_location_on_windows() {
         let branch_location = BranchLocation {
             path: Path::parse("C:\\Users\\Username\\Documents\\dataset\\tree\\feature\\new")
