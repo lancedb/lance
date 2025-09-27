@@ -30,10 +30,7 @@ use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_META_KEY},
-    Error, Result,
-};
+use crate::{datatypes::BLOB_DESC_LANCE_FIELD, Error, Result};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
 

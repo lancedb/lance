@@ -859,6 +859,8 @@ mod tests {
 
         let options = FileWriterOptions {
             max_page_bytes: Some(1024 * 1024), // 1MB
+            // This is a 2.0 only test because 2.1+ splits large pages on read instead of write
+            format_version: Some(LanceFileVersion::V2_0),
             ..Default::default()
         };
 

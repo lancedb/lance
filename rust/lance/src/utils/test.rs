@@ -945,8 +945,17 @@ mod tests {
                 .flat_map(|file| file.fields.iter())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut field_ids = schema.fields_pre_order().map(|f| f.id).collect::<Vec<_>>();
-            assert_ne!(field_ids_frags, field_ids);
+            let mut field_ids = schema
+                .fields_pre_order()
+                .filter_map(|f| {
+                    if data_storage_version == LanceFileVersion::Legacy || f.children.is_empty() {
+                        Some(f.id)
+                    } else {
+                        // In 2.1+, struct / list fields don't have their own column
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
             field_ids_frags.sort_unstable();
             field_ids.sort_unstable();
             assert_eq!(field_ids_frags, field_ids);
