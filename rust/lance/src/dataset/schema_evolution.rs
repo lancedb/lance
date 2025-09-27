@@ -966,6 +966,7 @@ mod test {
                         deletion_file: None,
                         row_id_meta: None,
                         physical_rows: Some(50),
+                        row_latest_update_version_meta: None,
                     }))
                 } else {
                     Ok(None)
