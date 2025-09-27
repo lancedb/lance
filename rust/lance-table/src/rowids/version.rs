@@ -25,8 +25,8 @@ use crate::rowids::{read_row_ids, RowIdSequence};
 /// and enables zipped iteration without building a map.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub struct RowVersionRun {
-    span: U64Segment,
-    version: u64,
+    pub span: U64Segment,
+    pub version: u64,
 }
 
 impl RowVersionRun {
@@ -53,7 +53,7 @@ impl RowVersionRun {
 /// efficient random access.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf, Default)]
 pub struct RowLatestUpdateVersionSequence {
-    runs: Vec<RowVersionRun>,
+    pub runs: Vec<RowVersionRun>,
 }
 
 impl RowLatestUpdateVersionSequence {

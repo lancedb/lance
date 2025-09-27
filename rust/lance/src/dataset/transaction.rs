@@ -46,7 +46,7 @@
 //!
 
 use super::ManifestWriteConfig;
-use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::index::mem_wal::update_mem_wal_index_in_indices_list;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
@@ -1637,10 +1637,6 @@ impl Transaction {
                 }
                 // Identify fragments that were updated or newly created in this update
                 let mut target_ids: HashSet<u64> = HashSet::new();
-                if update_mode.is_some() && *update_mode == Some(RewriteColumns) {
-                    // In rewrite column mode, we need to consider in-place updated frags
-                    target_ids.extend(updated_fragments.iter().map(|f| f.id));
-                }
                 target_ids.extend(new_fragments.iter().map(|f| f.id));
                 final_fragments.extend(new_fragments);
                 if config.use_stable_row_ids {

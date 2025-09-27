@@ -91,7 +91,12 @@ use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::{MemWal, MemWalId};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
-use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::format::{
+    Fragment, IndexMetadata, RowIdMeta, RowLatestUpdateVersionMeta, RowLatestUpdateVersionSequence,
+    RowVersionRun,
+};
+use lance_table::rowids::read_row_ids;
+use lance_table::rowids::segment::U64Segment;
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
@@ -825,6 +830,7 @@ impl MergeInsertJob {
     async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
+        current_version: u64,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
@@ -856,6 +862,7 @@ impl MergeInsertJob {
                 mut batches: Vec<RecordBatch>,
                 updated_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
+                current_version: u64,
             ) -> Result<usize> {
                 // batches still have _rowaddr
                 let write_schema = batches[0]
@@ -925,6 +932,34 @@ impl MergeInsertJob {
                     let (_num_rows, data_file) = writer.finish().await?;
 
                     metadata.files.push(data_file);
+
+                    if dataset.manifest.uses_stable_row_ids() {
+                        // in-place frag override, do the in-place refresh the frag's row_latest_update_version_meta
+                        let row_count = if let Some(pr) = metadata.physical_rows {
+                            pr as u64
+                        } else if let Some(row_id_meta) = metadata.row_id_meta.as_ref() {
+                            match row_id_meta {
+                                RowIdMeta::Inline(data) => {
+                                    let sequence = read_row_ids(data).unwrap();
+                                    sequence.len()
+                                }
+                                RowIdMeta::External(_file) => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        if row_count > 0 {
+                            let version_seq =
+                                RowLatestUpdateVersionSequence::from_uniform_row_count(
+                                    row_count,
+                                    current_version,
+                                );
+                            let version_meta =
+                                RowLatestUpdateVersionMeta::from_sequence(&version_seq)?;
+                            metadata.row_latest_update_version_meta = Some(version_meta);
+                        }
+                    }
+
                     updated_fragments.lock().unwrap().push(metadata);
                 } else {
                     // TODO: we could skip scanning row addresses we don't need.
@@ -1009,7 +1044,101 @@ impl MergeInsertJob {
                         updater.update(updated_batch).await?;
                     }
 
-                    let updated_fragment = updater.finish().await?;
+                    let mut updated_fragment = updater.finish().await?;
+
+                    if dataset.manifest.uses_stable_row_ids() {
+                        // in-place frag partial rows update, do the in-place refresh the frag's row_latest_update_version_meta
+                        // via compute updated local row offsets and write row-level version meta
+                        let mut updated_offsets: Vec<usize> = Vec::new();
+                        for b in batches.iter() {
+                            let row_addrs = b
+                                .column_by_name(ROW_ADDR)
+                                .unwrap()
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .unwrap();
+                            updated_offsets.extend(
+                                row_addrs
+                                    .values()
+                                    .iter()
+                                    .map(|addr| (*addr & 0xFFFF_FFFF) as usize),
+                            );
+                        }
+                        updated_offsets.sort_unstable();
+                        updated_offsets.dedup();
+
+                        // Determine row count for fragment
+                        let row_count_u64: u64 = if let Some(pr) = updated_fragment.physical_rows {
+                            pr as u64
+                        } else if let Some(row_id_meta) = updated_fragment.row_id_meta.as_ref() {
+                            match row_id_meta {
+                                RowIdMeta::Inline(data) => {
+                                    let sequence = read_row_ids(data).unwrap();
+                                    sequence.len()
+                                }
+                                RowIdMeta::External(_file) => {
+                                    todo!("External file loading not yet implemented")
+                                }
+                            }
+                        } else {
+                            0
+                        };
+
+                        if row_count_u64 > 0 {
+                            // Build base version vector from existing meta or previous dataset version
+                            let prev_version = dataset.manifest.version;
+                            let mut base_versions: Vec<u64> =
+                                Vec::with_capacity(row_count_u64 as usize);
+                            if let Some(meta) =
+                                updated_fragment.row_latest_update_version_meta.as_ref()
+                            {
+                                if let Ok(base_seq) = meta.load_sequence() {
+                                    for pos in 0..(row_count_u64 as usize) {
+                                        base_versions
+                                            .push(base_seq.version_at(pos).unwrap_or(prev_version));
+                                    }
+                                } else {
+                                    base_versions.resize(row_count_u64 as usize, prev_version);
+                                }
+                            } else {
+                                base_versions.resize(row_count_u64 as usize, prev_version);
+                            }
+
+                            // Apply updates to updated positions
+                            for &pos in &updated_offsets {
+                                if pos < base_versions.len() {
+                                    base_versions[pos] = current_version;
+                                }
+                            }
+
+                            // Compress into runs
+                            let mut runs: Vec<RowVersionRun> = Vec::new();
+                            if !base_versions.is_empty() {
+                                let mut start = 0usize;
+                                let mut curr_ver = base_versions[0];
+                                for (idx, &ver) in base_versions.iter().enumerate().skip(1) {
+                                    if ver != curr_ver {
+                                        runs.push(RowVersionRun {
+                                            span: U64Segment::Range(start as u64..idx as u64),
+                                            version: curr_ver,
+                                        });
+                                        start = idx;
+                                        curr_ver = ver;
+                                    }
+                                }
+                                runs.push(RowVersionRun {
+                                    span: U64Segment::Range(
+                                        start as u64..base_versions.len() as u64,
+                                    ),
+                                    version: curr_ver,
+                                });
+                            }
+                            let new_seq = RowLatestUpdateVersionSequence { runs };
+                            let new_meta = RowLatestUpdateVersionMeta::from_sequence(&new_seq)?;
+                            updated_fragment.row_latest_update_version_meta = Some(new_meta);
+                        }
+                    }
+
                     updated_fragments.lock().unwrap().push(updated_fragment);
                 }
                 Ok(reservation_size)
@@ -1105,6 +1234,7 @@ impl MergeInsertJob {
                         batches,
                         updated_fragments.clone(),
                         memory_size,
+                        current_version,
                     );
                     tasks.spawn(fut);
                 }
@@ -1412,8 +1542,12 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments, fields_modified) =
-                Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
+            let (updated_fragments, new_fragments, fields_modified) = Self::update_fragments(
+                self.dataset.clone(),
+                Box::pin(stream),
+                self.dataset.manifest.version + 1,
+            )
+            .await?;
 
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
