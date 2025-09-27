@@ -17,6 +17,7 @@ use crate::{
         DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
         STRUCTURAL_ENCODING_MINIBLOCK,
     },
+    data::DictionaryDataBlock,
     encodings::logical::primitive::blob::BlobPageScheduler,
     format::{
         pb21::{self, compressive_encoding::Compression, CompressiveEncoding, PageLayout},
@@ -32,7 +33,7 @@ use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{CacheKey, Context, DeepSizeOf},
     error::{Error, LanceOptionExt},
-    utils::{bit::pad_bytes, hash::U8SliceKey},
+    utils::bit::pad_bytes,
 };
 use log::trace;
 use snafu::location;
@@ -81,6 +82,7 @@ use crate::{
 };
 
 pub mod blob;
+pub mod dict;
 pub mod fullzip;
 pub mod miniblock;
 
@@ -565,54 +567,25 @@ impl DecodePageTask for DecodeMiniBlockTask {
             data_builder.append(&values, item_range);
         }
 
-        let data = data_builder.finish();
+        let mut data = data_builder.finish();
 
         let unraveler = RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone());
 
-        // if dictionary encoding is applied, do dictionary decode here.
         if let Some(dictionary) = &self.dictionary_data {
-            // assume the indices are uniformly distributed.
-            let estimated_size_bytes = dictionary.data_size()
-                * (data.num_values() + dictionary.num_values() - 1)
-                / dictionary.num_values();
-            let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
-
-            // if dictionary encoding is applied, decode indices based on their actual bit width
-            if let DataBlock::FixedWidth(fixed_width_data_block) = data {
-                match fixed_width_data_block.bits_per_value {
-                    32 => {
-                        let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i32>();
-                        let indices = indices.as_ref();
-
-                        indices.iter().for_each(|&idx| {
-                            data_builder.append(dictionary, idx as u64..idx as u64 + 1);
-                        });
-                    }
-                    64 => {
-                        let indices = fixed_width_data_block.data.borrow_to_typed_slice::<i64>();
-                        let indices = indices.as_ref();
-
-                        indices.iter().for_each(|&idx| {
-                            data_builder.append(dictionary, idx as u64..idx as u64 + 1);
-                        });
-                    }
-                    _ => {
-                        return Err(lance_core::Error::Internal {
-                            message: format!(
-                                "Unsupported dictionary index bit width: {} bits",
-                                fixed_width_data_block.bits_per_value
-                            ),
-                            location: location!(),
-                        });
-                    }
-                }
-
-                let data = data_builder.finish();
-                return Ok(DecodedPage {
-                    data,
-                    repdef: unraveler,
+            // Don't decode here, that happens later (if needed)
+            let DataBlock::FixedWidth(indices) = data else {
+                return Err(lance_core::Error::Internal {
+                    message: format!(
+                        "Expected FixedWidth DataBlock for dictionary indices, got {:?}",
+                        data
+                    ),
+                    location: location!(),
                 });
-            }
+            };
+            data = DataBlock::Dictionary(DictionaryDataBlock::from_parts(
+                indices,
+                dictionary.as_ref().clone(),
+            ));
         }
 
         Ok(DecodedPage {
@@ -1311,11 +1284,40 @@ enum PreambleAction {
     Absent,
 }
 
-// TODO: Add test cases for the all-preamble and all-trailer cases
-
 // When we schedule a chunk we use the repetition index (or, if none exists, just the # of items
 // in each chunk) to map a user requested range into a set of ChunkInstruction objects which tell
 // us how exactly to read from the chunk.
+//
+// Examples:
+//
+// | Chunk 0     | Chunk 1   | Chunk 2   | Chunk 3 |
+// | xxxxyyyyzzz | zzzzzzzzz | zzzzzzzzz | aaabbcc |
+//
+// Full read (0..6)
+//
+// Chunk 0: (several rows, ends with trailer)
+//   preamble: absent
+//   rows_to_skip: 0
+//   rows_to_take: 3 (x, y, z)
+//   take_trailer: true
+//
+// Chunk 1: (all preamble, ends with trailer)
+//   preamble: take
+//   rows_to_skip: 0
+//   rows_to_take: 0
+//   take_trailer: true
+//
+// Chunk 2: (all preamble, no trailer)
+//   preamble: take
+//   rows_to_skip: 0
+//   rows_to_take: 0
+//   take_trailer: false
+//
+// Chunk 3: (several rows, no trailer or preamble)
+//   preamble: absent
+//   rows_to_skip: 0
+//   rows_to_take: 3 (a, b, c)
+//   take_trailer: false
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChunkInstructions {
     // The index of the chunk to read
@@ -1330,13 +1332,13 @@ struct ChunkInstructions {
     //
     // If this is non-zero then premable must not be Take
     rows_to_skip: u64,
-    // How many complete (non-preamble / non-trailer) rows to take
+    // How many rows to take.  If a row splits across chunks then we will count the row in the first
+    // chunk that contains the row.
     rows_to_take: u64,
     // A "trailer" is when a chunk ends with a partial list.  If there is no repetition index there is
     // never a trailer.
     //
-    // It's possible for a chunk to be entirely trailer.  This would mean the chunk starts with the beginning
-    // of a list and that list is continued in the next chunk.
+    // A chunk that is all preamble may or may not have a trailer.
     //
     // If this is true then we want to include the trailer
     take_trailer: bool,
@@ -1428,7 +1430,10 @@ impl ChunkInstructions {
                             preamble: PreambleAction::Take,
                             rows_to_skip: 0,
                             rows_to_take: 0,
-                            take_trailer: false,
+                            // We still need to look at has_trailer to distinguish between "all preamble
+                            // and row ends at end of chunk" and "all preamble and row bleeds into next
+                            // chunk".  Both cases will have 0 rows available.
+                            take_trailer: chunk.has_trailer,
                         });
                         // Only set need_preamble = false if the chunk has at least one row,
                         // Or we are reaching the last block,
@@ -1468,13 +1473,11 @@ impl ChunkInstructions {
                 } else {
                     PreambleAction::Absent
                 };
-                let mut rows_to_take_no_trailer = rows_to_take;
 
                 // Are we taking the trailer?  If so, make sure we mark that we need the preamble
                 if rows_to_take == rows_avail && chunk.has_trailer {
                     take_trailer = true;
                     need_preamble = true;
-                    rows_to_take_no_trailer -= 1;
                 } else {
                     need_preamble = false;
                 };
@@ -1483,7 +1486,7 @@ impl ChunkInstructions {
                     preamble,
                     chunk_idx: block_index,
                     rows_to_skip: to_skip,
-                    rows_to_take: rows_to_take_no_trailer,
+                    rows_to_take,
                     take_trailer,
                 });
 
@@ -1525,7 +1528,7 @@ impl ChunkInstructions {
     ) -> (ChunkDrainInstructions, bool) {
         // If we need the premable then we shouldn't be skipping anything
         debug_assert!(!*need_preamble || *skip_in_chunk == 0);
-        let mut rows_avail = self.rows_to_take - *skip_in_chunk;
+        let rows_avail = self.rows_to_take - *skip_in_chunk;
         let has_preamble = self.preamble != PreambleAction::Absent;
         let preamble_action = match (*need_preamble, has_preamble) {
             (true, true) => PreambleAction::Take,
@@ -1534,16 +1537,16 @@ impl ChunkInstructions {
             (false, false) => PreambleAction::Absent,
         };
 
-        // Did the scheduled chunk have a trailer?  If so, we have one extra row available
-        if self.take_trailer {
-            rows_avail += 1;
-        }
-
         // How many rows are we actually taking in this take step (including the preamble
         // and trailer both as individual rows)
         let rows_taking = if *rows_desired >= rows_avail {
             // We want all the rows.  If there is a trailer we are grabbing it and will need
             // the preamble of the next chunk
+            // If there is a trailer and we are taking all the rows then we need the preamble
+            // of the next chunk.
+            //
+            // Also, if this chunk is entirely preamble (rows_avail == 0 && !take_trailer) then we
+            // need the preamble of the next chunk.
             *need_preamble = self.take_trailer;
             rows_avail
         } else {
@@ -1709,14 +1712,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             num_rows,
             chunk_instructions
                 .iter()
-                .map(|ci| {
-                    let taken = ci.rows_to_take;
-                    if ci.take_trailer {
-                        taken + 1
-                    } else {
-                        taken
-                    }
-                })
+                .map(|ci| ci.rows_to_take)
                 .sum::<u64>()
         );
 
@@ -1725,6 +1721,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .map(|ci| ci.chunk_idx)
             .unique()
             .collect::<Vec<_>>();
+
         let mut loaded_chunks = self.lookup_chunks(&chunks_needed);
         let chunk_ranges = loaded_chunks
             .iter()
@@ -3257,7 +3254,7 @@ const MINIBLOCK_ALIGNMENT: usize = 8;
 /// If the data is wide then we zip together the repetition and definition value
 /// with the value data into a single buffer.  This approach is called "zipped".
 ///
-/// If there is any repetition information then we create a repetition index (TODO)
+/// If there is any repetition information then we create a repetition index
 ///
 /// In addition, the compression process may create zero or more metadata buffers.
 /// For example, a dictionary compression will create dictionary metadata.  Any
@@ -3708,9 +3705,9 @@ impl PrimitiveStructuralEncoder {
         let repdef = RepDefBuilder::serialize(repdefs);
 
         if let DataBlock::AllNull(_null_block) = data {
-            // If we got here then all the data is null but we have rep/def information that
-            // we need to store.
-            todo!()
+            // We should not be using mini-block for all-null.  There are other structural
+            // encodings for that.
+            unreachable!()
         }
 
         let num_items = data.num_values();
@@ -4092,170 +4089,6 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn dictionary_encode(mut data_block: DataBlock) -> (DataBlock, DataBlock) {
-        let cardinality = data_block
-            .get_stat(Stat::Cardinality)
-            .unwrap()
-            .as_primitive::<UInt64Type>()
-            .value(0);
-        match data_block {
-            DataBlock::FixedWidth(ref mut fixed_width_data_block) => {
-                // Currently FixedWidth DataBlock with only bits_per_value 128 has cardinality
-                // TODO: a follow up PR to support `FixedWidth DataBlock with bits_per_value == 256`.
-                let mut map = HashMap::new();
-                let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
-                let u128_slice = u128_slice.as_ref();
-                let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
-                let mut indices_buffer =
-                    Vec::with_capacity(fixed_width_data_block.num_values as usize);
-                let mut curr_idx: i32 = 0;
-                u128_slice.iter().for_each(|&value| {
-                    let idx = *map.entry(value).or_insert_with(|| {
-                        dictionary_buffer.push(value);
-                        curr_idx += 1;
-                        curr_idx - 1
-                    });
-                    indices_buffer.push(idx);
-                });
-                let dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                    data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                    bits_per_value: 128,
-                    num_values: curr_idx as u64,
-                    block_info: BlockInfo::default(),
-                });
-                let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                    data: LanceBuffer::reinterpret_vec(indices_buffer),
-                    bits_per_value: 32,
-                    num_values: fixed_width_data_block.num_values,
-                    block_info: BlockInfo::default(),
-                });
-                // Todo: if we decide to do eager statistics computing, wrap statistics computing
-                // in DataBlock constructor.
-                indices_data_block.compute_stat();
-
-                (indices_data_block, dictionary_data_block)
-            }
-            DataBlock::VariableWidth(ref mut variable_width_data_block) => {
-                match variable_width_data_block.bits_per_offset {
-                    32 => {
-                        let mut map = HashMap::new();
-                        let offsets = variable_width_data_block
-                            .offsets
-                            .borrow_to_typed_slice::<u32>();
-                        let offsets = offsets.as_ref();
-
-                        let max_len = variable_width_data_block.get_stat(Stat::MaxLength).expect(
-                            "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                        );
-                        let max_len = max_len.as_primitive::<UInt64Type>().value(0);
-
-                        let mut dictionary_buffer: Vec<u8> =
-                            Vec::with_capacity((max_len * cardinality) as usize);
-                        let mut dictionary_offsets_buffer = vec![0];
-                        let mut curr_idx = 0;
-                        let mut indices_buffer =
-                            Vec::with_capacity(variable_width_data_block.num_values as usize);
-
-                        offsets
-                            .iter()
-                            .zip(offsets.iter().skip(1))
-                            .for_each(|(&start, &end)| {
-                                let key =
-                                    &variable_width_data_block.data[start as usize..end as usize];
-                                let idx: i32 = *map.entry(U8SliceKey(key)).or_insert_with(|| {
-                                    dictionary_buffer.extend_from_slice(key);
-                                    dictionary_offsets_buffer.push(dictionary_buffer.len() as u32);
-                                    curr_idx += 1;
-                                    curr_idx - 1
-                                });
-                                indices_buffer.push(idx);
-                            });
-
-                        let dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
-                            data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                            offsets: LanceBuffer::reinterpret_vec(dictionary_offsets_buffer),
-                            bits_per_offset: 32,
-                            num_values: curr_idx as u64,
-                            block_info: BlockInfo::default(),
-                        });
-
-                        let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                            data: LanceBuffer::reinterpret_vec(indices_buffer),
-                            bits_per_value: 32,
-                            num_values: variable_width_data_block.num_values,
-                            block_info: BlockInfo::default(),
-                        });
-                        // Todo: if we decide to do eager statistics computing, wrap statistics computing
-                        // in DataBlock constructor.
-                        indices_data_block.compute_stat();
-
-                        (indices_data_block, dictionary_data_block)
-                    }
-                    64 => {
-                        let mut map = HashMap::new();
-                        let offsets = variable_width_data_block
-                            .offsets
-                            .borrow_to_typed_slice::<u64>();
-                        let offsets = offsets.as_ref();
-
-                        let max_len = variable_width_data_block.get_stat(Stat::MaxLength).expect(
-                            "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                        );
-                        let max_len = max_len.as_primitive::<UInt64Type>().value(0);
-
-                        let mut dictionary_buffer: Vec<u8> =
-                            Vec::with_capacity((max_len * cardinality) as usize);
-                        let mut dictionary_offsets_buffer = vec![0];
-                        let mut curr_idx = 0;
-                        let mut indices_buffer =
-                            Vec::with_capacity(variable_width_data_block.num_values as usize);
-
-                        offsets
-                            .iter()
-                            .zip(offsets.iter().skip(1))
-                            .for_each(|(&start, &end)| {
-                                let key =
-                                    &variable_width_data_block.data[start as usize..end as usize];
-                                let idx: i64 = *map.entry(U8SliceKey(key)).or_insert_with(|| {
-                                    dictionary_buffer.extend_from_slice(key);
-                                    dictionary_offsets_buffer.push(dictionary_buffer.len() as u64);
-                                    curr_idx += 1;
-                                    curr_idx - 1
-                                });
-                                indices_buffer.push(idx);
-                            });
-
-                        let dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
-                            data: LanceBuffer::reinterpret_vec(dictionary_buffer),
-                            offsets: LanceBuffer::reinterpret_vec(dictionary_offsets_buffer),
-                            bits_per_offset: 64,
-                            num_values: curr_idx as u64,
-                            block_info: BlockInfo::default(),
-                        });
-
-                        let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
-                            data: LanceBuffer::reinterpret_vec(indices_buffer),
-                            bits_per_value: 64,
-                            num_values: variable_width_data_block.num_values,
-                            block_info: BlockInfo::default(),
-                        });
-                        // Todo: if we decide to do eager statistics computing, wrap statistics computing
-                        // in DataBlock constructor.
-                        indices_data_block.compute_stat();
-
-                        (indices_data_block, dictionary_data_block)
-                    }
-                    _ => {
-                        unreachable!()
-                    }
-                }
-            }
-            _ => {
-                unreachable!("dictionary encode called with data block {:?}", data_block)
-            }
-        }
-    }
-
     fn should_dictionary_encode(data_block: &DataBlock, field: &Field) -> bool {
         // Don't dictionary encode tiny arrays
         let too_small = env::var("LANCE_ENCODING_DICT_TOO_SMALL")
@@ -4359,18 +4192,32 @@ impl PrimitiveStructuralEncoder {
                 }
             }
 
-            // The top-level validity is encoded in repdef so we can remove it.
-            let data_block = data_block.remove_outer_validity();
-
-
-            if Self::should_dictionary_encode(&data_block, &field) {
+            if let DataBlock::Dictionary(dict) = data_block {
+                log::debug!("Encoding column {} with {} items using dictionary encoding (already dictionary encoded)", column_idx, num_values);
+                let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
+                // TODO: https://github.com/lancedb/lance/issues/4809
+                // If we compute stats on dictionary_data_block => panic.
+                // If we don't compute stats on indices_data_block => panic.
+                // This is messy.  Don't make me call compute_stat ever.
+                indices_data_block.compute_stat();
+                Self::encode_miniblock(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    indices_data_block,
+                    repdefs,
+                    row_number,
+                    Some(dictionary_data_block),
+                    num_rows
+                )
+            } else if Self::should_dictionary_encode(&data_block, &field) {
                 log::debug!(
                     "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
                     column_idx,
                     num_values
                 );
                 let (indices_data_block, dictionary_data_block) =
-                    Self::dictionary_encode(data_block);
+                    dict::dictionary_encode(data_block);
                 Self::encode_miniblock(
                     column_idx,
                     &field,
@@ -4421,28 +4268,37 @@ impl PrimitiveStructuralEncoder {
     }
 
     fn extract_validity_buf(
-        array: &dyn Array,
+        array: Arc<dyn Array>,
         repdef: &mut RepDefBuilder,
         keep_original_array: bool,
-    ) {
+    ) -> Result<Arc<dyn Array>> {
         if let Some(validity) = array.nulls() {
             if keep_original_array {
                 repdef.add_validity_bitmap(validity.clone());
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
             }
+            let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
+            Ok(make_array(data_no_nulls))
         } else {
             repdef.add_no_null(array.len());
+            Ok(array)
         }
     }
 
-    fn extract_validity(array: &dyn Array, repdef: &mut RepDefBuilder, keep_original_array: bool) {
+    fn extract_validity(
+        mut array: Arc<dyn Array>,
+        repdef: &mut RepDefBuilder,
+        keep_original_array: bool,
+    ) -> Result<Arc<dyn Array>> {
         match array.data_type() {
             DataType::Null => {
                 repdef.add_validity_bitmap(NullBuffer::new(BooleanBuffer::new_unset(array.len())));
+                Ok(array)
             }
             DataType::Dictionary(_, _) => {
-                unreachable!()
+                array = dict::normalize_dict_nulls(array)?;
+                Self::extract_validity_buf(array, repdef, keep_original_array)
             }
             // Extract our validity buf but NOT any child validity bufs. (they will be encoded in
             // as part of the values).  Note: for FSL we do not use repdef.add_fsl because we do
@@ -4467,7 +4323,7 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        Self::extract_validity(array.as_ref(), &mut repdef, self.keep_original_array);
+        let array = Self::extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
 
         if let Some((arrays, row_number, num_rows)) =
@@ -4921,7 +4777,7 @@ mod tests {
                 chunk_idx: 0,
                 preamble: PreambleAction::Absent,
                 rows_to_skip: 0,
-                rows_to_take: 5,
+                rows_to_take: 6,
                 take_trailer: true,
             },
             ChunkInstructions {
@@ -4935,7 +4791,7 @@ mod tests {
                 chunk_idx: 2,
                 preamble: PreambleAction::Absent,
                 rows_to_skip: 0,
-                rows_to_take: 4,
+                rows_to_take: 5,
                 take_trailer: true,
             },
             ChunkInstructions {
@@ -5002,7 +4858,7 @@ mod tests {
                     chunk_idx: 0,
                     preamble: PreambleAction::Absent,
                     rows_to_skip: 5,
-                    rows_to_take: 0,
+                    rows_to_take: 1,
                     take_trailer: true,
                 },
                 ChunkInstructions {

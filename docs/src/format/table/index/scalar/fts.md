@@ -134,8 +134,7 @@ Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Itali
 Lance SDKs provide dedicated full text search APIs to leverage the FTS index capabilities. 
 These APIs support complex query types beyond simple token matching, 
 enabling sophisticated text search operations.
-
-### Supported Query Types
+Here are the query types enabled by the FTS index:
 
 | Query Type          | Description                                                                              | Example Usage                                        | Result Type |
 |---------------------|------------------------------------------------------------------------------------------|------------------------------------------------------|-------------|

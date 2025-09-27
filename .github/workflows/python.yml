@@ -95,7 +95,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["9", "12"]
+        python-minor-version: ["9", "13"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04"
     defaults:
@@ -120,7 +120,7 @@ jobs:
       - uses: ./.github/workflows/build_linux_wheel
       - uses: ./.github/workflows/run_tests
       - name: Upload wheels as artifacts
-        if: ${{ matrix.python-minor-version == '12' }}
+        if: ${{ matrix.python-minor-version == '13' }}
         uses: actions/upload-artifact@v4
         with:
           name: linux-wheels
@@ -145,7 +145,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.12
+          python-version: 3.13
       - name: Download wheels
         uses: actions/download-artifact@v4
         with:
@@ -168,7 +168,7 @@ jobs:
   linux-arm:
     timeout-minutes: 45
     runs-on: ubuntu-2404-4x-arm64
-    name: Python Linux 3.12 ARM
+    name: Python Linux 3.13 ARM
     defaults:
       run:
         shell: bash
@@ -181,7 +181,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.12
+          python-version: 3.13
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -199,7 +199,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   mac:
     timeout-minutes: 45
-    name: Python macOS 3.12 ARM
+    name: Python macOS 3.13 ARM
     runs-on: "macos-14"
     defaults:
       run:
@@ -213,7 +213,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
