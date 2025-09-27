@@ -948,8 +948,8 @@ mod tests {
     ) {
         let dataset_root_dir = "file:///var/balabala/dataset1".to_string();
         let base_location = BranchLocation {
-            path: Path::from(dataset_root_dir.clone()),
-            uri: dataset_root_dir,
+            path: Path::from(format!("{}/tree/random_branch", dataset_root_dir.as_str())),
+            uri: format!("{}/tree/random_branch", dataset_root_dir.as_str()),
             branch: Some("random_branch".to_string()),
         };
 

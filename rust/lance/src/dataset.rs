@@ -8015,6 +8015,7 @@ mod tests {
     // 3. Checkout branch from main, a branch and a global tag
     // 4. List branches and verify branch metadata
     // 5. Delete branches
+    // 6. Delete zombie branches
     #[tokio::test]
     async fn test_branch() {
         let test_dir = tempdir().unwrap();
@@ -8262,7 +8263,7 @@ mod tests {
         // Now "feature/nathan/branch3" is a zombie branch
         // Use delete_branch to verify if the directory is cleaned up
         dataset
-            .delete_branch("feature/nathan/branch3")
+            .force_delete_branch("feature/nathan/branch3")
             .await
             .unwrap();
         let cleaned_path = Path::parse(format!("{}/tree/feature", test_uri)).unwrap();
