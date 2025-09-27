@@ -25,8 +25,8 @@ use crate::rowids::{read_row_ids, RowIdSequence};
 /// and enables zipped iteration without building a map.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub struct RowVersionRun {
-    pub span: U64Segment,
-    pub version: u64,
+    span: U64Segment,
+    version: u64,
 }
 
 impl RowVersionRun {
@@ -466,6 +466,117 @@ pub fn set_version_metadata_for_fragments_by_ids(
             fragment.row_latest_update_version_meta = Some(meta);
         }
     }
+}
+
+/// Refresh row-level latest update version metadata for a full fragment rewrite-column update.
+///
+/// This sets a uniform version sequence for all rows in the fragment to `current_version`.
+pub fn refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+    fragment: &mut Fragment,
+    current_version: u64,
+) -> Result<()> {
+    let row_count = if let Some(pr) = fragment.physical_rows {
+        pr as u64
+    } else if let Some(row_id_meta) = fragment.row_id_meta.as_ref() {
+        match row_id_meta {
+            crate::format::RowIdMeta::Inline(data) => {
+                let sequence = read_row_ids(data).unwrap();
+                sequence.len()
+            }
+            // Follow existing behavior: external sequence not yet supported here
+            crate::format::RowIdMeta::External(_file) => 0,
+        }
+    } else {
+        0
+    };
+
+    if row_count > 0 {
+        let version_seq =
+            RowLatestUpdateVersionSequence::from_uniform_row_count(row_count, current_version);
+        let version_meta = RowLatestUpdateVersionMeta::from_sequence(&version_seq)?;
+        fragment.row_latest_update_version_meta = Some(version_meta);
+    }
+
+    Ok(())
+}
+
+/// Refresh row-level latest update version metadata for a partial fragment rewrite-column update.
+///
+/// `updated_offsets` are local row offsets (within the fragment) that have been updated.
+/// Existing version metadata is preserved and only the updated positions are set to `current_version`.
+/// If no existing metadata is present, positions default to `prev_version`.
+pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+    fragment: &mut Fragment,
+    updated_offsets: &[usize],
+    current_version: u64,
+    prev_version: u64,
+) -> Result<()> {
+    // Determine row count for fragment
+    let row_count_u64: u64 = if let Some(pr) = fragment.physical_rows {
+        pr as u64
+    } else if let Some(row_id_meta) = fragment.row_id_meta.as_ref() {
+        match row_id_meta {
+            crate::format::RowIdMeta::Inline(data) => {
+                let sequence = read_row_ids(data).unwrap();
+                sequence.len()
+            }
+            crate::format::RowIdMeta::External(_file) => {
+                // Preserve original behavior for external sequences
+                todo!("External file loading not yet implemented")
+            }
+        }
+    } else {
+        0
+    };
+
+    if row_count_u64 > 0 {
+        // Build base version vector from existing meta or previous dataset version
+        let mut base_versions: Vec<u64> = Vec::with_capacity(row_count_u64 as usize);
+        if let Some(meta) = fragment.row_latest_update_version_meta.as_ref() {
+            if let Ok(base_seq) = meta.load_sequence() {
+                for pos in 0..(row_count_u64 as usize) {
+                    base_versions.push(base_seq.version_at(pos).unwrap_or(prev_version));
+                }
+            } else {
+                base_versions.resize(row_count_u64 as usize, prev_version);
+            }
+        } else {
+            base_versions.resize(row_count_u64 as usize, prev_version);
+        }
+
+        // Apply updates to updated positions
+        for &pos in updated_offsets {
+            if pos < base_versions.len() {
+                base_versions[pos] = current_version;
+            }
+        }
+
+        // Compress into runs
+        let mut runs: Vec<RowVersionRun> = Vec::new();
+        if !base_versions.is_empty() {
+            let mut start = 0usize;
+            let mut curr_ver = base_versions[0];
+            for (idx, &ver) in base_versions.iter().enumerate().skip(1) {
+                if ver != curr_ver {
+                    runs.push(RowVersionRun {
+                        span: U64Segment::Range(start as u64..idx as u64),
+                        version: curr_ver,
+                    });
+                    start = idx;
+                    curr_ver = ver;
+                }
+            }
+            runs.push(RowVersionRun {
+                span: U64Segment::Range(start as u64..base_versions.len() as u64),
+                version: curr_ver,
+            });
+        }
+        let new_seq = RowLatestUpdateVersionSequence { runs };
+        let new_meta = RowLatestUpdateVersionMeta::from_sequence(&new_seq)?;
+        fragment.row_latest_update_version_meta = Some(new_meta);
+    }
+
+    Ok(())
 }
 
 // Protobuf conversion implementations

@@ -91,12 +91,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::{MemWal, MemWalId};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
-use lance_table::format::{
-    Fragment, IndexMetadata, RowIdMeta, RowLatestUpdateVersionMeta, RowLatestUpdateVersionSequence,
-    RowVersionRun,
-};
-use lance_table::rowids::read_row_ids;
-use lance_table::rowids::segment::U64Segment;
+use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::{location, ResultExt};
@@ -934,30 +929,11 @@ impl MergeInsertJob {
                     metadata.files.push(data_file);
 
                     if dataset.manifest.uses_stable_row_ids() {
-                        // in-place frag override, do the in-place refresh the frag's row_latest_update_version_meta
-                        let row_count = if let Some(pr) = metadata.physical_rows {
-                            pr as u64
-                        } else if let Some(row_id_meta) = metadata.row_id_meta.as_ref() {
-                            match row_id_meta {
-                                RowIdMeta::Inline(data) => {
-                                    let sequence = read_row_ids(data).unwrap();
-                                    sequence.len()
-                                }
-                                RowIdMeta::External(_file) => 0,
-                            }
-                        } else {
-                            0
-                        };
-                        if row_count > 0 {
-                            let version_seq =
-                                RowLatestUpdateVersionSequence::from_uniform_row_count(
-                                    row_count,
-                                    current_version,
-                                );
-                            let version_meta =
-                                RowLatestUpdateVersionMeta::from_sequence(&version_seq)?;
-                            metadata.row_latest_update_version_meta = Some(version_meta);
-                        }
+                        // in-place frag override: refresh row-level latest update version meta
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                            &mut metadata,
+                            current_version,
+                        )?;
                     }
 
                     updated_fragments.lock().unwrap().push(metadata);
@@ -1067,76 +1043,12 @@ impl MergeInsertJob {
                         updated_offsets.sort_unstable();
                         updated_offsets.dedup();
 
-                        // Determine row count for fragment
-                        let row_count_u64: u64 = if let Some(pr) = updated_fragment.physical_rows {
-                            pr as u64
-                        } else if let Some(row_id_meta) = updated_fragment.row_id_meta.as_ref() {
-                            match row_id_meta {
-                                RowIdMeta::Inline(data) => {
-                                    let sequence = read_row_ids(data).unwrap();
-                                    sequence.len()
-                                }
-                                RowIdMeta::External(_file) => {
-                                    todo!("External file loading not yet implemented")
-                                }
-                            }
-                        } else {
-                            0
-                        };
-
-                        if row_count_u64 > 0 {
-                            // Build base version vector from existing meta or previous dataset version
-                            let prev_version = dataset.manifest.version;
-                            let mut base_versions: Vec<u64> =
-                                Vec::with_capacity(row_count_u64 as usize);
-                            if let Some(meta) =
-                                updated_fragment.row_latest_update_version_meta.as_ref()
-                            {
-                                if let Ok(base_seq) = meta.load_sequence() {
-                                    for pos in 0..(row_count_u64 as usize) {
-                                        base_versions
-                                            .push(base_seq.version_at(pos).unwrap_or(prev_version));
-                                    }
-                                } else {
-                                    base_versions.resize(row_count_u64 as usize, prev_version);
-                                }
-                            } else {
-                                base_versions.resize(row_count_u64 as usize, prev_version);
-                            }
-
-                            // Apply updates to updated positions
-                            for &pos in &updated_offsets {
-                                if pos < base_versions.len() {
-                                    base_versions[pos] = current_version;
-                                }
-                            }
-
-                            // Compress into runs
-                            let mut runs: Vec<RowVersionRun> = Vec::new();
-                            if !base_versions.is_empty() {
-                                let mut start = 0usize;
-                                let mut curr_ver = base_versions[0];
-                                for (idx, &ver) in base_versions.iter().enumerate().skip(1) {
-                                    if ver != curr_ver {
-                                        runs.push(RowVersionRun {
-                                            span: U64Segment::Range(start as u64..idx as u64),
-                                            version: curr_ver,
-                                        });
-                                        start = idx;
-                                        curr_ver = ver;
-                                    }
-                                }
-                                runs.push(RowVersionRun {
-                                    span: U64Segment::Range(
-                                        start as u64..base_versions.len() as u64,
-                                    ),
-                                    version: curr_ver,
-                                });
-                            }
-                            let new_seq = RowLatestUpdateVersionSequence { runs };
-                            let new_meta = RowLatestUpdateVersionMeta::from_sequence(&new_seq)?;
-                            updated_fragment.row_latest_update_version_meta = Some(new_meta);
-                        }
+                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                            &mut updated_fragment,
+                            &updated_offsets,
+                            current_version,
+                            dataset.manifest.version,
+                        )?;
                     }
 
                     updated_fragments.lock().unwrap().push(updated_fragment);
