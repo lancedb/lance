@@ -111,7 +111,7 @@ impl Refs {
     }
 
     pub fn root(&self) -> Result<BranchLocation> {
-        self.base_location.find_root()
+        self.base_location.find_main()
     }
 }
 
@@ -470,14 +470,12 @@ impl Branches<'_> {
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
             self.object_store().delete(&branch_file).await?;
+        } else if forced {
+            log::warn!("BranchContent of {} does not exist", branch);
         } else {
-            if forced {
-                log::warn!("BranchContent of {} does not exist", branch);
-            } else {
-                return Err(Error::RefNotFound {
-                    message: format!("Branch {} does not exist", branch),
-                });
-            }
+            return Err(Error::RefNotFound {
+                message: format!("Branch {} does not exist", branch),
+            });
         }
 
         // Clean up branch directories

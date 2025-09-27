@@ -510,7 +510,7 @@ impl Dataset {
             if let Some(branch_name) = branch.as_deref() {
                 self.find_branch_location(branch_name)?
             } else {
-                self.branch_location().find_root()?
+                self.branch_location().find_main()?
             }
         } else {
             self.branch_location()

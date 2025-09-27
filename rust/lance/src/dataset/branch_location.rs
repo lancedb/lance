@@ -4,7 +4,9 @@
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::location;
-use crate::dataset::refs;
+use std::env;
+
+pub const BRANCH_DIR: &str = "tree";
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BranchLocation {
@@ -15,24 +17,43 @@ pub struct BranchLocation {
 
 impl BranchLocation {
     /// Find the root location
-    pub fn find_root(&self) -> Result<Self> {
+    pub fn find_main(&self) -> Result<Self> {
         if let Some(branch_name) = self.branch.as_ref() {
-            refs::check_valid_branch(branch_name)?;
-            let mut path = self.path.clone();
-            let mut uri = self.uri.clone();
-            let segment_count = branch_name.split('/').count();
-            for _ in 0..segment_count + 1 {
-                path = Path::parse(Self::parent_str(path.as_ref())?)?;
-                uri = Self::parent_str(uri.as_str())?.to_string();
-            }
+            let root_path_str = Self::get_root_path(self.path.as_ref(), branch_name)?;
+            let root_uri = Self::get_root_path(self.uri.as_str(), branch_name)?;
             Ok(Self {
-                path,
-                uri,
+                path: Path::parse(root_path_str)?,
+                uri: root_uri,
                 branch: None,
             })
         } else {
             Ok(self.clone())
         }
+    }
+
+    fn get_root_path(path_str: &str, branch_name: &str) -> Result<String> {
+        let branch_suffix = format!("/{}/{}", BRANCH_DIR, branch_name);
+        let branch_suffix = branch_suffix.as_str();
+        let root_path_str = path_str
+            .strip_suffix(branch_suffix)
+            .or_else(|| {
+                if env::consts::OS == "windows" {
+                    let windows_suffix = branch_suffix.replace('/', "\\");
+                    path_str.strip_suffix(&windows_suffix)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    format!(
+                        "Can not find the root location of branch {} by uri {}",
+                        branch_name, path_str,
+                    ),
+                    location!(),
+                )
+            })?;
+        Ok(root_path_str.to_string())
     }
 
     /// Find the target branch location
@@ -41,7 +62,7 @@ impl BranchLocation {
             return Ok(self.clone());
         }
 
-        let root_location = self.find_root()?;
+        let root_location = self.find_main()?;
         if let Some(target_branch) = branch_name.as_ref() {
             let (new_path, new_uri) = {
                 // Handle empty segment
@@ -65,18 +86,6 @@ impl BranchLocation {
             })
         } else {
             Ok(root_location)
-        }
-    }
-
-    fn parent_str(path_str: &str) -> Result<&str> {
-        let trimmed = path_str.trim_end_matches('/');
-        match trimmed.rfind('/') {
-            Some(0) => Ok("/"),
-            Some(pos) => Ok(&trimmed[..pos]),
-            _ => Err(Error::invalid_input(
-                format!("Can not construct the parent path of {}", path_str),
-                location!(),
-            )),
         }
     }
 
@@ -111,27 +120,27 @@ mod tests {
     }
 
     #[test]
-    fn test_find_root_from_branch() {
+    fn test_find_main_from_branch() {
         let root_path = tempdir().unwrap().path().to_owned();
         let location = create_branch_location(root_path.clone());
-        let root_location = location.find_root().unwrap();
+        let main_location = location.find_main().unwrap();
 
         assert_eq!(
-            root_location.path.as_ref(),
+            main_location.path.as_ref(),
             Path::parse(root_path.to_str().unwrap()).unwrap().as_ref()
         );
-        assert_eq!(root_location.uri, root_path.to_str().unwrap().to_string());
-        assert_eq!(root_location.branch, None);
-        assert!(fs::create_dir(std::path::Path::new(root_location.uri.as_str())).is_ok());
+        assert_eq!(main_location.uri, root_path.to_str().unwrap().to_string());
+        assert_eq!(main_location.branch, None);
+        assert!(fs::create_dir(std::path::Path::new(main_location.uri.as_str())).is_ok());
     }
 
     #[test]
-    fn test_find_root_from_root() {
+    fn test_find_main_from_root() {
         let root_path = tempdir().unwrap().path().to_owned();
         let mut location = create_branch_location(root_path.clone());
         // Change current branch to Main
         location.branch = None;
-        let root_location = location.find_root().unwrap();
+        let root_location = location.find_main().unwrap();
 
         assert_eq!(root_location.path, location.path);
         assert_eq!(root_location.uri, location.uri);
@@ -158,7 +167,7 @@ mod tests {
         let location = create_branch_location(root_path.clone());
         let main_location = location.find_branch(None).unwrap();
 
-        let expected_root = location.find_root().unwrap();
+        let expected_root = location.find_main().unwrap();
         assert_eq!(main_location.path, expected_root.path);
         assert_eq!(main_location.uri, expected_root.uri);
         assert_eq!(main_location.branch, None);
@@ -227,5 +236,38 @@ mod tests {
     }
 
     #[test]
-    fn test_find_branch_with_slash() {}
+    #[cfg(target_os = "windows")]
+    fn test_branch_location_on_windows() {
+        let branch_location = BranchLocation {
+            path: Path::parse("C:\\Users\\Username\\Documents\\dataset\\tree\\feature\\new")
+                .unwrap(),
+            uri: "C:\\Users\\Username\\Documents\\dataset\\tree\\feature\\new".to_string(),
+            branch: Some("feature/new".to_string()),
+        };
+
+        let main_location = branch_location.find_main().unwrap();
+        assert_eq!(main_location.uri, "C:\\Users\\Username\\Documents\\dataset");
+        assert_eq!(
+            main_location.path.as_ref(),
+            Path::parse("C:\\Users\\Username\\Documents\\dataset")
+                .unwrap()
+                .as_ref()
+        );
+        assert_eq!(main_location.branch, None);
+
+        let new_branch = branch_location
+            .find_branch(Some("feature/nathan/A".to_string()))
+            .unwrap();
+        assert_eq!(
+            new_branch.uri,
+            "C:\\Users\\Username\\Documents\\dataset/tree/feature/nathan/A"
+        );
+        assert_eq!(
+            new_branch.path.as_ref(),
+            Path::parse("C:\\Users\\Username\\Documents\\dataset/tree/feature/nathan/A")
+                .unwrap()
+                .as_ref()
+        );
+        assert_eq!(new_branch.branch, Some("feature/nathan/A".to_string()));
+    }
 }
