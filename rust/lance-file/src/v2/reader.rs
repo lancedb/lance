@@ -1738,7 +1738,7 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            LanceFileVersion::default(),
+            version,
             None,
         )
         .await
@@ -1756,7 +1756,7 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            LanceFileVersion::default(),
+            version,
             None,
         )
         .await

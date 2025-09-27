@@ -687,7 +687,7 @@ impl ValueDecompressor {
 
         // Finally, restore the structure
         let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bits_per_value,
+            bits_per_value: self.bits_per_item,
             num_values: num_items as u64,
             data: LanceBuffer::from(data_buffer),
             block_info: BlockInfo::new(),
@@ -758,8 +758,8 @@ pub(crate) mod tests {
     };
 
     use arrow_array::{
-        make_array, new_null_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray,
-        Int32Array, ListArray, UInt8Array,
+        make_array, new_null_array, types::UInt32Type, Array, ArrayRef, Decimal128Array,
+        FixedSizeListArray, Int32Array, ListArray, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
@@ -776,7 +776,10 @@ pub(crate) mod tests {
             physical::value::ValueDecompressor,
         },
         format::pb21::compressive_encoding::Compression,
-        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
+        testing::{
+            check_basic_random, check_round_trip_encoding_generated,
+            check_round_trip_encoding_of_data, FnArrayGeneratorProvider, TestCases,
+        },
         version::LanceFileVersion,
     };
 
@@ -1147,6 +1150,20 @@ pub(crate) mod tests {
         );
 
         assert_eq!(decompressed.as_ref(), sample_array.as_ref());
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_fsl_nullable_items() {
+        let datagen = Box::new(FnArrayGeneratorProvider::new(move || {
+            lance_datagen::array::rand_vec_nullable::<UInt32Type>(Dimension::from(128), 0.5)
+        }));
+
+        let field = Field::new(
+            "",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, true)), 128),
+            false,
+        );
+        check_round_trip_encoding_generated(field, datagen, TestCases::default()).await;
     }
 
     #[test_log::test(tokio::test)]
