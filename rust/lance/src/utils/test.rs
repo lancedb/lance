@@ -948,15 +948,11 @@ mod tests {
             let mut field_ids = schema
                 .fields_pre_order()
                 .filter_map(|f| {
-                    if data_storage_version == LanceFileVersion::Legacy {
+                    if data_storage_version == LanceFileVersion::Legacy || f.children.is_empty() {
                         Some(f.id)
                     } else {
-                        if f.children.is_empty() {
-                            Some(f.id)
-                        } else {
-                            // In 2.1+, struct / list fields don't have their own column
-                            None
-                        }
+                        // In 2.1+, struct / list fields don't have their own column
+                        None
                     }
                 })
                 .collect::<Vec<_>>();

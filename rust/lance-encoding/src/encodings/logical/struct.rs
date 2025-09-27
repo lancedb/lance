@@ -329,10 +329,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
         if self.children.is_empty() {
             return Ok(DecodedArray {
-                array: dbg!(Arc::new(StructArray::new_empty_fields(
-                    self.num_rows as usize,
-                    None
-                ))),
+                array: Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
                 repdef: CompositeRepDefUnraveler::new(vec![]),
             });
         }
@@ -363,7 +360,6 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         };
 
         let array = StructArray::new(self.child_fields, children, validity);
-        println!("{:#?}", std::backtrace::Backtrace::capture());
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,

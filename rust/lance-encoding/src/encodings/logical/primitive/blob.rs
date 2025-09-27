@@ -198,7 +198,7 @@ impl DecodePageTask for BlobDescriptionDecodePageTask {
 
         Ok(DecodedPage {
             data: decoded.data,
-            repdef: repdef,
+            repdef,
         })
     }
 }
