@@ -437,7 +437,7 @@ impl Dataset {
     /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
     /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
     /// failure if we use the same name to `create_branch`. In that case, you need to call
-    /// `delete_branch` to interactively clean up the zombie dataset.
+    /// `force_delete_branch` to interactively clean up the zombie dataset.
     pub async fn create_branch(
         &mut self,
         branch: &str,
@@ -470,8 +470,13 @@ impl Dataset {
     }
 
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
-        self.branches().delete(branch).await?;
-        Ok(())
+        self.branches().delete(branch, false).await
+    }
+
+    /// Delete the branch even if the BranchContent is not found.
+    /// This could be useful when we have zombie branches and want to clean them up immediately.
+    pub async fn force_delete_branch(&mut self, branch: &str) -> Result<()> {
+        self.branches().delete(branch, true).await
     }
 
     pub async fn list_branches(&self) -> Result<HashMap<String, BranchContents>> {

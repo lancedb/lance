@@ -463,7 +463,7 @@ impl Branches<'_> {
             .map(|_| ())
     }
 
-    pub async fn delete(&mut self, branch: &str) -> Result<()> {
+    pub async fn delete(&mut self, branch: &str, forced: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
         let root_location = self.refs.root()?;
@@ -471,7 +471,13 @@ impl Branches<'_> {
         if self.object_store().exists(&branch_file).await? {
             self.object_store().delete(&branch_file).await?;
         } else {
-            log::warn!("BranchContent of {} does not exist", branch);
+            if forced {
+                log::warn!("BranchContent of {} does not exist", branch);
+            } else {
+                return Err(Error::RefNotFound {
+                    message: format!("Branch {} does not exist", branch),
+                });
+            }
         }
 
         // Clean up branch directories

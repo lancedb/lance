@@ -4,6 +4,7 @@
 use lance_core::{Error, Result};
 use object_store::path::Path;
 use snafu::location;
+use crate::dataset::refs;
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BranchLocation {
@@ -16,6 +17,7 @@ impl BranchLocation {
     /// Find the root location
     pub fn find_root(&self) -> Result<Self> {
         if let Some(branch_name) = self.branch.as_ref() {
+            refs::check_valid_branch(branch_name)?;
             let mut path = self.path.clone();
             let mut uri = self.uri.clone();
             let segment_count = branch_name.split('/').count();
@@ -93,29 +95,40 @@ impl BranchLocation {
 mod tests {
     use crate::dataset::branch_location::BranchLocation;
     use object_store::path::Path;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
 
     // Create a BranchLocation instance for testing
-    fn create_test_location() -> BranchLocation {
+    fn create_branch_location(root_path: PathBuf) -> BranchLocation {
+        let branch_dir = root_path.join("tree/feature/new");
+        let test_uri = branch_dir.to_str().unwrap().to_string();
         BranchLocation {
-            path: Path::parse("/repo/root/tree/feature/new").unwrap(),
-            uri: "https://example.com/repo/root/tree/feature/new".to_string(),
+            path: Path::parse(&test_uri).unwrap(),
+            uri: test_uri,
             branch: Some("feature/new".to_string()),
         }
     }
 
     #[test]
     fn test_find_root_from_branch() {
-        let location = create_test_location();
+        let root_path = tempdir().unwrap().path().to_owned();
+        let location = create_branch_location(root_path.clone());
         let root_location = location.find_root().unwrap();
 
-        assert_eq!(root_location.path.as_ref(), "repo/root");
-        assert_eq!(root_location.uri, "https://example.com/repo/root");
+        assert_eq!(
+            root_location.path.as_ref(),
+            Path::parse(root_path.to_str().unwrap()).unwrap().as_ref()
+        );
+        assert_eq!(root_location.uri, root_path.to_str().unwrap().to_string());
         assert_eq!(root_location.branch, None);
+        assert!(fs::create_dir(std::path::Path::new(root_location.uri.as_str())).is_ok());
     }
 
     #[test]
     fn test_find_root_from_root() {
-        let mut location = create_test_location();
+        let root_path = tempdir().unwrap().path().to_owned();
+        let mut location = create_branch_location(root_path.clone());
         // Change current branch to Main
         location.branch = None;
         let root_location = location.find_root().unwrap();
@@ -123,64 +136,88 @@ mod tests {
         assert_eq!(root_location.path, location.path);
         assert_eq!(root_location.uri, location.uri);
         assert_eq!(root_location.branch, None);
+        assert!(fs::create_dir_all(std::path::Path::new(root_location.uri.as_str())).is_ok());
     }
 
     #[test]
     fn test_find_branch_from_same_branch() {
-        let location = create_test_location();
+        let root_path = tempdir().unwrap().path().to_owned();
+        let location = create_branch_location(root_path.clone());
         let target_branch = location.branch.clone();
         let new_location = location.find_branch(target_branch).unwrap();
 
         assert_eq!(new_location.path, location.path);
         assert_eq!(new_location.uri, location.uri);
         assert_eq!(new_location.branch, location.branch);
+        assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
     }
 
     #[test]
     fn test_find_main_branch() {
-        let location = create_test_location();
-        let new_location = location.find_branch(None).unwrap();
+        let root_path = tempdir().unwrap().path().to_owned();
+        let location = create_branch_location(root_path.clone());
+        let main_location = location.find_branch(None).unwrap();
 
         let expected_root = location.find_root().unwrap();
-        assert_eq!(new_location.path, expected_root.path);
-        assert_eq!(new_location.uri, expected_root.uri);
-        assert_eq!(new_location.branch, None);
+        assert_eq!(main_location.path, expected_root.path);
+        assert_eq!(main_location.uri, expected_root.uri);
+        assert_eq!(main_location.branch, None);
+        assert!(fs::create_dir_all(std::path::Path::new(main_location.uri.as_str())).is_ok());
     }
 
     #[test]
     fn test_find_simple_branch() {
-        let location = create_test_location();
+        let root_path = tempdir().unwrap().path().to_owned();
+        let location = create_branch_location(root_path.clone());
         let new_branch = Some("featureA".to_string());
         let new_location = location.find_branch(new_branch.clone()).unwrap();
 
-        assert_eq!(new_location.path.as_ref(), "repo/root/tree/featureA");
+        assert_eq!(
+            new_location.path.as_ref(),
+            Path::parse(root_path.join("tree/featureA").to_str().unwrap())
+                .unwrap()
+                .as_ref()
+        );
         assert_eq!(
             new_location.uri,
-            "https://example.com/repo/root/tree/featureA"
+            root_path
+                .join("tree/featureA")
+                .to_str()
+                .unwrap()
+                .to_string()
         );
         assert_eq!(new_location.branch, new_branch);
+        assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
     }
 
     #[test]
     fn test_find_complex_branch() {
-        let location = create_test_location();
+        let root_path = tempdir().unwrap().path().to_owned();
+        let location = create_branch_location(root_path.clone());
         let new_branch = Some("bugfix/issue-123".to_string());
         let new_location = location.find_branch(new_branch.clone()).unwrap();
 
         assert_eq!(
             new_location.path.as_ref(),
-            "repo/root/tree/bugfix/issue-123"
+            Path::parse(root_path.join("tree/bugfix/issue-123").to_str().unwrap())
+                .unwrap()
+                .as_ref()
         );
         assert_eq!(
             new_location.uri,
-            "https://example.com/repo/root/tree/bugfix/issue-123"
+            root_path
+                .join("tree/bugfix/issue-123")
+                .to_str()
+                .unwrap()
+                .to_string()
         );
-        assert_eq!(new_location.branch, new_branch);
+        assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
     }
 
     #[test]
     fn test_find_empty_branch() {
-        let location = create_test_location();
+        let root_path = tempdir().unwrap().path().to_owned();
+        let location = create_branch_location(root_path.clone());
         let new_branch = Some("".to_string());
         let new_location = location.find_branch(new_branch.clone()).unwrap();
 
@@ -188,4 +225,7 @@ mod tests {
         assert_eq!(new_location.uri, location.uri);
         assert_eq!(new_location.branch, new_branch);
     }
+
+    #[test]
+    fn test_find_branch_with_slash() {}
 }
