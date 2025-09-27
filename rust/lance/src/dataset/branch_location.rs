@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn test_find_main_from_root() {
         let root_path = tempdir().unwrap().path().to_owned();
-        let mut location = create_branch_location(root_path.clone());
+        let mut location = create_branch_location(root_path);
         // Change current branch to Main
         location.branch = None;
         let root_location = location.find_main().unwrap();
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn test_find_branch_from_same_branch() {
         let root_path = tempdir().unwrap().path().to_owned();
-        let location = create_branch_location(root_path.clone());
+        let location = create_branch_location(root_path);
         let target_branch = location.branch.clone();
         let new_location = location.find_branch(target_branch).unwrap();
 
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn test_find_main_branch() {
         let root_path = tempdir().unwrap().path().to_owned();
-        let location = create_branch_location(root_path.clone());
+        let location = create_branch_location(root_path);
         let main_location = location.find_branch(None).unwrap();
 
         let expected_root = location.find_main().unwrap();
@@ -204,7 +204,7 @@ mod tests {
         let root_path = tempdir().unwrap().path().to_owned();
         let location = create_branch_location(root_path.clone());
         let new_branch = Some("bugfix/issue-123".to_string());
-        let new_location = location.find_branch(new_branch.clone()).unwrap();
+        let new_location = location.find_branch(new_branch).unwrap();
 
         assert_eq!(
             new_location.path.as_ref(),
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn test_find_empty_branch() {
         let root_path = tempdir().unwrap().path().to_owned();
-        let location = create_branch_location(root_path.clone());
+        let location = create_branch_location(root_path);
         let new_branch = Some("".to_string());
         let new_location = location.find_branch(new_branch.clone()).unwrap();
 
