@@ -2382,8 +2382,10 @@ mod tests {
     use crate::datafusion::LanceTableProvider;
     use datafusion::common::{assert_contains, assert_not_contains};
     use datafusion::prelude::SessionContext;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::udf::register_functions;
+    use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
     use rand::seq::SliceRandom;
@@ -7692,6 +7694,353 @@ mod tests {
 
         dataset.validate().await.unwrap();
         assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
+
+    async fn prepare_json_dataset() -> (Dataset, String) {
+        let text_col = Arc::new(StringArray::from(vec![
+            r#"{
+              "Title": "HarryPotter Chapter One",
+              "Content": "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say...",
+              "Author": "J.K. Rowling",
+              "Price": 128,
+              "Language": ["english", "chinese"]
+          }"#,
+            r#"{
+             "Title": "Fairy Talest",
+             "Content": "Once upon a time, on a bitterly cold New Year's Eve, a little girl...",
+             "Author": "ANDERSEN",
+             "Price": 50,
+             "Language": ["english", "chinese"]
+          }"#,
+        ]));
+        let json_col = "json_field".to_string();
+
+        // Prepare dataset
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata)
+            ])
+            .into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        (dataset, json_col)
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_match_query() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col, with max token len 10 and enable stemming,
+        // lower case, and remove stop words
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .max_token_length(Some(10))
+                    .stem(true)
+                    .lower_case(true)
+                    .remove_stop_words(true),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Match query with token length exceed max token length
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Title,str,harrypotter".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        // Match query with stemming
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Language,str,chinese".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
+
+        // Match query with lower case
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,DURSLEY".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+
+        // Match query with stop word
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Content,str,and".to_string()).with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_flat_match_query() {
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Append data
+        let text_col = Arc::new(StringArray::from(vec![
+            r#"{
+              "Title": "HarryPotter Chapter Two",
+              "Content": "Nearly ten years had passed since the Dursleys had woken up...",
+              "Author": "J.K. Rowling",
+              "Price": 128,
+              "Language": ["english", "chinese"]
+            }"#,
+        ]));
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata)
+            ])
+            .into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        dataset.append(stream, None).await.unwrap();
+
+        // Test match query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new("Title,str,harrypotter".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_phrase_query() {
+        // Prepare json dataset
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false)
+                    .with_position(true),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test phrase query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Phrase(
+                PhraseQuery::new("Title,str,harrypotter one chapter".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(0, batch.num_rows());
+
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Phrase(
+                PhraseQuery::new("Title,str,harrypotter chapter one".to_string())
+                    .with_column(Some(json_col.clone())),
+            ),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_multimatch_query() {
+        // Prepare json dataset
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test multi match query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::MultiMatch(MultiMatchQuery {
+                match_queries: vec![
+                    MatchQuery::new("Title,str,harrypotter".to_string())
+                        .with_column(Some(json_col.clone())),
+                    MatchQuery::new("Language,str,english".to_string())
+                        .with_column(Some(json_col.clone())),
+                ],
+            }),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(2, batch.num_rows());
+    }
+
+    #[tokio::test]
+    async fn test_json_inverted_boolean_query() {
+        // Prepare json dataset
+        let (mut dataset, json_col) = prepare_json_dataset().await;
+
+        // Create inverted index for json col
+        dataset
+            .create_index(
+                &[&json_col],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default()
+                    .lance_tokenizer("json".to_string())
+                    .stem(false),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Test boolean query
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Boolean(BooleanQuery {
+                should: vec![],
+                must: vec![
+                    FtsQuery::Match(
+                        MatchQuery::new("Language,str,english".to_string())
+                            .with_column(Some(json_col.clone())),
+                    ),
+                    FtsQuery::Match(
+                        MatchQuery::new("Title,str,harrypotter".to_string())
+                            .with_column(Some(json_col.clone())),
+                    ),
+                ],
+                must_not: vec![],
+            }),
+            limit: None,
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(1, batch.num_rows());
     }
 
     #[tokio::test]

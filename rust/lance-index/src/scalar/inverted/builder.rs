@@ -6,18 +6,27 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 
+use super::{
+    index::*,
+    merger::{Merger, SizeBasedMerger},
+    InvertedIndexParams,
+};
+use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::IndexStore;
 use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
 use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance_arrow::iter_str_array;
+use lance_arrow::json::JSON_EXT_NAME;
+use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
@@ -27,12 +36,6 @@ use snafu::location;
 use std::sync::LazyLock;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
-
-use super::{
-    index::*,
-    merger::{Merger, SizeBasedMerger},
-    InvertedIndexParams,
-};
 
 // the number of elements in each block
 // each block contains 128 row ids and 128 frequencies
@@ -139,6 +142,10 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
+        let schema = new_data.schema();
+        let col_name = schema.field(0).name();
+        let new_data = document_input(new_data, col_name)?;
+
         self.update_index(new_data).await?;
         self.write(dest_store).await?;
         Ok(())
@@ -158,7 +165,7 @@ impl InvertedIndexBuilder {
                     flatten_string_list::<i64>(&batch, doc_col)
                 }
                 _ => {
-                   Err(Error::Index { message: format!("expect data type String, LargeString or List of String/LargeString, but got {}", doc_col.data_type()), location: location!() })
+                   Err(Error::Index { message: format!("expect data type String and LargeString or List of String and LargeString, but got {}", doc_col.data_type()), location: location!() })
                 }
             }
         });
@@ -523,7 +530,7 @@ impl InnerBuilder {
 
 struct IndexWorker {
     store: Arc<dyn IndexStore>,
-    tokenizer: tantivy::tokenizer::TextAnalyzer,
+    tokenizer: Box<dyn LanceTokenizer>,
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
     partitions: Vec<u64>,
@@ -537,7 +544,7 @@ struct IndexWorker {
 impl IndexWorker {
     async fn new(
         store: Arc<dyn IndexStore>,
-        tokenizer: tantivy::tokenizer::TextAnalyzer,
+        tokenizer: Box<dyn LanceTokenizer>,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
@@ -581,7 +588,7 @@ impl IndexWorker {
             let mut token_occurrences = HashMap::new();
             let mut token_num = 0;
             {
-                let mut token_stream = self.tokenizer.token_stream(doc);
+                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
                     let token_text = std::mem::take(&mut token.text);
@@ -1020,4 +1027,35 @@ async fn merge_metadata_files(
     }
 
     Ok(())
+}
+
+pub fn document_input(
+    input: SendableRecordBatchStream,
+    column: &str,
+) -> Result<SendableRecordBatchStream> {
+    let schema = input.schema();
+    let field = schema.column_with_name(column).expect_ok()?.1;
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(input),
+        DataType::List(field)
+            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            Ok(input)
+        }
+        DataType::LargeBinary => {
+            match field.metadata().get(ARROW_EXT_NAME_KEY) {
+                Some(name) if name.as_str() == JSON_EXT_NAME => {
+                    Ok(Box::pin(JsonTextStream::new(input, column.to_string())))
+                }
+                _ => Err(Error::InvalidInput {
+                    source: format!("column {} is not json", column).into(),
+                    location: location!(),
+                }),
+            }
+        }
+        _ => Err(Error::InvalidInput {
+            source: format!("column {} is not utf8 or list of utf8", column).into(),
+            location: location!(),
+        }),
+    }
 }

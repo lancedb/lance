@@ -5,6 +5,7 @@ pub mod builder;
 mod encoding;
 mod index;
 mod iter;
+pub mod json;
 mod merger;
 pub mod parser;
 pub mod query;
@@ -110,12 +111,13 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => (),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::LargeBinary => (),
             DataType::List(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
             DataType::LargeList(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+
             _ => return Err(Error::InvalidInput {
                 source: format!(
-                    "A inverted index can only be created on a Utf8 or LargeUtf8 field/list. Column has type {:?}",
+                    "A inverted index can only be created on a Utf8, LargeUtf8, Binary, LargeBinary field/list. Column has type {:?}",
                     field.data_type()
                 )
                     .into(),
