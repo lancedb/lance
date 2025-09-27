@@ -1414,7 +1414,7 @@ impl Dataset {
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
-        let inner_result = RT.block_on(None, self_.ds.tags.get_version(&tag))?;
+        let inner_result = RT.block_on(None, self_.ds.tags().get_version(&tag))?;
 
         inner_result.map_err(|err: lance::Error| match err {
             lance::Error::NotFound { .. } => {
@@ -1428,8 +1428,8 @@ impl Dataset {
     }
 
     fn create_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags.create(tag.as_str(), version))?
+        let new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.tags().create(tag.as_str(), version))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
                 lance::Error::RefConflict { .. } => PyValueError::new_err(err.to_string()),
@@ -1441,8 +1441,8 @@ impl Dataset {
     }
 
     fn delete_tag(&mut self, tag: String) -> PyResult<()> {
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags.delete(tag.as_str()))?
+        let new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.tags().delete(tag.as_str()))?
             .map_err(|err| match err {
                 lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
                 lance::Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
@@ -1453,8 +1453,8 @@ impl Dataset {
     }
 
     fn update_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
-        let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags.update(tag.as_str(), version))?
+        let new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.tags().update(tag.as_str(), version))?
             .infer_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -2453,7 +2453,7 @@ impl Dataset {
     }
 
     fn list_tags(&self) -> PyResult<HashMap<String, TagContents>> {
-        RT.block_on(None, self.ds.tags.list())?.infer_error()
+        RT.block_on(None, self.ds.tags().list())?.infer_error()
     }
 
     fn list_tags_ordered(&self, order: Option<&str>) -> PyResult<Vec<(String, TagContents)>> {
@@ -2469,7 +2469,7 @@ impl Dataset {
             None => None,
         };
         RT.block_on(None, async {
-            self.ds.tags.list_tags_ordered(ordering).await
+            self.ds.tags().list_tags_ordered(ordering).await
         })?
         .infer_error()
     }

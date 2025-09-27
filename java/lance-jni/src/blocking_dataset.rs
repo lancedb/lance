@@ -182,27 +182,27 @@ impl BlockingDataset {
     }
 
     pub fn list_tags(&self) -> Result<HashMap<String, TagContents>> {
-        let tags = RT.block_on(self.inner.tags.list())?;
+        let tags = RT.block_on(self.inner.tags().list())?;
         Ok(tags)
     }
 
     pub fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.create(tag, version))?;
+        RT.block_on(self.inner.tags().create(tag, version))?;
         Ok(())
     }
 
     pub fn delete_tag(&mut self, tag: &str) -> Result<()> {
-        RT.block_on(self.inner.tags.delete(tag))?;
+        RT.block_on(self.inner.tags().delete(tag))?;
         Ok(())
     }
 
     pub fn update_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.update(tag, version))?;
+        RT.block_on(self.inner.tags().update(tag, version))?;
         Ok(())
     }
 
     pub fn get_version(&self, tag: &str) -> Result<u64> {
-        let version = RT.block_on(self.inner.tags.get_version(tag))?;
+        let version = RT.block_on(self.inner.tags().get_version(tag))?;
         Ok(version)
     }
 
