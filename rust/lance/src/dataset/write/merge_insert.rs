@@ -71,6 +71,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
 };
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
@@ -104,7 +105,6 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinSet;
-use lance_core::utils::address::RowAddress;
 
 mod assign_action;
 mod exec;

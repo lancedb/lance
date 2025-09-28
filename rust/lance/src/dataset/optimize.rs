@@ -893,9 +893,7 @@ async fn recalc_versions_for_rewritten_fragments(
             // Fallback: if no stored version meta, assume all rows last updated at current dataset version
             let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
                 match row_id_meta {
-                    RowIdMeta::Inline(data) => {
-                        lance_table::rowids::read_row_ids(data)?.len()
-                    }
+                    RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
                     RowIdMeta::External(_file) => {
                         // External not supported in tests / current code path
                         // Use physical_rows as a fallback
