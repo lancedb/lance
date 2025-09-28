@@ -3295,8 +3295,12 @@ mod tests {
         let count1 = results1.len();
 
         scanner = dataset.scan();
+        let schema = scanner.schema().await.unwrap();
+        println!("[DEBUG] Before nearest: scanner schema: {}", schema);
         scanner.nearest("vec", &query_vec2, 10).unwrap();
+        println!("[DEBUG] After nearest: scanner schema: {}", schema);
         scanner.project::<String>(&[]).unwrap().with_row_address();
+        println!("[DEBUG] After project+row_address: scanner schema: {}", schema);
         let results2 = scanner
             .try_into_stream()
             .await
@@ -3304,6 +3308,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        println!("[DEBUG] Results2 batch schema: {:?}", results2.get(0).map(|b| b.schema()));
         let count2 = results2.len();
 
         scanner = dataset.scan();
@@ -3380,8 +3385,12 @@ mod tests {
         assert_eq!(new_results1.len(), count1);
 
         scanner = dataset.scan();
+        let schema = scanner.schema().await.unwrap();
+        println!("[DEBUG] Before nearest: scanner schema: {}", schema);
         scanner.nearest("vec", &query_vec2, 10).unwrap();
+        println!("[DEBUG] After nearest: scanner schema: {}", schema);
         scanner.project::<String>(&[]).unwrap().with_row_address();
+        println!("[DEBUG] After project+row_address: scanner schema: {}", schema);
         let new_results2 = scanner
             .try_into_stream()
             .await

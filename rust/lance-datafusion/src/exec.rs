@@ -503,6 +503,7 @@ pub fn execute_plan(
         "Executing plan:\n{}",
         DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
     );
+    println!("Executing plan:\n{}", DisplayableExecutionPlan::new(plan.as_ref()).indent(true));
 
     let session_ctx = get_session_context(&options);
 
@@ -512,6 +513,7 @@ pub fn execute_plan(
     let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
 
     let schema = stream.schema();
+    println!("The schema is : {}", schema);
     let stream = stream.finally(move || {
         report_plan_summary_metrics(plan.as_ref(), &options);
     });

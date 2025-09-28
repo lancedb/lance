@@ -690,6 +690,8 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_field_path_for_project(c.as_ref())))
             .collect();
 
+        println!("transformed_columns: {:?}", transformed_columns);
+
         self.project_with_transform(&transformed_columns)
     }
 
@@ -1415,9 +1417,12 @@ impl Scanner {
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
     pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
+        println!("[DEBUG] try_into_stream: projection_plan: {:?}", self.projection_plan);
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
+
+            println!("[DEBUG] try_into_stream: created plan: {:?}", plan);
 
             Ok(DatasetRecordBatchStream::new(execute_plan(
                 plan,
