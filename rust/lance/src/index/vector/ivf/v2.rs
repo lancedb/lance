@@ -1479,7 +1479,15 @@ mod tests {
         .await;
 
         dataset.checkout_latest().await.unwrap();
-        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let indices = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|m| m.fields[0] == vector_field_id)
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(indices.len(), 1); // v1 index should be replaced by v3 index
         let index = dataset
             .open_vector_index(

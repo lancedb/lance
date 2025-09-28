@@ -413,8 +413,9 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
             .await
             .unwrap();
+        let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
         let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+            serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
         assert_eq!(stats["num_indices"], 1);
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 0);
@@ -433,7 +434,7 @@ mod tests {
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         dataset.append(batches, None).await.unwrap();
         let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+            serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
         assert_eq!(stats["num_indices"], 1);
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 1);
@@ -447,7 +448,7 @@ mod tests {
             .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+            serde_json::from_str(&dataset.index_statistics(&index_name).await.unwrap()).unwrap();
         assert_eq!(stats["num_indices"], 2);
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);

@@ -61,6 +61,8 @@ pub async fn connect(
     impl_name: &str,
     properties: HashMap<String, String>,
 ) -> Result<Arc<dyn LanceNamespace>> {
+    #[cfg(not(any(feature = "rest", feature = "dir")))]
+    let _ = &properties;
     match impl_name {
         #[cfg(feature = "rest")]
         "rest" => {

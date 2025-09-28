@@ -3718,11 +3718,11 @@ def test_use_scalar_index(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
 
-    assert "ScalarIndexQuery: query=[filter = 10]@filter_idx" in dataset.scanner(
+    assert "ScalarIndexQuery: query=[filter = 10]@filter_btree_idx" in dataset.scanner(
         filter="filter = 10"
     ).explain_plan(True)
 
-    assert "ScalarIndexQuery: query=[filter = 10]@filter_idx" in dataset.scanner(
+    assert "ScalarIndexQuery: query=[filter = 10]@filter_btree_idx" in dataset.scanner(
         filter="filter = 10", use_scalar_index=True
     ).explain_plan(True)
 

@@ -3670,7 +3670,11 @@ mod tests {
 
         let check_indices = async |dataset: &Dataset, id_frags: &[u32], value_frags: &[u32]| {
             let id_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("id_idx"))
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column("id")
+                        .supports_exact_equality(),
+                )
                 .await
                 .unwrap();
 
@@ -3687,7 +3691,11 @@ mod tests {
             }
 
             let value_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("value_idx"))
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column("value")
+                        .supports_exact_equality(),
+                )
                 .await
                 .unwrap();
 
@@ -3704,7 +3712,11 @@ mod tests {
             }
 
             let other_value_index = dataset
-                .load_scalar_index(ScalarIndexCriteria::default().with_name("other_value_idx"))
+                .load_scalar_index(
+                    ScalarIndexCriteria::default()
+                        .for_column("other_value")
+                        .supports_exact_equality(),
+                )
                 .await
                 .unwrap()
                 .unwrap();
