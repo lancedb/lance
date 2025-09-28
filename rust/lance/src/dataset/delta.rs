@@ -1473,4 +1473,179 @@ mod tests {
             "Updated IDs should include both pre and post compaction updates"
         );
     }
+
+    #[tokio::test]
+    async fn test_diff_merge_insert_full_schema_update() {
+        let base_dataset = create_test_dataset_with_stable_row_ids().await;
+        let initial_version = base_dataset.version().version;
+
+        // update id 5..=9；insert id 110..=114
+        let merge_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let mut ids: Vec<i32> = (5..=9).collect();
+        ids.extend(110..=114);
+        let names: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                if (5..=9).contains(id) {
+                    format!("merge_full_updated_{}", id)
+                } else {
+                    format!("merge_insert_{}", id)
+                }
+            })
+            .collect();
+        let values: Vec<i32> = ids
+            .iter()
+            .map(|id| {
+                if (5..=9).contains(id) {
+                    id * 100
+                } else {
+                    id * 10
+                }
+            })
+            .collect();
+
+        let merge_batch = arrow_array::RecordBatch::try_new(
+            merge_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from(values.clone())),
+            ],
+        )
+        .unwrap();
+        let merge_reader = arrow_array::RecordBatchIterator::new([Ok(merge_batch)], merge_schema);
+
+        let mut builder = crate::dataset::MergeInsertBuilder::try_new(
+            Arc::new(base_dataset.clone()),
+            vec!["id".to_string()],
+        )
+        .unwrap();
+        builder
+            .when_matched(crate::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+            .when_not_matched_by_source(crate::dataset::WhenNotMatchedBySource::Keep);
+
+        let (updated_dataset, stats) = builder
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(merge_reader))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 5);
+        assert_eq!(stats.num_inserted_rows, 5);
+
+        let diff_builder = DatasetDiffBuilder::new(updated_dataset.clone(), initial_version)
+            .with_include_data(true)
+            .with_max_concurrency(1)
+            .with_batch_size(32);
+        let diff_stream = diff_builder.execute().await.unwrap();
+        let diff_records: Vec<_> = diff_stream.try_collect().await.unwrap();
+
+        let mut update_ids = Vec::new();
+        let mut insert_ids = Vec::new();
+
+        for record in diff_records.iter() {
+            match record.operation {
+                DiffOperation::Update => {
+                    assert!(record.old_data.is_some());
+                    assert!(record.new_data.is_some());
+                    let old = record.old_data.as_ref().unwrap();
+                    let new = record.new_data.as_ref().unwrap();
+
+                    // Verify id
+                    let id_arr = new
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    let id = id_arr.value(0);
+                    update_ids.push(id);
+                    assert!((5..=9).contains(&id));
+
+                    // Verify name
+                    let old_name = old
+                        .column_by_name("name")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0);
+                    let new_name = new
+                        .column_by_name("name")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0);
+                    assert_eq!(old_name, "initial");
+                    assert_eq!(new_name, format!("merge_full_updated_{}", id));
+
+                    // Verify value changes
+                    let old_val = old
+                        .column_by_name("value")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0);
+                    let new_val = new
+                        .column_by_name("value")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0);
+                    assert_eq!(old_val, id);
+                    assert_eq!(new_val, id * 100);
+                }
+                DiffOperation::Insert => {
+                    // insert: only new_data
+                    assert!(record.old_data.is_none());
+                    assert!(record.new_data.is_some());
+                    let new = record.new_data.as_ref().unwrap();
+
+                    let id_arr = new
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    let id = id_arr.value(0);
+                    insert_ids.push(id);
+                    assert!((110..=114).contains(&id));
+
+                    let name = new
+                        .column_by_name("name")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0);
+                    let val = new
+                        .column_by_name("value")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0);
+                    assert_eq!(name, format!("merge_insert_{}", id));
+                    assert_eq!(val, id * 10);
+                }
+                DiffOperation::Delete => panic!("not supported!"),
+            }
+        }
+
+        // Verify all expected ids are present
+        update_ids.sort();
+        insert_ids.sort();
+        assert_eq!(update_ids, (5..=9).collect::<Vec<i32>>());
+        assert_eq!(insert_ids, (110..=114).collect::<Vec<i32>>());
+    }
 }
