@@ -27,22 +27,22 @@ public class Update implements Operation {
   private final List<Long> removedFragmentIds;
   private final List<FragmentMetadata> updatedFragments;
   private final List<FragmentMetadata> newFragments;
-  private final long[] fieldsModified;
-  private final long[] fieldsForPreservingFragBitmap;
+  private final long[] bitmapPruneFieldIds;
+  private final long[] bitmapPreserveExcludeFieldIds;
   private final Optional<UpdateMode> updateMode;
 
   private Update(
       List<Long> removedFragmentIds,
       List<FragmentMetadata> updatedFragments,
       List<FragmentMetadata> newFragments,
-      long[] fieldsModified,
-      long[] fieldsForPreservingFragBitmap,
+      long[] bitmapPruneFieldIds,
+      long[] bitmapPreserveExcludeFieldIds,
       Optional<UpdateMode> updateMode) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
     this.newFragments = newFragments;
-    this.fieldsModified = fieldsModified;
-    this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
+    this.bitmapPruneFieldIds = bitmapPruneFieldIds;
+    this.bitmapPreserveExcludeFieldIds = bitmapPreserveExcludeFieldIds;
     this.updateMode = updateMode;
   }
 
@@ -62,12 +62,12 @@ public class Update implements Operation {
     return newFragments;
   }
 
-  public long[] fieldsModified() {
-    return fieldsModified;
+  public long[] bitmapPruneFieldIds() {
+    return bitmapPruneFieldIds;
   }
 
-  public long[] fieldsForPreservingFragBitmap() {
-    return fieldsForPreservingFragBitmap;
+  public long[] bitmapPreserveExcludeFieldIds() {
+    return bitmapPreserveExcludeFieldIds;
   }
 
   public Optional<UpdateMode> updateMode() {
@@ -84,8 +84,8 @@ public class Update implements Operation {
         .add("removedFragmentIds", removedFragmentIds)
         .add("updatedFragments", updatedFragments)
         .add("newFragments", newFragments)
-        .add("fieldsModified", fieldsModified)
-        .add("fieldsForPreservingFragBitmap", fieldsForPreservingFragBitmap)
+        .add("bitmapPruneFieldIds", bitmapPruneFieldIds)
+        .add("bitmapPreserveExcludeFieldIds", bitmapPreserveExcludeFieldIds)
         .add("updateMode", updateMode)
         .toString();
   }
@@ -98,8 +98,8 @@ public class Update implements Operation {
     return Objects.equals(removedFragmentIds, that.removedFragmentIds)
         && Objects.equals(updatedFragments, that.updatedFragments)
         && Objects.equals(newFragments, that.newFragments)
-        && Arrays.equals(fieldsModified, that.fieldsModified)
-        && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
+        && Arrays.equals(bitmapPruneFieldIds, that.bitmapPruneFieldIds)
+        && Arrays.equals(bitmapPreserveExcludeFieldIds, that.bitmapPreserveExcludeFieldIds)
         && Objects.equals(updateMode, that.updateMode);
   }
 
@@ -112,8 +112,8 @@ public class Update implements Operation {
     private List<Long> removedFragmentIds = Collections.emptyList();
     private List<FragmentMetadata> updatedFragments = Collections.emptyList();
     private List<FragmentMetadata> newFragments = Collections.emptyList();
-    private long[] fieldsModified = new long[0];
-    private long[] fieldsForPreservingFragBitmap = new long[0];
+    private long[] bitmapPruneFieldIds = new long[0];
+    private long[] bitmapPreserveExcludeFieldIds = new long[0];
     private Optional<UpdateMode> updateMode = Optional.empty();
 
     private Builder() {}
@@ -133,13 +133,13 @@ public class Update implements Operation {
       return this;
     }
 
-    public Builder fieldsModified(long[] fieldsModified) {
-      this.fieldsModified = fieldsModified;
+    public Builder bitmapPruneFieldIds(long[] bitmapPruneFieldIds) {
+      this.bitmapPruneFieldIds = bitmapPruneFieldIds;
       return this;
     }
 
-    public Builder fieldsForPreservingFragBitmap(long[] fieldsForPreservingFragBitmap) {
-      this.fieldsForPreservingFragBitmap = fieldsForPreservingFragBitmap;
+    public Builder bitmapPreserveExcludeFieldIds(long[] bitmapPreserveExcludeFieldIds) {
+      this.bitmapPreserveExcludeFieldIds = bitmapPreserveExcludeFieldIds;
       return this;
     }
 
@@ -153,8 +153,8 @@ public class Update implements Operation {
           removedFragmentIds,
           updatedFragments,
           newFragments,
-          fieldsModified,
-          fieldsForPreservingFragBitmap,
+          bitmapPruneFieldIds,
+          bitmapPreserveExcludeFieldIds,
           updateMode);
     }
   }
