@@ -149,7 +149,7 @@ impl RleMiniBlockEncoder {
             let lengths_size = all_lengths.len() - lengths_start;
 
             let chunk = MiniBlockChunk {
-                buffer_sizes: vec![values_size as u16, lengths_size as u16],
+                buffer_sizes: vec![values_size as u32, lengths_size as u32],
                 log_num_values,
             };
 
