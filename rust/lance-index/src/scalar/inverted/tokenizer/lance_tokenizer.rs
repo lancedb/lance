@@ -6,6 +6,12 @@ use snafu::location;
 use tantivy::tokenizer::{BoxTokenStream, Token, TokenStream};
 
 /// Lance full text search tokenizer.
+///
+/// `LanceTokenizer` defines 2 methods for tokenization, normally they are the same, but sometimes
+/// tokenizer needs different behavior for search and index. Take json document as an example:
+/// 1. Query text is a triplet <path,type,value>, something like `a.b,str,123`. We shouldn't use
+///    json in search, because it would be too complicated.
+/// 2. Document text is a json string.
 pub trait LanceTokenizer: Send + Sync {
     /// Tokenize query text for search.
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a>;
@@ -288,7 +294,6 @@ mod tests {
         let mut tokenizer =
             tantivy::tokenizer::TextAnalyzer::builder(SimpleTokenizer::default()).build();
         let tokens = flatten_triplet(text, &mut tokenizer).unwrap();
-        println!("{:?}", tokens);
 
         assert_eq!(tokens.len(), 6);
         assert_token(&tokens[0], 0, "a,number,1");

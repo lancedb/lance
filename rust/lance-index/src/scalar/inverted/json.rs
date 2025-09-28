@@ -109,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_text_stream() {
-        let json_strings = vec![
+        let json_strings = [
             r#"{"a": 1, "b": "hello"}"#,
             r#"{"c": [1, 2, 3], "d": {"e": true}}"#,
             r#"{"f": null}"#,

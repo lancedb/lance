@@ -252,7 +252,6 @@ impl ExecutionPlan for MatchQueryExec {
             let mut tokenizer = match is_fuzzy {
                 false => inverted_idx.tokenizer(),
                 true => {
-                    // TODO: support fuzziness for other tokenizers
                     let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
                         tantivy::tokenizer::SimpleTokenizer::default(),
                     );

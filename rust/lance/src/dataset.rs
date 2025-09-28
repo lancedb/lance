@@ -7781,8 +7781,7 @@ mod tests {
         // Match query with stemming
         let query = FullTextSearchQuery {
             query: FtsQuery::Match(
-                MatchQuery::new("Language,str,chinese".to_string())
-                    .with_column(Some(json_col.clone())),
+                MatchQuery::new("Content,str,onc".to_string()).with_column(Some(json_col.clone())),
             ),
             limit: None,
             wand_factor: None,
@@ -7794,7 +7793,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(2, batch.num_rows());
+        assert_eq!(1, batch.num_rows());
 
         // Match query with lower case
         let query = FullTextSearchQuery {
