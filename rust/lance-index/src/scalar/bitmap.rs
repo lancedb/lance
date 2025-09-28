@@ -18,12 +18,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
-use lance_core::{
-    cache::{CacheKey, LanceCache, WeakLanceCache},
-    error::LanceOptionExt,
-    utils::mask::RowIdTreeMap,
-    Error, Result, ROW_ID,
-};
+use lance_core::{cache::{CacheKey, LanceCache, WeakLanceCache}, error::LanceOptionExt, utils::mask::RowIdTreeMap, Error, Result, ROW_ADDR, ROW_ID};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
@@ -667,7 +662,7 @@ impl BitmapIndexPlugin {
         let value_type = data_source.schema().field(0).data_type().clone();
         while let Some(batch) = data_source.try_next().await? {
             let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-            let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
+            let row_ids = batch.column_by_name(ROW_ADDR).expect_ok()?;
             debug_assert_eq!(row_ids.data_type(), &DataType::UInt64);
 
             let row_id_column = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
