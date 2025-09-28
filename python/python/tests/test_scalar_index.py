@@ -201,7 +201,7 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         )
 
         assert (
-            f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_idx"
+            f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_btree_idx"
             in scanner.explain_plan()
         )
 
@@ -220,7 +220,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
 
     assert (
-        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_idx"
+        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_btree_idx"
         in scanner.explain_plan()
     )
 
@@ -230,7 +230,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val >= 10 AND val <= 20", prefilter=True)
 
     assert (
-        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_idx"
+        "ScalarIndexQuery: query=[val >= 10 && val <= 20]@val_btree_idx"
         in scanner.explain_plan()
     )
 
@@ -243,7 +243,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val >= 5000 AND val <= 0", prefilter=True)
 
     assert (
-        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_idx"
+        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_btree_idx"
         in scanner.explain_plan()
     )
 
@@ -253,7 +253,7 @@ def test_indexed_between(tmp_path):
     scanner = dataset.scanner(filter="val BETWEEN 5000 AND 0", prefilter=True)
 
     assert (
-        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_idx"
+        "ScalarIndexQuery: query=[val >= 5000 && val <= 0]@val_btree_idx"
         in scanner.explain_plan()
     )
 
@@ -296,7 +296,7 @@ def test_temporal_index(tmp_path):
     half_now = now - timedelta(days=50)
     scanner = dataset.scanner(filter=f"ts > timestamp '{half_now}'", scan_in_order=True)
     assert re.search(
-        r"^.*ScalarIndexQuery: query=\[ts > .*\]@ts_idx.*$",
+        r"^.*ScalarIndexQuery: query=\[ts > .*\]@ts_btree_idx.*$",
         scanner.explain_plan(True),
         re.MULTILINE,
     )
@@ -306,7 +306,7 @@ def test_temporal_index(tmp_path):
     half_toady = today - timedelta(days=50)
     scanner = dataset.scanner(filter=f"date > date '{half_toady}'", scan_in_order=True)
     assert re.search(
-        r"^.*ScalarIndexQuery: query=\[date > .*\]@date_idx.*$",
+        r"^.*ScalarIndexQuery: query=\[date > .*\]@date_btree_idx.*$",
         scanner.explain_plan(True),
         re.MULTILINE,
     )
@@ -346,7 +346,7 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
     )
 
     assert (
-        f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_idx"
+        f"ScalarIndexQuery: query=[meta = {sample_meta}]@meta_btree_idx"
         in scanner.explain_plan()
     )
 
@@ -422,7 +422,7 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     assert make_fts_search(ds).to_table().num_rows == 12
 
     # Update vector index but NOT scalar index
-    ds.optimize.optimize_indices(index_names=["vec_idx", "text_idx"])
+    ds.optimize.optimize_indices(index_names=["vec_ivf_pq_idx", "text_inverted_idx"])
 
     # Ann search but with combined prefilter, should get 12 results
     plan = make_vec_search(ds).explain_plan()
@@ -470,7 +470,7 @@ def test_fixed_size_binary(tmp_path):
         "uuid = arrow_cast(0x32333435323334353233343532333435, 'FixedSizeBinary(16)')"
     )
     assert (
-        "ScalarIndexQuery: query=[uuid = 32333435323334353233...]@uuid_idx"
+        "ScalarIndexQuery: query=[uuid = 32333435323334353233...]@uuid_btree_idx"
         in ds.scanner(filter=query).explain_plan()
     )
 
@@ -674,13 +674,13 @@ def test_multi_index_create(tmp_path):
     indices = dataset.list_indices()
     assert len(indices) == 2
 
-    assert indices[0]["name"] == "ints_idx"
+    assert indices[0]["name"] == "ints_btree_idx"
     assert indices[0]["type"] == "BTree"
     assert indices[1]["name"] == "ints_bitmap_idx"
     assert indices[1]["type"] == "Bitmap"
 
     # Test that we can drop one of the indices
-    dataset.drop_index("ints_idx")
+    dataset.drop_index("ints_btree_idx")
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["name"] == "ints_bitmap_idx"
@@ -705,7 +705,7 @@ def test_use_multi_index(tmp_path):
     assert results.num_rows == 1
 
     assert (
-        "ScalarIndexQuery: query=[ints = 0]@ints_idx"
+        "ScalarIndexQuery: query=[ints = 0]@ints_btree_idx"
         in dataset.scanner(filter="ints = 0", prefilter=True).explain_plan()
     )
 
@@ -846,7 +846,7 @@ def test_fts_stats(dataset):
     dataset.create_scalar_index(
         "doc", index_type="INVERTED", with_position=False, remove_stop_words=True
     )
-    stats = dataset.stats.index_stats("doc_idx")
+    stats = dataset.stats.index_stats("doc_inverted_idx")
     assert stats["index_type"] == "Inverted"
     stats = stats["indices"][0]
     params = stats["params"]
@@ -1637,7 +1637,7 @@ def test_zonemap_index(tmp_path: Path):
     assert len(indices) == 1
 
     # Get detailed index statistics
-    index_stats = dataset.stats.index_stats("values_idx")
+    index_stats = dataset.stats.index_stats("values_zonemap_idx")
     assert index_stats["index_type"] == "ZoneMap"
     assert "indices" in index_stats
     assert len(index_stats["indices"]) == 1
@@ -1697,7 +1697,7 @@ def test_bloomfilter_index(tmp_path: Path):
     assert len(indices) == 1
 
     # Get detailed index statistics
-    index_stats = dataset.stats.index_stats("values_idx")
+    index_stats = dataset.stats.index_stats("values_bloomfilter_idx")
     assert index_stats["index_type"] == "BloomFilter"
     assert "indices" in index_stats
     assert len(index_stats["indices"]) == 1
@@ -2072,7 +2072,7 @@ def test_index_prewarm(tmp_path: Path):
 
     # Prewarm index, cache should be populated
     ds = lance.dataset(tmp_path)
-    ds.prewarm_index("fts_idx")
+    ds.prewarm_index("fts_inverted_idx")
     ds.scanner(
         scan_stats_callback=scan_stats_callback, full_text_query="word"
     ).to_table()
@@ -2102,7 +2102,7 @@ def test_btree_prewarm(tmp_path: Path):
     assert scan_stats.parts_loaded > 0
 
     ds = lance.dataset(tmp_path)
-    ds.prewarm_index("id_idx")
+    ds.prewarm_index("id_btree_idx")
     ds.scanner(scan_stats_callback=scan_stats_callback, filter="id>0").to_table()
     assert scan_stats.parts_loaded == 0
 

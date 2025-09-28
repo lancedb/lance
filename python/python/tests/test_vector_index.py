@@ -286,7 +286,7 @@ def test_index_with_nans(tmp_path, index_file_version):
         num_sub_vectors=16,
         index_file_version=index_file_version,
     )
-    idx_stats = dataset.stats.index_stats("vector_idx")
+    idx_stats = dataset.stats.index_stats("vector_ivf_pq_idx")
     assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
@@ -310,7 +310,7 @@ def test_torch_index_with_nans(tmp_path, index_file_version):
         one_pass_ivfpq=True,
         index_file_version=index_file_version,
     )
-    idx_stats = dataset.stats.index_stats("vector_idx")
+    idx_stats = dataset.stats.index_stats("vector_ivf_pq_idx")
     assert idx_stats["indices"][0]["index_file_version"] == index_file_version
     validate_vector_index(dataset, "vector")
 
@@ -574,7 +574,7 @@ def test_create_4bit_ivf_pq_index(dataset, tmp_path):
         num_bits=4,
         metric="l2",
     )
-    index = ann_ds.stats.index_stats("vector_idx")
+    index = ann_ds.stats.index_stats("vector_ivf_pq_idx")
     assert index["indices"][0]["sub_index"]["nbits"] == 4
 
 
@@ -586,7 +586,10 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
         num_sub_vectors=16,
         target_partition_size=1000,
     )
-    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 1
+    assert (
+        ann_ds.stats.index_stats("vector_ivf_pq_idx")["indices"][0]["num_partitions"]
+        == 1
+    )
 
     ann_ds = ann_ds.create_index(
         "vector",
@@ -595,7 +598,10 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
         target_partition_size=500,
         replace=True,
     )
-    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
+    assert (
+        ann_ds.stats.index_stats("vector_ivf_pq_idx")["indices"][0]["num_partitions"]
+        == 2
+    )
 
     # setting both num_partitions and target_partition_size will use num_partitions
     ann_ds = ann_ds.create_index(
@@ -606,7 +612,10 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
         target_partition_size=1000,
         replace=True,
     )
-    assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
+    assert (
+        ann_ds.stats.index_stats("vector_ivf_pq_idx")["indices"][0]["num_partitions"]
+        == 2
+    )
 
 
 def test_index_size_stats(tmp_path: Path):
@@ -641,7 +650,7 @@ def test_ivf_flat_over_binary_vector(tmp_path):
     tbl = pa.Table.from_pydict({"vector": array})
     ds = lance.write_dataset(tbl, tmp_path)
     ds.create_index("vector", index_type="IVF_FLAT", num_partitions=4, metric="hamming")
-    stats = ds.stats.index_stats("vector_idx")
+    stats = ds.stats.index_stats("vector_ivf_flat_idx")
     assert stats["indices"][0]["metric_type"] == "hamming"
     assert stats["index_type"] == "IVF_FLAT"
 
@@ -848,7 +857,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         dataset_with_index.stats.index_stats()
 
     # increase 1 hit of index_cache.metadata_cache
-    actual_statistics = dataset_with_index.stats.index_stats("vector_idx")
+    actual_statistics = dataset_with_index.stats.index_stats("vector_ivf_pq_idx")
     assert actual_statistics["num_indexed_rows"] == 1000
     assert actual_statistics["num_unindexed_rows"] == 0
 
@@ -970,7 +979,9 @@ def test_create_index_dot(dataset, tmp_path):
     )
 
     assert ds.has_index
-    assert "dot" == ds.stats.index_stats("vector_idx")["indices"][0]["metric_type"]
+    assert (
+        "dot" == ds.stats.index_stats("vector_ivf_pq_idx")["indices"][0]["metric_type"]
+    )
 
 
 def create_uniform_table(min, max, nvec, offset, ndim=8):
@@ -1412,15 +1423,15 @@ def test_retrain_indices(indexed_dataset):
     indices = indexed_dataset.list_indices()
     assert len(indices) == 2
 
-    stats = indexed_dataset.stats.index_stats("vector_idx")
+    stats = indexed_dataset.stats.index_stats("vector_ivf_pq_idx")
     centroids = stats["indices"][0]["centroids"]
     delta_centroids = stats["indices"][1]["centroids"]
     assert centroids == delta_centroids
 
     indexed_dataset.optimize.optimize_indices(retrain=True)
-    new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
-        "centroids"
-    ]
+    new_centroids = indexed_dataset.stats.index_stats("vector_ivf_pq_idx")["indices"][
+        0
+    ]["centroids"]
     indices = indexed_dataset.list_indices()
     assert len(indices) == 1
     assert centroids != new_centroids
@@ -1490,7 +1501,7 @@ def test_read_partition(indexed_dataset):
 
     with pytest.raises(ValueError, match="not vector index"):
         indexed_dataset.create_scalar_index("id", index_type="BTREE")
-        VectorIndexReader(indexed_dataset, "id_idx")
+        VectorIndexReader(indexed_dataset, "id_btree_idx")
 
 
 def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
@@ -1502,7 +1513,9 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
 
     raw_table = create_table()
     ds = lance.write_dataset(raw_table, uri, mode="append")
-    ds.optimize.optimize_indices(num_indices_to_merge=0, index_names=["vector_idx"])
+    ds.optimize.optimize_indices(
+        num_indices_to_merge=0, index_names=["vector_ivf_pq_idx"]
+    )
 
     res = ds.to_table(
         nearest={
