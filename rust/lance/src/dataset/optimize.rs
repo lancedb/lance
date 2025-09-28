@@ -110,6 +110,7 @@ use tracing::info;
 
 pub mod remapping;
 
+use crate::dataset::delta::infer_fragment_creation_version;
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
@@ -904,9 +905,10 @@ async fn recalc_versions_for_rewritten_fragments(
             } else {
                 frag.physical_rows.unwrap_or(0) as u64
             };
+            let creation_version = infer_fragment_creation_version(dataset, frag).await?;
             lance_table::format::RowLatestUpdateVersionSequence::from_uniform_row_count(
                 row_count,
-                dataset.manifest.version,
+                creation_version,
             )
         };
 

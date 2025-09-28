@@ -9,6 +9,7 @@ use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
 use lance_table::format::{Fragment, RowLatestUpdateVersionSequence};
+use lance_table::rowids::version::build_version_meta;
 use lance_table::rowids::{read_row_ids, RowIdSequence};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -140,18 +141,30 @@ impl FragmentDiffAnalyzer {
     pub async fn analyze_fragment(&self, fragment: &Fragment) -> Result<Vec<DiffRecord>> {
         let mut diff_records = Vec::new();
 
-        // Load the row version sequence for this fragment
-        if let Some(version_meta) = &fragment.row_latest_update_version_meta {
-            let version_sequence = version_meta.load_sequence()?;
-
-            // Find updated and inserted records
-            let updated_inserted = self
-                .find_updated_and_inserted_records(fragment, &version_sequence)
-                .await?;
-            diff_records.extend(updated_inserted);
+        // Load the row version sequence of this fragment; if it is missing,
+        // treat it as "all rows were added in the current version"
+        let version_sequence = if let Some(version_meta) =
+            fragment.row_latest_update_version_meta.as_ref()
+        {
+            version_meta.load_sequence()?
         } else {
-            panic!("In stable row id mode, fragment must have the row latest update version meta!")
-        }
+            let creation_version =
+                infer_fragment_creation_version(self.current_dataset.as_ref(), fragment).await?;
+            if let Some(meta) = build_version_meta(fragment, creation_version) {
+                meta.load_sequence()?
+            } else {
+                panic!(
+                    "Can not build row latest update version meta for fragment ID: {}!",
+                    fragment.id
+                )
+            }
+        };
+
+        // Find updated and inserted records
+        let updated_inserted = self
+            .find_updated_and_inserted_records(fragment, &version_sequence)
+            .await?;
+        diff_records.extend(updated_inserted);
 
         Ok(diff_records)
     }
@@ -376,6 +389,83 @@ impl FragmentDiffAnalyzer {
             Err(e) => futures::stream::iter(vec![Err(e)]).boxed(),
         };
         Box::pin(result_stream)
+    }
+}
+
+/// Find the first manifest version where the given fragment id appears.
+async fn first_appearance_version(dataset: &Dataset, fragment_id: u64) -> Result<u64> {
+    let mut first_seen: Option<u64> = None;
+    let mut v = dataset.manifest.version;
+
+    // Scan backward until the fragment id disappears
+    while v >= 1 {
+        let ds_v = if v == dataset.manifest.version {
+            dataset.clone()
+        } else {
+            dataset.checkout_version(v).await?
+        };
+        let exists = ds_v.manifest.fragments.iter().any(|f| f.id == fragment_id);
+        if exists {
+            first_seen = Some(v);
+            if v == 1 {
+                break;
+            }
+            v -= 1;
+            continue;
+        } else {
+            // If we have already seen the fragment in a newer version, we stop
+            break;
+        }
+    }
+
+    first_seen.ok_or_else(|| Error::Internal {
+        message: format!(
+            "Fragment {} not found in dataset manifests up to current version {}",
+            fragment_id, dataset.manifest.version
+        ),
+        location: snafu::location!(),
+    })
+}
+
+/// Infer the creation version for a fragment.
+///
+/// If the fragment was created by a Rewrite (compaction) operation, this traces
+/// lineage to old fragments and uses the earliest old fragment creation version
+/// to avoid misclassifying compaction as a change.
+pub async fn infer_fragment_creation_version(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<u64> {
+    let base_creation = first_appearance_version(dataset, fragment.id).await?;
+
+    // Try to refine using rewrite lineage if possible
+    if let Some(tx) = dataset.read_transaction_by_version(base_creation).await? {
+        match tx.operation {
+            crate::dataset::transaction::Operation::Rewrite { groups, .. } => {
+                // If our fragment id is among the new fragments in any group,
+                // then creation was due to rewrite. Trace to old fragments.
+                for g in groups.iter() {
+                    if g.new_fragments.iter().any(|nf| nf.id == fragment.id) {
+                        // Use the minimum first appearance of old fragments
+                        let mut min_old_creation = base_creation;
+                        for of in g.old_fragments.iter() {
+                            let old_first = first_appearance_version(dataset, of.id).await?;
+                            if old_first < min_old_creation {
+                                min_old_creation = old_first;
+                            }
+                        }
+                        return Ok(min_old_creation);
+                    }
+                }
+                Ok(base_creation)
+            }
+            // Update / Append / Overwrite: the fragment id's first appearance
+            // equals its creation commit version, which is what we want.
+            _ => Ok(base_creation),
+        }
+    } else {
+        // No transaction recorded (legacy or detached). Fall back to base creation.
+        Ok(base_creation)
     }
 }
 

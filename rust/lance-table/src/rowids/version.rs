@@ -411,7 +411,7 @@ pub fn rechunk_version_sequences(
 }
 
 /// Build version metadata for a fragment if it has physical rows and no existing metadata.
-fn build_version_meta(
+pub fn build_version_meta(
     fragment: &Fragment,
     current_version: u64,
 ) -> Option<RowLatestUpdateVersionMeta> {
@@ -438,34 +438,6 @@ fn build_version_meta(
         }
     }
     None
-}
-
-/// Set version metadata for a list of fragments
-pub fn set_version_metadata_for_fragments(fragments: &mut [Fragment], current_version: u64) {
-    for fragment in fragments.iter_mut() {
-        if fragment.row_latest_update_version_meta.is_some() {
-            continue;
-        }
-        if let Some(meta) = build_version_meta(fragment, current_version) {
-            fragment.row_latest_update_version_meta = Some(meta);
-        }
-    }
-}
-
-/// Set/override version metadata for specific fragments by id.
-pub fn set_version_metadata_for_fragments_by_ids(
-    fragments: &mut [Fragment],
-    current_version: u64,
-    target_ids: &std::collections::HashSet<u64>,
-) {
-    for fragment in fragments.iter_mut() {
-        if !target_ids.contains(&fragment.id) {
-            continue;
-        }
-        if let Some(meta) = build_version_meta(fragment, current_version) {
-            fragment.row_latest_update_version_meta = Some(meta);
-        }
-    }
 }
 
 /// Refresh row-level latest update version metadata for a full fragment rewrite-column update.
