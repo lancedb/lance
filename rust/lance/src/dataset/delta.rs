@@ -6,11 +6,10 @@ use crate::Dataset;
 use crate::Result;
 use arrow_array::RecordBatch;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
-use futures::FutureExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Error;
 use lance_table::format::{Fragment, RowLatestUpdateVersionSequence};
-use lance_table::rowids::read_row_ids;
+use lance_table::rowids::{read_row_ids, RowIdSequence};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -94,6 +93,8 @@ pub struct DiffConfig {
     pub max_concurrency: usize,
     /// Whether to include the actual record data in diff results
     pub include_data: bool,
+    /// Batch size for processing row ids
+    pub batch_size: usize,
 }
 
 impl Default for DiffConfig {
@@ -101,6 +102,7 @@ impl Default for DiffConfig {
         Self {
             max_concurrency: 4,
             include_data: true,
+            batch_size: 1000,
         }
     }
 }
@@ -181,109 +183,165 @@ impl FragmentDiffAnalyzer {
             .rows_with_version_greater_than(&row_ids_sequence, self.compared_version);
 
         let changed_set: HashSet<u64> = changed_rows.iter().copied().collect();
-        let updated_row_ids: Vec<u64> = changed_set
+        let mut updated_row_ids: Vec<u64> = changed_set
             .intersection(&self.old_row_ids)
             .copied()
             .collect();
-        let inserted_row_ids: Vec<u64> =
+        let mut inserted_row_ids: Vec<u64> =
             changed_set.difference(&self.old_row_ids).copied().collect();
 
-        // Process updated rows
-        for row_id in updated_row_ids {
-            let version = version_sequence
-                .get_version_for_row_id(&row_ids_sequence, row_id)
-                .unwrap();
+        // For a stable and predictable output order, sort by row_id
+        updated_row_ids.sort_unstable();
+        inserted_row_ids.sort_unstable();
 
-            // Skip rows that were updated after the current dataset version being analyzed
-            // This ensures we only include changes that actually occurred between the compared version
-            // and the current version we're diffing to
-            if version > self.current_dataset.manifest.version {
-                continue;
+        let batch_size = self.config.batch_size.max(1);
+        let max_concurrency = self.config.max_concurrency.max(1);
+
+        // Filter the given row_ids (version boundaries) and fetch data in batches, returning DiffRecord
+        async fn process_rows(
+            analyzer: Arc<FragmentDiffAnalyzer>,
+            row_ids: Vec<u64>,
+            version_sequence: &RowLatestUpdateVersionSequence,
+            row_ids_sequence: &RowIdSequence,
+            op: DiffOperation,
+            batch_size: usize,
+            max_concurrency: usize,
+        ) -> Result<Vec<DiffRecord>> {
+            // First, filter out the rows that are not within the current version range,
+            // and retain the version numbers for constructing the output.
+            let mut filtered: Vec<(u64, u64)> = Vec::with_capacity(row_ids.len());
+            for row_id in row_ids {
+                let version = version_sequence
+                    .get_version_for_row_id(row_ids_sequence, row_id)
+                    .unwrap();
+                if version <= analyzer.current_dataset.manifest.version {
+                    filtered.push((row_id, version));
+                }
             }
 
-            let old_data = if self.config.include_data {
-                self.get_record_data(row_id, &self.old_dataset).await.ok()
-            } else {
-                None
-            };
-
-            let new_data = if self.config.include_data {
-                Some(self.get_record_data(row_id, &self.current_dataset).await?)
-            } else {
-                None
-            };
-
-            records.push(DiffRecord {
-                row_id,
-                operation: DiffOperation::Update,
-                old_data,
-                new_data,
-                version,
-            });
-        }
-
-        // Process inserted rows
-        for row_id in inserted_row_ids {
-            let version = version_sequence
-                .get_version_for_row_id(&row_ids_sequence, row_id)
-                .unwrap();
-
-            // Skip rows that were updated after the current dataset version being analyzed
-            // This ensures we only include changes that actually occurred between the compared version
-            // and the current version we're diffing to
-            if version > self.current_dataset.manifest.version {
-                continue;
+            if filtered.is_empty() {
+                return Ok(Vec::new());
             }
 
-            let new_data = if self.config.include_data {
-                Some(self.get_record_data(row_id, &self.current_dataset).await?)
-            } else {
-                None
-            };
+            // Batch concurrent processing
+            let stream = futures::stream::iter(filtered.chunks(batch_size).map(|chunk| {
+                let ids: Vec<u64> = chunk.iter().map(|(id, _)| *id).collect();
+                let versions: Vec<u64> = chunk.iter().map(|(_, v)| *v).collect();
+                let op_clone = op.clone();
+                let analyzer = analyzer.clone();
 
-            records.push(DiffRecord {
-                row_id,
-                operation: DiffOperation::Insert,
-                old_data: None,
-                new_data,
-                version,
-            });
+                async move {
+                    let include_data = analyzer.config.include_data;
+
+                    let schema = analyzer.current_dataset.schema().clone();
+                    let projection = super::ProjectionRequest::Schema(Arc::new(schema));
+
+                    // batch new data
+                    let new_batch = if include_data {
+                        Some(
+                            analyzer
+                                .current_dataset
+                                .take_rows(&ids, projection.clone())
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+
+                    // Batch old data (only required for Update)
+                    let old_batch = if include_data && op_clone == DiffOperation::Update {
+                        Some(
+                            analyzer
+                                .old_dataset
+                                .take_rows(&ids, projection.clone())
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+
+                    // Robustness check: if data is enabled and the number of rows does not match, return an error
+                    if include_data {
+                        if let Some(ref nb) = new_batch {
+                            if nb.num_rows() != ids.len() {
+                                return Err(Error::invalid_input(
+                                    format!(
+                                        "Expected {} rows in new batch, got {}",
+                                        ids.len(),
+                                        nb.num_rows()
+                                    ),
+                                    Default::default(),
+                                ));
+                            }
+                        }
+                        if let Some(ref ob) = old_batch {
+                            if ob.num_rows() != ids.len() {
+                                return Err(Error::invalid_input(
+                                    format!(
+                                        "Expected {} rows in old batch, got {}",
+                                        ids.len(),
+                                        ob.num_rows()
+                                    ),
+                                    Default::default(),
+                                ));
+                            }
+                        }
+                    }
+
+                    let mut out = Vec::with_capacity(ids.len());
+                    for (i, (row_id, version)) in
+                        ids.into_iter().zip(versions.into_iter()).enumerate()
+                    {
+                        let new_data = new_batch.as_ref().map(|b| b.slice(i, 1));
+                        let old_data = old_batch.as_ref().map(|b| b.slice(i, 1));
+
+                        out.push(DiffRecord {
+                            row_id,
+                            operation: op_clone.clone(),
+                            old_data,
+                            new_data,
+                            version,
+                        });
+                    }
+                    Ok(out)
+                }
+            }))
+            .buffer_unordered(max_concurrency)
+            .try_collect::<Vec<Vec<DiffRecord>>>()
+            .await?;
+
+            Ok(stream.into_iter().flatten().collect())
         }
+
+        let updates = process_rows(
+            Arc::new(self.clone()),
+            updated_row_ids,
+            version_sequence,
+            &row_ids_sequence,
+            DiffOperation::Update,
+            batch_size,
+            max_concurrency,
+        )
+        .await?;
+        records.extend(updates);
+
+        let inserts = process_rows(
+            Arc::new(self.clone()),
+            inserted_row_ids,
+            version_sequence,
+            &row_ids_sequence,
+            DiffOperation::Insert,
+            batch_size,
+            max_concurrency,
+        )
+        .await?;
+        records.extend(inserts);
 
         Ok(records)
     }
 
-    /// Get record data for a specific row ID from a dataset
-    async fn get_record_data(&self, row_id: u64, dataset: &Dataset) -> Result<RecordBatch> {
-        // Use the dataset's take_rows functionality to retrieve the specific record by row ID
-        let row_ids = vec![row_id];
-        let schema = dataset.schema().clone();
-        let projection = super::ProjectionRequest::Schema(Arc::new(schema));
-
-        let batch = dataset.take_rows(&row_ids, projection).await?;
-
-        // Verify we got exactly one row
-        if batch.num_rows() == 0 {
-            return Err(Error::invalid_input(
-                format!("Row ID {} not found in dataset", row_id),
-                Default::default(),
-            ));
-        } else if batch.num_rows() > 1 {
-            return Err(Error::invalid_input(
-                format!(
-                    "Expected 1 row for row ID {}, got {}",
-                    row_id,
-                    batch.num_rows()
-                ),
-                Default::default(),
-            ));
-        }
-
-        Ok(batch)
-    }
-
     /// Create a stream of diff records for all fragments
-    pub fn create_diff_stream(self) -> DiffRecordStream {
+    pub async fn create_diff_stream(self) -> DiffRecordStream {
         let fragments = Arc::try_unwrap(self.current_dataset.manifest.fragments.clone())
             .unwrap_or_else(|arc| (*arc).clone());
         let max_concurrency = self.config.max_concurrency;
@@ -301,29 +359,23 @@ impl FragmentDiffAnalyzer {
                 })
             });
 
-        // Collect all records first, then deduplicate
-        let dedup_stream = stream
-            .try_collect::<Vec<_>>()
-            .then(|result| async move {
-                match result {
-                    Ok(records) => {
-                        let mut seen_row_ids = std::collections::HashSet::new();
-                        let mut deduped = Vec::new();
-
-                        for record in records {
-                            if seen_row_ids.insert(record.row_id) {
-                                deduped.push(Ok(record));
-                            }
-                        }
-
-                        futures::stream::iter(deduped)
-                    }
-                    Err(e) => futures::stream::iter(vec![Err(e)]),
+        async fn dedup_records(records: Vec<DiffRecord>) -> BoxStream<'static, Result<DiffRecord>> {
+            let mut seen_row_ids = std::collections::HashSet::new();
+            let mut deduped = Vec::new();
+            for record in records {
+                if seen_row_ids.insert(record.row_id) {
+                    deduped.push(Ok(record));
                 }
-            })
-            .flatten_stream();
+            }
+            futures::stream::iter(deduped).boxed()
+        }
 
-        Box::pin(dedup_stream)
+        let fut = stream.try_collect::<Vec<_>>();
+        let result_stream = match fut.await {
+            Ok(records) => dedup_records(records).await,
+            Err(e) => futures::stream::iter(vec![Err(e)]).boxed(),
+        };
+        Box::pin(result_stream)
     }
 }
 
@@ -421,6 +473,7 @@ impl DatasetDiffBuilder {
         let config = DiffConfig {
             max_concurrency: self.max_concurrency,
             include_data: self.include_data,
+            batch_size: self.batch_size,
         };
 
         // Create the fragment diff analyzer
@@ -433,7 +486,7 @@ impl DatasetDiffBuilder {
         );
 
         // Return the diff stream
-        Ok(analyzer.create_diff_stream())
+        Ok(analyzer.create_diff_stream().await)
     }
 
     /// Validate preconditions for diff operation
