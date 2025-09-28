@@ -4,294 +4,131 @@ A graph query engine for Lance datasets with Cypher syntax support. This crate e
 
 ## Features
 
-- **Cypher Query Support**: Parse and execute Cypher queries against Lance datasets
-- **Property Graph Model**: Interpret columnar data as nodes and relationships  
-- **SQL Translation**: Convert Cypher queries to optimized DataFusion SQL
-- **Flexible Configuration**: Map dataset columns to graph elements
-- **Type Safety**: Full Rust type safety with comprehensive error handling
-- **Performance**: Leverage Lance's columnar storage and DataFusion's query optimization
+- Cypher query parsing and AST construction
+- Graph configuration for mapping Lance tables to nodes and relationships
+- Semantic validation with typed `GraphError` diagnostics
+- Translation to DataFusion SQL with a direct-execution fast path for simple patterns
+- Async query execution that returns Arrow `RecordBatch` results
+- JSON-serializable parameter binding for reusable query templates
 
 ## Quick Start
 
-### Basic Usage
-
 ```rust
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use lance_graph::{CypherQuery, GraphConfig};
 
-// Configure how your dataset maps to a property graph
 let config = GraphConfig::builder()
     .with_node_label("Person", "person_id")
     .with_relationship("KNOWS", "src_person_id", "dst_person_id")
     .build()?;
 
-// Parse and configure a Cypher query
-let query = CypherQuery::new("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")?
-    .with_config(config);
+let schema = Arc::new(Schema::new(vec![
+    Field::new("person_id", DataType::Int32, false),
+    Field::new("name", DataType::Utf8, false),
+    Field::new("age", DataType::Int32, false),
+]));
+let batch = RecordBatch::try_new(
+    schema,
+    vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["Alice", "Bob"])) as ArrayRef,
+        Arc::new(Int32Array::from(vec![29, 35])) as ArrayRef,
+    ],
+)?;
 
-// Convert to SQL for execution
-let sql = query.to_sql()?;
-println!("Generated SQL: {}", sql);
+let mut tables = HashMap::new();
+tables.insert("Person".to_string(), batch);
+
+let query = CypherQuery::new("MATCH (p:Person) WHERE p.age > $min RETURN p.name")?
+    .with_config(config)
+    .with_parameter("min", 30);
+
+let runtime = tokio::runtime::Runtime::new()?;
+let result = runtime.block_on(query.execute(tables))?;
 ```
 
-### Query Examples
+The query expects a `HashMap<String, RecordBatch>` keyed by the labels and relationship types referenced in the Cypher text. Each record batch should expose the columns configured through `GraphConfig` (ID fields, property fields, etc.). Relationship mappings also expect a batch keyed by the relationship type (for example `KNOWS`) that contains the configured source/target ID columns and any optional property columns.
 
-#### Simple Node Queries
-```cypher
--- Find all persons
-MATCH (p:Person) RETURN p.name, p.age
+## Configuring Graph Mappings
 
--- Filter by properties
-MATCH (p:Person) WHERE p.age > 30 RETURN p.name
-
--- Node with property constraints
-MATCH (p:Person {city: "New York"}) RETURN p.name
-```
-
-#### Relationship Queries
-```cypher
--- Find relationships
-MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name, b.name
-
--- Multi-hop paths
-MATCH (a:Person)-[:KNOWS]->(b:Person)-[:WORKS_WITH]->(c:Person)
-RETURN a.name, b.name, c.name
-
--- Relationship properties
-MATCH (a:Person)-[r:KNOWS {since: 2020}]->(b:Person) RETURN a.name, b.name
-```
-
-#### Advanced Queries
-```cypher
--- Parameterized queries
-MATCH (p:Person) WHERE p.age > $minAge RETURN p.name
-
--- Aggregations
-MATCH (p:Person) RETURN p.city, COUNT(p) AS population
-
--- Sorting and limiting
-MATCH (p:Person) RETURN p.name ORDER BY p.age DESC LIMIT 10
-```
-
-## Architecture
-
-### Components
-
-1. **AST (`ast.rs`)**: Abstract syntax tree representation of Cypher queries
-2. **Parser (`parser.rs`)**: Nom-based parser for Cypher syntax
-3. **Config (`config.rs`)**: Graph configuration for dataset mapping
-4. **Planner (`planner.rs`)**: Query planner for Cypher-to-SQL translation
-5. **Query (`query.rs`)**: High-level query interface and validation
-6. **Error (`error.rs`)**: Comprehensive error handling
-
-### Query Flow
-
-```
-Cypher Query → Parser → AST → Planner → SQL → DataFusion → Results
-                ↓
-          Configuration
-```
-
-## Configuration
-
-### Node Mappings
-
-Configure how dataset rows become graph nodes:
+Graph mappings are declared with `GraphConfig::builder()`:
 
 ```rust
+use lance_graph::{GraphConfig, NodeMapping, RelationshipMapping};
+
 let config = GraphConfig::builder()
-    .with_node_label("Person", "person_id")        // Label and ID field
-    .with_node_label("Company", "company_id")
+    .with_node_label("Person", "person_id")
+    .with_relationship("KNOWS", "src_person_id", "dst_person_id")
     .build()?;
 ```
 
-### Relationship Mappings
-
-Configure how relationships are represented:
+For finer control, build `NodeMapping` and `RelationshipMapping` instances explicitly:
 
 ```rust
+let person = NodeMapping::new("Person", "person_id")
+    .with_properties(vec!["name".into(), "age".into()])
+    .with_filter("kind = 'person'");
+
+let knows = RelationshipMapping::new("KNOWS", "src_person_id", "dst_person_id")
+    .with_properties(vec!["since".into()]);
+
 let config = GraphConfig::builder()
-    .with_relationship("WORKS_FOR", "person_id", "company_id")
-    .with_relationship("KNOWS", "person_id", "friend_id")
+    .with_node_mapping(person)
+    .with_relationship_mapping(knows)
     .build()?;
 ```
 
-### Advanced Configuration
+## Executing Cypher Queries
 
-```rust
-let node_mapping = NodeMapping::new("person_id")
-    .with_filter("type = 'person'")                // Filter conditions
-    .with_property_mapping("name", "full_name");   // Property mappings
+- `CypherQuery::new` parses Cypher text into the internal AST.
+- `with_config` attaches the graph configuration used for validation and execution.
+- `with_parameter` / `with_parameters` bind JSON-serializable values that can be referenced as `$param` in the Cypher text.
+- `execute` is asynchronous and returns an Arrow `RecordBatch`.
 
-let rel_mapping = RelationshipMapping::new("src_id", "dst_id")
-    .with_filter("relationship_type = 'knows'")
-    .with_property_mapping("strength", "weight");
-```
+Queries with a single `MATCH` clause containing a path pattern are planned as joins using the provided mappings. Other queries fall back to a single-table projection/filter pipeline on the first registered dataset.
 
-## Data Model
+A builder (`CypherQueryBuilder`) is also available for constructing queries programmatically without parsing text.
 
-### Unified Table Approach
+## Supported Cypher Surface
 
-Store both nodes and relationships in a single table:
+- Node patterns `(:Label)` with optional variables.
+- Relationship patterns with fixed direction and type, including multi-hop paths.
+- Property comparisons against literal values with `AND`/`OR`/`NOT`/`EXISTS`.
+- RETURN lists of property accesses, optional `DISTINCT`, and `LIMIT`.
+- Positional and named parameters (e.g. `$min_age`).
 
-```sql
-CREATE TABLE graph_data (
-    id BIGINT,
-    type VARCHAR,           -- 'person', 'company', 'relationship'
-    name VARCHAR,           -- Node properties
-    age INT,
-    source_id BIGINT,       -- Relationship properties  
-    target_id BIGINT,
-    relationship_type VARCHAR
-);
-```
+Features such as ORDER BY, aggregations, optional matches, and subqueries are parsed but not executed yet.
 
-### Separate Tables Approach
+## Crate Layout
 
-Use separate tables for nodes and relationships:
-
-```sql
--- Nodes table
-CREATE TABLE persons (
-    person_id BIGINT,
-    name VARCHAR,
-    age INT,
-    city VARCHAR
-);
-
--- Relationships table  
-CREATE TABLE relationships (
-    id BIGINT,
-    source_person_id BIGINT,
-    target_person_id BIGINT,
-    relationship_type VARCHAR,
-    since_year INT
-);
-```
-
-## Supported Cypher Features
-
-### Currently Supported
-
-- ✅ Node patterns: `(n:Label)`, `(n:Label {prop: value})`
-- ✅ Relationship patterns: `-[r:TYPE]->`, `<-[r:TYPE]-`, `-[r:TYPE]-`
-- ✅ WHERE clauses with comparisons (`=`, `<>`, `<`, `>`, `<=`, `>=`)
-- ✅ RETURN clauses with properties and aliases
-- ✅ ORDER BY and LIMIT clauses
-- ✅ Query parameters (`$param`)
-- ✅ Variable references in RETURN
-
-### Planned Features
-
-- 🔄 Boolean operators in WHERE (`AND`, `OR`, `NOT`)
-- 🔄 Pattern expressions (`EXISTS`, `OPTIONAL MATCH`)
-- 🔄 Aggregation functions (`COUNT`, `SUM`, `AVG`, etc.)
-- 🔄 Path expressions and variable-length paths
-- 🔄 UNION and subqueries
-- 🔄 CREATE, UPDATE, DELETE operations
-- 🔄 Two-hop and multi-hop expansions in DataFusion execution (e.g., `(p)-[:R1]->(m)-[:R2]->(q)`), including small bounded variable-length unrolling (e.g., `*1..2`).
+- `ast` – Cypher AST definitions.
+- `parser` – Nom-based Cypher parser.
+- `semantic` – Lightweight semantic checks on the AST.
+- `logical_plan` – Builders for DataFusion logical plans.
+- `datafusion_planner` and `query_processor` – Execution planning utilities.
+- `config` – Graph configuration types and builders.
+- `query` – High level `CypherQuery` API and runtime.
+- `error` – `GraphError` and result helpers.
+- `source_catalog` – Helpers for looking up table metadata.
 
 ## Error Handling
 
-The crate provides comprehensive error handling:
-
-```rust
-use lance_graph::{GraphError, Result};
-
-match CypherQuery::new("INVALID QUERY") {
-    Ok(query) => println!("Query parsed successfully"),
-    Err(GraphError::ParseError { message, position, .. }) => {
-        println!("Parse error at position {}: {}", position, message);
-    }
-    Err(e) => println!("Other error: {}", e),
-}
-```
-
-## Performance Considerations
-
-### Query Optimization
-
-- **Predicate Pushdown**: WHERE clauses are pushed down to the dataset scan
-- **Join Optimization**: DataFusion optimizes relationship traversals
-- **Column Pruning**: Only required columns are read from storage
-- **Index Usage**: Leverage Lance's scalar and vector indices
-
-### Best Practices
-
-1. **Use Selective Filters**: Add WHERE clauses to reduce data scanned
-2. **Limit Results**: Use LIMIT for large result sets
-3. **Index Key Fields**: Create indices on ID fields used in joins
-4. **Batch Queries**: Process multiple queries together when possible
+Most APIs return `Result<T, GraphError>`. Errors include parsing failures, missing mappings, and execution issues surfaced from DataFusion.
 
 ## Testing
-
-Run the test suite:
 
 ```bash
 cargo test -p lance-graph
 ```
 
-Run specific tests:
+## Python Bindings
 
-```bash
-cargo test -p lance-graph parser::tests::test_parse_simple_node_query
-```
-
-## Examples
-
-See the `tests/` directory for comprehensive examples:
-
-- `test_parser.rs`: Cypher parsing examples
-- `test_planner.rs`: SQL translation examples  
-- `test_query.rs`: End-to-end query examples
-- `test_config.rs`: Configuration examples
-
-## Integration
-
-### With Lance Datasets
-
-```rust
-// This would be the integration point with Lance datasets
-// (Implementation depends on Lance's dataset APIs)
-
-let dataset = lance::Dataset::open("path/to/dataset")?;
-let config = GraphConfig::builder()...;
-let query = CypherQuery::new("MATCH (n) RETURN n")?;
-
-// Execute via DataFusion
-let ctx = SessionContext::new();
-let sql = query.to_sql()?;
-let df = ctx.sql(&sql).await?;
-let results = df.collect().await?;
-```
-
-### With Python
-
-Python bindings would provide a clean interface:
-
-```python
-import lance
-from lance.graph import GraphConfig, CypherQuery
-
-# Configure graph interpretation
-config = GraphConfig.builder() \
-    .with_node_label("Person", "person_id") \
-    .build()
-
-# Execute query
-query = CypherQuery("MATCH (p:Person) RETURN p.name") \
-    .with_config(config)
-
-dataset = lance.dataset("path/to/data")
-result = query.execute(dataset)
-```
-
-## Contributing
-
-1. Follow Rust conventions and the existing code style
-2. Add tests for new features
-3. Update documentation for API changes
-4. Run `cargo fmt` and `cargo clippy` before submitting
+Python bindings for this crate live under `python/src/graph.rs` and expose the same configuration and query APIs via PyO3.
 
 ## License
 
-Apache-2.0 License - see LICENSE file for details.
+Apache-2.0. See the top-level LICENSE file for details.
