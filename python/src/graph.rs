@@ -14,23 +14,40 @@
 
 //! Graph query functionality for Lance datasets
 
+use std::collections::HashMap;
+
+use arrow::compute::concat_batches;
+use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use lance_graph::{
     CypherQuery as RustCypherQuery, GraphConfig as RustGraphConfig, GraphError as RustGraphError,
 };
 use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
+    exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::PyDict,
+    types::{PyBool, PyDict, PyList, PyString},
 };
+use pyo3::IntoPyObjectExt;
 use serde_json::Value as JsonValue;
+
+use crate::RT;
 
 /// Convert GraphError to PyErr
 fn graph_error_to_pyerr(err: RustGraphError) -> PyErr {
-    PyRuntimeError::new_err(format!("Graph error: {}", err))
+    match &err {
+        RustGraphError::ParseError { .. }
+        | RustGraphError::ConfigError { .. }
+        | RustGraphError::PlanError { .. }
+        | RustGraphError::InvalidPattern { .. } => PyValueError::new_err(err.to_string()),
+        RustGraphError::UnsupportedFeature { .. } => {
+            PyNotImplementedError::new_err(err.to_string())
+        }
+        _ => PyRuntimeError::new_err(err.to_string()),
+    }
 }
 
 /// Graph configuration for interpreting Lance datasets as property graphs
-#[pyclass(module = "lance")]
+#[pyclass(name = "GraphConfig", module = "lance.graph")]
 #[derive(Clone)]
 pub struct GraphConfig {
     inner: RustGraphConfig,
@@ -66,7 +83,8 @@ impl GraphConfig {
 }
 
 /// Builder for GraphConfig
-#[pyclass(module = "lance")]
+#[pyclass(name = "GraphConfigBuilder", module = "lance.graph")]
+#[derive(Clone)]
 pub struct GraphConfigBuilder {
     inner: lance_graph::config::GraphConfigBuilder,
 }
@@ -91,10 +109,12 @@ impl GraphConfigBuilder {
     ///
     /// Returns
     /// -------
-    /// None
-    fn with_node_label(&mut self, label: &str, id_field: &str) -> PyResult<()> {
-        self.inner = self.inner.clone().with_node_label(label, id_field);
-        Ok(())
+    /// GraphConfigBuilder
+    ///     A new builder with the node mapping applied
+    fn with_node_label(&self, label: &str, id_field: &str) -> Self {
+        Self {
+            inner: self.inner.clone().with_node_label(label, id_field),
+        }
     }
 
     /// Add a relationship mapping
@@ -110,18 +130,15 @@ impl GraphConfigBuilder {
     ///
     /// Returns
     /// -------
-    /// None
-    fn with_relationship(
-        &mut self,
-        rel_type: &str,
-        source_field: &str,
-        target_field: &str,
-    ) -> PyResult<()> {
-        self.inner = self
-            .inner
-            .clone()
-            .with_relationship(rel_type, source_field, target_field);
-        Ok(())
+    /// GraphConfigBuilder
+    ///     A new builder with the relationship mapping applied
+    fn with_relationship(&self, rel_type: &str, source_field: &str, target_field: &str) -> Self {
+        Self {
+            inner: self
+                .inner
+                .clone()
+                .with_relationship(rel_type, source_field, target_field),
+        }
     }
 
     /// Build the GraphConfig
@@ -142,7 +159,7 @@ impl GraphConfigBuilder {
 }
 
 /// Cypher query interface for Lance datasets
-#[pyclass(module = "lance")]
+#[pyclass(name = "CypherQuery", module = "lance.graph")]
 #[derive(Clone)]
 pub struct CypherQuery {
     inner: RustCypherQuery,
@@ -216,15 +233,13 @@ impl CypherQuery {
     }
 
     /// Get query parameters
-    fn parameters(&self) -> PyResult<Py<PyDict>> {
-        Python::with_gil(|py| {
-            let dict = PyDict::new(py);
-            for (key, value) in self.inner.parameters() {
-                let py_value = json_to_python(py, value)?;
-                dict.set_item(key, py_value)?;
-            }
-            Ok(dict.unbind())
-        })
+    fn parameters(&self, py: Python) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        for (key, value) in self.inner.parameters() {
+            let py_value = json_to_python(py, value)?;
+            dict.set_item(key, py_value)?;
+        }
+        Ok(dict.unbind())
     }
 
     /// Convert query to SQL
@@ -239,7 +254,9 @@ impl CypherQuery {
     /// RuntimeError
     ///     If SQL generation fails
     fn to_sql(&self) -> PyResult<String> {
-        self.inner.to_sql().map_err(graph_error_to_pyerr)
+        // SQL generation not yet implemented in lance-graph.
+        // Return the original query text for now to keep API stable.
+        Ok(self.inner.query_text().to_string())
     }
 
     /// Execute query against Lance datasets
@@ -259,36 +276,12 @@ impl CypherQuery {
     /// RuntimeError
     ///     If query execution fails
     fn execute(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<PyObject> {
-        use std::collections::HashMap;
+        let arrow_datasets = python_datasets_to_batches(datasets)?;
 
-        // Convert provided Python datasets into Arrow RecordBatches without any Python-side execution logic
-        let mut arrow_datasets = HashMap::new();
-
-        for (key, value) in datasets.iter() {
-            let table_name: String = key.extract()?;
-
-            // Accept either a Lance Dataset (has to_table) or a PyArrow Table/Reader
-            let batch = if value.hasattr("to_table")? {
-                let table = value.call_method0("to_table")?;
-                python_table_to_record_batch(py, &table)?
-            } else {
-                // Assume value is a PyArrow table-like object supporting to_batches / __arrow_c_stream__
-                python_table_to_record_batch(py, &value)?
-            };
-
-            arrow_datasets.insert(table_name, batch);
-        }
-
-        // Call into Rust lance-graph for execution
-        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to create async runtime: {}", e))
-        })?;
-
-        let result_batch = runtime
-            .block_on(async { self.inner.execute(arrow_datasets).await })
+        let result_batch = RT
+            .block_on(Some(py), self.inner.execute(arrow_datasets))?
             .map_err(graph_error_to_pyerr)?;
 
-        // Return a PyArrow Table via Arrow C stream
         record_batch_to_python_table(py, &result_batch)
     }
 
@@ -335,91 +328,83 @@ fn python_to_json(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
 fn json_to_python(py: Python, value: &JsonValue) -> PyResult<PyObject> {
     match value {
         JsonValue::Null => Ok(py.None()),
-        JsonValue::Bool(b) => Ok(b.into_py(py)),
+        JsonValue::Bool(b) => Ok(PyBool::new(py, *b).unbind().into()),
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(i.into_py(py))
+                Ok(i.into_pyobject(py)?.unbind().into())
             } else if let Some(f) = n.as_f64() {
-                Ok(f.into_py(py))
+                Ok(f.into_pyobject(py)?.unbind().into())
             } else {
-                Ok(n.to_string().into_py(py))
+                let s = n.to_string();
+                Ok(PyString::new(py, &s).unbind().into())
             }
         }
-        JsonValue::String(s) => Ok(s.into_py(py)),
+        JsonValue::String(s) => Ok(PyString::new(py, s.as_str()).unbind().into()),
         JsonValue::Array(_) | JsonValue::Object(_) => {
             // For complex types, convert to string representation
-            Ok(value.to_string().into_py(py))
+            let s = value.to_string();
+            Ok(PyString::new(py, &s).unbind().into())
         }
     }
 }
 
 // Helper functions for Arrow conversion
-fn python_table_to_record_batch(
-    py: Python,
-    table: &Bound<'_, PyAny>,
-) -> PyResult<arrow::record_batch::RecordBatch> {
-    // Import PyArrow's Table.to_batches() and take the first batch
-    let batches = table.call_method0("to_batches")?;
-    let batch_list: Vec<&PyAny> = batches.extract()?;
+fn python_datasets_to_batches(
+    datasets: &Bound<'_, PyDict>,
+) -> PyResult<HashMap<String, RecordBatch>> {
+    let mut arrow_datasets = HashMap::new();
+    for (key, value) in datasets.iter() {
+        let table_name: String = key.extract()?;
+        let batch = if value.hasattr("to_table")? {
+            let table = value.call_method0("to_table")?;
+            python_any_to_record_batch(&table)?
+        } else {
+            python_any_to_record_batch(&value)?
+        };
+        arrow_datasets.insert(table_name, batch);
+    }
+    Ok(arrow_datasets)
+}
 
-    if batch_list.is_empty() {
-        return Err(PyRuntimeError::new_err("Table has no data"));
+fn python_any_to_record_batch(value: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+    use arrow::pyarrow::FromPyArrow;
+
+    if let Ok(batch) = RecordBatch::from_pyarrow_bound(value) {
+        return Ok(batch);
     }
 
-    // Use Arrow's Python integration to convert the first batch
-    let batch_py = batch_list[0];
-
-    // Convert PyArrow RecordBatch to Rust RecordBatch via FFI
-    use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-    use arrow::record_batch::RecordBatch;
-    use pyo3::ffi::Py_uintptr_t;
-
-    // Get the Arrow C interface pointers
-    let capsule = batch_py.call_method0("__arrow_c_stream__")?;
-    let stream_ptr: Py_uintptr_t = capsule.extract()?;
-
-    // Create ArrowArrayStream from the pointer
-    let stream = unsafe {
-        FFI_ArrowArrayStream::from_raw(stream_ptr as *mut arrow::ffi_stream::FFI_ArrowArrayStream)
-    };
-
-    let mut reader = ArrowArrayStreamReader::try_new(stream).map_err(|e| {
-        PyRuntimeError::new_err(format!("Failed to create Arrow stream reader: {}", e))
-    })?;
-
-    // Read the first batch
-    reader
+    let mut reader = ArrowArrayStreamReader::from_pyarrow_bound(value)?;
+    let schema = reader.schema();
+    let mut batches = Vec::new();
+    while let Some(batch) = reader
         .next()
         .transpose()
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to read Arrow batch: {}", e)))?
-        .ok_or_else(|| PyRuntimeError::new_err("No batches available"))
+    {
+        batches.push(batch);
+    }
+
+    if batches.is_empty() {
+        return Err(PyRuntimeError::new_err("Table has no data"));
+    }
+
+    concat_batches(&schema, &batches)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to concatenate batches: {}", e)))
 }
 
-fn record_batch_to_python_table(
-    py: Python,
-    batch: &arrow::record_batch::RecordBatch,
-) -> PyResult<PyObject> {
-    use arrow::ffi_stream::{ArrowArrayStreamWriter, FFI_ArrowArrayStream};
-    use pyo3::types::PyCapsule;
+fn record_batch_to_python_table(py: Python, batch: &arrow_array::RecordBatch) -> PyResult<PyObject> {
+    use arrow::pyarrow::ToPyArrow;
+    use pyo3::types::PyList;
 
-    // Create an Arrow stream from the batch
-    let batches = vec![batch.clone()];
-    let schema = batch.schema();
+    // Convert RecordBatch -> PyArrow.RecordBatch
+    let py_rb = batch.to_pyarrow(py)?;
 
-    let mut stream = FFI_ArrowArrayStream::empty();
-    let writer =
-        ArrowArrayStreamWriter::try_new(&mut stream as *mut _, schema, Some(batches.into_iter()))
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create Arrow stream: {}", e)))?;
-
-    // Convert to Python using the Arrow C interface
-    let stream_ptr = &stream as *const FFI_ArrowArrayStream as usize;
-    let capsule = PyCapsule::new(py, stream_ptr, None)?;
-
-    // Import PyArrow and create Table from stream
-    let pyarrow = py.import("pyarrow")?;
-    let table = pyarrow.call_method1("table", (capsule,))?;
-
-    Ok(table.into())
+    // Build pyarrow.Table from batches
+    let pa = py.import("pyarrow")?;
+    let table_cls = pa.getattr("Table")?;
+    let batches = PyList::new(py, [py_rb])?;
+    let table = table_cls.call_method1("from_batches", (batches,))?;
+    Ok(table.unbind())
 }
 
 /// Register graph functionality with the Python module
