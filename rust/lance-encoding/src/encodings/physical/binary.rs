@@ -90,7 +90,7 @@ fn chunk_offsets<N: OffsetSizeTrait>(
             } else {
                 num_values_in_this_chunk.trailing_zeros() as u8
             },
-            buffer_sizes: vec![padded_chunk_size as u16],
+            buffer_sizes: vec![padded_chunk_size as u32],
         });
         if this_last_offset_in_orig_idx == offsets.len() - 1 {
             break;

@@ -120,7 +120,7 @@ impl InlineBitpacking {
                 );
             }
             chunks.push(MiniBlockChunk {
-                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u16],
+                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u32],
                 log_num_values: LOG_ELEMS_PER_CHUNK,
             });
         }
@@ -149,7 +149,7 @@ impl InlineBitpacking {
         chunks.push(MiniBlockChunk {
             buffer_sizes: vec![
                 ((1 + packed_chunk_sizes[bit_widths_array.len() - 1]) * std::mem::size_of::<T>())
-                    as u16,
+                    as u32,
             ],
             log_num_values: 0,
         });
