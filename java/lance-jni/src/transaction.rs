@@ -495,9 +495,9 @@ fn convert_to_java_operation_inner<'local>(
             removed_fragment_ids,
             updated_fragments,
             new_fragments,
-            fields_modified,
+            bitmap_prune_field_ids,
             mem_wal_to_merge: _,
-            fields_for_preserving_frag_bitmap,
+            bitmap_preserve_exclude_field_ids,
             update_mode,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
@@ -507,9 +507,9 @@ fn convert_to_java_operation_inner<'local>(
             let removed_fragment_ids_obj = export_vec(env, &removed_ids)?;
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
             let new_fragments_obj = export_vec(env, &new_fragments)?;
-            let fields_modified = JLance(fields_modified.clone()).into_java(env)?;
-            let fields_for_preserving_frag_bitmap =
-                JLance(fields_for_preserving_frag_bitmap.clone()).into_java(env)?;
+            let bitmap_prune_field_ids = JLance(bitmap_prune_field_ids.clone()).into_java(env)?;
+            let bitmap_preserve_exclude_field_ids =
+                JLance(bitmap_preserve_exclude_field_ids.clone()).into_java(env)?;
             let update_mode = match update_mode {
                 Some(update_mode) => update_mode.into_java(env),
                 None => Ok(JObject::null()),
@@ -529,8 +529,8 @@ fn convert_to_java_operation_inner<'local>(
                     JValue::Object(&removed_fragment_ids_obj),
                     JValue::Object(&updated_fragments_obj),
                     JValue::Object(&new_fragments_obj),
-                    JValueGen::Object(&fields_modified),
-                    JValueGen::Object(&fields_for_preserving_frag_bitmap),
+                    JValueGen::Object(&bitmap_prune_field_ids),
+                    JValueGen::Object(&bitmap_preserve_exclude_field_ids),
                     JValue::Object(&update_mode_optional),
                 ],
             )?)
@@ -939,16 +939,16 @@ fn convert_to_rust_operation(
                     fragment.extract_object(env)
                 })?;
 
-            let fields_modified = env
-                .call_method(java_operation, "fieldsModified", "()[J", &[])?
+            let bitmap_prune_field_ids = env
+                .call_method(java_operation, "bitmapPruneFieldIds", "()[J", &[])?
                 .l()?;
-            let fields_modified = JLongArray::from(fields_modified).extract_object(env)?;
+            let bitmap_prune_field_ids = JLongArray::from(bitmap_prune_field_ids).extract_object(env)?;
 
-            let fields_for_preserving_frag_bitmap = env
-                .call_method(java_operation, "fieldsForPreservingFragBitmap", "()[J", &[])?
+            let bitmap_preserve_exclude_field_ids = env
+                .call_method(java_operation, "bitmapPreserveExcludeFieldIds", "()[J", &[])?
                 .l()?;
-            let fields_for_preserving_frag_bitmap =
-                JLongArray::from(fields_for_preserving_frag_bitmap).extract_object(env)?;
+            let bitmap_preserve_exclude_field_ids =
+                JLongArray::from(bitmap_preserve_exclude_field_ids).extract_object(env)?;
 
             let update_mode: Option<UpdateMode> =
                 env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
@@ -959,9 +959,9 @@ fn convert_to_rust_operation(
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified,
+                bitmap_prune_field_ids,
                 mem_wal_to_merge: None,
-                fields_for_preserving_frag_bitmap,
+                bitmap_preserve_exclude_field_ids,
                 update_mode,
             }
         }

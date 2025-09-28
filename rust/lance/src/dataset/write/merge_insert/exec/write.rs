@@ -882,9 +882,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified: vec![], // No fields are modified in schema for upsert
+                bitmap_prune_field_ids: vec![], // No schema fields are modified for upsert
                 mem_wal_to_merge,
-                fields_for_preserving_frag_bitmap: dataset
+                bitmap_preserve_exclude_field_ids: dataset
                     .schema()
                     .fields
                     .iter()

@@ -244,9 +244,9 @@ pub enum Operation {
     ///
     /// A horizontal update adds new columns.  In this case, the updated fragments
     /// may have fields removed or added.  It is even possible for a field to be tombstoned
-    /// and then added back in the same update. (which is a field modification).  If any
-    /// fields are modified in this way then they need to be added to the fields_modified list.
-    /// This way we can correctly update the indices.
+    /// and then added back in the same update. (which is a field modification).
+            /// Any fields modified in this way must be added to the bitmap_prune_field_ids list so indices that cover those fields can prune fragment bitmaps accordingly.
+            /// This ensures indices remain consistent after updates.
     /// This is what is used by a merge insert that does not match the whole schema.
     Update {
         /// Ids of fragments that have been moved
@@ -255,13 +255,14 @@ pub enum Operation {
         updated_fragments: Vec<Fragment>,
         /// Fragments that have been added
         new_fragments: Vec<Fragment>,
-        /// The fields that have been modified
-        fields_modified: Vec<u32>,
+        /// Field IDs that drive index fragment bitmap pruning
+        bitmap_prune_field_ids: Vec<u32>,
         /// The MemWAL (pre-image) that should be marked as merged after this transaction
         mem_wal_to_merge: Option<MemWal>,
-        /// The fields that used to judge whether to preserve the new frag's id into
-        /// the frag bitmap of the specified indices.
-        fields_for_preserving_frag_bitmap: Vec<u32>,
+        /// Field IDs used to decide whether to preserve new fragment IDs in the
+        /// fragment bitmap of specified indices. Indices that do not cover these
+        /// fields may preserve the new fragment IDs when applicable.
+        bitmap_preserve_exclude_field_ids: Vec<u32>,
         /// The mode of update
         update_mode: Option<UpdateMode>,
     },
@@ -310,6 +311,33 @@ pub enum UpdateMode {
     /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
     /// but a small subset of columns are affected.
     RewriteColumns,
+}
+
+impl Operation {
+    /// Returns the field IDs that drive index fragment bitmap pruning for Update operations.
+    /// For non-Update operations, returns an empty slice.
+    pub fn prune_fields(&self) -> &[u32] {
+        match self {
+            Operation::Update {
+                bitmap_prune_field_ids,
+                ..
+            } => bitmap_prune_field_ids.as_slice(),
+            _ => &[],
+        }
+    }
+
+    /// Returns the field IDs used to decide whether to preserve new fragment IDs
+    /// in an index's fragment bitmap for Update operations. For non-Update operations,
+    /// returns an empty slice.
+    pub fn bitmap_preserve_exclude_fields(&self) -> &[u32] {
+        match self {
+            Operation::Update {
+                bitmap_preserve_exclude_field_ids,
+                ..
+            } => bitmap_preserve_exclude_field_ids.as_slice(),
+            _ => &[],
+        }
+    }
 }
 
 impl std::fmt::Display for Operation {
@@ -449,29 +477,29 @@ impl PartialEq for Operation {
                     removed_fragment_ids: a_removed,
                     updated_fragments: a_updated,
                     new_fragments: a_new,
-                    fields_modified: a_fields,
+                    bitmap_prune_field_ids: a_prune_fields,
                     mem_wal_to_merge: a_mem_wal_to_merge,
-                    fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
+                    bitmap_preserve_exclude_field_ids: a_bitmap_preserve_exclude_fields,
                     update_mode: a_update_mode,
                 },
                 Self::Update {
                     removed_fragment_ids: b_removed,
                     updated_fragments: b_updated,
                     new_fragments: b_new,
-                    fields_modified: b_fields,
+                    bitmap_prune_field_ids: b_prune_fields,
                     mem_wal_to_merge: b_mem_wal_to_merge,
-                    fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
+                    bitmap_preserve_exclude_field_ids: b_bitmap_preserve_exclude_fields,
                     update_mode: b_update_mode,
                 },
             ) => {
                 compare_vec(a_removed, b_removed)
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
-                    && compare_vec(a_fields, b_fields)
+                    && compare_vec(a_prune_fields, b_prune_fields)
                     && a_mem_wal_to_merge == b_mem_wal_to_merge
                     && compare_vec(
-                        a_fields_for_preserving_frag_bitmap,
-                        b_fields_for_preserving_frag_bitmap,
+                        a_bitmap_preserve_exclude_fields,
+                        b_bitmap_preserve_exclude_fields,
                     )
                     && a_update_mode == b_update_mode
             }
@@ -1722,9 +1750,9 @@ impl Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified,
+                bitmap_prune_field_ids,
                 mem_wal_to_merge,
-                fields_for_preserving_frag_bitmap,
+                bitmap_preserve_exclude_field_ids,
                 update_mode,
             } => {
                 // Extract existing fragments once for reuse
@@ -1759,7 +1787,7 @@ impl Transaction {
                 Self::prune_updated_fields_from_indices(
                     &mut final_indices,
                     updated_fragments,
-                    fields_modified,
+                    bitmap_prune_field_ids,
                 );
 
                 let mut new_fragments =
@@ -1918,7 +1946,7 @@ impl Transaction {
                         &mut final_indices,
                         &pure_updated_frag_ids,
                         &original_fragment_ids,
-                        fields_for_preserving_frag_bitmap,
+                        bitmap_preserve_exclude_field_ids,
                     );
                 }
 
@@ -2323,13 +2351,13 @@ impl Transaction {
         indices: &mut [IndexMetadata],
         pure_update_frag_ids: &[u64],
         original_fragment_ids: &[u64],
-        fields_for_preserving_frag_bitmap: &[u32],
+        bitmap_preserve_exclude_field_ids: &[u32],
     ) {
         if pure_update_frag_ids.is_empty() {
             return;
         }
 
-        let value_updated_field_set = fields_for_preserving_frag_bitmap
+        let value_updated_field_set = bitmap_preserve_exclude_field_ids
             .iter()
             .collect::<HashSet<_>>();
 
@@ -2363,15 +2391,15 @@ impl Transaction {
     fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
-        fields_modified: &[u32],
+        bitmap_prune_field_ids: &[u32],
     ) {
-        if fields_modified.is_empty() {
+        if bitmap_prune_field_ids.is_empty() {
             return;
         }
 
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
-        let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
+        let fields_modified_set = bitmap_prune_field_ids.iter().collect::<HashSet<_>>();
         for index in indices.iter_mut() {
             if index
                 .fields
@@ -2911,9 +2939,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                fields_modified,
+                bitmap_prune_field_ids: fields_modified,
                 mem_wal_to_merge: mem_wal_to_merge.map(|m| MemWal::try_from(m).unwrap()),
-                fields_for_preserving_frag_bitmap,
+                bitmap_preserve_exclude_field_ids: fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
                     1 => Some(UpdateMode::RewriteColumns),
@@ -3266,9 +3294,9 @@ impl From<&Transaction> for pb::Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified,
+                bitmap_prune_field_ids,
                 mem_wal_to_merge,
-                fields_for_preserving_frag_bitmap,
+                bitmap_preserve_exclude_field_ids,
                 update_mode,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
@@ -3277,9 +3305,9 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::DataFragment::from)
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
-                fields_modified: fields_modified.clone(),
+                fields_modified: bitmap_prune_field_ids.clone(),
                 mem_wal_to_merge: mem_wal_to_merge.as_ref().map(|m| m.into()),
-                fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
+                fields_for_preserving_frag_bitmap: bitmap_preserve_exclude_field_ids.clone(),
                 update_mode: update_mode
                     .as_ref()
                     .map(|mode| match mode {

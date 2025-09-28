@@ -393,10 +393,10 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
-        let mut fields_for_preserving_frag_bitmap = Vec::new();
+        let mut bitmap_preserve_exclude_field_ids = Vec::new();
         for column_name in self.updates.keys() {
             if let Ok(field_id) = dataset.schema().field_id(column_name) {
-                fields_for_preserving_frag_bitmap.push(field_id as u32);
+                bitmap_preserve_exclude_field_ids.push(field_id as u32);
             }
         }
 
@@ -405,12 +405,11 @@ impl UpdateJob {
             removed_fragment_ids: update_data.removed_fragment_ids,
             updated_fragments: update_data.old_fragments,
             new_fragments: update_data.new_fragments,
-            // In "rewrite rows" mode, the rows that are updated in the fragment
-            // are moved(deleted and appended).
-            // so we do not need to handle the frag bitmap of the index about it.
-            fields_modified: vec![],
+            // In "rewrite rows" mode, rows updated in the fragment are moved (deleted and appended).
+            // Therefore we do not need to prune index fragment bitmaps based on updated values here.
+            bitmap_prune_field_ids: vec![],
             mem_wal_to_merge: None,
-            fields_for_preserving_frag_bitmap,
+            bitmap_preserve_exclude_field_ids,
             update_mode: Some(RewriteRows),
         };
 
