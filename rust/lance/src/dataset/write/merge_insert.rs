@@ -104,6 +104,7 @@ use std::{
     time::Duration,
 };
 use tokio::task::JoinSet;
+use lance_core::utils::address::RowAddress;
 
 mod assign_action;
 mod exec;
@@ -1037,7 +1038,7 @@ impl MergeInsertJob {
                                 row_addrs
                                     .values()
                                     .iter()
-                                    .map(|addr| (*addr & 0xFFFF_FFFF) as usize),
+                                    .map(|addr| RowAddress::from(*addr).row_offset() as usize),
                             );
                         }
                         updated_offsets.sort_unstable();
