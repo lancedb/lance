@@ -25,9 +25,9 @@ use lance_graph::{
 use pyo3::{
     exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyBool, PyDict, PyList, PyString},
+    types::PyDict,
+    IntoPyObject,
 };
-use pyo3::IntoPyObjectExt;
 use serde_json::Value as JsonValue;
 
 use crate::RT;
@@ -328,22 +328,23 @@ fn python_to_json(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
 fn json_to_python(py: Python, value: &JsonValue) -> PyResult<PyObject> {
     match value {
         JsonValue::Null => Ok(py.None()),
-        JsonValue::Bool(b) => Ok(PyBool::new(py, *b).unbind().into()),
+        JsonValue::Bool(b) => {
+            use pyo3::types::PyBool;
+            Ok(PyBool::new(py, *b).to_owned().into())
+        }
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(i.into_pyobject(py)?.unbind().into())
             } else if let Some(f) = n.as_f64() {
                 Ok(f.into_pyobject(py)?.unbind().into())
             } else {
-                let s = n.to_string();
-                Ok(PyString::new(py, &s).unbind().into())
+                Ok(n.to_string().into_pyobject(py)?.unbind().into())
             }
         }
-        JsonValue::String(s) => Ok(PyString::new(py, s.as_str()).unbind().into()),
+        JsonValue::String(s) => Ok(s.as_str().into_pyobject(py)?.unbind().into()),
         JsonValue::Array(_) | JsonValue::Object(_) => {
             // For complex types, convert to string representation
-            let s = value.to_string();
-            Ok(PyString::new(py, &s).unbind().into())
+            Ok(value.to_string().into_pyobject(py)?.unbind().into())
         }
     }
 }
@@ -392,7 +393,10 @@ fn python_any_to_record_batch(value: &Bound<'_, PyAny>) -> PyResult<RecordBatch>
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to concatenate batches: {}", e)))
 }
 
-fn record_batch_to_python_table(py: Python, batch: &arrow_array::RecordBatch) -> PyResult<PyObject> {
+fn record_batch_to_python_table(
+    py: Python,
+    batch: &arrow_array::RecordBatch,
+) -> PyResult<PyObject> {
     use arrow::pyarrow::ToPyArrow;
     use pyo3::types::PyList;
 
