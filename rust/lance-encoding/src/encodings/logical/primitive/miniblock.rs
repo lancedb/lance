@@ -44,8 +44,8 @@ pub struct MiniBlockCompressed {
 pub struct MiniBlockChunk {
     // The size in bytes of each buffer in the chunk.
     //
-    // The total size must be less than or equal to 8Ki - 6 (8188)
-    pub buffer_sizes: Vec<u16>,
+    // Updated to support larger chunk sizes (up to 4GB per buffer)
+    pub buffer_sizes: Vec<u32>,
     // The log (base 2) of the number of values in the chunk.  If this is the final chunk
     // then this should be 0 (the number of values will be calculated by subtracting the
     // size of all other chunks from the total size of the page)

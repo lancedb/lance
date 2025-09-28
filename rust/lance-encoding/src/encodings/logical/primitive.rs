@@ -451,8 +451,13 @@ impl DecodeMiniBlockTask {
         };
         let buffer_sizes = (0..self.num_buffers)
             .map(|_| {
-                let size = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
-                offset += 2;
+                let size = u32::from_le_bytes([
+                    buf[offset],
+                    buf[offset + 1],
+                    buf[offset + 2],
+                    buf[offset + 3],
+                ]);
+                offset += 4;
                 size
             })
             .collect::<Vec<_>>();
@@ -3569,7 +3574,8 @@ impl PrimitiveStructuralEncoder {
             assert!(chunk_bytes <= 2 * 1024 * 1024 * 1024); // 2GB limit with u32 metadata
             assert!(chunk_bytes > 0);
             assert_eq!(chunk_bytes % 8, 0);
-            assert!(chunk.log_num_values <= 12); // 4Ki values max
+            // 4Ki values max
+            assert!(chunk.log_num_values <= 12);
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
             // 0xFFF

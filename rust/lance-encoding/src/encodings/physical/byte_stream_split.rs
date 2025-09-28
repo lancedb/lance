@@ -159,7 +159,7 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
 
                     debug_assert!(chunk_bytes > 0);
                     chunks.push(MiniBlockChunk {
-                        buffer_sizes: vec![chunk_bytes as u16],
+                        buffer_sizes: vec![chunk_bytes as u32],
                         log_num_values,
                     });
 

@@ -68,7 +68,7 @@ impl MiniBlockCompressor for GeneralMiniBlockCompressor {
 
             // Create new chunk with updated first buffer size
             let mut new_buffer_sizes = chunk.buffer_sizes.clone();
-            new_buffer_sizes[0] = compressed_size as u16;
+            new_buffer_sizes[0] = compressed_size as u32;
 
             new_chunks.push(MiniBlockChunk {
                 buffer_sizes: new_buffer_sizes,
