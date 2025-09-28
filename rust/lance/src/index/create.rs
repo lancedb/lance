@@ -114,7 +114,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        let index_name = self.name.take().unwrap_or(format!(
+            "{}_{}_idx",
+            column,
+            self.index_type.to_string().to_lowercase()
+        ));
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
@@ -565,5 +569,40 @@ mod tests {
         let mut expected_fragments = fragment_ids.clone();
         expected_fragments.sort();
         assert_eq!(all_covered_fragments, expected_fragments);
+    }
+
+    #[tokio::test]
+    async fn test_auto_generated_index_name() {
+        // Test that when no index name is provided, the auto-generated name follows the expected pattern
+        use lance_index::scalar::BuiltinIndexType;
+
+        let tmpdir = tempdir().unwrap();
+        let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
+
+        // Create test data
+        let batch = create_text_batch(0, 10);
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], create_text_batch(0, 1).schema());
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        // Test for Inverted index (original test)
+        let params = InvertedIndexParams::default();
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_inverted_idx");
+
+        // Test for BloomFilter index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::BloomFilter, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_bloomfilter_idx");
+
+        // Test for ZoneMap index
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::ZoneMap, &params);
+        let index_metadata = builder.execute_uncommitted().await.unwrap();
+        assert_eq!(index_metadata.name, "text_zonemap_idx");
     }
 }

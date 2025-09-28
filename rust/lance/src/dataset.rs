@@ -3625,9 +3625,18 @@ mod tests {
         assert_eq!(fragment_bitmap.len(), 1);
         assert!(fragment_bitmap.contains(0));
 
-        let actual_statistics: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("embeddings_idx").await.unwrap())
-                .unwrap();
+        // Test auto-generated index name follows the expected pattern
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "embeddings_ivf_pq_idx");
+
+        let actual_statistics: serde_json::Value = serde_json::from_str(
+            &dataset
+                .index_statistics("embeddings_ivf_pq_idx")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF_PQ");
 
