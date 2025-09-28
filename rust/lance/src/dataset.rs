@@ -425,14 +425,14 @@ impl Dataset {
 
     /// This is a two-phase operation:
     /// - Create the branch dataset by shallow cloning.
-    /// - Create the branch metadata (a.k.a. `BranchContent`).
+    /// - Create the branch metadata (a.k.a. `BranchContents`).
     ///
-    /// These two phases are not atomic. We consider `BranchContent` as the source of truth
+    /// These two phases are not atomic. We consider `BranchContents` as the source of truth
     /// for the branch.
     ///
     /// The cleanup procedure should:
-    /// - Clean up zombie branch datasets that have no related `BranchContent`.
-    /// - Delete broken `BranchContent` entries that have no related branch dataset.
+    /// - Clean up zombie branch datasets that have no related `BranchContents`.
+    /// - Delete broken `BranchContents` entries that have no related branch dataset.
     ///
     /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
     /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
@@ -462,7 +462,7 @@ impl Dataset {
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
         let dataset = builder.execute(transaction).await?;
 
-        // Create BranchContent after shallow_clone
+        // Create BranchContents after shallow_clone
         self.branches()
             .create(branch, version_number, source_branch.as_deref())
             .await?;
@@ -473,7 +473,7 @@ impl Dataset {
         self.branches().delete(branch, false).await
     }
 
-    /// Delete the branch even if the BranchContent is not found.
+    /// Delete the branch even if the BranchContents is not found.
     /// This could be useful when we have zombie branches and want to clean them up immediately.
     pub async fn force_delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, true).await

@@ -67,7 +67,7 @@ impl fmt::Display for Ref {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Version(branch, version_number) => {
-                let branch_name = branch.as_deref().unwrap_or("Main");
+                let branch_name = branch.as_deref().unwrap_or("main");
                 let version_str = version_number
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "latest".to_string());
@@ -463,15 +463,19 @@ impl Branches<'_> {
             .map(|_| ())
     }
 
-    pub async fn delete(&mut self, branch: &str, forced: bool) -> Result<()> {
+    /// Delete a branch
+    ///
+    /// If the `BranchContents` does not exist, it will return an error directly unless `force` is true.
+    /// If `force` is true, it will try to delete the branch directories no matter `BranchContents` exists or not.
+    pub async fn delete(&mut self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
             self.object_store().delete(&branch_file).await?;
-        } else if forced {
-            log::warn!("BranchContent of {} does not exist", branch);
+        } else if force {
+            log::warn!("BranchContents of {} does not exist", branch);
         } else {
             return Err(Error::RefNotFound {
                 message: format!("Branch {} does not exist", branch),
@@ -499,7 +503,7 @@ impl Branches<'_> {
         Ok(branches)
     }
 
-    /// Clean up empty parent directories using 4-step algorithm
+    /// Clean up empty parent directories
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
@@ -677,7 +681,7 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
         });
     }
 
-    if branch_name.eq_ignore_ascii_case("main") {
+    if branch_name.eq("main") {
         return Err(Error::InvalidRef {
             message: "Branch name cannot be 'main'".to_string(),
         });
