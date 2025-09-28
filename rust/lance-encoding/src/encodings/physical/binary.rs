@@ -22,7 +22,7 @@ use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, MAX_MINIBLOCK_VALUES,
 };
 use crate::format::pb21::compressive_encoding::Compression;
 use crate::format::pb21::CompressiveEncoding;
@@ -163,13 +163,17 @@ fn search_next_offset_idx<N: OffsetSizeTrait>(offsets: &[N], last_offset_idx: us
         let new_size =
             existing_bytes + N::from_usize((new_num_values + 1) * N::get_byte_width()).unwrap();
         if new_size.to_i64().unwrap() <= *AIM_MINICHUNK_SIZE {
+            if new_num_values * 2 > MAX_MINIBLOCK_VALUES as usize {
+                // hit the max number of values limit
+                break;
+            }
             num_values = new_num_values;
             new_num_values *= 2;
         } else {
             break;
         }
     }
-    last_offset_idx + new_num_values
+    last_offset_idx + num_values
 }
 
 impl BinaryMiniBlockEncoder {

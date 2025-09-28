@@ -1661,9 +1661,9 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let rep_index_bytes = buffers.next();
 
             // Parse the metadata and build the chunk meta
-            assert!(meta_bytes.len() % 2 == 0);
-            let bytes = LanceBuffer::from_bytes(meta_bytes, 2);
-            let words = bytes.borrow_to_typed_slice::<u16>();
+            assert!(meta_bytes.len() % 4 == 0);
+            let bytes = LanceBuffer::from_bytes(meta_bytes, 4);
+            let words = bytes.borrow_to_typed_slice::<u32>();
             let words = words.as_ref();
 
             let mut chunk_meta = Vec::with_capacity(words.len());
@@ -3501,7 +3501,7 @@ impl PrimitiveStructuralEncoder {
         // 2 bytes for the length of each buffer and up to 7 bytes of padding per buffer
         let max_extra = 9 * num_buffers;
         let mut data_buffer = Vec::with_capacity(bytes_rep + bytes_def + bytes_data + max_extra);
-        let mut meta_buffer = Vec::with_capacity(miniblocks.chunks.len() * 2);
+        let mut meta_buffer = Vec::with_capacity(miniblocks.chunks.len() * 4);
 
         let mut rep_iter = rep.map(|r| r.into_iter());
         let mut def_iter = def.map(|d| d.into_iter());
@@ -3566,16 +3566,17 @@ impl PrimitiveStructuralEncoder {
             }
 
             let chunk_bytes = data_buffer.len() - start_pos;
-            assert!(chunk_bytes <= 32 * 1024);
+            assert!(chunk_bytes <= 2 * 1024 * 1024 * 1024); // 2GB limit with u32 metadata
             assert!(chunk_bytes > 0);
             assert_eq!(chunk_bytes % 8, 0);
+            assert!(chunk.log_num_values <= 12); // 4Ki values max
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
             // 0xFFF
             let divided_bytes = chunk_bytes / MINIBLOCK_ALIGNMENT;
             let divided_bytes_minus_one = (divided_bytes - 1) as u64;
 
-            let metadata = ((divided_bytes_minus_one << 4) | chunk.log_num_values as u64) as u16;
+            let metadata = ((divided_bytes_minus_one << 4) | chunk.log_num_values as u64) as u32;
             meta_buffer.extend_from_slice(&metadata.to_le_bytes());
         }
 
