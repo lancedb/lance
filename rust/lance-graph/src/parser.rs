@@ -185,18 +185,16 @@ fn relationship_pattern(input: &str) -> IResult<&str, RelationshipPattern> {
     ))
 }
 
+// Type alias for complex relationship content return type
+type RelationshipContentResult<'a> = (
+    Option<&'a str>,
+    Vec<&'a str>,
+    Option<HashMap<String, PropertyValue>>,
+    Option<LengthRange>,
+);
+
 // Parse relationship content inside brackets
-fn relationship_content(
-    input: &str,
-) -> IResult<
-    &str,
-    (
-        Option<&str>,
-        Vec<&str>,
-        Option<HashMap<String, PropertyValue>>,
-        Option<LengthRange>,
-    ),
-> {
+fn relationship_content(input: &str) -> IResult<&str, RelationshipContentResult<'_>> {
     let (input, _) = multispace0(input)?;
     let (input, variable) = opt(identifier)(input)?;
     let (input, types) = many0(preceded(char(':'), identifier))(input)?;

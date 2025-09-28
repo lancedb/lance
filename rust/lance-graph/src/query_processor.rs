@@ -80,13 +80,13 @@ impl QueryProcessor {
         let plan = self.process_query(query_text)?;
 
         let mut explanation = String::new();
-        explanation.push_str(&format!("=== Query Processing Pipeline ===\n\n"));
+        explanation.push_str("=== Query Processing Pipeline ===\n\n");
         explanation.push_str(&format!("Original Query:\n{}\n\n", plan.query_text));
 
-        explanation.push_str(&format!("=== Phase 1: Parsing ===\n"));
+        explanation.push_str("=== Phase 1: Parsing ===\n");
         explanation.push_str(&format!("AST: {:#?}\n\n", plan.ast));
 
-        explanation.push_str(&format!("=== Phase 2: Semantic Analysis ===\n"));
+        explanation.push_str("=== Phase 2: Semantic Analysis ===\n");
         explanation.push_str(&format!(
             "Variables: {:#?}\n",
             plan.semantic_result.variables
@@ -94,12 +94,12 @@ impl QueryProcessor {
         if !plan.semantic_result.warnings.is_empty() {
             explanation.push_str(&format!("Warnings: {:?}\n", plan.semantic_result.warnings));
         }
-        explanation.push_str("\n");
+        explanation.push('\n');
 
-        explanation.push_str(&format!("=== Phase 3: Logical Planning ===\n"));
+        explanation.push_str("=== Phase 3: Logical Planning ===\n");
         explanation.push_str(&format!("Logical Plan: {:#?}\n\n", plan.logical_plan));
 
-        explanation.push_str(&format!("=== Phase 4: DataFusion Planning ===\n"));
+        explanation.push_str("=== Phase 4: DataFusion Planning ===\n");
         explanation.push_str(&format!("DataFusion Plan: {:#?}\n\n", plan.datafusion_plan));
 
         // No legacy SQL generation layer; DataFusion plan is the physical output.
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn test_new_pipeline_vs_old() {
         let config = create_test_config();
-        let processor = QueryProcessor::new(config.clone());
+        let processor = QueryProcessor::new(config);
 
         // Test the new pipeline
         let query = "MATCH (n:Person) WHERE n.age > 30 RETURN n.name";

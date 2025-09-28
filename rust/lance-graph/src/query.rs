@@ -185,7 +185,7 @@ impl<'a> PathExecutor<'a> {
             .fields()
             .iter()
             .map(|f| {
-                datafusion::logical_expr::col(f.name()).alias(&format!("{}__{}", alias, f.name()))
+                datafusion::logical_expr::col(f.name()).alias(format!("{}__{}", alias, f.name()))
             })
             .collect();
         df.alias(alias)?
@@ -207,7 +207,7 @@ impl<'a> PathExecutor<'a> {
             df = df
                 .filter(datafusion::logical_expr::Expr::BinaryExpr(
                     datafusion::logical_expr::BinaryExpr {
-                        left: Box::new(datafusion::logical_expr::col(&format!(
+                        left: Box::new(datafusion::logical_expr::col(format!(
                             "{}__{}",
                             self.start_alias, k
                         ))),
@@ -337,7 +337,7 @@ impl<'a> PathExecutor<'a> {
                 let alias = self
                     .resolve_var_alias(&prop.variable)
                     .unwrap_or(&prop.variable);
-                let mut e = datafusion::logical_expr::col(&format!("{}__{}", alias, prop.property));
+                let mut e = datafusion::logical_expr::col(format!("{}__{}", alias, prop.property));
                 if let Some(a) = &item.alias {
                     e = e.alias(a);
                 }
@@ -747,10 +747,10 @@ impl CypherQuery {
         ctx: &datafusion::prelude::SessionContext,
     ) -> Result<Option<datafusion::dataframe::DataFrame>> {
         use crate::ast::GraphPattern;
-        let match_clause = match self.ast.match_clauses.as_slice() {
-            [mc] => mc,
-            _ => return Ok(None),
+        let [mc] = self.ast.match_clauses.as_slice() else {
+            return Ok(None);
         };
+        let match_clause = mc;
         let path = match match_clause.patterns.as_slice() {
             [GraphPattern::Path(p)] if !p.segments.is_empty() => p,
             _ => return Ok(None),
@@ -777,10 +777,10 @@ impl CypherQuery {
         use datafusion::prelude::*;
 
         // Only handle a single MATCH with a single path and exactly one segment
-        let match_clause = match self.ast.match_clauses.as_slice() {
-            [mc] => mc,
-            _ => return Ok(None),
+        let [mc] = self.ast.match_clauses.as_slice() else {
+            return Ok(None);
         };
+        let match_clause = mc;
         let path = match match_clause.patterns.as_slice() {
             [GraphPattern::Path(p)] if (p.segments.len() == 1 || p.segments.len() == 2) => p,
             _ => return Ok(None),
@@ -841,7 +841,7 @@ impl CypherQuery {
             .fields()
             .iter()
             .map(|f| {
-                datafusion::logical_expr::col(f.name()).alias(&format!(
+                datafusion::logical_expr::col(f.name()).alias(format!(
                     "{}__{}",
                     start_alias,
                     f.name()
@@ -861,7 +861,7 @@ impl CypherQuery {
             left = left
                 .filter(datafusion::logical_expr::Expr::BinaryExpr(
                     datafusion::logical_expr::BinaryExpr {
-                        left: Box::new(datafusion::logical_expr::col(&format!(
+                        left: Box::new(datafusion::logical_expr::col(format!(
                             "{}__{}",
                             start_alias, k
                         ))),
@@ -887,7 +887,7 @@ impl CypherQuery {
             .fields()
             .iter()
             .map(|f| {
-                datafusion::logical_expr::col(f.name()).alias(&format!(
+                datafusion::logical_expr::col(f.name()).alias(format!(
                     "{}__{}",
                     rel_alias,
                     f.name()
@@ -939,7 +939,7 @@ impl CypherQuery {
             .fields()
             .iter()
             .map(|f| {
-                datafusion::logical_expr::col(f.name()).alias(&format!(
+                datafusion::logical_expr::col(f.name()).alias(format!(
                     "{}__{}",
                     end_alias,
                     f.name()
@@ -1137,21 +1137,15 @@ impl CypherQuery {
             if let Some(where_clause) = &self.ast.where_clause {
                 if let Some(expr) =
                     to_df_boolean_expr_with_vars(&where_clause.expression, &|var, prop| {
-                        let alias = if Some(var)
-                            == path.start_node.variable.as_ref().map(String::as_str)
-                        {
+                        let alias = if Some(var) == path.start_node.variable.as_deref() {
                             start_alias
-                        } else if Some(var)
-                            == seg.relationship.variable.as_ref().map(String::as_str)
-                        {
+                        } else if Some(var) == seg.relationship.variable.as_deref() {
                             rel_alias
-                        } else if Some(var) == seg.end_node.variable.as_ref().map(String::as_str) {
+                        } else if Some(var) == seg.end_node.variable.as_deref() {
                             mid_alias
-                        } else if Some(var)
-                            == seg2.relationship.variable.as_ref().map(String::as_str)
-                        {
+                        } else if Some(var) == seg2.relationship.variable.as_deref() {
                             &rel2_alias
-                        } else if Some(var) == seg2.end_node.variable.as_ref().map(String::as_str) {
+                        } else if Some(var) == seg2.end_node.variable.as_deref() {
                             end_alias
                         } else {
                             var
@@ -1171,24 +1165,17 @@ impl CypherQuery {
             for item in &self.ast.return_clause.items {
                 if let ValueExpression::Property(prop) = &item.expression {
                     let col_name = if Some(prop.variable.as_str())
-                        == path.start_node.variable.as_ref().map(String::as_str)
+                        == path.start_node.variable.as_deref()
                     {
                         format!("{}.{}", start_alias, prop.property)
-                    } else if Some(prop.variable.as_str())
-                        == seg.relationship.variable.as_ref().map(String::as_str)
-                    {
+                    } else if Some(prop.variable.as_str()) == seg.relationship.variable.as_deref() {
                         format!("{}.{}", rel_alias, prop.property)
-                    } else if Some(prop.variable.as_str())
-                        == seg.end_node.variable.as_ref().map(String::as_str)
-                    {
+                    } else if Some(prop.variable.as_str()) == seg.end_node.variable.as_deref() {
                         format!("{}.{}", mid_alias, prop.property)
-                    } else if Some(prop.variable.as_str())
-                        == seg2.relationship.variable.as_ref().map(String::as_str)
+                    } else if Some(prop.variable.as_str()) == seg2.relationship.variable.as_deref()
                     {
                         format!("{}.{}", rel2_alias, prop.property)
-                    } else if Some(prop.variable.as_str())
-                        == seg2.end_node.variable.as_ref().map(String::as_str)
-                    {
+                    } else if Some(prop.variable.as_str()) == seg2.end_node.variable.as_deref() {
                         format!("{}.{}", end_alias, prop.property)
                     } else {
                         format!("{}.{}", prop.variable, prop.property)
@@ -1231,13 +1218,11 @@ impl CypherQuery {
         if let Some(where_clause) = &self.ast.where_clause {
             if let Some(expr) =
                 to_df_boolean_expr_with_vars(&where_clause.expression, &|var, prop| {
-                    let alias = if Some(var)
-                        == path.start_node.variable.as_ref().map(String::as_str)
-                    {
+                    let alias = if Some(var) == path.start_node.variable.as_deref() {
                         start_alias
-                    } else if Some(var) == seg.relationship.variable.as_ref().map(String::as_str) {
+                    } else if Some(var) == seg.relationship.variable.as_deref() {
                         rel_alias
-                    } else if Some(var) == seg.end_node.variable.as_ref().map(String::as_str) {
+                    } else if Some(var) == seg.end_node.variable.as_deref() {
                         end_alias
                     } else {
                         var
@@ -1256,21 +1241,16 @@ impl CypherQuery {
         let mut proj: Vec<datafusion::logical_expr::Expr> = Vec::new();
         for item in &self.ast.return_clause.items {
             if let ValueExpression::Property(prop) = &item.expression {
-                let col_name = if Some(prop.variable.as_str())
-                    == path.start_node.variable.as_ref().map(String::as_str)
-                {
-                    format!("{}.{}", start_alias, prop.property)
-                } else if Some(prop.variable.as_str())
-                    == seg.relationship.variable.as_ref().map(String::as_str)
-                {
-                    format!("{}.{}", rel_alias, prop.property)
-                } else if Some(prop.variable.as_str())
-                    == seg.end_node.variable.as_ref().map(String::as_str)
-                {
-                    format!("{}.{}", end_alias, prop.property)
-                } else {
-                    format!("{}.{}", prop.variable, prop.property)
-                };
+                let col_name =
+                    if Some(prop.variable.as_str()) == path.start_node.variable.as_deref() {
+                        format!("{}.{}", start_alias, prop.property)
+                    } else if Some(prop.variable.as_str()) == seg.relationship.variable.as_deref() {
+                        format!("{}.{}", rel_alias, prop.property)
+                    } else if Some(prop.variable.as_str()) == seg.end_node.variable.as_deref() {
+                        format!("{}.{}", end_alias, prop.property)
+                    } else {
+                        format!("{}.{}", prop.variable, prop.property)
+                    };
                 let mut e = datafusion::logical_expr::col(&col_name);
                 if let Some(a) = &item.alias {
                     e = e.alias(a);
@@ -1466,7 +1446,7 @@ impl CypherQueryBuilder {
         };
 
         // Generate query text from AST (simplified)
-        let query_text = format!("MATCH ... RETURN ..."); // TODO: Implement AST->text conversion
+        let query_text = "MATCH ... RETURN ...".to_string(); // TODO: Implement AST->text conversion
 
         let query = CypherQuery {
             query_text,
@@ -1477,6 +1457,94 @@ impl CypherQueryBuilder {
 
         query.validate()?;
         Ok(query)
+    }
+}
+
+/// Minimal translator for simple boolean expressions into DataFusion Expr
+fn to_df_boolean_expr_simple(
+    expr: &crate::ast::BooleanExpression,
+) -> Option<datafusion::logical_expr::Expr> {
+    use crate::ast::{BooleanExpression as BE, ComparisonOperator as CO, ValueExpression as VE};
+    use datafusion::logical_expr::{col, Expr, Operator};
+    match expr {
+        BE::Comparison {
+            left,
+            operator,
+            right,
+        } => {
+            // Only support property <op> literal
+            let (col_name, lit_expr) = match (left, right) {
+                (VE::Property(prop), VE::Literal(val)) => {
+                    (prop.property.clone(), to_df_literal(val))
+                }
+                (VE::Literal(val), VE::Property(prop)) => {
+                    (prop.property.clone(), to_df_literal(val))
+                }
+                _ => return None,
+            };
+            let op = match operator {
+                CO::Equal => Operator::Eq,
+                CO::NotEqual => Operator::NotEq,
+                CO::LessThan => Operator::Lt,
+                CO::LessThanOrEqual => Operator::LtEq,
+                CO::GreaterThan => Operator::Gt,
+                CO::GreaterThanOrEqual => Operator::GtEq,
+            };
+            Some(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+                left: Box::new(col(col_name)),
+                op,
+                right: Box::new(lit_expr),
+            }))
+        }
+        BE::And(l, r) => Some(datafusion::logical_expr::Expr::BinaryExpr(
+            datafusion::logical_expr::BinaryExpr {
+                left: Box::new(to_df_boolean_expr_simple(l)?),
+                op: Operator::And,
+                right: Box::new(to_df_boolean_expr_simple(r)?),
+            },
+        )),
+        BE::Or(l, r) => Some(datafusion::logical_expr::Expr::BinaryExpr(
+            datafusion::logical_expr::BinaryExpr {
+                left: Box::new(to_df_boolean_expr_simple(l)?),
+                op: Operator::Or,
+                right: Box::new(to_df_boolean_expr_simple(r)?),
+            },
+        )),
+        BE::Not(inner) => Some(datafusion::logical_expr::Expr::Not(Box::new(
+            to_df_boolean_expr_simple(inner)?,
+        ))),
+        BE::Exists(prop) => Some(datafusion::logical_expr::Expr::IsNotNull(Box::new(
+            datafusion::logical_expr::Expr::Column(datafusion::common::Column::from_name(
+                prop.property.clone(),
+            )),
+        ))),
+        _ => None,
+    }
+}
+
+fn to_df_value_expr_simple(expr: &crate::ast::ValueExpression) -> datafusion::logical_expr::Expr {
+    use crate::ast::ValueExpression as VE;
+    use datafusion::logical_expr::{col, lit};
+    match expr {
+        VE::Property(prop) => col(&prop.property),
+        VE::Variable(v) => col(v),
+        VE::Literal(v) => to_df_literal(v),
+        VE::Function { .. } | VE::Arithmetic { .. } => lit(0),
+    }
+}
+
+fn to_df_literal(val: &crate::ast::PropertyValue) -> datafusion::logical_expr::Expr {
+    use datafusion::logical_expr::lit;
+    match val {
+        crate::ast::PropertyValue::String(s) => lit(s.clone()),
+        crate::ast::PropertyValue::Integer(i) => lit(*i),
+        crate::ast::PropertyValue::Float(f) => lit(*f),
+        crate::ast::PropertyValue::Boolean(b) => lit(*b),
+        crate::ast::PropertyValue::Null => {
+            datafusion::logical_expr::Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
+        }
+        crate::ast::PropertyValue::Parameter(_) => lit(0),
+        crate::ast::PropertyValue::Property(prop) => datafusion::logical_expr::col(&prop.property),
     }
 }
 
@@ -1648,93 +1716,5 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(got.contains(&"Bob".to_string()));
         assert!(got.contains(&"Carol".to_string()));
-    }
-}
-
-/// Minimal translator for simple boolean expressions into DataFusion Expr
-fn to_df_boolean_expr_simple(
-    expr: &crate::ast::BooleanExpression,
-) -> Option<datafusion::logical_expr::Expr> {
-    use crate::ast::{BooleanExpression as BE, ComparisonOperator as CO, ValueExpression as VE};
-    use datafusion::logical_expr::{col, Expr, Operator};
-    match expr {
-        BE::Comparison {
-            left,
-            operator,
-            right,
-        } => {
-            // Only support property <op> literal
-            let (col_name, lit_expr) = match (left, right) {
-                (VE::Property(prop), VE::Literal(val)) => {
-                    (prop.property.clone(), to_df_literal(val))
-                }
-                (VE::Literal(val), VE::Property(prop)) => {
-                    (prop.property.clone(), to_df_literal(val))
-                }
-                _ => return None,
-            };
-            let op = match operator {
-                CO::Equal => Operator::Eq,
-                CO::NotEqual => Operator::NotEq,
-                CO::LessThan => Operator::Lt,
-                CO::LessThanOrEqual => Operator::LtEq,
-                CO::GreaterThan => Operator::Gt,
-                CO::GreaterThanOrEqual => Operator::GtEq,
-            };
-            Some(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
-                left: Box::new(col(col_name)),
-                op,
-                right: Box::new(lit_expr),
-            }))
-        }
-        BE::And(l, r) => Some(datafusion::logical_expr::Expr::BinaryExpr(
-            datafusion::logical_expr::BinaryExpr {
-                left: Box::new(to_df_boolean_expr_simple(l)?),
-                op: Operator::And,
-                right: Box::new(to_df_boolean_expr_simple(r)?),
-            },
-        )),
-        BE::Or(l, r) => Some(datafusion::logical_expr::Expr::BinaryExpr(
-            datafusion::logical_expr::BinaryExpr {
-                left: Box::new(to_df_boolean_expr_simple(l)?),
-                op: Operator::Or,
-                right: Box::new(to_df_boolean_expr_simple(r)?),
-            },
-        )),
-        BE::Not(inner) => Some(datafusion::logical_expr::Expr::Not(Box::new(
-            to_df_boolean_expr_simple(inner)?,
-        ))),
-        BE::Exists(prop) => Some(datafusion::logical_expr::Expr::IsNotNull(Box::new(
-            datafusion::logical_expr::Expr::Column(datafusion::common::Column::from_name(
-                prop.property.clone(),
-            )),
-        ))),
-        _ => None,
-    }
-}
-
-fn to_df_value_expr_simple(expr: &crate::ast::ValueExpression) -> datafusion::logical_expr::Expr {
-    use crate::ast::ValueExpression as VE;
-    use datafusion::logical_expr::{col, lit};
-    match expr {
-        VE::Property(prop) => col(&prop.property),
-        VE::Variable(v) => col(v),
-        VE::Literal(v) => to_df_literal(v),
-        VE::Function { .. } | VE::Arithmetic { .. } => lit(0),
-    }
-}
-
-fn to_df_literal(val: &crate::ast::PropertyValue) -> datafusion::logical_expr::Expr {
-    use datafusion::logical_expr::lit;
-    match val {
-        crate::ast::PropertyValue::String(s) => lit(s.clone()),
-        crate::ast::PropertyValue::Integer(i) => lit(*i as i64),
-        crate::ast::PropertyValue::Float(f) => lit(*f),
-        crate::ast::PropertyValue::Boolean(b) => lit(*b),
-        crate::ast::PropertyValue::Null => {
-            datafusion::logical_expr::Expr::Literal(datafusion::scalar::ScalarValue::Null, None)
-        }
-        crate::ast::PropertyValue::Parameter(_) => lit(0),
-        crate::ast::PropertyValue::Property(prop) => datafusion::logical_expr::col(&prop.property),
     }
 }

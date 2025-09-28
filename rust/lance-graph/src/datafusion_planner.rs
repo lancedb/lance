@@ -280,7 +280,7 @@ impl DataFusionPlanner {
             VE::Property(prop) => col(&prop.property),
             VE::Variable(v) => col(v),
             VE::Literal(PV::String(s)) => lit(s.clone()),
-            VE::Literal(PV::Integer(i)) => lit(*i as i64),
+            VE::Literal(PV::Integer(i)) => lit(*i),
             VE::Literal(PV::Float(f)) => lit(*f),
             VE::Literal(PV::Boolean(b)) => lit(*b),
             VE::Literal(PV::Null) => {

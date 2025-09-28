@@ -324,6 +324,7 @@ impl LogicalPlanner {
     }
 
     /// Extract the main variable from a logical plan (for chaining)
+    #[allow(clippy::only_used_in_recursion)]
     fn extract_variable_from_plan(&self, plan: &LogicalOperator) -> Result<String> {
         match plan {
             LogicalOperator::ScanByLabel { variable, .. } => Ok(variable.clone()),

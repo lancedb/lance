@@ -108,7 +108,7 @@ fn make_friendship_batch(n: usize) -> RecordBatch {
     ]));
     let src: Vec<i32> = (0..n as i32).collect();
     let dst: Vec<i32> = (0..n as i32).map(|i| (i + 1) % n as i32).collect();
-    let ftype: Vec<&str> = std::iter::repeat("friend").take(n).collect();
+    let ftype: Vec<&str> = std::iter::repeat_n("friend", n).collect();
     RecordBatch::try_new(
         schema,
         vec![
@@ -127,23 +127,27 @@ fn bench_cypher_execution(c: &mut Criterion) {
     // Global runtime reused across iterations
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Prebuild graph config and queries (reuse per iteration)
-    let cfg = GraphConfig::builder()
-        .with_node_label("Person", "person_id")
-        .with_relationship("FRIEND_OF", "person1_id", "person2_id")
-        .build()
-        .unwrap();
+    // Helper function to create graph config
+    let make_config = || {
+        GraphConfig::builder()
+            .with_node_label("Person", "person_id")
+            .with_relationship("FRIEND_OF", "person1_id", "person2_id")
+            .build()
+            .unwrap()
+    };
+
+    // Prebuild queries (reuse per iteration)
     let q_basic = CypherQuery::new("MATCH (n:Person) WHERE n.age > 50 RETURN n.name")
         .unwrap()
-        .with_config(cfg.clone());
+        .with_config(make_config());
     let q_single_hop = CypherQuery::new("MATCH (a:Person)-[:FRIEND_OF]->(b:Person) RETURN b.name")
         .unwrap()
-        .with_config(cfg.clone());
+        .with_config(make_config());
     let q_two_hop = CypherQuery::new(
         "MATCH (a:Person)-[:FRIEND_OF]->(b:Person)-[:FRIEND_OF]->(c:Person) RETURN c.name",
     )
     .unwrap()
-    .with_config(cfg.clone());
+    .with_config(make_config());
 
     // Prebuild small (100) datasets once and reuse
     let person_small = make_people_batch(100);

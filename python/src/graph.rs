@@ -276,10 +276,15 @@ impl CypherQuery {
     /// RuntimeError
     ///     If query execution fails
     fn execute(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<PyObject> {
+        // Convert datasets to Arrow batches while holding the GIL - same as before
         let arrow_datasets = python_datasets_to_batches(datasets)?;
 
+        // Clone the inner query for use in the async block
+        let inner_query = self.inner.clone();
+
+        // Use RT.block_on with Some(py) like the scanner to_pyarrow method
         let result_batch = RT
-            .block_on(Some(py), self.inner.execute(arrow_datasets))?
+            .block_on(Some(py), inner_query.execute(arrow_datasets))?
             .map_err(graph_error_to_pyerr)?;
 
         record_batch_to_python_table(py, &result_batch)
@@ -356,7 +361,10 @@ fn python_datasets_to_batches(
     let mut arrow_datasets = HashMap::new();
     for (key, value) in datasets.iter() {
         let table_name: String = key.extract()?;
-        let batch = if value.hasattr("to_table")? {
+        let batch = if is_lance_dataset(&value)? {
+            // Handle Lance datasets using scan() -> to_pyarrow() pattern that works elsewhere
+            lance_dataset_to_record_batch(&value)?
+        } else if value.hasattr("to_table")? {
             let table = value.call_method0("to_table")?;
             python_any_to_record_batch(&table)?
         } else {
@@ -365,6 +373,54 @@ fn python_datasets_to_batches(
         arrow_datasets.insert(table_name, batch);
     }
     Ok(arrow_datasets)
+}
+
+// Check if a Python object is a Lance dataset
+fn is_lance_dataset(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    // Check the type name directly
+    if let Ok(type_name) = value.get_type().repr() {
+        let type_str = type_name.to_string();
+        let is_lance = type_str.contains("lance.dataset.LanceDataset");
+        return Ok(is_lance);
+    }
+
+    // Fallback: check for uri (which we know Lance datasets have)
+    value.hasattr("uri")
+}
+
+// Convert Lance dataset to RecordBatch using alternative methods that avoid GIL issues
+fn lance_dataset_to_record_batch(dataset: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+    // Try the scanner() approach that's used elsewhere in the Lance codebase
+    if let Ok(scanner) = dataset.call_method0("scanner") {
+        if let Ok(py_reader) = scanner.call_method0("to_pyarrow") {
+            return python_any_to_record_batch(&py_reader);
+        }
+    }
+
+    // Method 2: Use the count_rows + take approach to get data without to_table()
+    if dataset.hasattr("count_rows")? && dataset.hasattr("take")? {
+        let count = dataset.call_method0("count_rows")?;
+        let count_int: usize = count.extract()?;
+        if count_int > 0 {
+            // Take a range of rows (limit to 10000 for performance)
+            let take_count = std::cmp::min(count_int, 10000);
+
+            // Create a Python list of indices
+            let py = dataset.py();
+            let range_list = pyo3::types::PyList::empty(py);
+            for i in 0..take_count {
+                range_list.append(i)?;
+            }
+
+            if let Ok(table) = dataset.call_method1("take", (range_list,)) {
+                return python_any_to_record_batch(&table);
+            }
+        }
+    }
+
+    // Fallback: Use to_table() (this might still cause GIL issues but is last resort)
+    let table = dataset.call_method0("to_table")?;
+    python_any_to_record_batch(&table)
 }
 
 fn python_any_to_record_batch(value: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
