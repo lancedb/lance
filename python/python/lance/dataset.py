@@ -3924,12 +3924,15 @@ class LanceOperation:
         new_fragments: list[FragmentMetadata]
             The fragments that contain the new rows.
         bitmap_prune_field_ids: list[int]
-            Field IDs that drive index fragment bitmap pruning. If any fields are modified in updated_fragments,
-            then they must be listed here so those fragments can be removed from indices that
-            cover any of these fields.
+            Field IDs that drive index fragment bitmap pruning. If any fields are
+            modified in updated_fragments,
+            then they must be listed here so those fragments can be removed from
+            indices that cover any of these fields.
         bitmap_preserve_exclude_field_ids: list[int]
-            Field IDs used to decide whether to preserve new fragment IDs in an index's fragment bitmap.
-            Indices that do not cover these fields may preserve the new fragment IDs when applicable.
+            Field IDs used to decide whether to preserve new fragment IDs in an index's
+             fragment bitmap.
+            Indices that do not cover these fields may preserve the new fragment IDs
+            when applicable.
         """
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
         updated_fragments: List[FragmentMetadata] = dataclasses.field(

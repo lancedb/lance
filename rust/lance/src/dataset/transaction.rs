@@ -245,8 +245,8 @@ pub enum Operation {
     /// A horizontal update adds new columns.  In this case, the updated fragments
     /// may have fields removed or added.  It is even possible for a field to be tombstoned
     /// and then added back in the same update. (which is a field modification).
-            /// Any fields modified in this way must be added to the bitmap_prune_field_ids list so indices that cover those fields can prune fragment bitmaps accordingly.
-            /// This ensures indices remain consistent after updates.
+    /// Any fields modified in this way must be added to the bitmap_prune_field_ids list so indices that cover those fields can prune fragment bitmaps accordingly.
+    /// This ensures indices remain consistent after updates.
     /// This is what is used by a merge insert that does not match the whole schema.
     Update {
         /// Ids of fragments that have been moved
@@ -318,7 +318,7 @@ impl Operation {
     /// For non-Update operations, returns an empty slice.
     pub fn prune_fields(&self) -> &[u32] {
         match self {
-            Operation::Update {
+            Self::Update {
                 bitmap_prune_field_ids,
                 ..
             } => bitmap_prune_field_ids.as_slice(),
@@ -331,7 +331,7 @@ impl Operation {
     /// returns an empty slice.
     pub fn bitmap_preserve_exclude_fields(&self) -> &[u32] {
         match self {
-            Operation::Update {
+            Self::Update {
                 bitmap_preserve_exclude_field_ids,
                 ..
             } => bitmap_preserve_exclude_field_ids.as_slice(),
