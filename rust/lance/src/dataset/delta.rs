@@ -12,6 +12,7 @@ use lance_core::Error;
 use lance_table::format::{Fragment, RowLatestUpdateVersionSequence};
 use lance_table::rowids::read_row_ids;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -110,6 +111,8 @@ pub struct FragmentDiffAnalyzer {
     old_dataset: Arc<Dataset>,
     compared_version: u64,
     config: DiffConfig,
+    /// Row IDs present in the old dataset (for fast classification)
+    old_row_ids: Arc<HashSet<u64>>,
 }
 
 impl FragmentDiffAnalyzer {
@@ -119,12 +122,14 @@ impl FragmentDiffAnalyzer {
         old_dataset: Arc<Dataset>,
         compared_version: u64,
         config: DiffConfig,
+        old_row_ids: Arc<HashSet<u64>>,
     ) -> Self {
         Self {
             current_dataset,
             old_dataset,
             compared_version,
             config,
+            old_row_ids,
         }
     }
 
@@ -175,7 +180,16 @@ impl FragmentDiffAnalyzer {
         let changed_rows = version_sequence
             .rows_with_version_greater_than(&row_ids_sequence, self.compared_version);
 
-        for row_id in changed_rows {
+        let changed_set: HashSet<u64> = changed_rows.iter().copied().collect();
+        let updated_row_ids: Vec<u64> = changed_set
+            .intersection(&self.old_row_ids)
+            .copied()
+            .collect();
+        let inserted_row_ids: Vec<u64> =
+            changed_set.difference(&self.old_row_ids).copied().collect();
+
+        // Process updated rows
+        for row_id in updated_row_ids {
             let version = version_sequence
                 .get_version_for_row_id(&row_ids_sequence, row_id)
                 .unwrap();
@@ -187,19 +201,7 @@ impl FragmentDiffAnalyzer {
                 continue;
             }
 
-            // Determine operation type by checking if the row existed in the old dataset
-            // Try to get the record from the old dataset to see if it exists
-            let old_record_result = self.get_record_data(row_id, &self.old_dataset).await;
-            let row_exists_in_old = old_record_result.is_ok();
-
-            let operation = if row_exists_in_old {
-                DiffOperation::Update
-            } else {
-                DiffOperation::Insert
-            };
-
-            let old_data = if self.config.include_data && matches!(operation, DiffOperation::Update)
-            {
+            let old_data = if self.config.include_data {
                 self.get_record_data(row_id, &self.old_dataset).await.ok()
             } else {
                 None
@@ -213,8 +215,36 @@ impl FragmentDiffAnalyzer {
 
             records.push(DiffRecord {
                 row_id,
-                operation,
+                operation: DiffOperation::Update,
                 old_data,
+                new_data,
+                version,
+            });
+        }
+
+        // Process inserted rows
+        for row_id in inserted_row_ids {
+            let version = version_sequence
+                .get_version_for_row_id(&row_ids_sequence, row_id)
+                .unwrap();
+
+            // Skip rows that were updated after the current dataset version being analyzed
+            // This ensures we only include changes that actually occurred between the compared version
+            // and the current version we're diffing to
+            if version > self.current_dataset.manifest.version {
+                continue;
+            }
+
+            let new_data = if self.config.include_data {
+                Some(self.get_record_data(row_id, &self.current_dataset).await?)
+            } else {
+                None
+            };
+
+            records.push(DiffRecord {
+                row_id,
+                operation: DiffOperation::Insert,
+                old_data: None,
                 new_data,
                 version,
             });
@@ -305,8 +335,34 @@ impl Clone for FragmentDiffAnalyzer {
             old_dataset: self.old_dataset.clone(),
             compared_version: self.compared_version,
             config: self.config.clone(),
+            old_row_ids: self.old_row_ids.clone(),
         }
     }
+}
+
+/// Collect all row IDs present in the given dataset (across all fragments).
+fn collect_all_row_ids(dataset: &Dataset) -> Result<HashSet<u64>> {
+    let mut set: HashSet<u64> = HashSet::new();
+    let fragments = &dataset.manifest.fragments;
+    for fragment in fragments.iter() {
+        let row_ids_sequence = if let Some(row_id_meta) = &fragment.row_id_meta {
+            match row_id_meta {
+                lance_table::format::RowIdMeta::Inline(data) => read_row_ids(data).unwrap(),
+                lance_table::format::RowIdMeta::External(_file) => {
+                    todo!("External row id meta currently not supported in diff")
+                }
+            }
+        } else {
+            return Err(Error::invalid_input(
+                "In stable row id mode, fragment must have the row id meta!",
+                Default::default(),
+            ));
+        };
+        for id in row_ids_sequence.iter() {
+            set.insert(id);
+        }
+    }
+    Ok(set)
 }
 
 /// Dataset diff builder for configuring and executing diff operations
@@ -359,14 +415,22 @@ impl DatasetDiffBuilder {
         // Load the old version of the dataset
         let old_dataset = Arc::new(self.dataset.checkout_version(self.compared_version).await?);
 
+        // Pre-compute row IDs in the old dataset for batch classification
+        let old_row_ids = collect_all_row_ids(old_dataset.as_ref())?;
+
         let config = DiffConfig {
             max_concurrency: self.max_concurrency,
             include_data: self.include_data,
         };
 
         // Create the fragment diff analyzer
-        let analyzer =
-            FragmentDiffAnalyzer::new(self.dataset, old_dataset, self.compared_version, config);
+        let analyzer = FragmentDiffAnalyzer::new(
+            self.dataset,
+            old_dataset,
+            self.compared_version,
+            config,
+            Arc::new(old_row_ids),
+        );
 
         // Return the diff stream
         Ok(analyzer.create_diff_stream())
