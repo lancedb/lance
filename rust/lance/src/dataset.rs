@@ -3629,10 +3629,14 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "embeddings_ivf_pq_idx");
-        
-        let actual_statistics: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("embeddings_ivf_pq_idx").await.unwrap())
-                .unwrap();
+
+        let actual_statistics: serde_json::Value = serde_json::from_str(
+            &dataset
+                .index_statistics("embeddings_ivf_pq_idx")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let actual_statistics = actual_statistics.as_object().unwrap();
         assert_eq!(actual_statistics["index_type"].as_str().unwrap(), "IVF_PQ");
 

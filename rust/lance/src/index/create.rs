@@ -575,7 +575,7 @@ mod tests {
     async fn test_auto_generated_index_name() {
         // Test that when no index name is provided, the auto-generated name follows the expected pattern
         use lance_index::scalar::BuiltinIndexType;
-        
+
         let tmpdir = tempdir().unwrap();
         let dataset_uri = format!("file://{}", tmpdir.path().to_str().unwrap());
 
@@ -586,19 +586,22 @@ mod tests {
 
         // Test for Inverted index (original test)
         let params = InvertedIndexParams::default();
-        let mut builder = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params);
         let index_metadata = builder.execute_uncommitted().await.unwrap();
         assert_eq!(index_metadata.name, "text_inverted_idx");
 
         // Test for BloomFilter index
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter);
-        let mut builder = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::BloomFilter, &params);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::BloomFilter, &params);
         let index_metadata = builder.execute_uncommitted().await.unwrap();
         assert_eq!(index_metadata.name, "text_bloomfilter_idx");
 
         // Test for ZoneMap index
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
-        let mut builder = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::ZoneMap, &params);
+        let mut builder =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::ZoneMap, &params);
         let index_metadata = builder.execute_uncommitted().await.unwrap();
         assert_eq!(index_metadata.name, "text_zonemap_idx");
     }
