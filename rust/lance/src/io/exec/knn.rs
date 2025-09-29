@@ -159,6 +159,25 @@ impl KNNVectorDistanceExec {
             DataType::Float32,
             true,
         ))?);
+        {
+            let names = output_schema
+                .fields()
+                .iter()
+                .map(|f| format!("{}({:?})", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[DEBUG] KNNVectorDistanceExec output schema fields: {}", names);
+            let mut marks: Vec<String> = Vec::new();
+            for (i, f) in output_schema.fields().iter().enumerate() {
+                let n = f.name();
+                if n == DIST_COL || n == ROW_ADDR {
+                    marks.push(format!("{}@{}({:?})", n, i, f.data_type()));
+                }
+            }
+            if !marks.is_empty() {
+                println!("[DEBUG] KNNVectorDistanceExec column order (key cols): {}", marks.join(", "));
+            }
+        }
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.
