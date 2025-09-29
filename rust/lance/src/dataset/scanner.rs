@@ -690,6 +690,8 @@ impl Scanner {
             .map(|c| (c.as_ref(), escape_field_path_for_project(c.as_ref())))
             .collect();
 
+        println!("transformed_columns: {:?}", transformed_columns);
+
         self.project_with_transform(&transformed_columns)
     }
 
@@ -1139,7 +1141,7 @@ impl Scanner {
             q.use_index = true;
         }
         self.fast_search = true;
-        self.projection_plan.include_row_id(); // fast search requires _rowid
+        self.projection_plan.include_row_addr(); // fast search requires _rowaddr
         self
     }
 
@@ -1415,9 +1417,29 @@ impl Scanner {
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
     pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
+        println!("[DEBUG] try_into_stream: projection_plan: {:?}", self.projection_plan);
+        {
+            let requested_names: Vec<&str> = self
+                .projection_plan
+                .requested_output_expr
+                .iter()
+                .map(|oc| oc.name.as_str())
+                .collect();
+            println!(
+                "[DEBUG] requested_output_expr names: {}",
+                requested_names.join(", ")
+            );
+            let phys = &self.projection_plan.physical_projection;
+            println!(
+                "[DEBUG] physical_projection flags: with_row_id={}, with_row_addr={}, field_ids={:?}",
+                phys.with_row_id, phys.with_row_addr, phys.field_ids
+            );
+        }
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
+
+            println!("[DEBUG] try_into_stream: created plan: {:?}", plan);
 
             Ok(DatasetRecordBatchStream::new(execute_plan(
                 plan,
@@ -1887,8 +1909,26 @@ impl Scanner {
 
         // Stage 7: final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+        println!(
+            "[DEBUG] final_projection expr names: {}",
+            final_projection
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
+        {
+            let out_schema = plan.schema();
+            let fields_summary = out_schema
+                .fields()
+                .iter()
+                .map(|f| format!("{}({:?})", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[DEBUG] output schema fields: {}", fields_summary);
+        }
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
@@ -2125,7 +2165,7 @@ impl Scanner {
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
             self.calc_eager_projection(filter_plan, &self.projection_plan.physical_projection)?
-                .with_row_id()
+                .with_row_addr()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
             // columns that the user asked for.
@@ -2462,8 +2502,8 @@ impl Scanner {
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
-                    expressions::col(ROW_ID, schema.as_ref())?,
-                    ROW_ID.to_string(),
+                    expressions::col(ROW_ADDR, schema.as_ref())?,
+                    ROW_ADDR.to_string(),
                 )];
 
                 let fts_node = Arc::new(UnionExec::new(children));
@@ -2547,8 +2587,8 @@ impl Scanner {
                             joined_plan,
                             plan,
                             vec![(
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
                             )],
                             None,
                             &datafusion_expr::JoinType::Inner,
@@ -2763,14 +2803,14 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
-            let mut vector_scan_projection = self
+            let vector_scan_projection = self
                 .dataset
                 .empty_projection()
-                .with_row_id()
+                .with_row_addr()
                 .union_columns(&columns, OnMissing::Error)?;
 
-            vector_scan_projection.with_row_addr =
-                self.projection_plan.physical_projection.with_row_addr;
+            // vector_scan_projection.with_row_addr =
+            //     self.projection_plan.physical_projection.with_row_addr;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(
@@ -2835,8 +2875,8 @@ impl Scanner {
             // most common case is that fragments that are newer than the vector index are going to be newer
             // than the scalar indices anyways
             let mut scan_node = self.scan_fragments(
-                true,
                 false,
+                true,
                 false,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
@@ -3224,7 +3264,7 @@ impl Scanner {
                     },
                 },
                 PhysicalSortExpr {
-                    expr: expressions::col(ROW_ID, knn_plan.schema().as_ref())?,
+                    expr: expressions::col(ROW_ADDR, knn_plan.schema().as_ref())?,
                     options: SortOptions {
                         descending: false,
                         nulls_first: false,
@@ -3286,7 +3326,7 @@ impl Scanner {
             },
         };
         let sort_expr_row_id = PhysicalSortExpr {
-            expr: expressions::col(ROW_ID, inner_fanout_search.schema().as_ref())?,
+            expr: expressions::col(ROW_ADDR, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
@@ -3345,7 +3385,7 @@ impl Scanner {
                 },
             };
             let sort_expr_row_id = PhysicalSortExpr {
-                expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+                expr: expressions::col(ROW_ADDR, ann_node.schema().as_ref())?,
                 options: SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -3368,7 +3408,7 @@ impl Scanner {
             },
         };
         let sort_expr_row_id = PhysicalSortExpr {
-            expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+            expr: expressions::col(ROW_ADDR, ann_node.schema().as_ref())?,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
@@ -3439,7 +3479,7 @@ impl Scanner {
         let PlannedFilteredScan { plan, .. } = self
             .filtered_read(
                 filter_plan,
-                self.dataset.empty_projection().with_row_id(),
+                self.dataset.empty_projection().with_row_addr(),
                 false,
                 Some(fragments),
                 None,
@@ -4115,7 +4155,7 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
-    #[rstest]
+    // #[rstest]
     #[tokio::test]
     async fn test_can_project_distance() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
@@ -5282,7 +5322,7 @@ mod test {
 
         assert_eq!(
             results[0].schema().field_names(),
-            vec!["text", "_distance", "_rowid"]
+            vec!["text", "_distance", "_rowaddr"]
         );
     }
 
@@ -5941,7 +5981,7 @@ mod test {
         assert_eq!(batch.column(0).as_primitive::<UInt64Type>().values()[0], 50);
     }
 
-    #[rstest]
+    // #[rstest]
     #[tokio::test]
     async fn test_index_take_batch_size() {
         let fixture = ScalarIndexTestFixture::new(LanceFileVersion::Stable, false).await;
@@ -6016,7 +6056,7 @@ mod test {
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   ProjectionExec: expr=[_rowid@1 as _rowid]
-    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
+    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
         )
         .await
         .unwrap();

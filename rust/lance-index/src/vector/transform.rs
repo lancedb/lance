@@ -16,7 +16,7 @@ use lance_arrow::RecordBatchExt;
 use num_traits::Float;
 use snafu::location;
 
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ADDR, ROW_ADDR_FIELD};
 use lance_linalg::kernels::normalize_fsl;
 use tracing::instrument;
 
@@ -198,7 +198,7 @@ impl Transformer for Flatten {
         match arr.data_type() {
             DataType::FixedSizeList(_, _) => Ok(batch.clone()),
             DataType::List(_) => {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_ids = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let vectors = arr.as_list::<i32>();
 
                 let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
@@ -212,7 +212,7 @@ impl Transformer for Flatten {
                 let row_ids = UInt64Array::from_iter_values(row_ids);
                 let vectors = vectors.values().as_fixed_size_list().clone();
                 let schema = Arc::new(Schema::new(vec![
-                    ROW_ID_FIELD.clone(),
+                    ROW_ADDR_FIELD.clone(),
                     Field::new(self.column.as_str(), vectors.data_type().clone(), true),
                 ]));
                 let batch =

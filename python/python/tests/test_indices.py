@@ -186,15 +186,15 @@ def test_assign_partitions(rand_dataset, rand_ivf):
     partitions_uri = builder.assign_ivf_partitions(rand_ivf, accelerator="cuda")
 
     partitions = lance.dataset(partitions_uri)
-    found_row_ids = set()
+    found_row_addrs = set()
     for batch in partitions.to_batches():
-        row_ids = batch["row_id"]
-        for row_id in row_ids:
-            found_row_ids.add(row_id)
+        row_addrs = batch["row_addr"]
+        for row_addr in row_addrs:
+            found_row_addrs.add(row_addr)
         part_ids = batch["partition"]
         for part_id in part_ids:
             assert part_id.as_py() < 100
-    assert len(found_row_ids) == rand_dataset.count_rows()
+    assert len(found_row_addrs) == rand_dataset.count_rows()
 
 
 @pytest.mark.cuda
@@ -209,15 +209,15 @@ def test_assign_partitions_mostly_null(mostly_null_dataset, distance_type):
     partitions_uri = builder.assign_ivf_partitions(ivf, accelerator="cuda")
 
     partitions = lance.dataset(partitions_uri)
-    found_row_ids = set()
+    found_row_addrs = set()
     for batch in partitions.to_batches():
-        row_ids = batch["row_id"]
-        for row_id in row_ids:
-            found_row_ids.add(row_id)
+        row_addrs = batch["row_addr"]
+        for row_addr in row_addrs:
+            found_row_addrs.add(row_addr)
         part_ids = batch["partition"]
         for part_id in part_ids:
             assert part_id.as_py() < 100
-    assert len(found_row_ids) == (mostly_null_dataset.count_rows() / 10)
+    assert len(found_row_addrs) == (mostly_null_dataset.count_rows() / 10)
 
 
 @pytest.fixture
@@ -240,8 +240,8 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
-    row_id = data.column("_rowid")
-    assert row_id.type == pa.uint64()
+    row_addr = data.column("_rowaddr")
+    assert row_addr.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
     assert pq_code.type == pa.list_(pa.uint8(), 8)
@@ -281,8 +281,8 @@ def test_vector_transform_with_precomputed_partitions(
     assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
-    row_id = data.column("_rowid")
-    assert row_id.type == pa.uint64()
+    row_addr = data.column("_rowaddr")
+    assert row_addr.type == pa.uint64()
 
     pq_code = data.column("__pq_code")
     assert pq_code.type == pa.list_(pa.uint8(), 8)

@@ -3284,7 +3284,7 @@ mod tests {
         // Get initial KNN search results
         let mut scanner = dataset.scan();
         scanner.nearest("vec", &query_vec1, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let results1 = scanner
             .try_into_stream()
             .await
@@ -3295,8 +3295,12 @@ mod tests {
         let count1 = results1.len();
 
         scanner = dataset.scan();
+        let schema = scanner.schema().await.unwrap();
+        println!("[DEBUG] Before nearest: scanner schema: {}", schema);
         scanner.nearest("vec", &query_vec2, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        println!("[DEBUG] After nearest: scanner schema: {}", schema);
+        scanner.project::<String>(&[]).unwrap().with_row_address();
+        println!("[DEBUG] After project+row_address: scanner schema: {}", schema);
         let results2 = scanner
             .try_into_stream()
             .await
@@ -3304,11 +3308,12 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
+        println!("[DEBUG] Results2 batch schema: {:?}", results2.get(0).map(|b| b.schema()));
         let count2 = results2.len();
 
         scanner = dataset.scan();
         scanner.nearest("vec", &query_vec3, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let results3 = scanner
             .try_into_stream()
             .await
@@ -3369,7 +3374,7 @@ mod tests {
         // Verify that KNN searches still work correctly and return the same counts
         let mut scanner = dataset.scan();
         scanner.nearest("vec", &query_vec1, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let new_results1 = scanner
             .try_into_stream()
             .await
@@ -3380,8 +3385,12 @@ mod tests {
         assert_eq!(new_results1.len(), count1);
 
         scanner = dataset.scan();
+        let schema = scanner.schema().await.unwrap();
+        println!("[DEBUG] Before nearest: scanner schema: {}", schema);
         scanner.nearest("vec", &query_vec2, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        println!("[DEBUG] After nearest: scanner schema: {}", schema);
+        scanner.project::<String>(&[]).unwrap().with_row_address();
+        println!("[DEBUG] After project+row_address: scanner schema: {}", schema);
         let new_results2 = scanner
             .try_into_stream()
             .await
@@ -3393,7 +3402,7 @@ mod tests {
 
         scanner = dataset.scan();
         scanner.nearest("vec", &query_vec3, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let new_results3 = scanner
             .try_into_stream()
             .await
@@ -3406,7 +3415,7 @@ mod tests {
         // Verify that after index creation and compaction, scan uses vector index scan
         let mut scanner = dataset.scan();
         scanner.nearest("vec", &query_vec1, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
             plan.contains("ANNSubIndex"),

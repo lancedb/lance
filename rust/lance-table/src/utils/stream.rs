@@ -323,7 +323,7 @@ mod tests {
     use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
     use lance_core::{
         utils::{address::RowAddress, deletion::DeletionVector},
-        ROW_ID,
+        ROW_ADDR, ROW_ID,
     };
     use lance_datagen::{BatchCount, RowCount};
     use lance_io::{stream::arrow_stream_to_lance_stream, ReadBatchParams};
@@ -406,8 +406,10 @@ mod tests {
                 let mut offset = 0;
                 let expected = expected.clone();
                 for batch in batches {
-                    let actual_row_ids =
-                        batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+                    let actual_row_ids = batch[ROW_ADDR]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .to_vec();
                     let expected_row_ids = expected[offset..offset + 10]
                         .iter()
                         .map(|row_offset| {

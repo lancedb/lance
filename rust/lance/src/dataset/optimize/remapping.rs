@@ -216,13 +216,13 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             .await
             .unwrap();
 
-    if frag_reuse_index.row_id_maps.is_empty() {
+    if frag_reuse_index.row_addr_maps.is_empty() {
         return Ok(());
     }
 
     // Sequentially apply the row addr maps from oldest to latest
     let mut curr_index_id = *index_id;
-    for (i, row_id_map) in frag_reuse_index.row_id_maps.iter().enumerate() {
+    for (i, row_id_map) in frag_reuse_index.row_addr_maps.iter().enumerate() {
         let version = &frag_reuse_index.details.versions[i];
         // load on-disk index metadata before auto-remap
         let curr_index_meta = read_manifest_indexes(

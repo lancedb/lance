@@ -409,7 +409,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                row_id: doc.row_addr,
                 freqs,
                 doc_length,
             })
@@ -530,7 +530,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                row_id: doc.row_addr,
                 freqs,
                 doc_length,
             })

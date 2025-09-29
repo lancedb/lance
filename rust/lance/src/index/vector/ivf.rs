@@ -39,7 +39,7 @@ use lance_core::{
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
-    Error, Result, ROW_ID_FIELD,
+    Error, Result, ROW_ADDR_FIELD,
 };
 use lance_file::{
     format::MAGIC,
@@ -714,7 +714,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Prepare the quantization storage writer
     let schema = Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         arrow_schema::Field::new(
             quantizer.column(),
             DataType::FixedSizeList(
@@ -1310,7 +1310,7 @@ async fn scan_index_field_stream(
 ) -> Result<impl RecordBatchStream + Unpin + 'static> {
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
-    scanner.with_row_id();
+    scanner.with_row_address();
     scanner.try_into_stream().await
 }
 
@@ -1676,7 +1676,7 @@ async fn write_ivf_hnsw_file(
         .child(INDEX_AUXILIARY_FILE_NAME);
     let aux_writer = object_store.create(&aux_path).await?;
     let schema = Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         arrow_schema::Field::new(
             quantizer.column(),
             DataType::FixedSizeList(
@@ -1883,7 +1883,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
-    use lance_core::ROW_ID;
+    use lance_core::ROW_ADDR;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
@@ -3057,7 +3057,7 @@ mod tests {
         let k = 100;
         let results = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .nearest("vector", query, k)
             .unwrap()
             .minimum_nprobes(nlist)
@@ -3071,7 +3071,7 @@ mod tests {
         assert_eq!(k, results[0].num_rows());
 
         let row_ids = results[0]
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()
@@ -3139,7 +3139,7 @@ mod tests {
         let k = 100;
         let results = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .nearest("vector", query, k)
             .unwrap()
             .minimum_nprobes(nlist)
@@ -3153,7 +3153,7 @@ mod tests {
         assert_eq!(k, results[0].num_rows());
 
         let row_ids = results[0]
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()
@@ -3251,7 +3251,7 @@ mod tests {
             let query = &arr.slice(query_id * DIM, DIM);
             let results = dataset
                 .scan()
-                .with_row_id()
+                .with_row_address()
                 .nearest("vector", query, 1)
                 .unwrap()
                 .try_into_batch()
@@ -3259,7 +3259,7 @@ mod tests {
                 .unwrap();
             assert_eq!(results.num_rows(), 1);
             let row_id = results
-                .column_by_name("_rowid")
+                .column_by_name("_rowaddr")
                 .unwrap()
                 .as_primitive::<UInt64Type>()
                 .value(0);
