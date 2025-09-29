@@ -459,7 +459,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
     for array in array_iterator {
         null_count += array.null_count() as i64;
-        if array.null_count() == array.len() {
+        if array.null_count() == array.len() || (true_present && false_present) {
             continue;
         }
 
@@ -472,9 +472,6 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
                 }
             };
         });
-        if true_present && false_present {
-            break;
-        }
     }
 
     StatisticsRow {
@@ -2210,5 +2207,47 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn test_boolean_statistics_multi_array() {
+        use arrow_array::BooleanArray;
+        use std::sync::Arc;
+
+        // Array 1: [True, False, True, None, None] - 2 nulls
+        let bool_array1 = BooleanArray::from(vec![Some(true), Some(false), Some(true), None, None]);
+        let array1_ref: ArrayRef = Arc::new(bool_array1);
+
+        // Array 2: [False, True, False, None, None] - 2 nulls
+        let bool_array2 =
+            BooleanArray::from(vec![Some(false), Some(true), Some(false), None, None]);
+        let array2_ref: ArrayRef = Arc::new(bool_array2);
+
+        // Test individual arrays first
+        let stats1 = collect_statistics(&[&array1_ref]);
+        let stats2 = collect_statistics(&[&array2_ref]);
+
+        assert_eq!(stats1.null_count, 2, "First array should have 2 nulls");
+        assert_eq!(stats2.null_count, 2, "Second array should have 2 nulls");
+
+        let array_refs: Vec<&ArrayRef> = vec![&array1_ref, &array2_ref];
+        let combined_stats = collect_statistics(&array_refs);
+
+        assert_eq!(
+            combined_stats.null_count, 4,
+            "Combined statistics should have null_count=4 (2+2), got {}",
+            combined_stats.null_count
+        );
+
+        assert_eq!(
+            combined_stats.min_value,
+            ScalarValue::Boolean(Some(false)),
+            "Min value should be false"
+        );
+        assert_eq!(
+            combined_stats.max_value,
+            ScalarValue::Boolean(Some(true)),
+            "Max value should be true"
+        );
     }
 }
