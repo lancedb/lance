@@ -8,6 +8,7 @@ use uuid::Uuid;
 mod fragment;
 mod index;
 mod manifest;
+mod row_version;
 
 pub use fragment::*;
 pub use index::IndexMetadata;
@@ -15,6 +16,9 @@ pub use index::IndexMetadata;
 pub use manifest::{
     is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, DETACHED_VERSION_MASK,
+};
+pub use row_version::{
+    RowLatestUpdateVersionMeta, RowLatestUpdateVersionSequence, RowVersionSegment,
 };
 
 use lance_core::{Error, Result};
