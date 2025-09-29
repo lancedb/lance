@@ -31,7 +31,7 @@ impl BranchLocation {
     }
 
     fn get_root_path(path_str: &str, branch_name: &str) -> Result<String> {
-        let branch_suffix = format!("/{}/{}", BRANCH_DIR, branch_name);
+        let branch_suffix = format!("{}/{}", BRANCH_DIR, branch_name);
         let branch_suffix = branch_suffix.as_str();
         let root_path_str = path_str
             .strip_suffix(branch_suffix)
@@ -52,7 +52,20 @@ impl BranchLocation {
                     location!(),
                 )
             })?;
-        Ok(root_path_str.to_string())
+        let root_path_str = if root_path_str.ends_with('/') {
+            root_path_str.trim_end_matches('/').to_string()
+        } else if cfg!(windows) {
+            root_path_str.trim_end_matches('\\').to_string()
+        } else {
+            return Err(Error::invalid_input(
+                format!(
+                    "Invalid dataset root uri {} for branch {}",
+                    root_path_str, path_str,
+                ),
+                location!(),
+            ));
+        };
+        Ok(root_path_str)
     }
 
     /// Find the target branch location
