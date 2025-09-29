@@ -159,6 +159,15 @@ impl KNNVectorDistanceExec {
             DataType::Float32,
             true,
         ))?);
+        {
+            let fields_summary = output_schema
+                .fields()
+                .iter()
+                .map(|f| format!("{}({:?})", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[DEBUG] KNNVectorDistanceExec output schema fields: {}", fields_summary);
+        }
 
         // This node has the same partitioning & boundedness as the input node
         // but it destroys any ordering.
@@ -611,6 +620,15 @@ impl ANNIvfSubIndexExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
+        {
+            let fields_summary = KNN_INDEX_SCHEMA
+                .fields()
+                .iter()
+                .map(|f| format!("{}({:?})", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[DEBUG] KNN_INDEX_SCHEMA fields: {}", fields_summary);
+        }
         Ok(Self {
             input,
             dataset,
@@ -1101,6 +1119,16 @@ impl MultivectorScoringExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
+
+        {
+            let fields_summary = KNN_INDEX_SCHEMA
+                .fields()
+                .iter()
+                .map(|f| format!("{}({:?})", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[DEBUG] KNN_INDEX_SCHEMA fields: {}", fields_summary);
+        }
 
         Ok(Self {
             inputs,

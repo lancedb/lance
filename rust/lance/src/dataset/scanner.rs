@@ -1418,6 +1418,23 @@ impl Scanner {
     #[instrument(skip_all)]
     pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         println!("[DEBUG] try_into_stream: projection_plan: {:?}", self.projection_plan);
+        {
+            let requested_names: Vec<&str> = self
+                .projection_plan
+                .requested_output_expr
+                .iter()
+                .map(|oc| oc.name.as_str())
+                .collect();
+            println!(
+                "[DEBUG] requested_output_expr names: {}",
+                requested_names.join(", ")
+            );
+            let phys = &self.projection_plan.physical_projection;
+            println!(
+                "[DEBUG] physical_projection flags: with_row_id={}, with_row_addr={}, field_ids={:?}",
+                phys.with_row_id, phys.with_row_addr, phys.field_ids
+            );
+        }
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
@@ -1892,8 +1909,26 @@ impl Scanner {
 
         // Stage 7: final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+        println!(
+            "[DEBUG] final_projection expr names: {}",
+            final_projection
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
+        {
+            let out_schema = plan.schema();
+            let fields_summary = out_schema
+                .fields()
+                .iter()
+                .map(|f| format!("{}({:?})", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[DEBUG] output schema fields: {}", fields_summary);
+        }
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
