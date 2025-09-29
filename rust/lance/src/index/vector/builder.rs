@@ -631,7 +631,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // otherwise, we need to merge all existing indices and split large partitions.
         let reader = reader.clone();
         let (assign_batches, merge_indices) =
-            match Self::should_split(&ivf, reader.as_ref(), &self.existing_indices)? {
+            match Self::should_split(ivf, reader.as_ref(), &self.existing_indices)? {
                 Some(partition) => {
                     // Perform split and record the fact for downstream build/merge
                     let split_results = self.split_partition(partition, ivf).await?;
@@ -675,7 +675,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         .await?;
 
                         if let Some((assign_batch, deleted_row_ids)) = assign_batch {
-                            if deleted_row_ids.len() > 0 {
+                            if !deleted_row_ids.is_empty() {
                                 let deleted_row_ids = HashSet::<u64>::from_iter(
                                     deleted_row_ids.values().iter().copied(),
                                 );
@@ -1119,9 +1119,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             self.select_reassign_candidates(ivf, &c0)?;
 
         // compute the distance between the vectors and the 3 centroids (original one and the 2 new ones)
-        let d0 = self.distance_type.arrow_batch_func()(&c0, &vectors)?;
-        let d1 = self.distance_type.arrow_batch_func()(&c1, &vectors)?;
-        let d2 = self.distance_type.arrow_batch_func()(&c2, &vectors)?;
+        let d0 = self.distance_type.arrow_batch_func()(&c0, vectors)?;
+        let d1 = self.distance_type.arrow_batch_func()(&c1, vectors)?;
+        let d2 = self.distance_type.arrow_batch_func()(&c2, vectors)?;
         let d0 = d0.values();
         let d1 = d1.values();
         let d2 = d2.values();
@@ -1132,11 +1132,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             part_idx,
             centroid1_part_idx,
             centroid2_part_idx,
-            &row_ids,
-            &vectors,
-            &d0,
-            &d1,
-            &d2,
+            row_ids,
+            vectors,
+            d0,
+            d1,
+            d2,
             &reassign_part_ids,
             &reassign_part_centroids,
             true,
@@ -1163,9 +1163,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 centroid2_part_idx,
                 &row_ids,
                 &vectors,
-                &d0,
-                &d1,
-                &d2,
+                d0,
+                d1,
+                d2,
                 &reassign_part_ids,
                 &reassign_part_centroids,
                 false,
@@ -1263,7 +1263,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let row_ids = row_ids_builder.finish();
         let vector = FixedSizeListArray::try_new_from_values(
             vector_builder.finish(),
-            centroids.value_length() as i32,
+            centroids.value_length(),
         )?;
         let part_ids = part_ids_builder.finish();
         let deleted_row_ids = deleted_row_ids.finish();
@@ -1338,6 +1338,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     // assign the vectors of original partition
+    #[allow(clippy::too_many_arguments)]
     fn assign_vectors<T: ArrowPrimitiveType>(
         &self,
         part_idx: usize,
