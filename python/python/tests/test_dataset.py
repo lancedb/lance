@@ -3666,9 +3666,9 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk > 0
+    assert data_stats.fields[0].bytes_on_disk == 42
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk > 0
+    assert data_stats.fields[1].bytes_on_disk == 42
 
     dataset.add_columns({"z": "y"})
 
@@ -3677,11 +3677,11 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk > 0
+    assert data_stats.fields[0].bytes_on_disk == 60
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk > 0
+    assert data_stats.fields[1].bytes_on_disk == 42
     assert data_stats.fields[2].id == 2
-    assert data_stats.fields[2].bytes_on_disk > 0
+    assert data_stats.fields[2].bytes_on_disk == 68
 
 
 def test_default_storage_version(tmp_path: Path):
@@ -3874,8 +3874,10 @@ def test_schema_project_swap_column(tmp_path: Path):
 def test_empty_structs(tmp_path):
     schema = pa.schema([pa.field("id", pa.int32()), pa.field("empties", pa.struct([]))])
     table = pa.table({"id": [0, 1, 2], "empties": [{}] * 3}, schema=schema)
+    print(table)
     ds = lance.write_dataset(table, tmp_path)
     res = ds.take([2, 0, 1])
+    print(res)
     assert res.num_rows == 3
     assert res == table.take([2, 0, 1])
 

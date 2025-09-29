@@ -236,7 +236,7 @@ def test_metadata(tmp_path):
     assert metadata.num_rows == 3
     assert metadata.num_global_buffer_bytes > 0
     assert metadata.num_column_metadata_bytes > 0
-    assert metadata.num_data_bytes > 0
+    assert metadata.num_data_bytes == 128
     assert len(metadata.columns) == 1
 
     column = metadata.columns[0]
@@ -244,9 +244,11 @@ def test_metadata(tmp_path):
     assert len(column.pages) == 1
 
     page = column.pages[0]
-    assert len(page.buffers) == 1
+    assert len(page.buffers) == 2
     assert page.buffers[0].position == 0
-    assert page.buffers[0].size == 24
+    assert page.buffers[0].size == 2
+    assert page.buffers[1].position == 64
+    assert page.buffers[1].size == 32
 
     assert len(page.encoding) > 0
 

@@ -55,15 +55,15 @@ def test_optimize_max_bytes(tmp_path: Path):
         batch_size=128,
     )
 
-    # We get 4 fragments here because we don't actually write any data to the file
-    # until we've accumulated 8MiB for a page.
+    # We get 8 fragments here because we don't actually write any data to the file
+    # until we've accumulated 16MiB for a page.
     assert metrics.fragments_removed == 2
-    assert metrics.fragments_added == 4
+    assert metrics.fragments_added == 8
     assert metrics.files_removed == 2
-    assert metrics.files_added == 4
+    assert metrics.files_added == 8
 
     num_frags = len(dataset.get_fragments())
-    assert num_frags == 4
+    assert num_frags == 8
 
     dataset = lance.write_dataset(
         data,
@@ -83,9 +83,9 @@ def test_optimize_max_bytes(tmp_path: Path):
     results = [task.execute(dataset) for task in plan.tasks]
     metrics = Compaction.commit(dataset, results)
     assert metrics.fragments_removed == 2
-    assert metrics.fragments_added == 4
+    assert metrics.fragments_added == 8
     assert metrics.files_removed == 2
-    assert metrics.files_added == 4
+    assert metrics.files_added == 8
 
     dataset = lance.write_dataset(
         data,

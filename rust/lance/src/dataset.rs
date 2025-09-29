@@ -6545,8 +6545,8 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].metadata.files.len(), 1);
-        assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 2, 1]);
-        assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1, 2]);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[2, 1]);
+        assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1]);
 
         // Can insert c, b
         let just_c_b = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -6573,8 +6573,8 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[1].metadata.files.len(), 1);
-        assert_eq!(&fragments[1].metadata.files[0].fields, &[0, 3, 2]);
-        assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1, 2]);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[3, 2]);
+        assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1]);
 
         // Can't insert a, c (b is non-nullable)
         let just_a_c = Arc::new(ArrowSchema::new(vec![ArrowField::new(
