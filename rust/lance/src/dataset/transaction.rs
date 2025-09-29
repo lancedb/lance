@@ -313,33 +313,6 @@ pub enum UpdateMode {
     RewriteColumns,
 }
 
-impl Operation {
-    /// Returns the field IDs that drive index fragment bitmap pruning for Update operations.
-    /// For non-Update operations, returns an empty slice.
-    pub fn prune_fields(&self) -> &[u32] {
-        match self {
-            Self::Update {
-                bitmap_prune_field_ids,
-                ..
-            } => bitmap_prune_field_ids.as_slice(),
-            _ => &[],
-        }
-    }
-
-    /// Returns the field IDs used to decide whether to preserve new fragment IDs
-    /// in an index's fragment bitmap for Update operations. For non-Update operations,
-    /// returns an empty slice.
-    pub fn bitmap_preserve_exclude_fields(&self) -> &[u32] {
-        match self {
-            Self::Update {
-                bitmap_preserve_exclude_field_ids,
-                ..
-            } => bitmap_preserve_exclude_field_ids.as_slice(),
-            _ => &[],
-        }
-    }
-}
-
 impl std::fmt::Display for Operation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
