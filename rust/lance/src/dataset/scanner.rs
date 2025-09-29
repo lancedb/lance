@@ -2808,14 +2808,14 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
-            let vector_scan_projection = self
+            let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
                 .with_row_addr()
                 .union_columns(&columns, OnMissing::Error)?;
 
-            // vector_scan_projection.with_row_addr =
-            //     self.projection_plan.physical_projection.with_row_addr;
+            vector_scan_projection.with_row_addr =
+                self.projection_plan.physical_projection.with_row_addr;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(
