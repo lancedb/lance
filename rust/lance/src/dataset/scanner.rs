@@ -1359,27 +1359,24 @@ impl Scanner {
         // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
 
-        // Make sure _distance and _score are included in the output unless the user has opted out of the legacy
-        // projection behavior. If the user explicitly requested a projection, we will not auto-append scoring
-        // columns to avoid breaking the output contract expected by downstream consumers (e.g., RowConverter).
+        // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
+        // projection behavior
         if self.autoproject_scoring_columns {
             if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
-                if self.projection_plan.has_output_cols() {
-                    // Do not auto-append when there is any explicit requested output (e.g. `_rowaddr`).
-                } else {
-                    let vector_expr = expressions::col(DIST_COL, current_schema)?;
-                    output_expr.push((vector_expr, DIST_COL.to_string()));
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to to adopt the future behavior and avoid this warning");
                 }
+                let vector_expr = expressions::col(DIST_COL, current_schema)?;
+                output_expr.push((vector_expr, DIST_COL.to_string()));
             }
             if self.full_text_query.is_some()
                 && output_expr.iter().all(|(_, name)| name != SCORE_COL)
             {
-                if self.projection_plan.has_output_cols() {
-                    // Do not auto-append when there is any explicit requested output.
-                } else {
-                    let score_expr = expressions::col(SCORE_COL, current_schema)?;
-                    output_expr.push((score_expr, SCORE_COL.to_string()));
+                if self.explicit_projection {
+                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
                 }
+                let score_expr = expressions::col(SCORE_COL, current_schema)?;
+                output_expr.push((score_expr, SCORE_COL.to_string()));
             }
         }
 
@@ -1421,25 +1418,6 @@ impl Scanner {
     #[instrument(skip_all)]
     pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         println!("[DEBUG] try_into_stream: projection_plan: {:?}", self.projection_plan);
-        // [DEBUG] explicit names for requested_output_expr and physical_projection flags
-        {
-            let requested_names: Vec<&str> = self
-                .projection_plan
-                .requested_output_expr
-                .iter()
-                .map(|oc| oc.name.as_str())
-                .collect();
-            println!(
-                "[DEBUG] requested_output_expr names: {}",
-                requested_names.join(", ")
-            );
-            let phys = &self.projection_plan.physical_projection;
-            // Note: field_ids is a HashSet<i32>
-            println!(
-                "[DEBUG] physical_projection flags: with_row_id={}, with_row_addr={}, field_ids={:?}",
-                phys.with_row_id, phys.with_row_addr, phys.field_ids
-            );
-        }
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
@@ -1914,26 +1892,8 @@ impl Scanner {
 
         // Stage 7: final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
-        println!(
-            "[DEBUG] final_projection expr names: {}",
-            final_projection
-                .iter()
-                .map(|(_, name)| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
-        {
-            let out_schema = plan.schema();
-            let fields_summary = out_schema
-                .fields()
-                .iter()
-                .map(|f| format!("{}({:?})", f.name(), f.data_type()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("[DEBUG] output schema fields: {}", fields_summary);
-        }
 
         // Stage 8: If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
