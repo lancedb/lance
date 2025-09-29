@@ -31,9 +31,9 @@ use lance_file::v2::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
-use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
+use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation,
@@ -792,29 +792,9 @@ impl Dataset {
                 self.object_store.open(&self.manifest_location.path).await?
             };
 
-            // Safely decode inline transaction at offset `pos`.
-            // We avoid using read_message directly because it may panic on malformed inputs.
-            let file_size = reader.size().await?;
-            if pos + 4 <= file_size {
-                // Read the 4-byte length prefix
-                let header = reader
-                    .get_range(pos..std::cmp::min(pos + 4, file_size))
-                    .await?;
-                if header.len() == 4 {
-                    let msg_len = LittleEndian::read_u32(&header[..]) as usize;
-                    let start = pos + 4;
-                    let end = start + msg_len;
-                    if end <= file_size {
-                        let message_bytes = reader.get_range(start..end).await?;
-                        if let Ok(pb_txn) =
-                            lance_table::format::pb::Transaction::decode(message_bytes)
-                        {
-                            return Transaction::try_from(pb_txn).map(Some);
-                        }
-                    }
-                }
-                // If any of the checks above fail, we will fall through to external file
-            }
+            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
+            return Transaction::try_from(tx).map(Some);
+            // If any of the checks above fail, we will fall through to external file
         }
 
         // Fallback: read external transaction file if present

@@ -116,7 +116,6 @@ message Manifest {
   // The path format is "{read_version}-{uuid}.txn" where {read_version} is the version of
   // the table the transaction read from (serialized to decimal with no padding digits),
   // and {uuid} is a hyphen-separated UUID.
-  // Make this field optional since we have inline_transaction by transaction_section.
   string transaction_file = 12;
 
   // The file position of the transaction content.
