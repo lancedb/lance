@@ -15,10 +15,12 @@
 //! Graph query functionality for Lance datasets
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::Schema;
 use lance_graph::{
     CypherQuery as RustCypherQuery, GraphConfig as RustGraphConfig, GraphError as RustGraphError,
 };
@@ -370,9 +372,30 @@ fn python_datasets_to_batches(
         } else {
             python_any_to_record_batch(&value)?
         };
+        let batch = normalize_record_batch(batch)?;
         arrow_datasets.insert(table_name, batch);
     }
     Ok(arrow_datasets)
+}
+
+fn normalize_record_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
+    if batch.schema().metadata().is_empty() {
+        return Ok(batch);
+    }
+
+    // DataFusion expects stable, metadata-free schemas across optimization passes.
+    // Rebuild the schema without the PyArrow-specific metadata to avoid mismatches.
+    let columns = batch.columns().to_vec();
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| (**field).clone())
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).map_err(|e| {
+        PyRuntimeError::new_err(format!("Failed to strip metadata from Arrow batch: {}", e))
+    })
 }
 
 // Check if a Python object is a Lance dataset

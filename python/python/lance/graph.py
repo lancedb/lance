@@ -49,7 +49,9 @@ class GraphConfigBuilder:
         Returns:
             Self for method chaining
         """
-        self._builder.with_node_label(label, id_field)
+        # The underlying builder follows a functional style and returns a new builder
+        # instance, so we must retain the result to keep the accumulated state.
+        self._builder = self._builder.with_node_label(label, id_field)
         return self
 
     def with_relationship(self, rel_type: str, source_field: str, target_field: str):
@@ -63,7 +65,11 @@ class GraphConfigBuilder:
         Returns:
             Self for method chaining
         """
-        self._builder.with_relationship(rel_type, source_field, target_field)
+        # As with node mappings, capture the newly returned builder so that
+        # subsequent chained calls see the updated configuration.
+        self._builder = self._builder.with_relationship(
+            rel_type, source_field, target_field
+        )
         return self
 
     def build(self):
