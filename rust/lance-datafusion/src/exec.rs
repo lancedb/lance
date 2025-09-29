@@ -26,6 +26,7 @@ use datafusion::{
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
+        metrics::MetricValue,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -51,8 +52,8 @@ use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
-        MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-        IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+        PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
 
@@ -413,21 +414,45 @@ pub struct ExecutionSummaryCounts {
 
 fn visit_node(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
-        for (metric_name, count) in metrics.iter_counts() {
-            match metric_name.as_ref() {
-                IOPS_METRIC => counts.iops += count.value(),
-                REQUESTS_METRIC => counts.requests += count.value(),
-                BYTES_READ_METRIC => counts.bytes_read += count.value(),
-                INDICES_LOADED_METRIC => counts.indices_loaded += count.value(),
-                PARTS_LOADED_METRIC => counts.parts_loaded += count.value(),
-                INDEX_COMPARISONS_METRIC => counts.index_comparisons += count.value(),
-                _ => {
-                    let existing = counts
-                        .all_counts
-                        .entry(metric_name.as_ref().to_string())
-                        .or_insert(0);
-                    *existing += count.value();
+        for metric in metrics.iter() {
+            match metric.value() {
+                MetricValue::Count { name, count } => {
+                    let value = count.value();
+                    match name.as_ref() {
+                        IOPS_METRIC => counts.iops += value,
+                        REQUESTS_METRIC => counts.requests += value,
+                        BYTES_READ_METRIC => counts.bytes_read += value,
+                        INDICES_LOADED_METRIC => counts.indices_loaded += value,
+                        PARTS_LOADED_METRIC => counts.parts_loaded += value,
+                        INDEX_COMPARISONS_METRIC => counts.index_comparisons += value,
+                        _ => {
+                            let existing = counts
+                                .all_counts
+                                .entry(name.as_ref().to_string())
+                                .or_insert(0);
+                            *existing += value;
+                        }
+                    }
                 }
+                MetricValue::Gauge { name, gauge } => {
+                    let value = gauge.value();
+                    match name.as_ref() {
+                        IOPS_METRIC => counts.iops += value,
+                        REQUESTS_METRIC => counts.requests += value,
+                        BYTES_READ_METRIC => counts.bytes_read += value,
+                        INDICES_LOADED_METRIC => counts.indices_loaded += value,
+                        PARTS_LOADED_METRIC => counts.parts_loaded += value,
+                        INDEX_COMPARISONS_METRIC => counts.index_comparisons += value,
+                        _ => {
+                            let existing = counts
+                                .all_counts
+                                .entry(name.as_ref().to_string())
+                                .or_insert(0);
+                            *existing += value;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
