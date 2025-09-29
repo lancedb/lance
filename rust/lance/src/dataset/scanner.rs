@@ -1892,6 +1892,7 @@ impl Scanner {
 
         // Stage 7: final projection
         let final_projection = self.calculate_final_projection(plan.schema().as_ref())?;
+        println!("final projection: {:?}", final_projection);
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
@@ -2768,14 +2769,14 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
-            let vector_scan_projection = self
+            let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
                 .with_row_addr()
                 .union_columns(&columns, OnMissing::Error)?;
 
-            // vector_scan_projection.with_row_addr =
-            //     self.projection_plan.physical_projection.with_row_addr;
+            vector_scan_projection.with_row_addr =
+                self.projection_plan.physical_projection.with_row_addr;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(
