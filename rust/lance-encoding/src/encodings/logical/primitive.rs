@@ -1284,11 +1284,40 @@ enum PreambleAction {
     Absent,
 }
 
-// TODO: Add test cases for the all-preamble and all-trailer cases
-
 // When we schedule a chunk we use the repetition index (or, if none exists, just the # of items
 // in each chunk) to map a user requested range into a set of ChunkInstruction objects which tell
 // us how exactly to read from the chunk.
+//
+// Examples:
+//
+// | Chunk 0     | Chunk 1   | Chunk 2   | Chunk 3 |
+// | xxxxyyyyzzz | zzzzzzzzz | zzzzzzzzz | aaabbcc |
+//
+// Full read (0..6)
+//
+// Chunk 0: (several rows, ends with trailer)
+//   preamble: absent
+//   rows_to_skip: 0
+//   rows_to_take: 3 (x, y, z)
+//   take_trailer: true
+//
+// Chunk 1: (all preamble, ends with trailer)
+//   preamble: take
+//   rows_to_skip: 0
+//   rows_to_take: 0
+//   take_trailer: true
+//
+// Chunk 2: (all preamble, no trailer)
+//   preamble: take
+//   rows_to_skip: 0
+//   rows_to_take: 0
+//   take_trailer: false
+//
+// Chunk 3: (several rows, no trailer or preamble)
+//   preamble: absent
+//   rows_to_skip: 0
+//   rows_to_take: 3 (a, b, c)
+//   take_trailer: false
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChunkInstructions {
     // The index of the chunk to read
@@ -1303,13 +1332,13 @@ struct ChunkInstructions {
     //
     // If this is non-zero then premable must not be Take
     rows_to_skip: u64,
-    // How many complete (non-preamble / non-trailer) rows to take
+    // How many rows to take.  If a row splits across chunks then we will count the row in the first
+    // chunk that contains the row.
     rows_to_take: u64,
     // A "trailer" is when a chunk ends with a partial list.  If there is no repetition index there is
     // never a trailer.
     //
-    // It's possible for a chunk to be entirely trailer.  This would mean the chunk starts with the beginning
-    // of a list and that list is continued in the next chunk.
+    // A chunk that is all preamble may or may not have a trailer.
     //
     // If this is true then we want to include the trailer
     take_trailer: bool,
@@ -1401,7 +1430,10 @@ impl ChunkInstructions {
                             preamble: PreambleAction::Take,
                             rows_to_skip: 0,
                             rows_to_take: 0,
-                            take_trailer: false,
+                            // We still need to look at has_trailer to distinguish between "all preamble
+                            // and row ends at end of chunk" and "all preamble and row bleeds into next
+                            // chunk".  Both cases will have 0 rows available.
+                            take_trailer: chunk.has_trailer,
                         });
                         // Only set need_preamble = false if the chunk has at least one row,
                         // Or we are reaching the last block,
@@ -1441,13 +1473,11 @@ impl ChunkInstructions {
                 } else {
                     PreambleAction::Absent
                 };
-                let mut rows_to_take_no_trailer = rows_to_take;
 
                 // Are we taking the trailer?  If so, make sure we mark that we need the preamble
                 if rows_to_take == rows_avail && chunk.has_trailer {
                     take_trailer = true;
                     need_preamble = true;
-                    rows_to_take_no_trailer -= 1;
                 } else {
                     need_preamble = false;
                 };
@@ -1456,7 +1486,7 @@ impl ChunkInstructions {
                     preamble,
                     chunk_idx: block_index,
                     rows_to_skip: to_skip,
-                    rows_to_take: rows_to_take_no_trailer,
+                    rows_to_take,
                     take_trailer,
                 });
 
@@ -1498,7 +1528,7 @@ impl ChunkInstructions {
     ) -> (ChunkDrainInstructions, bool) {
         // If we need the premable then we shouldn't be skipping anything
         debug_assert!(!*need_preamble || *skip_in_chunk == 0);
-        let mut rows_avail = self.rows_to_take - *skip_in_chunk;
+        let rows_avail = self.rows_to_take - *skip_in_chunk;
         let has_preamble = self.preamble != PreambleAction::Absent;
         let preamble_action = match (*need_preamble, has_preamble) {
             (true, true) => PreambleAction::Take,
@@ -1507,16 +1537,16 @@ impl ChunkInstructions {
             (false, false) => PreambleAction::Absent,
         };
 
-        // Did the scheduled chunk have a trailer?  If so, we have one extra row available
-        if self.take_trailer {
-            rows_avail += 1;
-        }
-
         // How many rows are we actually taking in this take step (including the preamble
         // and trailer both as individual rows)
         let rows_taking = if *rows_desired >= rows_avail {
             // We want all the rows.  If there is a trailer we are grabbing it and will need
             // the preamble of the next chunk
+            // If there is a trailer and we are taking all the rows then we need the preamble
+            // of the next chunk.
+            //
+            // Also, if this chunk is entirely preamble (rows_avail == 0 && !take_trailer) then we
+            // need the preamble of the next chunk.
             *need_preamble = self.take_trailer;
             rows_avail
         } else {
@@ -1682,14 +1712,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             num_rows,
             chunk_instructions
                 .iter()
-                .map(|ci| {
-                    let taken = ci.rows_to_take;
-                    if ci.take_trailer {
-                        taken + 1
-                    } else {
-                        taken
-                    }
-                })
+                .map(|ci| ci.rows_to_take)
                 .sum::<u64>()
         );
 
@@ -1698,6 +1721,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .map(|ci| ci.chunk_idx)
             .unique()
             .collect::<Vec<_>>();
+
         let mut loaded_chunks = self.lookup_chunks(&chunks_needed);
         let chunk_ranges = loaded_chunks
             .iter()
@@ -3230,7 +3254,7 @@ const MINIBLOCK_ALIGNMENT: usize = 8;
 /// If the data is wide then we zip together the repetition and definition value
 /// with the value data into a single buffer.  This approach is called "zipped".
 ///
-/// If there is any repetition information then we create a repetition index (TODO)
+/// If there is any repetition information then we create a repetition index
 ///
 /// In addition, the compression process may create zero or more metadata buffers.
 /// For example, a dictionary compression will create dictionary metadata.  Any
@@ -3681,9 +3705,9 @@ impl PrimitiveStructuralEncoder {
         let repdef = RepDefBuilder::serialize(repdefs);
 
         if let DataBlock::AllNull(_null_block) = data {
-            // If we got here then all the data is null but we have rep/def information that
-            // we need to store.
-            todo!()
+            // We should not be using mini-block for all-null.  There are other structural
+            // encodings for that.
+            unreachable!()
         }
 
         let num_items = data.num_values();
@@ -4753,7 +4777,7 @@ mod tests {
                 chunk_idx: 0,
                 preamble: PreambleAction::Absent,
                 rows_to_skip: 0,
-                rows_to_take: 5,
+                rows_to_take: 6,
                 take_trailer: true,
             },
             ChunkInstructions {
@@ -4767,7 +4791,7 @@ mod tests {
                 chunk_idx: 2,
                 preamble: PreambleAction::Absent,
                 rows_to_skip: 0,
-                rows_to_take: 4,
+                rows_to_take: 5,
                 take_trailer: true,
             },
             ChunkInstructions {
@@ -4834,7 +4858,7 @@ mod tests {
                     chunk_idx: 0,
                     preamble: PreambleAction::Absent,
                     rows_to_skip: 5,
-                    rows_to_take: 0,
+                    rows_to_take: 1,
                     take_trailer: true,
                 },
                 ChunkInstructions {
