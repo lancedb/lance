@@ -34,6 +34,7 @@ use lance_index::scalar::inverted::InvertedIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_index::scalar::{CreatedIndex, ScalarIndex};
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
@@ -1210,6 +1211,19 @@ impl DatasetIndexInternalExt for Dataset {
                         let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
                             self.object_store.clone(),
                             index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_RQ" => {
+                        let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -3416,11 +3430,7 @@ mod tests {
 
             // Perform shallow clone for this round (chain cloning from current dataset)
             let mut round_cloned_dataset = current_dataset
-                .shallow_clone(
-                    round_cloned_uri,
-                    tag_name.as_str(),
-                    ObjectStoreParams::default(),
-                )
+                .shallow_clone(round_cloned_uri, tag_name.as_str(), None)
                 .await
                 .unwrap();
 

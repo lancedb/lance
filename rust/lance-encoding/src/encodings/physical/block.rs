@@ -529,7 +529,7 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
             )?,
             64 => self.per_value_decompress(
                 data_bytes,
-                &data.offsets.borrow_to_typed_slice::<u32>(),
+                &data.offsets.borrow_to_typed_slice::<u64>(),
                 &mut decompressed,
             )?,
             _ => unreachable!(),
@@ -659,9 +659,22 @@ mod tests {
 
     #[cfg(feature = "lz4")]
     mod lz4 {
+        use std::{collections::HashMap, sync::Arc};
+
+        use arrow_schema::{DataType, Field};
+        use lance_datagen::array::{binary_prefix_plus_counter, utf8_prefix_plus_counter};
+
         use super::*;
 
-        use crate::encodings::physical::block::lz4::Lz4BufferCompressor;
+        use crate::{
+            constants::{
+                COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
+                STRUCTURAL_ENCODING_META_KEY,
+            },
+            encodings::physical::block::lz4::Lz4BufferCompressor,
+            testing::{check_round_trip_encoding_generated, FnArrayGeneratorProvider, TestCases},
+            version::LanceFileVersion,
+        };
 
         #[test]
         fn test_lz4_compress_decompress() {
@@ -677,6 +690,49 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+        }
+
+        #[test_log::test(tokio::test)]
+        async fn test_lz4_compress_round_trip() {
+            for data_type in &[
+                DataType::Utf8,
+                DataType::LargeUtf8,
+                DataType::Binary,
+                DataType::LargeBinary,
+            ] {
+                let field = Field::new("", data_type.clone(), false);
+                let mut field_meta = HashMap::new();
+                field_meta.insert(COMPRESSION_META_KEY.to_string(), "lz4".to_string());
+                // Some bad cardinality estimatation causes us to use dictionary encoding currently
+                // which causes the expected encoding check to fail.
+                field_meta.insert(DICT_DIVISOR_META_KEY.to_string(), "100000".to_string());
+                field_meta.insert(
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    STRUCTURAL_ENCODING_FULLZIP.to_string(),
+                );
+                let field = field.with_metadata(field_meta);
+                let test_cases = TestCases::basic()
+                    // Need to use large pages as small pages might be too small to compress
+                    .with_page_sizes(vec![1024 * 1024])
+                    .with_expected_encoding("zstd")
+                    .with_min_file_version(LanceFileVersion::V2_1);
+
+                // Can't use the default random provider because random data isn't compressible
+                // and we will fallback to uncompressed encoding
+                let datagen = Box::new(FnArrayGeneratorProvider::new(move || match data_type {
+                    DataType::Utf8 => utf8_prefix_plus_counter("compressme", false),
+                    DataType::Binary => {
+                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), false)
+                    }
+                    DataType::LargeUtf8 => utf8_prefix_plus_counter("compressme", true),
+                    DataType::LargeBinary => {
+                        binary_prefix_plus_counter(Arc::from(b"compressme".to_owned()), true)
+                    }
+                    _ => panic!("Unsupported data type: {:?}", data_type),
+                }));
+
+                check_round_trip_encoding_generated(field, datagen, test_cases).await;
+            }
         }
     }
 }

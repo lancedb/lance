@@ -747,9 +747,10 @@ pub(crate) mod tests {
     };
 
     use arrow_array::{
-        make_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array,
+        make_array, Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray,
+        UInt8Array,
     };
-    use arrow_buffer::{BooleanBuffer, NullBuffer};
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
 
@@ -1022,6 +1023,25 @@ pub(crate) mod tests {
         );
 
         assert_eq!(decompressed.as_ref(), &sample_list);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn regress_list_fsl() {
+        // This regresses a case where rows are large lists that span multiple
+        // mini-block chunks which gives us some all-premable mini-block chunks.
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 393, 755, 1156, 1536]);
+        let data = UInt8Array::from(vec![0; 1536 * 16]);
+        let fsl_field = Arc::new(Field::new("item", DataType::UInt8, true));
+        let fsl = FixedSizeListArray::new(fsl_field, 16, Arc::new(data), None);
+        let list_field = Arc::new(Field::new("item", fsl.data_type().clone(), false));
+        let list_arr = ListArray::new(list_field, OffsetBuffer::new(offsets), Arc::new(fsl), None);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_batch_size(1);
+
+        check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
+            .await;
     }
 
     fn create_random_fsl() -> Arc<dyn Array> {
