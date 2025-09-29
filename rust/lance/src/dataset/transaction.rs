@@ -2898,9 +2898,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
-                fields_modified,
+                bitmap_prune_field_ids,
                 mem_wal_to_merge,
-                fields_for_preserving_frag_bitmap,
+                bitmap_preserve_exclude_field_ids,
                 update_mode,
             })) => Operation::Update {
                 removed_fragment_ids,
@@ -2912,9 +2912,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                bitmap_prune_field_ids: fields_modified,
+                bitmap_prune_field_ids,
                 mem_wal_to_merge: mem_wal_to_merge.map(|m| MemWal::try_from(m).unwrap()),
-                bitmap_preserve_exclude_field_ids: fields_for_preserving_frag_bitmap,
+                bitmap_preserve_exclude_field_ids,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
                     1 => Some(UpdateMode::RewriteColumns),
@@ -3278,9 +3278,9 @@ impl From<&Transaction> for pb::Transaction {
                     .map(pb::DataFragment::from)
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
-                fields_modified: bitmap_prune_field_ids.clone(),
+                bitmap_prune_field_ids: bitmap_prune_field_ids.clone(),
                 mem_wal_to_merge: mem_wal_to_merge.as_ref().map(|m| m.into()),
-                fields_for_preserving_frag_bitmap: bitmap_preserve_exclude_field_ids.clone(),
+                bitmap_preserve_exclude_field_ids: bitmap_preserve_exclude_field_ids.clone(),
                 update_mode: update_mode
                     .as_ref()
                     .map(|mode| match mode {

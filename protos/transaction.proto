@@ -193,13 +193,14 @@ message Transaction {
     repeated DataFragment updated_fragments = 2;
     // The new fragments where updated rows have been moved to.
     repeated DataFragment new_fragments = 3;
-    // The ids of the fields that have been modified.
-    repeated uint32 fields_modified = 4;
+    /// Field IDs that drive index fragment bitmap pruning
+    repeated uint32 bitmap_prune_field_ids = 4;
     /// The MemWAL (pre-image) that should be marked as merged after this transaction
     MemWalIndexDetails.MemWal mem_wal_to_merge = 5;
-    /// The fields that used to judge whether to preserve the new frag's id into
-    /// the frag bitmap of the specified indices.
-    repeated uint32 fields_for_preserving_frag_bitmap = 6;
+    /// Field IDs used to decide whether to preserve new fragment IDs in the
+    /// fragment bitmap of specified indices. Indices that do not cover these
+    /// fields may preserve the new fragment IDs when applicable.
+    repeated uint32 bitmap_preserve_exclude_field_ids = 6;
     // The mode of update
     UpdateMode update_mode = 7;
   }
