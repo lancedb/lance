@@ -1557,21 +1557,27 @@ impl FileFragment {
                 location!(),
             ));
         };
-        for field in right_schema.fields() {
+        let write_schema = right_schema.as_ref().without_column(right_on);
+        for field in write_schema.fields() {
             if ROW_ID.eq(field.name()) || ROW_ADDR.eq(field.name()) {
-                continue;
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} is a reversed metadata column and cannot be updated",
+                        field.name()
+                    ),
+                    location!(),
+                ));
             }
             if self.schema().field(field.name()).is_none() {
                 return Err(Error::invalid_input(
                     format!(
-                        "Column {} in left side fragment does not exist in right side fragment",
+                        "Column {} in right side fragment does not exist in left side fragment",
                         field.name()
                     ),
                     location!(),
                 ));
             }
         }
-        let write_schema = right_schema.as_ref().without_column(right_on);
 
         let write_schema = self.schema().project_by_schema(
             &write_schema,
