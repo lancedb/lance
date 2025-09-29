@@ -61,7 +61,7 @@ def test_schema_only(tmp_path):
 def test_write_with_max_page_bytes(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])
-    for version in ["2.0", "stable"]:
+    for version in ["2.0", "2.1"]:
         with LanceFileWriter(
             str(path), schema, max_page_bytes=1, version=version
         ) as writer:
@@ -275,7 +275,8 @@ def test_file_stat(tmp_path):
     assert file_stat.columns[0].num_pages == 1
     assert file_stat.columns[0].size_bytes <= 8_000_000
 
-    assert file_stat.columns[1].num_pages == 1
+    # 2 pages on 2.0, 1 page in 2.1+
+    assert file_stat.columns[1].num_pages <= 2
     # Slightly larger than 64MiB because of padding, chunk overhead, etc.
     assert file_stat.columns[1].size_bytes <= 64_200_000
 
