@@ -942,7 +942,8 @@ fn convert_to_rust_operation(
             let bitmap_prune_field_ids = env
                 .call_method(java_operation, "bitmapPruneFieldIds", "()[J", &[])?
                 .l()?;
-            let bitmap_prune_field_ids = JLongArray::from(bitmap_prune_field_ids).extract_object(env)?;
+            let bitmap_prune_field_ids =
+                JLongArray::from(bitmap_prune_field_ids).extract_object(env)?;
 
             let bitmap_preserve_exclude_field_ids = env
                 .call_method(java_operation, "bitmapPreserveExcludeFieldIds", "()[J", &[])?
