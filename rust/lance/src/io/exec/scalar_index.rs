@@ -30,7 +30,7 @@ use lance_core::{
         address::RowAddress,
         mask::{RowIdMask, RowIdTreeMap},
     },
-    Error, Result, ROW_ID_FIELD,
+    Error, Result, ROW_ADDR_FIELD, ROW_ID_FIELD,
 };
 use lance_datafusion::{
     chunker::break_stream,
@@ -328,7 +328,7 @@ impl MapIndexExec {
 
             let allow_list =
                 allow_list
-                    .row_ids()
+                    .row_addrs()
                     .ok_or(datafusion::error::DataFusionError::External(
                         "IndexedLookupExec: row addresses didn't have an iterable allow list"
                             .into(),
@@ -454,7 +454,7 @@ impl ExecutionPlan for MapIndexExec {
 }
 
 pub static MATERIALIZE_INDEX_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 /// An execution node that performs a scalar index search and materializes the mask into row ids
 ///
@@ -613,7 +613,7 @@ async fn row_ids_for_mask(
         (Some(mut allow_list), None) => {
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
-            if let Some(allow_list_iter) = allow_list.row_ids() {
+            if let Some(allow_list_iter) = allow_list.row_addrs() {
                 Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
             } else {
                 // We shouldn't hit this branch if the row ids are stable.
@@ -651,7 +651,7 @@ async fn row_ids_for_mask(
             // We need to filter out irrelevant fragments as well.
             retain_fragments(&mut allow_list, fragments, dataset).await?;
 
-            if let Some(allow_list_iter) = allow_list.row_ids() {
+            if let Some(allow_list_iter) = allow_list.row_addrs() {
                 Ok(allow_list_iter
                     .filter_map(|addr| {
                         let row_id = u64::from(addr);

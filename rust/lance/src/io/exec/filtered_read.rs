@@ -639,7 +639,16 @@ impl FilteredReadStream {
 
                 match &evaluated_index.index_result {
                     IndexExprResult::Exact(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        // let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        // Prefer row address based ranges when possible to ensure coordinate consistency
+                        let valid_ranges = if let Some(offsets) =
+                            Self::mask_offsets_for_fragment(row_id_mask, fragment_id)
+                        {
+                            Self::offsets_to_ranges(offsets)
+                        } else {
+                            // Fallback to stable row-id sequence mapping
+                            row_id_sequence.mask_to_offset_ranges(row_id_mask)
+                        };
                         let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
                         fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
@@ -648,12 +657,24 @@ impl FilteredReadStream {
                     }
                     IndexExprResult::AtMost(row_id_mask) => {
                         // Cannot push down skip/take for AtMost
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let valid_ranges = if let Some(offsets) =
+                            Self::mask_offsets_for_fragment(row_id_mask, fragment_id)
+                        {
+                            Self::offsets_to_ranges(offsets)
+                        } else {
+                            row_id_sequence.mask_to_offset_ranges(row_id_mask)
+                        };
                         let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
                         fragments_to_read.insert(fragment_id, matched_ranges);
                     }
                     IndexExprResult::AtLeast(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let valid_ranges = if let Some(offsets) =
+                            Self::mask_offsets_for_fragment(row_id_mask, fragment_id)
+                        {
+                            Self::offsets_to_ranges(offsets)
+                        } else {
+                            row_id_sequence.mask_to_offset_ranges(row_id_mask)
+                        };
                         let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
                         fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
@@ -709,6 +730,43 @@ impl FilteredReadStream {
         }
 
         physical_ranges.truncate(write_idx);
+    }
+
+    /// Convert a list of row offsets into grouped contiguous ranges (start..end)
+    fn offsets_to_ranges(mut offsets: Vec<u64>) -> Vec<Range<u64>> {
+        if offsets.is_empty() {
+            return Vec::new();
+        }
+        offsets.sort_unstable();
+        let mut ranges = Vec::new();
+        let mut start = offsets[0];
+        let mut end = start + 1;
+        for off in offsets.into_iter().skip(1) {
+            if off == end {
+                end += 1;
+            } else {
+                ranges.push(start..end);
+                start = off;
+                end = off + 1;
+            }
+        }
+        ranges.push(start..end);
+        ranges
+    }
+
+    /// Extract row address offsets for the given fragment from a RowIdMask (if iterable)
+    fn mask_offsets_for_fragment(mask: &RowIdMask, fragment_id: u32) -> Option<Vec<u64>> {
+        if let Some(ids_iter) = mask.iter_ids() {
+            let mut offsets = Vec::new();
+            for addr in ids_iter {
+                if addr.fragment_id() == fragment_id {
+                    offsets.push(addr.row_offset() as u64);
+                }
+            }
+            Some(offsets)
+        } else {
+            None
+        }
     }
 
     /// Intersect two sets of sorted ranges
