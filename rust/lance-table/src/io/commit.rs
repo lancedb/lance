@@ -53,6 +53,8 @@ use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
 use lance_io::traits::WriteExt;
 
+use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 #[cfg(feature = "dynamodb")]
 use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
@@ -64,8 +66,6 @@ use {
     std::borrow::Cow,
     std::time::{Duration, SystemTime},
 };
-use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
-use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
 
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
