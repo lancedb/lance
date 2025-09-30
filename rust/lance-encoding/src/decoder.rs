@@ -701,6 +701,7 @@ impl CoreFieldDecoderStrategy {
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
                 self.cache_repetition_index,
+                field,
             )?);
 
             // advance to the next top level column
@@ -711,11 +712,13 @@ impl CoreFieldDecoderStrategy {
         match &data_type {
             DataType::Struct(fields) => {
                 if field.is_packed_struct() {
+                    // Packed struct
                     let column_info = column_infos.expect_next()?;
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
                         self.cache_repetition_index,
+                        field,
                     )?);
 
                     // advance to the next top level column
@@ -723,6 +726,29 @@ impl CoreFieldDecoderStrategy {
 
                     return Ok(scheduler);
                 }
+                // Maybe a blob descriptions struct?
+                if field.is_blob() {
+                    let column_info = column_infos.peek();
+                    if column_info.page_infos.iter().any(|page| {
+                        matches!(
+                            page.encoding,
+                            PageEncoding::Structural(pb21::PageLayout {
+                                layout: Some(pb21::page_layout::Layout::BlobLayout(_))
+                            })
+                        )
+                    }) {
+                        let column_info = column_infos.expect_next()?;
+                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                            column_info.as_ref(),
+                            self.decompressor_strategy.as_ref(),
+                            self.cache_repetition_index,
+                            field,
+                        )?);
+                        column_infos.next_top_level();
+                        return Ok(scheduler);
+                    }
+                }
+
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
                     let field_scheduler =
