@@ -155,7 +155,7 @@ impl TryFrom<&DataType> for LogicalType {
             },
             DataType::FixedSizeList(field, len) => {
                 if is_bfloat16_field(field) {
-                    // Don't want to directly use `blfoat16`, in case a built-in type is added
+                    // Don't want to directly use `bfloat16`, in case a built-in type is added
                     // that isn't identical to our extension type.
                     format!("fixed_size_list:lance.bfloat16:{}", *len)
                 } else {
