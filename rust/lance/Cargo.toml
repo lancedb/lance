@@ -76,7 +76,6 @@ tantivy.workspace = true
 tfrecord = { version = "0.15.0", optional = true, features = ["async"] }
 prost_old = { version = "0.12.6", package = "prost", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
-tempfile.workspace = true
 tracing.workspace = true
 humantime = { workspace = true }
 async_cell = "0.2.2"

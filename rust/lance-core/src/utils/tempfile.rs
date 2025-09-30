@@ -8,6 +8,8 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
+use crate::Result;
+
 #[derive(Debug)]
 pub struct TempDir {
     tempdir: tempfile::TempDir,
@@ -17,6 +19,11 @@ impl TempDir {
     fn new() -> Self {
         let tempdir = tempfile::tempdir().unwrap();
         Self { tempdir }
+    }
+
+    pub fn try_new() -> Result<Self> {
+        let tempdir = tempfile::tempdir()?;
+        Ok(Self { tempdir })
     }
 
     fn norm_path(&self) -> String {

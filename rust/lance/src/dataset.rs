@@ -2509,6 +2509,7 @@ mod tests {
     use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
     use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
     use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
+    use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_file::v2::writer::FileWriter;
     use lance_file::version::LanceFileVersion;
@@ -2537,7 +2538,6 @@ mod tests {
     use rand::Rng;
     use rstest::rstest;
     use std::cmp::Ordering;
-    use tempfile::{tempdir, TempDir};
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
@@ -2644,8 +2644,8 @@ mod tests {
     ) {
         // Appending / Overwriting a dataset that does not exist is treated as Create
         for mode in [WriteMode::Create, WriteMode::Append, Overwrite] {
-            let test_dir = tempdir().unwrap();
-            create_file(test_dir.path(), mode, data_storage_version).await
+            let test_dir = TempStdDir::default();
+            create_file(&test_dir, mode, data_storage_version).await
         }
     }
 
@@ -2655,8 +2655,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -2669,7 +2668,7 @@ mod tests {
         assert_eq!(schema.as_ref(), reader.schema().as_ref());
         let result = Dataset::write(
             reader,
-            test_uri,
+            &test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
@@ -2704,7 +2703,7 @@ mod tests {
         .unwrap()];
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        Dataset::write(batches, &test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -2715,7 +2714,7 @@ mod tests {
         .unwrap();
 
         // get actual dataset
-        let actual_ds = Dataset::open(test_uri).await.unwrap();
+        let actual_ds = Dataset::open(&test_uri).await.unwrap();
         // confirm schema is same
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
@@ -2748,8 +2747,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -2762,7 +2760,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             ..Default::default()
         });
-        let result = Dataset::write(reader, test_uri, write_params)
+        let result = Dataset::write(reader, &test_uri, write_params)
             .await
             .unwrap();
 
@@ -2838,8 +2836,7 @@ mod tests {
     ) {
         use fragment::FragReadConfig;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -2861,7 +2858,7 @@ mod tests {
             data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
-        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+        let dataset = Dataset::write(batches, &test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -2894,8 +2891,7 @@ mod tests {
     ) {
         use lance_table::feature_flags::FLAG_UNKNOWN;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -2911,7 +2907,7 @@ mod tests {
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let write_fut = Dataset::write(
             batches,
-            test_uri,
+            &test_uri,
             Some(WriteParams {
                 data_storage_version: Some(data_storage_version),
                 auto_cleanup: None,
@@ -2990,7 +2986,7 @@ mod tests {
         .unwrap();
 
         // Check it rejects reading it
-        let read_result = Dataset::open(test_uri).await;
+        let read_result = Dataset::open(&test_uri).await;
         assert!(matches!(read_result, Err(Error::NotSupported { .. })));
 
         // Check it rejects writing to it.
@@ -3002,7 +2998,7 @@ mod tests {
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let write_result = Dataset::write(
             batches,
-            test_uri,
+            &test_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
                 data_storage_version: Some(data_storage_version),
@@ -3020,7 +3016,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
+        let test_uri = TempStrDir::default();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -3033,7 +3029,6 @@ mod tests {
         )
         .unwrap()];
 
-        let test_uri = test_dir.path().to_str().unwrap();
         let mut write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
@@ -3041,7 +3036,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write(batches, &test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -3052,7 +3047,7 @@ mod tests {
         .unwrap()];
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params.clone()))
+        Dataset::write(batches, &test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -3062,7 +3057,7 @@ mod tests {
         )
         .unwrap();
 
-        let actual_ds = Dataset::open(test_uri).await.unwrap();
+        let actual_ds = Dataset::open(&test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 2);
         let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
@@ -3102,9 +3097,10 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let clone_dir = test_dir.path().join("clone");
+        let test_dir = TempStdDir::default();
+        let base_dir = test_dir.join("base");
+        let test_uri = base_dir.to_str().unwrap();
+        let clone_dir = test_dir.join("clone");
         let cloned_uri = clone_dir.to_str().unwrap();
 
         // Generate consistent test data batches
@@ -3233,8 +3229,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = TempStrDir::default();
         let append_row_count = 36;
 
         // Async dataset writer function

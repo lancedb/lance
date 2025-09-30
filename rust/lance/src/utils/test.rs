@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 
+use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use snafu::location;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -26,7 +27,6 @@ use object_store::{
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
-use tempfile::{tempdir, TempDir};
 
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
@@ -692,7 +692,7 @@ impl DatagenExt for BatchGeneratorBuilder {
 }
 
 pub struct NoContextTestFixture {
-    _tmp_dir: TempDir,
+    _tmp_dir: TempStrDir,
     pub dataset: Dataset,
 }
 
@@ -703,14 +703,17 @@ impl NoContextTestFixture {
             .unwrap();
 
         runtime.block_on(async move {
-            let tempdir = tempdir().unwrap();
-            let tmppath = tempdir.path().to_str().unwrap();
+            let tempdir = TempStrDir::default();
             let dataset = lance_datagen::gen_batch()
                 .col(
                     "text",
                     lance_datagen::array::rand_utf8(ByteCount::from(10), false),
                 )
-                .into_dataset(tmppath, FragmentCount::from(4), FragmentRowCount::from(100))
+                .into_dataset(
+                    tempdir.as_str(),
+                    FragmentCount::from(4),
+                    FragmentRowCount::from(100),
+                )
                 .await
                 .unwrap();
             Self {
@@ -743,7 +746,7 @@ pub fn copy_dir_all(
 ///
 /// The `table_path` should be relative to `test_data/` at the root of the
 /// repo.
-pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
+pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempStdDir> {
     use std::path::PathBuf;
 
     let mut src = PathBuf::new();
@@ -751,9 +754,9 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     src.push("../../test_data");
     src.push(table_path);
 
-    let test_dir = tempdir().unwrap();
+    let test_dir = TempStdDir::default();
 
-    copy_dir_all(src.as_path(), test_dir.path())?;
+    copy_dir_all(src.as_path(), &test_dir)?;
 
     Ok(test_dir)
 }
@@ -838,9 +841,12 @@ pub async fn assert_plan_node_equals(
 mod tests {
     use std::sync::Arc;
 
+    use crate::dataset::WriteDestination;
+
     use super::*;
     use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int32Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
+    use lance_core::utils::tempfile::TempStrDir;
     use rstest::rstest;
 
     #[rstest]
@@ -1033,6 +1039,12 @@ mod tests {
                     assert_ne!(field_structure[0], field_structure[1]);
                 }
             }
+        }
+    }
+
+    impl<'a> From<&'a TempStrDir> for WriteDestination<'a> {
+        fn from(value: &'a TempStrDir) -> Self {
+            WriteDestination::Uri(value.as_str())
         }
     }
 }

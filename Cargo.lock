@@ -4308,7 +4308,6 @@ dependencies = [
  "serde_json",
  "snafu",
  "tantivy",
- "tempfile",
  "test-log",
  "tfrecord",
  "tokio",
