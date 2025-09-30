@@ -294,7 +294,7 @@ impl PostingIterator {
 }
 
 pub struct DocCandidate {
-    pub row_id: u64,
+    pub row_addr: u64,
     pub freqs: Vec<(String, u32)>,
     pub doc_length: u32,
 }
@@ -349,12 +349,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
-        match (mask.max_len(), mask.iter_ids()) {
-            (Some(num_rows_matched), Some(row_ids))
+        match (mask.max_len(), mask.iter_addrs()) {
+            (Some(num_rows_matched), Some(row_addrs))
                 if num_rows_matched * 100
                     <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
             {
-                return self.flat_search(params, row_ids, metrics);
+                return self.flat_search(params, row_addrs, metrics);
             }
             _ => {}
         }
@@ -370,14 +370,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
             self.cur_doc = Some(doc);
             num_comparisons += 1;
 
-            let row_id = match &doc {
+            let row_addr = match &doc {
                 DocInfo::Raw(doc) => {
-                    // if the doc is not located, we need to find the row id
-                    self.docs.row_id(doc.doc_id)
+                    // if the doc is not located, we need to find the row addr
+                    self.docs.row_addr(doc.doc_id)
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
-            if !mask.selected(row_id) {
+            if !mask.selected(row_addr) {
                 self.move_preceding(pivot, doc.doc_id() + 1);
                 continue;
             }
@@ -391,7 +391,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let doc_length = match &doc {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
-                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
+                DocInfo::Located(doc) => self.docs.num_tokens_by_row_addr(doc.row_id),
             };
             let score = self.score(pivot, doc_length);
             let freqs = self
@@ -399,13 +399,21 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 .map(|(token, freq)| (token.to_owned(), freq))
                 .collect();
             if candidates.len() < limit {
-                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_addr, score),
+                    freqs,
+                    doc_length,
+                )));
                 if candidates.len() == limit {
                     self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
                 }
             } else if score > candidates.peek().unwrap().0 .0.score.0 {
                 candidates.pop();
-                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_addr, score),
+                    freqs,
+                    doc_length,
+                )));
                 self.threshold = candidates.peek().unwrap().0 .0.score.0 * params.wand_factor;
             }
             self.move_preceding(pivot, doc.doc_id() + 1);
@@ -415,7 +423,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                row_addr: doc.row_addr,
                 freqs,
                 doc_length,
             })
@@ -518,7 +526,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             // score the doc
             let doc_length = match is_compressed {
                 true => self.docs.num_tokens(doc_id as u32),
-                false => self.docs.num_tokens_by_row_id(row_id),
+                false => self.docs.num_tokens_by_row_addr(row_id),
             };
 
             let score = self.score(max_pivot, doc_length);
@@ -543,7 +551,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                row_addr: doc.row_addr,
                 freqs,
                 doc_length,
             })
