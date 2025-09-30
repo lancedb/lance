@@ -49,7 +49,6 @@ rand.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-tempfile.workspace = true
 test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true

@@ -734,6 +734,7 @@ fn infer_block_size(scheme: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::tempfile::{TempStdDir, TempStdFile, TempStrDir};
     use object_store::memory::InMemory;
     use rstest::rstest;
     use std::env::set_current_dir;
@@ -759,8 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_absolute_paths() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = TempStrDir::default();
         write_to_file(
             &format!("{tmp_path}/bar/foo.lance/test_file"),
             "TEST_CONTENT",
@@ -852,8 +852,7 @@ mod tests {
     #[case("memory:///bucket/foo.lance")]
     #[tokio::test]
     async fn test_block_size_used_file(#[case] prefix: &str) {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = TempStrDir::default();
         let path = format!("{tmp_path}/bar/foo.lance/test_file");
         write_to_file(&path, "URL").unwrap();
         let uri = format!("{prefix}:///{path}");
@@ -862,15 +861,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_relative_paths() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        let tmp_path = TempStrDir::default();
         write_to_file(
             &format!("{tmp_path}/bar/foo.lance/test_file"),
             "RELATIVE_URL",
         )
         .unwrap();
 
-        set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
+        set_current_dir(StdPath::new(tmp_path.as_ref())).expect("Error changing current dir");
         let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
 
         let contents = read_from_store(store.as_ref(), &path.child("test_file"))
@@ -892,8 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_directory() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path();
+        let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
         create_dir_all(path.join("foo").join("zoo").join("abc")).unwrap();
@@ -910,8 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_directory() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let path = tmp_dir.path();
+        let path = TempStdDir::default();
         create_dir_all(path.join("foo").join("bar")).unwrap();
         create_dir_all(path.join("foo").join("zoo")).unwrap();
         create_dir_all(path.join("foo").join("zoo").join("abc")).unwrap();
@@ -992,26 +988,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_paths() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let file_path = temp_dir.path().join("test_file");
-        let mut writer = ObjectStore::create_local_writer(file_path.as_path())
+        let file_path = TempStdFile::default();
+        let mut writer = ObjectStore::create_local_writer(&file_path)
             .await
             .unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
         writer.shutdown().await.unwrap();
 
-        let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
+        let reader = ObjectStore::open_local(&file_path).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
         assert_eq!(buf.as_ref(), b"LOCAL");
     }
 
     #[tokio::test]
     async fn test_read_one() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let file_path = temp_dir.path().join("test_file");
-        let mut writer = ObjectStore::create_local_writer(file_path.as_path())
+        let file_path = TempStdFile::default();
+        let mut writer = ObjectStore::create_local_writer(&file_path)
             .await
             .unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
@@ -1047,9 +1039,8 @@ mod tests {
             }
         }
 
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_path = tmp_dir.path();
-        let prefix = get_path_prefix(tmp_path);
+        let tmp_path = TempStdFile::default();
+        let prefix = get_path_prefix(&tmp_path);
         let drive_letter = get_drive_letter(prefix);
 
         write_to_file(
@@ -1073,16 +1064,16 @@ mod tests {
     #[tokio::test]
     async fn test_cross_filesystem_copy() {
         // Create two temporary directories that simulate different filesystems
-        let source_dir = tempfile::tempdir().unwrap();
-        let dest_dir = tempfile::tempdir().unwrap();
+        let source_dir = TempStdDir::default();
+        let dest_dir = TempStdDir::default();
 
         // Create a test file in the source directory
         let source_file_name = "test_file.txt";
-        let source_file = source_dir.path().join(source_file_name);
+        let source_file = source_dir.join(source_file_name);
         std::fs::write(&source_file, b"test content").unwrap();
 
         // Create ObjectStore for local filesystem
-        let (store, base_path) = ObjectStore::from_uri(source_dir.path().to_str().unwrap())
+        let (store, base_path) = ObjectStore::from_uri(source_dir.to_str().unwrap())
             .await
             .unwrap();
 
@@ -1090,7 +1081,7 @@ mod tests {
         let from_path = base_path.child(source_file_name);
 
         // Use object_store::Path::parse for the destination
-        let dest_file = dest_dir.path().join("copied_file.txt");
+        let dest_file = dest_dir.join("copied_file.txt");
         let dest_str = dest_file.to_str().unwrap();
         let to_path = object_store::path::Path::parse(dest_str).unwrap();
 
@@ -1105,16 +1096,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_creates_parent_directories() {
-        let source_dir = tempfile::tempdir().unwrap();
-        let dest_dir = tempfile::tempdir().unwrap();
+        let source_dir = TempStdDir::default();
+        let dest_dir = TempStdDir::default();
 
         // Create a test file in the source directory
         let source_file_name = "test_file.txt";
-        let source_file = source_dir.path().join(source_file_name);
+        let source_file = source_dir.join(source_file_name);
         std::fs::write(&source_file, b"test content").unwrap();
 
         // Create ObjectStore for local filesystem
-        let (store, base_path) = ObjectStore::from_uri(source_dir.path().to_str().unwrap())
+        let (store, base_path) = ObjectStore::from_uri(source_dir.to_str().unwrap())
             .await
             .unwrap();
 
@@ -1123,7 +1114,6 @@ mod tests {
 
         // Create destination with nested directories that don't exist yet
         let dest_file = dest_dir
-            .path()
             .join("nested")
             .join("dirs")
             .join("copied_file.txt");
