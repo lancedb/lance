@@ -27,7 +27,7 @@ use object_store::path::Path;
 use snafu::location;
 use tracing::instrument;
 
-use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
+use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ADDR};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
     ivf::shuffler::shuffle_dataset,
@@ -66,9 +66,9 @@ pub(super) async fn build_partitions(
             location: location!(),
         });
     }
-    if schema.column_with_name(ROW_ID).is_none() {
+    if schema.column_with_name(ROW_ADDR).is_none() {
         return Err(Error::Schema {
-            message: "ROW ID is not set when building index partitions".to_string(),
+            message: "ROW ADDR is not set when building index partitions".to_string(),
             location: location!(),
         });
     }
@@ -118,8 +118,8 @@ async fn load_precomputed_partitions(
     let partition_lookup = stream
         .try_fold(lookup, |mut lookup, batch| {
             let row_addrs: &UInt64Array = batch
-                .column_by_name("row_id")
-                .expect("malformed partition file: missing row_id column")
+                .column_by_name("row_addr")
+                .expect("malformed partition file: missing row_addr column")
                 .as_primitive();
             let partitions: &UInt32Array = batch
                 .column_by_name("partition")
@@ -146,12 +146,12 @@ fn add_precomputed_partitions(
     partition_map: &[Vec<i32>],
     part_id_field: &ArrowField,
 ) -> Result<RecordBatch> {
-    let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+    let row_addrs = batch.column_by_name(ROW_ADDR).ok_or(Error::Index {
         message: "column does not exist".to_string(),
         location: location!(),
     })?;
     let part_ids = UInt32Array::from_iter_values(
-        row_ids
+        row_addrs
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
@@ -268,9 +268,9 @@ pub(super) async fn build_hnsw_partitions(
             location: location!(),
         });
     }
-    if schema.column_with_name(ROW_ID).is_none() {
+    if schema.column_with_name(ROW_ADDR).is_none() {
         return Err(Error::Schema {
-            message: "ROW ID is not set when building index partitions".to_string(),
+            message: "ROW ADDR is not set when building index partitions".to_string(),
             location: location!(),
         });
     }

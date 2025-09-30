@@ -6043,7 +6043,7 @@ mod tests {
 
         let results = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .full_text_search(FullTextSearchQuery::new("score".to_owned()))
             .unwrap()
             .limit(Some(3), None)
@@ -6052,12 +6052,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 3);
-        let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
-        assert_eq!(row_ids, &[0, 1, 2]);
+        let row_addrs = results[ROW_ADDR].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_addrs, &[0, 1, 2]);
 
         let results = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .full_text_search(FullTextSearchQuery::new("score".to_owned()))
             .unwrap()
             .limit(Some(2), None)
@@ -6066,12 +6066,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 2);
-        let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
-        assert_eq!(row_ids, &[0, 1]);
+        let row_addrs = results[ROW_ADDR].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_addrs, &[0, 1]);
 
         let results = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .full_text_search(FullTextSearchQuery::new("score".to_owned()))
             .unwrap()
             .limit(Some(1), None)
@@ -6080,8 +6080,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 1);
-        let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
-        assert_eq!(row_ids, &[0]);
+        let row_addrs = results[ROW_ADDR].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_addrs, &[0]);
     }
 
     async fn create_fts_dataset<

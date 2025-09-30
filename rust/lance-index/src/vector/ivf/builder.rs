@@ -133,20 +133,20 @@ pub async fn load_precomputed_partitions(
 ) -> Result<HashMap<u64, u32>> {
     let partition_lookup = stream
         .try_fold(HashMap::with_capacity(size_hint), |mut lookup, batch| {
-            let row_ids: &UInt64Array = batch
-                .column_by_name("row_id")
-                .expect("malformed partition file: missing row_id column")
+            let row_addrs: &UInt64Array = batch
+                .column_by_name("row_addr")
+                .expect("malformed partition file: missing row_addr column")
                 .as_primitive();
             let partitions: &UInt32Array = batch
                 .column_by_name("partition")
                 .expect("malformed partition file: missing partition column")
                 .as_primitive();
-            row_ids
+            row_addrs
                 .values()
                 .iter()
                 .zip(partitions.values().iter())
-                .for_each(|(row_id, partition)| {
-                    lookup.insert(*row_id, *partition);
+                .for_each(|(row_addr, partition)| {
+                    lookup.insert(*row_addr, *partition);
                 });
             async move { Ok(lookup) }
         })

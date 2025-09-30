@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
-use lance_core::{Result, ROW_ID_FIELD};
+use lance_core::{Result, ROW_ADDR_FIELD};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use quantizer::{QuantizationType, Quantizer};
@@ -55,7 +55,7 @@ pub const LOSS_METADATA_KEY: &str = "_loss";
 pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::new(|| {
     arrow_schema::SchemaRef::new(arrow_schema::Schema::new(vec![
         Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ]))
 });
 
@@ -152,7 +152,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// use arrow_schema::{Schema, Field, DataType};
     ///
     /// Schema::new(vec![
-    ///   Field::new("_rowid", DataType::UInt64, true),
+    ///   Field::new("_rowaddr", DataType::UInt64, true),
     ///   Field::new("_distance", DataType::Float32, false),
     /// ]);
     /// ```
@@ -236,8 +236,8 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     fn num_rows(&self) -> u64;
 
-    /// Return the IDs of rows in the index.
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;
+    /// Return the addrs of rows in the index.
+    fn row_addrs(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;
 
     /// Remap the index according to mapping
     ///

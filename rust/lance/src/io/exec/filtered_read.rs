@@ -639,8 +639,19 @@ impl FilteredReadStream {
 
                 match &evaluated_index.index_result {
                     IndexExprResult::Exact(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        // Prefer row-id sequence mapping to derive valid ranges.
+                        // In non-stable mode this sequence is address-style and acts as identity.
+                        let seq_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let mut matched_ranges = Self::intersect_ranges(&to_read, &seq_ranges);
+                        // Fallback: if sequence-based mapping yields nothing (domain mismatch),
+                        // try interpreting the mask as row-addresses for this fragment.
+                        if matched_ranges.is_empty() {
+                            if let Some(addr_ranges) =
+                                Self::mask_ranges_for_fragment(row_id_mask, fragment_id)
+                            {
+                                matched_ranges = Self::intersect_ranges(&to_read, &addr_ranges);
+                            }
+                        }
                         fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
                         Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
@@ -648,13 +659,29 @@ impl FilteredReadStream {
                     }
                     IndexExprResult::AtMost(row_id_mask) => {
                         // Cannot push down skip/take for AtMost
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        // Prefer row-id sequence mapping to derive valid ranges.
+                        let seq_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let mut matched_ranges = Self::intersect_ranges(&to_read, &seq_ranges);
+                        if matched_ranges.is_empty() {
+                            if let Some(addr_ranges) =
+                                Self::mask_ranges_for_fragment(row_id_mask, fragment_id)
+                            {
+                                matched_ranges = Self::intersect_ranges(&to_read, &addr_ranges);
+                            }
+                        }
                         fragments_to_read.insert(fragment_id, matched_ranges);
                     }
                     IndexExprResult::AtLeast(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        // Prefer row-id sequence mapping to derive valid ranges.
+                        let seq_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &seq_ranges);
+                        if guaranteed_ranges.is_empty() {
+                            if let Some(addr_ranges) =
+                                Self::mask_ranges_for_fragment(row_id_mask, fragment_id)
+                            {
+                                guaranteed_ranges = Self::intersect_ranges(&to_read, &addr_ranges);
+                            }
+                        }
                         fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
                         Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
@@ -709,6 +736,51 @@ impl FilteredReadStream {
         }
 
         physical_ranges.truncate(write_idx);
+    }
+
+    /// Extract contiguous row address ranges for the given fragment from a RowIdMask
+    fn mask_ranges_for_fragment(mask: &RowIdMask, fragment_id: u32) -> Option<Vec<Range<u64>>> {
+        // Only proceed if there is an allow list. When allow_list is None, it means "all rows",
+        // and we cannot construct fragment-local offsets without fragment size.
+        let allow_list = mask.allow_list.as_ref()?;
+
+        // Fetch allowed offsets for this fragment.
+        let mut allowed = if let Some(bm) = allow_list.get_fragment_bitmap(fragment_id) {
+            bm.clone()
+        } else {
+            // No rows allowed in this fragment.
+            RoaringBitmap::new()
+        };
+
+        // Subtract any blocked rows for this fragment.
+        if let Some(block_list) = &mask.block_list {
+            if let Some(blocked) = block_list.get_fragment_bitmap(fragment_id) {
+                // RoaringBitmap supports efficient in-place difference.
+                allowed -= blocked;
+            }
+        }
+
+        if allowed.is_empty() {
+            return Some(Vec::new());
+        }
+
+        // Convert bitmap into contiguous ranges without sorting.
+        let mut ranges = Vec::new();
+        let mut iter = allowed.iter();
+        if let Some(mut start) = iter.next() {
+            let mut end = start + 1;
+            for off in iter {
+                if off == end {
+                    end += 1;
+                } else {
+                    ranges.push(start as u64..end as u64);
+                    start = off;
+                    end = off + 1;
+                }
+            }
+            ranges.push(start as u64..end as u64);
+        }
+        Some(ranges)
     }
 
     /// Intersect two sets of sorted ranges
@@ -1555,16 +1627,16 @@ impl DisplayAs for FilteredReadExec {
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}",
-                self.dataset.data_dir(),
-                columns,
-                self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
-                self.options.scan_range_before_filter,
-                self.options.scan_range_after_filter,
-                self.options.projection.with_row_id,
-                self.options.projection.with_row_addr,
-                self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
-                self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
-            )
+                       self.dataset.data_dir(),
+                       columns,
+                       self.options.fragments.as_ref().map(|f| f.len()).unwrap_or(self.dataset.fragments().len()),
+                       self.options.scan_range_before_filter,
+                       self.options.scan_range_after_filter,
+                       self.options.projection.with_row_id,
+                       self.options.projection.with_row_addr,
+                       self.options.full_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
+                       self.options.refine_filter.as_ref().map(|i| i.to_string()).unwrap_or("true".to_string()),
+                )
             }
         }
     }

@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::{DistanceType, Dot};
 use lance_linalg::simd::dist_table::{BATCH_SIZE, PERM0, PERM0_INVERSE};
@@ -114,7 +114,7 @@ pub struct RabitQuantizationStorage {
     distance_type: DistanceType,
 
     // helper fields
-    row_ids: UInt64Array,
+    row_addrs: UInt64Array,
     codes: FixedSizeListArray,
     add_factors: Float32Array,
     scale_factors: Float32Array,
@@ -392,12 +392,12 @@ impl VectorStore for RabitQuantizationStorage {
         self.batch.num_rows()
     }
 
-    fn row_id(&self, id: u32) -> u64 {
-        self.row_ids.value(id as usize)
+    fn row_addr(&self, id: u32) -> u64 {
+        self.row_addrs.value(id as usize)
     }
 
-    fn row_ids(&self) -> impl Iterator<Item = &u64> {
-        self.row_ids.values().iter()
+    fn row_addrs(&self) -> impl Iterator<Item = &u64> {
+        self.row_addrs.values().iter()
     }
 
     fn distance_type(&self) -> DistanceType {
@@ -610,7 +610,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         _fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+        let row_addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
         let add_factors = batch[ADD_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
@@ -635,7 +635,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             metadata,
             batch,
             distance_type,
-            row_ids,
+            row_addrs,
             codes,
             add_factors,
             scale_factors,
@@ -663,38 +663,38 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let num_code_bytes = self.codes.value_length() as usize;
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
         let mut indices = Vec::with_capacity(num_vectors);
-        let mut new_row_ids = Vec::with_capacity(num_vectors);
+        let mut new_row_addrs = Vec::with_capacity(num_vectors);
         let mut new_codes = Vec::with_capacity(codes.len());
 
-        let row_ids = self.row_ids.values();
-        for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
-                Some(Some(new_id)) => {
+        let row_addrs = self.row_addrs.values();
+        for (i, row_addr) in row_addrs.iter().enumerate() {
+            match mapping.get(row_addr) {
+                Some(Some(new_addr)) => {
                     indices.push(i as u32);
-                    new_row_ids.push(*new_id);
+                    new_row_addrs.push(*new_addr);
                     new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
                 }
                 Some(None) => {}
                 None => {
                     indices.push(i as u32);
-                    new_row_ids.push(*row_id);
+                    new_row_addrs.push(*row_addr);
                     new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
                 }
             }
         }
 
-        let new_row_ids = UInt64Array::from(new_row_ids);
+        let new_row_addrs = UInt64Array::from(new_row_addrs);
         let new_codes = FixedSizeListArray::try_new_from_values(
             UInt8Array::from(new_codes),
             num_code_bytes as i32,
         )?;
-        let batch = if new_row_ids.is_empty() {
+        let batch = if new_row_addrs.is_empty() {
             RecordBatch::new_empty(self.schema().clone())
         } else {
             let codes = Arc::new(pack_codes(&new_codes));
             self.batch
                 .take(&UInt32Array::from(indices))?
-                .replace_column_by_name(ROW_ID, Arc::new(new_row_ids.clone()))?
+                .replace_column_by_name(ROW_ADDR, Arc::new(new_row_addrs.clone()))?
                 .replace_column_by_name(RABIT_CODE_COLUMN, codes)?
         };
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
@@ -706,7 +706,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             codes,
             add_factors: self.add_factors.clone(),
             scale_factors: self.scale_factors.clone(),
-            row_ids: new_row_ids,
+            row_addrs: new_row_addrs,
         })
     }
 }

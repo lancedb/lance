@@ -28,7 +28,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
-use lance_core::{Result, ROW_ID};
+use lance_core::{Result, ROW_ADDR};
 use lance_index::prefilter::FilterLoader;
 use snafu::location;
 
@@ -55,7 +55,7 @@ pub(crate) fn build_prefilter(
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
             let stream = src_node.execute(partition, context)?;
-            Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            Some(Box::new(FilteredRowAddrsToPrefilter(stream)) as Box<dyn FilterLoader>)
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
             let stream = src_node.execute(partition, context)?;
@@ -70,24 +70,26 @@ pub(crate) fn build_prefilter(
     )))
 }
 
-// Utility to convert an input (containing row ids) into a prefilter
-pub(crate) struct FilteredRowIdsToPrefilter(pub SendableRecordBatchStream);
+// Utility to convert an input (containing row addrs) into a prefilter
+pub(crate) struct FilteredRowAddrsToPrefilter(pub SendableRecordBatchStream);
 
 #[async_trait]
-impl FilterLoader for FilteredRowIdsToPrefilter {
+impl FilterLoader for FilteredRowAddrsToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowIdMask> {
         let mut allow_list = RowIdTreeMap::new();
         while let Some(batch) = self.0.next().await {
             let batch = batch?;
-            let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Internal {
-                message: "input batch missing row id column even though it is in the schema for the stream".into(),
-                location: location!(),
-            })?;
-            let row_ids = row_ids
+            let row_addrs_col = batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::Internal {
+                    message: "input batch missing row addr column even though it is in the schema for the stream".into(),
+                    location: location!(),
+                })?;
+            let row_addrs = row_addrs_col
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .expect("row id column in input batch had incorrect type");
-            allow_list.extend(row_ids.iter().flatten())
+                .expect("row addr column in input batch had incorrect type");
+            allow_list.extend(row_addrs.iter().flatten())
         }
         Ok(RowIdMask::from_allowed(allow_list))
     }

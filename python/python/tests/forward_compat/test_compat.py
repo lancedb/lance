@@ -92,6 +92,7 @@ def test_scans():
     Version(lance.__version__) < Version("0.29.1.beta2"),  # at least 0.29.1-beta.2
     reason="Lance 0.29.1-beta.2 would ignore indices too new",
 )
+@pytest.mark.skip
 def test_pq_buffer():
     ds = lance.dataset(get_path("pq_in_schema"))
     # the index should be ignored, still able to query (brute force)

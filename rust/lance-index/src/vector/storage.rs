@@ -10,7 +10,7 @@ use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::v2::reader::FileReader;
 use lance_io::ReadBatchParams;
@@ -82,10 +82,10 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     /// Return [DistanceType].
     fn distance_type(&self) -> DistanceType;
 
-    /// Get the lance ROW ID from one vector.
-    fn row_id(&self, id: u32) -> u64;
+    /// Get the lance ROW ADDR from one vector.
+    fn row_addr(&self, id: u32) -> u64;
 
-    fn row_ids(&self) -> impl Iterator<Item = &u64>;
+    fn row_addrs(&self) -> impl Iterator<Item = &u64>;
 
     /// Append Raw [RecordBatch] into the Storage.
     /// The storage implement will perform quantization if necessary.
@@ -145,7 +145,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
             )?;
         }
 
-        debug_assert!(batch.column_by_name(ROW_ID).is_some());
+        debug_assert!(batch.column_by_name(ROW_ADDR).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
         Q::Storage::try_from_batch(
