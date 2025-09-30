@@ -3421,7 +3421,7 @@ mod tests {
             // Create tag for this round (use current dataset for chain cloning)
             let current_version = current_dataset.version().version;
             current_dataset
-                .tags
+                .tags()
                 .create(&tag_name, current_version)
                 .await
                 .unwrap();

@@ -5879,7 +5879,11 @@ mod test {
         data_storage_version: LanceFileVersion,
         #[values(false, true)] use_stable_row_ids: bool,
     ) {
-        let fixture = ScalarIndexTestFixture::new(data_storage_version, use_stable_row_ids).await;
+        let fixture = Box::pin(ScalarIndexTestFixture::new(
+            data_storage_version,
+            use_stable_row_ids,
+        ))
+        .await;
 
         for use_index in [false, true] {
             for use_projection in [false, true] {
@@ -5944,7 +5948,7 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_index_take_batch_size() {
-        let fixture = ScalarIndexTestFixture::new(LanceFileVersion::Stable, false).await;
+        let fixture = Box::pin(ScalarIndexTestFixture::new(LanceFileVersion::Stable, false)).await;
         let stream = fixture
             .dataset
             .scan()
