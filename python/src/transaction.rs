@@ -213,8 +213,8 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 let bitmap_prune_field_ids = ob.getattr("bitmap_prune_field_ids")?.extract()?;
 
-                let bitmap_preserve_exclude_field_ids = ob
-                    .getattr("bitmap_preserve_exclude_field_ids")?
+                let bitmap_preserve_field_ids = ob
+                    .getattr("bitmap_preserve_field_ids")?
                     .extract()
                     .unwrap_or_default();
 
@@ -230,7 +230,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                     new_fragments,
                     bitmap_prune_field_ids,
                     mem_wal_to_merge: None,
-                    bitmap_preserve_exclude_field_ids,
+                    bitmap_preserve_field_ids,
                     update_mode,
                 };
                 Ok(Self(op))
@@ -368,7 +368,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 updated_fragments,
                 new_fragments,
                 bitmap_prune_field_ids,
-                bitmap_preserve_exclude_field_ids,
+                bitmap_preserve_field_ids,
                 update_mode,
                 ..
             } => {
@@ -376,8 +376,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let bitmap_prune_field_ids = bitmap_prune_field_ids.into_pyobject(py)?;
-                let bitmap_preserve_exclude_field_ids =
-                    bitmap_preserve_exclude_field_ids.into_pyobject(py)?;
+                let bitmap_preserve_field_ids =
+                    bitmap_preserve_field_ids.into_pyobject(py)?;
                 let update_mode = match update_mode {
                     Some(mode) => match mode {
                         lance::dataset::transaction::UpdateMode::RewriteRows => "rewrite_rows",
@@ -395,7 +395,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     updated_fragments,
                     new_fragments,
                     bitmap_prune_field_ids,
-                    bitmap_preserve_exclude_field_ids,
+                    bitmap_preserve_field_ids,
                     update_mode,
                 ))
             }

@@ -200,7 +200,7 @@ message Transaction {
     /// Field IDs used to decide whether to preserve new fragment IDs in the
     /// fragment bitmap of specified indices. Indices that do not cover these
     /// fields may preserve the new fragment IDs when applicable.
-    repeated uint32 bitmap_preserve_exclude_field_ids = 6;
+    repeated uint32 bitmap_preserve_field_ids = 6;
     // The mode of update
     UpdateMode update_mode = 7;
   }

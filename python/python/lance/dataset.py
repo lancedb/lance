@@ -3928,7 +3928,7 @@ class LanceOperation:
             modified in updated_fragments,
             then they must be listed here so those fragments can be removed from
             indices that cover any of these fields.
-        bitmap_preserve_exclude_field_ids: list[int]
+        bitmap_preserve_field_ids: list[int]
             Field IDs used to decide whether to preserve new fragment IDs in an index's
              fragment bitmap.
             Indices that do not cover these fields may preserve the new fragment IDs
@@ -3985,7 +3985,7 @@ class LanceOperation:
         0  1  a
         1  2  b
         2  3  c
-        3  4  d
+        3  4  dpython/python/lance/dataset.py
         >>> def double_a(batch: pa.RecordBatch) -> pa.RecordBatch:
         ...     doubled = pc.multiply(batch["a"], 2)
         ...     return pa.record_batch([doubled], ["a_doubled"])

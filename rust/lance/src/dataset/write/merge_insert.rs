@@ -1480,7 +1480,7 @@ impl MergeInsertJob {
                 new_fragments,
                 bitmap_prune_field_ids,
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
-                bitmap_preserve_exclude_field_ids: vec![], // in-place update does not affect preserving fragment bitmap
+                bitmap_preserve_field_ids: vec![], // in-place update does not affect preserving fragment bitmap
                 update_mode: Some(RewriteColumns),
             };
             // We have rewritten the fragments, not just the deletion files, so
@@ -1553,11 +1553,7 @@ impl MergeInsertJob {
                 // modify any field values.
                 bitmap_prune_field_ids: vec![],
                 mem_wal_to_merge: self.params.mem_wal_to_merge,
-                bitmap_preserve_exclude_field_ids: full_schema
-                    .fields
-                    .iter()
-                    .map(|f| f.id as u32)
-                    .collect(),
+                bitmap_preserve_field_ids: full_schema.fields.iter().map(|f| f.id as u32).collect(),
                 update_mode: Some(RewriteRows),
             };
 

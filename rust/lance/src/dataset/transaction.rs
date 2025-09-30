@@ -262,7 +262,7 @@ pub enum Operation {
         /// Field IDs used to decide whether to preserve new fragment IDs in the
         /// fragment bitmap of specified indices. Indices that do not cover these
         /// fields may preserve the new fragment IDs when applicable.
-        bitmap_preserve_exclude_field_ids: Vec<u32>,
+        bitmap_preserve_field_ids: Vec<u32>,
         /// The mode of update
         update_mode: Option<UpdateMode>,
     },
@@ -452,7 +452,7 @@ impl PartialEq for Operation {
                     new_fragments: a_new,
                     bitmap_prune_field_ids: a_prune_fields,
                     mem_wal_to_merge: a_mem_wal_to_merge,
-                    bitmap_preserve_exclude_field_ids: a_bitmap_preserve_exclude_fields,
+                    bitmap_preserve_field_ids: a_bitmap_preserve_exclude_fields,
                     update_mode: a_update_mode,
                 },
                 Self::Update {
@@ -461,7 +461,7 @@ impl PartialEq for Operation {
                     new_fragments: b_new,
                     bitmap_prune_field_ids: b_prune_fields,
                     mem_wal_to_merge: b_mem_wal_to_merge,
-                    bitmap_preserve_exclude_field_ids: b_bitmap_preserve_exclude_fields,
+                    bitmap_preserve_field_ids: b_bitmap_preserve_exclude_fields,
                     update_mode: b_update_mode,
                 },
             ) => {
@@ -1725,7 +1725,7 @@ impl Transaction {
                 new_fragments,
                 bitmap_prune_field_ids,
                 mem_wal_to_merge,
-                bitmap_preserve_exclude_field_ids,
+                bitmap_preserve_field_ids,
                 update_mode,
             } => {
                 // Extract existing fragments once for reuse
@@ -1919,7 +1919,7 @@ impl Transaction {
                         &mut final_indices,
                         &pure_updated_frag_ids,
                         &original_fragment_ids,
-                        bitmap_preserve_exclude_field_ids,
+                        bitmap_preserve_field_ids,
                     );
                 }
 
@@ -2324,15 +2324,13 @@ impl Transaction {
         indices: &mut [IndexMetadata],
         pure_update_frag_ids: &[u64],
         original_fragment_ids: &[u64],
-        bitmap_preserve_exclude_field_ids: &[u32],
+        bitmap_preserve_field_ids: &[u32],
     ) {
         if pure_update_frag_ids.is_empty() {
             return;
         }
 
-        let value_updated_field_set = bitmap_preserve_exclude_field_ids
-            .iter()
-            .collect::<HashSet<_>>();
+        let value_updated_field_set = bitmap_preserve_field_ids.iter().collect::<HashSet<_>>();
 
         for index in indices.iter_mut() {
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
@@ -2372,12 +2370,12 @@ impl Transaction {
 
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
-        let fields_modified_set = bitmap_prune_field_ids.iter().collect::<HashSet<_>>();
+        let fields_set_for_pruning = bitmap_prune_field_ids.iter().collect::<HashSet<_>>();
         for index in indices.iter_mut() {
             if index
                 .fields
                 .iter()
-                .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
+                .any(|field_id| fields_set_for_pruning.contains(&u32::try_from(*field_id).unwrap()))
             {
                 if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                     for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
@@ -2900,7 +2898,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 bitmap_prune_field_ids,
                 mem_wal_to_merge,
-                bitmap_preserve_exclude_field_ids,
+                bitmap_preserve_field_ids,
                 update_mode,
             })) => Operation::Update {
                 removed_fragment_ids,
@@ -2914,7 +2912,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
                 bitmap_prune_field_ids,
                 mem_wal_to_merge: mem_wal_to_merge.map(|m| MemWal::try_from(m).unwrap()),
-                bitmap_preserve_exclude_field_ids,
+                bitmap_preserve_field_ids,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
                     1 => Some(UpdateMode::RewriteColumns),
@@ -3269,7 +3267,7 @@ impl From<&Transaction> for pb::Transaction {
                 new_fragments,
                 bitmap_prune_field_ids,
                 mem_wal_to_merge,
-                bitmap_preserve_exclude_field_ids,
+                bitmap_preserve_field_ids,
                 update_mode,
             } => pb::transaction::Operation::Update(pb::transaction::Update {
                 removed_fragment_ids: removed_fragment_ids.clone(),
@@ -3280,7 +3278,7 @@ impl From<&Transaction> for pb::Transaction {
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 bitmap_prune_field_ids: bitmap_prune_field_ids.clone(),
                 mem_wal_to_merge: mem_wal_to_merge.as_ref().map(|m| m.into()),
-                bitmap_preserve_exclude_field_ids: bitmap_preserve_exclude_field_ids.clone(),
+                bitmap_preserve_field_ids: bitmap_preserve_field_ids.clone(),
                 update_mode: update_mode
                     .as_ref()
                     .map(|mode| match mode {

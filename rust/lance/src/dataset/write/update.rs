@@ -393,10 +393,10 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
-        let mut bitmap_preserve_exclude_field_ids = Vec::new();
+        let mut bitmap_preserve_field_ids = Vec::new();
         for column_name in self.updates.keys() {
             if let Ok(field_id) = dataset.schema().field_id(column_name) {
-                bitmap_preserve_exclude_field_ids.push(field_id as u32);
+                bitmap_preserve_field_ids.push(field_id as u32);
             }
         }
 
@@ -409,7 +409,7 @@ impl UpdateJob {
             // Therefore we do not need to prune index fragment bitmaps based on updated values here.
             bitmap_prune_field_ids: vec![],
             mem_wal_to_merge: None,
-            bitmap_preserve_exclude_field_ids,
+            bitmap_preserve_field_ids,
             update_mode: Some(RewriteRows),
         };
 
