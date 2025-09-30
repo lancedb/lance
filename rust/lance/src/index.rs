@@ -954,7 +954,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     ) -> Result<Option<Arc<MemWalIndex>>>;
 
     /// Gets the fragment reuse index UUID from the current manifest, if it exists
-    fn frag_reuse_index_uuid(&self) -> Option<Uuid>;
+    async fn frag_reuse_index_uuid(&self) -> Option<Uuid>;
 
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
@@ -982,7 +982,7 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check both scalar and vector caches
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index.as_index());
@@ -1031,7 +1031,7 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index);
@@ -1059,7 +1059,7 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
@@ -1337,7 +1337,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let frag_reuse_uuid = self.frag_reuse_index_uuid();
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
@@ -1361,10 +1361,8 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(Some(index))
     }
 
-    fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
-        // We need to load indices first, but we can't make this async
-        // For now, let's use a synchronous approach by checking if indices are already loaded
-        if let Ok(indices) = futures::executor::block_on(self.load_indices()) {
+    async fn frag_reuse_index_uuid(&self) -> Option<Uuid> {
+        if let Ok(indices) = self.load_indices().await {
             indices
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -3423,7 +3421,7 @@ mod tests {
             // Create tag for this round (use current dataset for chain cloning)
             let current_version = current_dataset.version().version;
             current_dataset
-                .tags
+                .tags()
                 .create(&tag_name, current_version)
                 .await
                 .unwrap();
