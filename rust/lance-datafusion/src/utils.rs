@@ -155,6 +155,7 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
 pub trait MetricsExt {
     fn find_count(&self, name: &str) -> Option<Count>;
     fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)>;
+    fn iter_gauges(&self) -> impl Iterator<Item = (impl AsRef<str>, &Gauge)>;
 }
 
 impl MetricsExt for MetricsSet {
@@ -174,6 +175,13 @@ impl MetricsExt for MetricsSet {
     fn iter_counts(&self) -> impl Iterator<Item = (impl AsRef<str>, &Count)> {
         self.iter().filter_map(|m| match m.value() {
             MetricValue::Count { name, count } => Some((name, count)),
+            _ => None,
+        })
+    }
+
+    fn iter_gauges(&self) -> impl Iterator<Item = (impl AsRef<str>, &Gauge)> {
+        self.iter().filter_map(|m| match m.value() {
+            MetricValue::Gauge { name, gauge } => Some((name, gauge)),
             _ => None,
         })
     }
