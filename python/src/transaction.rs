@@ -376,8 +376,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
                 let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let bitmap_prune_field_ids = bitmap_prune_field_ids.into_pyobject(py)?;
-                let bitmap_preserve_field_ids =
-                    bitmap_preserve_field_ids.into_pyobject(py)?;
+                let bitmap_preserve_field_ids = bitmap_preserve_field_ids.into_pyobject(py)?;
                 let update_mode = match update_mode {
                     Some(mode) => match mode {
                         lance::dataset::transaction::UpdateMode::RewriteRows => "rewrite_rows",
