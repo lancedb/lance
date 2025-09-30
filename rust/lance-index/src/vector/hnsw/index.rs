@@ -14,7 +14,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
-use lance_core::ROW_ID;
+use lance_core::ROW_ADDR;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
@@ -289,7 +289,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             store.schema().clone()
         } else {
             let schema = store.schema();
-            let row_id_idx = schema.index_of(ROW_ID)?;
+            let row_id_idx = schema.index_of(ROW_ADDR)?;
             Arc::new(schema.project(&[row_id_idx])?)
         };
 

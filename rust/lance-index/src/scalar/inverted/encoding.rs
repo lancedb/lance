@@ -152,7 +152,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
 }
 
 /// decompress the posting list from a LargeBinaryArray
-/// returns a vector of (row_id, frequency) tuples
+/// returns a vector of (row_addr, frequency) tuples
 #[allow(dead_code)]
 pub fn decompress_posting_list(
     num_docs: u32,

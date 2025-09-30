@@ -1965,7 +1965,7 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
+                projection.with_row_addr,
                 make_deletions_null,
                 Arc::new(projection.to_bare_schema()),
                 fragments,
@@ -2125,7 +2125,7 @@ impl Scanner {
             // it makes sense to grab cheap columns during the first step to avoid taking them for
             // the second step.
             self.calc_eager_projection(filter_plan, &self.projection_plan.physical_projection)?
-                .with_row_id()
+                .with_row_addr()
         } else {
             // If the filter plan only has one step then we just do a filtered read of all the
             // columns that the user asked for.
@@ -2462,8 +2462,8 @@ impl Scanner {
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
-                    expressions::col(ROW_ID, schema.as_ref())?,
-                    ROW_ID.to_string(),
+                    expressions::col(ROW_ADDR, schema.as_ref())?,
+                    ROW_ADDR.to_string(),
                 )];
 
                 let fts_node = Arc::new(UnionExec::new(children));
@@ -2547,8 +2547,8 @@ impl Scanner {
                             joined_plan,
                             plan,
                             vec![(
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
+                                Arc::new(Column::new_with_schema(ROW_ADDR, &FTS_SCHEMA)?),
                             )],
                             None,
                             &datafusion_expr::JoinType::Inner,
@@ -2805,11 +2805,11 @@ impl Scanner {
             let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
-                .with_row_id()
+                .with_row_addr()
                 .union_columns(&columns, OnMissing::Error)?;
 
-            vector_scan_projection.with_row_addr =
-                self.projection_plan.physical_projection.with_row_addr;
+            vector_scan_projection.with_row_id =
+                self.projection_plan.physical_projection.with_row_id;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(
@@ -2874,8 +2874,8 @@ impl Scanner {
             // most common case is that fragments that are newer than the vector index are going to be newer
             // than the scalar indices anyways
             let mut scan_node = self.scan_fragments(
-                true,
                 false,
+                true,
                 false,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
@@ -3263,7 +3263,7 @@ impl Scanner {
                     },
                 },
                 PhysicalSortExpr {
-                    expr: expressions::col(ROW_ID, knn_plan.schema().as_ref())?,
+                    expr: expressions::col(ROW_ADDR, knn_plan.schema().as_ref())?,
                     options: SortOptions {
                         descending: false,
                         nulls_first: false,
@@ -3325,7 +3325,7 @@ impl Scanner {
             },
         };
         let sort_expr_row_id = PhysicalSortExpr {
-            expr: expressions::col(ROW_ID, inner_fanout_search.schema().as_ref())?,
+            expr: expressions::col(ROW_ADDR, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
@@ -3384,7 +3384,7 @@ impl Scanner {
                 },
             };
             let sort_expr_row_id = PhysicalSortExpr {
-                expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+                expr: expressions::col(ROW_ADDR, ann_node.schema().as_ref())?,
                 options: SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -3407,7 +3407,7 @@ impl Scanner {
             },
         };
         let sort_expr_row_id = PhysicalSortExpr {
-            expr: expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+            expr: expressions::col(ROW_ADDR, ann_node.schema().as_ref())?,
             options: SortOptions {
                 descending: false,
                 nulls_first: false,
@@ -5309,7 +5309,7 @@ mod test {
         let mut scan = data.scan();
         scan.nearest("vec", &Float32Array::from(vec![1.0, 1.0, 1.0, 1.0]), 5)
             .unwrap();
-        scan.with_row_id().project(&["text"]).unwrap();
+        scan.with_row_address().project(&["text"]).unwrap();
 
         let results = scan
             .try_into_stream()
@@ -5321,7 +5321,7 @@ mod test {
 
         assert_eq!(
             results[0].schema().field_names(),
-            vec!["text", "_distance", "_rowid"]
+            vec!["text", "_distance", "_rowaddr"]
         );
     }
 
@@ -6059,7 +6059,7 @@ mod test {
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   ProjectionExec: expr=[_rowid@1 as _rowid]
-    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
+    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
         )
         .await
         .unwrap();
@@ -7232,9 +7232,9 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 32)?
                     .fast_search()
-                    .project(&["_distance", "_rowid"])
+                    .project(&["_distance", "_rowaddr"])
             },
-            "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowaddr@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=32, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -7246,10 +7246,10 @@ mod test {
             |scan| {
                 scan.nearest("vec", &q, 33)?
                     .fast_search()
-                    .with_row_id()
-                    .project(&["_distance", "_rowid"])
+                    .with_row_address()
+                    .project(&["_distance", "_rowaddr"])
             },
-            "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
+            "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowaddr@1 ASC NULLS LAST]...
     ANNSubIndex: name=idx, k=33, deltas=1
       ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )
@@ -7261,23 +7261,23 @@ mod test {
             &dataset.dataset,
             |scan| {
                 scan.nearest("vec", &q, 34)?
-                    .with_row_id()
-                    .project(&["_distance", "_rowid"])
+                    .with_row_address()
+                    .project(&["_distance", "_rowaddr"])
             },
-            "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
+            "ProjectionExec: expr=[_distance@2 as _distance, _rowaddr@0 as _rowaddr]
   FilterExec: _distance@2 IS NOT NULL
-    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@0 ASC NULLS LAST]...
+    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowaddr@0 ASC NULLS LAST]...
       KNNVectorDistance: metric=l2
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+            ProjectionExec: expr=[_distance@2 as _distance, _rowaddr@1 as _rowaddr, vec@0 as vec]
               FilterExec: _distance@2 IS NOT NULL
-                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
+                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowaddr@1 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
-                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-            Take: columns=\"_distance, _rowid, (vec)\"
+                    LanceScan: uri=..., projection=[vec], row_id=false, row_addr=true, ordered=false, range=None
+            Take: columns=\"_distance, _rowaddr, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
-                SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
+                SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowaddr@1 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
                     ANNIvfPartition: uuid=..., minimum_nprobes=20, maximum_nprobes=None, deltas=1",
         )

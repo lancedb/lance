@@ -20,7 +20,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{
-    Error as LanceError, Result as LanceResult, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_OFFSET,
+    Error as LanceError, Result as LanceResult, ROW_ADDR, ROW_ADDR_FIELD, ROW_OFFSET,
     ROW_OFFSET_FIELD,
 };
 use lance_table::rowids::RowIdIndex;
@@ -91,7 +91,7 @@ impl AddRowAddrExec {
         let rowid_pos = input_schema
             .fields()
             .iter()
-            .position(|f| f.name() == ROW_ID)
+            .position(|f| f.name() == ROW_ADDR)
             .ok_or_else(|| {
                 DataFusionError::Internal("rowid field not found in input schema".into())
             })?;

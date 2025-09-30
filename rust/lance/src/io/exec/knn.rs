@@ -36,8 +36,8 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::ROW_ID;
-use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, DELTAS_SEARCHED_METRIC, PARTITIONS_RANKED_METRIC,
     PARTITIONS_SEARCHED_METRIC,
@@ -289,7 +289,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 pub static KNN_INDEX_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
     ]))
 });
 
@@ -1186,7 +1186,7 @@ impl ExecutionPlan for MultivectorScoringExec {
         let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
             stream.map(|batch| {
                 let batch = batch?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_ids = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 debug_assert_eq!(dists.null_count(), 0);
 
@@ -1230,7 +1230,7 @@ impl ExecutionPlan for MultivectorScoringExec {
             let mut results = HashMap::with_capacity(k * refactor);
             let mut missed_sim_sum = 0.0;
             while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_ids = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let sims = batch[DIST_COL].as_primitive::<Float32Type>();
 
                 let query_results = row_ids
@@ -1300,11 +1300,15 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::*;
 
+    use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::vector::VectorIndexParams;
+    use crate::io::exec::testing::TestingExec;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::ROW_ADDR;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datagen::{array, BatchCount, RowCount};
     use lance_index::optimize::OptimizeOptions;
@@ -1314,10 +1318,6 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
-
-    use crate::dataset::{WriteMode, WriteParams};
-    use crate::index::vector::VectorIndexParams;
-    use crate::io::exec::testing::TestingExec;
 
     #[tokio::test]
     async fn knn_flat_search() {
@@ -1475,7 +1475,7 @@ mod tests {
                 .await?;
             let mut results = HashMap::new();
             for batch in batches {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_ids = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
                     results.insert(*row_id, *dist);
@@ -1655,7 +1655,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1692,7 +1692,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1729,7 +1729,7 @@ mod tests {
                 .scan_stats_callback(stats_holder.get_setter())
                 .project(&Vec::<String>::new())
                 .unwrap()
-                .with_row_id()
+                .with_row_address()
                 .try_into_batch()
                 .await
                 .unwrap();
@@ -1767,7 +1767,7 @@ mod tests {
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1806,7 +1806,7 @@ mod tests {
             .unwrap()
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1840,7 +1840,7 @@ mod tests {
             .scan_stats_callback(stats_holder.get_setter())
             .project(&Vec::<String>::new())
             .unwrap()
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();

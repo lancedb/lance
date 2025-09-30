@@ -13,7 +13,7 @@ use futures::{
 use lance_arrow::RecordBatchExt;
 use lance_core::{
     utils::{address::RowAddress, deletion::DeletionVector},
-    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
+    Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD,
 };
 use lance_io::ReadBatchParams;
 use tracing::{instrument, Instrument};
@@ -136,7 +136,7 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
         .iter()
         .zip(batch.columns())
         .map(|(field, col)| {
-            if field.name() == ROW_ID || field.name() == ROW_ADDR {
+            if field.name() == ROW_ADDR || field.name() == ROW_ADDR {
                 let col_data = col.to_data();
                 // If it already has a validity bitmap, then AND it with the mask.
                 // Otherwise, use the boolean buffer as the mask.
@@ -323,7 +323,7 @@ mod tests {
     use futures::{stream::BoxStream, FutureExt, StreamExt, TryStreamExt};
     use lance_core::{
         utils::{address::RowAddress, deletion::DeletionVector},
-        ROW_ID,
+        ROW_ADDR,
     };
     use lance_datagen::{BatchCount, RowCount};
     use lance_io::{stream::arrow_stream_to_lance_stream, ReadBatchParams};
@@ -406,8 +406,10 @@ mod tests {
                 let mut offset = 0;
                 let expected = expected.clone();
                 for batch in batches {
-                    let actual_row_ids =
-                        batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+                    let actual_row_ids = batch[ROW_ADDR]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .to_vec();
                     let expected_row_ids = expected[offset..offset + 10]
                         .iter()
                         .map(|row_offset| {
@@ -521,7 +523,7 @@ mod tests {
                             let total_num_nulls = if make_deletions_null {
                                 batches
                                     .iter()
-                                    .map(|b| b[ROW_ID].null_count())
+                                    .map(|b| b[ROW_ADDR].null_count())
                                     .sum::<usize>()
                             } else {
                                 0
@@ -542,20 +544,20 @@ mod tests {
                                     // If we make deletions null we get 3 batches of all-null and then
                                     // a batch of half-null
                                     assert_eq!(
-                                        batches[3][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        batches[3][ROW_ADDR].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 30))
                                     );
-                                    assert_eq!(batches[3][ROW_ID].null_count(), 5);
+                                    assert_eq!(batches[3][ROW_ADDR].null_count(), 5);
                                 } else {
                                     // If we materialize deletions the first row will be 35
                                     assert_eq!(
-                                        batches[0][ROW_ID].as_primitive::<UInt64Type>().value(0),
+                                        batches[0][ROW_ADDR].as_primitive::<UInt64Type>().value(0),
                                         u64::from(RowAddress::new_from_parts(frag_id, 35))
                                     );
                                 }
                             }
                             if !with_row_id {
-                                assert!(batches[0].column_by_name(ROW_ID).is_none());
+                                assert!(batches[0].column_by_name(ROW_ADDR).is_none());
                             }
                         }
                     }
