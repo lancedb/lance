@@ -32,7 +32,7 @@ impl TempDir {
     }
 
     pub fn obj_path(&self) -> ObjPath {
-        ObjPath::parse(&self.norm_path()).unwrap()
+        ObjPath::parse(self.norm_path()).unwrap()
     }
 }
 
@@ -114,16 +114,9 @@ impl AsRef<str> for TempStrDir {
     }
 }
 
+#[derive(Default)]
 pub struct TempStdDir {
     _tempdir: TempDir,
-}
-
-impl Default for TempStdDir {
-    fn default() -> Self {
-        Self {
-            _tempdir: TempDir::default(),
-        }
-    }
 }
 
 impl AsRef<StdPath> for TempStdDir {
@@ -163,7 +156,7 @@ impl TempFile {
     }
 
     pub fn obj_path(&self) -> ObjPath {
-        ObjPath::parse(&self.norm_path()).unwrap()
+        ObjPath::parse(self.norm_path()).unwrap()
     }
 }
 
@@ -173,16 +166,9 @@ impl Default for TempFile {
     }
 }
 
+#[derive(Default)]
 pub struct TempStdFile {
     _tempfile: TempFile,
-}
-
-impl Default for TempStdFile {
-    fn default() -> Self {
-        Self {
-            _tempfile: TempFile::default(),
-        }
-    }
 }
 
 impl AsRef<StdPath> for TempStdFile {
@@ -238,7 +224,7 @@ impl Default for TempStdPath {
     fn default() -> Self {
         let tempdir = TempDir::default();
         let path = format!("{}/some_file", tempdir.norm_path());
-        let path = PathBuf::try_from(path).unwrap();
+        let path = PathBuf::from(path);
         Self {
             _tempdir: tempdir,
             path,

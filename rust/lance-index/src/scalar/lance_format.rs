@@ -338,7 +338,7 @@ pub mod tests {
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();
-        let (object_store, test_path) = ObjectStore::from_uri(&test_path.to_string())
+        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
             .now_or_never()
             .unwrap()
             .unwrap();
