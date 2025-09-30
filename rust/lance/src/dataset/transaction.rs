@@ -245,7 +245,8 @@ pub enum Operation {
     /// A horizontal update adds new columns.  In this case, the updated fragments
     /// may have fields removed or added.  It is even possible for a field to be tombstoned
     /// and then added back in the same update. (which is a field modification).
-    /// Any fields modified in this way must be added to the bitmap_prune_field_ids list so indices that cover those fields can prune fragment bitmaps accordingly.
+    /// Any fields modified in this way must be added to the bitmap_prune_field_ids list so
+    /// indices that cover those fields can prune fragment bitmaps accordingly.
     /// This ensures indices remain consistent after updates.
     /// This is what is used by a merge insert that does not match the whole schema.
     Update {
