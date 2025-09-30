@@ -1425,7 +1425,8 @@ public class DatasetTest {
 
     // Calculate the actual length of the protobuf data
     // The structure is: [4-byte length][protobuf data][8-byte manifest_pos][8-byte magic]
-    byte[] trimmedManifest = Arrays.copyOfRange(fileBytes, manifestStart + 4, fileBytes.length - 16);
+    byte[] trimmedManifest =
+        Arrays.copyOfRange(fileBytes, manifestStart + 4, fileBytes.length - 16);
     ByteBuffer manifestBuffer = ByteBuffer.allocateDirect(trimmedManifest.length);
     manifestBuffer.put(trimmedManifest);
     manifestBuffer.flip();
