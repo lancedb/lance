@@ -49,7 +49,7 @@ use dataset::optimize::{
 use dataset::{MergeInsertBuilder, PyFullTextQuery};
 use env_logger::{Builder, Env};
 use file::{
-    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
     LanceFileStatistics, LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
@@ -239,6 +239,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(stable_version))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;

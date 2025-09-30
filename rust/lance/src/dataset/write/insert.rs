@@ -472,6 +472,7 @@ struct WriteContext<'a> {
 
 #[cfg(test)]
 mod test {
+    use arrow_array::StructArray;
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::session::Session;
@@ -494,5 +495,33 @@ mod test {
             .unwrap();
 
         assert_eq!(Arc::as_ptr(&dataset.session()), Arc::as_ptr(&session));
+    }
+
+    #[tokio::test]
+    async fn test_write_empty_struct() {
+        // Regresses a 2.1 issue where empty structs did not get assigned any columns
+        // in the file because we only look at leaf columns.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "empties",
+            DataType::Struct(Vec::<Field>::new().into()),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::new_empty_fields(1, None))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dataset
+                .count_rows(Some("empties IS NOT NULL".to_string()))
+                .await
+                .unwrap(),
+            1
+        );
     }
 }

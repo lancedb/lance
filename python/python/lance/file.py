@@ -12,6 +12,7 @@ from .lance import (
     LanceFileMetadata,
     LanceFileStatistics,
     LancePageMetadata,
+    stable_version,
 )
 from .lance import (
     LanceFileReader as _LanceFileReader,
@@ -418,4 +419,5 @@ __all__ = [
     "LancePageMetadata",
     "LanceBufferDescriptor",
     "LanceFileStatistics",
+    "stable_version",
 ]

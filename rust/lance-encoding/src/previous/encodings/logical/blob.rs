@@ -396,7 +396,7 @@ pub mod tests {
 
     use arrow_array::LargeBinaryArray;
     use arrow_schema::{DataType, Field};
-    use lance_core::datatypes::BLOB_META_KEY;
+    use lance_arrow::BLOB_META_KEY;
 
     use crate::{
         format::pb::column_encoding,

@@ -376,7 +376,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     fn statistics(&self) -> Result<serde_json::Value> {
         let partitions_statistics = (0..self.ivf.num_partitions())
             .map(|part_id| IvfIndexPartitionStatistics {
-                size: self.ivf.partition_size(part_id) as u32,
+                size: self.storage.partition_size(part_id) as u32,
             })
             .collect::<Vec<_>>();
 
