@@ -39,7 +39,7 @@ use lance_core::{
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
-    Error, Result, ROW_ID_FIELD,
+    Error, Result, ROW_ADDR_FIELD,
 };
 use lance_file::{
     format::MAGIC,
@@ -712,7 +712,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Prepare the quantization storage writer
     let schema = Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         arrow_schema::Field::new(
             quantizer.column(),
             DataType::FixedSizeList(
@@ -1017,7 +1017,7 @@ impl VectorIndex for IVFIndex {
         self.ivf.num_rows()
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
+    fn row_addrs(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
@@ -1314,7 +1314,7 @@ async fn scan_index_field_stream(
 ) -> Result<impl RecordBatchStream + Unpin + 'static> {
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
-    scanner.with_row_id();
+    scanner.with_row_address();
     scanner.try_into_stream().await
 }
 
@@ -1445,14 +1445,14 @@ impl RemapPageTask {
             .expect("Generic index writing not supported yet");
         ivf.offsets.push(writer.tell().await?);
         ivf.lengths
-            .push(page.row_ids.as_ref().unwrap().len() as u32);
+            .push(page.row_addrs.as_ref().unwrap().len() as u32);
         let original_pq = transpose(
             page.code.as_ref().unwrap(),
             page.pq.code_dim(),
-            page.row_ids.as_ref().unwrap().len(),
+            page.row_addrs.as_ref().unwrap().len(),
         );
         PlainEncoder::write(writer, &[&original_pq]).await?;
-        PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
+        PlainEncoder::write(writer, &[page.row_addrs.as_ref().unwrap().as_ref()]).await?;
         Ok(())
     }
 }
@@ -1756,7 +1756,7 @@ async fn write_ivf_hnsw_file(
         .child(INDEX_AUXILIARY_FILE_NAME);
     let aux_writer = object_store.create(&aux_path).await?;
     let schema = Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         arrow_schema::Field::new(
             quantizer.column(),
             DataType::FixedSizeList(
@@ -1967,7 +1967,7 @@ mod tests {
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::ROW_ID;
+    use lance_core::ROW_ADDR;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
@@ -3138,7 +3138,7 @@ mod tests {
         let k = 100;
         let results = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .nearest("vector", query, k)
             .unwrap()
             .minimum_nprobes(nlist)
@@ -3151,8 +3151,8 @@ mod tests {
         assert_eq!(1, results.len());
         assert_eq!(k, results[0].num_rows());
 
-        let row_ids = results[0]
-            .column_by_name(ROW_ID)
+        let row_addrs = results[0]
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()
@@ -3169,7 +3169,7 @@ mod tests {
             .values()
             .to_vec();
 
-        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
+        let results = dists.into_iter().zip(row_addrs.into_iter()).collect_vec();
         let gt = ground_truth(&vector_array, query.values(), k, DistanceType::L2);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
@@ -3220,7 +3220,7 @@ mod tests {
         let k = 100;
         let results = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .nearest("vector", query, k)
             .unwrap()
             .minimum_nprobes(nlist)
@@ -3233,8 +3233,8 @@ mod tests {
         assert_eq!(1, results.len());
         assert_eq!(k, results[0].num_rows());
 
-        let row_ids = results[0]
-            .column_by_name(ROW_ID)
+        let row_addrs = results[0]
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()
@@ -3251,7 +3251,7 @@ mod tests {
             .values()
             .to_vec();
 
-        let results = dists.into_iter().zip(row_ids.into_iter()).collect_vec();
+        let results = dists.into_iter().zip(row_addrs.into_iter()).collect_vec();
         let gt = ground_truth(&vector_array, query.values(), k, distance_type);
 
         let results_set = results.iter().map(|r| r.1).collect::<HashSet<_>>();
@@ -3332,19 +3332,19 @@ mod tests {
             let query = &arr.slice(query_id * DIM, DIM);
             let results = dataset
                 .scan()
-                .with_row_id()
+                .with_row_address()
                 .nearest("vector", query, 1)
                 .unwrap()
                 .try_into_batch()
                 .await
                 .unwrap();
             assert_eq!(results.num_rows(), 1);
-            let row_id = results
-                .column_by_name("_rowid")
+            let row_addr = results
+                .column_by_name("_rowaddr")
                 .unwrap()
                 .as_primitive::<UInt64Type>()
                 .value(0);
-            if row_id == (query_id as u64) {
+            if row_addr == (query_id as u64) {
                 correct_times += 1;
             }
         }

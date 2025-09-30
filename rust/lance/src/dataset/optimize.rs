@@ -103,7 +103,7 @@ use lance_core::Error;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use tracing::info;
@@ -669,8 +669,9 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // Since indices are keyed by row address, compaction that rewrites fragments
+    // may change row addresses. We always capture row ids for remapping or for
+    // building deferred remap state (changed_row_addrs), regardless of stable row id mode.
     let mut scanner = dataset.scan();
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
@@ -685,17 +686,11 @@ async fn rewrite_files(
     );
     scanner
         .with_fragments(fragments.clone())
-        .scan_in_order(true);
-    let (row_ids_rx, reader) = if needs_remapping {
-        scanner.with_row_id();
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        let (data_no_row_ids, row_id_rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
-        (Some(row_id_rx), data_no_row_ids)
-    } else {
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
-        (None, data)
-    };
+        .scan_in_order(true)
+        .with_row_id();
+    let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    let (reader, row_ids_rx) =
+        make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
 
     let mut rows_read = 0;
     let schema = reader.schema();
@@ -737,49 +732,54 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let (row_id_map, changed_row_addrs) = if let Some(row_ids_rx) = row_ids_rx {
-        let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
-            message: format!("Failed to receive row ids: {}", err),
-            location: location!(),
-        })?;
-        // This code path is only when we use address style ids.
-        let row_addrs = captured_ids.row_addrs(None).into_owned();
+    let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
+        message: format!("Failed to receive row ids: {}", err),
+        location: location!(),
+    })?;
 
+    // Derive row addresses from captured row ids. In stable row id mode, this uses the RowIdIndex.
+    let row_addrs = if dataset.manifest.uses_stable_row_ids() {
+        let row_id_index_opt = crate::dataset::rowids::get_row_id_index(dataset.as_ref())
+            .await?
+            .ok_or_else(|| Error::Internal {
+                message: "RowIdIndex required for stable row id remapping".into(),
+                location: location!(),
+            })?;
+        captured_ids
+            .row_addrs(Some(row_id_index_opt.as_ref()))
+            .into_owned()
+    } else {
+        captured_ids.row_addrs(None).into_owned()
+    };
+
+    if !dataset.manifest.uses_stable_row_ids() {
         log::info!(
             "Compaction task {}: reserving fragment ids and transposing row addrs",
             task_id
         );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
+    }
 
-        if options.defer_index_remap {
+    // Maintain stable row id metadata if enabled
+    if dataset.manifest.uses_stable_row_ids() {
+        log::info!("Compaction task {}: rechunking stable row ids", task_id);
+        rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+        recalc_versions_for_rewritten_fragments(dataset.as_ref(), &mut new_fragments, &fragments)
+            .await?;
+    }
+
+    // In stable row-id mode we always record changed row addrs for building the fragment reuse index
+    // so that queries can remap pre-compaction addresses to post-compaction addresses. In legacy mode,
+    // if deferring is disabled, we compute a row-id map for immediate index remap.
+    let (row_id_map, changed_row_addrs) =
+        if dataset.manifest.uses_stable_row_ids() || options.defer_index_remap {
             let mut changed_row_addrs = Vec::with_capacity(row_addrs.serialized_size());
             row_addrs.serialize_into(&mut changed_row_addrs)?;
             (None, Some(changed_row_addrs))
         } else {
             let row_id_map = remapping::transpose_row_addrs(row_addrs, &fragments, &new_fragments);
             (Some(row_id_map), None)
-        }
-    } else {
-        log::info!("Compaction task {}: rechunking stable row ids", task_id);
-        rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-        if dataset.manifest.uses_stable_row_ids() {
-            recalc_versions_for_rewritten_fragments(
-                dataset.as_ref(),
-                &mut new_fragments,
-                &fragments,
-            )
-            .await?;
-        }
-
-        if options.defer_index_remap {
-            let no_addrs = RoaringTreemap::new();
-            let mut serialized_no_addrs = Vec::with_capacity(no_addrs.serialized_size());
-            no_addrs.serialize_into(&mut serialized_no_addrs)?;
-            (None, Some(serialized_no_addrs))
-        } else {
-            (Some(HashMap::new()), None)
-        }
-    };
+        };
 
     metrics.files_removed = task
         .fragments
@@ -988,8 +988,10 @@ pub async fn commit_compaction(
     let mut metrics = CompactionMetrics::default();
 
     let mut row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
-    let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
+
+    // Collect initial rewrite groups and, if needed, preliminary frag reuse groups (with placeholder new frag ids)
+    let mut prelim_frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
 
     for task in completed_tasks {
         metrics += task.metrics;
@@ -999,18 +1001,61 @@ pub async fn commit_compaction(
         };
         if needs_remapping {
             row_id_map.extend(task.row_id_map.unwrap());
-        } else if options.defer_index_remap {
-            frag_reuse_groups.push(FragReuseGroup {
-                changed_row_addrs: task.changed_row_addrs.unwrap(),
+        } else if options.defer_index_remap || dataset.manifest.uses_stable_row_ids() {
+            prelim_frag_reuse_groups.push(FragReuseGroup {
+                changed_row_addrs: task
+                    .changed_row_addrs
+                    .as_ref()
+                    .expect("changed_row_addrs must be present in stable row-id mode")
+                    .clone(),
                 old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
                 new_frags: task.new_fragments.iter().map(|f| f.into()).collect(),
             });
-
-            task.new_fragments.iter().for_each(|frag| {
-                new_fragment_bitmap.insert(frag.id as u32);
-            });
         }
         rewrite_groups.push(rewrite_group);
+    }
+
+    #[allow(unused_assignments)]
+    let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
+
+    // Reserve fragment ids for stable mode and update frag reuse groups and bitmap accordingly
+    if dataset.manifest.uses_stable_row_ids() && !rewrite_groups.is_empty() {
+        let unassigned = rewrite_groups
+            .iter_mut()
+            .flat_map(|group| group.new_fragments.iter_mut())
+            .filter(|frag| frag.id == 0)
+            .collect::<Vec<_>>();
+        if !unassigned.is_empty() {
+            reserve_fragment_ids(dataset, unassigned.into_iter()).await?;
+        }
+        // Now rebuild frag reuse groups with the assigned new fragment ids
+        frag_reuse_groups = prelim_frag_reuse_groups
+            .into_iter()
+            .enumerate()
+            .map(|(idx, mut grp)| {
+                grp.new_frags = rewrite_groups[idx]
+                    .new_fragments
+                    .iter()
+                    .map(|f| f.into())
+                    .collect();
+                grp
+            })
+            .collect();
+        // Recompute new fragment bitmap from updated rewrite groups
+        new_fragment_bitmap = RoaringBitmap::new();
+        for group in &rewrite_groups {
+            for frag in &group.new_fragments {
+                new_fragment_bitmap.insert(frag.id as u32);
+            }
+        }
+    } else {
+        // Legacy mode or deferred remap without stable row ids: keep prelim groups and bitmap
+        frag_reuse_groups = prelim_frag_reuse_groups;
+        for group in &rewrite_groups {
+            for frag in &group.new_fragments {
+                new_fragment_bitmap.insert(frag.id as u32);
+            }
+        }
     }
 
     let rewritten_indices = if needs_remapping {
@@ -1032,9 +1077,19 @@ pub async fn commit_compaction(
                 new_index_version: rewritten.index_version,
             })
             .collect()
-    } else if !options.defer_index_remap {
-        // We need to reserve fragment ids here so that the fragment bitmap
-        // can be updated for each index.
+    } else if dataset.manifest.uses_stable_row_ids() {
+        // Stable mode: aggregate all new fragments with placeholder ids and reserve once.
+        let unassigned = rewrite_groups
+            .iter_mut()
+            .flat_map(|group| group.new_fragments.iter_mut())
+            .filter(|frag| frag.id == 0)
+            .collect::<Vec<_>>();
+        if !unassigned.is_empty() {
+            reserve_fragment_ids(dataset, unassigned.into_iter()).await?;
+        }
+        Vec::new()
+    } else if !options.defer_index_remap && !dataset.manifest.uses_stable_row_ids() {
+        // Non-stable mode: immediate index bitmap updates require fragment ids.
         let new_fragments = rewrite_groups
             .iter_mut()
             .flat_map(|group| group.new_fragments.iter_mut())
@@ -1045,7 +1100,7 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    let frag_reuse_index = if options.defer_index_remap {
+    let frag_reuse_index = if options.defer_index_remap || dataset.manifest.uses_stable_row_ids() {
         Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
     } else {
         None
@@ -1100,6 +1155,7 @@ mod tests {
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::io::manifest::read_manifest_indexes;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
+    use roaring::RoaringTreemap;
     use rstest::rstest;
     use std::collections::HashSet;
     use std::io::Cursor;
@@ -1828,6 +1884,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
+                .filter(|index| index.name != FRAG_REUSE_INDEX_NAME)
                 .map(|index| index.uuid)
                 .collect()
         }
@@ -3075,19 +3132,19 @@ mod tests {
         scanner
             .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let count1 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
             .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let count2 = scanner.count_rows().await.unwrap();
         scanner = dataset.scan();
         scanner
             .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let count3 = scanner.count_rows().await.unwrap();
 
         // Verify that after index creation and compaction, scan uses inverted index scan
@@ -3095,7 +3152,7 @@ mod tests {
         scanner
             .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let plan = scanner.explain_plan(true).await.unwrap();
         assert!(
             plan.contains("MatchQuery"),
@@ -3125,19 +3182,19 @@ mod tests {
         scanner
             .full_text_search(FullTextSearchQuery::new(test_word1.clone()))
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         assert_eq!(scanner.count_rows().await.unwrap(), count1);
         scanner = dataset.scan();
         scanner
             .full_text_search(FullTextSearchQuery::new(test_word2.clone()))
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         assert_eq!(scanner.count_rows().await.unwrap(), count2);
         scanner = dataset.scan();
         scanner
             .full_text_search(FullTextSearchQuery::new(test_word3.clone()))
             .unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         assert_eq!(scanner.count_rows().await.unwrap(), count3);
     }
 
@@ -3384,7 +3441,7 @@ mod tests {
         // Get initial KNN search results
         let mut scanner = dataset.scan();
         scanner.nearest("vec", &query_vec1, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let results1 = scanner
             .try_into_stream()
             .await
@@ -3396,7 +3453,7 @@ mod tests {
 
         scanner = dataset.scan();
         scanner.nearest("vec", &query_vec2, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let results2 = scanner
             .try_into_stream()
             .await
@@ -3408,7 +3465,7 @@ mod tests {
 
         scanner = dataset.scan();
         scanner.nearest("vec", &query_vec3, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let results3 = scanner
             .try_into_stream()
             .await
@@ -3469,7 +3526,7 @@ mod tests {
         // Verify that KNN searches still work correctly and return the same counts
         let mut scanner = dataset.scan();
         scanner.nearest("vec", &query_vec1, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let new_results1 = scanner
             .try_into_stream()
             .await
@@ -3481,7 +3538,7 @@ mod tests {
 
         scanner = dataset.scan();
         scanner.nearest("vec", &query_vec2, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let new_results2 = scanner
             .try_into_stream()
             .await
@@ -3493,7 +3550,7 @@ mod tests {
 
         scanner = dataset.scan();
         scanner.nearest("vec", &query_vec3, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let new_results3 = scanner
             .try_into_stream()
             .await
@@ -3506,7 +3563,7 @@ mod tests {
         // Verify that after index creation and compaction, scan uses vector index scan
         let mut scanner = dataset.scan();
         scanner.nearest("vec", &query_vec1, 10).unwrap();
-        scanner.project::<String>(&[]).unwrap().with_row_id();
+        scanner.project::<String>(&[]).unwrap().with_row_address();
         let plan = scanner.explain_plan(false).await.unwrap();
         assert!(
             plan.contains("ANNSubIndex"),

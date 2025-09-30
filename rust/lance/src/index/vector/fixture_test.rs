@@ -148,7 +148,7 @@ mod test {
             self.ret_val.num_rows() as u64
         }
 
-        fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
+        fn row_addrs(&self) -> Box<dyn Iterator<Item = &u64>> {
             todo!("this method is for only IVF_HNSW_* index");
         }
 

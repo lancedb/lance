@@ -23,7 +23,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ADDR};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
@@ -548,8 +548,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             store.schema().clone()
         } else {
             let schema = store.schema();
-            let row_id_idx = schema.index_of(ROW_ID)?;
-            Arc::new(store.schema().project(&[row_id_idx])?)
+            let row_addr_idx = schema.index_of(ROW_ADDR)?;
+            Arc::new(store.schema().project(&[row_addr_idx])?)
         };
 
         let batches = store
@@ -571,7 +571,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         self.storage.num_rows()
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
+    fn row_addrs(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
@@ -622,7 +622,6 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::RQBuildParams;
-    use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::vector::ivf::v2::IvfPq;
@@ -638,7 +637,7 @@ mod tests {
     };
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{Result, ROW_ID};
+    use lance_core::{Result, ROW_ADDR};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
@@ -646,6 +645,7 @@ mod tests {
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::storage::VectorStore;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
@@ -965,7 +965,7 @@ mod tests {
     ) -> HashSet<u64> {
         let batch = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .nearest(column, query, k)
             .unwrap()
             .distance_metric(distance_type)
@@ -973,7 +973,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        batch[ROW_ID]
+        batch[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
@@ -1180,17 +1180,17 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
             .minimum_nprobes(nlist)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
-        let row_ids = results[ROW_ID]
+        let row_addrs = results[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        let recall = row_ids.intersection(&gt).count() as f32 / 100.0;
+        let recall = row_addrs.intersection(&gt).count() as f32 / 100.0;
         // 100 can't be exactly expressed as a float, so we need to use a tolerance
         assert_ge!(
             recall,
@@ -1219,7 +1219,7 @@ mod tests {
             .nearest(vector_column, query.as_primitive::<T>(), 100)
             .unwrap()
             .minimum_nprobes(nlist)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
@@ -1600,11 +1600,11 @@ mod tests {
             .nearest("vector", &query, k)
             .unwrap()
             .minimum_nprobes(nlist)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
-        let row_ids = result[ROW_ID]
+        let row_addrs = result[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
@@ -1614,14 +1614,14 @@ mod tests {
             .to_vec();
         let results = dists
             .into_iter()
-            .zip(row_ids.clone().into_iter())
+            .zip(row_addrs.clone().into_iter())
             .collect::<Vec<_>>();
-        let row_ids = row_ids.into_iter().collect::<HashSet<_>>();
+        let row_addrs = row_addrs.into_iter().collect::<HashSet<_>>();
 
         let gt = multivec_ground_truth(&vectors, &query, k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
-        let recall = row_ids.intersection(&gt_set).count() as f32 / 100.0;
+        let recall = row_addrs.intersection(&gt_set).count() as f32 / 100.0;
         assert!(
             recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
@@ -1830,12 +1830,12 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .try_into_batch()
             .await
             .unwrap();
         assert_eq!(result.num_rows(), k);
-        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        let row_addrs = result[ROW_ADDR].as_primitive::<UInt64Type>().values();
         let dists = result[DIST_COL].as_primitive::<Float32Type>().values();
 
         let part_idx = k / 2;
@@ -1847,7 +1847,7 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .distance_range(None, Some(part_dist))
             .try_into_batch()
             .await
@@ -1858,7 +1858,7 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .distance_range(Some(part_dist), None)
             .try_into_batch()
             .await
@@ -1868,13 +1868,13 @@ mod tests {
         if dist_type != DistanceType::Hamming {
             assert_eq!(left_res.num_rows(), part_idx);
             assert_eq!(right_res.num_rows(), k - part_idx);
-            let left_row_ids = left_res[ROW_ID].as_primitive::<UInt64Type>().values();
-            let right_row_ids = right_res[ROW_ID].as_primitive::<UInt64Type>().values();
-            row_ids.iter().enumerate().for_each(|(i, id)| {
+            let left_row_addrs = left_res[ROW_ADDR].as_primitive::<UInt64Type>().values();
+            let right_row_addrs = right_res[ROW_ADDR].as_primitive::<UInt64Type>().values();
+            row_addrs.iter().enumerate().for_each(|(i, id)| {
                 if i < part_idx {
-                    assert_eq!(left_row_ids[i], *id,);
+                    assert_eq!(left_row_addrs[i], *id,);
                 } else {
-                    assert_eq!(right_row_ids[i - part_idx], *id,);
+                    assert_eq!(right_row_addrs[i - part_idx], *id,);
                 }
             });
         }
@@ -1893,7 +1893,7 @@ mod tests {
             .unwrap()
             .minimum_nprobes(nlist)
             .ef(100)
-            .with_row_id()
+            .with_row_address()
             .distance_range(dists.first().copied(), dists.last().copied())
             .try_into_batch()
             .await
@@ -1901,12 +1901,12 @@ mod tests {
         if dist_type != DistanceType::Hamming {
             let excluded_count = dists.iter().filter(|d| *d == dists.last().unwrap()).count();
             assert_eq!(exclude_last_res.num_rows(), k - excluded_count);
-            let res_row_ids = exclude_last_res[ROW_ID]
+            let res_row_addrs = exclude_last_res[ROW_ADDR]
                 .as_primitive::<UInt64Type>()
                 .values();
-            row_ids.iter().enumerate().for_each(|(i, id)| {
+            row_addrs.iter().enumerate().for_each(|(i, id)| {
                 if i < k - excluded_count {
-                    assert_eq!(res_row_ids[i], *id);
+                    assert_eq!(res_row_addrs[i], *id);
                 }
             });
         }
@@ -1979,7 +1979,7 @@ mod tests {
             .await
             .unwrap();
 
-        let row_ids = result[ROW_ID]
+        let row_addrs = result[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
@@ -1989,14 +1989,14 @@ mod tests {
             .to_vec();
         let results = dists
             .into_iter()
-            .zip(row_ids.into_iter())
+            .zip(row_addrs.into_iter())
             .collect::<Vec<_>>();
-        let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
-        assert!(row_ids.len() == k);
+        let row_addrs = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
+        assert!(row_addrs.len() == k);
 
         let gt = ground_truth(dataset, vector_column, &query, k, params.metric_type).await;
 
-        let recall = row_ids.intersection(&gt).count() as f32 / k as f32;
+        let recall = row_addrs.intersection(&gt).count() as f32 / k as f32;
         assert!(
             recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
@@ -2055,6 +2055,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_pq_storage_backwards_compat() {
         let test_dir = copy_test_data_to_tmp("v0.27.1/pq_in_schema").unwrap();

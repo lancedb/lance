@@ -7,7 +7,6 @@ use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
 use super::IVFIndex;
-use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use arrow::compute::concat;
 use arrow_array::UInt64Array;
@@ -21,7 +20,7 @@ use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::Error;
+use lance_core::{Error, ROW_ADDR};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -52,14 +51,14 @@ use crate::Result;
 static HNSW_PARTITIONS_BUILD_PARALLEL: LazyLock<usize> =
     LazyLock::new(get_num_compute_intensive_cpus);
 
-/// Merge streams with the same partition id and collect PQ codes and row IDs.
+/// Merge streams with the same partition id and collect PQ codes and row addrs.
 async fn merge_streams(
     streams_heap: &mut BinaryHeap<(Reverse<u32>, usize)>,
     new_streams: &mut [Pin<Box<Peekable<impl Stream<Item = Result<RecordBatch>>>>>],
     part_id: u32,
     code_column: Option<&str>,
     code_array: &mut Vec<Arc<dyn Array>>,
-    row_id_array: &mut Vec<Arc<dyn Array>>,
+    row_addr_array: &mut Vec<Arc<dyn Array>>,
 ) -> Result<()> {
     while let Some((Reverse(stream_part_id), stream_idx)) = streams_heap.pop() {
         if stream_part_id != part_id {
@@ -84,14 +83,14 @@ async fn merge_streams(
             }
         };
 
-        let row_ids: Arc<dyn Array> = Arc::new(
+        let row_addrs: Arc<dyn Array> = Arc::new(
             batch
-                .column_by_name(ROW_ID)
-                .expect("row id column not found")
+                .column_by_name(ROW_ADDR)
+                .expect("row addr column not found")
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );
-        row_id_array.push(row_ids);
+        row_addr_array.push(row_addrs);
 
         if let Some(column) = code_column {
             let codes = Arc::new(
@@ -185,7 +184,7 @@ pub(super) async fn write_pq_partitions(
     for part_id in 0..ivf.num_partitions() as u32 {
         let start = Instant::now();
         let mut pq_array: Vec<Arc<dyn Array>> = vec![];
-        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+        let mut row_addr_array: Vec<Arc<dyn Array>> = vec![];
 
         if let Some(&previous_indices) = existing_indices.as_ref() {
             for &idx in previous_indices.iter() {
@@ -214,7 +213,7 @@ pub(super) async fn write_pq_partitions(
                         .unwrap(),
                     );
                     pq_array.push(fsl);
-                    row_id_array.push(pq_index.row_ids.as_ref().unwrap().clone());
+                    row_addr_array.push(pq_index.row_addrs.as_ref().unwrap().clone());
                 }
             }
         }
@@ -226,17 +225,20 @@ pub(super) async fn write_pq_partitions(
             part_id,
             Some(PQ_CODE_COLUMN),
             &mut pq_array,
-            &mut row_id_array,
+            &mut row_addr_array,
         )
         .await?;
 
-        let total_records = row_id_array.iter().map(|a| a.len()).sum::<usize>();
+        let total_records = row_addr_array.iter().map(|a| a.len()).sum::<usize>();
         ivf.add_partition_with_offset(writer.tell().await?, total_records as u32);
         if total_records > 0 {
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
             PlainEncoder::write(writer, &pq_refs).await?;
 
-            let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            let row_ids_refs = row_addr_array
+                .iter()
+                .map(|a| a.as_ref())
+                .collect::<Vec<_>>();
             PlainEncoder::write(writer, row_ids_refs.as_slice()).await?;
         }
         log::info!(
@@ -306,7 +308,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
 
         let mut code_array: Vec<Arc<dyn Array>> = vec![];
-        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+        let mut row_addr_array: Vec<Arc<dyn Array>> = vec![];
 
         // We don't transform vectors to SQ codes while shuffling,
         // so we won't merge SQ codes from the stream.
@@ -316,8 +318,10 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 let sub_index = idx
                     .load_partition(part_id, true, &NoOpMetricsCollector)
                     .await?;
-                let row_ids = Arc::new(UInt64Array::from_iter_values(sub_index.row_ids().cloned()));
-                row_id_array.push(row_ids);
+                let row_addrs = Arc::new(UInt64Array::from_iter_values(
+                    sub_index.row_addrs().cloned(),
+                ));
+                row_addr_array.push(row_addrs);
             }
         }
 
@@ -331,11 +335,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             part_id as u32,
             code_column,
             &mut code_array,
-            &mut row_id_array,
+            &mut row_addr_array,
         )
         .await?;
 
-        if row_id_array.is_empty() {
+        if row_addr_array.is_empty() {
             tasks.push(tokio::spawn(async { Ok(0) }));
             continue;
         }
@@ -379,7 +383,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 part_writer,
                 aux_part_writer,
                 quantizer,
-                row_id_array,
+                row_addr_array,
                 code_array,
             )
             .await;

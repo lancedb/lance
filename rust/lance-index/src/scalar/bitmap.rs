@@ -22,7 +22,7 @@ use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::mask::RowIdTreeMap,
-    Error, Result, ROW_ID,
+    Error, Result, ROW_ADDR,
 };
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -221,7 +221,7 @@ impl BitmapIndex {
 
             // Apply fragment remapping if needed
             if let Some(fri) = &frag_reuse_index {
-                bitmap = fri.remap_row_ids_tree_map(&bitmap);
+                bitmap = fri.remap_row_addrs_tree_map(&bitmap);
             }
 
             null_map = Arc::new(bitmap);
@@ -281,7 +281,7 @@ impl BitmapIndex {
         let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
         if let Some(fri) = &self.frag_reuse_index {
-            bitmap = fri.remap_row_ids_tree_map(&bitmap);
+            bitmap = fri.remap_row_addrs_tree_map(&bitmap);
         }
 
         self.index_cache
@@ -361,7 +361,7 @@ impl Index for BitmapIndex {
                 let mut bitmap = RowIdTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
                 if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-                    bitmap = frag_reuse_index_ref.remap_row_ids_tree_map(&bitmap);
+                    bitmap = frag_reuse_index_ref.remap_row_addrs_tree_map(&bitmap);
                 }
 
                 let cache_key = BitmapKey { value: key };
@@ -509,7 +509,7 @@ impl ScalarIndex for BitmapIndex {
         for key in self.index_map.keys() {
             let bitmap = self.load_bitmap(key, None).await?;
             let remapped_bitmap =
-                RowIdTreeMap::from_iter(bitmap.row_ids().unwrap().filter_map(|addr| {
+                RowIdTreeMap::from_iter(bitmap.row_addrs().unwrap().filter_map(|addr| {
                     let addr_as_u64 = u64::from(addr);
                     mapping
                         .get(&addr_as_u64)
@@ -521,7 +521,7 @@ impl ScalarIndex for BitmapIndex {
 
         if !self.null_map.is_empty() {
             let remapped_null =
-                RowIdTreeMap::from_iter(self.null_map.row_ids().unwrap().filter_map(|addr| {
+                RowIdTreeMap::from_iter(self.null_map.row_addrs().unwrap().filter_map(|addr| {
                     let addr_as_u64 = u64::from(addr);
                     mapping
                         .get(&addr_as_u64)
@@ -570,7 +570,7 @@ impl ScalarIndex for BitmapIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -667,15 +667,15 @@ impl BitmapIndexPlugin {
         let value_type = data_source.schema().field(0).data_type().clone();
         while let Some(batch) = data_source.try_next().await? {
             let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-            let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
-            debug_assert_eq!(row_ids.data_type(), &DataType::UInt64);
+            let row_addrs = batch.column_by_name(ROW_ADDR).expect_ok()?;
+            debug_assert_eq!(row_addrs.data_type(), &DataType::UInt64);
 
-            let row_id_column = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let row_addr_column = row_addrs.as_any().downcast_ref::<UInt64Array>().unwrap();
 
             for i in 0..values.len() {
-                let row_id = row_id_column.value(i);
+                let row_addr = row_addr_column.value(i);
                 let key = ScalarValue::try_from_array(values.as_ref(), i)?;
-                state.entry(key.clone()).or_default().insert(row_id);
+                state.entry(key.clone()).or_default().insert(row_addr);
             }
         }
 
@@ -707,7 +707,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             });
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
 
@@ -793,7 +793,7 @@ pub mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -830,8 +830,12 @@ pub mod tests {
 
         // Verify results
         let expected_red_rows = vec![0u64, 3, 6, 10, 11];
-        if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+        if let SearchResult::Exact(row_addrs) = result {
+            let mut actual: Vec<u64> = row_addrs
+                .row_addrs()
+                .unwrap()
+                .map(|addr| addr.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_red_rows);
         } else {
@@ -840,8 +844,12 @@ pub mod tests {
 
         // Test 2: Search for "red" again - should hit cache
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+        if let SearchResult::Exact(row_addrs) = result {
+            let mut actual: Vec<u64> = row_addrs
+                .row_addrs()
+                .unwrap()
+                .map(|addr| addr.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_red_rows);
         }
@@ -854,8 +862,12 @@ pub mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         let expected_range_rows = vec![1u64, 2, 5, 7, 8, 12, 13];
-        if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+        if let SearchResult::Exact(row_addrs) = result {
+            let mut actual: Vec<u64> = row_addrs
+                .row_addrs()
+                .unwrap()
+                .map(|addr| addr.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_range_rows);
         }
@@ -868,8 +880,12 @@ pub mod tests {
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
         let expected_in_rows = vec![0u64, 3, 4, 6, 9, 10, 11, 14];
-        if let SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(|id| id.into()).collect();
+        if let SearchResult::Exact(row_addrs) = result {
+            let mut actual: Vec<u64> = row_addrs
+                .row_addrs()
+                .unwrap()
+                .map(|addr| addr.into())
+                .collect();
             actual.sort();
             assert_eq!(actual, expected_in_rows);
         }
@@ -968,11 +984,11 @@ pub mod tests {
                 .unwrap_or_else(|_| panic!("Key {} should exist", key_val));
 
             // Convert RowIdTreeMap to a vector for easier assertion
-            let row_ids: Vec<u64> = bitmap.row_ids().unwrap().map(u64::from).collect();
+            let row_addrs: Vec<u64> = bitmap.row_addrs().unwrap().map(u64::from).collect();
 
             // Verify length
             assert_eq!(
-                row_ids.len(),
+                row_addrs.len(),
                 per_bitmap_size as usize,
                 "Bitmap for key {} has wrong size",
                 key_val
@@ -981,7 +997,7 @@ pub mod tests {
             // Verify first few and last few elements
             for i in 0..5.min(per_bitmap_size) {
                 assert!(
-                    row_ids.contains(&i),
+                    row_addrs.contains(&i),
                     "Bitmap for key {} should contain row_id {}",
                     key_val,
                     i
@@ -990,7 +1006,7 @@ pub mod tests {
 
             for i in (per_bitmap_size - 5)..per_bitmap_size {
                 assert!(
-                    row_ids.contains(&i),
+                    row_addrs.contains(&i),
                     "Bitmap for key {} should contain row_id {}",
                     key_val,
                     i
@@ -1000,7 +1016,7 @@ pub mod tests {
             // Verify exact range
             let expected_range: Vec<u64> = (0..per_bitmap_size).collect();
             assert_eq!(
-                row_ids, expected_range,
+                row_addrs, expected_range,
                 "Bitmap for key {} doesn't contain expected values",
                 key_val
             );
@@ -1008,7 +1024,7 @@ pub mod tests {
             tracing::info!(
                 "✓ Verified bitmap for key {}: {} rows as expected",
                 key_val,
-                row_ids.len()
+                row_addrs.len()
             );
         }
 
@@ -1035,7 +1051,7 @@ pub mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -1098,7 +1114,7 @@ pub mod tests {
             .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .unwrap();
-        let red_rows: Vec<u64> = cached_red.row_ids().unwrap().map(u64::from).collect();
+        let red_rows: Vec<u64> = cached_red.row_addrs().unwrap().map(u64::from).collect();
         assert_eq!(red_rows, vec![0, 3, 6, 10, 11]);
 
         // Call prewarm again - should be idempotent
@@ -1109,7 +1125,7 @@ pub mod tests {
             .get_with_key::<BitmapKey>(&cache_key_red)
             .await
             .unwrap();
-        let red_rows_2: Vec<u64> = cached_red_2.row_ids().unwrap().map(u64::from).collect();
+        let red_rows_2: Vec<u64> = cached_red_2.row_addrs().unwrap().map(u64::from).collect();
         assert_eq!(red_rows_2, vec![0, 3, 6, 10, 11]);
     }
 
@@ -1150,7 +1166,7 @@ pub mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::UInt32, true),
-            Field::new("_rowid", DataType::UInt64, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -1224,7 +1240,7 @@ pub mod tests {
         ];
         let actual_null_addrs: Vec<u64> = reloaded_idx
             .null_map
-            .row_ids()
+            .row_addrs()
             .unwrap()
             .map(u64::from)
             .collect();
@@ -1239,8 +1255,8 @@ pub mod tests {
             .search(&query, &NoOpMetricsCollector)
             .await
             .unwrap();
-        if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+        if let crate::scalar::SearchResult::Exact(row_addrs) = result {
+            let mut actual: Vec<u64> = row_addrs.row_addrs().unwrap().map(u64::from).collect();
             actual.sort();
             let expected: Vec<u64> = vec![
                 RowAddress::new_from_parts(3, 2).into(),
@@ -1255,8 +1271,8 @@ pub mod tests {
             .search(&query, &NoOpMetricsCollector)
             .await
             .unwrap();
-        if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+        if let crate::scalar::SearchResult::Exact(row_addrs) = result {
+            let mut actual: Vec<u64> = row_addrs.row_addrs().unwrap().map(u64::from).collect();
             actual.sort();
             let expected: Vec<u64> = vec![
                 RowAddress::new_from_parts(3, 4).into(),
@@ -1271,8 +1287,8 @@ pub mod tests {
             .search(&query, &NoOpMetricsCollector)
             .await
             .unwrap();
-        if let crate::scalar::SearchResult::Exact(row_ids) = result {
-            let mut actual: Vec<u64> = row_ids.row_ids().unwrap().map(u64::from).collect();
+        if let crate::scalar::SearchResult::Exact(row_addrs) = result {
+            let mut actual: Vec<u64> = row_addrs.row_addrs().unwrap().map(u64::from).collect();
             actual.sort();
             assert_eq!(
                 actual, expected_null_addrs,

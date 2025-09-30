@@ -202,40 +202,40 @@ impl FragReuseIndexDetails {
     }
 }
 
-/// An index that stores row ID maps.
-/// A row ID map describes the mapping from old row address to new address after compactions.
+/// An index that stores row addr maps.
+/// A row addr map describes the mapping from old row address to new address after compactions.
 /// Each version contains the mapping for one round of compaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragReuseIndex {
     pub uuid: Uuid,
-    pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+    pub row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
     pub details: FragReuseIndexDetails,
 }
 
 impl DeepSizeOf for FragReuseIndex {
     fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-        self.row_id_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+        self.row_addr_maps.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
     }
 }
 
 impl FragReuseIndex {
     pub fn new(
         uuid: Uuid,
-        row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+        row_addr_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
         Self {
             uuid,
-            row_id_maps,
+            row_addr_maps,
             details,
         }
     }
 
-    pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        let mut mapped_value = Some(row_id);
-        for row_id_map in self.row_id_maps.iter() {
+    pub fn remap_row_addr(&self, row_addr: u64) -> Option<u64> {
+        let mut mapped_value = Some(row_addr);
+        for row_addr_map in self.row_addr_maps.iter() {
             if mapped_value.is_some() {
-                mapped_value = row_id_map
+                mapped_value = row_addr_map
                     .get(&mapped_value.unwrap())
                     .copied()
                     .unwrap_or(mapped_value);
@@ -245,37 +245,41 @@ impl FragReuseIndex {
         mapped_value
     }
 
-    pub fn remap_row_ids_tree_map(&self, row_ids: &RowIdTreeMap) -> RowIdTreeMap {
-        RowIdTreeMap::from_iter(row_ids.row_ids().unwrap().filter_map(|addr| {
+    pub fn remap_row_addrs_tree_map(&self, row_addrs: &RowIdTreeMap) -> RowIdTreeMap {
+        RowIdTreeMap::from_iter(row_addrs.row_addrs().unwrap().filter_map(|addr| {
             let addr_as_u64 = u64::from(addr);
-            self.remap_row_id(addr_as_u64)
+            self.remap_row_addr(addr_as_u64)
         }))
     }
 
-    pub fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
-        RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
+    pub fn remap_row_addrs_roaring_tree_map(&self, row_addrs: &RoaringTreemap) -> RoaringTreemap {
+        RoaringTreemap::from_iter(
+            row_addrs
+                .iter()
+                .filter_map(|addr| self.remap_row_addr(addr)),
+        )
     }
 
-    /// Remap a record batch that contains a row_id column at index [`row_id_idx`]
+    /// Remap a record batch that contains a row_addr column at index [`row_addr_idx`]
     /// Currently this assumes there are only 2 columns in the schema,
     /// which is the case for all indexes.
-    /// For example, for btree, the schema is (value, row_id).
-    /// For vector index storage, the schema is (row_id, vector).
-    pub fn remap_row_ids_record_batch(
+    /// For example, for btree, the schema is (value, row_addr).
+    /// For vector index storage, the schema is (row_addr, vector).
+    pub fn remap_row_addrs_record_batch(
         &self,
         batch: RecordBatch,
-        row_id_idx: usize,
+        row_addr_idx: usize,
     ) -> Result<RecordBatch> {
         assert_eq!(batch.schema().fields().len(), 2);
-        let other_column_idx = 1 - row_id_idx;
-        let row_ids = batch.column(row_id_idx).as_primitive::<UInt64Type>();
-        let (val_indices, new_row_ids): (Vec<u64>, Vec<u64>) = row_ids
+        let other_column_idx = 1 - row_addr_idx;
+        let row_addrs = batch.column(row_addr_idx).as_primitive::<UInt64Type>();
+        let (val_indices, new_row_addrs): (Vec<u64>, Vec<u64>) = row_addrs
             .values()
             .iter()
             .enumerate()
-            .filter_map(|(idx, old_id)| {
-                self.remap_row_id(*old_id)
-                    .map(|new_id| (idx as u64, new_id))
+            .filter_map(|(idx, old_addr)| {
+                self.remap_row_addr(*old_addr)
+                    .map(|new_addr| (idx as u64, new_addr))
             })
             .unzip();
         let new_val_indices = UInt64Array::from_iter_values(val_indices);
@@ -284,8 +288,8 @@ impl FragReuseIndex {
 
         let mut batch_data: Vec<(usize, ArrayRef)> = vec![
             (
-                row_id_idx,
-                Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
+                row_addr_idx,
+                Arc::new(UInt64Array::from_iter_values(new_row_addrs)) as ArrayRef,
             ),
             (other_column_idx, Arc::new(new_vals)),
         ];
@@ -296,17 +300,17 @@ impl FragReuseIndex {
         )?)
     }
 
-    pub fn remap_row_ids_array(&self, array: ArrayRef) -> PrimitiveArray<UInt64Type> {
+    pub fn remap_row_addrs_array(&self, array: ArrayRef) -> PrimitiveArray<UInt64Type> {
         let primitive_array = array
             .as_any()
             .downcast_ref::<PrimitiveArray<UInt64Type>>()
-            .expect("expected row IDs to be uint64 array");
+            .expect("expected row addrs to be uint64 array");
         (0..primitive_array.len())
             .map(|i| {
                 if primitive_array.is_null(i) {
                     None
                 } else {
-                    self.remap_row_id(primitive_array.value(i))
+                    self.remap_row_addr(primitive_array.value(i))
                 }
             })
             .collect()

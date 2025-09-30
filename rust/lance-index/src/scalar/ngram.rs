@@ -38,8 +38,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{utils::mask::RowIdTreeMap, Error};
-use lance_core::{Result, ROW_ID};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result, ROW_ADDR};
 use lance_io::object_store::ObjectStore;
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -185,7 +184,7 @@ impl NGramPostingList {
                 location: location!(),
             })?;
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
+            bitmap = frag_reuse_index_ref.remap_row_addrs_roaring_tree_map(&bitmap);
         }
         Ok(Self { bitmap })
     }
@@ -538,7 +537,7 @@ impl ScalarIndex for NGramIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -744,8 +743,8 @@ impl NGramIndexBuilder {
                 location: location!(),
             });
         }
-        let row_id_field = schema.field_with_name(ROW_ID)?;
-        if *row_id_field.data_type() != DataType::UInt64 {
+        let row_addr_field = schema.field_with_name(ROW_ADDR)?;
+        if *row_addr_field.data_type() != DataType::UInt64 {
             return Err(Error::InvalidInput {
                 source: "Second field in ngram index schema must be of type UInt64".into(),
                 location: location!(),
@@ -844,22 +843,22 @@ impl NGramIndexBuilder {
         num_workers: usize,
     ) -> Result<Vec<Vec<(u32, u64)>>> {
         let text_iter = iter_str_array(batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?);
-        let row_id_col = batch
-            .column_by_name(ROW_ID)
+        let row_addr_col = batch
+            .column_by_name(ROW_ADDR)
             .expect_ok()?
             .as_primitive::<UInt64Type>();
         // Guessing 1000 tokens per row to at least avoid some of the earlier allocations
         let mut partitions = vec![Vec::with_capacity(batch.num_rows() * 1000); num_workers];
         let divisor = (MAX_TOKEN - MIN_TOKEN) / num_workers;
-        for (text, row_id) in text_iter.zip(row_id_col.values()) {
+        for (text, row_addr) in text_iter.zip(row_addr_col.values()) {
             if let Some(text) = text {
                 tokenize_visitor(tokenizer, text, |token| {
                     let token = ngram_to_token(token, NGRAM_N);
                     let partition_id = (token as usize).saturating_sub(MIN_TOKEN) / divisor;
-                    partitions[partition_id % num_workers].push((token, *row_id));
+                    partitions[partition_id % num_workers].push((token, *row_addr));
                 });
             } else {
-                partitions[0].push((0, *row_id));
+                partitions[0].push((0, *row_addr));
             }
         }
         Ok(partitions)
@@ -1266,7 +1265,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             });
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
 
@@ -1338,7 +1337,7 @@ mod tests {
     use lance_core::{
         cache::LanceCache,
         utils::{mask::RowIdTreeMap, tempfile::TempDir},
-        ROW_ID,
+        ROW_ADDR,
     };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
@@ -1460,7 +1459,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1546,7 +1545,7 @@ mod tests {
     fn test_data_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]))
     }
 
@@ -1676,7 +1675,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64 + 100));
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1720,7 +1719,7 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 lance_datagen::array::rand_utf8(ByteCount::from(50), false),
             )
-            .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
+            .col(ROW_ADDR, lance_datagen::array::step::<UInt64Type>())
             .into_reader_stream(RowCount::from(128), BatchCount::from(32));
 
         let data = Box::pin(RecordBatchStreamAdapter::new(

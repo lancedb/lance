@@ -29,7 +29,7 @@ use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
+use lance_core::{datatypes::Schema, Error, Result, ROW_ADDR};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
@@ -282,16 +282,16 @@ pub async fn shuffle_dataset(
                     let mut batch = b?;
 
                     if !partition_map.is_empty() {
-                        let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
+                        let row_addrs = batch.column_by_name(ROW_ADDR).ok_or(Error::Index {
                             message: "column does not exist".to_string(),
                             location: location!(),
                         })?;
                         let part_ids = UInt32Array::from_iter(
-                            row_ids
+                            row_addrs
                                 .as_primitive::<UInt64Type>()
                                 .values()
                                 .iter()
-                                .map(|row_id| partition_map.get(row_id).copied()),
+                                .map(|row_addr| partition_map.get(row_addr).copied()),
                         );
                         let part_ids = UInt32Array::from(part_ids);
                         batch = batch
@@ -459,10 +459,11 @@ impl IvfShuffler {
         };
 
         // validate the schema,
-        // we need to have row ID and partition ID column
-        schema
-            .column_with_name(ROW_ID)
-            .ok_or(Error::io("row ID column not found".to_owned(), location!()))?;
+        // we need to have row addr and partition ID column
+        schema.column_with_name(ROW_ADDR).ok_or(Error::io(
+            "row ADDR column not found".to_owned(),
+            location!(),
+        ))?;
         schema.column_with_name(PART_ID_COLUMN).ok_or(Error::io(
             "partition ID column not found".to_owned(),
             location!(),
@@ -678,8 +679,8 @@ impl IvfShuffler {
                     continue;
                 }
 
-                if let Some((row_id_idx, _)) = batch.schema().column_with_name("row_id") {
-                    batch = batch.rename_column(row_id_idx, ROW_ID)?;
+                if let Some((row_addr_idx, _)) = batch.schema().column_with_name("row_addr") {
+                    batch = batch.rename_column(row_addr_idx, ROW_ADDR)?;
                 }
 
                 let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
@@ -869,7 +870,7 @@ mod test {
     };
     use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::ROW_ID_FIELD;
+    use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
     use lance_io::stream::RecordBatchStreamAdapter;
     use rand::RngCore;
 
@@ -879,7 +880,7 @@ mod test {
 
     fn make_schema(pq_dim: u32) -> Arc<arrow_schema::Schema> {
         Arc::new(arrow_schema::Schema::new(vec![
-            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
             arrow_schema::Field::new(PART_ID_COLUMN, DataType::UInt32, true),
             arrow_schema::Field::new(
                 PQ_CODE_COLUMN,
@@ -947,8 +948,8 @@ mod test {
     }
 
     fn check_batch(batch: RecordBatch, idx: usize, num_rows: usize) {
-        let row_ids = batch
-            .column_by_name(ROW_ID)
+        let row_addrs = batch
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_primitive::<UInt64Type>();
         let part_ids = batch
@@ -962,7 +963,7 @@ mod test {
             .values()
             .as_primitive::<UInt8Type>();
 
-        assert_eq!(row_ids.len(), num_rows);
+        assert_eq!(row_addrs.len(), num_rows);
         assert_eq!(part_ids.len(), num_rows);
         assert_eq!(pq_codes.len(), num_rows * 32);
 

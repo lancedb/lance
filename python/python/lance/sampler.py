@@ -274,6 +274,7 @@ class Sampler(ABC):
         filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         **kwargs,
     ) -> Generator[pa.RecordBatch, None, None]:
         """A generator to yield `pyarrow.RecordBatch` from the dataset."""
@@ -296,6 +297,7 @@ class FragmentSampler(Sampler):
         filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         **kwargs,
     ) -> Generator[pa.RecordBatch, None, None]:
         fragments = self.iter_fragments(dataset, *args, **kwargs)
@@ -304,6 +306,7 @@ class FragmentSampler(Sampler):
             columns=columns,
             filter=filter,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             batch_readahead=batch_readahead,
             fragments=list(fragments),
         )
@@ -563,12 +566,17 @@ class ShardedBatchSampler(Sampler):
         filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
         **kwargs,
     ) -> Generator[pa.RecordBatch, None, None]:
         if filter is None:
             if with_row_id is not None:
                 warnings.warn(
                     "with_row_id is not supported for ShardedBatchSampler",
+                )
+            if with_row_address is not None:
+                warnings.warn(
+                    "with_row_address is not supported for ShardedBatchSampler",
                 )
             return self._sample_all(dataset, batch_size, columns, batch_readahead)
         else:
