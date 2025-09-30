@@ -120,6 +120,7 @@ async fn do_commit_new_dataset(
         ref_name,
         ref_version,
         ref_path,
+        branch_name,
         ..
     } = &transaction.operation
     {
@@ -148,6 +149,7 @@ async fn do_commit_new_dataset(
             ref_name.clone(),
             ref_path.clone(),
             new_base_id,
+            branch_name.clone(),
             transaction_file,
         );
 

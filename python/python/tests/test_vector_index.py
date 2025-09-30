@@ -609,6 +609,30 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
     assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
 
 
+def test_index_size_stats(tmp_path: Path):
+    num_rows = 512
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(num_rows * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    index_name = "vec_idx"
+    dataset.create_index(
+        "a", "IVF_PQ", name=index_name, num_partitions=2, num_sub_vectors=1
+    )
+
+    # Expect to see non-zero sizes here but all sizes are zero
+    stats = dataset.stats.index_stats(index_name)
+    stats = stats["indices"][0]
+    assert stats["partitions"][0]["size"] + stats["partitions"][1]["size"] == num_rows
+
+
 def test_ivf_flat_over_binary_vector(tmp_path):
     dim = 128
     nvec = 1000
