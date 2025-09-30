@@ -185,7 +185,7 @@ impl NGramPostingList {
                 location: location!(),
             })?;
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
+            bitmap = frag_reuse_index_ref.remap_row_addrs_roaring_tree_map(&bitmap);
         }
         Ok(Self { bitmap })
     }

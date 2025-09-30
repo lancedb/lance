@@ -2171,7 +2171,7 @@ impl DocSet {
                 .iter()
                 .filter_map(|id| {
                     if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
+                        frag_reuse_index_ref.remap_row_addr(*id)
                     } else {
                         Some(*id)
                     }
@@ -2192,16 +2192,16 @@ impl DocSet {
         // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
         // remapped, we'll need resort to make sure binary_search works.
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            let mut row_ids = Vec::with_capacity(row_id_col.len());
+            let mut row_addrs = Vec::with_capacity(row_id_col.len());
             let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
-            for (row_id, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
-                if let Some(new_row_id) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    row_ids.push(new_row_id);
+            for (row_addr, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
+                if let Some(new_row_addr) = frag_reuse_index_ref.remap_row_addr(*row_addr) {
+                    row_addrs.push(new_row_addr);
                     num_tokens.push(*num_token);
                 }
             }
 
-            let mut inv: Vec<(u64, u32)> = row_ids
+            let mut inv: Vec<(u64, u32)> = row_addrs
                 .iter()
                 .enumerate()
                 .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
@@ -2210,7 +2210,7 @@ impl DocSet {
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
             return Ok(Self {
-                row_ids,
+                row_ids: row_addrs,
                 num_tokens,
                 inv,
                 total_tokens,

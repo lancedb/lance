@@ -820,7 +820,7 @@ impl BTreeIndex {
             .await?;
         if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
             serialized_page =
-                frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+                frag_reuse_index_ref.remap_row_addrs_record_batch(serialized_page, 1)?;
         }
         let result = self.sub_index.load_subindex(serialized_page).await?;
         Ok(result)
