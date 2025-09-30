@@ -31,6 +31,7 @@ from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
+from lance.file import stable_version
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
 
@@ -936,10 +937,8 @@ def test_analyze_scan(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     dataset = lance.write_dataset(table, tmp_path)
     plan = dataset.scanner().analyze_plan()
-    # The bytes_read part might get brittle if we change file versions a lot
-    # future us are free to ignore that part.
     assert re.search(
-        r"^\s*LanceRead:.*bytes_read=3643.*iops=3.*requests=3.*$", plan, re.MULTILINE
+        r"^\s*LanceRead:.*bytes_read=\d+.*iops=\d+.*requests=\d+.*$", plan, re.MULTILINE
     )
 
 
@@ -949,7 +948,7 @@ def test_analyze_take(tmp_path: Path):
     dataset.create_scalar_index("a", "BTREE")
     plan = dataset.scanner(filter="a = 50").analyze_plan()
     assert re.search(
-        r"^\s*LanceRead:.*bytes_read=16.*iops=2.*requests=2.*$", plan, re.MULTILINE
+        r"^\s*LanceRead:.*bytes_read=\d+.*iops=\d+.*requests=\d+.*$", plan, re.MULTILINE
     )
 
 
@@ -3508,7 +3507,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
     assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
-    assert dataset.data_storage_version == "2.0"
+    assert dataset.data_storage_version == stable_version()
 
     # Append will write v2 if dataset was originally created with v2
     dataset = lance.write_dataset(table, tmp_path, mode="append")
@@ -3650,9 +3649,9 @@ def test_use_scalar_index(tmp_path: Path):
     ).explain_plan(True)
 
 
-EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
-EXPECTED_MAJOR_VERSION = 2
-EXPECTED_MINOR_VERSION = 0
+EXPECTED_DEFAULT_STORAGE_VERSION = stable_version()
+EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
+EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
 
 
 def test_stats(tmp_path: Path):
@@ -3667,9 +3666,9 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk == 32
+    assert data_stats.fields[0].bytes_on_disk == 42
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[1].bytes_on_disk == 42
 
     dataset.add_columns({"z": "y"})
 
@@ -3678,11 +3677,11 @@ def test_stats(tmp_path: Path):
     data_stats = dataset.stats.data_stats()
 
     assert data_stats.fields[0].id == 0
-    assert data_stats.fields[0].bytes_on_disk == 40
+    assert data_stats.fields[0].bytes_on_disk == 60
     assert data_stats.fields[1].id == 1
-    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[1].bytes_on_disk == 42
     assert data_stats.fields[2].id == 2
-    assert data_stats.fields[2].bytes_on_disk == 56  # 16 bytes data + 40 bytes offset
+    assert data_stats.fields[2].bytes_on_disk == 68
 
 
 def test_default_storage_version(tmp_path: Path):
@@ -3875,8 +3874,10 @@ def test_schema_project_swap_column(tmp_path: Path):
 def test_empty_structs(tmp_path):
     schema = pa.schema([pa.field("id", pa.int32()), pa.field("empties", pa.struct([]))])
     table = pa.table({"id": [0, 1, 2], "empties": [{}] * 3}, schema=schema)
+    print(table)
     ds = lance.write_dataset(table, tmp_path)
     res = ds.take([2, 0, 1])
+    print(res)
     assert res.num_rows == 3
     assert res == table.take([2, 0, 1])
 

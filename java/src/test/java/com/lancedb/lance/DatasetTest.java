@@ -778,7 +778,7 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
 
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        assertEquals(100, dataset2.calculateDataSize());
+        assertEquals(108, dataset2.calculateDataSize());
       }
     }
   }

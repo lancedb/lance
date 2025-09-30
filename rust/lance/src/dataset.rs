@@ -6690,8 +6690,8 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].metadata.files.len(), 1);
-        assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 2, 1]);
-        assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1, 2]);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[2, 1]);
+        assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1]);
 
         // Can insert c, b
         let just_c_b = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -6718,8 +6718,8 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[1].metadata.files.len(), 1);
-        assert_eq!(&fragments[1].metadata.files[0].fields, &[0, 3, 2]);
-        assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1, 2]);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[3, 2]);
+        assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1]);
 
         // Can't insert a, c (b is non-nullable)
         let just_a_c = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -7036,6 +7036,8 @@ mod tests {
         writer.write_batch(&batch).await.unwrap();
         writer.finish().await.unwrap();
 
+        let (major, minor) = lance_file::version::LanceFileVersion::Stable.to_numbers();
+
         // find the datafile we want to replace
         let new_data_file = DataFile {
             path: "test.lance".to_string(),
@@ -7043,8 +7045,8 @@ mod tests {
             fields: vec![1],
             // is located in the first column of this datafile
             column_indices: vec![0],
-            file_major_version: 2,
-            file_minor_version: 0,
+            file_major_version: major,
+            file_minor_version: minor,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
         };
@@ -7098,8 +7100,8 @@ mod tests {
             fields: vec![0],
             // is located in the first column of this datafile
             column_indices: vec![0],
-            file_major_version: 2,
-            file_minor_version: 0,
+            file_major_version: major,
+            file_minor_version: minor,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
         };

@@ -19,13 +19,13 @@ from forward_compat.util import build_basic_types, build_large, get_path
 
 def write_basic_types():
     path = get_path("basic_types.lance")
-    with LanceFileWriter(str(path)) as writer:
+    with LanceFileWriter(str(path), version="2.0") as writer:
         writer.write_batch(build_basic_types())
 
 
 def write_large():
     path = get_path("large.lance")
-    with LanceFileWriter(str(path)) as writer:
+    with LanceFileWriter(str(path), version="2.0") as writer:
         writer.write_batch(build_large())
 
 
@@ -47,7 +47,9 @@ def write_dataset_pq_buffer():
         }
     )
 
-    dataset = lance.write_dataset(data, get_path("pq_in_schema"))
+    dataset = lance.write_dataset(
+        data, get_path("pq_in_schema"), data_storage_version="2.0"
+    )
     dataset.create_index(
         "vec",
         "IVF_PQ",
@@ -66,7 +68,7 @@ def write_dataset_json():
         }
     )
 
-    dataset = lance.write_dataset(data, get_path("json"))
+    dataset = lance.write_dataset(data, get_path("json"), data_storage_version="2.0")
     dataset.create_scalar_index(
         "json",
         IndexConfig(
@@ -90,7 +92,9 @@ def write_dataset_scalar_index():
         }
     )
 
-    dataset = lance.write_dataset(data, get_path("scalar_index"))
+    dataset = lance.write_dataset(
+        data, get_path("scalar_index"), data_storage_version="2.0"
+    )
     dataset.create_scalar_index("btree", "BTREE")
     dataset.create_scalar_index("bitmap", "BITMAP")
     dataset.create_scalar_index("label_list", "LABEL_LIST")

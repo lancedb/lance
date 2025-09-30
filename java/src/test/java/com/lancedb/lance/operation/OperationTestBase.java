@@ -34,7 +34,7 @@ import java.util.UUID;
 public class OperationTestBase {
 
   public static final int TEST_FILE_FORMAT_MAJOR_VERSION = 2;
-  public static final int TEST_FILE_FORMAT_MINOR_VERSION = 0;
+  public static final int TEST_FILE_FORMAT_MINOR_VERSION = 1;
   protected Dataset dataset;
 
   @BeforeAll

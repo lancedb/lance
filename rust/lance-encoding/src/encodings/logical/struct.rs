@@ -257,7 +257,7 @@ impl StructuralStructDecoder {
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() {
+                if field.is_packed_struct() || field.is_blob() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Box::new(decoder)
@@ -358,6 +358,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         } else {
             repdef.unravel_validity(length)
         };
+
         let array = StructArray::new(self.child_fields, children, validity);
         Ok(DecodedArray {
             array: Arc::new(array),
