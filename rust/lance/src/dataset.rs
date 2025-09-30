@@ -8138,7 +8138,7 @@ mod tests {
         let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
         assert_eq!(read_tx, tx);
     }
-  
+
     // This test covers
     // 1. Create branch from main, a branch and a global tag
     // 2. Write to each created branch and verify data
