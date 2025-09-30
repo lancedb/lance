@@ -1232,10 +1232,10 @@ def test_vector_with_nans(tmp_path: Path):
     )
     tbl = ds.to_table(
         nearest={"column": "vector", "q": data[0:DIM], "k": TOTAL, "nprobes": 2},
-        with_row_id=True,
+        with_row_address=True,
     )
     assert len(tbl) == TOTAL - 1
-    assert 1 not in tbl["_rowid"].to_numpy(), "Row with ID 1 is not in the index"
+    assert 1 not in tbl["_rowaddr"].to_numpy(), "Row with address 1 is not in the index"
 
 
 def test_validate_vector_index(tmp_path: Path):
@@ -1472,7 +1472,7 @@ def test_read_partition(indexed_dataset):
     for part_id in range(reader.num_partitions()):
         res = reader.read_partition(part_id)
         row_sum += res.num_rows
-        assert "_rowid" in res.column_names
+        assert "_rowaddr" in res.column_names
     assert row_sum == num_rows
 
     row_sum = 0
@@ -1480,7 +1480,7 @@ def test_read_partition(indexed_dataset):
         res = reader.read_partition(part_id, with_vector=True)
         row_sum += res.num_rows
         pq_column = res["__pq_code"]
-        assert "_rowid" in res.column_names
+        assert "_rowaddr" in res.column_names
         assert pq_column.type == pa.list_(pa.uint8(), 16)
     assert row_sum == num_rows
 
@@ -1511,7 +1511,7 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
             "k": 10,
         },
         filter="id > 0",
-        with_row_id=True,
+        with_row_address=True,
         prefilter=True,
     )
     assert len(res) == 10

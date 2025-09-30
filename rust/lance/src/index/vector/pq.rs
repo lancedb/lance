@@ -21,7 +21,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_core::{ROW_ID, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -127,7 +127,7 @@ impl PQIndex {
             warn!("Filtering on empty PQ code array");
             return Ok((code, row_ids));
         }
-        let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
+        let indices_to_keep = pre_filter.filter_row_addrs(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
@@ -356,9 +356,9 @@ impl VectorIndex for PQIndex {
                 let row_ids = row_ids.as_primitive::<UInt64Type>().values().iter();
                 let (remapped_row_ids, remapped_pq_codes): (Vec<u64>, Vec<Vec<u8>>) = row_ids
                     .enumerate()
-                    .filter_map(|(vec_idx, old_row_id)| {
-                        let new_row_id = frag_reuse_index_ref.remap_row_id(*old_row_id);
-                        new_row_id.map(|new_row_id| {
+                    .filter_map(|(vec_idx, old_row_addr)| {
+                        let new_row_addr = frag_reuse_index_ref.remap_row_addr(*old_row_addr);
+                        new_row_addr.map(|new_row_id| {
                             (
                                 new_row_id,
                                 Self::get_pq_codes(&pq_codes, vec_idx, num_vectors),
@@ -395,7 +395,7 @@ impl VectorIndex for PQIndex {
         })?;
 
         let num_rows = row_ids.len();
-        let mut fields = vec![ROW_ID_FIELD.clone()];
+        let mut fields = vec![ROW_ADDR_FIELD.clone()];
         let mut columns: Vec<ArrayRef> = vec![row_ids];
         if with_vector {
             let transposed_codes = self.code.clone().ok_or(Error::Index {
@@ -431,7 +431,7 @@ impl VectorIndex for PQIndex {
             .map_or(0, |row_ids| row_ids.len() as u64)
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
+    fn row_addrs(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
@@ -601,7 +601,7 @@ pub(crate) fn build_pq_storage(
     std::mem::drop(code_array);
 
     let pq_batch = RecordBatch::try_from_iter_with_nullable(vec![
-        (ROW_ID, row_ids, true),
+        (ROW_ADDR, row_ids, true),
         (pq.column(), pq_column, false),
     ])?;
     let pq_store = ProductQuantizationStorage::new(
@@ -757,12 +757,12 @@ mod tests {
     }
 
     struct TestPreFilter {
-        row_ids: Vec<u64>,
+        row_addrs: Vec<u64>,
     }
 
     impl TestPreFilter {
-        fn new(row_ids: Vec<u64>) -> Self {
-            Self { row_ids }
+        fn new(row_addrs: Vec<u64>) -> Self {
+            Self { row_addrs }
         }
     }
 
@@ -773,16 +773,19 @@ mod tests {
         }
 
         fn is_empty(&self) -> bool {
-            self.row_ids.is_empty()
+            self.row_addrs.is_empty()
         }
 
         fn mask(&self) -> Arc<RowIdMask> {
             RowIdMask::all_rows().into()
         }
 
-        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-            row_ids
-                .filter(|&row_id| self.row_ids.contains(row_id))
+        fn filter_row_addrs<'a>(
+            &self,
+            row_addrs: Box<dyn Iterator<Item = &'a u64> + 'a>,
+        ) -> Vec<u64> {
+            row_addrs
+                .filter(|&row_addr| self.row_addrs.contains(row_addr))
                 .cloned()
                 .collect()
         }

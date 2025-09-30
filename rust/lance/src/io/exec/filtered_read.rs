@@ -639,8 +639,20 @@ impl FilteredReadStream {
 
                 match &evaluated_index.index_result {
                     IndexExprResult::Exact(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        // Prefer row-id sequence mapping to derive valid ranges.
+                        // In non-stable mode this sequence is address-style and acts as identity.
+                        let seq_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let mut matched_ranges = Self::intersect_ranges(&to_read, &seq_ranges);
+                        // Fallback: if sequence-based mapping yields nothing (domain mismatch),
+                        // try interpreting the mask as row-addresses for this fragment.
+                        if matched_ranges.is_empty() {
+                            if let Some(offsets) =
+                                Self::mask_offsets_for_fragment(row_id_mask, fragment_id)
+                            {
+                                let addr_ranges = Self::offsets_to_ranges(offsets);
+                                matched_ranges = Self::intersect_ranges(&to_read, &addr_ranges);
+                            }
+                        }
                         fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
                         Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
@@ -648,13 +660,31 @@ impl FilteredReadStream {
                     }
                     IndexExprResult::AtMost(row_id_mask) => {
                         // Cannot push down skip/take for AtMost
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        // Prefer row-id sequence mapping to derive valid ranges.
+                        let seq_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let mut matched_ranges = Self::intersect_ranges(&to_read, &seq_ranges);
+                        if matched_ranges.is_empty() {
+                            if let Some(offsets) =
+                                Self::mask_offsets_for_fragment(row_id_mask, fragment_id)
+                            {
+                                let addr_ranges = Self::offsets_to_ranges(offsets);
+                                matched_ranges = Self::intersect_ranges(&to_read, &addr_ranges);
+                            }
+                        }
                         fragments_to_read.insert(fragment_id, matched_ranges);
                     }
                     IndexExprResult::AtLeast(row_id_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
-                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                        // Prefer row-id sequence mapping to derive valid ranges.
+                        let seq_ranges = row_id_sequence.mask_to_offset_ranges(row_id_mask);
+                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &seq_ranges);
+                        if guaranteed_ranges.is_empty() {
+                            if let Some(offsets) =
+                                Self::mask_offsets_for_fragment(row_id_mask, fragment_id)
+                            {
+                                let addr_ranges = Self::offsets_to_ranges(offsets);
+                                guaranteed_ranges = Self::intersect_ranges(&to_read, &addr_ranges);
+                            }
+                        }
                         fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
                         Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
@@ -709,6 +739,43 @@ impl FilteredReadStream {
         }
 
         physical_ranges.truncate(write_idx);
+    }
+
+    /// Convert a list of row offsets into grouped contiguous ranges (start..end)
+    fn offsets_to_ranges(mut offsets: Vec<u64>) -> Vec<Range<u64>> {
+        if offsets.is_empty() {
+            return Vec::new();
+        }
+        offsets.sort_unstable();
+        let mut ranges = Vec::new();
+        let mut start = offsets[0];
+        let mut end = start + 1;
+        for off in offsets.into_iter().skip(1) {
+            if off == end {
+                end += 1;
+            } else {
+                ranges.push(start..end);
+                start = off;
+                end = off + 1;
+            }
+        }
+        ranges.push(start..end);
+        ranges
+    }
+
+    /// Extract row address offsets for the given fragment from a RowIdMask (if iterable)
+    fn mask_offsets_for_fragment(mask: &RowIdMask, fragment_id: u32) -> Option<Vec<u64>> {
+        if let Some(ids_iter) = mask.iter_ids() {
+            let mut offsets = Vec::new();
+            for addr in ids_iter {
+                if addr.fragment_id() == fragment_id {
+                    offsets.push(addr.row_offset() as u64);
+                }
+            }
+            Some(offsets)
+        } else {
+            None
+        }
     }
 
     /// Intersect two sets of sorted ranges

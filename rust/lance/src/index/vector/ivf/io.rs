@@ -7,7 +7,6 @@ use std::time::Instant;
 use std::{cmp::Reverse, pin::Pin};
 
 use super::IVFIndex;
-use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{build_pq_storage, PQIndex};
 use arrow::compute::concat;
 use arrow_array::UInt64Array;
@@ -21,7 +20,7 @@ use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::Error;
+use lance_core::{Error, ROW_ADDR};
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -86,8 +85,8 @@ async fn merge_streams(
 
         let row_ids: Arc<dyn Array> = Arc::new(
             batch
-                .column_by_name(ROW_ID)
-                .expect("row id column not found")
+                .column_by_name(ROW_ADDR)
+                .expect("row addr column not found")
                 .as_primitive::<UInt64Type>()
                 .clone(),
         );
@@ -306,7 +305,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
         aux_part_files.push(tmp_part_dir.child(format!("hnsw_part_aux_{}", part_id)));
 
         let mut code_array: Vec<Arc<dyn Array>> = vec![];
-        let mut row_id_array: Vec<Arc<dyn Array>> = vec![];
+        let mut row_addr_array: Vec<Arc<dyn Array>> = vec![];
 
         // We don't transform vectors to SQ codes while shuffling,
         // so we won't merge SQ codes from the stream.
@@ -316,8 +315,10 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 let sub_index = idx
                     .load_partition(part_id, true, &NoOpMetricsCollector)
                     .await?;
-                let row_ids = Arc::new(UInt64Array::from_iter_values(sub_index.row_ids().cloned()));
-                row_id_array.push(row_ids);
+                let row_addrs = Arc::new(UInt64Array::from_iter_values(
+                    sub_index.row_addrs().cloned(),
+                ));
+                row_addr_array.push(row_addrs);
             }
         }
 
@@ -331,11 +332,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             part_id as u32,
             code_column,
             &mut code_array,
-            &mut row_id_array,
+            &mut row_addr_array,
         )
         .await?;
 
-        if row_id_array.is_empty() {
+        if row_addr_array.is_empty() {
             tasks.push(tokio::spawn(async { Ok(0) }));
             continue;
         }
@@ -379,7 +380,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                 part_writer,
                 aux_part_writer,
                 quantizer,
-                row_id_array,
+                row_addr_array,
                 code_array,
             )
             .await;

@@ -14,7 +14,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
-use lance_core::ROW_ID;
+use lance_core::ROW_ADDR;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
@@ -289,8 +289,8 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             store.schema().clone()
         } else {
             let schema = store.schema();
-            let row_id_idx = schema.index_of(ROW_ID)?;
-            Arc::new(schema.project(&[row_id_idx])?)
+            let row_addr_idx = schema.index_of(ROW_ADDR)?;
+            Arc::new(schema.project(&[row_addr_idx])?)
         };
 
         let batches = store
@@ -311,8 +311,8 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             .map_or(0, |hnsw| hnsw.num_nodes(0) as u64)
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
-        Box::new(self.storage.as_ref().unwrap().row_ids())
+    fn row_addrs(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
+        Box::new(self.storage.as_ref().unwrap().row_addrs())
     }
 
     async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {

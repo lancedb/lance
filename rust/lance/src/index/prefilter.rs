@@ -6,7 +6,6 @@
 //! Based on the query, we might have information about which fragment ids and
 //! row ids can be excluded from the search.
 
-use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,7 +30,7 @@ use tracing::instrument;
 use tracing::Instrument;
 
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::rowids::load_row_id_sequence;
+use crate::dataset::rowids::{get_row_id_index, load_row_id_sequence};
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
 use crate::Result;
@@ -72,6 +71,7 @@ impl DatasetPreFilter {
             Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
+
         Self {
             deleted_ids,
             filtered_ids,
@@ -150,22 +150,41 @@ impl DatasetPreFilter {
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
+                    let row_id_index = get_row_id_index(&dataset_clone)
+                        .await?
+                        .expect("stable row id mode should have a RowIdIndex");
                     let allow_list = spawn_cpu(move || {
-                        Ok(row_ids_and_deletions.into_iter().fold(
-                            RowIdTreeMap::new(),
-                            |mut allow_list, (row_ids, deletion_vector)| {
-                                let seq = if let Some(deletion_vector) = deletion_vector {
-                                    let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.iter()).unwrap();
-                                    Cow::Owned(row_ids)
-                                } else {
-                                    Cow::Borrowed(row_ids.as_ref())
-                                };
-                                let treemap = RowIdTreeMap::from(seq.as_ref());
-                                allow_list |= treemap;
-                                allow_list
-                            },
-                        ))
+                        // Build allow_list in ADDRESS domain by translating stable row ids via RowIdIndex.
+                        // This keeps mask in the physical address space which RowIdTreeMap operates on,
+                        // while logical stability is ensured by deriving addresses from stable row ids.
+                        let mut allow_list = RowIdTreeMap::new();
+                        for (row_ids, deletion_vector_opt) in row_ids_and_deletions.into_iter() {
+                            match deletion_vector_opt {
+                                Some(dv) => {
+                                    // Add only non-deleted rows: translate rid -> addr and insert addr.
+                                    let len = row_ids.len() as usize;
+                                    for off in 0..len {
+                                        let rid = row_ids.get(off).expect("row id must exist");
+                                        let row_offset = off as u32;
+                                        if dv.contains(row_offset) {
+                                            continue;
+                                        }
+                                        if let Some(addr) = row_id_index.get(rid) {
+                                            allow_list.insert(u64::from(addr));
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // No deletions in fragment: add all rows by translating rid -> addr.
+                                    for rid in row_ids.iter() {
+                                        if let Some(addr) = row_id_index.get(rid) {
+                                            allow_list.insert(u64::from(addr));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok::<_, crate::Error>(allow_list)
                     })
                     .await?;
 
@@ -265,15 +284,15 @@ impl PreFilter for DatasetPreFilter {
             .clone()
     }
 
-    /// Check whether a slice of row ids should be included in a query.
+    /// Check whether a slice of row addrs should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
     /// also known as a selection vector.
     ///
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
-    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        self.mask().selected_indices(row_ids)
+    fn filter_row_addrs<'a>(&self, row_addrs: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        self.mask().selected_indices(row_addrs)
     }
 }
 
@@ -405,7 +424,13 @@ mod test {
         );
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
-        let expected = RowIdTreeMap::from_iter(0..8);
+        // In stable row-id mode, the deletion mask allow-list is expressed in ADDRESS domain.
+        // The dataset has 9 rows across 3 fragments (3 rows per fragment). After deleting x=8,
+        // the remaining addresses are: f0:{0,1,2}, f1:{0,1,2}, f2:{0,1}.
+        let mut expected = RowIdTreeMap::new();
+        expected.insert_bitmap(0, RoaringBitmap::from_iter([0, 1, 2]));
+        expected.insert_bitmap(1, RoaringBitmap::from_iter([0, 1, 2]));
+        expected.insert_bitmap(2, RoaringBitmap::from_iter([0, 1]));
         assert_eq!(mask.allow_list, Some(expected)); // There was just one row deleted.
 
         // If there are deletions and missing fragments, we should get an allow list

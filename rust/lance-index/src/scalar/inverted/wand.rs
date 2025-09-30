@@ -294,7 +294,7 @@ impl PostingIterator {
 }
 
 pub struct DocCandidate {
-    pub row_id: u64,
+    pub row_addr: u64,
     pub freqs: Vec<(String, u32)>,
     pub doc_length: u32,
 }
@@ -372,8 +372,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let row_id = match &doc {
                 DocInfo::Raw(doc) => {
-                    // if the doc is not located, we need to find the row id
-                    self.docs.row_id(doc.doc_id)
+                    // if the doc is not located, we need to find the row addr
+                    self.docs.row_addr(doc.doc_id)
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
@@ -391,7 +391,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let doc_length = match &doc {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
-                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
+                DocInfo::Located(doc) => self.docs.num_tokens_by_row_addr(doc.row_id),
             };
             let score = self.score(pivot, doc_length);
             let freqs = self
@@ -415,7 +415,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                row_addr: doc.row_addr,
                 freqs,
                 doc_length,
             })
@@ -518,7 +518,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             // score the doc
             let doc_length = match is_compressed {
                 true => self.docs.num_tokens(doc_id as u32),
-                false => self.docs.num_tokens_by_row_id(row_id),
+                false => self.docs.num_tokens_by_row_addr(row_id),
             };
 
             let score = self.score(max_pivot, doc_length);
@@ -543,7 +543,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                row_addr: doc.row_addr,
                 freqs,
                 doc_length,
             })
