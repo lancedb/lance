@@ -42,6 +42,7 @@ use log::warn;
 use object_store::PutOptions;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::location;
+use tracing::info;
 use url::Url;
 
 #[cfg(feature = "dynamodb")]
@@ -63,7 +64,7 @@ use {
     std::borrow::Cow,
     std::time::{Duration, SystemTime},
 };
-
+use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
 
 const VERSIONS_DIR: &str = "_versions";
@@ -204,6 +205,7 @@ pub fn write_manifest_file_to_path<'a>(
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
         let res = object_writer.shutdown().await?;
+        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(res)
     })
 }
