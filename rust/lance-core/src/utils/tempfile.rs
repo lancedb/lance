@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Deref, path::Path as StdPath};
 use object_store::path::Path as ObjPath;
+use std::{
+    ops::Deref,
+    path::{Path as StdPath, PathBuf},
+};
 use tempfile::NamedTempFile;
 
+#[derive(Debug)]
 pub struct TempDir {
     tempdir: tempfile::TempDir,
 }
@@ -12,9 +16,7 @@ pub struct TempDir {
 impl TempDir {
     fn new() -> Self {
         let tempdir = tempfile::tempdir().unwrap();
-        Self {
-            tempdir
-        }
+        Self { tempdir }
     }
 
     fn norm_path(&self) -> String {
@@ -45,6 +47,14 @@ pub struct TempObjDir {
     path: ObjPath,
 }
 
+impl Deref for TempObjDir {
+    type Target = ObjPath;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
 impl AsRef<ObjPath> for TempObjDir {
     fn as_ref(&self) -> &ObjPath {
         &self.path
@@ -55,7 +65,10 @@ impl Default for TempObjDir {
     fn default() -> Self {
         let tempdir = TempDir::default();
         let path = tempdir.obj_path();
-        Self { _tempdir: tempdir, path }
+        Self {
+            _tempdir: tempdir,
+            path,
+        }
     }
 }
 
@@ -82,18 +95,17 @@ impl Default for TempStrDir {
         let string = tempdir.norm_path();
         Self {
             _tempdir: tempdir,
-            string
+            string,
         }
     }
 }
 
 impl Deref for TempStrDir {
     type Target = String;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.string
     }
-    
 }
 
 impl AsRef<str> for TempStrDir {
@@ -109,7 +121,7 @@ pub struct TempStdDir {
 impl Default for TempStdDir {
     fn default() -> Self {
         Self {
-            _tempdir: TempDir::default()
+            _tempdir: TempDir::default(),
         }
     }
 }
@@ -128,7 +140,6 @@ impl Deref for TempStdDir {
     }
 }
 
-
 pub struct TempFile {
     temppath: NamedTempFile,
 }
@@ -136,9 +147,7 @@ pub struct TempFile {
 impl TempFile {
     fn new() -> Self {
         let temppath = tempfile::NamedTempFile::new().unwrap();
-        Self {
-            temppath
-        }
+        Self { temppath }
     }
 
     fn norm_path(&self) -> String {
@@ -171,7 +180,7 @@ pub struct TempStdFile {
 impl Default for TempStdFile {
     fn default() -> Self {
         Self {
-            _tempfile: TempFile::default()
+            _tempfile: TempFile::default(),
         }
     }
 }
@@ -203,7 +212,7 @@ impl AsRef<ObjPath> for TempObjFile {
 
 impl std::ops::Deref for TempObjFile {
     type Target = ObjPath;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.path
     }
@@ -213,7 +222,40 @@ impl Default for TempObjFile {
     fn default() -> Self {
         let tempfile = TempFile::default();
         let path = tempfile.obj_path();
-        Self { _tempfile: tempfile, path }
+        Self {
+            _tempfile: tempfile,
+            path,
+        }
     }
 }
 
+pub struct TempStdPath {
+    _tempdir: TempDir,
+    path: PathBuf,
+}
+
+impl Default for TempStdPath {
+    fn default() -> Self {
+        let tempdir = TempDir::default();
+        let path = format!("{}/some_file", tempdir.norm_path());
+        let path = PathBuf::try_from(path).unwrap();
+        Self {
+            _tempdir: tempdir,
+            path,
+        }
+    }
+}
+
+impl Deref for TempStdPath {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<StdPath> for TempStdPath {
+    fn as_ref(&self) -> &StdPath {
+        self.path.as_path()
+    }
+}

@@ -304,7 +304,7 @@ impl IndexStore for LanceIndexStore {
 #[cfg(test)]
 pub mod tests {
 
-    use std::{collections::HashMap, ops::Bound, path::Path};
+    use std::{collections::HashMap, ops::Bound};
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::pbold;
@@ -332,17 +332,16 @@ pub mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::utils::tempfile::TempDir;
     use lance_core::ROW_ID;
     use lance_datagen::{array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
-    use tempfile::{tempdir, TempDir};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path: &Path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_uri(test_path.as_os_str().to_str().unwrap())
-                .now_or_never()
-                .unwrap()
-                .unwrap();
+        let test_path = tempdir.obj_path();
+        let (object_store, test_path) = ObjectStore::from_uri(&test_path.to_string())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
         let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
             128 * 1024 * 1024,
         ));
@@ -380,7 +379,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_basic_btree() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
@@ -445,7 +444,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_btree_update() {
-        let index_dir = tempdir().unwrap();
+        let index_dir = TempDir::default();
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
@@ -470,7 +469,7 @@ pub mod tests {
             .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
-        let updated_index_dir = tempdir().unwrap();
+        let updated_index_dir = TempDir::default();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
@@ -527,7 +526,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_btree_with_gaps() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let batch_one = gen_batch()
             .col(
@@ -770,7 +769,7 @@ pub mod tests {
             // Min/max accumulator not implemented for Duration(Nanosecond)
             // DataType::Duration(TimeUnit::Nanosecond),
         ] {
-            let tempdir = tempdir().unwrap();
+            let tempdir = TempDir::default();
             let index_store = test_store(&tempdir);
             let data: RecordBatch = gen_batch()
                 .col(VALUE_COLUMN_NAME, array::rand_type(data_type))
@@ -839,7 +838,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn btree_entire_null_page() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let batch = gen_batch()
             .col(
@@ -919,7 +918,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_bitmap_working() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
 
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -988,7 +987,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_basic_bitmap() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
@@ -1052,7 +1051,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_bitmap_with_gaps() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let batch_one = gen_batch()
             .col(
@@ -1273,7 +1272,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_bitmap_update() {
-        let index_dir = tempdir().unwrap();
+        let index_dir = TempDir::default();
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
@@ -1289,7 +1288,7 @@ pub mod tests {
             .col(ROW_ID, array::step_custom::<UInt64Type>(4096, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
 
-        let updated_index_dir = tempdir().unwrap();
+        let updated_index_dir = TempDir::default();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
@@ -1318,7 +1317,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_bitmap_remap() {
-        let index_dir = tempdir().unwrap();
+        let index_dir = TempDir::default();
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
@@ -1342,7 +1341,7 @@ pub mod tests {
             })
             .collect::<HashMap<_, _>>();
 
-        let remapped_dir = tempdir().unwrap();
+        let remapped_dir = TempDir::default();
         let remapped_store = test_store(&remapped_dir);
         index
             .remap(&mapping, remapped_store.as_ref())
@@ -1407,7 +1406,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_label_list_index() {
-        let tempdir = tempdir().unwrap();
+        let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(

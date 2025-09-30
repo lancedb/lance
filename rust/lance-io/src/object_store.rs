@@ -989,9 +989,7 @@ mod tests {
     #[tokio::test]
     async fn test_local_paths() {
         let file_path = TempStdFile::default();
-        let mut writer = ObjectStore::create_local_writer(&file_path)
-            .await
-            .unwrap();
+        let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
         writer.shutdown().await.unwrap();
 
@@ -1003,9 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_one() {
         let file_path = TempStdFile::default();
-        let mut writer = ObjectStore::create_local_writer(&file_path)
-            .await
-            .unwrap();
+        let mut writer = ObjectStore::create_local_writer(&file_path).await.unwrap();
         writer.write_all(b"LOCAL").await.unwrap();
         writer.shutdown().await.unwrap();
 
@@ -1113,10 +1109,7 @@ mod tests {
         let from_path = base_path.child(source_file_name);
 
         // Create destination with nested directories that don't exist yet
-        let dest_file = dest_dir
-            .join("nested")
-            .join("dirs")
-            .join("copied_file.txt");
+        let dest_file = dest_dir.join("nested").join("dirs").join("copied_file.txt");
         let dest_str = dest_file.to_str().unwrap();
         let to_path = object_store::path::Path::parse(dest_str).unwrap();
 

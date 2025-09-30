@@ -473,7 +473,7 @@ mod tests {
         types::GenericStringType, BinaryArray, GenericStringArray, LargeStringArray, StringArray,
     };
     use arrow_select::concat::concat;
-    use lance_core::utils::tempfile::{TempStdFile};
+    use lance_core::utils::tempfile::TempStdFile;
 
     use crate::local::LocalObjectReader;
 
