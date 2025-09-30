@@ -10,7 +10,7 @@ use arrow::{compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::Field as ArrowField;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
@@ -18,7 +18,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
+use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::location;
 
@@ -532,8 +532,8 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 #[cfg(test)]
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
-    use arrow_schema::DataType;
-    use lance_core::ROW_ID_FIELD;
+    use arrow_schema::{DataType, Schema as ArrowSchema};
+    use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use rstest::rstest;

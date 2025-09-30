@@ -251,11 +251,7 @@ impl Schema {
         for col in columns {
             let split = parse_field_path(col.as_ref())?;
             let first = split[0].as_str();
-            if first == ROW_ID {
-                candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
-            } else if first == ROW_ADDR {
-                candidates.push(Field::try_from(ROW_ADDR_FIELD.clone())?);
-            } else if let Some(field) = self.field(first) {
+            if let Some(field) = self.field(first) {
                 let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
                 let projected_field = field.project(&split_refs)?;
                 if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == first) {
@@ -263,6 +259,10 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
+            } else if first == ROW_ID {
+                candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
+            } else if first == ROW_ADDR {
+                candidates.push(Field::try_from(ROW_ADDR_FIELD.clone())?);
             } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
