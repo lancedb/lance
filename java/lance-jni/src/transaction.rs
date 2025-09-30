@@ -496,7 +496,7 @@ fn convert_to_java_operation_inner<'local>(
             new_fragments,
             bitmap_prune_field_ids,
             mem_wal_to_merge: _,
-            bitmap_preserve_exclude_field_ids,
+            bitmap_preserve_field_ids,
             update_mode,
         } => {
             let removed_ids: Vec<JLance<i64>> = removed_fragment_ids
@@ -507,8 +507,8 @@ fn convert_to_java_operation_inner<'local>(
             let updated_fragments_obj = export_vec(env, &updated_fragments)?;
             let new_fragments_obj = export_vec(env, &new_fragments)?;
             let bitmap_prune_field_ids = JLance(bitmap_prune_field_ids.clone()).into_java(env)?;
-            let bitmap_preserve_exclude_field_ids =
-                JLance(bitmap_preserve_exclude_field_ids.clone()).into_java(env)?;
+            let bitmap_preserve_field_ids =
+                JLance(bitmap_preserve_field_ids.clone()).into_java(env)?;
             let update_mode = match update_mode {
                 Some(update_mode) => update_mode.into_java(env),
                 None => Ok(JObject::null()),
@@ -529,7 +529,7 @@ fn convert_to_java_operation_inner<'local>(
                     JValue::Object(&updated_fragments_obj),
                     JValue::Object(&new_fragments_obj),
                     JValueGen::Object(&bitmap_prune_field_ids),
-                    JValueGen::Object(&bitmap_preserve_exclude_field_ids),
+                    JValueGen::Object(&bitmap_preserve_field_ids),
                     JValue::Object(&update_mode_optional),
                 ],
             )?)
@@ -943,11 +943,11 @@ fn convert_to_rust_operation(
             let bitmap_prune_field_ids =
                 JLongArray::from(bitmap_prune_field_ids).extract_object(env)?;
 
-            let bitmap_preserve_exclude_field_ids = env
+            let bitmap_preserve_field_ids = env
                 .call_method(java_operation, "bitmapPreserveExcludeFieldIds", "()[J", &[])?
                 .l()?;
-            let bitmap_preserve_exclude_field_ids =
-                JLongArray::from(bitmap_preserve_exclude_field_ids).extract_object(env)?;
+            let bitmap_preserve_field_ids =
+                JLongArray::from(bitmap_preserve_field_ids).extract_object(env)?;
 
             let update_mode: Option<UpdateMode> =
                 env.get_optional_from_method(java_operation, "updateMode", |env, update_mode| {
@@ -960,7 +960,7 @@ fn convert_to_rust_operation(
                 new_fragments,
                 bitmap_prune_field_ids,
                 mem_wal_to_merge: None,
-                bitmap_preserve_exclude_field_ids,
+                bitmap_preserve_field_ids,
                 update_mode,
             }
         }

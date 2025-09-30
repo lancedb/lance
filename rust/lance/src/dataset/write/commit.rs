@@ -790,7 +790,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 bitmap_prune_field_ids: vec![],
                 mem_wal_to_merge: None,
-                bitmap_preserve_exclude_field_ids: vec![],
+                bitmap_preserve_field_ids: vec![],
                 update_mode: None,
             },
             read_version: 1,

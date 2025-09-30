@@ -3857,7 +3857,7 @@ class LanceOperation:
             modified in updated_fragments,
             then they must be listed here so those fragments can be removed from
             indices that cover any of these fields.
-        bitmap_preserve_exclude_field_ids: list[int]
+        bitmap_preserve_field_ids: list[int]
             Field IDs used to decide whether to preserve new fragment IDs in an index's
              fragment bitmap.
             Indices that do not cover these fields may preserve the new fragment IDs
@@ -3868,7 +3868,7 @@ class LanceOperation:
         updated_fragments: List[FragmentMetadata]
         new_fragments: List[FragmentMetadata]
         bitmap_prune_field_ids: List[int]
-        bitmap_preserve_exclude_field_ids: List[int]
+        bitmap_preserve_field_ids: List[int]
         update_mode: str
 
         def __post_init__(self):
