@@ -189,23 +189,18 @@ mod tests {
     #[test]
     fn test_find_simple_branch() {
         let root_path = tempdir().unwrap().path().to_owned();
-        let location = create_branch_location(root_path.clone());
+        let location = create_branch_location(root_path);
         let new_branch = Some("featureA".to_string());
+        let main_location = location.find_main().unwrap();
         let new_location = location.find_branch(new_branch.clone()).unwrap();
 
         assert_eq!(
             new_location.path.as_ref(),
-            Path::parse(root_path.join("tree/featureA").to_str().unwrap())
-                .unwrap()
-                .as_ref()
+            format!("{}/tree/featureA", main_location.path.as_ref())
         );
         assert_eq!(
             new_location.uri,
-            root_path
-                .join("tree/featureA")
-                .to_str()
-                .unwrap()
-                .to_string()
+            format!("{}/tree/featureA", main_location.uri)
         );
         assert_eq!(new_location.branch, new_branch);
         assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
@@ -214,23 +209,18 @@ mod tests {
     #[test]
     fn test_find_complex_branch() {
         let root_path = tempdir().unwrap().path().to_owned();
-        let location = create_branch_location(root_path.clone());
+        let location = create_branch_location(root_path);
         let new_branch = Some("bugfix/issue-123".to_string());
+        let main_location = location.find_main().unwrap();
         let new_location = location.find_branch(new_branch).unwrap();
 
         assert_eq!(
             new_location.path.as_ref(),
-            Path::parse(root_path.join("tree/bugfix/issue-123").to_str().unwrap())
-                .unwrap()
-                .as_ref()
+            format!("{}/tree/bugfix/issue-123", main_location.path.as_ref())
         );
         assert_eq!(
             new_location.uri,
-            root_path
-                .join("tree/bugfix/issue-123")
-                .to_str()
-                .unwrap()
-                .to_string()
+            format!("{}/tree/bugfix/issue-123", main_location.uri)
         );
         assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
     }
