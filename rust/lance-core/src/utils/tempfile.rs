@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Utility functions for creating temporary files and directories.
+//!
+//! Most of these types wrap around the `tempfile` crate.  We add two
+//! additional features:
+//!
+//! * There are wrappers around temporary directories and files that expose
+//!   the dir/file as an object store path, std path, or string, which can save
+//!   some boilerplate.
+//! * We work around a current bug in the `url` crate which fails to parse
+//!   Windows paths like `C:\` correctly.  We do so by replacing all `\` with
+//!   `/` in the path.  This is not safe in general (e.g. paths may use `\` as
+//!   an escape) but it should be safe for temporary paths.
+
 use object_store::path::Path as ObjPath;
 use std::{
     ops::Deref,
@@ -10,6 +23,15 @@ use tempfile::NamedTempFile;
 
 use crate::Result;
 
+/// A temporary directory
+///
+/// This create a temporary directory using [`tempfile::tempdir`].  It will
+/// generally be cleaned up when the object is dropped.
+///
+/// This type is primarily useful when you need multiple representations (string,
+/// path, object store path) of the same temporary directory.  If you only need
+/// a single representation you can use the [`TempStdDir`], [`TempStrDir`], or
+/// [`TempObjDir`] types.
 #[derive(Debug)]
 pub struct TempDir {
     tempdir: tempfile::TempDir,
@@ -21,11 +43,19 @@ impl TempDir {
         Self { tempdir }
     }
 
+    /// Create a temporary directory, exposing any potential errors.
+    ///
+    /// For most test cases you should use the [`Default`] implementation instead.
+    /// However, when we use this type in production code, we may want to return
+    /// errors gracefully instead of panicking.
     pub fn try_new() -> Result<Self> {
         let tempdir = tempfile::tempdir()?;
         Ok(Self { tempdir })
     }
 
+    /// Get the path as a string
+    ///
+    /// This path will be safe to use as a URI on Windows
     pub fn path_str(&self) -> String {
         if cfg!(windows) {
             self.tempdir.path().to_str().unwrap().replace("\\", "/")
@@ -34,10 +64,19 @@ impl TempDir {
         }
     }
 
+    /// Get the path as a standard library path
+    ///
+    /// If you convert this to a string, it will NOT be safe to use as a URI on Windows.
+    /// Use [`TempDir::path_str`] instead.
+    ///
+    /// It is safe to use this as a standard path on Windows.
     pub fn std_path(&self) -> &StdPath {
         self.tempdir.path()
     }
 
+    /// Get the path as an object store path
+    ///
+    /// This path will be safe to use as a URI on Windows
     pub fn obj_path(&self) -> ObjPath {
         ObjPath::parse(self.path_str()).unwrap()
     }
@@ -49,6 +88,11 @@ impl Default for TempDir {
     }
 }
 
+/// A temporary directory that is exposed as an object store path
+///
+/// This is a wrapper around [`TempDir`] that exposes the path as an object store path.
+/// It is useful when you need to create a temporary directory that is only
+/// used as an object store path.
 pub struct TempObjDir {
     _tempdir: TempDir,
     path: ObjPath,
@@ -79,6 +123,11 @@ impl Default for TempObjDir {
     }
 }
 
+/// A temporary directory that is exposed as a string
+///
+/// This is a wrapper around [`TempDir`] that exposes the path as a string.
+/// It is useful when you need to create a temporary directory that is only
+/// used as a string.
 pub struct TempStrDir {
     _tempdir: TempDir,
     string: String,
@@ -91,6 +140,7 @@ impl std::fmt::Display for TempStrDir {
 }
 
 impl TempStrDir {
+    /// Create a cloned copy of the string that can be used if Into<String> is needed
     pub fn as_into_string(&self) -> impl Into<String> {
         self.string.clone()
     }
@@ -121,6 +171,11 @@ impl AsRef<str> for TempStrDir {
     }
 }
 
+/// A temporary directory that is exposed as a standard library path
+///
+/// This is a wrapper around [`TempDir`] that exposes the path as a standard library path.
+/// It is useful when you need to create a temporary directory that is only
+/// used as a standard library path.
 #[derive(Default)]
 pub struct TempStdDir {
     _tempdir: TempDir,
@@ -140,6 +195,13 @@ impl Deref for TempStdDir {
     }
 }
 
+/// A temporary file
+///
+/// This is a wrapper around [`tempfile::NamedTempFile`].  The file will normally be cleaned
+/// up when the object is dropped.
+///
+/// Note: this function may create an empty file when the object is created.  If you are checking
+/// that the path does not exist, you should use [`TempStdPath`] instead.
 pub struct TempFile {
     temppath: NamedTempFile,
 }
@@ -158,10 +220,19 @@ impl TempFile {
         }
     }
 
+    /// Get the path as a standard library path
+    ///
+    /// If you convert this to a string, it will NOT be safe to use as a URI on Windows.
+    /// Use [`TempFile::path_str`] instead.
+    ///
+    /// It is safe to use this as a standard path on Windows.
     pub fn std_path(&self) -> &StdPath {
         self.temppath.path()
     }
 
+    /// Get the path as an object store path
+    ///
+    /// This path will be safe to use as a URI on Windows
     pub fn obj_path(&self) -> ObjPath {
         ObjPath::parse(self.path_str()).unwrap()
     }
@@ -173,6 +244,10 @@ impl Default for TempFile {
     }
 }
 
+/// A temporary file that is exposed as a standard library path
+///
+/// This is a wrapper around [`TempFile`] that exposes the path as a standard library path.
+/// It is useful when you need to create a temporary file that is only used as a standard library path.
 #[derive(Default)]
 pub struct TempStdFile {
     _tempfile: TempFile,
@@ -192,6 +267,10 @@ impl Deref for TempStdFile {
     }
 }
 
+/// A temporary file that is exposed as an object store path
+///
+/// This is a wrapper around [`TempFile`] that exposes the path as an object store path.
+/// It is useful when you need to create a temporary file that is only used as an object store path.
 pub struct TempObjFile {
     _tempfile: TempFile,
     path: ObjPath,
@@ -222,6 +301,13 @@ impl Default for TempObjFile {
     }
 }
 
+/// Get a unique path to a temporary file
+///
+/// Unlike [`TempFile`], this function will not create an empty file.  We create
+/// a temporary directory and then create a path inside of it.  Since the temporary
+/// directory is created first, we can be confident that the path is unique.
+///
+/// This path will be safe to use as a URI on Windows
 pub struct TempStdPath {
     _tempdir: TempDir,
     path: PathBuf,
