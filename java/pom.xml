@@ -7,7 +7,7 @@
     <groupId>com.lancedb</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>0.36.0</version>
+    <version>0.37.0</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>

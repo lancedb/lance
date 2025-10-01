@@ -5,8 +5,8 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{export_vec, import_vec, FromJObjectWithEnv, FromJString};
 use crate::utils::{
-    extract_storage_options, extract_write_params, get_scalar_index_params,
-    get_vector_index_params, to_rust_map,
+    build_compaction_options, extract_storage_options, extract_write_params,
+    get_scalar_index_params, get_vector_index_params, to_rust_map,
 };
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
@@ -33,7 +33,7 @@ use lance::dataset::{
 };
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
-use lance::table::format::Index;
+use lance::table::format::IndexMetadata;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
@@ -84,6 +84,7 @@ impl BlockingDataset {
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
+        serialized_manifest: Option<&[u8]>,
     ) -> Result<Self> {
         let params = ReadParams {
             index_cache_size_bytes: index_cache_size_bytes as usize,
@@ -101,6 +102,10 @@ impl BlockingDataset {
             builder = builder.with_version(ver as u64);
         }
         builder = builder.with_storage_options(storage_options);
+
+        if let Some(serialized_manifest) = serialized_manifest {
+            builder = builder.with_serialized_manifest(serialized_manifest)?;
+        }
 
         let inner = RT.block_on(builder.load())?;
         Ok(Self { inner })
@@ -177,27 +182,27 @@ impl BlockingDataset {
     }
 
     pub fn list_tags(&self) -> Result<HashMap<String, TagContents>> {
-        let tags = RT.block_on(self.inner.tags.list())?;
+        let tags = RT.block_on(self.inner.tags().list())?;
         Ok(tags)
     }
 
     pub fn create_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.create(tag, version))?;
+        RT.block_on(self.inner.tags().create(tag, version))?;
         Ok(())
     }
 
     pub fn delete_tag(&mut self, tag: &str) -> Result<()> {
-        RT.block_on(self.inner.tags.delete(tag))?;
+        RT.block_on(self.inner.tags().delete(tag))?;
         Ok(())
     }
 
     pub fn update_tag(&mut self, tag: &str, version: u64) -> Result<()> {
-        RT.block_on(self.inner.tags.update(tag, version))?;
+        RT.block_on(self.inner.tags().update(tag, version))?;
         Ok(())
     }
 
     pub fn get_version(&self, tag: &str) -> Result<u64> {
-        let version = RT.block_on(self.inner.tags.get_version(tag))?;
+        let version = RT.block_on(self.inner.tags().get_version(tag))?;
         Ok(version)
     }
 
@@ -211,22 +216,9 @@ impl BlockingDataset {
         Ok(stats)
     }
 
-    pub fn list_indexes(&self) -> Result<Arc<Vec<Index>>> {
+    pub fn list_indexes(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indexes = RT.block_on(self.inner.load_indices())?;
         Ok(indexes)
-    }
-
-    pub fn update_config(
-        &mut self,
-        upsert_values: impl Iterator<Item = (String, String)>,
-    ) -> Result<()> {
-        RT.block_on(self.inner.update_config(upsert_values))?;
-        Ok(())
-    }
-
-    pub fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
-        RT.block_on(self.inner.delete_config_keys(delete_keys))?;
-        Ok(())
     }
 
     pub fn commit_transaction(
@@ -250,17 +242,8 @@ impl BlockingDataset {
         Ok(transaction)
     }
 
-    pub fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
-        RT.block_on(self.inner.replace_schema_metadata(metadata))?;
-        Ok(())
-    }
-
-    pub fn replace_field_metadata(
-        &mut self,
-        metadata_map: HashMap<u32, HashMap<String, String>>,
-    ) -> Result<()> {
-        RT.block_on(self.inner.replace_field_metadata(metadata_map))?;
-        Ok(())
+    pub fn get_table_metadata(&self) -> Result<HashMap<String, String>> {
+        Ok(self.inner.metadata().clone())
     }
 
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
@@ -672,6 +655,7 @@ fn inner_create_index(
         | IndexType::IvfFlat
         | IndexType::IvfSq
         | IndexType::IvfPq
+        | IndexType::IvfRq
         | IndexType::IvfHnswSq
         | IndexType::IvfHnswPq
         | IndexType::IvfHnswFlat => {
@@ -701,6 +685,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
+    serialized_manifest: JObject, // Optional<ByteBuffer>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -711,11 +696,13 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
-            storage_options_obj
+            storage_options_obj,
+            serialized_manifest
         )
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
@@ -724,12 +711,14 @@ fn inner_open_native<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject, // Map<String, String>
+    serialized_manifest: JObject, // Optional<ByteBuffer>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+    let serialized_manifest = env.get_bytes_opt(&serialized_manifest)?;
     let dataset = BlockingDataset::open(
         &path_str,
         version,
@@ -737,6 +726,7 @@ fn inner_open_native<'local>(
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
+        serialized_manifest,
     )?;
     dataset.into_java(env)
 }
@@ -1120,7 +1110,7 @@ fn inner_get_config<'local>(
     let config = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.inner.config()?
+        dataset_guard.inner.config().clone()
     };
 
     let java_hashmap = env
@@ -1145,49 +1135,6 @@ fn inner_get_config<'local>(
     }
 
     Ok(java_hashmap)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUpdateConfig(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    config_map: JObject,
-) {
-    ok_or_throw_without_return!(env, inner_update_config(&mut env, java_dataset, config_map))
-}
-
-fn inner_update_config(env: &mut JNIEnv, java_dataset: JObject, config_map: JObject) -> Result<()> {
-    let jmap = JMap::from_env(env, &config_map)?;
-    let config = to_rust_map(env, &jmap)?;
-    let mut dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.update_config(config.into_iter())?;
-    Ok(())
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDeleteConfigKeys(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    config_keys: JObject,
-) {
-    ok_or_throw_without_return!(
-        env,
-        inner_delete_config_keys(&mut env, java_dataset, config_keys)
-    )
-}
-
-fn inner_delete_config_keys(
-    env: &mut JNIEnv,
-    java_dataset: JObject,
-    config_keys: JObject,
-) -> Result<()> {
-    let keys: Vec<String> = env.get_strings(&config_keys)?;
-    let mut dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    let key_slice: &[&str] = &keys.iter().map(String::as_str).collect::<Vec<_>>();
-    dataset_guard.delete_config_keys(key_slice)?;
-    Ok(())
 }
 
 #[no_mangle]
@@ -1667,62 +1614,48 @@ fn inner_get_version_by_tag(
     dataset_guard.get_version(tag.as_str())
 }
 
-#[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceSchemaMetadata(
-    mut env: JNIEnv,
-    java_dataset: JObject,
-    jschema_metadata: JObject,
-) {
-    ok_or_throw_without_return!(
-        env,
-        inner_replace_schema_metadata(&mut env, java_dataset, jschema_metadata)
-    )
-}
-
-fn inner_replace_schema_metadata(
-    env: &mut JNIEnv,
-    java_dataset: JObject,
-    jschema_metadata: JObject,
-) -> Result<()> {
-    let jmap = JMap::from_env(env, &jschema_metadata)?;
-    let schema_metadata = to_rust_map(env, &jmap)?;
-    let mut dataset_guard =
-        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.replace_schema_metadata(schema_metadata)
-}
+// Unified metadata API JNI methods
 
 #[no_mangle]
-pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeReplaceFieldMetadata(
-    mut env: JNIEnv,
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetTableMetadata<'local>(
+    mut env: JNIEnv<'local>,
     java_dataset: JObject,
-    jfield_metadata_map: JObject,
-) {
-    ok_or_throw_without_return!(
-        env,
-        inner_replace_field_metadata(&mut env, java_dataset, jfield_metadata_map)
-    )
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_table_metadata(&mut env, java_dataset))
 }
 
-fn inner_replace_field_metadata(
-    env: &mut JNIEnv,
+fn inner_get_table_metadata<'local>(
+    env: &mut JNIEnv<'local>,
     java_dataset: JObject,
-    jfield_metadata_map: JObject,
-) -> Result<()> {
-    let jmap = JMap::from_env(env, &jfield_metadata_map)?;
-    let mut field_metadata_map = HashMap::new();
-    let mut iter = jmap.iter(env)?;
-    env.with_local_frame(16, |env| {
-        while let Some((key, value)) = iter.next(env)? {
-            let field_id = env.call_method(&key, "intValue", "()I", &[])?.i()? as u32;
-            let inner_map = JMap::from_env(env, &value)?;
-            let value_map = to_rust_map(env, &inner_map)?;
-            field_metadata_map.insert(field_id, value_map);
-        }
-        Ok::<(), Error>(())
-    })?;
-    let mut dataset_guard =
-        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.replace_field_metadata(field_metadata_map)
+) -> Result<JObject<'local>> {
+    let table_metadata = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.get_table_metadata()?
+    };
+
+    let java_hashmap = env
+        .new_object("java/util/HashMap", "()V", &[])
+        .expect("Failed to create Java HashMap");
+
+    for (k, v) in table_metadata {
+        let java_key = env
+            .new_string(&k)
+            .expect("Failed to create Java String (key)");
+        let java_value = env
+            .new_string(&v)
+            .expect("Failed to create Java String (value)");
+
+        env.call_method(
+            &java_hashmap,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&java_key), JValue::Object(&java_value)],
+        )
+        .expect("Failed to call HashMap.put()");
+    }
+
+    Ok(java_hashmap)
 }
 
 //////////////////////////////
@@ -1756,64 +1689,75 @@ fn convert_java_compaction_options_to_rust(
     env: &mut JNIEnv,
     java_options: JObject,
 ) -> Result<RustCompactionOptions> {
-    // Extract all field values directly from Java object fields to minimize JNI calls
     let target_rows_per_fragment = env
-        .get_field(&java_options, "targetRowsPerFragment", "I")?
-        .i()? as usize;
-
-    let max_rows_per_group = env.get_field(&java_options, "maxRowsPerGroup", "I")?.i()? as usize;
-
+        .call_method(
+            &java_options,
+            "getTargetRowsPerFragment",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_rows_per_group = env
+        .call_method(
+            &java_options,
+            "getMaxRowsPerGroup",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_bytes_per_file = env
+        .call_method(
+            &java_options,
+            "getMaxBytesPerFile",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
     let materialize_deletions = env
-        .get_field(&java_options, "materializeDeletions", "Z")?
-        .z()?;
-
+        .call_method(
+            &java_options,
+            "getMaterializeDeletions",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
     let materialize_deletions_threshold = env
-        .get_field(&java_options, "materializeDeletionsThreshold", "F")?
-        .f()?;
-
-    let defer_index_remap = env.get_field(&java_options, "deferIndexRemap", "Z")?.z()?;
-
-    // Extract Optional<Integer> fields efficiently
-    let max_bytes_per_file =
-        extract_optional_integer(env, &java_options, "maxBytesPerFile")?.map(|i| i as usize);
-
-    let num_threads =
-        extract_optional_integer(env, &java_options, "numThreads")?.map(|i| i as usize);
-
-    let batch_size = extract_optional_integer(env, &java_options, "batchSize")?.map(|i| i as usize);
-
-    Ok(RustCompactionOptions {
-        target_rows_per_fragment,
-        max_rows_per_group,
-        max_bytes_per_file,
-        materialize_deletions,
-        materialize_deletions_threshold,
-        num_threads,
-        batch_size,
-        defer_index_remap,
-    })
-}
-
-// Helper function to efficiently extract Optional<Integer> fields
-fn extract_optional_integer(
-    env: &mut JNIEnv,
-    java_obj: &JObject,
-    field_name: &str,
-) -> Result<Option<i32>> {
-    let optional_field = env
-        .get_field(java_obj, field_name, "Ljava/util/Optional;")?
+        .call_method(
+            &java_options,
+            "getMaterializeDeletionsThreshold",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let num_threads = env
+        .call_method(
+            &java_options,
+            "getNumThreads",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let batch_size = env
+        .call_method(&java_options, "getBatchSize", "()Ljava/util/Optional;", &[])?
+        .l()?;
+    let defer_index_remap = env
+        .call_method(
+            &java_options,
+            "getDeferIndexRemap",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
         .l()?;
 
-    if env
-        .call_method(&optional_field, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let integer_obj = env
-            .call_method(optional_field, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let value = env.call_method(integer_obj, "intValue", "()I", &[])?.i()?;
-        Ok(Some(value))
-    } else {
-        Ok(None)
-    }
+    build_compaction_options(
+        env,
+        &target_rows_per_fragment,
+        &max_rows_per_group,
+        &max_bytes_per_file,
+        &materialize_deletions,
+        &materialize_deletions_threshold,
+        &num_threads,
+        &batch_size,
+        &defer_index_remap,
+    )
 }

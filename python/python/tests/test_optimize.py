@@ -333,7 +333,7 @@ def test_migration_via_fragment_apis(tmp_path):
         data_obj=[],
         uri=tmp_path / "dataset2",
         schema=ds.schema,
-        data_storage_version="stable",
+        data_storage_version="2.0",
     )
 
     # Add v2 files
@@ -345,7 +345,7 @@ def test_migration_via_fragment_apis(tmp_path):
                 dataset_uri=tmp_path / "dataset2",
                 data=reader,
                 fragment_id=frag.fragment_id,
-                data_storage_version="stable",
+                data_storage_version="2.0",
             )
         )
 

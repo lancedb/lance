@@ -396,11 +396,11 @@ pub mod tests {
 
     use arrow_array::LargeBinaryArray;
     use arrow_schema::{DataType, Field};
-    use lance_core::datatypes::BLOB_META_KEY;
+    use lance_arrow::BLOB_META_KEY;
 
     use crate::{
         format::pb::column_encoding,
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
 
@@ -412,9 +412,9 @@ pub mod tests {
     });
 
     #[test_log::test(tokio::test)]
-    async fn test_blob() {
+    async fn test_basic_blob() {
         let field = Field::new("", DataType::LargeBinary, false).with_metadata(BLOB_META.clone());
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -422,26 +422,36 @@ pub mod tests {
         let val1: &[u8] = &[1, 2, 3];
         let val2: &[u8] = &[7, 8, 9];
         let array = Arc::new(LargeBinaryArray::from(vec![Some(val1), None, Some(val2)]));
-        let test_cases = TestCases::default().with_verify_encoding(Arc::new(|cols| {
-            assert_eq!(cols.len(), 1);
-            let col = &cols[0];
-            assert!(matches!(
-                col.encoding.column_encoding.as_ref().unwrap(),
-                column_encoding::ColumnEncoding::Blob(_)
-            ));
-        }));
+        let test_cases = TestCases::default()
+            .with_expected_encoding("packed_struct")
+            .with_verify_encoding(Arc::new(|cols, version| {
+                if version < &LanceFileVersion::V2_1 {
+                    // In 2.0 we used a special "column encoding" to mark blob fields.  In 2.1 we
+                    // don't do this and just rely on the regular page encoding.
+                    assert_eq!(cols.len(), 1);
+                    let col = &cols[0];
+                    assert!(matches!(
+                        col.encoding.column_encoding.as_ref().unwrap(),
+                        column_encoding::ColumnEncoding::Blob(_)
+                    ));
+                }
+            }));
         // Use blob encoding if requested
         check_round_trip_encoding_of_data(vec![array.clone()], &test_cases, BLOB_META.clone())
             .await;
 
-        let test_cases = TestCases::default().with_verify_encoding(Arc::new(|cols| {
-            assert_eq!(cols.len(), 1);
-            let col = &cols[0];
-            assert!(!matches!(
-                col.encoding.column_encoding.as_ref().unwrap(),
-                column_encoding::ColumnEncoding::Blob(_)
-            ));
-        }));
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_verify_encoding(Arc::new(|cols, version| {
+                if version < &LanceFileVersion::V2_1 {
+                    assert_eq!(cols.len(), 1);
+                    let col = &cols[0];
+                    assert!(!matches!(
+                        col.encoding.column_encoding.as_ref().unwrap(),
+                        column_encoding::ColumnEncoding::Blob(_)
+                    ));
+                }
+            }));
         // Don't use blob encoding if not requested
         check_round_trip_encoding_of_data(vec![array], &test_cases, Default::default()).await;
     }

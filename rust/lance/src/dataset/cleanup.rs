@@ -44,7 +44,7 @@ use lance_core::{
     Error, Result,
 };
 use lance_table::{
-    format::{Index, Manifest},
+    format::{IndexMetadata, Manifest},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -124,7 +124,7 @@ impl<'a> CleanupTask<'a> {
         // pass on option to process manifests around whether to return error
         // or clean around the manifest
 
-        let tags = self.dataset.tags.list().await?;
+        let tags = self.dataset.tags().list().await?;
         let tagged_versions: HashSet<u64> = tags
             .values()
             .map(|tag_content| tag_content.version)
@@ -210,7 +210,7 @@ impl<'a> CleanupTask<'a> {
     fn process_manifest(
         &self,
         manifest: &Manifest,
-        indexes: &Vec<Index>,
+        indexes: &Vec<IndexMetadata>,
         in_working_set: bool,
         inspection: &mut MutexGuard<CleanupInspection>,
     ) -> Result<()> {
@@ -615,7 +615,7 @@ fn tagged_old_versions_cleanup_error(
 ) -> Error {
     let unreferenced_tags: HashMap<String, u64> = tags
         .iter()
-        .filter_map(|(k, &v)| {
+        .filter_map(|(k, v)| {
             if tagged_old_versions.contains(&v.version) {
                 Some((k.clone(), v.version))
             } else {
@@ -1029,10 +1029,10 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
 
         fixture
             .clock
@@ -1051,7 +1051,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 2 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         cleanup_error = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1060,7 +1060,7 @@ mod tests {
             .unwrap();
         assert_contains!(cleanup_error.to_string(), "Cleanup error: 1 tagged version(s) have been marked for cleanup. Either set `error_if_tagged_old_versions=false` or delete the following tag(s) to enable cleanup:");
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         let removed = fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
@@ -1080,11 +1080,11 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
         fixture.overwrite_some_data().await.unwrap();
 
-        let mut dataset = *(fixture.open().await.unwrap());
+        let dataset = *(fixture.open().await.unwrap());
 
-        dataset.tags.create("old-tag", 1).await.unwrap();
-        dataset.tags.create("another-old-tag", 2).await.unwrap();
-        dataset.tags.create("tag-latest", 3).await.unwrap();
+        dataset.tags().create("old-tag", 1).await.unwrap();
+        dataset.tags().create("another-old-tag", 2).await.unwrap();
+        dataset.tags().create("tag-latest", 3).await.unwrap();
 
         fixture
             .clock
@@ -1101,7 +1101,7 @@ mod tests {
 
         assert_eq!(removed.old_versions, 0);
 
-        dataset.tags.delete("old-tag").await.unwrap();
+        dataset.tags().delete("old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(
@@ -1113,7 +1113,7 @@ mod tests {
             .unwrap();
         assert_eq!(removed.old_versions, 1);
 
-        dataset.tags.delete("another-old-tag").await.unwrap();
+        dataset.tags().delete("another-old-tag").await.unwrap();
 
         removed = fixture
             .run_cleanup_with_override(
@@ -1202,7 +1202,12 @@ mod tests {
             new_cleanup_interval.to_string(),
         );
 
-        dataset.update_config(new_autoclean_params).await.unwrap();
+        // Convert to new API format
+        let config_updates = new_autoclean_params
+            .into_iter()
+            .map(|(k, v)| (k, Some(v)))
+            .collect::<HashMap<String, Option<String>>>();
+        dataset.update_config(config_updates).await.unwrap();
 
         // Fast forward so we are outside of the new "older_than" window.
         fixture

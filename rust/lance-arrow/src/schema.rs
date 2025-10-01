@@ -5,6 +5,8 @@
 
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema};
 
+use crate::BLOB_META_KEY;
+
 pub enum Indentation {
     OneLine,
     MultiLine(u8),
@@ -33,7 +35,11 @@ pub trait FieldExt {
     /// This is intended for display purposes and not for serialization
     fn to_compact_string(&self, indent: Indentation) -> String;
 
+    /// Check if the field is marked as a packed struct
     fn is_packed_struct(&self) -> bool;
+
+    /// Check if the field is marked as a blob
+    fn is_blob(&self) -> bool;
 }
 
 impl FieldExt for Field {
@@ -89,6 +95,11 @@ impl FieldExt for Field {
             .get("packed")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false)
+    }
+
+    fn is_blob(&self) -> bool {
+        let field_metadata = self.metadata();
+        field_metadata.get(BLOB_META_KEY).is_some()
     }
 }
 

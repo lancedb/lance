@@ -3,7 +3,7 @@
 
 use futures::future::BoxFuture;
 use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
-use lance_table::format::Index as IndexMetadata;
+use lance_table::format::IndexMetadata;
 use snafu::location;
 use std::{future::IntoFuture, sync::Arc};
 use tracing::instrument;

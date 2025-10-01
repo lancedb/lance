@@ -16,6 +16,7 @@ use arrow_array::{
     OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
+use num_traits::AsPrimitive;
 use num_traits::{bounds::Bounded, Float, Num};
 
 use crate::{Error, Result};
@@ -137,20 +138,26 @@ pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
 /// L2 normalize a vector.
 ///
 /// Returns an iterator of normalized values.
-pub fn normalize<T: Float + Sum>(v: &[T]) -> impl Iterator<Item = T> + '_ {
+pub fn normalize<T: Float + Sum + AsPrimitive<f32>>(
+    v: &[T],
+) -> (impl Iterator<Item = T> + '_, f32) {
     let l2_norm = v.iter().map(|x| x.powi(2)).sum::<T>().sqrt();
-    v.iter().map(move |&x| x / l2_norm)
+    (v.iter().map(move |&x| x / l2_norm), l2_norm.as_())
 }
 
-fn do_normalize_arrow<T: ArrowPrimitiveType>(arr: &dyn Array) -> Result<ArrayRef>
+fn do_normalize_arrow<T: ArrowPrimitiveType>(arr: &dyn Array) -> Result<(ArrayRef, f32)>
 where
-    <T as ArrowPrimitiveType>::Native: Float + Sum,
+    <T as ArrowPrimitiveType>::Native: Float + Sum + AsPrimitive<f32>,
 {
     let v = arr.as_primitive::<T>();
-    Ok(Arc::new(PrimitiveArray::<T>::from_iter_values(normalize(v.values()))) as ArrayRef)
+    let (iter, l2_norm) = normalize(v.values());
+    Ok((
+        Arc::new(PrimitiveArray::<T>::from_iter_values(iter)) as ArrayRef,
+        l2_norm,
+    ))
 }
 
-pub fn normalize_arrow(v: &dyn Array) -> Result<ArrayRef> {
+pub fn normalize_arrow(v: &dyn Array) -> Result<(ArrayRef, f32)> {
     match v.data_type() {
         DataType::Float16 => do_normalize_arrow::<Float16Type>(v),
         DataType::Float32 => do_normalize_arrow::<Float32Type>(v),
@@ -164,7 +171,7 @@ pub fn normalize_arrow(v: &dyn Array) -> Result<ArrayRef> {
 
 fn do_normalize_fsl<T: ArrowPrimitiveType>(fsl: &FixedSizeListArray) -> Result<FixedSizeListArray>
 where
-    T::Native: Float + Sum,
+    T::Native: Float + Sum + AsPrimitive<f32>,
 {
     let dim = fsl.value_length() as usize;
     let norm_arr = PrimitiveArray::<T>::from_iter_values(
@@ -172,7 +179,7 @@ where
             .as_primitive::<T>()
             .values()
             .chunks(dim)
-            .flat_map(normalize),
+            .flat_map(|chunk| normalize(chunk).0),
     );
 
     // Extract the field from the data type
@@ -364,7 +371,7 @@ mod tests {
         let v = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0];
         let l2_norm = v.iter().map(|&x| x.powi(2)).sum::<f32>().sqrt();
         assert_relative_eq!(l2_norm, 55_f32.sqrt());
-        let normalized = normalize(&v).collect::<Vec<f32>>();
+        let normalized = normalize(&v).0.collect::<Vec<f32>>();
         normalized
             .iter()
             .enumerate()

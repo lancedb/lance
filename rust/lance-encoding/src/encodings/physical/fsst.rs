@@ -381,7 +381,7 @@ mod tests {
     async fn test_fsst() {
         let test_cases = TestCases::default()
             .with_expected_encoding("fsst")
-            .with_file_version(LanceFileVersion::V2_1);
+            .with_min_file_version(LanceFileVersion::V2_1);
 
         // Generate data suitable for FSST (large strings, total size > 32KB)
         let arr = lance_datagen::gen_batch()

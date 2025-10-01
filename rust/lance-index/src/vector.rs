@@ -8,7 +8,7 @@ use std::any::Any;
 use std::fmt::Debug;
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
@@ -41,13 +41,15 @@ pub mod v3;
 use super::pb;
 use crate::metrics::MetricsCollector;
 use crate::{prefilter::PreFilter, Index};
-pub use residual::RESIDUAL_COLUMN;
 
 // TODO: Make these crate private once the migration from lance to lance-index is done.
 pub const DIST_COL: &str = "_distance";
 pub const DISTANCE_TYPE_KEY: &str = "distance_type";
 pub const INDEX_UUID_COLUMN: &str = "__index_uuid";
 pub const PART_ID_COLUMN: &str = "__ivf_part_id";
+pub const DIST_Q_C_COLUMN: &str = "__dist_q_c";
+// dist from vector to centroid
+pub const CENTROID_DIST_COLUMN: &str = "__centroid_dist";
 pub const PQ_CODE_COLUMN: &str = "__pq_code";
 pub const SQ_CODE_COLUMN: &str = "__sq_code";
 pub const LOSS_METADATA_KEY: &str = "_loss";
@@ -61,6 +63,10 @@ pub static VECTOR_RESULT_SCHEMA: LazyLock<arrow_schema::SchemaRef> = LazyLock::n
 
 pub static PART_ID_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true)
+});
+
+pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(CENTROID_DIST_COLUMN, arrow_schema::DataType::Float32, true)
 });
 
 /// Query parameters for the vector indices
@@ -102,6 +108,10 @@ pub struct Query {
 
     /// Whether to use an ANN index if available
     pub use_index: bool,
+
+    /// the distance between the query and the centroid
+    /// this is only used for IVF index with Rabit quantization
+    pub dist_q_c: f32,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
@@ -165,8 +175,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// that are most likely to contain the nearest neighbors (e.g. the closest
     /// partitions to the query vector).
     ///
-    /// The results should be in sorted order from closest to farthest.
-    fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
+    /// Return the partition ids and the distances between the query and the centroids,
+    /// the results should be in sorted order from closest to farthest.
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)>;
 
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;

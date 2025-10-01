@@ -17,7 +17,7 @@ use crate::{
     dataset::{
         builder::DatasetBuilder,
         commit_detached_transaction, commit_new_dataset, commit_transaction,
-        refs::Tags,
+        refs::Refs,
         transaction::{Operation, Transaction},
         ManifestWriteConfig, ReadParams,
     },
@@ -26,6 +26,7 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
+use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
@@ -370,12 +371,6 @@ impl<'a> CommitBuilder<'a> {
             operation=&transaction.operation.name()
         );
 
-        let tags = Tags::new(
-            object_store.clone(),
-            commit_handler.clone(),
-            base_path.clone(),
-        );
-
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
 
         match &self.dest {
@@ -386,20 +381,31 @@ impl<'a> CommitBuilder<'a> {
                 fragment_bitmap,
                 ..dataset.as_ref().clone()
             }),
-            WriteDestination::Uri(uri) => Ok(Dataset {
-                object_store,
-                base: base_path,
-                uri: uri.to_string(),
-                manifest: Arc::new(manifest),
-                manifest_location,
-                session,
-                commit_handler,
-                tags,
-                index_cache,
-                fragment_bitmap,
-                metadata_cache,
-                file_reader_options: None,
-            }),
+            WriteDestination::Uri(uri) => {
+                let refs = Refs::new(
+                    object_store.clone(),
+                    commit_handler.clone(),
+                    BranchLocation {
+                        path: base_path.clone(),
+                        uri: uri.to_string(),
+                        branch: manifest.branch.clone(),
+                    },
+                );
+                Ok(Dataset {
+                    object_store,
+                    base: base_path,
+                    uri: uri.to_string(),
+                    manifest: Arc::new(manifest),
+                    manifest_location,
+                    session,
+                    commit_handler,
+                    refs,
+                    index_cache,
+                    fragment_bitmap,
+                    metadata_cache,
+                    file_reader_options: None,
+                })
+            }
         }
     }
 
@@ -494,14 +500,15 @@ mod tests {
     use super::*;
 
     fn sample_fragment() -> Fragment {
+        let (major_version, minor_version) = LanceFileVersion::Stable.to_numbers();
         Fragment {
             id: 0,
             files: vec![DataFile {
                 path: "file.lance".to_string(),
                 fields: vec![0],
                 column_indices: vec![0],
-                file_major_version: 2,
-                file_minor_version: 0,
+                file_major_version: major_version,
+                file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
             }],

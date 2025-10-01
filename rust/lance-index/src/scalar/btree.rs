@@ -14,9 +14,9 @@ use super::{
     flat::FlatIndexMetadata, AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter,
     MetricsCollector, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
 };
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
-    pb,
     scalar::{
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
@@ -1218,7 +1218,8 @@ impl ScalarIndex for BTreeIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
     }
@@ -1243,7 +1244,8 @@ impl ScalarIndex for BTreeIndex {
         .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
     }
@@ -1980,7 +1982,8 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         )
         .await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BTreeIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
             index_version: BTREE_INDEX_VERSION,
         })
     }

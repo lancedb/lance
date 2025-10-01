@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BinaryHeap, ops::Range, sync::Arc};
+use std::{
+    collections::{BinaryHeap, VecDeque},
+    ops::Range,
+    sync::Arc,
+};
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, LoadedPage, NextDecodeTask, PageEncoding,
+        DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
         ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
         StructuralFieldScheduler, StructuralSchedulingJob,
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
-    repdef::RepDefBuilder,
+    repdef::{CompositeRepDefUnraveler, RepDefBuilder},
 };
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Fields};
@@ -35,6 +39,7 @@ struct StructuralSchedulingJobWithStatus<'a> {
     job: Box<dyn StructuralSchedulingJob + 'a>,
     rows_scheduled: u64,
     rows_remaining: u64,
+    ready_scan_lines: VecDeque<ScheduledScanLine>,
 }
 
 impl PartialEq for StructuralSchedulingJobWithStatus<'_> {
@@ -69,6 +74,7 @@ struct RepDefStructSchedulingJob<'a> {
     /// A min-heap whose key is the # of rows currently scheduled
     children: BinaryHeap<StructuralSchedulingJobWithStatus<'a>>,
     rows_scheduled: u64,
+    num_rows: u64,
 }
 
 impl<'a> RepDefStructSchedulingJob<'a> {
@@ -86,11 +92,13 @@ impl<'a> RepDefStructSchedulingJob<'a> {
                 job,
                 rows_scheduled: 0,
                 rows_remaining: num_rows,
+                ready_scan_lines: VecDeque::new(),
             })
             .collect::<BinaryHeap<_>>();
         Self {
             children,
             rows_scheduled: 0,
+            num_rows,
         }
     }
 }
@@ -99,22 +107,40 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>> {
+    ) -> Result<Vec<ScheduledScanLine>> {
+        if self.children.is_empty() {
+            // Special path for empty structs
+            if self.rows_scheduled == self.num_rows {
+                return Ok(Vec::new());
+            }
+            self.rows_scheduled = self.num_rows;
+            return Ok(vec![ScheduledScanLine {
+                decoders: Vec::new(),
+                rows_scheduled: self.num_rows,
+            }]);
+        }
+
         let mut decoders = Vec::new();
         let old_rows_scheduled = self.rows_scheduled;
         // Schedule as many children as we need to until we have scheduled at least one
         // complete row
         while old_rows_scheduled == self.rows_scheduled {
-            let mut next_child = self.children.pop().unwrap();
-            let scoped = context.push(next_child.col_name, next_child.col_idx);
-            let child_scan = next_child.job.schedule_next(scoped.context)?;
-            // next_child is the least-scheduled child and, if it's done, that
-            // means we are completely done.
-            if child_scan.is_none() {
-                return Ok(None);
+            if self.children.is_empty() {
+                // Early exit when schedulers are exhausted prematurely (TODO: does this still happen?)
+                return Ok(Vec::new());
             }
-            let child_scan = child_scan.unwrap();
-
+            let mut next_child = self.children.pop().unwrap();
+            if next_child.ready_scan_lines.is_empty() {
+                let scoped = context.push(next_child.col_name, next_child.col_idx);
+                let child_scans = next_child.job.schedule_next(scoped.context)?;
+                context = scoped.pop();
+                if child_scans.is_empty() {
+                    // Continue without pushing next_child back onto the heap (it is done)
+                    continue;
+                }
+                next_child.ready_scan_lines.extend(child_scans);
+            }
+            let child_scan = next_child.ready_scan_lines.pop_front().unwrap();
             trace!(
                 "Scheduled {} rows for child {}",
                 child_scan.rows_scheduled,
@@ -125,13 +151,12 @@ impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
             decoders.extend(child_scan.decoders);
             self.children.push(next_child);
             self.rows_scheduled = self.children.peek().unwrap().rows_scheduled;
-            context = scoped.pop();
         }
         let struct_rows_scheduled = self.rows_scheduled - old_rows_scheduled;
-        Ok(Some(ScheduledScanLine {
+        Ok(vec![ScheduledScanLine {
             decoders,
             rows_scheduled: struct_rows_scheduled,
-        }))
+        }])
     }
 }
 
@@ -153,7 +178,6 @@ pub struct StructuralStructScheduler {
 
 impl StructuralStructScheduler {
     pub fn new(children: Vec<Box<dyn StructuralFieldScheduler>>, child_fields: Fields) -> Self {
-        debug_assert!(!children.is_empty());
         Self {
             children,
             child_fields,
@@ -233,7 +257,7 @@ impl StructuralStructDecoder {
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() {
+                if field.is_packed_struct() || field.is_blob() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Box::new(decoder)
@@ -266,7 +290,7 @@ impl StructuralStructDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
-    fn accept_page(&mut self, mut child: LoadedPage) -> Result<()> {
+    fn accept_page(&mut self, mut child: LoadedPageShard) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();
         // This decoder is intended for one of our children
@@ -284,6 +308,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
             is_root: self.is_root,
+            num_rows,
         }))
     }
 
@@ -297,10 +322,18 @@ struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
     is_root: bool,
+    num_rows: u64,
 }
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        if self.children.is_empty() {
+            return Ok(DecodedArray {
+                array: Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
+                repdef: CompositeRepDefUnraveler::new(vec![]),
+            });
+        }
+
         let arrays = self
             .children
             .into_iter()
@@ -325,6 +358,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         } else {
             repdef.unravel_validity(length)
         };
+
         let array = StructArray::new(self.child_fields, children, validity);
         Ok(DecodedArray {
             array: Arc::new(array),
@@ -534,10 +568,9 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
-    use rstest::rstest;
 
     use crate::{
-        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        testing::{check_basic_random, check_round_trip_encoding_of_data, TestCases},
         version::LanceFileVersion,
     };
 
@@ -548,7 +581,7 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -598,7 +631,7 @@ mod tests {
             Some(rows_validity),
         );
 
-        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
 
         check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, HashMap::new()).await;
     }
@@ -628,7 +661,7 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
             HashMap::new(),
         )
         .await;
@@ -659,17 +692,14 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
             HashMap::new(),
         )
         .await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_struct_list(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
+    async fn test_struct_list() {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new(
                 "inner_list",
@@ -679,7 +709,7 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, version).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -688,7 +718,7 @@ mod tests {
         // make sure we support that
         let data_type = DataType::Struct(Fields::from(Vec::<Field>::default()));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -710,7 +740,7 @@ mod tests {
             Field::new("outer_binary", DataType::Binary, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

@@ -896,6 +896,11 @@ def test_fts_on_list(tmp_path):
     results = ds.to_table(full_text_query=PhraseQuery("lance database", "text"))
     assert results.num_rows == 2
 
+    # Append new data without fts index, then query.
+    ds.insert(data)
+    results = ds.to_table(full_text_query="lance")
+    assert results.num_rows == 6
+
 
 def test_fts_fuzzy_query(tmp_path):
     data = pa.table(
@@ -1021,7 +1026,7 @@ def test_fts_boost_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("text", "INVERTED", with_position=True)
     results = ds.to_table(
         full_text_query=BoostQuery(
             MatchQuery("puppy", "text"),
@@ -1029,6 +1034,22 @@ def test_fts_boost_query(tmp_path):
             negative_boost=0.5,
         ),
     )
+    assert results.num_rows == 3
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+        "frodo was a happy puppy",
+    }
+
+    # boost using phrase
+    results = ds.to_table(
+        full_text_query=BoostQuery(
+            MatchQuery("puppy", "text"),
+            PhraseQuery("a happy puppy", "text"),
+            negative_boost=0.5,
+        ),
+    )
+
     assert results.num_rows == 3
     assert set(results["text"].to_pylist()) == {
         "frodo was a puppy",
@@ -1077,7 +1098,7 @@ def test_fts_boolean_query(tmp_path):
     )
 
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("text", "INVERTED", with_position=True)
 
     query = MatchQuery("puppy", "text") & MatchQuery("happy", "text")
     results = ds.to_table(
@@ -1101,6 +1122,20 @@ def test_fts_boolean_query(tmp_path):
             [
                 (Occur.MUST, MatchQuery("puppy", "text")),
                 (Occur.MUST_NOT, MatchQuery("happy", "text")),
+            ]
+        ),
+    )
+    assert results.num_rows == 2
+    assert set(results["text"].to_pylist()) == {
+        "frodo was a puppy",
+        "frodo was a puppy with a tail",
+    }
+
+    results = ds.to_table(
+        full_text_query=BooleanQuery(
+            [
+                (Occur.MUST, MatchQuery("puppy", "text")),
+                (Occur.MUST_NOT, PhraseQuery("a happy puppy", "text")),
             ]
         ),
     )
@@ -1557,6 +1592,37 @@ def test_zonemap_index(tmp_path: Path):
     assert result.num_rows == 8142  # 51..8192
 
 
+def test_zonemap_zone_size(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"x": range(64 * 1024)}), tmp_path)
+
+    def get_bytes_read():
+        scan_stats = None
+
+        def scan_stats_callback(stats: lance.ScanStatistics):
+            nonlocal scan_stats
+            scan_stats = stats
+
+        ds.scanner(filter="x = 7", scan_stats_callback=scan_stats_callback).to_table()
+
+        return scan_stats.bytes_read
+
+    ds.create_scalar_index(
+        "x",
+        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 64}),
+    )
+
+    small_bytes_read = get_bytes_read()
+
+    ds.create_scalar_index(
+        "x",
+        IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 16 * 1024}),
+    )
+
+    large_bytes_read = get_bytes_read()
+
+    assert small_bytes_read < large_bytes_read
+
+
 def test_bloomfilter_index(tmp_path: Path):
     """Test create bloomfilter index"""
     tbl = pa.Table.from_arrays([pa.array([i for i in range(10000)])], names=["values"])
@@ -1675,26 +1741,19 @@ def test_null_handling(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
 
-    def check(has_index: bool):
+    def check():
         assert dataset.to_table(filter="x IS NULL").num_rows == 1
         assert dataset.to_table(filter="x IS NOT NULL").num_rows == 3
         assert dataset.to_table(filter="x > 0").num_rows == 3
         assert dataset.to_table(filter="x < 5").num_rows == 3
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
-        # Note: there is a bit of discrepancy here.  Datafusion does not consider
-        # NULL==NULL when doing an IN operation due to classic SQL shenanigans.
-        # We should decide at some point which behavior we want and make this
-        # consistent.
-        if has_index:
-            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 3
-        else:
-            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+        assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
 
-    check(False)
+    check()
     dataset.create_scalar_index("x", index_type="BITMAP")
-    check(True)
+    check()
     dataset.create_scalar_index("x", index_type="BTREE")
-    check(True)
+    check()
 
 
 def test_nan_handling(tmp_path: Path):
@@ -3105,6 +3164,26 @@ def test_backward_compatibility_no_fragment_ids(tmp_path):
 
     results = ds.scanner(full_text_query=search_word).to_table()
     assert results.num_rows > 0
+
+
+def test_backward_compatibility_changed_index_protos(tmp_path):
+    path = (
+        Path(__file__).parent.parent.parent.parent
+        / "test_data"
+        / "0.36.0"
+        / "btree_in_index_pkg.lance"
+    )
+    shutil.copytree(path, tmp_path, dirs_exist_ok=True)
+    ds = lance.dataset(tmp_path)
+
+    indices = ds.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["name"] == "x_idx"
+    assert indices[0]["type"] == "BTree"
+
+    results = ds.scanner(filter="x = 100").to_table()
+    assert results.num_rows == 1
+    assert results.column("x").to_pylist() == [100]
 
 
 def test_distribute_btree_index_build(tmp_path):

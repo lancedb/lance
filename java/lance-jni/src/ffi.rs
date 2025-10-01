@@ -56,6 +56,9 @@ pub trait JNIEnvExt {
     /// Get Option<bool> from Java Optional<Boolean>.
     fn get_boolean_opt(&mut self, obj: &JObject) -> Result<Option<bool>>;
 
+    /// Get Option<f32> from Java Optional<Float>.
+    fn get_f32_opt(&mut self, obj: &JObject) -> Result<Option<f32>>;
+
     /// Get Option<&[u8]> from Java Optional<ByteBuffer>.
     fn get_bytes_opt(&mut self, obj: &JObject) -> Result<Option<&[u8]>>;
 
@@ -218,6 +221,16 @@ impl JNIEnvExt for JNIEnv<'_> {
             let boolean_obj = env.call_method(java_boolean_obj, "booleanValue", "()Z", &[])?;
             let boolean_value = boolean_obj.z()?;
             Ok(boolean_value)
+        })
+    }
+
+    fn get_f32_opt(&mut self, obj: &JObject) -> Result<Option<f32>> {
+        self.get_optional(obj, |env, inner_obj| {
+            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
+            let java_float_obj = java_obj_gen.l()?;
+            let float_obj = env.call_method(java_float_obj, "floatValue", "()F", &[])?;
+            let float_value = float_obj.f()?;
+            Ok(float_value)
         })
     }
 

@@ -47,7 +47,8 @@ use crate::constants::{
     PACKED_STRUCT_META_KEY,
 };
 
-use lance_core::datatypes::{Field, BLOB_DESC_FIELD, BLOB_META_KEY};
+use lance_arrow::BLOB_META_KEY;
+use lance_core::datatypes::{Field, BLOB_DESC_FIELD};
 use lance_core::{Error, Result};
 
 /// An encoded array
@@ -114,19 +115,14 @@ pub struct CoreFieldEncodingStrategy {
     pub version: LanceFileVersion,
 }
 
-// For some reason clippy has a false negative and thinks this can be derived but
-// it can't because ArrayEncodingStrategy has no default implementation
-#[allow(clippy::derivable_impls)]
-impl Default for CoreFieldEncodingStrategy {
-    fn default() -> Self {
+impl CoreFieldEncodingStrategy {
+    pub fn new(version: LanceFileVersion) -> Self {
         Self {
-            array_encoding_strategy: Arc::<CoreArrayEncodingStrategy>::default(),
-            version: LanceFileVersion::default(),
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy::new(version)),
+            version,
         }
     }
-}
 
-impl CoreFieldEncodingStrategy {
     fn is_primitive_type(data_type: &DataType) -> bool {
         matches!(
             data_type,
@@ -272,7 +268,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
 
 /// The core array encoding strategy is a set of basic encodings that
 /// are generally applicable in most scenarios.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CoreArrayEncodingStrategy {
     pub version: LanceFileVersion,
 }
@@ -283,6 +279,12 @@ const BINARY_DATATYPES: [DataType; 4] = [
     DataType::Utf8,
     DataType::LargeUtf8,
 ];
+
+impl CoreArrayEncodingStrategy {
+    fn new(version: LanceFileVersion) -> Self {
+        Self { version }
+    }
+}
 
 impl CoreArrayEncodingStrategy {
     fn can_use_fsst(data_type: &DataType, data_size: u64, version: LanceFileVersion) -> bool {

@@ -19,6 +19,7 @@ use crate::{
 };
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
+use arrow_array::Float32Array;
 use arrow_array::{
     cast::AsArray,
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type},
@@ -46,6 +47,7 @@ use lance_file::{
 };
 use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::KMeansParams;
@@ -467,6 +469,24 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?;
         }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
         // IVF_HNSW_FLAT
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
@@ -532,6 +552,13 @@ pub(crate) async fn optimize_vector_indices_v2(
             .await?
             .build()
             .await?;
+        }
+        (sub_index_type, quantization_type) => {
+            unimplemented!(
+                "unsupported index type: {}, {}",
+                sub_index_type,
+                quantization_type
+            )
         }
     }
 
@@ -712,8 +739,6 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Write the metadata of quantizer
     let quantization_metadata = match &quantizer {
-        Quantizer::Flat(_) => None,
-        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -727,7 +752,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
                 ..Default::default()
             })
         }
-        Quantizer::Scalar(_) => None,
+        _ => None,
     };
 
     aux_writer.add_metadata(
@@ -923,7 +948,7 @@ impl VectorIndex for IVFIndex {
     /// Internal API with no stability guarantees.
     ///
     /// Assumes the query vector is normalized if the metric type is cosine.
-    fn find_partitions(&self, query: &Query) -> Result<UInt32Array> {
+    fn find_partitions(&self, query: &Query) -> Result<(UInt32Array, Float32Array)> {
         let mt = if self.metric_type == MetricType::Cosine {
             MetricType::L2
         } else {
@@ -1676,8 +1701,6 @@ async fn write_ivf_hnsw_file(
 
     // For PQ, we need to store the codebook
     let quantization_metadata = match &quantizer {
-        Quantizer::Flat(_) => None,
-        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -1691,7 +1714,7 @@ async fn write_ivf_hnsw_file(
                 ..Default::default()
             })
         }
-        Quantizer::Scalar(_) => None,
+        _ => None,
     };
 
     aux_writer.add_metadata(
@@ -2069,8 +2092,9 @@ mod tests {
                     refine_factor: None,
                     metric_type: MetricType::L2,
                     use_index: true,
+                    dist_q_c: 0.0,
                 };
-                let partitions = index.find_partitions(&query).unwrap();
+                let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;
                 let search_result = index
                     .search_in_partition(
@@ -2259,7 +2283,7 @@ mod tests {
         // After building the index file, we need to register the index metadata
         // so that the dataset can find it when we try to open it
         let field = dataset.schema().field(WellKnownIvfPqData::COLUMN).unwrap();
-        let index_meta = lance_table::format::Index {
+        let index_meta = lance_table::format::IndexMetadata {
             uuid,
             dataset_version: dataset.version().version,
             fields: vec![field.id],
@@ -2304,7 +2328,7 @@ mod tests {
 
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
-        let index_meta = lance_table::format::Index {
+        let index_meta = lance_table::format::IndexMetadata {
             uuid,
             dataset_version: 0,
             fields: Vec::new(),
@@ -2363,7 +2387,7 @@ mod tests {
             .schema()
             .field(WellKnownIvfPqData::COLUMN)
             .unwrap();
-        let new_index_meta = lance_table::format::Index {
+        let new_index_meta = lance_table::format::IndexMetadata {
             uuid: new_uuid,
             dataset_version: dataset_mut.version().version,
             fields: vec![field.id],

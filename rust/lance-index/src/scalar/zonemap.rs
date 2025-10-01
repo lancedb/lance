@@ -12,6 +12,7 @@
 //! false positives that require rechecking.
 //!
 //!
+use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -19,7 +20,7 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
 };
-use crate::{pb, Any};
+use crate::Any;
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
 use futures::TryStreamExt;
@@ -606,7 +607,8 @@ impl ScalarIndex for ZoneMapIndex {
         combined_builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
+                .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })
     }
@@ -1001,7 +1003,8 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             })?;
         Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::ZoneMapIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
+                .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
         })
     }

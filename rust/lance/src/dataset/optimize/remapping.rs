@@ -13,7 +13,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::Error;
 use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
 use lance_index::DatasetIndexExt;
-use lance_table::format::{Fragment, Index};
+use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -83,26 +83,26 @@ impl IndexRemapperOptions for IgnoreRemap {
     }
 }
 
-/// Iterator that yields row_ids that are in the given fragments but not in
-/// the given row_ids iterator.
-struct MissingIds<'a, I: Iterator<Item = u64>> {
-    row_ids: I,
-    expected_row_id: u64,
+/// Iterator that yields row_addrs that are in the given fragments but not in
+/// the given row_addrs iterator.
+struct MissingAddrs<'a, I: Iterator<Item = u64>> {
+    row_addrs: I,
+    expected_row_addr: u64,
     current_fragment_idx: usize,
     last: Option<u64>,
     fragments: &'a Vec<FragDigest>,
 }
 
-impl<'a, I: Iterator<Item = u64>> MissingIds<'a, I> {
-    /// row_ids must be sorted in the same order in which the rows would be
+impl<'a, I: Iterator<Item = u64>> MissingAddrs<'a, I> {
+    /// row_addrs must be sorted in the same order in which the rows would be
     /// found by scanning fragments in the order they are presented in.
     /// fragments is not guaranteed to be sorted by id.
-    fn new(row_ids: I, fragments: &'a Vec<FragDigest>) -> Self {
+    fn new(row_addrs: I, fragments: &'a Vec<FragDigest>) -> Self {
         assert!(!fragments.is_empty());
         let first_frag = &fragments[0];
         Self {
-            row_ids,
-            expected_row_id: first_frag.id * RowAddress::FRAGMENT_SIZE,
+            row_addrs,
+            expected_row_addr: first_frag.id * RowAddress::FRAGMENT_SIZE,
             current_fragment_idx: 0,
             last: None,
             fragments,
@@ -110,7 +110,7 @@ impl<'a, I: Iterator<Item = u64>> MissingIds<'a, I> {
     }
 }
 
-impl<I: Iterator<Item = u64>> Iterator for MissingIds<'_, I> {
+impl<I: Iterator<Item = u64>> Iterator for MissingAddrs<'_, I> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -122,53 +122,54 @@ impl<I: Iterator<Item = u64>> Iterator for MissingIds<'_, I> {
                 self.last = None;
                 last
             } else {
-                // If we've exhausted row_ids but we aren't done then use 0 which
-                // is guaranteed to not match because that would mean that row_ids
+                // If we've exhausted row_addrs but we aren't done then use 0 which
+                // is guaranteed to not match because that would mean that row_addrs
                 // was empty and we check for that earlier.
-                self.row_ids.next().unwrap_or(0)
+                self.row_addrs.next().unwrap_or(0)
             };
 
             let current_fragment = &self.fragments[self.current_fragment_idx];
             let frag = val / RowAddress::FRAGMENT_SIZE;
-            let expected_row_id = self.expected_row_id;
-            self.expected_row_id += 1;
+            let expected_row_addr = self.expected_row_addr;
+            self.expected_row_addr += 1;
 
             let current_physical_rows = current_fragment.physical_rows;
-            if (self.expected_row_id % RowAddress::FRAGMENT_SIZE) == current_physical_rows as u64 {
+            if (self.expected_row_addr % RowAddress::FRAGMENT_SIZE) == current_physical_rows as u64
+            {
                 self.current_fragment_idx += 1;
                 if self.current_fragment_idx < self.fragments.len() {
-                    self.expected_row_id =
+                    self.expected_row_addr =
                         self.fragments[self.current_fragment_idx].id * RowAddress::FRAGMENT_SIZE;
                 }
             }
             if frag != current_fragment.id {
                 self.last = Some(val);
-                return Some(expected_row_id);
+                return Some(expected_row_addr);
             }
-            if val != expected_row_id {
+            if val != expected_row_addr {
                 self.last = Some(val);
-                return Some(expected_row_id);
+                return Some(expected_row_addr);
             }
         }
     }
 }
 
-pub fn transpose_row_ids(
-    row_ids: RoaringTreemap,
+pub fn transpose_row_addrs(
+    row_addrs: RoaringTreemap,
     old_fragments: &[Fragment],
     new_fragments: &[Fragment],
 ) -> HashMap<u64, Option<u64>> {
     let old_frag_digests: Vec<FragDigest> = old_fragments.iter().map(|frag| frag.into()).collect();
     let new_frag_digests: Vec<FragDigest> = new_fragments.iter().map(|frag| frag.into()).collect();
-    transpose_row_ids_from_digest(row_ids, &old_frag_digests, &new_frag_digests)
+    transpose_row_ids_from_digest(row_addrs, &old_frag_digests, &new_frag_digests)
 }
 
 pub fn transpose_row_ids_from_digest(
-    row_ids: RoaringTreemap,
+    row_addrs: RoaringTreemap,
     old_fragments: &Vec<FragDigest>,
     new_fragments: &[FragDigest],
 ) -> HashMap<u64, Option<u64>> {
-    let new_ids = new_fragments.iter().flat_map(|frag| {
+    let new_addrs = new_fragments.iter().flat_map(|frag| {
         (0..frag.physical_rows as u32).map(|offset| {
             Some(u64::from(RowAddress::new_from_parts(
                 frag.id as u32,
@@ -176,20 +177,20 @@ pub fn transpose_row_ids_from_digest(
             )))
         })
     });
-    // The hashmap will have an entry for each row id to map plus all rows that
+    // The hashmap will have an entry for each row addr to map plus all rows that
     // were deleted.
-    let expected_size = row_ids.len() as usize
+    let expected_size = row_addrs.len() as usize
         + old_fragments
             .iter()
             .map(|frag| frag.num_deleted_rows)
             .sum::<usize>();
-    // We expect row ids to be unique, so we should already not get many collisions.
+    // We expect row addrs to be unique, so we should already not get many collisions.
     // The default hasher is designed to be resistance to DoS attacks, which is
     // more than we need for this use case.
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::with_capacity(expected_size);
-    mapping.extend(row_ids.iter().zip(new_ids));
-    MissingIds::new(row_ids.into_iter(), old_fragments).for_each(|id| {
-        mapping.insert(id, None);
+    mapping.extend(row_addrs.iter().zip(new_addrs));
+    MissingAddrs::new(row_addrs.into_iter(), old_fragments).for_each(|addr| {
+        mapping.insert(addr, None);
     });
     mapping
 }
@@ -219,7 +220,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         return Ok(());
     }
 
-    // Sequentially apply the row id maps from oldest to latest
+    // Sequentially apply the row addr maps from oldest to latest
     let mut curr_index_id = *index_id;
     for (i, row_id_map) in frag_reuse_index.row_id_maps.iter().enumerate() {
         let version = &frag_reuse_index.details.versions[i];
@@ -273,7 +274,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
 
             let new_index_meta = match remap_result {
                 RemapResult::Drop => continue,
-                RemapResult::Keep(new_id) => Index {
+                RemapResult::Keep(new_id) => IndexMetadata {
                     uuid: new_id,
                     name: curr_index_meta.name.clone(),
                     fields: curr_index_meta.fields.clone(),
@@ -284,7 +285,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     created_at: curr_index_meta.created_at,
                     base_id: None,
                 },
-                RemapResult::Remapped(remapped_index) => Index {
+                RemapResult::Remapped(remapped_index) => IndexMetadata {
                     uuid: remapped_index.new_id,
                     name: curr_index_meta.name.clone(),
                     fields: curr_index_meta.fields.clone(),
@@ -391,7 +392,7 @@ mod tests {
             .into_iter()
             .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into());
 
-        let missing = MissingIds::new(rows, &frags).collect::<Vec<_>>();
+        let missing = MissingAddrs::new(rows, &frags).collect::<Vec<_>>();
         let expected_missing = [(0, 0), (0, 2), (3, 1)]
             .into_iter()
             .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into())
@@ -424,7 +425,7 @@ mod tests {
         ];
 
         // Written as pairs of (fragment_id, offset)
-        let row_ids = vec![
+        let row_addrs = vec![
             (0, 1),
             (0, 3),
             (0, 4),
@@ -434,10 +435,10 @@ mod tests {
             (1, 1),
             (1, 2),
         ];
-        let row_ids = row_ids
+        let row_addrs = row_addrs
             .into_iter()
             .map(|(frag, offset)| RowAddress::new_from_parts(frag, offset).into());
-        let result = MissingIds::new(row_ids, &fragments).collect::<Vec<_>>();
+        let result = MissingAddrs::new(row_addrs, &fragments).collect::<Vec<_>>();
 
         let expected = vec![(0, 0), (0, 2), (3, 1)];
         let expected = expected

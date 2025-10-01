@@ -9,9 +9,10 @@ use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{cache::LanceCache, Error, Result};
 use snafu::location;
 
+use crate::pb;
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
-    pb,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
         expression::ScalarQueryParser, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
@@ -195,13 +196,13 @@ impl ScalarIndexPluginRegistry {
         let mut registry = Self {
             plugins: HashMap::new(),
         };
-        registry.add_plugin::<pb::BTreeIndexDetails, BTreeIndexPlugin>();
-        registry.add_plugin::<pb::BitmapIndexDetails, BitmapIndexPlugin>();
-        registry.add_plugin::<pb::LabelListIndexDetails, LabelListIndexPlugin>();
-        registry.add_plugin::<pb::NGramIndexDetails, NGramIndexPlugin>();
-        registry.add_plugin::<pb::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
+        registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
+        registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
+        registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
+        registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
+        registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
-        registry.add_plugin::<pb::InvertedIndexDetails, InvertedIndexPlugin>();
+        registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
 
         let registry = Arc::new(registry);

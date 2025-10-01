@@ -4,18 +4,20 @@
 use std::sync::LazyLock;
 
 /// A level of SIMD support for some feature
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimdSupport {
     None,
     Neon,
     Sse,
     Avx2,
     Avx512,
+    Avx512FP16,
     Lsx,
     Lasx,
 }
 
-/// Support for FP16 SIMD operations
-pub static FP16_SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
+/// Support for SIMD operations
+pub static SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
     #[cfg(all(target_arch = "aarch64", any(target_os = "ios", target_os = "tvos")))]
     {
         // AArch64 iOS/tvOS has NEON; fp16 arithmetic is available on modern targets.
@@ -34,8 +36,12 @@ pub static FP16_SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if x86::has_avx512_f16_support() {
-            SimdSupport::Avx512
+        if x86::has_avx512() {
+            if x86::has_avx512_f16_support() {
+                SimdSupport::Avx512FP16
+            } else {
+                SimdSupport::Avx512
+            }
         } else if is_x86_feature_detected!("avx2") {
             SimdSupport::Avx2
         } else {
@@ -65,7 +71,7 @@ mod x86 {
 
     pub fn has_avx512_f16_support() -> bool {
         // this macro does many OS checks/etc. to determine if allowed to use AVX512
-        if !is_x86_feature_detected!("avx512f") {
+        if !has_avx512() {
             return false;
         }
 
@@ -74,6 +80,10 @@ mod x86 {
         // https://www.intel.com/content/dam/develop/external/us/en/documents/architecture-instruction-set-extensions-programming-reference.pdf
         let ext_cpuid_result = unsafe { __cpuid(7) };
         check_flag(ext_cpuid_result.edx as usize, 23)
+    }
+
+    pub fn has_avx512() -> bool {
+        is_x86_feature_detected!("avx512f")
     }
 }
 

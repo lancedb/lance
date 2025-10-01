@@ -383,7 +383,9 @@ impl FileWriter {
     /// flushed to the file (some data may be in the data cache or the I/O cache)
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         debug!(
-            "write_batch called with {} bytes of data",
+            "write_batch called with {} rows, {} columns, and {} bytes of data",
+            batch.num_rows(),
+            batch.num_columns(),
             batch.get_array_memory_size()
         );
         self.ensure_initialized(batch)?;
@@ -857,6 +859,8 @@ mod tests {
 
         let options = FileWriterOptions {
             max_page_bytes: Some(1024 * 1024), // 1MB
+            // This is a 2.0 only test because 2.1+ splits large pages on read instead of write
+            format_version: Some(LanceFileVersion::V2_0),
             ..Default::default()
         };
 

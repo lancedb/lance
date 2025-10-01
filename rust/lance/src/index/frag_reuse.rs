@@ -11,7 +11,7 @@ use lance_index::frag_reuse::{
 use lance_index::DatasetIndexExt;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
-use lance_table::format::Index;
+use lance_table::format::IndexMetadata;
 use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::location;
@@ -24,7 +24,7 @@ use uuid::Uuid;
 /// Load fragment reuse index details from index metadata
 pub async fn load_frag_reuse_index_details(
     dataset: &Dataset,
-    index: &Index,
+    index: &IndexMetadata,
 ) -> lance_core::Result<Arc<FragReuseIndexDetails>> {
     let details_any = index.index_details.clone();
     if details_any.is_none()
@@ -101,7 +101,7 @@ pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
     new_fragment_bitmap: RoaringBitmap,
-) -> lance_core::Result<Index> {
+) -> lance_core::Result<IndexMetadata> {
     let new_version = FragReuseVersion {
         dataset_version: dataset.manifest.version,
         groups: frag_reuse_groups,
@@ -137,10 +137,10 @@ pub(crate) async fn build_new_frag_reuse_index(
 
 pub(crate) async fn build_frag_reuse_index_metadata(
     dataset: &Dataset,
-    index_meta: Option<&Index>,
+    index_meta: Option<&IndexMetadata>,
     new_index_details: FragReuseIndexDetails,
     new_fragment_bitmap: RoaringBitmap,
-) -> lance_core::Result<Index> {
+) -> lance_core::Result<IndexMetadata> {
     let index_id = uuid::Uuid::new_v4();
     let new_index_details_proto = InlineContent::from(&new_index_details);
     let proto = if new_index_details_proto.encoded_len() > 204800 {
@@ -167,7 +167,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         }
     };
 
-    Ok(Index {
+    Ok(IndexMetadata {
         uuid: index_id,
         name: FRAG_REUSE_INDEX_NAME.to_string(),
         fields: vec![],

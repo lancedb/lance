@@ -6,16 +6,18 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray, UInt64Array};
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
-use futures::future::BoxFuture;
-use lance_core::{datatypes::Field, Error, Result};
+use futures::{future::BoxFuture, FutureExt};
+use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,
     constants::PACKED_STRUCT_META_KEY,
-    encoder::{EncodeTask, EncodedColumn, FieldEncoder, OutOfLineBuffers},
+    decoder::PageEncoding,
+    encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     encodings::logical::primitive::PrimitiveStructuralEncoder,
-    repdef::RepDefBuilder,
+    format::ProtobufUtils21,
+    repdef::{DefinitionInterpretation, RepDefBuilder},
 };
 
 /// Blob structural encoder - stores large binary data in external buffers
@@ -26,6 +28,8 @@ use crate::{
 pub struct BlobStructuralEncoder {
     // Encoder for the descriptors (position/size struct)
     descriptor_encoder: Box<dyn FieldEncoder>,
+    // Set when we first see data
+    def_meaning: Option<Arc<[DefinitionInterpretation]>>,
 }
 
 impl BlobStructuralEncoder {
@@ -60,7 +64,43 @@ impl BlobStructuralEncoder {
             Arc::new(HashMap::new()),
         )?);
 
-        Ok(Self { descriptor_encoder })
+        Ok(Self {
+            descriptor_encoder,
+            def_meaning: None,
+        })
+    }
+
+    fn wrap_tasks(
+        tasks: Vec<EncodeTask>,
+        def_meaning: Arc<[DefinitionInterpretation]>,
+    ) -> Vec<EncodeTask> {
+        tasks
+            .into_iter()
+            .map(|task| {
+                let def_meaning = def_meaning.clone();
+                task.then(|encoded_page| async move {
+                    let encoded_page = encoded_page?;
+
+                    let PageEncoding::Structural(inner_layout) = encoded_page.description else {
+                        return Err(Error::Internal {
+                            message: "Expected inner encoding to return structural layout"
+                                .to_string(),
+                            location: location!(),
+                        });
+                    };
+
+                    let wrapped = ProtobufUtils21::blob_layout(inner_layout, &def_meaning);
+                    Ok(EncodedPage {
+                        column_idx: encoded_page.column_idx,
+                        data: encoded_page.data,
+                        description: PageEncoding::Structural(wrapped),
+                        num_rows: encoded_page.num_rows,
+                        row_number: encoded_page.row_number,
+                    })
+                })
+                .boxed()
+            })
+            .collect::<Vec<_>>()
     }
 }
 
@@ -69,10 +109,16 @@ impl FieldEncoder for BlobStructuralEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        repdef: RepDefBuilder,
+        mut repdef: RepDefBuilder,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
+        if let Some(validity) = array.nulls() {
+            repdef.add_validity_bitmap(validity.clone());
+        } else {
+            repdef.add_no_null(array.len());
+        }
+
         // Convert input array to LargeBinary
         let binary_array = array
             .as_binary_opt::<i64>()
@@ -81,15 +127,34 @@ impl FieldEncoder for BlobStructuralEncoder {
                 location: location!(),
             })?;
 
+        let repdef = RepDefBuilder::serialize(vec![repdef]);
+
+        let rep = repdef.repetition_levels.as_ref();
+        let def = repdef.definition_levels.as_ref();
+        let def_meaning: Arc<[DefinitionInterpretation]> = repdef.def_meaning.into();
+
+        if self.def_meaning.is_none() {
+            self.def_meaning = Some(def_meaning.clone());
+        } else {
+            debug_assert_eq!(self.def_meaning.as_ref().unwrap(), &def_meaning);
+        }
+
         // Collect positions and sizes
         let mut positions = Vec::with_capacity(binary_array.len());
         let mut sizes = Vec::with_capacity(binary_array.len());
 
         for i in 0..binary_array.len() {
             if binary_array.is_null(i) {
-                // Null values are handled in the structural layer
-                // We just need placeholders here
-                positions.push(0);
+                // Null values are smuggled into the positions array
+
+                // If we have null values we must have definition levels
+                let mut repdef = (def.expect_ok()?[i] as u64) << 16;
+                if let Some(rep) = rep {
+                    repdef += rep[i] as u64;
+                }
+
+                debug_assert_ne!(repdef, 0);
+                positions.push(repdef);
                 sizes.push(0);
             } else {
                 let value = binary_array.value(i);
@@ -116,21 +181,32 @@ impl FieldEncoder for BlobStructuralEncoder {
                 ArrowField::new("size", DataType::UInt64, false),
             ]),
             vec![position_array as ArrayRef, size_array as ArrayRef],
-            binary_array.nulls().cloned(), // Pass through null buffer
+            None, // Descriptors are never null
         ));
 
         // Delegate to descriptor encoder
-        self.descriptor_encoder.maybe_encode(
+        let encode_tasks = self.descriptor_encoder.maybe_encode(
             descriptor_array,
             external_buffers,
-            repdef,
+            RepDefBuilder::default(),
             row_number,
             num_rows,
-        )
+        )?;
+
+        Ok(Self::wrap_tasks(encode_tasks, def_meaning))
     }
 
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
-        self.descriptor_encoder.flush(external_buffers)
+        let encode_tasks = self.descriptor_encoder.flush(external_buffers)?;
+
+        // Use the cached def meaning.  If we haven't seen any data yet then we can just use a dummy
+        // value (not clear there would be any encode tasks in that case)
+        let def_meaning = self
+            .def_meaning
+            .clone()
+            .unwrap_or_else(|| Arc::new([DefinitionInterpretation::AllValidItem]));
+
+        Ok(Self::wrap_tasks(encode_tasks, def_meaning))
     }
 
     fn finish(
@@ -173,10 +249,7 @@ mod tests {
     async fn test_blob_encoding_simple() {
         let field = Field::try_from(
             ArrowField::new("blob_field", DataType::LargeBinary, true).with_metadata(
-                HashMap::from([(
-                    lance_core::datatypes::BLOB_META_KEY.to_string(),
-                    "true".to_string(),
-                )]),
+                HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]),
             ),
         )
         .unwrap();
@@ -222,10 +295,8 @@ mod tests {
     #[tokio::test]
     async fn test_blob_round_trip() {
         // Test round-trip encoding with blob metadata
-        let blob_metadata = HashMap::from([(
-            lance_core::datatypes::BLOB_META_KEY.to_string(),
-            "true".to_string(),
-        )]);
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
 
         // Create test data
         let val1: &[u8] = &vec![1u8; 1024]; // 1KB

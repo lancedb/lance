@@ -61,7 +61,7 @@ use {
     std::time::{Duration, SystemTime},
 };
 
-use crate::format::{is_detached_version, Index, Manifest};
+use crate::format::{is_detached_version, IndexMetadata, Manifest};
 
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
@@ -179,7 +179,7 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
 pub type ManifestWriter = for<'a> fn(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
 ) -> BoxFuture<'a, Result<WriteResult>>;
 
@@ -547,7 +547,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -807,7 +807,7 @@ impl CommitHandler for UnsafeCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -873,7 +873,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -923,7 +923,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -952,7 +952,7 @@ impl CommitHandler for RenameCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1010,7 +1010,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,

@@ -3,6 +3,7 @@
 
 //! Lance data types, [Schema] and [Field]
 
+use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
@@ -21,11 +22,10 @@ pub use field::{
     Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions, StorageClass,
     LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
 };
-pub use schema::{OnMissing, Projectable, Projection, Schema};
-
-// NOTE: BLOB_META_KEY is used in lance-core's field.rs, so it must stay here
-// to avoid circular dependency with lance-encoding
-pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+pub use schema::{
+    escape_field_path_for_project, format_field_path, parse_field_path, FieldRef, OnMissing,
+    Projectable, Projection, Schema,
+};
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
@@ -34,12 +34,14 @@ pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     ])
 });
 
+pub static BLOB_DESC_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_DESC_FIELDS.clone()));
+
 pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
-    ArrowField::new(
-        "description",
-        DataType::Struct(BLOB_DESC_FIELDS.clone()),
-        true,
-    )
+    ArrowField::new("description", BLOB_DESC_TYPE.clone(), true).with_metadata(HashMap::from([(
+        lance_arrow::BLOB_META_KEY.to_string(),
+        "true".to_string(),
+    )]))
 });
 
 pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
@@ -154,7 +156,7 @@ impl TryFrom<&DataType> for LogicalType {
             },
             DataType::FixedSizeList(field, len) => {
                 if is_bfloat16_field(field) {
-                    // Don't want to directly use `blfoat16`, in case a built-in type is added
+                    // Don't want to directly use `bfloat16`, in case a built-in type is added
                     // that isn't identical to our extension type.
                     format!("fixed_size_list:lance.bfloat16:{}", *len)
                 } else {

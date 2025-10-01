@@ -18,11 +18,12 @@ import pyarrow.parquet as pq
 from lance.file import LanceFileReader, LanceFileWriter
 
 if __name__ == "__main__":
-        # Define the directory containing the Parquet files
-    parquet_dir = os.path.join(os.getcwd(), 'test_files')
+    print("Starting test_write_read.py")
+    # Define the directory containing the Parquet files
+    parquet_dir = os.path.join(os.getcwd(), "test_files")
 
-    # Find all Parquet files 
-    parquet_files = glob.glob(os.path.join(parquet_dir, '*.parquet'))
+    # Find all Parquet files
+    parquet_files = glob.glob(os.path.join(parquet_dir, "*.parquet"))
 
     # Fail if no Parquet files are available for testing
     if len(parquet_files) == 0:
@@ -30,6 +31,7 @@ if __name__ == "__main__":
 
     # Process each Parquet file
     for file_path in parquet_files:
+        print(f"Processing file: {file_path}")
         try:
             # Define the corresponding Lance file path
             lance_file_path = os.path.splitext(file_path)[0] + ".lance"
@@ -37,16 +39,26 @@ if __name__ == "__main__":
             # Read the Parquet file into a PyArrow table
             parquet_table = pq.read_table(file_path)
 
+            print(f"Read in table with {parquet_table.num_rows} rows")
+
             # Write the table to a Lance file
             with LanceFileWriter(lance_file_path, version="2.0") as writer:
                 writer.write_batch(parquet_table)
 
+            print(f"Wrote to Lance file to {lance_file_path}")
+
             # Read the Lance file back into a table
             tab_lance = LanceFileReader(lance_file_path).read_all().to_table()
 
+            print(f"Read back from Lance file with {tab_lance.num_rows} rows")
+
             # Check if the tables are equal
             assert tab_lance == parquet_table
-            print(f"Table read from Lance is the same as table read from Parquet for file: {file_path}")
+            print(
+                f"Table read from Lance is the same as table read from Parquet for file: {file_path}"
+            )
 
         except Exception:
-            raise AssertionError(f"Table read from Lance is not the same as table read from Parquet for file: {file_path}")
+            raise AssertionError(
+                f"Table read from Lance is not the same as table read from Parquet for file: {file_path}"
+            )

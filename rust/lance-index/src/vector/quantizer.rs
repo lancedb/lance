@@ -12,7 +12,8 @@ use arrow_schema::Field;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
-use lance_core::{Error, Result};
+use lance_arrow::RecordBatchExt;
+use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -24,6 +25,7 @@ use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 use crate::frag_reuse::FragReuseIndex;
+use crate::vector::bq::builder::RabitQuantizer;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
 pub trait Quantization:
@@ -56,12 +58,17 @@ pub trait Quantization:
     fn metadata(&self, _: Option<QuantizationMetadata>) -> Self::Metadata;
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer>;
     fn field(&self) -> Field;
+    fn extra_fields(&self) -> Vec<Field> {
+        vec![]
+    }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantizationType {
     Flat,
     Product,
     Scalar,
+    Rabit,
 }
 
 impl FromStr for QuantizationType {
@@ -72,6 +79,7 @@ impl FromStr for QuantizationType {
             "FLAT" => Ok(Self::Flat),
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
+            "RABIT" => Ok(Self::Rabit),
             _ => Err(Error::Index {
                 message: format!("Unknown quantization type: {}", s),
                 location: location!(),
@@ -86,6 +94,7 @@ impl std::fmt::Display for QuantizationType {
             Self::Flat => write!(f, "FLAT"),
             Self::Product => write!(f, "PQ"),
             Self::Scalar => write!(f, "SQ"),
+            Self::Rabit => write!(f, "RQ"),
         }
     }
 }
@@ -114,6 +123,7 @@ pub enum Quantizer {
     FlatBin(FlatBinQuantizer),
     Product(ProductQuantizer),
     Scalar(ScalarQuantizer),
+    Rabit(RabitQuantizer),
 }
 
 impl Quantizer {
@@ -123,6 +133,7 @@ impl Quantizer {
             Self::FlatBin(fq) => fq.code_dim(),
             Self::Product(pq) => pq.code_dim(),
             Self::Scalar(sq) => sq.code_dim(),
+            Self::Rabit(rq) => rq.code_dim(),
         }
     }
 
@@ -132,6 +143,7 @@ impl Quantizer {
             Self::FlatBin(fq) => fq.column(),
             Self::Product(pq) => pq.column(),
             Self::Scalar(sq) => sq.column(),
+            Self::Rabit(rq) => rq.column(),
         }
     }
 
@@ -141,6 +153,7 @@ impl Quantizer {
             Self::FlatBin(_) => FlatBinQuantizer::metadata_key(),
             Self::Product(_) => ProductQuantizer::metadata_key(),
             Self::Scalar(_) => ScalarQuantizer::metadata_key(),
+            Self::Rabit(_) => RabitQuantizer::metadata_key(),
         }
     }
 
@@ -150,6 +163,7 @@ impl Quantizer {
             Self::FlatBin(_) => QuantizationType::Flat,
             Self::Product(_) => QuantizationType::Product,
             Self::Scalar(_) => QuantizationType::Scalar,
+            Self::Rabit(_) => QuantizationType::Rabit,
         }
     }
 
@@ -159,6 +173,7 @@ impl Quantizer {
             Self::FlatBin(fq) => serde_json::to_value(fq.metadata(args))?,
             Self::Product(pq) => serde_json::to_value(pq.metadata(args))?,
             Self::Scalar(sq) => serde_json::to_value(sq.metadata(args))?,
+            Self::Rabit(rq) => serde_json::to_value(rq.metadata(args))?,
         };
         Ok(metadata)
     }
@@ -249,13 +264,11 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
                 }
 
                 let indices = UInt32Array::from(indices);
-                let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
-                let new_vectors = arrow::compute::take(b.column(1), &indices, None)?;
-
-                Ok(RecordBatch::try_new(
-                    self.schema().clone(),
-                    vec![new_row_ids, new_vectors],
-                )?)
+                let new_row_ids = UInt64Array::from(new_row_ids);
+                let b = b
+                    .take(&indices)?
+                    .replace_column_by_name(ROW_ID, Arc::new(new_row_ids))?;
+                Ok(b)
             })
             .collect::<Result<Vec<_>>>()?;
 

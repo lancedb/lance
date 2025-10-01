@@ -19,13 +19,7 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512\"))");
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
-
-    if cfg!(not(feature = "fp16kernels")) {
-        println!(
-            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
-        );
-        return Ok(());
-    }
+    println!("cargo:rerun-if-changed=src/simd/dist_table.c");
 
     // Important: we don't use `cfg!(target_arch)` here because that is the target_arch
     // for the build script, not the target_arch for the library. Similar story for
@@ -53,12 +47,20 @@ fn main() -> Result<(), String> {
             // It's likely the compiler doesn't support the sapphirerapids architecture
             // Clang 12 and GCC 11 are the first versions with sapphire rapids support
             println!(
-                "cargo:warning=Skipping build of AVX-512 fp16 kernels.  Clang/GCC too old or compiler does not support sapphirerapids architecture.  Error: {}",
+                "cargo:warning=Skipping build of AVX-512 fp16 kernels. Error: {}",
                 err
             );
         } else {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
+            println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
+        };
+        if let Err(err) = build_dist_table_with_flags("avx512", &["-march=native"]) {
+            println!(
+                "cargo:warning=Skipping build of AVX-512 dist_table. Error: {}",
+                err
+            );
+        } else {
             println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
         };
         // Build a version with AVX
@@ -80,6 +82,13 @@ fn main() -> Result<(), String> {
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
+    if cfg!(not(feature = "fp16kernels")) {
+        println!(
+            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
+        );
+        return Ok(());
+    }
+
     let mut builder = cc::Build::new();
     builder
         // We use clang #pragma to yields better vectorization
@@ -103,4 +112,21 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
     }
 
     builder.try_compile(&format!("f16_{}", suffix))
+}
+
+fn build_dist_table_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
+    let mut builder = cc::Build::new();
+    builder
+        .std("c17")
+        .file("src/simd/dist_table.c")
+        .flag("-funroll-loops")
+        .flag("-O3")
+        .flag("-Wall")
+        .flag("-Wextra")
+        .flag("-mavx512bw")
+        .flag(format!("-DSUFFIX=_{}", suffix).as_str());
+    for flag in flags {
+        builder.flag(flag);
+    }
+    builder.try_compile(&format!("dist_table_{}", suffix))
 }

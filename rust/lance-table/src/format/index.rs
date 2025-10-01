@@ -16,7 +16,7 @@ use lance_core::{Error, Result};
 
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
-pub struct Index {
+pub struct IndexMetadata {
     /// Unique ID across all dataset versions.
     pub uuid: Uuid,
 
@@ -56,7 +56,7 @@ pub struct Index {
     pub base_id: Option<u32>,
 }
 
-impl Index {
+impl IndexMetadata {
     pub fn effective_fragment_bitmap(
         &self,
         existing_fragments: &RoaringBitmap,
@@ -66,7 +66,7 @@ impl Index {
     }
 }
 
-impl DeepSizeOf for Index {
+impl DeepSizeOf for IndexMetadata {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.uuid.as_bytes().deep_size_of_children(context)
             + self.fields.deep_size_of_children(context)
@@ -80,7 +80,7 @@ impl DeepSizeOf for Index {
     }
 }
 
-impl TryFrom<pb::IndexMetadata> for Index {
+impl TryFrom<pb::IndexMetadata> for IndexMetadata {
     type Error = Error;
 
     fn try_from(proto: pb::IndexMetadata) -> Result<Self> {
@@ -114,8 +114,8 @@ impl TryFrom<pb::IndexMetadata> for Index {
     }
 }
 
-impl From<&Index> for pb::IndexMetadata {
-    fn from(idx: &Index) -> Self {
+impl From<&IndexMetadata> for pb::IndexMetadata {
+    fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
         if let Some(bitmap) = &idx.fragment_bitmap {
             if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {

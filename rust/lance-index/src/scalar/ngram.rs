@@ -14,6 +14,7 @@ use super::{
 };
 use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
+use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -21,7 +22,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::vector::VectorIndex;
-use crate::{pb, Index, IndexType};
+use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
@@ -512,7 +513,8 @@ impl ScalarIndex for NGramIndex {
         writer.finish().await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
@@ -530,7 +532,8 @@ impl ScalarIndex for NGramIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }
@@ -1300,7 +1303,8 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
 
         Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::NGramIndexDetails::default()).unwrap(),
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
         })
     }

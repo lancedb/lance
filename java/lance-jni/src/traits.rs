@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use jni::objects::{JIntArray, JMap, JObject, JString, JValue, JValueGen};
+use jni::objects::{JIntArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::JNIEnv;
 
 use crate::error::Result;
@@ -149,11 +149,27 @@ pub fn import_vec<'local>(env: &mut JNIEnv<'local>, obj: &JObject) -> Result<Vec
     Ok(ret)
 }
 
+pub fn import_vec_to_rust<T, F>(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    mut extractor: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&mut JNIEnv<'_>, JObject<'_>) -> Result<T>,
+{
+    let java_items = import_vec(env, obj)?;
+    let mut result = Vec::with_capacity(java_items.len());
+    for item in java_items {
+        result.push(extractor(env, item)?);
+    }
+    Ok(result)
+}
+
 pub fn import_vec_from_method<T, F>(
     env: &mut JNIEnv<'_>,
     java_obj: &JObject<'_>,
     method_name: &str,
-    mut extractor: F,
+    extractor: F,
 ) -> Result<Vec<T>>
 where
     F: FnMut(&mut JNIEnv<'_>, JObject<'_>) -> Result<T>,
@@ -162,12 +178,7 @@ where
         .call_method(java_obj, method_name, "()Ljava/util/List;", &[])?
         .l()?;
 
-    let java_items = import_vec(env, &list_obj)?;
-    let mut result = Vec::with_capacity(java_items.len());
-    for item in java_items {
-        result.push(extractor(env, item)?);
-    }
-    Ok(result)
+    import_vec_to_rust(env, &list_obj, extractor)
 }
 
 pub struct JLance<T>(pub T);
@@ -176,6 +187,15 @@ impl IntoJava for JLance<Vec<i32>> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let arr = env.new_int_array(self.0.len() as i32)?;
         env.set_int_array_region(&arr, 0, &self.0)?;
+        Ok(arr.into())
+    }
+}
+
+impl IntoJava for JLance<Vec<u32>> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let arr = env.new_long_array(self.0.len() as i32)?;
+        let res: Vec<i64> = self.0.iter().map(|val| *val as i64).collect();
+        env.set_long_array_region(&arr, 0, &res)?;
         Ok(arr.into())
     }
 }
@@ -232,6 +252,15 @@ impl FromJObjectWithEnv<Vec<i32>> for JIntArray<'_> {
         let mut ret: Vec<i32> = vec![0; len as usize];
         env.get_int_array_region(self, 0, ret.as_mut_slice())?;
         Ok(ret)
+    }
+}
+
+impl FromJObjectWithEnv<Vec<u32>> for JLongArray<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Vec<u32>> {
+        let len = env.get_array_length(self)?;
+        let mut ret: Vec<i64> = vec![0; len as usize];
+        env.get_long_array_region(self, 0, ret.as_mut_slice())?;
+        Ok(ret.into_iter().map(|val| val as u32).collect())
     }
 }
 

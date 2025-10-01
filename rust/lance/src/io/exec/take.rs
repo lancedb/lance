@@ -27,7 +27,6 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -276,10 +275,8 @@ impl TakeStream {
             })
             .boxed();
         batches
+            .inspect_ok(move |_| metrics.io_metrics.record(&scan_scheduler))
             .try_buffered(get_num_compute_intensive_cpus())
-            .finally(move || {
-                metrics.io_metrics.record_final(scan_scheduler.as_ref());
-            })
     }
 }
 

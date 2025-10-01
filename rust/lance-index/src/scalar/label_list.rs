@@ -22,6 +22,7 @@ use super::{bitmap::BitmapIndex, AnyQuery, IndexStore, LabelListQuery, ScalarInd
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
+use crate::pbold;
 use crate::scalar::bitmap::BitmapIndexPlugin;
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -29,7 +30,7 @@ use crate::scalar::registry::{
     VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
-use crate::{pb, Index, IndexType};
+use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 const LABEL_LIST_INDEX_VERSION: u32 = 0;
@@ -194,7 +195,7 @@ impl ScalarIndex for LabelListIndex {
         self.values_index.remap(mapping, dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
         })
@@ -211,7 +212,7 @@ impl ScalarIndex for LabelListIndex {
             .await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
         })
@@ -442,7 +443,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             .train_index(data, index_store, request, fragment_ids)
             .await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::LabelListIndexDetails::default())
+            index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
         })

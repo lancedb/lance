@@ -10,13 +10,19 @@ mod index;
 mod manifest;
 
 pub use fragment::*;
-pub use index::Index;
+pub use index::IndexMetadata;
+
 pub use manifest::{
     is_detached_version, BasePath, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, DETACHED_VERSION_MASK,
 };
 
 use lance_core::{Error, Result};
+
+// In 0.36.1 we renamed Index to IndexMetadata because Index conflicted too much with the
+// Index trait.  This is left in for backward compatibility.
+#[deprecated(since = "0.36.1", note = "Use IndexMetadata instead")]
+pub type Index = IndexMetadata;
 
 /// Protobuf definitions for Lance Format
 pub mod pb {

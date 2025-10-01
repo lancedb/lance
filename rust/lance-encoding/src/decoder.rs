@@ -401,7 +401,7 @@ pub struct ColumnInfoIter<'a> {
 
 impl<'a> ColumnInfoIter<'a> {
     pub fn new(column_infos: Vec<Arc<ColumnInfo>>, column_indices: &'a [u32]) -> Self {
-        let initial_pos = column_indices[0] as usize;
+        let initial_pos = column_indices.first().copied().unwrap_or(0) as usize;
         Self {
             column_infos,
             column_indices,
@@ -529,14 +529,36 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn is_primitive(data_type: &DataType) -> bool {
+    fn is_structural_primitive(data_type: &DataType) -> bool {
+        if data_type.is_primitive() {
+            true
+        } else {
+            match data_type {
+                // DataType::is_primitive doesn't consider these primitive but we do
+                DataType::Dictionary(_, value_type) => Self::is_structural_primitive(value_type),
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Utf8
+                | DataType::LargeUtf8 => true,
+                DataType::FixedSizeList(inner, _) => {
+                    Self::is_structural_primitive(inner.data_type())
+                }
+                _ => false,
+            }
+        }
+    }
+
+    fn is_primitive_legacy(data_type: &DataType) -> bool {
         if data_type.is_primitive() {
             true
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
                 DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
+                DataType::FixedSizeList(inner, _) => Self::is_primitive_legacy(inner.data_type()),
                 _ => false,
             }
         }
@@ -673,12 +695,13 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
-        if Self::is_primitive(&data_type) {
+        if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
                 self.cache_repetition_index,
+                field,
             )?);
 
             // advance to the next top level column
@@ -689,11 +712,13 @@ impl CoreFieldDecoderStrategy {
         match &data_type {
             DataType::Struct(fields) => {
                 if field.is_packed_struct() {
+                    // Packed struct
                     let column_info = column_infos.expect_next()?;
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
                         self.cache_repetition_index,
+                        field,
                     )?);
 
                     // advance to the next top level column
@@ -701,6 +726,29 @@ impl CoreFieldDecoderStrategy {
 
                     return Ok(scheduler);
                 }
+                // Maybe a blob descriptions struct?
+                if field.is_blob() {
+                    let column_info = column_infos.peek();
+                    if column_info.page_infos.iter().any(|page| {
+                        matches!(
+                            page.encoding,
+                            PageEncoding::Structural(pb21::PageLayout {
+                                layout: Some(pb21::page_layout::Layout::BlobLayout(_))
+                            })
+                        )
+                    }) {
+                        let column_info = column_infos.expect_next()?;
+                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                            column_info.as_ref(),
+                            self.decompressor_strategy.as_ref(),
+                            self.cache_repetition_index,
+                            field,
+                        )?);
+                        column_infos.next_top_level();
+                        return Ok(scheduler);
+                    }
+                }
+
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
                     let field_scheduler =
@@ -714,16 +762,6 @@ impl CoreFieldDecoderStrategy {
                         as Box<dyn StructuralFieldScheduler>,
                 )
             }
-            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
-                let column_info = column_infos.expect_next()?;
-                let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                    column_info.as_ref(),
-                    self.decompressor_strategy.as_ref(),
-                    self.cache_repetition_index,
-                )?);
-                column_infos.next_top_level();
-                Ok(scheduler)
-            }
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field
                     .children
@@ -734,7 +772,7 @@ impl CoreFieldDecoderStrategy {
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
-            _ => todo!(),
+            _ => todo!("create_structural_field_scheduler for {}", data_type),
         }
     }
 
@@ -745,7 +783,7 @@ impl CoreFieldDecoderStrategy {
         buffers: FileBuffers,
     ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         let data_type = field.data_type();
-        if Self::is_primitive(&data_type) {
+        if Self::is_primitive_legacy(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
             return Ok(scheduler);
@@ -804,7 +842,7 @@ impl CoreFieldDecoderStrategy {
             DataType::FixedSizeList(inner, _dimension) => {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
-                if Self::is_primitive(inner.data_type()) {
+                if Self::is_primitive_legacy(inner.data_type()) {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -814,7 +852,7 @@ impl CoreFieldDecoderStrategy {
                 }
             }
             DataType::Dictionary(_key_type, value_type) => {
-                if Self::is_primitive(value_type) || value_type.is_binary_like() {
+                if Self::is_primitive_legacy(value_type) || value_type.is_binary_like() {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler =
                         self.create_primitive_scheduler(field, primitive_col, buffers)?;
@@ -960,7 +998,7 @@ impl DecodeBatchScheduler {
             .metadata
             .insert("__lance_decoder_root".to_string(), "true".to_string());
 
-        if column_infos[0].is_structural() {
+        if column_infos.is_empty() || column_infos[0].is_structural() {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
             let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
@@ -1032,29 +1070,29 @@ impl DecodeBatchScheduler {
         let mut root_job = maybe_root_job.unwrap();
         let mut num_rows_scheduled = 0;
         loop {
-            let maybe_next_scan_line = root_job.schedule_next(&mut context);
-            if let Err(err) = maybe_next_scan_line {
+            let maybe_next_scan_lines = root_job.schedule_next(&mut context);
+            if let Err(err) = maybe_next_scan_lines {
                 schedule_action(Err(err));
                 return;
             }
-            let next_scan_line = maybe_next_scan_line.unwrap();
-            match next_scan_line {
-                Some(next_scan_line) => {
-                    trace!(
-                        "Scheduled scan line of {} rows and {} decoders",
-                        next_scan_line.rows_scheduled,
-                        next_scan_line.decoders.len()
-                    );
-                    num_rows_scheduled += next_scan_line.rows_scheduled;
-                    if !schedule_action(Ok(DecoderMessage {
-                        scheduled_so_far: num_rows_scheduled,
-                        decoders: next_scan_line.decoders,
-                    })) {
-                        // Decoder has disconnected
-                        return;
-                    }
+            let next_scan_lines = maybe_next_scan_lines.unwrap();
+            if next_scan_lines.is_empty() {
+                return;
+            }
+            for next_scan_line in next_scan_lines {
+                trace!(
+                    "Scheduled scan line of {} rows and {} decoders",
+                    next_scan_line.rows_scheduled,
+                    next_scan_line.decoders.len()
+                );
+                num_rows_scheduled += next_scan_line.rows_scheduled;
+                if !schedule_action(Ok(DecoderMessage {
+                    scheduled_so_far: num_rows_scheduled,
+                    decoders: next_scan_line.decoders,
+                })) {
+                    // Decoder has disconnected
+                    return;
                 }
-                None => return,
             }
         }
     }
@@ -1419,7 +1457,7 @@ impl BatchDecodeStream {
 // Utility types to smooth out the differences between the 2.0 and 2.1 decoders so that
 // we can have a single implementation of the batch decode iterator
 enum RootDecoderMessage {
-    LoadedPage(LoadedPage),
+    LoadedPage(LoadedPageShard),
     LegacyPage(crate::previous::decoder::DecoderReady),
 }
 trait RootDecoderType {
@@ -1501,7 +1539,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     ///
     /// If the data is not available this will perform a *blocking* wait (put
     /// the current thread to sleep)
-    fn wait_for_page(&self, unloaded_page: UnloadedPage) -> Result<LoadedPage> {
+    fn wait_for_page(&self, unloaded_page: UnloadedPageShard) -> Result<LoadedPageShard> {
         match maybe_done(unloaded_page.0) {
             // Fast path, avoid all runtime shenanigans if the data is ready
             MaybeDone::Done(loaded_page) => loaded_page,
@@ -1516,7 +1554,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     /// Note that `scheduled_need` is cumulative.  E.g. this method
     /// should be called with 5, 10, 15 and not 5, 5, 5
     #[instrument(skip_all)]
-    fn wait_for_io(&mut self, scheduled_need: u64) -> Result<u64> {
+    fn wait_for_io(&mut self, scheduled_need: u64, to_take: u64) -> Result<u64> {
         while self.rows_scheduled < scheduled_need && !self.messages.is_empty() {
             let message = self.messages.pop_front().unwrap()?;
             self.rows_scheduled = message.scheduled_so_far;
@@ -1538,7 +1576,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             }
         }
 
-        let loaded_need = self.rows_drained + self.rows_per_batch as u64 - 1;
+        let loaded_need = self.rows_drained + to_take.min(self.rows_per_batch as u64) - 1;
 
         self.root_decoder
             .wait(loaded_need, &self.wait_for_io_runtime)?;
@@ -1568,7 +1606,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 "Draining from scheduler (desire at least {} scheduled rows)",
                 desired_scheduled
             );
-            let actually_scheduled = self.wait_for_io(desired_scheduled)?;
+            let actually_scheduled = self.wait_for_io(desired_scheduled, to_take)?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
                 to_take -= under_scheduled;
@@ -2308,9 +2346,9 @@ impl SchedulerContext {
     }
 }
 
-pub struct UnloadedPage(pub BoxFuture<'static, Result<LoadedPage>>);
+pub struct UnloadedPageShard(pub BoxFuture<'static, Result<LoadedPageShard>>);
 
-impl std::fmt::Debug for UnloadedPage {
+impl std::fmt::Debug for UnloadedPageShard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnloadedPage").finish()
     }
@@ -2323,10 +2361,13 @@ pub struct ScheduledScanLine {
 }
 
 pub trait StructuralSchedulingJob: std::fmt::Debug {
-    fn schedule_next(
-        &mut self,
-        context: &mut SchedulerContext,
-    ) -> Result<Option<ScheduledScanLine>>;
+    /// Schedule the next batch of data
+    ///
+    /// Normally this equates to scheduling the next page of data into one task.  Very large pages
+    /// might be split into multiple scan lines.  Each scan line has one or more rows.
+    ///
+    /// If a scheduler ends early it may return an empty vector.
+    fn schedule_next(&mut self, context: &mut SchedulerContext) -> Result<Vec<ScheduledScanLine>>;
 }
 
 /// A filter expression to apply to the data
@@ -2433,7 +2474,7 @@ pub enum MessageType {
     // Starting in 2.1 we use a simpler scheme where the scheduling happens in priority
     // order and the message is an unloaded decoder.  These can be awaited, in order, and
     // the decoder does not have to worry about waiting for I/O.
-    UnloadedPage(UnloadedPage),
+    UnloadedPage(UnloadedPageShard),
 }
 
 impl MessageType {
@@ -2446,7 +2487,7 @@ impl MessageType {
         }
     }
 
-    pub fn into_structural(self) -> UnloadedPage {
+    pub fn into_structural(self) -> UnloadedPageShard {
         match self {
             Self::UnloadedPage(unloaded) => unloaded,
             Self::DecoderReady(_) => {
@@ -2487,7 +2528,7 @@ pub trait StructuralPageDecoder: std::fmt::Debug + Send {
 }
 
 #[derive(Debug)]
-pub struct LoadedPage {
+pub struct LoadedPageShard {
     // The decoder that is ready to be decoded
     pub decoder: Box<dyn StructuralPageDecoder>,
     // The path to the decoder, the first value is the column index
@@ -2509,7 +2550,6 @@ pub struct LoadedPage {
     // handled through indirect I/O at the moment and so they don't
     // need to be represented (yet)
     pub path: VecDeque<u32>,
-    pub page_index: usize,
 }
 
 pub struct DecodedArray {
@@ -2526,7 +2566,7 @@ pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
     ///
     /// The default implementation does not expect children and returns
     /// an error.
-    fn accept_page(&mut self, _child: LoadedPage) -> Result<()>;
+    fn accept_page(&mut self, _child: LoadedPageShard) -> Result<()>;
     /// Creates a task to decode `num_rows` of data into an array
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>>;
     /// The data type of the decoded data

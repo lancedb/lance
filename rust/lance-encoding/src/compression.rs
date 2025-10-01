@@ -430,7 +430,17 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 // If values are very large then use block compression on a per-value basis
                 //
                 // TODO: Could maybe use median here
-                if max_len > 32 * 1024 && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
+
+                let per_value_requested =
+                    if let Some(compression) = field_params.compression.as_deref() {
+                        compression != "none" && compression != "fsst"
+                    } else {
+                        false
+                    };
+
+                if (max_len > 32 * 1024 || per_value_requested)
+                    && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                {
                     return Ok(Box::new(CompressedBufferEncoder::default()));
                 }
 
@@ -462,7 +472,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
     fn create_block_compressor(
         &self,
-        _field: &Field,
+        field: &Field,
         data: &DataBlock,
     ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
         match data {
@@ -486,7 +496,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 );
                 Ok((encoder, encoding))
             }
-            _ => unreachable!(),
+            _ => todo!(
+                "block compressor for field {:?} and block type {:?}",
+                field,
+                data.name()
+            ),
         }
     }
 }
@@ -658,6 +672,12 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
         description: &CompressiveEncoding,
     ) -> Result<Box<dyn FixedPerValueDecompressor>> {
         match description.compression.as_ref().unwrap() {
+            Compression::Constant(constant) => Ok(Box::new(ConstantDecompressor::new(
+                constant
+                    .value
+                    .as_ref()
+                    .map(|v| LanceBuffer::from_bytes(v.clone(), 1)),
+            ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
             _ => todo!("fixed-per-value decompressor for {:?}", description),
@@ -706,7 +726,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             )),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::Constant(constant) => {
-                let scalar = LanceBuffer::from_bytes(constant.value.clone(), 1);
+                let scalar = constant
+                    .value
+                    .as_ref()
+                    .map(|v| LanceBuffer::from_bytes(v.clone(), 1));
                 Ok(Box::new(ConstantDecompressor::new(scalar)))
             }
             Compression::Variable(_) => Ok(Box::new(BinaryBlockDecompressor::default())),
