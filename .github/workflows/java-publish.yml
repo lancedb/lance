@@ -245,6 +245,7 @@ jobs:
     needs: [linux-arm64, linux-x86, macos-arm64]
     if: always() && (github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     permissions:
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@v4

@@ -199,6 +199,7 @@ jobs:
     # needs: [linux, mac, windows]
     needs: [linux]
     permissions:
+      contents: read
       issues: write
     if: always()
     steps:
