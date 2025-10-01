@@ -424,9 +424,8 @@ pub async fn object_store_from_uri_or_path(
     } else {
         uri_or_path.as_ref()
     };
-    let path = Path::parse(uri_or_path).map_err(|e| {
-        PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path, e))
-    })?;
+    let path = Path::parse(uri_or_path)
+        .map_err(|e| PyIOError::new_err(format!("Invalid path `{}`: {}", uri_or_path, e)))?;
     let object_store = Arc::new(ObjectStore::local());
     Ok((object_store, path))
 }

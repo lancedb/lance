@@ -734,6 +734,11 @@ def one_pass_assign_ivf_pq_on_accelerator(
     )
     if dst_dataset_uri is None:
         dst_dataset_uri = tempfile.mkdtemp()
+        if re.search(r".:\\", dst_dataset_uri) is not None:
+            # Hack for Windows due to
+            # https://github.com/apache/arrow-rs-object-store/issues/499
+            dst_dataset_uri = dst_dataset_uri.replace("\\", "/", 1)
+        print(f"dst_dataset_uri={dst_dataset_uri}")
     ds = write_dataset(
         rbr,
         dst_dataset_uri,
