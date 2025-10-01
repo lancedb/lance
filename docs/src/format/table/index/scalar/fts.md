@@ -54,6 +54,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 
 | Field               | Type    | Default   | Description                                                    |
 |---------------------|---------|-----------|----------------------------------------------------------------|
+| `lance_tokenizer`   | String  | "text"    | Lance tokenizer type (see Tokenizers section)                  |
 | `base_tokenizer`    | String  | "simple"  | Base tokenizer type (see Tokenizers section)                   |
 | `language`          | String  | "English" | Language for stemming and stop words                           |
 | `with_position`     | Boolean | false     | Store term positions for phrase queries (increases index size) |
@@ -68,7 +69,64 @@ The metadata file contains JSON-serialized configuration and partition informati
 
 ## Tokenizers
 
-The full text search index supports multiple tokenizer types for different text processing needs:
+The full text search index supports multiple tokenizer types for different text processing needs.
+There are two different tokenizer configurations: `lance_tokenizer` and `base_tokenizer`.
+
+The `lance_tokenizer` is responsible for handling different document types, such as text and json,
+while the `base_tokenizer` is responsible for tokenizing documents.
+
+### Lance Tokenizers
+| Tokenizer | Description                                                          | Use Case                |
+|-----------|----------------------------------------------------------------------|-------------------------|
+| **text**  | Parse TEXT document into tokens.                                     | Text document (default) |
+| **json**  | Parse JSON document into tokens in triplet format `path,type,value`. | Json document           |
+
+#### Text Tokenizer
+Text Tokenizer is responsible for handling TEXT-type data, which is Utf8, LargeUtf8 or List of them in arrow format.
+The Text Tokenizer behaves consistently in both query and document parsing scenarios, which means that if a document
+contains the word "lance," we can retrieve it using a query with "lance".
+
+#### Json Tokenizer
+The Json Tokenizer is responsible for handling JSON-type data, which is the JSON type in arrow format.
+Unlike Text Tokenizer, the Json Tokenizer behaves differently in "query" and "document parsing" scenarios.
+
+JSON is a nested structure, a JSON document can always be converted into triplets in format: `path,type,value`. That's
+how lance handle JSON during document parsing, breaking down JSON document into tokens in the triplet format.
+In scenarios where the triplet value is a text, the text value will be further tokenized using the base_tokenizer,
+resulting in multiple triplet tokens.
+
+During "querying," the Json Tokenizer uses the triplet format instead of the JSON format, which simplifies the query
+syntax.
+
+The example below shows how the Json Tokenizer works. Assume we have the following JSON document:
+```json
+{
+  "name": "Lance",
+  "legal.age": 30,
+  "address": {
+    "city": "San Francisco",
+    "zip:us": 94102
+  }
+}
+```
+
+After parsing, the document will be tokenized into the following tokens:
+```
+name,str,Lance
+legal.age,number,30
+address.city,str,San
+address.city,str,Francisco
+address.zip:us,number,94102
+```
+
+Then we do full text search in triplet format. To search for "San Francisco," we can search with one of the triplets
+below:
+```
+address.city:San Francisco
+address.city:San
+address.city:Francisco
+```
+
 
 ### Base Tokenizers
 
