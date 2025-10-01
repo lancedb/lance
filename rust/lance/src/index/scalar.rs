@@ -201,7 +201,12 @@ pub(crate) async fn load_training_data(
     if train {
         // Use the training request to scan data with fragment filtering
         if let Some(ref fragment_ids) = training_request.fragment_ids {
-            let fragment_ids = fragment_ids.clone().into_iter().dedup().collect_vec();
+            let fragment_ids = fragment_ids
+                .clone()
+                .into_iter()
+                .sorted()
+                .dedup()
+                .collect_vec();
             let frags = dataset.get_frags_from_ordered_ids(&fragment_ids);
             let frags: Result<Vec<_>> = fragment_ids
                 .iter()
