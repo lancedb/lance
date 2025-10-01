@@ -56,9 +56,10 @@ const SHUFFLE_BATCH_SIZE: usize = 1024;
 fn get_temp_dir() -> Result<Path> {
     // Note: using keep here means we will not delete this TempDir automatically
     let dir = tempfile::TempDir::new()?.keep();
-    let tmp_dir_path = std::fs::canonicalize(dir)?;
-    let tmp_dir_path = tmp_dir_path.as_os_str().to_str().unwrap().replace("\\" ,"/");
-    let tmp_dir_path = Path::parse(tmp_dir_path)?;
+    let tmp_dir_path = Path::from_filesystem_path(dir).map_err(|e| Error::IO {
+        source: Box::new(e),
+        location: location!(),
+    })?;
     Ok(tmp_dir_path)
 }
 

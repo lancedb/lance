@@ -330,7 +330,7 @@ mod test {
             .head(&version_six_staging_location)
             .await
             .unwrap()
-            .size as u64;
+            .size;
         store
             .put_if_exists(
                 ds.base.as_ref(),
