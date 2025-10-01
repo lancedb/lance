@@ -1554,7 +1554,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     /// Note that `scheduled_need` is cumulative.  E.g. this method
     /// should be called with 5, 10, 15 and not 5, 5, 5
     #[instrument(skip_all)]
-    fn wait_for_io(&mut self, scheduled_need: u64) -> Result<u64> {
+    fn wait_for_io(&mut self, scheduled_need: u64, to_take: u64) -> Result<u64> {
         while self.rows_scheduled < scheduled_need && !self.messages.is_empty() {
             let message = self.messages.pop_front().unwrap()?;
             self.rows_scheduled = message.scheduled_so_far;
@@ -1576,7 +1576,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
             }
         }
 
-        let loaded_need = self.rows_drained + self.rows_per_batch as u64 - 1;
+        let loaded_need = self.rows_drained + to_take.min(self.rows_per_batch as u64) - 1;
 
         self.root_decoder
             .wait(loaded_need, &self.wait_for_io_runtime)?;
@@ -1606,7 +1606,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 "Draining from scheduler (desire at least {} scheduled rows)",
                 desired_scheduled
             );
-            let actually_scheduled = self.wait_for_io(desired_scheduled)?;
+            let actually_scheduled = self.wait_for_io(desired_scheduled, to_take)?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
                 to_take -= under_scheduled;
