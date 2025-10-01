@@ -20,8 +20,8 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
+use lance::datatypes::Schema;
 use lance::Result;
-use lance::{datatypes::Schema};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
@@ -218,11 +218,8 @@ impl Hnsw {
 
     #[pyo3(signature = (file_path))]
     fn to_lance_file(&self, py: Python, file_path: &str) -> PyResult<()> {
-        let (object_store, path) = RT
-            .block_on(
-                Some(py),
-                object_store_from_uri_or_path(file_path, None),
-            )??;
+        let (object_store, path) =
+            RT.block_on(Some(py), object_store_from_uri_or_path(file_path, None))??;
         let mut writer = RT
             .block_on(
                 Some(py),
